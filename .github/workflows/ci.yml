@@ -26,15 +26,26 @@ jobs:
       - name: apply quilt series
         run: ./scripts/apply-patches.sh
 
-      - name: ensure no patch needed a refresh
+      - name: ensure no patch needed adjustment vs pinned upstream
+        env:
+          QUILT_PATCHES: ${{ github.workspace }}/patches
+          QUILT_SERIES: ${{ github.workspace }}/patches/series
         run: |
+          # Refresh every patch in the series. If a patch applied with fuzz or
+          # line-offset against the pinned upstream SHA, quilt refresh rewrites
+          # the patch file — and `git diff --exit-code patches/` catches it.
           cd vendor/screenpipe
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "::error::patches applied but left dirty working tree — refresh needed"
-            git status
-            git diff | head -100
+          while quilt top >/dev/null 2>&1; do
+            quilt refresh
+            quilt pop || break
+          done
+
+          cd "$GITHUB_WORKSPACE"
+          if ! git diff --exit-code patches/; then
+            echo "::error::a patch drifted vs upstream — run scripts/refresh-from-upstream.sh and commit the result"
             exit 1
           fi
+          echo "all patches apply with zero fuzz against pinned upstream"
 
   cascade-schema-build:
     name: cascade-schema crate builds
