@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patches-apply:
+    name: patches apply cleanly
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: install quilt
+        run: brew install quilt
+
+      - name: apply quilt series
+        run: ./scripts/apply-patches.sh
+
+      - name: ensure no patch needed a refresh
+        run: |
+          cd vendor/screenpipe
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::patches applied but left dirty working tree — refresh needed"
+            git status
+            git diff | head -100
+            exit 1
+          fi
+
+  cascade-schema-build:
+    name: cascade-schema crate builds
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/cascade-schema
+
+      - name: cargo check (cascade-schema only, no vendor)
+        working-directory: crates/cascade-schema
+        run: cargo check
+
+      - name: cargo test
+        working-directory: crates/cascade-schema
+        run: cargo test

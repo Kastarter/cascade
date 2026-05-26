@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cascade-schema",
+]
+
+# Intentionally NOT pulling vendor/screenpipe/crates/* into this workspace.
+# Reasons:
+#   1. Their workspace uses a specific Rust toolchain (rust-toolchain.toml) and
+#      bundled native deps that should stay scoped to their build.
+#   2. Cascade's overlay/patch model means vendor/screenpipe builds via its OWN
+#      tauri.conf.json + cargo workspace, invoked by scripts/build-macos.sh.
+#   3. Keeping our workspace minimal lets `cargo test` in CI run in seconds
+#      without compiling tesseract/ffmpeg/whisper/etc.
+#
+# When we add more Cascade-owned crates (e.g. cascade-agent-runtime later),
+# add them to `members` above.
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Mohanad139/Cascade"
+
+[workspace.dependencies]
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

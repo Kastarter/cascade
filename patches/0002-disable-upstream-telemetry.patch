@@ -1,0 +1,26 @@
+Index: screenpipe/apps/screenpipe-app-tauri/app/providers.tsx
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/app/providers.tsx
++++ screenpipe/apps/screenpipe-app-tauri/app/providers.tsx
+@@ -112,17 +112,10 @@ export const Providers = forwardRef<
+     };
+   }, []);
+ 
+-  useEffect(() => {
+-    if (typeof window !== "undefined") {
+-      const isDebug = process.env.TAURI_ENV_DEBUG === "true";
+-      if (isDebug) return;
+-      posthog.init("phc_z7FZXE8vmXtdTQ78LMy3j1BQWW4zP6PGDUP46rgcdnb", {
+-        api_host: "https://us.i.posthog.com",
+-        person_profiles: "identified_only",
+-        capture_pageview: false,
+-      });
+-    }
+-  }, []);
++  // cascade: upstream PostHog telemetry disabled. PostHogProvider remains
++  // wired below so call sites in the app don't crash; the unintialized
++  // posthog client no-ops on capture/identify.
++  useEffect(() => {}, []);
+ 
+   return (
+     <Suspense>

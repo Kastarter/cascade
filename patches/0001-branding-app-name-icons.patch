@@ -1,0 +1,85 @@
+Index: screenpipe/apps/screenpipe-app-tauri/package.json
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/package.json
++++ screenpipe/apps/screenpipe-app-tauri/package.json
+@@ -1,5 +1,5 @@
+ {
+-  "name": "screenpipe",
++  "name": "cascade",
+   "private": true,
+   "scripts": {
+     "dev": "next dev -p 1420",
+Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
++++ screenpipe/apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+@@ -1,7 +1,7 @@
+ {
+   "$schema": "https://schema.tauri.app/config/2",
+-  "productName": "screenpipe - Development",
+-  "identifier": "screenpi.pe.dev",
++  "productName": "Cascade",
++  "identifier": "com.cascade.app",
+   "build": {
+     "beforeDevCommand": "bun run dev",
+     "beforeBuildCommand": "bun run build",
+@@ -10,10 +10,10 @@
+   },
+   "bundle": {
+     "active": true,
+-    "publisher": "Mediar, Inc.",
+-    "category": "DeveloperTool",
+-    "shortDescription": "24/7 memory for your desktop",
+-    "longDescription": "24/7 memory for your desktop. 100% local. You own your data.",
++    "publisher": "Cascade",
++    "category": "Productivity",
++    "shortDescription": "Cascade remembers what you did so you don't have to",
++    "longDescription": "Cascade is a passive screen recorder with a retrospective AI agent. Ask anything about your day — Cascade answers from your own recorded history. 100% local.",
+     "copyright": "",
+     "targets": [
+       "app",
+@@ -52,7 +52,7 @@
+     "deep-link": {
+       "desktop": {
+         "schemes": [
+-          "screenpipe"
++          "cascade"
+         ]
+       },
+       "mobile": [
+@@ -104,7 +104,7 @@
+   "app": {
+     "withGlobalTauri": true,
+     "trayIcon": {
+-      "id": "screenpipe_main",
++      "id": "cascade_main",
+       "iconPath": "assets/screenpipe-logo-tray-white.png",
+       "iconAsTemplate": true,
+       "menuOnLeftClick": true
+@@ -114,7 +114,8 @@
+         "enable": true,
+         "scope": [
+           "$APPDATA/**",
+-          "$HOME/.screenpipe/**"
++          "$HOME/.screenpipe/**",
++          "$HOME/.cascade/**"
+         ]
+       },
+       "csp": null
+Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/tauri.macos.conf.json
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/src-tauri/tauri.macos.conf.json
++++ screenpipe/apps/screenpipe-app-tauri/src-tauri/tauri.macos.conf.json
+@@ -1,10 +1,10 @@
+ {
+     "bundle": {
+-        "publisher": "Mediar, Inc.",
++        "publisher": "Cascade",
+         "macOS": {
+             "entitlements": "entitlements.plist",
+             "hardenedRuntime": true,
+-            "exceptionDomain": "screenpi.pe",
++            "exceptionDomain": "cascade.app",
+             "provisioningProfile": null,
+             "dmg": {
+                 "background": "assets/dmg-background.png"

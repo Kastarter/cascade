@@ -6,7 +6,7 @@ Cascade is a two-layer enterprise productivity product:
 - **Layer 1 (this plan):** passive screen-monitoring + employee-facing rewind & Q&A
 - **Layer 2 (later):** admin dashboard, waste-detection agent, deployable fix-agents that the boss "cascades" down to employees (the product's namesake loop)
 
-We're competing against Cluely (YC, live-overlay coaching). The bet: passive recording + retrospective intelligence + deployable fix-agents beats live nagging.
+We're competing against **Clicky** (`farzaa/clicky`, MIT-licensed open source, commercial version at heyclicky.com) — a Swift macOS menu-bar app that watches your screen and **coaches you live** via push-to-talk + voice (Claude + ElevenLabs), drawing a cursor pointer to highlight UI elements. The bet: **passive recording + retrospective intelligence + admin-deployable fix-agents** beats live "tell me what to click" coaching. Clicky's model requires the user to actively engage (push-to-talk) and watch a live overlay; Cascade just records and answers questions later, then (Layer 2) lets a boss push automation down to fix recurring inefficiencies.
 
 **Why Layer 1 first:** Layer 2's detection and fix-agents are useless without a high-quality event store and employee trust. Shipping a personal rewind/Q&A app first (a) validates the capture pipeline, (b) earns employee trust before the admin side appears, (c) gives Layer 2 real data to design against.
 
@@ -132,11 +132,35 @@ Cascade/
 
 ## Verify before writing code (M0 gate)
 
-1. **Confirm pi agent works with direct BYOK Anthropic** (no Screenpipe Cloud token). Their `pi.rs` references `screenpipe_cloud_models`; need to confirm Anthropic provider isn't routed through their cloud by default. **Biggest single unknown** — if it fails, M2 grows: pi config patch or direct-Anthropic shim required.
+1. ✅ **Anthropic BYOK confirmed in pi agent.** `vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri/src/pi.rs:3212` has `test_build_models_json_anthropic_provider` showing provider key `"anthropic-byok"` with `baseUrl: https://api.anthropic.com` and `api: anthropic-messages`. **No custom shim needed** — Cascade calls existing `pi_start` Tauri command with `provider_config: { provider: "anthropic", model: "claude-sonnet-4-6", token: <key> }`. The biggest M0 unknown is resolved.
 2. **Confirm `sqlite-vec` is actually wired into a search path** (not just compiled in). Search migrations for `vec0` virtual table creation. If absent, rewind/Q&A still works via FTS5 + keyword — no blocker, adjust expectations.
 3. **Confirm `localhost:3030/raw_sql` is exposed and not enterprise-license-gated** (check `ee/enterprise_policy.rs`). Pipe may need it for time-range queries beyond `/search`.
-4. **Run their app on a clean macOS install to baseline:** cold-start RAM, idle CPU, daily DB growth. We promise "low resource use" — measure before promising.
-5. **Verify macOS signing flow with our Developer ID** in `tauri.conf.json`.
+4. **Run app on a clean macOS install to baseline:** cold-start RAM, idle CPU, daily DB growth. Requires `bun install` + `bun run tauri build`. Without Apple Developer ID, run unsigned with "continue anyway" button after TCC 5s timer.
+5. **Verify macOS signing flow with our Developer ID** in patched `tauri.conf.json`.
+
+### Clicky (the actual competitor) — what they do, what we don't
+
+From `farzaa/clicky` README (active as of 2026-04-27, MIT):
+- Swift NSPanel menu-bar app, macOS only
+- Continuous screenshots for context, NO local storage / NO rewind / NO OCR / NO event store
+- Push-to-talk hotkey (Control+Option) — user-driven, synchronous
+- AssemblyAI STT → Claude reasoning → ElevenLabs TTS audio reply
+- Draws a cursor pointer on screen to point at UI elements
+- Cloudflare Workers backend for credential proxy
+
+**Cascade differentiation (where each feature falls vs Clicky):**
+| Capability | Clicky | Cascade Layer 1 | Cascade Layer 2 |
+|---|---|---|---|
+| Always-on capture | ❌ (per-question only) | ✅ | ✅ |
+| Local event store | ❌ | ✅ (Screenpipe SQLite) | ✅ |
+| Rewind UI | ❌ | ✅ | ✅ |
+| Retrospective Q&A | ❌ | ✅ (Cascade pipe) | ✅ |
+| Live coaching overlay | ✅ | ❌ (deliberate) | ❌ |
+| Voice in/out | ✅ | ❌ | ❌ |
+| Admin / multi-user | ❌ | ❌ | ✅ |
+| Deployable fix-agents | ❌ | ❌ | ✅ |
+
+**Strategic implication:** if a user wants "tell me what to click right now," they want Clicky, not us. We do **not** ship live overlay coaching in Layer 1 — it's a Clicky feature, building it would dilute our positioning. If Clicky later adds passive recording + retrospective Q&A, our moat compresses to Layer 2 (admin + cascadeable agents).
 
 ## Risks that could derail v1
 
@@ -157,25 +181,36 @@ Cascade/
 7. `Activity Monitor`: Cascade RAM < 400 MB idle, < 5% CPU average. SQLite DB growth < 50 MB/hr at default settings.
 8. Auto-update: bump version in release feed, confirm app prompts to update on next launch.
 
-## First actions after plan approval
+## Status snapshot (post-scaffold session)
 
-1. Create `~/Desktop/Cascade/` folder.
-2. Copy this plan to `Cascade/plan.md`.
-3. `git init`, add `.gitignore`, initial commit.
-4. `git submodule add https://github.com/mediar-ai/screenpipe vendor/screenpipe` at a pinned SHA.
-5. Set up `quilt` series with empty patches/ folder + `series` file.
-6. Begin M0 verification gate (the 5 checks above) before any patch is written.
+**Shipped (foundation):**
+- ✅ `~/Desktop/Cascade/` scaffolded, git init'd, pushed to `github.com/Mohanad139/Cascade`
+- ✅ Screenpipe pinned as submodule at SHA `85b0f37c6e7efbcdde83bfeea21b601f8da79ca7` (v2.2.17-3255-g85b0f37c6)
+- ✅ Quilt installed; series + patch infra working
+- ✅ `patches/0001-branding-app-name-icons.patch` — productName/identifier/publisher/copy/trayId/deep-link scheme + `$HOME/.cascade/**` allow-listed in asset protocol
+- ✅ `patches/0002-disable-upstream-telemetry.patch` — PostHog init replaced with no-op; `PostHogProvider` left wired so call sites don't crash
+- ✅ Both patches verified via `./scripts/apply-patches.sh` and pop cleanly via `quilt pop -a`
+- ✅ `crates/cascade-schema` — sidecar tables (`cascade_event_tags`, `cascade_entity_extractions`, `cascade_classifications`), async API, FK-cascade verified by green `cargo test`
+- ✅ `pipes/cascade-rewind-qa/pipe.md` — prompt format matches actual Screenpipe pipe schema
+- ✅ `app-overlays/screenpipe-app-tauri/` — `cascade-defaults.ts`, `cascade-byok-dialog.tsx`, `cascade-onboarding.tsx`, `cascade_commands.rs` (Keychain BYOK + mirror to `~/.pi/agent/auth.json`)
+- ✅ `scripts/apply-patches.sh`, `refresh-from-upstream.sh`, `overlay.sh`, `build-macos.sh`
+- ✅ `.github/workflows/ci.yml` (patch-applies-clean + schema build/test) + `release-macos.yml` (signed DMG)
+- ✅ Workspace `Cargo.toml`, `.gitignore`, `README.md`
 
-## Critical files to create (named)
+**Deferred (not in v1 critical path):**
+- ❌ `0003 onboarding-strip-cloud-signup.patch` — onboarding/page.tsx is 188 lines; cleaner as overlay-replacement than in-place patch. Decide in M3.
+- ❌ `0004 disable-pipe-store.patch` — pipe-store.tsx is 1765 lines. Cleanest is hiding the route in the layout. Decide in M4.
+- ❌ `0005 default-provider-anthropic-byok.patch` — **not needed.** UI calls existing `pi_start` Tauri command with `provider_config`. Removed from series.
 
-- `Cascade/plan.md` (copy of this document)
-- `Cascade/patches/0001-branding-app-name-icons.patch` … `0005-disable-pipe-store.patch`
-- `Cascade/app-overlays/screenpipe-app-tauri/components/cascade-byok-dialog.tsx`
-- `Cascade/app-overlays/screenpipe-app-tauri/components/cascade-onboarding.tsx`
-- `Cascade/app-overlays/screenpipe-app-tauri/lib/cascade-defaults.ts`
-- `Cascade/app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_commands.rs`
-- `Cascade/pipes/cascade-rewind-qa/pipe.md`
-- `Cascade/crates/cascade-schema/src/lib.rs`
-- `Cascade/crates/cascade-schema/migrations/0001_init.sql`
-- `Cascade/scripts/apply-patches.sh`, `refresh-from-upstream.sh`, `overlay.sh`, `build-macos.sh`
-- `Cascade/.github/workflows/ci.yml`, `release-macos.yml`
+**Blocked on user inputs:**
+- ⏳ **Apple Developer ID** — needed for signed DMG + TCC permission persistence. Add as GH repo secrets: `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `KEYCHAIN_PASSWORD`, `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+- ⏳ **Anthropic API key** — for dev-time E2E of the Q&A pipe (Cascade is BYOK so this isn't a deploy blocker, but you need one to *test*).
+- ⏳ **Release hosting** for M5 auto-update — S3/CloudFront or GitHub Releases endpoint for the Tauri updater manifest.
+- ⏳ **Branding assets** — `app-overlays/.../public/branding/` is empty; need Cascade logo + tray icon + DMG background. Until then, builds keep Screenpipe icons.
+
+**Next concrete steps when resuming:**
+1. `cd vendor/screenpipe/apps/screenpipe-app-tauri && bun install` to confirm deps resolve, then `./scripts/apply-patches.sh && ./scripts/overlay.sh`.
+2. Run `./scripts/build-macos.sh` unsigned and verify DMG opens, app says "Cascade" in dock, tray icon present.
+3. Resolve remaining M0 gate items (2: sqlite-vec wiring, 3: raw_sql endpoint, 4: baseline perf, 5: signing).
+4. Wire `cascade-onboarding.tsx` into the actual `app/onboarding/page.tsx` route.
+5. End-to-end test the Q&A pipe with a real Anthropic key.
