@@ -1,0 +1,160 @@
+Index: screenpipe/apps/screenpipe-app-tauri/app/globals.css
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/app/globals.css
++++ screenpipe/apps/screenpipe-app-tauri/app/globals.css
+@@ -1,3 +1,7 @@
++/* Cascade visual identity — fonts loaded via @import; for offline-first we
++ * fall back to system fonts. Native font shipped via Tauri assets later. */
++@import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;450;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap');
++
+ @tailwind base;
+ @tailwind components;
+ @tailwind utilities;
+@@ -199,11 +203,88 @@
+   }
+ }
+ 
++/* ─────────────────────────────────────────────────────────────────────────
++ * Cascade visual identity — moss & ink palette + editorial typography.
++ * Overrides Screenpipe's B&W tokens with HSL-format Cascade equivalents so
++ * existing Tailwind components reskin automatically. Cascade-only OKLCH
++ * tokens live in `--cascade-*` for new editorial components.
++ * ─────────────────────────────────────────────────────────────────────── */
++@layer base {
++  /* HSL overrides for both themes — dark first since Cascade defaults dark */
++  .dark, [data-theme="dark"] {
++    --background: 140 6% 12%;
++    --foreground: 100 5% 96%;
++    --surface: 140 7% 16%;
++    --surface-secondary: 140 8% 19%;
++    --surface-tertiary: 140 9% 22%;
++    --card: 140 7% 16%;
++    --card-foreground: 100 5% 96%;
++    --card-hover: 140 8% 19%;
++    --popover: 140 7% 16%;
++    --popover-foreground: 100 5% 96%;
++    --primary: 100 5% 96%;
++    --primary-foreground: 140 8% 12%;
++    --primary-hover: 100 5% 88%;
++    --primary-muted: 140 8% 22%;
++    --secondary: 140 7% 16%;
++    --secondary-foreground: 100 5% 96%;
++    --secondary-hover: 140 8% 19%;
++    --muted: 140 7% 18%;
++    --muted-foreground: 100 4% 65%;
++    --accent: 55 18% 64%;
++    --accent-foreground: 140 8% 12%;
++    --accent-hover: 55 22% 56%;
++    --border: 140 9% 25%;
++    --input: 140 9% 25%;
++    --input-focus: 55 18% 64%;
++    --ring: 55 18% 64%;
++    --sidebar-background: 140 7% 14%;
++    --sidebar-foreground: 100 5% 96%;
++    --sidebar-primary: 55 18% 64%;
++    --sidebar-primary-foreground: 140 8% 12%;
++    --sidebar-accent: 140 8% 19%;
++    --sidebar-accent-foreground: 100 5% 96%;
++    --sidebar-border: 140 9% 25%;
++    --sidebar-ring: 55 18% 64%;
++  }
++
++  /* Cascade-specific OKLCH tokens — for editorial components we build */
++  :root {
++    --cascade-bg:           oklch(0.155 0.008 140);
++    --cascade-panel:        oklch(0.200 0.010 140);
++    --cascade-panel-2:      oklch(0.240 0.011 140);
++    --cascade-panel-3:      oklch(0.280 0.012 140);
++    --cascade-border:       oklch(0.310 0.012 140);
++    --cascade-border-hi:    oklch(0.405 0.014 140);
++    --cascade-text:         oklch(0.965 0.006 100);
++    --cascade-text-2:       oklch(0.755 0.010 100);
++    --cascade-text-3:       oklch(0.560 0.012 110);
++    --cascade-text-4:       oklch(0.405 0.012 110);
++    --cascade-accent:       oklch(0.78 0.10 55);
++    --cascade-accent-2:     oklch(0.60 0.13 45);
++    --cascade-accent-warm:  oklch(0.78 0.10 30);
++    --cascade-on-accent:    oklch(0.18 0.05 55);
++
++    --cascade-rec-bg:       oklch(0.24 0.045 30 / 0.4);
++    --cascade-rec-border:   oklch(0.45 0.085 30 / 0.5);
++    --cascade-rec-text:     oklch(0.84 0.085 35);
++    --cascade-rec-dot:      oklch(0.70 0.16 30);
++
++    --cascade-wallpaper:    radial-gradient(ellipse at 14% 6%, oklch(0.28 0.07 50 / 0.45), transparent 55%),
++                            radial-gradient(ellipse at 88% 94%, oklch(0.24 0.06 25 / 0.4), transparent 55%),
++                            oklch(0.108 0.008 60);
++
++    --cascade-sans:  'Inter Tight', -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
++    --cascade-serif: 'Instrument Serif', 'Times New Roman', serif;
++    --cascade-mono:  'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
++  }
++}
++
+ @layer base {
+   * {
+     @apply border-border;
+   }
+-  
++
+   /* Prevent flash during theme initialization and support transparency */
+   html {
+     background-color: hsl(var(--background));
+@@ -212,6 +293,13 @@
+ 
+   body {
+     @apply bg-background text-foreground !pointer-events-auto !overscroll-none;
++    font-family: var(--cascade-sans);
++  }
++
++  /* Dark mode body wallpaper — Cascade midnight gradient */
++  .dark body,
++  [data-theme="dark"] body {
++    background: var(--cascade-wallpaper);
+   }
+ 
+   /* When translucent sidebar is enabled on macOS, the OS handles the background */
+Index: screenpipe/apps/screenpipe-app-tauri/app/layout.tsx
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/app/layout.tsx
++++ screenpipe/apps/screenpipe-app-tauri/app/layout.tsx
+@@ -313,19 +313,16 @@ export default function RootLayout({
+           dangerouslySetInnerHTML={{
+             __html: `
+               (function() {
+-                // Apply theme to prevent flash and ensure sidebar/main content consistency.
+-                // Priority: stored preference > system preference
++                // Cascade defaults to dark. Stored preference still wins so the
++                // user can opt into light mode later.
+                 try {
+                   var theme = localStorage.getItem('screenpipe-ui-theme');
+                   if (!theme || theme === 'system') {
+-                    // No preference or 'system' mode: detect system preference for consistent startup
+-                    theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
++                    theme = 'dark';
+                   }
+                   document.documentElement.classList.add(theme);
+                 } catch (e) {
+-                  // localStorage unavailable, detect system preference as fallback
+-                  var systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+-                  document.documentElement.classList.add(systemTheme);
++                  document.documentElement.classList.add('dark');
+                 }
+ 
+                 // Crash recovery: if React fails to render, the page stays blank.
+Index: screenpipe/apps/screenpipe-app-tauri/tailwind.config.ts
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/tailwind.config.ts
++++ screenpipe/apps/screenpipe-app-tauri/tailwind.config.ts
+@@ -18,8 +18,9 @@ module.exports = {
+ 	  },
+ 	  extend: {
+ 		fontFamily: {
+-		  /* Screenpipe Brand: Monospace primary */
+-		  sans: ["JetBrains Mono", "SF Mono", "IBM Plex Mono", "ui-monospace", "monospace"],
++		  /* Cascade visual identity — editorial sans body, serif for headlines */
++		  sans: ["Inter Tight", "-apple-system", "BlinkMacSystemFont", "SF Pro Display", "system-ui", "sans-serif"],
++		  serif: ["Instrument Serif", "Times New Roman", "serif"],
+ 		  mono: ["JetBrains Mono", "SF Mono", "IBM Plex Mono", "ui-monospace", "monospace"],
+ 		},
+ 		colors: {
