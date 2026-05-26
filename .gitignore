@@ -1,0 +1,56 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / Bun
+node_modules/
+.pnp
+.pnp.js
+.next/
+out/
+dist/
+.turbo/
+bun.lockb.bak
+
+# Tauri
+src-tauri/target/
+src-tauri/Cargo.lock.bak
+src-tauri/gen/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# Build artifacts
+*.dmg
+*.app
+*.pkg
+release/
+build/
+
+# Logs
+*.log
+logs/
+
+# Quilt internals
+.pc/
+
+# Patches: applied series state (the patch files themselves ARE tracked)
+patches/.applied
