@@ -27,23 +27,47 @@ import { CascadeTitlebar } from "@/components/cascade-titlebar";
 export function CascadeReel() {
   const [frames, setFrames] = useState<CascadeFrame[]>([]);
   const [loading, setLoading] = useState(true);
-  const [time, setTime] = useState<number>(() => {
-    const n = new Date();
-    return n.getHours() * 60 + n.getMinutes() + n.getSeconds() / 60;
-  });
-  const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState<"0.5×" | "1×" | "2×" | "8×">("1×");
   const [nowTick, setNowTick] = useState<number>(() => {
     const n = new Date();
     return n.getHours() * 60 + n.getMinutes() + n.getSeconds() / 60;
   });
+  // Auto-follow "now" by default — the time displayed is the live clock.
+  // Any manual interaction (scrub, play, prev/next) breaks autofollow until
+  // user clicks "LIVE" / "Jump to now" to re-engage.
+  const [autoFollow, setAutoFollow] = useState(true);
+  const [manualTime, setManualTime] = useState<number>(() => {
+    const n = new Date();
+    return n.getHours() * 60 + n.getMinutes() + n.getSeconds() / 60;
+  });
+  const time = autoFollow ? nowTick : manualTime;
+  const setTime = (t: number | ((p: number) => number)) => {
+    setAutoFollow(false);
+    setManualTime((prev) => (typeof t === "function" ? (t as (p: number) => number)(prev) : t));
+  };
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState<"0.5×" | "1×" | "2×" | "8×">("1×");
 
-  // Keep nowTick fresh every second so the timeline end advances smoothly
+  // Keep nowTick fresh every second so the timeline end + playhead (in
+  // autoFollow mode) advance smoothly.
   useEffect(() => {
     const id = setInterval(() => {
       const n = new Date();
       setNowTick(n.getHours() * 60 + n.getMinutes() + n.getSeconds() / 60);
     }, 1_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Periodically refetch frames so new captures appear in the live timeline.
+  // Every 30s — light enough not to thrash the API, fresh enough to feel live.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      fetchOcrFrames({ startTime: start, endTime: end, limit: 2000 }).then((f) => {
+        setFrames(f);
+      });
+    }, 30_000);
     return () => clearInterval(id);
   }, []);
 
@@ -206,7 +230,7 @@ export function CascadeReel() {
                   boxShadow: currentSeg?.app ? `0 0 10px ${segColor}` : "none",
                 }}
               />
-              {appDisplayName(currentSeg?.app ?? null)}
+              {appDisplayName(currentSeg?.app ?? currentFrame?.app_name ?? null)}
             </span>
           </div>
         </div>
@@ -279,12 +303,25 @@ export function CascadeReel() {
         <Transport
           time={time}
           playing={playing}
-          onPlay={() => setPlaying(!playing)}
+          onPlay={() => {
+            // Starting playback breaks autofollow; seed manualTime at current
+            // displayed time so playback continues from where the user sees.
+            if (!playing) {
+              setManualTime(time);
+              setAutoFollow(false);
+            }
+            setPlaying(!playing);
+          }}
           onScrub={setTime}
           speed={speed}
           onSpeed={setSpeed}
           dayStart={dayStart}
           dayEnd={dayEnd}
+          autoFollow={autoFollow}
+          onJumpToNow={() => {
+            setAutoFollow(true);
+            setPlaying(false);
+          }}
         />
 
         <FullTimeline
@@ -526,6 +563,8 @@ function Transport({
   onSpeed,
   dayStart,
   dayEnd,
+  autoFollow,
+  onJumpToNow,
 }: {
   time: number;
   playing: boolean;
@@ -535,6 +574,8 @@ function Transport({
   onSpeed: (s: "0.5×" | "1×" | "2×" | "8×") => void;
   dayStart: number;
   dayEnd: number;
+  autoFollow: boolean;
+  onJumpToNow: () => void;
 }) {
   return (
     <div
@@ -587,6 +628,54 @@ function Transport({
         <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-3)", letterSpacing: 0.5 }}>
           / {minToHHMMSS(dayEnd)}
         </span>
+        {autoFollow ? (
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+              padding: "2px 7px 2px 6px",
+              borderRadius: 999,
+              background: "oklch(0.30 0.060 60)",
+              border: "1px solid oklch(0.46 0.095 55)",
+              fontFamily: "var(--cascade-mono)",
+              fontSize: 9.5,
+              color: "oklch(0.82 0.12 65)",
+              letterSpacing: 0.5,
+              marginLeft: 4,
+            }}
+          >
+            <span
+              style={{
+                width: 5,
+                height: 5,
+                borderRadius: "50%",
+                background: "oklch(0.74 0.18 145)",
+                boxShadow: "0 0 6px oklch(0.74 0.18 145)",
+              }}
+            />
+            LIVE
+          </span>
+        ) : (
+          <button
+            onClick={onJumpToNow}
+            title="Jump back to now"
+            style={{
+              padding: "2px 8px",
+              borderRadius: 999,
+              background: "transparent",
+              border: "1px solid var(--cascade-border)",
+              fontFamily: "var(--cascade-mono)",
+              fontSize: 9.5,
+              color: "var(--cascade-text-3)",
+              letterSpacing: 0.4,
+              cursor: "pointer",
+              marginLeft: 4,
+            }}
+          >
+            ↓ NOW
+          </button>
+        )}
       </div>
 
       <div style={{ display: "flex", gap: 2 }}>
@@ -1241,6 +1330,62 @@ function SceneChatPanel({
  * Key is stored in localStorage under `cascade-anthropic-key`. Stored from
  * Settings (or onboarding once that's wired in M3 follow-up).
  */
+/**
+ * Cascade Q&A system prompt — tight guardrails from the architecture spec.
+ * Mirrors pipes/cascade-rewind-qa/pipe.md so behavior is consistent whether
+ * the agent is invoked via Screenpipe's pi runtime or directly from the Reel
+ * chat panel.
+ */
+const CASCADE_SYSTEM_PROMPT = `You are Cascade. You have read-only access to one moment of the user's recorded workday (provided in MOMENT METADATA + OCR TEXT below). Your job is to answer the user's exact question briefly, with cited evidence.
+
+HARD RULES — NEVER VIOLATE:
+1. Never fabricate timestamps, app names, file names, or quotes. If the provided context doesn't contain enough information, say so plainly.
+2. No psychological judgments. Forbidden phrasings: "you seemed unfocused", "you wasted time", "you were distracted", "you should have", "you procrastinated". Describe data, not the user.
+3. Retrospective only — never generative. Refuse to write emails, draft replies, compose messages, or take forward-looking actions. If asked, redirect: "I only answer about what you've already done."
+4. No fishing. Refuse questions about other people's screens or anything not derivable from this moment.
+5. No PII echoing. If OCR text contains anything that looks like a password, API key, credit card, or token, do not include it. Say "[sensitive content detected, hidden]" if relevant.
+
+ANSWER SHAPE:
+- Lead with the direct answer in ONE sentence. No preamble. No "Let me", "I'll", "Based on", "Looking at", "Sure".
+- Then up to 3 short bullet points of supporting evidence, each citing a timestamp like (2:34 PM) or the app/window context.
+- Maximum 6 lines total. Stop when the question is answered.
+- Citations format: (HH:MMam/pm, AppName · window detail).
+- Don't end with "Want me to dig deeper?" or "Anything else?". User asks follow-ups if needed.
+- Never use markdown bold (**...**) anywhere in the answer. Plain text only.
+
+REFUSALS:
+- Zero evidence: "I don't see evidence of that in this moment."
+- Out of scope: "I only have what was on your screen at this captured moment."
+- Generative request: "I only answer about what you've already done — I don't compose or send."`;
+
+/**
+ * Defensive PII redaction before sending OCR to Claude. Removes obvious
+ * password / token / card patterns. Not exhaustive — entropy-based detection
+ * is a follow-up. Better to over-redact than leak.
+ */
+function redactPII(text: string): string {
+  if (!text) return text;
+  return text
+    // Anthropic + OpenAI-style API keys
+    .replace(/sk-[a-zA-Z0-9_-]{20,}/g, "[REDACTED_API_KEY]")
+    .replace(/sk-ant-[a-zA-Z0-9_-]{20,}/g, "[REDACTED_API_KEY]")
+    // GitHub PATs
+    .replace(/gh[opsu]_[a-zA-Z0-9]{36,}/g, "[REDACTED_GH_TOKEN]")
+    // AWS access keys
+    .replace(/AKIA[0-9A-Z]{16}/g, "[REDACTED_AWS_KEY]")
+    // JWTs
+    .replace(/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED_JWT]")
+    // Credit card patterns (Luhn not enforced, but 13-19 digits with separators)
+    .replace(/\b(?:\d[ -]?){13,19}\b/g, (m) => {
+      const digits = m.replace(/\D/g, "");
+      return digits.length >= 13 && digits.length <= 19 ? "[REDACTED_CARD]" : m;
+    })
+    // Bearer tokens
+    .replace(/Bearer\s+[a-zA-Z0-9_.-]{20,}/gi, "Bearer [REDACTED]")
+    // Password labels like "password: secret123"
+    .replace(/(password|passwd|pwd|secret)\s*[:=]\s*\S+/gi, "$1: [REDACTED]");
+}
+
 async function askClaude(question: string, frame: CascadeFrame | null): Promise<string> {
   const key =
     (typeof window !== "undefined" && (window.localStorage.getItem("cascade-anthropic-key") ?? "")) || "";
@@ -1248,15 +1393,22 @@ async function askClaude(question: string, frame: CascadeFrame | null): Promise<
     return "I need an Anthropic API key to answer. Add one in Settings (key starts with sk-ant-).";
   }
 
+  // Redact PII patterns before sending OCR to Claude. Defensive — even though
+  // the user trusts their own key, OCR text may include passwords, API keys,
+  // credit cards, tokens.
+  const safeText = redactPII(frame?.text ?? "").slice(0, 4000);
+
   const context = frame
-    ? `Context from the user's screen at ${new Date(frame.timestamp).toLocaleString()}:
-App: ${frame.app_name ?? "unknown"}
-Window: ${frame.window_name ?? "unknown"}
-OCR text on screen:
+    ? `MOMENT METADATA
+- timestamp: ${new Date(frame.timestamp).toLocaleString()}
+- app: ${frame.app_name ?? "unknown"}
+- window: ${frame.window_name ?? "unknown"}
+
+OCR TEXT (verbatim from screen, may contain noise):
 """
-${frame.text.slice(0, 4000)}
+${safeText || "(no text captured)"}
 """`
-    : "(no specific frame context — answering from general knowledge)";
+    : "(no specific frame is selected — answer from general knowledge of recording behavior, or ask the user to scrub to a moment)";
 
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -1268,10 +1420,9 @@ ${frame.text.slice(0, 4000)}
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 800,
-      system:
-        "You are Cascade, the user's personal workday memory. You answer questions about what they were doing based on the screen capture context provided. Be concise (2-4 sentences). Cite the timestamp and app when relevant. Never fabricate — if context is insufficient, say so plainly.",
-      messages: [{ role: "user", content: `${context}\n\nQuestion: ${question}` }],
+      max_tokens: 500,
+      system: CASCADE_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: `${context}\n\nQUESTION: ${question}` }],
     }),
   });
   if (!r.ok) {

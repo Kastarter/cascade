@@ -10,6 +10,7 @@
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { CascadeVault } from "@/components/cascade-vault";
+import { CascadeThrottle } from "@/components/cascade-throttle";
 
 export function CascadeTitlebar() {
   const [tick, setTick] = useState(0);
@@ -17,7 +18,9 @@ export function CascadeTitlebar() {
   const [now, setNow] = useState<Date>(new Date());
   const router = useRouter();
   const pathname = usePathname();
-  const onTodayRoute = pathname === "/today";
+  const onCascadesRoute = pathname === "/cascades" || pathname === "/today";
+  const onManagerRoute = pathname === "/manager";
+  const onReelRoute = !onCascadesRoute && !onManagerRoute;
 
   useEffect(() => {
     const idA = setInterval(() => setTick((x) => x + 1), 1200);
@@ -55,7 +58,7 @@ export function CascadeTitlebar() {
           <span style={{ color: "var(--cascade-text)", fontSize: 13, fontWeight: 500 }}>Cascade</span>
         </div>
 
-        {/* Segmented view switcher — center. Today disabled for now (Phase C). */}
+        {/* Segmented view switcher — center. */}
         <div
           style={{
             position: "absolute",
@@ -70,16 +73,22 @@ export function CascadeTitlebar() {
           }}
         >
           <button
-            style={switcherBtn(!onTodayRoute)}
+            style={switcherBtn(onReelRoute)}
             onClick={() => router.push("/home")}
           >
             Reel
           </button>
           <button
-            style={switcherBtn(onTodayRoute)}
-            onClick={() => router.push("/today")}
+            style={switcherBtn(onCascadesRoute)}
+            onClick={() => router.push("/cascades")}
           >
-            Today
+            Cascades
+          </button>
+          <button
+            style={switcherBtn(onManagerRoute)}
+            onClick={() => router.push("/manager")}
+          >
+            Manager
           </button>
         </div>
 
@@ -103,6 +112,8 @@ export function CascadeTitlebar() {
       </div>
 
       <CascadeVault open={vaultOpen} onClose={() => setVaultOpen(false)} />
+      {/* Production throttle runs continuously while the app is open. */}
+      <CascadeThrottle />
     </>
   );
 }

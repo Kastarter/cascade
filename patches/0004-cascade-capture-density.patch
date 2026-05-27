@@ -1,0 +1,18 @@
+Index: screenpipe/crates/screenpipe-engine/src/event_driven_capture.rs
+===================================================================
+--- screenpipe.orig/crates/screenpipe-engine/src/event_driven_capture.rs
++++ screenpipe/crates/screenpipe-engine/src/event_driven_capture.rs
+@@ -197,7 +197,12 @@ impl Default for EventDrivenCaptureConfi
+     fn default() -> Self {
+         Self {
+             min_capture_interval_ms: 200,
+-            idle_capture_interval_ms: 30_000, // 30 seconds
++            // cascade: lowered from upstream 30s → 15s for production
++            // (~4 idle captures/min floor). Dedup still suppresses identical
++            // frames so disk impact at 14-day retention is modest (~2–4 GB
++            // steady-state); CascadeThrottle pauses recording at the quota
++            // boundary regardless.
++            idle_capture_interval_ms: 15_000,
+             jpeg_quality: 80,
+             capture_on_click: true,
+             capture_on_keystroke: false,

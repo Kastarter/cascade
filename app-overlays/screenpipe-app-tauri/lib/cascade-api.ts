@@ -43,7 +43,9 @@ export async function fetchOcrFrames(opts: {
   appName?: string;
 }): Promise<CascadeFrame[]> {
   const params = new URLSearchParams({
-    content_type: "ocr",
+    // 'all' gives denser timeline density vs 'ocr' which only returns frames
+    // with detected text. Non-OCR frames still have app_name + window metadata.
+    content_type: "all",
     limit: String(opts.limit ?? 100),
   });
   if (opts.startTime) params.set("start_time", opts.startTime.toISOString());
@@ -176,7 +178,7 @@ export function appColor(app: string | null): string {
 }
 
 export function appDisplayName(app: string | null): string {
-  if (!app) return "Paused";
+  if (!app) return "—";
   return APP_COLORS[app]?.name ?? app;
 }
 
