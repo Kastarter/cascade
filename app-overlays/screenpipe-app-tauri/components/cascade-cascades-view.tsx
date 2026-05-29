@@ -3,52 +3,56 @@
 //
 // CascadesView — employee-facing inbox for fix-agents cascaded from a manager.
 //
-// Mirrors the 4-stage agent lifecycle from the architecture spec:
-//   1. Review the spec   — what the agent does, what it touches, when it fires
-//   2. Sandbox test       — dry-run against synthetic / historical data, no real tool calls
-//   3. Approve            — explicit employee + manager dual approval to deploy
-//   4. Monitor / rollback — running agents with audit log, pause, undo
+// Drives the real Agent #4 lifecycle over generated specs (Agent #3 output):
+//   1. Review    — the structured spec: what it does, what it touches, how to undo
+//   2. Sandbox   — dry-run against recent sanitized activity, all tools mocked,
+//                  anomaly detection on the result
+//   3. Running   — installed agents, with an immutable audit log + pause/uninstall
+//   4. History   — declined / failed, kept for the audit trail
 //
-// This keeps Agent #3 (Generator) and Agent #4 (Deployment Monitor) visually
-// separated — the user can see at a glance which stage each cascade is in
-// rather than collapsing everything into one "install/decline" toggle.
+// Nothing runs against real data until BOTH the manager and the employee
+// approve AND the sandbox test passes.
 
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
 import {
-  CascadeManagerSuggestion,
-  listManagerSuggestions,
-  updateManagerSuggestionStatus,
-} from "@/lib/cascade-manager";
+  CascadeAgentRun,
+  CascadeAgentSpecView,
+  CascadeAuditEntry,
+  listAgentRuns,
+  listAgentSpecs,
+  listAudit,
+  sandboxTest,
+  transitionAgentSpec,
+} from "@/lib/cascade-agents";
 
 type Stage = "review" | "sandbox" | "running" | "history";
 
-const STAGE_FROM_STATUS: Record<string, Stage | null> = {
-  sent: "review",
-  reviewing: "review",
+const STAGE_FROM_STATUS: Record<string, Stage> = {
+  review: "review",
+  generated: "review",
   sandbox_passed: "sandbox",
-  approved: "sandbox", // ready to install
+  sandbox_failed: "sandbox",
+  approved: "sandbox",
   deployed: "running",
   paused: "running",
   rejected: "history",
-  rolled_back: "history",
 };
 
 export function CascadesView() {
-  const [suggestions, setSuggestions] = useState<CascadeManagerSuggestion[]>([]);
+  const [specs, setSpecs] = useState<CascadeAgentSpecView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [note, setNote] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    setLoading(true);
     setError(null);
     try {
-      // No status filter — we partition client-side by lifecycle stage.
-      const items = await listManagerSuggestions({ limit: 100 });
-      setSuggestions(items);
+      const items = await listAgentSpecs(100);
+      setSpecs(items);
     } catch (e: any) {
       setError(String(e?.message ?? e));
     } finally {
@@ -62,32 +66,55 @@ export function CascadesView() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Partition cascades by lifecycle stage
   const buckets = useMemo(() => {
-    const map: Record<Stage, CascadeManagerSuggestion[]> = {
+    const map: Record<Stage, CascadeAgentSpecView[]> = {
       review: [],
       sandbox: [],
       running: [],
       history: [],
     };
-    for (const s of suggestions) {
-      const stage = STAGE_FROM_STATUS[s.status] ?? null;
-      if (stage) map[stage].push(s);
+    for (const s of specs) {
+      const stage = STAGE_FROM_STATUS[s.status] ?? "history";
+      map[stage].push(s);
     }
     return map;
-  }, [suggestions]);
+  }, [specs]);
 
-  const transition = async (id: number, next: "approved" | "deployed" | "rejected") => {
-    setBusyId(id);
-    try {
-      await updateManagerSuggestionStatus(id, next);
-      await refresh();
-    } catch (e) {
-      console.error("cascade transition failed", e);
-    } finally {
-      setBusyId(null);
-    }
-  };
+  const run = useCallback(
+    async (id: number, fn: () => Promise<unknown>, ok: string) => {
+      setBusyId(id);
+      setError(null);
+      try {
+        await fn();
+        await refresh();
+        setNote(ok);
+      } catch (e: any) {
+        setError(String(e?.message ?? e));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [refresh],
+  );
+
+  const onSandbox = (s: CascadeAgentSpecView) =>
+    run(s.id, () => sandboxTest(s.id), `Sandbox test finished for “${s.name}”`);
+  const onInstall = (s: CascadeAgentSpecView) =>
+    run(
+      s.id,
+      async () => {
+        await transitionAgentSpec(s.id, "approve_employee");
+        await transitionAgentSpec(s.id, "deploy");
+      },
+      `“${s.name}” is now running on this Mac`,
+    );
+  const onDecline = (s: CascadeAgentSpecView) =>
+    run(s.id, () => transitionAgentSpec(s.id, "reject"), `Declined “${s.name}”`);
+  const onPause = (s: CascadeAgentSpecView) =>
+    run(s.id, () => transitionAgentSpec(s.id, s.status === "paused" ? "resume" : "pause"),
+      s.status === "paused" ? `Resumed “${s.name}”` : `Paused “${s.name}”`);
+  const onUninstall = (s: CascadeAgentSpecView) =>
+    run(s.id, () => transitionAgentSpec(s.id, "reject"), `Uninstalled “${s.name}”`);
 
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
@@ -104,7 +131,6 @@ export function CascadesView() {
           fontFamily: "var(--cascade-sans)",
         }}
       >
-        {/* HERO */}
         <div style={{ marginBottom: 32 }}>
           <div style={labelStyle}>Cascades · sent your way</div>
           <h1
@@ -120,39 +146,31 @@ export function CascadesView() {
             <span style={{ fontStyle: "italic" }}>Helpers</span> from your manager —{" "}
             <span style={{ color: "var(--cascade-text-3)" }}>review, test, then run.</span>
           </h1>
-          <p style={{ fontSize: 14, color: "var(--cascade-text-3)", lineHeight: 1.55, maxWidth: 680, margin: 0 }}>
-            Each cascade is a small AI helper proposed because a pattern was detected in the team's recorded work.
-            Nothing runs on your Mac until you approve it. You can pause or roll back any cascade at any time.
+          <p style={{ fontSize: 14, color: "var(--cascade-text-3)", lineHeight: 1.55, maxWidth: 700, margin: 0 }}>
+            Each cascade is a small AI helper, generated from a pattern in the team's recorded work.
+            You see the full spec — every tool it can touch, every step, and how to undo it — before anything runs.
+            It only runs for real after a sandbox test passes and you approve it. Pause or uninstall anytime.
           </p>
         </div>
 
-        {error && (
-          <ErrorBanner message={error} onRetry={refresh} />
-        )}
+        {error && <ErrorBanner message={error} onRetry={refresh} />}
+        {note && <InfoBanner message={note} onClose={() => setNote(null)} />}
 
-        {loading && suggestions.length === 0 ? (
-          <EmptyState
-            headline="Loading cascades…"
-            sub="Reading the local manager suggestions table."
-          />
+        {loading && specs.length === 0 ? (
+          <EmptyState headline="Loading cascades…" sub="Reading generated agent specs from this device." />
         ) : (
           <>
             <StageSection
               title="1 · Review the spec"
-              sub="The manager has sent these. Read what they'll do, then decide whether to test."
-              cascades={buckets.review}
+              sub="Your manager generated and sent these. Read exactly what each will do, then dry-run it."
+              specs={buckets.review}
+              busyId={busyId}
               renderActions={(s) => (
                 <>
-                  <PrimaryBtn
-                    disabled={busyId === s.id}
-                    onClick={() => s.id && transition(s.id, "approved")}
-                  >
-                    Looks good · test it
+                  <PrimaryBtn disabled={busyId === s.id} onClick={() => onSandbox(s)}>
+                    {busyId === s.id ? "Testing…" : "Run sandbox test"}
                   </PrimaryBtn>
-                  <GhostBtn
-                    disabled={busyId === s.id}
-                    onClick={() => s.id && transition(s.id, "rejected")}
-                  >
+                  <GhostBtn disabled={busyId === s.id} onClick={() => onDecline(s)}>
                     Decline
                   </GhostBtn>
                 </>
@@ -160,40 +178,44 @@ export function CascadesView() {
             />
 
             <StageSection
-              title="2 · Sandbox test"
-              sub="Cascade dry-runs the helper against your last 30 days with all external tool calls mocked. No real emails sent, no real changes made. Confirm the output looks right, then install."
-              cascades={buckets.sandbox}
-              renderActions={(s) => (
-                <>
-                  <PrimaryBtn
-                    disabled={busyId === s.id}
-                    onClick={() => s.id && transition(s.id, "deployed")}
-                  >
-                    Install & run for real
-                  </PrimaryBtn>
-                  <GhostBtn
-                    disabled={busyId === s.id}
-                    onClick={() => s.id && transition(s.id, "rejected")}
-                  >
-                    Decline
-                  </GhostBtn>
-                </>
-              )}
+              title="2 · Sandbox result"
+              sub="Cascade dry-ran the helper against your recent sanitized activity with every external tool mocked — no real emails, no real changes. Review what it would have done, then install."
+              specs={buckets.sandbox}
+              busyId={busyId}
+              renderActions={(s) =>
+                s.status === "sandbox_passed" ? (
+                  <>
+                    <PrimaryBtn disabled={busyId === s.id} onClick={() => onInstall(s)}>
+                      {busyId === s.id ? "Installing…" : "Approve & install"}
+                    </PrimaryBtn>
+                    <GhostBtn disabled={busyId === s.id} onClick={() => onDecline(s)}>
+                      Decline
+                    </GhostBtn>
+                  </>
+                ) : (
+                  <>
+                    <GhostBtn disabled={busyId === s.id} onClick={() => onSandbox(s)}>
+                      Re-test
+                    </GhostBtn>
+                    <GhostBtn disabled={busyId === s.id} onClick={() => onDecline(s)}>
+                      Decline
+                    </GhostBtn>
+                  </>
+                )
+              }
             />
 
             <StageSection
               title="3 · Running on this Mac"
-              sub="Active helpers. Each execution is audit-logged on this device. Pause anytime; rollback when supported."
-              cascades={buckets.running}
+              sub="Active helpers. Every execution is audit-logged on this device. Pause anytime; uninstall when you like."
+              specs={buckets.running}
+              busyId={busyId}
               renderActions={(s) => (
                 <>
-                  <GhostBtn disabled title="Pause is wired via Vault for now">
-                    Pause
+                  <GhostBtn disabled={busyId === s.id} onClick={() => onPause(s)}>
+                    {s.status === "paused" ? "Resume" : "Pause"}
                   </GhostBtn>
-                  <GhostBtn
-                    disabled={busyId === s.id}
-                    onClick={() => s.id && transition(s.id, "rejected")}
-                  >
+                  <GhostBtn disabled={busyId === s.id} onClick={() => onUninstall(s)}>
                     Uninstall
                   </GhostBtn>
                 </>
@@ -202,18 +224,19 @@ export function CascadesView() {
 
             <StageSection
               title="4 · History"
-              sub="Declined, rolled back, or uninstalled. Kept for your audit."
-              cascades={buckets.history}
+              sub="Declined or uninstalled. Kept for your audit."
+              specs={buckets.history}
+              busyId={busyId}
               renderActions={() => null}
               dim
             />
 
-            {Object.values(buckets).every((b) => b.length === 0) && (
+            {specs.length === 0 && (
               <EmptyState
                 headline="No cascades yet."
                 sub={
-                  "Your manager hasn't sent any helpers your way. " +
-                  "When patterns surface in the team's recorded work, you'll review them here."
+                  "Your manager hasn't generated any helpers for you. When a pattern surfaces in the team's " +
+                  "recorded work and the manager turns it into an agent, you'll review it here."
                 }
               />
             )}
@@ -224,48 +247,67 @@ export function CascadesView() {
   );
 }
 
-// ─── Subcomponents ─────────────────────────────────────────────────
+// ─── Stage section ──────────────────────────────────────────────────
 
 function StageSection({
   title,
   sub,
-  cascades,
+  specs,
+  busyId,
   renderActions,
   dim,
 }: {
   title: string;
   sub: string;
-  cascades: CascadeManagerSuggestion[];
-  renderActions: (s: CascadeManagerSuggestion) => React.ReactNode;
+  specs: CascadeAgentSpecView[];
+  busyId: number | null;
+  renderActions: (s: CascadeAgentSpecView) => React.ReactNode;
   dim?: boolean;
 }) {
-  if (cascades.length === 0) return null;
-
+  if (specs.length === 0) return null;
   return (
     <section style={{ marginBottom: 36, opacity: dim ? 0.6 : 1 }}>
       <div style={{ marginBottom: 12 }}>
         <div style={{ ...labelStyle, color: dim ? "var(--cascade-text-4)" : "var(--cascade-text-3)" }}>{title}</div>
-        <div style={{ fontSize: 13, color: "var(--cascade-text-3)", marginTop: 4, maxWidth: 720 }}>{sub}</div>
+        <div style={{ fontSize: 13, color: "var(--cascade-text-3)", marginTop: 4, maxWidth: 740 }}>{sub}</div>
       </div>
-
       <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
-        {cascades.map((s) => (
-          <CascadeCard key={s.id ?? s.title} suggestion={s} actions={renderActions(s)} />
+        {specs.map((s) => (
+          <SpecCard key={s.id} spec={s} actions={renderActions(s)} busy={busyId === s.id} />
         ))}
       </div>
     </section>
   );
 }
 
-function CascadeCard({
-  suggestion: s,
-  actions,
-}: {
-  suggestion: CascadeManagerSuggestion;
-  actions: React.ReactNode;
-}) {
-  const conf = Math.round((s.confidence ?? 0) * 100);
-  const sev = Math.round((s.severityScore ?? 0) * 100);
+// ─── Spec card ──────────────────────────────────────────────────────
+
+function SpecCard({ spec, actions }: { spec: CascadeAgentSpecView; actions: React.ReactNode; busy: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [runs, setRuns] = useState<CascadeAgentRun[]>([]);
+  const [audit, setAudit] = useState<CascadeAuditEntry[]>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [r, a] = await Promise.all([listAgentRuns(spec.id, 5), listAudit(spec.id, 12)]);
+        if (!cancelled) {
+          setRuns(r);
+          setAudit(a);
+        }
+      } catch {
+        /* non-fatal */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, spec.id, spec.status]);
+
+  const lastRun = runs[0];
+  const d = spec.spec;
 
   return (
     <article
@@ -274,113 +316,177 @@ function CascadeCard({
         border: "1px solid var(--cascade-border)",
         borderRadius: 14,
         padding: "20px 22px",
-        display: "grid",
-        gridTemplateColumns: "1fr auto",
-        gap: 20,
-        alignItems: "start",
       }}
     >
-      <div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
-          <span
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 20, alignItems: "start" }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+            <span style={agentKindStyle}>{d.tools.slice(0, 3).join(" · ") || "no external tools"}</span>
+            {spec.validationStatus === "invalid" && <Badge label="spec invalid" tone="warn" />}
+            <Badge label={`~$${spec.estCostUsd.toFixed(3)}/run`} />
+            <Badge label={`saves ~${Math.round(spec.estTimeSavedMin)}m/wk`} />
+            <Badge label={spec.status.replace(/_/g, " ")} tone={spec.status === "sandbox_failed" ? "warn" : "neutral"} />
+          </div>
+
+          <h3
             style={{
-              fontFamily: "var(--cascade-mono)",
-              fontSize: 10,
-              letterSpacing: 1.4,
-              textTransform: "uppercase",
-              color: "var(--cascade-accent)",
+              fontFamily: "var(--cascade-serif)",
+              fontSize: 22,
+              fontWeight: 400,
+              letterSpacing: -0.2,
+              margin: "0 0 8px",
             }}
           >
-            {s.suggestedAgentKind}
-          </span>
-          <Badge label={`${conf}% conf`} />
-          <Badge label={`${sev}% severity`} tone={sev >= 70 ? "warn" : "neutral"} />
+            {spec.name}
+          </h3>
+          <p style={{ fontSize: 13.5, color: "var(--cascade-text-2)", lineHeight: 1.55, margin: "0 0 6px" }}>
+            {d.taskDescription}
+          </p>
+          <p style={{ fontSize: 12.5, color: "var(--cascade-text-3)", lineHeight: 1.5, margin: 0 }}>{d.rationale}</p>
+
+          {lastRun && lastRun.anomalies.length > 0 && (
+            <div style={anomalyBoxStyle}>
+              <strong style={{ color: "oklch(0.84 0.085 35)" }}>Sandbox flagged {lastRun.anomalies.length}:</strong>{" "}
+              {lastRun.anomalies.map((a) => a.kind).join(", ")}
+            </div>
+          )}
+
+          <button onClick={() => setOpen((v) => !v)} style={discloseBtnStyle}>
+            {open ? "▾ Hide details" : "▸ Spec, sandbox run & audit"}
+          </button>
         </div>
-        <h3
-          style={{
-            fontFamily: "var(--cascade-serif)",
-            fontSize: 22,
-            fontWeight: 400,
-            letterSpacing: -0.2,
-            margin: "0 0 8px",
-            color: "var(--cascade-text)",
-          }}
-        >
-          {s.title}
-        </h3>
-        <p style={{ fontSize: 13.5, color: "var(--cascade-text-2)", lineHeight: 1.55, margin: "0 0 12px" }}>
-          {s.summary}
-        </p>
 
-        {s.evidence && s.evidence.length > 0 && (
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 6,
-              marginTop: 10,
-              paddingTop: 10,
-              borderTop: "1px dashed var(--cascade-border)",
-            }}
-          >
-            {s.evidence.slice(0, 6).map((e, i) => (
-              <span
-                key={i}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "baseline",
-                  gap: 5,
-                  padding: "3px 9px",
-                  borderRadius: 6,
-                  background: "var(--cascade-panel-2)",
-                  border: "1px solid var(--cascade-border)",
-                  fontFamily: "var(--cascade-mono)",
-                  fontSize: 10.5,
-                  color: "var(--cascade-text-3)",
-                }}
-              >
-                <span style={{ opacity: 0.7 }}>{e.label}</span>
-                <strong style={{ color: "var(--cascade-text-2)", fontWeight: 500 }}>{e.value}</strong>
-              </span>
-            ))}
-          </div>
-        )}
-
-        {s.createdAt && (
-          <div
-            style={{
-              fontFamily: "var(--cascade-mono)",
-              fontSize: 10,
-              color: "var(--cascade-text-4)",
-              marginTop: 10,
-              letterSpacing: 0.4,
-            }}
-          >
-            {new Date(s.createdAt).toLocaleString()}
-          </div>
-        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "stretch", minWidth: 150 }}>
+          {actions}
+        </div>
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "stretch" }}>{actions}</div>
+      {open && <SpecDetails spec={spec} lastRun={lastRun} audit={audit} />}
     </article>
   );
 }
 
+function SpecDetails({
+  spec,
+  lastRun,
+  audit,
+}: {
+  spec: CascadeAgentSpecView;
+  lastRun?: CascadeAgentRun;
+  audit: CascadeAuditEntry[];
+}) {
+  const d = spec.spec;
+  return (
+    <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px dashed var(--cascade-border)", display: "grid", gap: 16 }}>
+      {spec.validationNotes && (
+        <div style={anomalyBoxStyle}>
+          <strong style={{ color: "oklch(0.84 0.085 35)" }}>Validation notes:</strong> {spec.validationNotes}
+        </div>
+      )}
+
+      <DetailBlock title="Workflow">
+        <ol style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 4 }}>
+          {d.workflow.map((w) => (
+            <li key={w.step} style={{ fontSize: 12.5, color: "var(--cascade-text-2)", lineHeight: 1.5 }}>
+              {w.action}
+              {w.approvalRequired && <span style={pillStyle}>needs approval</span>}
+              {w.decisionPoint && (
+                <span style={{ color: "var(--cascade-text-4)" }}> · if: {w.decisionPoint}</span>
+              )}
+            </li>
+          ))}
+        </ol>
+      </DetailBlock>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <DetailBlock title="Tools it may use">
+          <ChipList items={d.tools} empty="none" />
+        </DetailBlock>
+        <DetailBlock title="Reads">
+          <ChipList items={d.requiredInputs.map((i) => i.source)} empty="nothing" />
+        </DetailBlock>
+        <DetailBlock title="Approval points">
+          <ChipList items={d.approvalPoints} empty="none required" />
+        </DetailBlock>
+        <DetailBlock title="Fails if">
+          <ChipList items={d.failureConditions} empty="—" />
+        </DetailBlock>
+      </div>
+
+      <DetailBlock title="How to undo (rollback)">
+        <div style={{ fontSize: 12.5, color: "var(--cascade-text-2)", lineHeight: 1.5 }}>{d.rollbackPath}</div>
+      </DetailBlock>
+
+      {lastRun && (
+        <DetailBlock title={`Last sandbox run · ${lastRun.status}`}>
+          <div style={{ fontSize: 12.5, color: "var(--cascade-text-2)", lineHeight: 1.5, marginBottom: 8 }}>
+            {lastRun.summary}
+          </div>
+          <div style={{ display: "grid", gap: 5 }}>
+            {lastRun.steps.map((s) => (
+              <div key={s.step} style={{ fontFamily: "var(--cascade-mono)", fontSize: 11, color: "var(--cascade-text-3)" }}>
+                <span style={{ color: "var(--cascade-accent)" }}>{s.tool || "step"}</span> — {s.action}
+                {s.mockedResult && <span style={{ color: "var(--cascade-text-4)" }}> → {s.mockedResult}</span>}
+              </div>
+            ))}
+          </div>
+        </DetailBlock>
+      )}
+
+      {audit.length > 0 && (
+        <DetailBlock title="Audit log (immutable)">
+          <div style={{ display: "grid", gap: 4 }}>
+            {audit.map((a) => (
+              <div key={a.id} style={{ fontFamily: "var(--cascade-mono)", fontSize: 10.5, color: "var(--cascade-text-4)" }}>
+                {new Date(a.createdAt).toLocaleString()} · <span style={{ color: "var(--cascade-text-3)" }}>{a.actor}</span> · {a.action}
+              </div>
+            ))}
+          </div>
+        </DetailBlock>
+      )}
+    </div>
+  );
+}
+
+// ─── Small UI pieces ────────────────────────────────────────────────
+
+function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div style={{ ...labelStyle, fontSize: 9.5, marginBottom: 6 }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function ChipList({ items, empty }: { items: string[]; empty: string }) {
+  if (!items || items.length === 0) {
+    return <span style={{ fontSize: 12, color: "var(--cascade-text-4)" }}>{empty}</span>;
+  }
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {items.map((t, i) => (
+        <span key={`${t}-${i}`} style={chipStyle}>
+          {t}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function Badge({ label, tone = "neutral" }: { label: string; tone?: "neutral" | "warn" }) {
-  const bg = tone === "warn" ? "oklch(0.24 0.045 30 / 0.5)" : "var(--cascade-panel)";
-  const border = tone === "warn" ? "oklch(0.45 0.085 30 / 0.6)" : "var(--cascade-border)";
-  const color = tone === "warn" ? "oklch(0.84 0.085 35)" : "var(--cascade-text-3)";
+  const warn = tone === "warn";
   return (
     <span
       style={{
         padding: "2px 8px",
         borderRadius: 999,
-        background: bg,
-        border: `1px solid ${border}`,
+        background: warn ? "oklch(0.24 0.045 30 / 0.5)" : "var(--cascade-panel)",
+        border: `1px solid ${warn ? "oklch(0.45 0.085 30 / 0.6)" : "var(--cascade-border)"}`,
         fontFamily: "var(--cascade-mono)",
         fontSize: 9.5,
         letterSpacing: 0.6,
-        color,
+        color: warn ? "oklch(0.84 0.085 35)" : "var(--cascade-text-3)",
         textTransform: "uppercase",
       }}
     >
@@ -389,26 +495,9 @@ function Badge({ label, tone = "neutral" }: { label: string; tone?: "neutral" | 
   );
 }
 
-function PrimaryBtn({ children, onClick, disabled, title }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean; title?: string }) {
+function PrimaryBtn({ children, onClick, disabled }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean }) {
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      style={{
-        padding: "9px 16px",
-        borderRadius: 7,
-        background: "var(--cascade-accent)",
-        color: "var(--cascade-on-accent)",
-        border: "none",
-        cursor: disabled ? "default" : "pointer",
-        fontFamily: "var(--cascade-sans)",
-        fontSize: 12.5,
-        fontWeight: 500,
-        opacity: disabled ? 0.5 : 1,
-        whiteSpace: "nowrap",
-      }}
-    >
+    <button onClick={onClick} disabled={disabled} style={{ ...btnBase, background: "var(--cascade-accent)", color: "var(--cascade-on-accent)", border: "none", opacity: disabled ? 0.5 : 1 }}>
       {children}
     </button>
   );
@@ -416,23 +505,7 @@ function PrimaryBtn({ children, onClick, disabled, title }: { children: React.Re
 
 function GhostBtn({ children, onClick, disabled, title }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean; title?: string }) {
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      style={{
-        padding: "9px 16px",
-        borderRadius: 7,
-        background: "var(--cascade-panel)",
-        color: "var(--cascade-text-2)",
-        border: "1px solid var(--cascade-border)",
-        cursor: disabled ? "default" : "pointer",
-        fontFamily: "var(--cascade-sans)",
-        fontSize: 12.5,
-        opacity: disabled ? 0.5 : 1,
-        whiteSpace: "nowrap",
-      }}
-    >
+    <button onClick={onClick} disabled={disabled} title={title} style={{ ...btnBase, background: "var(--cascade-panel)", color: "var(--cascade-text-2)", border: "1px solid var(--cascade-border)", opacity: disabled ? 0.5 : 1 }}>
       {children}
     </button>
   );
@@ -440,65 +513,32 @@ function GhostBtn({ children, onClick, disabled, title }: { children: React.Reac
 
 function ErrorBanner({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
-    <div
-      style={{
-        background: "oklch(0.24 0.045 30 / 0.5)",
-        border: "1px solid oklch(0.45 0.085 30 / 0.6)",
-        color: "oklch(0.84 0.085 35)",
-        padding: "12px 16px",
-        borderRadius: 9,
-        marginBottom: 24,
-        display: "flex",
-        gap: 12,
-        alignItems: "center",
-      }}
-    >
-      <span style={{ flex: 1, fontSize: 13 }}>Couldn't load cascades — {message}</span>
-      <button
-        onClick={onRetry}
-        style={{
-          padding: "6px 12px",
-          borderRadius: 6,
-          background: "transparent",
-          border: "1px solid oklch(0.45 0.085 30 / 0.6)",
-          color: "oklch(0.84 0.085 35)",
-          fontFamily: "var(--cascade-mono)",
-          fontSize: 11,
-          cursor: "pointer",
-        }}
-      >
-        Retry
-      </button>
+    <div style={bannerStyle("warn")}>
+      <span style={{ flex: 1, fontSize: 13 }}>Something went wrong — {message}</span>
+      <button onClick={onRetry} style={bannerBtnStyle}>Retry</button>
+    </div>
+  );
+}
+
+function InfoBanner({ message, onClose }: { message: string; onClose: () => void }) {
+  return (
+    <div style={bannerStyle("ok")}>
+      <span style={{ flex: 1, fontSize: 13 }}>{message}</span>
+      <button onClick={onClose} style={bannerBtnStyle}>Dismiss</button>
     </div>
   );
 }
 
 function EmptyState({ headline, sub }: { headline: string; sub: string }) {
   return (
-    <div
-      style={{
-        background: "var(--cascade-panel)",
-        border: "1px solid var(--cascade-border)",
-        borderRadius: 14,
-        padding: "44px 32px",
-        textAlign: "center",
-        color: "var(--cascade-text-3)",
-      }}
-    >
-      <div
-        style={{
-          fontFamily: "var(--cascade-serif)",
-          fontSize: 24,
-          color: "var(--cascade-text-2)",
-          marginBottom: 6,
-        }}
-      >
-        {headline}
-      </div>
+    <div style={{ background: "var(--cascade-panel)", border: "1px solid var(--cascade-border)", borderRadius: 14, padding: "44px 32px", textAlign: "center", color: "var(--cascade-text-3)" }}>
+      <div style={{ fontFamily: "var(--cascade-serif)", fontSize: 24, color: "var(--cascade-text-2)", marginBottom: 6 }}>{headline}</div>
       <div style={{ fontSize: 13.5, lineHeight: 1.5, maxWidth: 520, margin: "0 auto" }}>{sub}</div>
     </div>
   );
 }
+
+// ─── styles ─────────────────────────────────────────────────────────
 
 const labelStyle: React.CSSProperties = {
   fontFamily: "var(--cascade-mono)",
@@ -506,4 +546,93 @@ const labelStyle: React.CSSProperties = {
   letterSpacing: 1.6,
   textTransform: "uppercase",
   color: "var(--cascade-text-3)",
+};
+
+const agentKindStyle: React.CSSProperties = {
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 10,
+  letterSpacing: 1.0,
+  textTransform: "uppercase",
+  color: "var(--cascade-accent)",
+};
+
+const btnBase: React.CSSProperties = {
+  padding: "9px 16px",
+  borderRadius: 7,
+  cursor: "pointer",
+  fontFamily: "var(--cascade-sans)",
+  fontSize: 12.5,
+  fontWeight: 500,
+  whiteSpace: "nowrap",
+};
+
+const chipStyle: React.CSSProperties = {
+  padding: "3px 9px",
+  borderRadius: 6,
+  background: "var(--cascade-panel-2)",
+  border: "1px solid var(--cascade-border)",
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 10.5,
+  color: "var(--cascade-text-3)",
+};
+
+const pillStyle: React.CSSProperties = {
+  marginLeft: 8,
+  padding: "1px 6px",
+  borderRadius: 999,
+  background: "oklch(0.24 0.045 60 / 0.5)",
+  border: "1px solid var(--cascade-border)",
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 9,
+  letterSpacing: 0.5,
+  textTransform: "uppercase",
+  color: "var(--cascade-text-3)",
+};
+
+const discloseBtnStyle: React.CSSProperties = {
+  marginTop: 12,
+  background: "transparent",
+  border: "none",
+  cursor: "pointer",
+  padding: 0,
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 11,
+  letterSpacing: 0.6,
+  color: "var(--cascade-text-3)",
+};
+
+const anomalyBoxStyle: React.CSSProperties = {
+  marginTop: 10,
+  padding: "8px 12px",
+  borderRadius: 8,
+  background: "oklch(0.24 0.045 30 / 0.35)",
+  border: "1px solid oklch(0.45 0.085 30 / 0.5)",
+  fontSize: 12,
+  color: "var(--cascade-text-2)",
+};
+
+function bannerStyle(tone: "warn" | "ok"): React.CSSProperties {
+  const warn = tone === "warn";
+  return {
+    background: warn ? "oklch(0.24 0.045 30 / 0.5)" : "oklch(0.22 0.03 145 / 0.5)",
+    border: `1px solid ${warn ? "oklch(0.45 0.085 30 / 0.6)" : "oklch(0.44 0.08 145 / 0.6)"}`,
+    color: warn ? "oklch(0.84 0.085 35)" : "var(--cascade-text)",
+    padding: "12px 16px",
+    borderRadius: 9,
+    marginBottom: 20,
+    display: "flex",
+    gap: 12,
+    alignItems: "center",
+  };
+}
+
+const bannerBtnStyle: React.CSSProperties = {
+  padding: "6px 12px",
+  borderRadius: 6,
+  background: "transparent",
+  border: "1px solid currentColor",
+  color: "inherit",
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 11,
+  cursor: "pointer",
 };

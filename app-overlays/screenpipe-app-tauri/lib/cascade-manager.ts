@@ -8,11 +8,14 @@ export interface CascadeManagerEvidence {
   value: string;
 }
 
+export type CascadeTier = "info" | "suggest" | "urgent";
+
 export interface CascadeManagerSuggestion {
   id?: number | null;
   kind: string;
   title: string;
   summary: string;
+  tier: CascadeTier;
   evidence: CascadeManagerEvidence[];
   suggestedAgentKind: string;
   severityScore: number;
@@ -27,6 +30,8 @@ export interface CascadeManagerSuggestionBatch {
   windowEnd: string;
   hoursAnalyzed: number;
   deliveryMode: string;
+  model: string;
+  costUsd: number;
   outboxPath: string;
   suggestions: CascadeManagerSuggestion[];
 }

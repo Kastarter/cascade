@@ -5,10 +5,12 @@
 ## Summary
 
 - **Agent #1 — Q&A Agent (Reel chat)** · Layer 1 · Employee Mac · Sonnet 4.6 (escalate Opus 4.7) · ✅ Shipped
-- **Agent #2 — Waste Detector** · Layer 2 · Server, weekly batch · Opus 4.7 · ❌ Not built
-- **Agent #3 — Agent Generator** · Layer 2 · Server, on-demand · Opus 4.7 · ❌ Not built
-- **Agent #4 — Deployment & Runtime Monitor** · Layer 2 · Client + server · Sonnet 4.6 · ❌ Not built
-- **Agent #5 — Privacy Aggregator** · Layer 1 · Employee Mac, hourly · Local Llama 3.2 3B · ❌ Not built (recommended foundation)
+- **Agent #2 — Waste Detector** · Layer 2 · on-demand · Opus 4.7 · ✅ Built (LLM over #5 output only)
+- **Agent #3 — Agent Generator** · Layer 2 · on-demand · Opus 4.7 · ✅ Built (typed validated spec)
+- **Agent #4 — Deployment & Runtime Monitor** · Layer 2 · on-device · Sonnet 4.6 · ✅ Built (sandbox + lifecycle + anomaly + audit)
+- **Agent #5 — Privacy Aggregator** · Layer 1 · Employee Mac · deterministic on-device · ✅ Built (allowlist + DP jitter + sensitive-app exclusion)
+
+> Implementation note (2026-05-29): #2–#5 implemented in `cascade_agents.rs` (commands) + `cascade_llm.rs` (Anthropic client) + `cascade-schema` migration `0003_layer2_agents.sql`. #5 is deterministic (no LLM) so the privacy boundary is provable — the detector physically receives only `cascade_privacy_aggregates`, never raw OCR. The original "weekly batch / Local Llama" framing is the multi-employee production target; the single-Mac prototype runs #5 deterministically and #2/#3/#4 on the BYOK Anthropic key.
 
 > N runtime fix-agents are the output of #3 — one template, N instances managed by #4.
 

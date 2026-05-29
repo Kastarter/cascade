@@ -1,6 +1,19 @@
 # Cascade — Session Handoff
 
-> Last updated: 2026-05-27 (paused mid-iteration). Read this first when resuming. Combine with `docs/agents.md` (canonical agent spec) and `plan.md` (full milestone breakdown).
+> Last updated: 2026-05-29 — Layer 2 agents #2/#3/#4/#5 implemented this session. Read this first when resuming. Combine with `docs/agents.md` (canonical agent spec) and `plan.md` (full milestone breakdown).
+
+## 2026-05-29 session — all five agents now real
+
+Implemented the full Layer 2 agent stack (was: only #1 real, #2 heuristic, #3/#4/#5 absent):
+
+- **#5 Privacy Aggregator** — `cascade_agents.rs::cascade_run_privacy_aggregation`. Deterministic, on-device, $0. Projects the raw activity summary to an allowlist (`app`, `category`, `durationMin`, `contextSwitches`), drops sensitive apps/windows (banking/health/legal/dating/incognito via `SENSITIVE_MARKERS`), applies ε≈1 jitter to counts < 10 (`dp_jitter`, FNV-seeded, no `rand` dep), writes `cascade_privacy_aggregates` + a previewable outbox. This is the privacy boundary: the detector reads ONLY this table, never OCR.
+- **#2 Waste Detector** — now **LLM** (Opus, temp 0.2), not heuristic. Runs #5 first, then `call_anthropic_json` over the sanitized aggregates only. Whitelist-clamps `kind`/`suggestedAgentKind`, tiers info/suggest/urgent, caps at 6.
+- **#3 Agent Generator** — `cascade_generate_agent_spec` (Opus, temp 0.1). Produces a typed `AgentSpecDoc` (workflow, tool whitelist, approval points, rollback, est cost/time). `validate_spec` enforces: tool whitelist (no shell/exec), mutating-tool→approval-point, rollback required, $0.10 cost cap. Persists to `cascade_agent_specs`.
+- **#4 Deployment Monitor** — `cascade_sandbox_test` (Sonnet, temp 0.0) dry-runs the spec over recent aggregates with mocked tools; `detect_anomalies` flags scope-creep / missing-approval / excessive-steps in Rust. `cascade_transition_agent_spec` owns lifecycle (review→sandbox→dual-approve→deploy→pause/reject) with dual-approval enforced on deploy. Every action → immutable `cascade_audit_log`. Runs → `cascade_agent_runs`.
+
+New files: `crates/cascade-schema/migrations/0003_layer2_agents.sql`, `app-overlays/.../src-tauri/src/cascade_llm.rs`, `app-overlays/.../src-tauri/src/cascade_agents.rs`, `app-overlays/.../lib/cascade-agents.ts`. `cascade_commands.rs` trimmed to BYOK+tagging. `main.rs` registers 11 new/moved commands. UI: manager dashboard ComposeConsole now generates+reviews+sends a real spec; cascades-view drives the real spec lifecycle with sandbox results + audit log. Schema crate: `cargo test -p cascade-schema` = 5 green.
+
+NOTE: the heuristic detector (`build_*_suggestion`, `classify_app` keyword lists, OCR `key_texts` reading) is **removed** — that path read raw OCR and was the bossware-risk surface #5 exists to close.
 
 ## What's installed right now
 

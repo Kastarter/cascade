@@ -11,8 +11,13 @@ import {
   CascadeManagerSuggestionBatch,
   generateManagerSuggestions,
   listManagerSuggestions,
-  updateManagerSuggestionStatus,
 } from "@/lib/cascade-manager";
+import {
+  CascadeAgentSpecView,
+  generateAgentSpec,
+  listAgentSpecs,
+  transitionAgentSpec,
+} from "@/lib/cascade-agents";
 import {
   buildDashboardMetrics,
   ManagerDashboardCascade,
@@ -57,16 +62,15 @@ export function CascadeManagerDashboard() {
   );
   const metrics = useMemo(() => buildDashboardMetrics(suggestions, batch), [suggestions, batch]);
 
+  // Read-only on load — listing never triggers an LLM call. Detection (an Opus
+  // pass over the sanitized aggregates) only runs when the manager asks for it.
   async function loadSuggestions() {
     setLoading(true);
     try {
-      let existing = await listManagerSuggestions({ limit: 24 });
-      if (existing.length === 0) {
-        const generated = await generateManagerSuggestions(8);
-        setBatch(generated);
-        existing = generated.suggestions;
-      }
+      const existing = await listManagerSuggestions({ limit: 24 });
       setSuggestions(existing);
+    } catch (e: any) {
+      setToast(`Couldn't load patterns — ${String(e?.message ?? e)}`);
     } finally {
       setLoading(false);
     }
@@ -78,22 +82,22 @@ export function CascadeManagerDashboard() {
       const generated = await generateManagerSuggestions(8);
       setBatch(generated);
       setSuggestions(generated.suggestions);
-      setToast(`Refreshed ${generated.suggestions.length} pattern${generated.suggestions.length === 1 ? "" : "s"}`);
+      setToast(
+        generated.suggestions.length === 0
+          ? "Detector ran — no clear patterns in this window yet"
+          : `Detector surfaced ${generated.suggestions.length} pattern${generated.suggestions.length === 1 ? "" : "s"}`,
+      );
+    } catch (e: any) {
+      setToast(`Detection failed — ${String(e?.message ?? e)}`);
     } finally {
       setRefreshing(false);
     }
   }
 
-  async function deployPattern(pattern: ManagerDashboardPattern) {
-    if (!pattern.suggestionId) return;
-    await updateManagerSuggestionStatus(pattern.suggestionId, "deployed");
-    setSuggestions((current) =>
-      current.map((suggestion) =>
-        suggestion.id === pattern.suggestionId ? { ...suggestion, status: "deployed" } : suggestion,
-      ),
-    );
+  async function handleSent(name: string) {
     setSelected(null);
-    setToast(`${pattern.proposal.name} cascaded to this employee`);
+    setToast(`${name} cascaded to this employee — they’ll review and sandbox-test it`);
+    await loadSuggestions();
   }
 
   return (
@@ -170,7 +174,7 @@ export function CascadeManagerDashboard() {
         <ComposeConsole
           pattern={selected}
           onClose={() => setSelected(null)}
-          onDeploy={() => void deployPattern(selected)}
+          onSent={handleSent}
         />
       )}
 
@@ -598,33 +602,75 @@ function CascadesTable({ cascades }: { cascades: ManagerDashboardCascade[] }) {
 function ComposeConsole({
   pattern,
   onClose,
-  onDeploy,
+  onSent,
 }: {
   pattern: ManagerDashboardPattern;
   onClose: () => void;
-  onDeploy: () => void;
+  onSent: (name: string) => void;
 }) {
-  const [name, setName] = useState(pattern.proposal.name);
-  const [what, setWhat] = useState(pattern.proposal.what);
-  const [trigger, setTrigger] = useState(pattern.proposal.trigger);
-  const [sending, setSending] = useState(false);
+  const [spec, setSpec] = useState<CascadeAgentSpecView | null>(null);
+  const [phase, setPhase] = useState<"idle" | "generating" | "ready" | "sending">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  // If a spec was already generated for this pattern, load it.
+  useEffect(() => {
+    if (!pattern.suggestionId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const existing = await listAgentSpecs(100);
+        const match = existing.find((s) => s.suggestionId === pattern.suggestionId);
+        if (!cancelled && match) {
+          setSpec(match);
+          setPhase("ready");
+        }
+      } catch {
+        /* non-fatal */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pattern.suggestionId]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !sending) onClose();
+      if (event.key === "Escape" && phase !== "generating" && phase !== "sending") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, sending]);
+  }, [onClose, phase]);
 
-  async function handleDeploy() {
-    setSending(true);
+  async function handleGenerate() {
+    if (!pattern.suggestionId) return;
+    setPhase("generating");
+    setError(null);
     try {
-      await onDeploy();
-    } finally {
-      setSending(false);
+      const generated = await generateAgentSpec(pattern.suggestionId);
+      setSpec(generated);
+      setPhase("ready");
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+      setPhase("idle");
     }
   }
+
+  async function handleSend() {
+    if (!spec) return;
+    setPhase("sending");
+    setError(null);
+    try {
+      await transitionAgentSpec(spec.id, "send_to_employee");
+      onSent(spec.name);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+      setPhase("ready");
+    }
+  }
+
+  const busy = phase === "generating" || phase === "sending";
+  const invalid = spec?.validationStatus === "invalid";
+  const alreadySent = spec ? spec.status !== "generated" : false;
 
   return (
     <div
@@ -642,7 +688,7 @@ function ComposeConsole({
       <div
         onClick={(event) => event.stopPropagation()}
         style={{
-          width: 720,
+          width: 760,
           height: "100%",
           background: "var(--cascade-bg)",
           borderLeft: "1px solid var(--cascade-border)",
@@ -653,15 +699,15 @@ function ComposeConsole({
         <div style={{ padding: "24px 28px 22px", borderBottom: "1px solid var(--cascade-border)", background: "var(--cascade-panel)" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
             <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 11, letterSpacing: 1.8, textTransform: "uppercase", color: "var(--cascade-accent)" }}>
-              Compose cascade
+              Generate cascade
             </span>
             <span style={{ flex: 1, height: 1, background: "var(--cascade-border)" }} />
-            <button onClick={onClose} disabled={sending} style={closeBtnStyle}>×</button>
+            <button onClick={onClose} disabled={busy} style={closeBtnStyle}>×</button>
           </div>
 
           <div style={{ padding: "14px 18px", background: "var(--cascade-bg)", border: "1px solid var(--cascade-border)", borderRadius: 8 }}>
             <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 9.5, letterSpacing: 1.4, textTransform: "uppercase", color: "var(--cascade-text-3)", marginBottom: 8 }}>
-              Pattern
+              Detected pattern
             </div>
             <div style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>{pattern.title}</div>
             <div style={{ color: "var(--cascade-text-2)", lineHeight: 1.55 }}>{pattern.detail}</div>
@@ -669,7 +715,7 @@ function ComposeConsole({
         </div>
 
         <div style={{ padding: "16px 28px", borderBottom: "1px solid var(--cascade-border)" }}>
-          <Field label="What the detector saw">
+          <Field label="What the detector saw (from sanitized metrics only)">
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               {pattern.evidence.map((item) => (
                 <div key={`${item.label}-${item.value}`} style={evidenceCardStyle}>
@@ -683,56 +729,139 @@ function ComposeConsole({
           </Field>
         </div>
 
-        <div style={{ padding: "16px 28px", borderBottom: "1px solid var(--cascade-border)" }}>
-          <Field label="Name">
-            <input value={name} onChange={(event) => setName(event.target.value)} style={inputStyle(18, true)} />
-          </Field>
-          <Field label="What it does">
-            <textarea value={what} onChange={(event) => setWhat(event.target.value)} rows={4} style={{ ...inputStyle(13), resize: "none" }} />
-          </Field>
-          <Field label="When it runs">
-            <input value={trigger} onChange={(event) => setTrigger(event.target.value)} style={inputStyle(12)} />
-          </Field>
-          <Field label="Deploy target">
-            <div style={{ ...evidenceCardStyle, display: "inline-flex", alignItems: "center", gap: 10 }}>
-              <div style={avatarStyle}>ME</div>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>This employee</div>
-                <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-4)" }}>
-                  One-device manager prototype
-                </div>
-              </div>
-            </div>
-          </Field>
-        </div>
-
-        <div style={{ padding: "16px 28px", borderBottom: "1px solid var(--cascade-border)" }}>
-          <Field label="What they’ll see">
-            <div style={{ ...evidenceCardStyle, background: "linear-gradient(180deg, oklch(0.21 0.03 150), var(--cascade-panel))" }}>
-              <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-3)", textTransform: "uppercase", letterSpacing: 1.2 }}>
-                Cascade helper
-              </div>
-              <div style={{ marginTop: 10, fontSize: 16, fontWeight: 600 }}>{name}</div>
-              <div style={{ marginTop: 8, color: "var(--cascade-text-2)", lineHeight: 1.55 }}>{what}</div>
-            </div>
-          </Field>
-        </div>
-
-        <div style={{ position: "sticky", bottom: 0, background: "var(--cascade-panel)", borderTop: "1px solid var(--cascade-border)", padding: "14px 28px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-3)" }}>
-            The employee can review this locally before acting on it.
+        {error && (
+          <div style={{ margin: "16px 28px 0", padding: "12px 16px", borderRadius: 9, background: "oklch(0.24 0.045 30 / 0.5)", border: "1px solid oklch(0.45 0.085 30 / 0.6)", color: "oklch(0.84 0.085 35)", fontSize: 13 }}>
+            {error}
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={onClose} disabled={sending} style={ghostBtnStyle}>
-              Save draft
-            </button>
-            <button onClick={handleDeploy} disabled={sending} style={primaryBtnStyle}>
-              {sending ? "Deploying…" : "Deploy cascade"}
+        )}
+
+        {!spec ? (
+          <div style={{ padding: "28px", textAlign: "center" }}>
+            <p style={{ color: "var(--cascade-text-2)", fontSize: 14, lineHeight: 1.6, maxWidth: 520, margin: "0 auto 20px" }}>
+              The Agent Generator (Opus) will turn this pattern into a fully-specified helper agent — its workflow,
+              the exact tools it may touch, every approval point, and a rollback path. You review it before the
+              employee ever sees it.
+            </p>
+            <button onClick={handleGenerate} disabled={busy} style={{ ...primaryBtnStyle, padding: "11px 22px", fontSize: 12.5 }}>
+              {phase === "generating" ? "Generating spec…" : "Generate agent spec"}
             </button>
           </div>
-        </div>
+        ) : (
+          <SpecReview spec={spec} />
+        )}
+
+        {spec && (
+          <div style={{ position: "sticky", bottom: 0, background: "var(--cascade-panel)", borderTop: "1px solid var(--cascade-border)", padding: "14px 28px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: invalid ? "oklch(0.84 0.085 35)" : "var(--cascade-text-3)" }}>
+              {invalid
+                ? "Spec failed validation — cannot be sent. Regenerate."
+                : alreadySent
+                  ? "Already sent. The employee sandbox-tests and approves it."
+                  : "Sending requires the employee to sandbox-test + approve before it runs."}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={handleGenerate} disabled={busy} style={ghostBtnStyle}>
+                {phase === "generating" ? "…" : "Regenerate"}
+              </button>
+              <button onClick={handleSend} disabled={busy || invalid || alreadySent} style={{ ...primaryBtnStyle, opacity: busy || invalid || alreadySent ? 0.5 : 1 }}>
+                {phase === "sending" ? "Sending…" : "Send to employee"}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
+  );
+}
+
+function SpecReview({ spec }: { spec: CascadeAgentSpecView }) {
+  const d = spec.spec;
+  return (
+    <div style={{ padding: "16px 28px 24px", display: "grid", gap: 18 }}>
+      <div style={{ ...evidenceCardStyle, background: "linear-gradient(180deg, oklch(0.21 0.03 150), var(--cascade-panel))" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+          <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-3)", textTransform: "uppercase", letterSpacing: 1.2 }}>
+            Generated agent
+          </span>
+          <SpecBadge label={spec.validationStatus === "valid" ? "valid" : "invalid"} warn={spec.validationStatus !== "valid"} />
+          <SpecBadge label={`~$${spec.estCostUsd.toFixed(3)}/run`} />
+          <SpecBadge label={`saves ~${Math.round(spec.estTimeSavedMin)}m/wk`} />
+        </div>
+        <div style={{ fontSize: 17, fontWeight: 600 }}>{d.name}</div>
+        <div style={{ marginTop: 8, color: "var(--cascade-text-2)", lineHeight: 1.55 }}>{d.taskDescription}</div>
+        <div style={{ marginTop: 6, color: "var(--cascade-text-3)", fontSize: 12.5, lineHeight: 1.5 }}>{d.rationale}</div>
+      </div>
+
+      {spec.validationNotes && (
+        <div style={{ padding: "10px 14px", borderRadius: 8, background: "oklch(0.24 0.045 30 / 0.35)", border: "1px solid oklch(0.45 0.085 30 / 0.5)", fontSize: 12.5, color: "var(--cascade-text-2)" }}>
+          <strong style={{ color: "oklch(0.84 0.085 35)" }}>Validation: </strong>
+          {spec.validationNotes}
+        </div>
+      )}
+
+      <Field label="Workflow">
+        <ol style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 5 }}>
+          {d.workflow.map((w) => (
+            <li key={w.step} style={{ fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.5 }}>
+              {w.action}
+              {w.approvalRequired && (
+                <span style={{ marginLeft: 8, fontFamily: "var(--cascade-mono)", fontSize: 9, color: "var(--cascade-accent)", textTransform: "uppercase", letterSpacing: 0.8 }}>
+                  · needs approval
+                </span>
+              )}
+            </li>
+          ))}
+        </ol>
+      </Field>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <Field label="Tools (whitelist only)">
+          <SpecChips items={d.tools} empty="no external tools" />
+        </Field>
+        <Field label="Approval points">
+          <SpecChips items={d.approvalPoints} empty="none" />
+        </Field>
+      </div>
+
+      <Field label="Rollback path">
+        <div style={{ fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.5 }}>{d.rollbackPath}</div>
+      </Field>
+    </div>
+  );
+}
+
+function SpecChips({ items, empty }: { items: string[]; empty: string }) {
+  if (!items || items.length === 0) {
+    return <span style={{ fontSize: 12.5, color: "var(--cascade-text-4)" }}>{empty}</span>;
+  }
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {items.map((t, i) => (
+        <span key={`${t}-${i}`} style={{ ...evidenceCardStyle, padding: "4px 9px", fontFamily: "var(--cascade-mono)", fontSize: 11, color: "var(--cascade-text-3)" }}>
+          {t}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function SpecBadge({ label, warn }: { label: string; warn?: boolean }) {
+  return (
+    <span
+      style={{
+        padding: "2px 8px",
+        borderRadius: 999,
+        background: warn ? "oklch(0.24 0.045 30 / 0.5)" : "var(--cascade-bg)",
+        border: `1px solid ${warn ? "oklch(0.45 0.085 30 / 0.6)" : "var(--cascade-border)"}`,
+        fontFamily: "var(--cascade-mono)",
+        fontSize: 9.5,
+        letterSpacing: 0.6,
+        color: warn ? "oklch(0.84 0.085 35)" : "var(--cascade-text-3)",
+        textTransform: "uppercase",
+      }}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -781,20 +910,6 @@ const evidenceCardStyle: CSSProperties = {
   background: "var(--cascade-panel)",
 };
 
-const avatarStyle: CSSProperties = {
-  width: 28,
-  height: 28,
-  borderRadius: "50%",
-  background: "linear-gradient(135deg, oklch(0.62 0.13 28), oklch(0.42 0.10 28))",
-  color: "white",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  fontFamily: "var(--cascade-mono)",
-  fontSize: 10,
-  fontWeight: 700,
-};
-
 const closeBtnStyle: CSSProperties = {
   width: 28,
   height: 28,
@@ -831,19 +946,3 @@ const primaryBtnStyle: CSSProperties = {
   fontSize: 11,
   cursor: "pointer",
 };
-
-function inputStyle(fontSize = 13, bold = false): CSSProperties {
-  return {
-    width: "100%",
-    background: "transparent",
-    border: "none",
-    outline: "none",
-    color: "var(--cascade-text)",
-    fontSize,
-    fontFamily: "var(--cascade-sans)",
-    fontWeight: bold ? 600 : 400,
-    letterSpacing: -0.1,
-    padding: "6px 0",
-    borderBottom: "1.5px dashed var(--cascade-border)",
-  };
-}

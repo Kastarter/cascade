@@ -65,6 +65,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     let sql_files = [
         include_str!("../migrations/0001_init.sql"),
         include_str!("../migrations/0002_manager_suggestions.sql"),
+        include_str!("../migrations/0003_layer2_agents.sql"),
     ];
 
     for sql in sql_files {
@@ -272,6 +273,355 @@ pub async fn update_manager_suggestion_status(
     Ok(())
 }
 
+// ─── Agent #5 · Privacy Aggregator ──────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyAggregateInput {
+    pub app: String,
+    pub category: String,
+    pub duration_min: f64,
+    pub context_switches: i64,
+    pub noised: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyAggregateRecord {
+    pub id: i64,
+    pub window_start: String,
+    pub window_end: String,
+    pub app: String,
+    pub category: String,
+    pub duration_min: f64,
+    pub context_switches: i64,
+    pub noised: bool,
+    pub created_at: String,
+}
+
+/// Replace the stored aggregate set for a window. The aggregator is the single
+/// writer; re-running it for the same window supersedes the prior snapshot.
+pub async fn replace_privacy_aggregates(
+    pool: &SqlitePool,
+    window_start: &str,
+    window_end: &str,
+    rows: &[PrivacyAggregateInput],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM cascade_privacy_aggregates WHERE window_start = ?1 AND window_end = ?2")
+        .bind(window_start)
+        .bind(window_end)
+        .execute(&mut *tx)
+        .await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT INTO cascade_privacy_aggregates
+                (window_start, window_end, app, category, duration_min, context_switches, noised)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(window_start)
+        .bind(window_end)
+        .bind(&row.app)
+        .bind(&row.category)
+        .bind(row.duration_min)
+        .bind(row.context_switches)
+        .bind(row.noised as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn list_privacy_aggregates(
+    pool: &SqlitePool,
+    window_start: &str,
+    window_end: &str,
+) -> Result<Vec<PrivacyAggregateRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, window_start, window_end, app, category, duration_min,
+                context_switches, noised, created_at
+         FROM cascade_privacy_aggregates
+         WHERE window_start = ?1 AND window_end = ?2
+         ORDER BY duration_min DESC",
+    )
+    .bind(window_start)
+    .bind(window_end)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PrivacyAggregateRecord {
+            id: row.get("id"),
+            window_start: row.get("window_start"),
+            window_end: row.get("window_end"),
+            app: row.get("app"),
+            category: row.get("category"),
+            duration_min: row.get("duration_min"),
+            context_switches: row.get("context_switches"),
+            noised: row.get::<i64, _>("noised") != 0,
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+// ─── Agent #3 · Generated specs ─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSpecInput {
+    pub suggestion_id: i64,
+    pub name: String,
+    pub spec_json: String,
+    pub est_cost_usd: f64,
+    pub est_time_saved_min: f64,
+    pub validation_status: String,
+    pub validation_notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSpecRecord {
+    pub id: i64,
+    pub suggestion_id: i64,
+    pub name: String,
+    pub spec_json: String,
+    pub est_cost_usd: f64,
+    pub est_time_saved_min: f64,
+    pub validation_status: String,
+    pub validation_notes: Option<String>,
+    pub status: String,
+    pub employee_approved: bool,
+    pub manager_approved: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub async fn insert_agent_spec(pool: &SqlitePool, spec: &AgentSpecInput) -> Result<i64> {
+    // A suggestion gets at most one live spec — regenerating supersedes the old.
+    sqlx::query("DELETE FROM cascade_agent_specs WHERE suggestion_id = ?1")
+        .bind(spec.suggestion_id)
+        .execute(pool)
+        .await?;
+    let row = sqlx::query(
+        "INSERT INTO cascade_agent_specs
+            (suggestion_id, name, spec_json, est_cost_usd, est_time_saved_min,
+             validation_status, validation_notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id",
+    )
+    .bind(spec.suggestion_id)
+    .bind(&spec.name)
+    .bind(&spec.spec_json)
+    .bind(spec.est_cost_usd)
+    .bind(spec.est_time_saved_min)
+    .bind(&spec.validation_status)
+    .bind(&spec.validation_notes)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+fn map_spec_record(row: &sqlx::sqlite::SqliteRow) -> AgentSpecRecord {
+    AgentSpecRecord {
+        id: row.get("id"),
+        suggestion_id: row.get("suggestion_id"),
+        name: row.get("name"),
+        spec_json: row.get("spec_json"),
+        est_cost_usd: row.get("est_cost_usd"),
+        est_time_saved_min: row.get("est_time_saved_min"),
+        validation_status: row.get("validation_status"),
+        validation_notes: row.get("validation_notes"),
+        status: row.get("status"),
+        employee_approved: row.get::<i64, _>("employee_approved") != 0,
+        manager_approved: row.get::<i64, _>("manager_approved") != 0,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+const SPEC_COLS: &str = "id, suggestion_id, name, spec_json, est_cost_usd, est_time_saved_min, \
+     validation_status, validation_notes, status, employee_approved, manager_approved, \
+     created_at, updated_at";
+
+pub async fn get_agent_spec(pool: &SqlitePool, spec_id: i64) -> Result<Option<AgentSpecRecord>> {
+    let sql = format!("SELECT {SPEC_COLS} FROM cascade_agent_specs WHERE id = ?1");
+    let row = sqlx::query(&sql).bind(spec_id).fetch_optional(pool).await?;
+    Ok(row.map(|r| map_spec_record(&r)))
+}
+
+pub async fn list_agent_specs(pool: &SqlitePool, limit: i64) -> Result<Vec<AgentSpecRecord>> {
+    let sql =
+        format!("SELECT {SPEC_COLS} FROM cascade_agent_specs ORDER BY created_at DESC LIMIT ?1");
+    let rows = sqlx::query(&sql).bind(limit).fetch_all(pool).await?;
+    Ok(rows.iter().map(map_spec_record).collect())
+}
+
+/// Update a spec's lifecycle status and (optionally) approval flags. Passing
+/// `None` for an approval flag leaves it untouched.
+pub async fn update_agent_spec_status(
+    pool: &SqlitePool,
+    spec_id: i64,
+    status: &str,
+    employee_approved: Option<bool>,
+    manager_approved: Option<bool>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE cascade_agent_specs
+         SET status = ?2,
+             employee_approved = CASE WHEN ?3 >= 0 THEN ?3 ELSE employee_approved END,
+             manager_approved = CASE WHEN ?4 >= 0 THEN ?4 ELSE manager_approved END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+    )
+    .bind(spec_id)
+    .bind(status)
+    .bind(employee_approved.map(|v| v as i64).unwrap_or(-1))
+    .bind(manager_approved.map(|v| v as i64).unwrap_or(-1))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── Agent #4 · Runs + audit log ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRunInput {
+    pub spec_id: i64,
+    pub mode: String,
+    pub status: String,
+    pub summary: String,
+    pub steps_json: String,
+    pub anomalies_json: String,
+    pub cost_usd: f64,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRunRecord {
+    pub id: i64,
+    pub spec_id: i64,
+    pub mode: String,
+    pub status: String,
+    pub summary: String,
+    pub steps_json: String,
+    pub anomalies_json: String,
+    pub cost_usd: f64,
+    pub duration_ms: i64,
+    pub created_at: String,
+}
+
+pub async fn insert_agent_run(pool: &SqlitePool, run: &AgentRunInput) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO cascade_agent_runs
+            (spec_id, mode, status, summary, steps_json, anomalies_json, cost_usd, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING id",
+    )
+    .bind(run.spec_id)
+    .bind(&run.mode)
+    .bind(&run.status)
+    .bind(&run.summary)
+    .bind(&run.steps_json)
+    .bind(&run.anomalies_json)
+    .bind(run.cost_usd)
+    .bind(run.duration_ms)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+pub async fn list_agent_runs(
+    pool: &SqlitePool,
+    spec_id: i64,
+    limit: i64,
+) -> Result<Vec<AgentRunRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, spec_id, mode, status, summary, steps_json, anomalies_json,
+                cost_usd, duration_ms, created_at
+         FROM cascade_agent_runs
+         WHERE spec_id = ?1
+         ORDER BY created_at DESC
+         LIMIT ?2",
+    )
+    .bind(spec_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AgentRunRecord {
+            id: row.get("id"),
+            spec_id: row.get("spec_id"),
+            mode: row.get("mode"),
+            status: row.get("status"),
+            summary: row.get("summary"),
+            steps_json: row.get("steps_json"),
+            anomalies_json: row.get("anomalies_json"),
+            cost_usd: row.get("cost_usd"),
+            duration_ms: row.get("duration_ms"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub spec_id: Option<i64>,
+    pub run_id: Option<i64>,
+    pub actor: String,
+    pub action: String,
+    pub detail_json: String,
+    pub created_at: String,
+}
+
+/// Append-only. There is no update/delete path for the audit log by design.
+pub async fn append_audit(
+    pool: &SqlitePool,
+    spec_id: Option<i64>,
+    run_id: Option<i64>,
+    actor: &str,
+    action: &str,
+    detail_json: &str,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO cascade_audit_log (spec_id, run_id, actor, action, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
+    )
+    .bind(spec_id)
+    .bind(run_id)
+    .bind(actor)
+    .bind(action)
+    .bind(detail_json)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+pub async fn list_audit(pool: &SqlitePool, spec_id: i64, limit: i64) -> Result<Vec<AuditEntry>> {
+    let rows = sqlx::query(
+        "SELECT id, spec_id, run_id, actor, action, detail_json, created_at
+         FROM cascade_audit_log
+         WHERE spec_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?2",
+    )
+    .bind(spec_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AuditEntry {
+            id: row.get("id"),
+            spec_id: row.get("spec_id"),
+            run_id: row.get("run_id"),
+            actor: row.get("actor"),
+            action: row.get("action"),
+            detail_json: row.get("detail_json"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +718,129 @@ mod tests {
         let sent = list_manager_suggestions(&pool, Some("sent"), 10).await?;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].id, suggestion_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn privacy_aggregates_replace_is_idempotent() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        std::fs::File::create(&db).unwrap();
+        let pool = open(&db).await?;
+        stub_frames(&pool).await?;
+        migrate(&pool).await?;
+
+        let rows = vec![
+            PrivacyAggregateInput {
+                app: "Slack".into(),
+                category: "communication".into(),
+                duration_min: 42.0,
+                context_switches: 18,
+                noised: false,
+            },
+            PrivacyAggregateInput {
+                app: "Cursor".into(),
+                category: "coding".into(),
+                duration_min: 95.0,
+                context_switches: 4,
+                noised: true,
+            },
+        ];
+        replace_privacy_aggregates(&pool, "S", "E", &rows).await?;
+        replace_privacy_aggregates(&pool, "S", "E", &rows).await?; // re-run must not duplicate
+
+        let stored = list_privacy_aggregates(&pool, "S", "E").await?;
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].app, "Cursor"); // ordered by duration desc
+        assert!(stored[0].noised);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_spec_lifecycle_and_audit() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        std::fs::File::create(&db).unwrap();
+        let pool = open(&db).await?;
+        stub_frames(&pool).await?;
+        migrate(&pool).await?;
+
+        let run_id = create_detection_run(&pool, "d", "S", "E", "{}").await?;
+        let suggestion_id = insert_manager_suggestion(
+            &pool,
+            run_id,
+            &ManagerSuggestionInput {
+                kind: "communication_churn".into(),
+                title: "t".into(),
+                summary: "s".into(),
+                evidence_json: "[]".into(),
+                suggested_agent_kind: "inbox-batcher".into(),
+                severity_score: 0.6,
+                confidence: 0.7,
+            },
+        )
+        .await?;
+
+        let spec_id = insert_agent_spec(
+            &pool,
+            &AgentSpecInput {
+                suggestion_id,
+                name: "Inbox batcher".into(),
+                spec_json: r#"{"task":"batch inbox"}"#.into(),
+                est_cost_usd: 0.03,
+                est_time_saved_min: 45.0,
+                validation_status: "valid".into(),
+                validation_notes: None,
+            },
+        )
+        .await?;
+        assert!(spec_id > 0);
+
+        // regeneration supersedes (only one spec per suggestion)
+        let spec_id2 = insert_agent_spec(
+            &pool,
+            &AgentSpecInput {
+                suggestion_id,
+                name: "Inbox batcher v2".into(),
+                spec_json: "{}".into(),
+                est_cost_usd: 0.02,
+                est_time_saved_min: 50.0,
+                validation_status: "valid".into(),
+                validation_notes: None,
+            },
+        )
+        .await?;
+        let all = list_agent_specs(&pool, 10).await?;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, spec_id2);
+
+        update_agent_spec_status(&pool, spec_id2, "approved", Some(true), Some(true)).await?;
+        let spec = get_agent_spec(&pool, spec_id2).await?.unwrap();
+        assert_eq!(spec.status, "approved");
+        assert!(spec.employee_approved && spec.manager_approved);
+
+        let run = insert_agent_run(
+            &pool,
+            &AgentRunInput {
+                spec_id: spec_id2,
+                mode: "sandbox".into(),
+                status: "success".into(),
+                summary: "ok".into(),
+                steps_json: "[]".into(),
+                anomalies_json: "[]".into(),
+                cost_usd: 0.004,
+                duration_ms: 1200,
+            },
+        )
+        .await?;
+        assert!(run > 0);
+        let runs = list_agent_runs(&pool, spec_id2, 10).await?;
+        assert_eq!(runs.len(), 1);
+
+        append_audit(&pool, Some(spec_id2), Some(run), "employee", "sandbox_test", "{}").await?;
+        let audit = list_audit(&pool, spec_id2, 10).await?;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, "sandbox_test");
         Ok(())
     }
 }
