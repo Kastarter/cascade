@@ -66,6 +66,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         include_str!("../migrations/0001_init.sql"),
         include_str!("../migrations/0002_manager_suggestions.sql"),
         include_str!("../migrations/0003_layer2_agents.sql"),
+        include_str!("../migrations/0004_agent_runtime.sql"),
     ];
 
     for sql in sql_files {
@@ -622,6 +623,141 @@ pub async fn list_audit(pool: &SqlitePool, spec_id: i64, limit: i64) -> Result<V
         .collect())
 }
 
+// ─── Agent #4 · Runtime actions ledger ──────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActionInput {
+    pub run_id: i64,
+    pub spec_id: i64,
+    pub step: i64,
+    pub tool: String,
+    pub summary: String,
+    pub content: Option<String>,
+    pub artifact_path: Option<String>,
+    pub reversible: bool,
+    pub mutating: bool,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActionRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub spec_id: i64,
+    pub step: i64,
+    pub tool: String,
+    pub summary: String,
+    pub content: Option<String>,
+    pub artifact_path: Option<String>,
+    pub reversible: bool,
+    pub mutating: bool,
+    pub state: String,
+    pub created_at: String,
+}
+
+fn map_action(row: &sqlx::sqlite::SqliteRow) -> AgentActionRecord {
+    AgentActionRecord {
+        id: row.get("id"),
+        run_id: row.get("run_id"),
+        spec_id: row.get("spec_id"),
+        step: row.get("step"),
+        tool: row.get("tool"),
+        summary: row.get("summary"),
+        content: row.get("content"),
+        artifact_path: row.get("artifact_path"),
+        reversible: row.get::<i64, _>("reversible") != 0,
+        mutating: row.get::<i64, _>("mutating") != 0,
+        state: row.get("state"),
+        created_at: row.get("created_at"),
+    }
+}
+
+const ACTION_COLS: &str =
+    "id, run_id, spec_id, step, tool, summary, content, artifact_path, reversible, mutating, state, created_at";
+
+pub async fn insert_agent_action(pool: &SqlitePool, action: &AgentActionInput) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO cascade_agent_actions
+            (run_id, spec_id, step, tool, summary, content, artifact_path, reversible, mutating, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) RETURNING id",
+    )
+    .bind(action.run_id)
+    .bind(action.spec_id)
+    .bind(action.step)
+    .bind(&action.tool)
+    .bind(&action.summary)
+    .bind(&action.content)
+    .bind(&action.artifact_path)
+    .bind(action.reversible as i64)
+    .bind(action.mutating as i64)
+    .bind(&action.state)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+pub async fn get_agent_action(pool: &SqlitePool, action_id: i64) -> Result<Option<AgentActionRecord>> {
+    let sql = format!("SELECT {ACTION_COLS} FROM cascade_agent_actions WHERE id = ?1");
+    let row = sqlx::query(&sql).bind(action_id).fetch_optional(pool).await?;
+    Ok(row.map(|r| map_action(&r)))
+}
+
+pub async fn list_actions_for_spec(
+    pool: &SqlitePool,
+    spec_id: i64,
+    limit: i64,
+) -> Result<Vec<AgentActionRecord>> {
+    let sql = format!(
+        "SELECT {ACTION_COLS} FROM cascade_agent_actions WHERE spec_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2"
+    );
+    let rows = sqlx::query(&sql).bind(spec_id).bind(limit).fetch_all(pool).await?;
+    Ok(rows.iter().map(map_action).collect())
+}
+
+pub async fn update_agent_action_state(
+    pool: &SqlitePool,
+    action_id: i64,
+    state: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE cascade_agent_actions SET state = ?2 WHERE id = ?1")
+        .bind(action_id)
+        .bind(state)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Count completed live runs for a spec — used for the "first 3 runs are
+/// supervised" rule. Sandbox runs don't count.
+pub async fn count_live_runs(pool: &SqlitePool, spec_id: i64) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM cascade_agent_runs WHERE spec_id = ?1 AND mode = 'live'",
+    )
+    .bind(spec_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("n"))
+}
+
+pub async fn last_live_run_at(pool: &SqlitePool, spec_id: i64) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT MAX(created_at) AS t FROM cascade_agent_runs WHERE spec_id = ?1 AND mode = 'live'",
+    )
+    .bind(spec_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<Option<String>, _>("t"))
+}
+
+/// All specs currently in `deployed` status — the scheduler's work list.
+pub async fn list_deployed_specs(pool: &SqlitePool) -> Result<Vec<AgentSpecRecord>> {
+    let sql = format!(
+        "SELECT {SPEC_COLS} FROM cascade_agent_specs WHERE status = 'deployed' ORDER BY created_at ASC"
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    Ok(rows.iter().map(map_spec_record).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +977,52 @@ mod tests {
         let audit = list_audit(&pool, spec_id2, 10).await?;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].action, "sandbox_test");
+
+        // ── runtime ledger ──
+        assert_eq!(count_live_runs(&pool, spec_id2).await?, 0);
+        let live = insert_agent_run(
+            &pool,
+            &AgentRunInput {
+                spec_id: spec_id2,
+                mode: "live".into(),
+                status: "awaiting_approval".into(),
+                summary: "did real work".into(),
+                steps_json: "[]".into(),
+                anomalies_json: "[]".into(),
+                cost_usd: 0.01,
+                duration_ms: 500,
+            },
+        )
+        .await?;
+        assert_eq!(count_live_runs(&pool, spec_id2).await?, 1);
+        assert!(last_live_run_at(&pool, spec_id2).await?.is_some());
+
+        let action_id = insert_agent_action(
+            &pool,
+            &AgentActionInput {
+                run_id: live,
+                spec_id: spec_id2,
+                step: 1,
+                tool: "artifact.write".into(),
+                summary: "wrote a digest".into(),
+                content: Some("# Digest".into()),
+                artifact_path: Some("/tmp/x.md".into()),
+                reversible: true,
+                mutating: true,
+                state: "pending".into(),
+            },
+        )
+        .await?;
+        let acts = list_actions_for_spec(&pool, spec_id2, 10).await?;
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].state, "pending");
+        update_agent_action_state(&pool, action_id, "committed").await?;
+        assert_eq!(get_agent_action(&pool, action_id).await?.unwrap().state, "committed");
+
+        update_agent_spec_status(&pool, spec_id2, "deployed", None, None).await?;
+        let deployed = list_deployed_specs(&pool).await?;
+        assert_eq!(deployed.len(), 1);
+        assert_eq!(deployed[0].id, spec_id2);
         Ok(())
     }
 }

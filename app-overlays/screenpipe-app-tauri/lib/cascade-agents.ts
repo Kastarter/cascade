@@ -53,6 +53,7 @@ export interface RequiredInput {
 export interface WorkflowStep {
   step: number;
   action: string;
+  tool: string | null;
   decisionPoint: string | null;
   approvalRequired: boolean;
 }
@@ -69,6 +70,7 @@ export interface AgentSpecDoc {
   rollbackPath: string;
   estimatedCostUsd: number;
   estimatedTimeSavedMin: number;
+  scheduleMinutes: number;
 }
 
 export type AgentSpecStatus =
@@ -102,6 +104,11 @@ export async function generateAgentSpec(suggestionId: number): Promise<CascadeAg
 
 export async function listAgentSpecs(limit = 50): Promise<CascadeAgentSpecView[]> {
   return invoke<CascadeAgentSpecView[]>("cascade_list_agent_specs", { limit });
+}
+
+/** Seed a ready-to-run demo agent (deployed + approved) for testing. */
+export async function seedDemoAgent(): Promise<CascadeAgentSpecView> {
+  return invoke<CascadeAgentSpecView>("cascade_seed_demo_agent", {});
 }
 
 // ─── #4 Deployment & Runtime Monitor ────────────────────────────────
@@ -165,4 +172,98 @@ export async function listAgentRuns(specId: number, limit = 20): Promise<Cascade
 
 export async function listAudit(specId: number, limit = 50): Promise<CascadeAuditEntry[]> {
   return invoke<CascadeAuditEntry[]>("cascade_list_audit", { specId, limit });
+}
+
+// ─── #4 Steady-state runtime (deployed agents actually do the work) ─
+
+export type ActionState = "committed" | "pending" | "rejected" | "rolled_back" | "failed";
+
+export interface CascadeAgentAction {
+  id: number;
+  runId: number;
+  specId: number;
+  step: number;
+  tool: string;
+  summary: string;
+  content: string | null;
+  artifactPath: string | null;
+  reversible: boolean;
+  mutating: boolean;
+  state: ActionState;
+  createdAt: string;
+}
+
+export interface CascadeRunResult {
+  runId: number;
+  specId: number;
+  status: "success" | "awaiting_approval" | "flagged" | "failed" | "running";
+  summary: string;
+  supervised: boolean;
+  pendingCount: number;
+  costUsd: number;
+  anomalies: Anomaly[];
+  actions: CascadeAgentAction[];
+}
+
+export async function runAgent(specId: number): Promise<CascadeRunResult> {
+  return invoke<CascadeRunResult>("cascade_run_agent", { specId });
+}
+
+export async function listAgentActions(specId: number, limit = 40): Promise<CascadeAgentAction[]> {
+  return invoke<CascadeAgentAction[]>("cascade_list_agent_actions", { specId, limit });
+}
+
+export async function approveAction(actionId: number): Promise<CascadeAgentAction> {
+  return invoke<CascadeAgentAction>("cascade_approve_action", { actionId });
+}
+
+export async function rejectAction(actionId: number): Promise<void> {
+  return invoke("cascade_reject_action", { actionId });
+}
+
+export async function rollbackAction(actionId: number): Promise<void> {
+  return invoke("cascade_rollback_action", { actionId });
+}
+
+export async function tickDueAgents(): Promise<number> {
+  return invoke<number>("cascade_tick_due_agents", {});
+}
+
+// ─── Computer use ("Cascade Hands") ─────────────────────────────────
+
+export interface ComputerAgentStatus {
+  specId: number;
+  awaitingApproval: boolean;
+}
+
+/** Start ONE deployed agent doing its task on-screen with its own cursor. */
+export async function startComputerTask(specId: number, goal?: string): Promise<void> {
+  return invoke("cascade_start_computer_task", { specId, goal: goal ?? null });
+}
+
+/** Start EVERY installed agent at once — one cursor per agent. */
+export async function startAllComputerTasks(): Promise<number> {
+  return invoke<number>("cascade_start_all_computer_tasks", {});
+}
+
+/** Stop one agent (specId), or all of them (specId = 0). */
+export async function stopComputerTask(specId = 0): Promise<void> {
+  return invoke("cascade_stop_computer_task", { specId });
+}
+
+/** Pause/resume an agent without shutting it down (specId 0 = all). */
+export async function pauseComputerTask(paused: boolean, specId = 0): Promise<void> {
+  return invoke("cascade_pause_computer_task", { specId, paused });
+}
+
+export async function approveComputerStep(specId: number): Promise<void> {
+  return invoke("cascade_approve_computer_step", { specId });
+}
+
+export async function rejectComputerStep(specId: number): Promise<void> {
+  return invoke("cascade_reject_computer_step", { specId });
+}
+
+export async function computerStatus(): Promise<ComputerAgentStatus[]> {
+  return invoke<ComputerAgentStatus[]>("cascade_computer_status", {});
 }

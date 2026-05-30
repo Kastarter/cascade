@@ -38,6 +38,12 @@ export function CascadeByokDialog({ open, onOpenChange, onSaved }: CascadeByokDi
     setSaving(true);
     try {
       await invoke("cascade_set_anthropic_key", { key });
+      // Cache for the in-browser Reel Q&A chat so it uses the same key.
+      try {
+        window.localStorage.setItem("cascade-anthropic-key", key);
+      } catch {
+        /* non-fatal */
+      }
       toast.success("Anthropic key saved to Keychain");
       setKey("");
       onSaved();

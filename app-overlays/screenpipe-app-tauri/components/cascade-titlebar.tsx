@@ -20,7 +20,8 @@ export function CascadeTitlebar() {
   const pathname = usePathname();
   const onCascadesRoute = pathname === "/cascades" || pathname === "/today";
   const onManagerRoute = pathname === "/manager";
-  const onReelRoute = !onCascadesRoute && !onManagerRoute;
+  const onSettingsRoute = pathname === "/settings";
+  const onReelRoute = !onCascadesRoute && !onManagerRoute && !onSettingsRoute;
 
   useEffect(() => {
     const idA = setInterval(() => setTick((x) => x + 1), 1200);
@@ -89,6 +90,12 @@ export function CascadeTitlebar() {
             onClick={() => router.push("/manager")}
           >
             Manager
+          </button>
+          <button
+            style={switcherBtn(onSettingsRoute)}
+            onClick={() => router.push("/settings")}
+          >
+            Settings
           </button>
         </div>
 

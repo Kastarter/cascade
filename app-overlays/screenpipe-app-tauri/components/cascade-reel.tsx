@@ -9,6 +9,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   appColor,
   appDisplayName,
@@ -23,6 +24,55 @@ import {
   toMinutesFromMidnight,
 } from "@/lib/cascade-api";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
+
+const SITE_NAMES: Record<string, string> = {
+  linkedin: "LinkedIn",
+  github: "GitHub",
+  youtube: "YouTube",
+  gmail: "Gmail",
+  google: "Google",
+  docs: "Google Docs",
+  notion: "Notion",
+  figma: "Figma",
+  slack: "Slack",
+  x: "X",
+  twitter: "X",
+  stackoverflow: "Stack Overflow",
+  reddit: "Reddit",
+  chatgpt: "ChatGPT",
+  claude: "Claude",
+  railway: "Railway",
+  vercel: "Vercel",
+};
+
+// Turn a browser URL into a friendly site name, e.g. linkedin.com → "LinkedIn".
+function siteFromUrl(url: string | null | undefined): string {
+  if (!url) return "";
+  try {
+    const host = new URL(url.includes("://") ? url : `https://${url}`).hostname.replace(/^www\./, "");
+    const core = host.split(".").slice(-2, -1)[0] ?? host; // "messaging.linkedin.com" → "linkedin"
+    if (SITE_NAMES[core]) return SITE_NAMES[core];
+    return core.charAt(0).toUpperCase() + core.slice(1);
+  } catch {
+    return "";
+  }
+}
+
+// A clean, short title for the current moment. Prefer the real window/tab title;
+// for browsers (where the OS title is often empty) fall back to the site from
+// the URL — so it reads "LinkedIn", not just "Chrome". We never scrape OCR (that
+// grabs the tab strip / menu bar and reads as garbage); the scene shows the rest.
+function describeMoment(
+  seg: CascadeSegment | null | undefined,
+  frame: CascadeFrame | null | undefined,
+): string {
+  const app = (seg?.app ?? frame?.app_name ?? "").trim().toLowerCase();
+  const win = (frame?.window_name ?? "").trim();
+  if (win && win.toLowerCase() !== app && win.length <= 80) return win;
+  const site = siteFromUrl(frame?.browser_url);
+  if (site && site.toLowerCase() !== app) return site;
+  return "";
+}
 
 export function CascadeReel() {
   const [frames, setFrames] = useState<CascadeFrame[]>([]);
@@ -141,12 +191,15 @@ export function CascadeReel() {
     return () => clearInterval(id);
   }, [playing, speed, dayEnd]);
 
-  // Observation line for current segment.
-  const observation = currentSeg
-    ? `${appDisplayName(currentSeg.app)} — ${currentSeg.title}.`
-    : currentFrame
-      ? `${appDisplayName(currentFrame.app_name)} — ${currentFrame.window_name ?? "captured"}.`
-      : "Idle — no capture at this time.";
+  // What's actually inside the current moment. window_name is often empty
+  // (e.g. Chrome), so we fall back to a description pulled from the OCR text.
+  const momentApp = appDisplayName(currentSeg?.app ?? currentFrame?.app_name ?? null);
+  const realTitle = describeMoment(currentSeg, currentFrame);
+  const observation = currentSeg || currentFrame
+    ? realTitle
+      ? `${momentApp} — ${realTitle}`
+      : momentApp
+    : "Idle — no capture at this time.";
 
   const segColor = currentSeg
     ? appColor(currentSeg.app)
@@ -232,6 +285,24 @@ export function CascadeReel() {
               />
               {appDisplayName(currentSeg?.app ?? currentFrame?.app_name ?? null)}
             </span>
+            {/* What's actually happening in that app — window title or OCR-derived. */}
+            {realTitle && (
+              <span
+                style={{
+                  fontFamily: "var(--cascade-mono)",
+                  fontSize: 10.5,
+                  color: "var(--cascade-text-3)",
+                  maxWidth: 260,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  textAlign: "right",
+                }}
+                title={realTitle}
+              >
+                {realTitle}
+              </span>
+            )}
           </div>
         </div>
 
@@ -951,10 +1022,25 @@ function SceneChatPanel({
   const [keyInput, setKeyInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Detect whether the Anthropic key is set
+  // Detect whether the Anthropic key is set. Source of truth is the key saved
+  // in Settings (Keychain); localStorage is just a cache for fast reads.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    setHasKey(!!window.localStorage.getItem("cascade-anthropic-key"));
+    (async () => {
+      if (window.localStorage.getItem("cascade-anthropic-key")) {
+        setHasKey(true);
+        return;
+      }
+      try {
+        const k = await invoke<string | null>("cascade_get_anthropic_key");
+        if (k) {
+          window.localStorage.setItem("cascade-anthropic-key", k);
+          setHasKey(true);
+        }
+      } catch {
+        /* non-fatal */
+      }
+    })();
   }, []);
 
   // Reset chat when segment changes
@@ -967,12 +1053,16 @@ function SceneChatPanel({
     const k = keyInput.trim();
     if (!k.startsWith("sk-ant-")) return;
     window.localStorage.setItem("cascade-anthropic-key", k);
+    // Persist to the Keychain too so the agents (detector/generator/computer-use)
+    // and the Reel chat all share one key.
+    invoke("cascade_set_anthropic_key", { key: k }).catch(() => {});
     setHasKey(true);
     setKeyInput("");
   };
 
   const clearKey = () => {
     window.localStorage.removeItem("cascade-anthropic-key");
+    invoke("cascade_clear_anthropic_key").catch(() => {});
     setHasKey(false);
   };
 
@@ -1345,13 +1435,13 @@ HARD RULES — NEVER VIOLATE:
 4. No fishing. Refuse questions about other people's screens or anything not derivable from this moment.
 5. No PII echoing. If OCR text contains anything that looks like a password, API key, credit card, or token, do not include it. Say "[sensitive content detected, hidden]" if relevant.
 
-ANSWER SHAPE:
+ANSWER SHAPE — BE BRIEF BUT COMPLETE:
 - Lead with the direct answer in ONE sentence. No preamble. No "Let me", "I'll", "Based on", "Looking at", "Sure".
-- Then up to 3 short bullet points of supporting evidence, each citing a timestamp like (2:34 PM) or the app/window context.
-- Maximum 6 lines total. Stop when the question is answered.
-- Citations format: (HH:MMam/pm, AppName · window detail).
-- Don't end with "Want me to dig deeper?" or "Anything else?". User asks follow-ups if needed.
-- Never use markdown bold (**...**) anywhere in the answer. Plain text only.
+- Then AT MOST 2 short bullets of the key supporting facts (only if they add real info). Each ≤ 1 line.
+- HARD CAP: 4 lines total. Be terse — pack the information densely, cut every filler word. Never pad.
+- Cite inline only when it matters: (HH:MMam/pm, App · detail). Don't cite every line.
+- Don't end with "Want me to dig deeper?" or "Anything else?".
+- Never use markdown bold (**...**). Plain text only.
 
 REFUSALS:
 - Zero evidence: "I don't see evidence of that in this moment."
@@ -1386,9 +1476,19 @@ function redactPII(text: string): string {
     .replace(/(password|passwd|pwd|secret)\s*[:=]\s*\S+/gi, "$1: [REDACTED]");
 }
 
+async function getAnthropicKey(): Promise<string> {
+  // Prefer the key saved in Settings (Keychain); fall back to the localStorage cache.
+  try {
+    const k = await invoke<string | null>("cascade_get_anthropic_key");
+    if (k) return k;
+  } catch {
+    /* fall through to cache */
+  }
+  return (typeof window !== "undefined" && (window.localStorage.getItem("cascade-anthropic-key") ?? "")) || "";
+}
+
 async function askClaude(question: string, frame: CascadeFrame | null): Promise<string> {
-  const key =
-    (typeof window !== "undefined" && (window.localStorage.getItem("cascade-anthropic-key") ?? "")) || "";
+  const key = await getAnthropicKey();
   if (!key) {
     return "I need an Anthropic API key to answer. Add one in Settings (key starts with sk-ant-).";
   }
@@ -1420,7 +1520,7 @@ ${safeText || "(no text captured)"}
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 500,
+      max_tokens: 260,
       system: CASCADE_SYSTEM_PROMPT,
       messages: [{ role: "user", content: `${context}\n\nQUESTION: ${question}` }],
     }),

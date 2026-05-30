@@ -18,13 +18,22 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
 import {
+  CascadeAgentAction,
   CascadeAgentRun,
   CascadeAgentSpecView,
   CascadeAuditEntry,
+  approveAction,
+  listAgentActions,
   listAgentRuns,
   listAgentSpecs,
   listAudit,
+  rejectAction,
+  rollbackAction,
+  runAgent,
   sandboxTest,
+  seedDemoAgent,
+  startAllComputerTasks,
+  startComputerTask,
   transitionAgentSpec,
 } from "@/lib/cascade-agents";
 
@@ -115,6 +124,49 @@ export function CascadesView() {
       s.status === "paused" ? `Resumed “${s.name}”` : `Paused “${s.name}”`);
   const onUninstall = (s: CascadeAgentSpecView) =>
     run(s.id, () => transitionAgentSpec(s.id, "reject"), `Uninstalled “${s.name}”`);
+  const [lastRunSummary, setLastRunSummary] = useState<Record<number, string>>({});
+  const onRunNow = (s: CascadeAgentSpecView) =>
+    run(
+      s.id,
+      async () => {
+        const r = await runAgent(s.id);
+        setLastRunSummary((m) => ({ ...m, [s.id]: r.summary }));
+      },
+      `${s.name} ran — see the work below`,
+    );
+  const onWatch = (s: CascadeAgentSpecView) =>
+    run(
+      s.id,
+      () => startComputerTask(s.id),
+      `${s.name} is doing it on-screen — watch its cursor`,
+    );
+  const onWatchAll = async () => {
+    setError(null);
+    try {
+      const n = await startAllComputerTasks();
+      setNote(
+        n === 0
+          ? "No installed agents to run yet."
+          : `${n} agent${n === 1 ? "" : "s"} now working on-screen — one cursor each.`,
+      );
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    }
+  };
+  const [seeding, setSeeding] = useState(false);
+  const onSeedDemo = async () => {
+    setSeeding(true);
+    setError(null);
+    try {
+      const s = await seedDemoAgent();
+      await refresh();
+      setNote(`Generated “${s.name}” via the pipeline — it's deployed in Running. Hit Start & watch.`);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setSeeding(false);
+    }
+  };
 
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
@@ -151,6 +203,14 @@ export function CascadesView() {
             You see the full spec — every tool it can touch, every step, and how to undo it — before anything runs.
             It only runs for real after a sandbox test passes and you approve it. Pause or uninstall anytime.
           </p>
+          <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 10 }}>
+            <PrimaryBtn disabled={seeding} onClick={onSeedDemo}>
+              {seeding ? "Generating via the workflow…" : "+ Generate a demo agent"}
+            </PrimaryBtn>
+            <span style={{ fontSize: 12, color: "var(--cascade-text-4)" }}>
+              Runs the detector on your real activity, generates a real agent (#3), and deploys it — takes a few seconds.
+            </span>
+          </div>
         </div>
 
         {error && <ErrorBanner message={error} onRetry={refresh} />}
@@ -205,16 +265,30 @@ export function CascadesView() {
               }
             />
 
+            {buckets.running.length > 1 && (
+              <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -18 }}>
+                <PrimaryBtn onClick={onWatchAll}>
+                  ▶ Watch all {buckets.running.length} agents work on-screen
+                </PrimaryBtn>
+              </div>
+            )}
+
             <StageSection
               title="3 · Running on this Mac"
-              sub="Active helpers. Every execution is audit-logged on this device. Pause anytime; uninstall when you like."
+              sub="Active helpers doing real work on their schedule. The first 3 runs are supervised — you approve each thing the agent produces. Every action is audit-logged and reversible. Pause or uninstall anytime."
               specs={buckets.running}
               busyId={busyId}
+              lastRunSummary={lastRunSummary}
+              showRuntime
               renderActions={(s) => (
                 <>
-                  <GhostBtn disabled={busyId === s.id} onClick={() => onPause(s)}>
-                    {s.status === "paused" ? "Resume" : "Pause"}
-                  </GhostBtn>
+                  <PrimaryBtn
+                    disabled={busyId === s.id}
+                    onClick={() => onWatch(s)}
+                    title="Start the agent — its cursor does the task on-screen in the live box"
+                  >
+                    {busyId === s.id ? "Starting…" : "▶ Start & watch"}
+                  </PrimaryBtn>
                   <GhostBtn disabled={busyId === s.id} onClick={() => onUninstall(s)}>
                     Uninstall
                   </GhostBtn>
@@ -256,6 +330,8 @@ function StageSection({
   busyId,
   renderActions,
   dim,
+  showRuntime,
+  lastRunSummary,
 }: {
   title: string;
   sub: string;
@@ -263,6 +339,8 @@ function StageSection({
   busyId: number | null;
   renderActions: (s: CascadeAgentSpecView) => React.ReactNode;
   dim?: boolean;
+  showRuntime?: boolean;
+  lastRunSummary?: Record<number, string>;
 }) {
   if (specs.length === 0) return null;
   return (
@@ -273,7 +351,14 @@ function StageSection({
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
         {specs.map((s) => (
-          <SpecCard key={s.id} spec={s} actions={renderActions(s)} busy={busyId === s.id} />
+          <SpecCard
+            key={s.id}
+            spec={s}
+            actions={renderActions(s)}
+            busy={busyId === s.id}
+            showRuntime={showRuntime}
+            lastRunSummary={lastRunSummary?.[s.id]}
+          />
         ))}
       </div>
     </section>
@@ -282,10 +367,32 @@ function StageSection({
 
 // ─── Spec card ──────────────────────────────────────────────────────
 
-function SpecCard({ spec, actions }: { spec: CascadeAgentSpecView; actions: React.ReactNode; busy: boolean }) {
+function SpecCard({
+  spec,
+  actions,
+  showRuntime,
+  lastRunSummary,
+}: {
+  spec: CascadeAgentSpecView;
+  actions: React.ReactNode;
+  busy: boolean;
+  showRuntime?: boolean;
+  lastRunSummary?: string;
+}) {
   const [open, setOpen] = useState(false);
   const [runs, setRuns] = useState<CascadeAgentRun[]>([]);
   const [audit, setAudit] = useState<CascadeAuditEntry[]>([]);
+  const [agentActions, setAgentActions] = useState<CascadeAgentAction[]>([]);
+  const [actionBusy, setActionBusy] = useState<number | null>(null);
+
+  const loadActions = useCallback(async () => {
+    if (!showRuntime) return;
+    try {
+      setAgentActions(await listAgentActions(spec.id, 30));
+    } catch {
+      /* non-fatal */
+    }
+  }, [showRuntime, spec.id]);
 
   useEffect(() => {
     if (!open) return;
@@ -297,6 +404,7 @@ function SpecCard({ spec, actions }: { spec: CascadeAgentSpecView; actions: Reac
           setRuns(r);
           setAudit(a);
         }
+        await loadActions();
       } catch {
         /* non-fatal */
       }
@@ -304,8 +412,26 @@ function SpecCard({ spec, actions }: { spec: CascadeAgentSpecView; actions: Reac
     return () => {
       cancelled = true;
     };
-  }, [open, spec.id, spec.status]);
+  }, [open, spec.id, spec.status, lastRunSummary, loadActions]);
 
+  // Pending approvals should surface even when the card is collapsed.
+  useEffect(() => {
+    if (showRuntime) void loadActions();
+  }, [showRuntime, lastRunSummary, loadActions]);
+
+  const runAction = async (id: number, fn: () => Promise<unknown>) => {
+    setActionBusy(id);
+    try {
+      await fn();
+      await loadActions();
+    } catch (e) {
+      console.error("action failed", e);
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const pending = agentActions.filter((a) => a.state === "pending");
   const lastRun = runs[0];
   const d = spec.spec;
 
@@ -351,8 +477,45 @@ function SpecCard({ spec, actions }: { spec: CascadeAgentSpecView; actions: Reac
             </div>
           )}
 
+          {showRuntime && (
+            <div style={{ marginTop: 12 }}>
+              {spec.status === "paused" && (
+                <div style={anomalyBoxStyle}>
+                  Paused. {pending.length > 0 ? "Resolve the items below, then resume." : "Resume to let it run again."}
+                </div>
+              )}
+              {lastRunSummary && (
+                <div style={{ fontSize: 12.5, color: "var(--cascade-text-2)", marginBottom: 8 }}>
+                  Last run — {lastRunSummary}
+                </div>
+              )}
+              <div style={{ fontSize: 11.5, color: "var(--cascade-text-4)", marginBottom: 8 }}>
+                Runs about every {formatCadence(d.scheduleMinutes)} on its own.
+              </div>
+
+              {pending.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ ...labelStyle, fontSize: 9.5, marginBottom: 6, color: "var(--cascade-accent)" }}>
+                    Awaiting your approval — supervised
+                  </div>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {pending.map((a) => (
+                      <ActionRow
+                        key={a.id}
+                        action={a}
+                        busy={actionBusy === a.id}
+                        onApprove={() => runAction(a.id, () => approveAction(a.id))}
+                        onReject={() => runAction(a.id, () => rejectAction(a.id))}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           <button onClick={() => setOpen((v) => !v)} style={discloseBtnStyle}>
-            {open ? "▾ Hide details" : "▸ Spec, sandbox run & audit"}
+            {open ? "▾ Hide details" : showRuntime ? "▸ Spec, work done & audit" : "▸ Spec, sandbox run & audit"}
           </button>
         </div>
 
@@ -361,8 +524,62 @@ function SpecCard({ spec, actions }: { spec: CascadeAgentSpecView; actions: Reac
         </div>
       </div>
 
-      {open && <SpecDetails spec={spec} lastRun={lastRun} audit={audit} />}
+      {open && (
+        <SpecDetails
+          spec={spec}
+          lastRun={lastRun}
+          audit={audit}
+          actions={showRuntime ? agentActions : []}
+          actionBusy={actionBusy}
+          onRollback={(id) => runAction(id, () => rollbackAction(id))}
+        />
+      )}
     </article>
+  );
+}
+
+function formatCadence(minutes: number): string {
+  if (!minutes || minutes <= 0) return "day";
+  if (minutes >= 1440) {
+    const d = Math.round(minutes / 1440);
+    return d <= 1 ? "day" : `${d} days`;
+  }
+  if (minutes >= 60) {
+    const h = Math.round(minutes / 60);
+    return h <= 1 ? "hour" : `${h} hours`;
+  }
+  return `${minutes} min`;
+}
+
+function ActionRow({
+  action,
+  busy,
+  onApprove,
+  onReject,
+}: {
+  action: CascadeAgentAction;
+  busy: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const [show, setShow] = useState(false);
+  return (
+    <div style={{ border: "1px solid var(--cascade-border)", borderRadius: 8, padding: "10px 12px", background: "var(--cascade-panel)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-accent)" }}>{action.tool}</span>
+        <span style={{ flex: 1, fontSize: 12.5, color: "var(--cascade-text-2)" }}>{action.summary}</span>
+        <GhostBtn disabled={busy} onClick={onApprove}>Approve</GhostBtn>
+        <GhostBtn disabled={busy} onClick={onReject}>Reject</GhostBtn>
+      </div>
+      {action.content && (
+        <>
+          <button onClick={() => setShow((v) => !v)} style={{ ...discloseBtnStyle, marginTop: 8 }}>
+            {show ? "▾ Hide what it produced" : "▸ Preview what it produced"}
+          </button>
+          {show && <pre style={preStyle}>{action.content}</pre>}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -370,12 +587,19 @@ function SpecDetails({
   spec,
   lastRun,
   audit,
+  actions,
+  actionBusy,
+  onRollback,
 }: {
   spec: CascadeAgentSpecView;
   lastRun?: CascadeAgentRun;
   audit: CascadeAuditEntry[];
+  actions: CascadeAgentAction[];
+  actionBusy: number | null;
+  onRollback: (id: number) => void;
 }) {
   const d = spec.spec;
+  const doneActions = actions.filter((a) => a.state !== "pending");
   return (
     <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px dashed var(--cascade-border)", display: "grid", gap: 16 }}>
       {spec.validationNotes && (
@@ -416,6 +640,36 @@ function SpecDetails({
       <DetailBlock title="How to undo (rollback)">
         <div style={{ fontSize: 12.5, color: "var(--cascade-text-2)", lineHeight: 1.5 }}>{d.rollbackPath}</div>
       </DetailBlock>
+
+      {doneActions.length > 0 && (
+        <DetailBlock title="Work this agent has done">
+          <div style={{ display: "grid", gap: 8 }}>
+            {doneActions.map((a) => (
+              <div key={a.id} style={{ border: "1px solid var(--cascade-border)", borderRadius: 8, padding: "9px 12px", background: "var(--cascade-panel)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-accent)" }}>{a.tool}</span>
+                  <span style={{ flex: 1, fontSize: 12.5, color: "var(--cascade-text-2)" }}>{a.summary}</span>
+                  <Badge
+                    label={a.state.replace(/_/g, " ")}
+                    tone={a.state === "rolled_back" || a.state === "rejected" || a.state === "failed" ? "warn" : "neutral"}
+                  />
+                  {a.reversible && a.state === "committed" && (
+                    <GhostBtn disabled={actionBusy === a.id} onClick={() => onRollback(a.id)}>
+                      Undo
+                    </GhostBtn>
+                  )}
+                </div>
+                {a.artifactPath && (
+                  <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-4)", marginTop: 4 }}>
+                    {a.artifactPath}
+                  </div>
+                )}
+                {a.content && <pre style={preStyle}>{a.content}</pre>}
+              </div>
+            ))}
+          </div>
+        </DetailBlock>
+      )}
 
       {lastRun && (
         <DetailBlock title={`Last sandbox run · ${lastRun.status}`}>
@@ -495,9 +749,9 @@ function Badge({ label, tone = "neutral" }: { label: string; tone?: "neutral" | 
   );
 }
 
-function PrimaryBtn({ children, onClick, disabled }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean }) {
+function PrimaryBtn({ children, onClick, disabled, title }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean; title?: string }) {
   return (
-    <button onClick={onClick} disabled={disabled} style={{ ...btnBase, background: "var(--cascade-accent)", color: "var(--cascade-on-accent)", border: "none", opacity: disabled ? 0.5 : 1 }}>
+    <button onClick={onClick} disabled={disabled} title={title} style={{ ...btnBase, background: "var(--cascade-accent)", color: "var(--cascade-on-accent)", border: "none", opacity: disabled ? 0.5 : 1 }}>
       {children}
     </button>
   );
@@ -599,6 +853,23 @@ const discloseBtnStyle: React.CSSProperties = {
   fontSize: 11,
   letterSpacing: 0.6,
   color: "var(--cascade-text-3)",
+};
+
+const preStyle: React.CSSProperties = {
+  marginTop: 8,
+  marginBottom: 0,
+  padding: "10px 12px",
+  borderRadius: 8,
+  background: "var(--cascade-bg)",
+  border: "1px solid var(--cascade-border)",
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 11,
+  lineHeight: 1.5,
+  color: "var(--cascade-text-2)",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  maxHeight: 280,
+  overflow: "auto",
 };
 
 const anomalyBoxStyle: React.CSSProperties = {

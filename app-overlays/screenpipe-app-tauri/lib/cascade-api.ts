@@ -20,6 +20,7 @@ export interface CascadeFrame {
   timestamp: string;          // ISO 8601
   app_name: string | null;
   window_name: string | null;
+  browser_url: string | null; // active tab URL when the app is a browser
   text: string;               // OCR
   file_path?: string;         // path to the video file containing this frame
   offset_index?: number;      // frame index within the video file
@@ -65,6 +66,7 @@ export async function fetchOcrFrames(opts: {
       timestamp: it.content?.timestamp ?? it.timestamp ?? new Date().toISOString(),
       app_name: it.content?.app_name ?? it.app_name ?? null,
       window_name: it.content?.window_name ?? it.window_name ?? null,
+      browser_url: it.content?.browser_url ?? it.browser_url ?? null,
       text: it.content?.text ?? it.text ?? "",
       file_path: it.content?.file_path ?? it.file_path,
       offset_index: it.content?.offset_index ?? it.offset_index,
@@ -148,8 +150,9 @@ export function minToHHMMSS(min: number): string {
 }
 
 export function durMins(mins: number): string {
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
+  const total = Math.max(1, Math.round(mins)); // round; never show a fractional minute
+  const h = Math.floor(total / 60);
+  const m = total % 60;
   if (h === 0) return `${m}m`;
   if (m === 0) return `${h}h`;
   return `${h}h ${m}m`;

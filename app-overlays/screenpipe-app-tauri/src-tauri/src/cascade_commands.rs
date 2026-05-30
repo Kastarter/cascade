@@ -121,6 +121,40 @@ pub async fn cascade_key_status() -> Result<CascadeKeyStatus, String> {
     }
 }
 
+/// Return the saved Anthropic key from the Keychain, so the in-browser Reel
+/// Q&A chat uses the SAME key the Settings page saved (single source of truth).
+/// The key already lives in the JS context for that chat's direct API call, so
+/// exposing it here is not a new disclosure.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_get_anthropic_key() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-a",
+                ANTHROPIC_KEY_NAME,
+                "-s",
+                CASCADE_KEYCHAIN_SERVICE,
+                "-w",
+            ])
+            .output()
+            .map_err(|e| format!("keychain read failed: {e}"))?;
+        if out.status.success() {
+            let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !key.is_empty() {
+                return Ok(Some(key));
+            }
+        }
+        return Ok(None);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn cascade_clear_anthropic_key() -> Result<(), String> {

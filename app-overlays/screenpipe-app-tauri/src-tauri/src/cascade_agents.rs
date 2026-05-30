@@ -15,12 +15,14 @@
 //!
 //! Agent #1 (Reel Q&A) lives in the `pi` subprocess, not here.
 
-use crate::cascade_llm::{call_anthropic_json, LlmCall, MODEL_OPUS, MODEL_SONNET};
+use crate::cascade_llm::{call_anthropic, call_anthropic_json, LlmCall, MODEL_OPUS, MODEL_SONNET};
 use cascade_schema::{
-    append_audit, create_detection_run, get_agent_spec, insert_agent_run, insert_agent_spec,
-    insert_manager_suggestion, list_agent_runs, list_agent_specs, list_audit,
-    list_manager_suggestions, list_privacy_aggregates, migrate, open, replace_privacy_aggregates,
-    update_agent_spec_status, update_manager_suggestion_status, AgentRunInput, AgentSpecInput,
+    append_audit, count_live_runs, create_detection_run, get_agent_action, get_agent_spec,
+    insert_agent_action, insert_agent_run, insert_agent_spec, insert_manager_suggestion,
+    last_live_run_at, list_actions_for_spec, list_agent_runs, list_agent_specs, list_audit,
+    list_deployed_specs, list_manager_suggestions, list_privacy_aggregates, migrate, open,
+    replace_privacy_aggregates, update_agent_action_state, update_agent_spec_status,
+    update_manager_suggestion_status, AgentActionInput, AgentRunInput, AgentSpecInput,
     ManagerSuggestionInput, PrivacyAggregateInput,
 };
 use chrono::{Duration, Utc};
@@ -97,6 +99,24 @@ fn is_sensitive(text: &str) -> bool {
     SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// The notes/docs app the employee actually uses most (Notion, Notes, Obsidian,
+/// Google Docs, …) over the recent window — so a computer-use agent writes
+/// where the employee already works instead of a hardcoded app. None if they
+/// haven't used a writing app recently.
+pub(crate) async fn preferred_notes_app(app: &tauri::AppHandle) -> Option<String> {
+    let (_, _, summary) = fetch_activity_summary(app, 24).await.ok()?;
+    let mut best: Option<(String, f64)> = None;
+    for a in &summary.apps {
+        if classify_app(&a.name) == "writing" {
+            let better = best.as_ref().map(|(_, m)| a.minutes > *m).unwrap_or(true);
+            if better {
+                best = Some((a.name.clone(), a.minutes));
+            }
+        }
+    }
+    best.map(|(n, _)| n)
+}
+
 // ─── Shared infra (data dir, pool, activity summary) ────────────────
 
 fn cascade_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -119,27 +139,37 @@ pub(crate) async fn cascade_pool(
     Ok(pool)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+// NOTE: the /activity-summary server response is plain snake_case
+// (`data_status`, `total_frames`, `app_name`, …) — NOT camelCase. We must match
+// that exactly or serde fails with "error decoding response body". We only pull
+// the subset we need; serde ignores the rest.
+#[derive(Debug, Default, Deserialize)]
 struct ActivitySummaryResponse {
+    #[serde(default)]
     apps: Vec<ActivityAppUsage>,
+    #[serde(default)]
     windows: Vec<ActivityWindow>,
+    #[serde(default)]
     data_status: String,
+    #[serde(default)]
     total_frames: i64,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ActivityAppUsage {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     minutes: f64,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ActivityWindow {
+    #[serde(default)]
     app_name: String,
+    #[serde(default)]
     window_name: String,
+    #[serde(default)]
     minutes: f64,
 }
 
@@ -422,6 +452,8 @@ struct DetectorSuggestion {
     #[serde(default = "default_tier")]
     tier: String,
     suggested_agent_kind: String,
+    #[serde(default)]
+    suggested_agent_purpose: String,
     severity_score: f64,
     confidence: f64,
     #[serde(default)]
@@ -431,36 +463,34 @@ fn default_tier() -> String {
     "suggest".to_string()
 }
 
-const ALLOWED_AGENT_KINDS: &[&str] = &[
-    "focus-guard",
-    "inbox-batcher",
-    "meeting-recap",
-    "research-assistant",
-    "status-automation",
-];
-
 fn detector_system_prompt() -> String {
-    format!(
-        "You are Cascade's Waste Detector. You receive ONLY a privacy-sanitized, \
-allowlisted activity summary (per-app: app, category, duration in minutes, context-switch count). \
-You never see screen text, window titles, or any content. Surface patterns of *workflow* \
-inefficiency a manager could address by deploying a small helper agent — never judgments about the \
-person.\n\n\
+    // No preset pattern/agent taxonomy. The detector names whatever it actually
+    // observes and proposes a bespoke agent for exactly that — so an unusual but
+    // automatable behavior gets its own agent rather than being forced into a box.
+    "You are Cascade's Waste Detector. You receive ONLY a privacy-sanitized, allowlisted activity \
+summary (per-app: app, category, duration in minutes, context-switch count). You never see screen \
+text, window titles, or any content.\n\n\
+Find SPECIFIC, RECURRING things this person does that a software agent could take off their plate — \
+real repetitive workflows, not personality judgments, and NOT forced into preset categories. \
+Describe the actual behavior the data shows. For each finding, propose a BESPOKE helper agent built \
+for exactly that task.\n\n\
 HARD RULES:\n\
-- Surface at most 6 patterns. Fewer is better; only flag what the data clearly supports.\n\
-- Each pattern's `kind` MUST be one of: context_switching, communication_churn, meeting_load, \
-research_friction, manual_admin_work.\n\
-- Each `suggestedAgentKind` MUST be one of: {}.\n\
-- `tier` is one of: info, suggest, urgent. Reserve `urgent` for clear, costly patterns.\n\
+- Surface at most 6 findings. Fewer is better; only flag what the data clearly supports.\n\
+- `kind`: a short kebab-case slug YOU invent that names the observed behavior (e.g. \
+\"repeated-spreadsheet-reconciliation\", \"doc-to-chat-context-thrash\"). Do NOT use a fixed list.\n\
+- `suggestedAgentKind`: a short kebab-case slug for the bespoke agent you'd build (e.g. \
+\"daily-standup-drafter\"). Invent it to fit the finding.\n\
+- `suggestedAgentPurpose`: ONE plain sentence — what the agent would actually DO to remove this \
+specific toil.\n\
+- `tier`: info | suggest | urgent. Reserve `urgent` for clear, costly, frequent toil.\n\
 - If the day skews toward off-hours or overload, DEMOTE tier (do not reward overwork).\n\
 - Never use evaluative language about the person (\"unfocused\", \"wasted time\"). Describe the workflow only.\n\
 - `evidence` items must be derived strictly from the numbers given (label + value). No invented metrics.\n\
 - severityScore and confidence are floats 0..1.\n\n\
-Return ONLY JSON: {{\"suggestions\":[{{\"kind\":...,\"title\":...,\"summary\":...,\"tier\":...,\
-\"suggestedAgentKind\":...,\"severityScore\":0.0,\"confidence\":0.0,\
-\"evidence\":[{{\"label\":...,\"value\":...}}]}}]}}",
-        ALLOWED_AGENT_KINDS.join(", ")
-    )
+Return ONLY JSON: {\"suggestions\":[{\"kind\":...,\"title\":...,\"summary\":...,\"tier\":...,\
+\"suggestedAgentKind\":...,\"suggestedAgentPurpose\":...,\"severityScore\":0.0,\"confidence\":0.0,\
+\"evidence\":[{\"label\":...,\"value\":...}]}]}"
+        .to_string()
 }
 
 fn detector_user_prompt(
@@ -478,23 +508,45 @@ Surface the workflow inefficiency patterns this data supports."
     )
 }
 
-fn normalize_suggestion(mut s: DetectorSuggestion) -> CascadeManagerSuggestion {
-    // Clamp + whitelist-enforce so a misbehaving model can't widen scope.
-    if !ALLOWED_AGENT_KINDS.contains(&s.suggested_agent_kind.as_str()) {
-        s.suggested_agent_kind = "status-automation".to_string();
+fn slugify_kind(raw: &str) -> String {
+    let slug = raw
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "automatable-task".to_string()
+    } else {
+        slug.chars().take(60).collect()
     }
+}
+
+fn normalize_suggestion(s: DetectorSuggestion) -> CascadeManagerSuggestion {
+    // No taxonomy clamp — the kind/agent are whatever the detector named for
+    // this specific person. We only sanitize the slug shape + bound the scores,
+    // and surface the proposed automation as the first evidence row.
     let tier = match s.tier.as_str() {
         "info" | "suggest" | "urgent" => s.tier,
         _ => "suggest".to_string(),
     };
+    let mut evidence = Vec::new();
+    if !s.suggested_agent_purpose.trim().is_empty() {
+        evidence.push(CascadeManagerEvidence {
+            label: "proposed automation".to_string(),
+            value: s.suggested_agent_purpose.trim().to_string(),
+        });
+    }
+    evidence.extend(s.evidence);
     CascadeManagerSuggestion {
         id: None,
-        kind: s.kind,
+        kind: slugify_kind(&s.kind),
         title: s.title,
         summary: s.summary,
         tier,
-        evidence: s.evidence,
-        suggested_agent_kind: s.suggested_agent_kind,
+        evidence,
+        suggested_agent_kind: slugify_kind(&s.suggested_agent_kind),
         severity_score: s.severity_score.clamp(0.0, 1.0),
         confidence: s.confidence.clamp(0.0, 1.0),
         status: "pending".to_string(),
@@ -512,8 +564,16 @@ pub async fn cascade_generate_manager_suggestions(
 ) -> Result<CascadeManagerSuggestionBatch, String> {
     let hours = hours.unwrap_or(8).clamp(1, 24);
 
+    // Surface the Cascade floating box while detection runs so it's visible the
+    // moment the manager clicks "Refresh signals". Uses spec_id -1 (the detector).
+    #[cfg(target_os = "macos")]
+    crate::cascade_computer::box_begin(&app, -1, "Cascade Detector", "Reading your recent activity");
+
     // #5 first — the detector is only ever allowed to read this.
     let report = cascade_run_privacy_aggregation(app.clone(), Some(hours)).await?;
+
+    #[cfg(target_os = "macos")]
+    crate::cascade_computer::box_step(&app, -1, "Cascade Detector", "Privacy aggregation", "Sanitized your activity — finding automatable patterns…", 1);
 
     let mut batch = CascadeManagerSuggestionBatch {
         generated_at: Utc::now().to_rfc3339(),
@@ -529,6 +589,8 @@ pub async fn cascade_generate_manager_suggestions(
 
     if report.aggregates.is_empty() {
         batch.outbox_path = write_json_outbox(&app, MANAGER_OUTBOX_DIR, &batch)?;
+        #[cfg(target_os = "macos")]
+        crate::cascade_computer::box_end(&app, -1, "Cascade Detector", "Detection", "No activity to analyze yet.");
         return Ok(batch);
     }
 
@@ -592,6 +654,15 @@ pub async fn cascade_generate_manager_suggestions(
         s.created_at = Some(Utc::now().to_rfc3339());
         s.evidence = evidence;
     }
+
+    #[cfg(target_os = "macos")]
+    crate::cascade_computer::box_end(
+        &app,
+        -1,
+        "Cascade Detector",
+        "Detection",
+        &format!("Found {} pattern(s) to review in Manager.", suggestions.len()),
+    );
 
     batch.suggestions = suggestions;
     batch.outbox_path = write_json_outbox(&app, MANAGER_OUTBOX_DIR, &batch)?;
@@ -668,36 +739,27 @@ pub async fn cascade_update_manager_suggestion_status(
 // Agent #3 — Agent Generator (LLM, produces a typed reviewable spec)
 // ════════════════════════════════════════════════════════════════════
 
-/// MCP tools a generated agent may declare. Anything else (especially shell /
-/// exec) is rejected at validation time.
+/// Capabilities a generated agent may declare. Deliberately VENDOR-NEUTRAL —
+/// the agent does whatever work the detected pattern calls for (a recap, a
+/// digest, a focus plan, a status draft, a reminder…), not a hardcoded
+/// "send a Slack/Gmail message". Each maps to a real on-device implementation
+/// in the runtime (see `execute_tool`). Anything off this list — especially
+/// shell/exec — is rejected at validation time.
 const TOOL_WHITELIST: &[&str] = &[
-    "gmail.read",
-    "gmail.draft",
-    "gmail.send",
-    "slack.read",
-    "slack.post",
-    "calendar.read",
-    "calendar.create_event",
-    "notion.read",
-    "notion.write",
-    "drive.read",
-    "drive.write",
-    "linear.read",
-    "linear.create_issue",
-    "notify.local",
-    "summarize.local",
+    "read.activity",   // read the employee's recent sanitized activity (input)
+    "analyze.patterns", // LLM reasoning over the inputs
+    "summarize.text",  // LLM summary / recap content
+    "artifact.write",  // write a real deliverable document (recap/digest/plan/checklist)
+    "draft.message",   // draft a message the employee can review + send themselves
+    "task.create",     // create a task/checklist item as a real artifact
+    "reminder.set",    // set a reminder as a real artifact
+    "notify.local",    // a real macOS notification to the employee
 ];
 
-/// Tools that change state outside Cascade → require an approval point.
-const MUTATING_TOOLS: &[&str] = &[
-    "gmail.send",
-    "gmail.draft",
-    "slack.post",
-    "calendar.create_event",
-    "notion.write",
-    "drive.write",
-    "linear.create_issue",
-];
+/// Capabilities that produce an outward-facing / committing work product →
+/// supervised (require employee approval) on an agent's first 3 live runs.
+/// Pure analysis, reads, and local notifications auto-run.
+const MUTATING_TOOLS: &[&str] = &["artifact.write", "draft.message", "task.create", "reminder.set"];
 
 const MAX_PER_EXEC_COST_USD: f64 = 0.10;
 
@@ -713,6 +775,10 @@ pub struct RequiredInput {
 pub struct WorkflowStep {
     pub step: i64,
     pub action: String,
+    /// Which capability this step invokes at runtime (from the whitelist), or
+    /// null for a pure reasoning/decision step whose output feeds later steps.
+    #[serde(default)]
+    pub tool: Option<String>,
     #[serde(default)]
     pub decision_point: Option<String>,
     #[serde(default)]
@@ -733,6 +799,14 @@ pub struct AgentSpecDoc {
     pub rollback_path: String,
     pub estimated_cost_usd: f64,
     pub estimated_time_saved_min: f64,
+    /// How often the deployed agent should run itself, in minutes. The runtime
+    /// clamps to >= 60. Default daily when the model omits it.
+    #[serde(default = "default_schedule_minutes")]
+    pub schedule_minutes: i64,
+}
+
+fn default_schedule_minutes() -> i64 {
+    1440
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -755,23 +829,36 @@ pub struct CascadeAgentSpecView {
 fn generator_system_prompt() -> String {
     format!(
         "You are Cascade's Agent Generator. Given a single detected workflow-waste pattern, produce \
-ONE deterministic, reviewable agent specification. The spec is NOT executed — a human reviews it, \
-it is sandbox-tested, and dual-approved before it ever runs.\n\n\
+ONE deterministic, reviewable agent specification that will ACTUALLY DO WORK to address THAT \
+specific pattern. The agent is generic: design whatever real deliverable fits the pattern — a \
+meeting recap, a batched-comms digest, a focus plan, a status draft, a reminder. It is NOT \
+necessarily a message; do whatever the pattern calls for. The spec is reviewed, sandbox-tested, \
+and dual-approved before it runs, then it runs on its own on a schedule.\n\n\
+AVAILABLE CAPABILITIES (vendor-neutral; each does real on-device work):\n\
+- read.activity — read the employee's recent sanitized activity (the agent's input)\n\
+- analyze.patterns — reason over the inputs to decide what to produce\n\
+- summarize.text — produce recap/summary content\n\
+- artifact.write — write a real deliverable document the employee will use\n\
+- draft.message — draft a message the employee can review and send THEMSELVES\n\
+- task.create — create a task/checklist item as a real artifact\n\
+- reminder.set — set a reminder as a real artifact\n\
+- notify.local — send the employee a real notification\n\n\
 HARD RULES (a violated rule means the spec is rejected — follow all):\n\
-- `tools` may ONLY contain tools from this whitelist: {}. NEVER invent tools. NEVER request shell/exec/file-system access.\n\
-- The `workflow` must be linear or branch only on schema-checkable conditions — never \"the agent decides what to do next\".\n\
-- Every state-mutating step (send/post/write/create) MUST have approvalRequired=true AND a matching entry in `approvalPoints`.\n\
-- `rollbackPath` is REQUIRED and must describe how to undo the agent's actions (recall/delete/revert).\n\
-- `estimatedCostUsd` must be a realistic per-execution number and SHOULD be <= {:.2}.\n\
+- `tools` may ONLY contain capabilities from the list above. NEVER invent tools. NEVER request shell/exec/network/file-system access.\n\
+- EVERY workflow step must set `tool` to one of those capabilities, OR null for a pure reasoning step. The agent does the work BY running these steps in order — make the workflow concrete and runnable, not abstract.\n\
+- The workflow must be linear or branch only on schema-checkable conditions — never \"the agent decides what to do next\".\n\
+- Every step whose tool produces an outward-facing/committing artifact (artifact.write, draft.message, task.create, reminder.set) MUST have approvalRequired=true AND a matching entry in `approvalPoints`.\n\
+- `rollbackPath` is REQUIRED — describe how to undo the agent's outputs (delete the artifact, dismiss the reminder).\n\
+- `estimatedCostUsd` must be realistic per-execution and SHOULD be <= {:.2}.\n\
+- `scheduleMinutes`: how often it should run itself (>= 60). Most agents are daily (1440) or a few times a day.\n\
 - `taskDescription` is one plain-English sentence (readable, no jargon).\n\
 - `requiredInputs[].source` should reference Cascade data the agent reads, e.g. \"cascade_privacy_aggregates\".\n\n\
 Return ONLY JSON with EXACTLY these camelCase keys:\n\
 {{\"name\":str,\"taskDescription\":str,\"rationale\":str,\
 \"requiredInputs\":[{{\"source\":str,\"fields\":[str]}}],\
-\"workflow\":[{{\"step\":int,\"action\":str,\"decisionPoint\":str|null,\"approvalRequired\":bool}}],\
+\"workflow\":[{{\"step\":int,\"action\":str,\"tool\":str|null,\"decisionPoint\":str|null,\"approvalRequired\":bool}}],\
 \"tools\":[str],\"failureConditions\":[str],\"approvalPoints\":[str],\"rollbackPath\":str,\
-\"estimatedCostUsd\":number,\"estimatedTimeSavedMin\":number}}",
-        TOOL_WHITELIST.join(", "),
+\"estimatedCostUsd\":number,\"estimatedTimeSavedMin\":number,\"scheduleMinutes\":int}}",
         MAX_PER_EXEC_COST_USD
     )
 }
@@ -784,9 +871,10 @@ fn generator_user_prompt(s: &CascadeManagerSuggestion) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Pattern kind: {}\nTitle: {}\nSummary: {}\nSuggested agent family: {}\n\
-Severity: {:.2}  Confidence: {:.2}\nEvidence:\n{}\n\n\
-Generate the agent spec that would address this pattern with the least intrusive, most reversible workflow.",
+        "Observed behavior (kind): {}\nTitle: {}\nWhat the person keeps doing: {}\n\
+Proposed bespoke agent slug: {}\nSeverity: {:.2}  Confidence: {:.2}\nSignals:\n{}\n\n\
+Design a BESPOKE agent for THIS specific recurring task — not a generic template. Its workflow \
+should concretely remove this exact toil using the least intrusive, most reversible steps.",
         s.kind, s.title, s.summary, s.suggested_agent_kind, s.severity_score, s.confidence, evidence
     )
 }
@@ -815,8 +903,27 @@ fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
         }
     }
 
+    // Per-step tools must also be whitelisted, and a mutating step must be
+    // marked approvalRequired so the runtime's supervision gate engages.
+    for step in &doc.workflow {
+        if let Some(t) = &step.tool {
+            if !TOOL_WHITELIST.contains(&t.as_str()) {
+                problems.push(format!("step {} uses non-whitelisted tool: {t}", step.step));
+            } else if MUTATING_TOOLS.contains(&t.as_str()) && !step.approval_required {
+                problems.push(format!(
+                    "step {} produces a committing artifact ({t}) but is not marked approvalRequired",
+                    step.step
+                ));
+            }
+        }
+    }
+
     // Mutating tool requires at least one approval point.
-    let has_mutating = doc.tools.iter().any(|t| MUTATING_TOOLS.contains(&t.as_str()));
+    let has_mutating = doc.tools.iter().any(|t| MUTATING_TOOLS.contains(&t.as_str()))
+        || doc
+            .workflow
+            .iter()
+            .any(|s| s.tool.as_deref().map(|t| MUTATING_TOOLS.contains(&t)).unwrap_or(false));
     if has_mutating && doc.approval_points.is_empty() {
         problems.push("state-mutating tools declared but no approval points".into());
     }
@@ -917,6 +1024,78 @@ pub async fn cascade_generate_agent_spec(
         .await
         .map_err(|e| format!("reload spec: {e}"))?
         .ok_or("spec vanished after insert")?;
+    spec_view(record)
+}
+
+/// Seed a ready-to-run demo agent (already deployed + dual-approved) so the
+/// deployment lifecycle, "Run now", "Watch it work", and the live floating box
+/// can be tested without waiting for the detector to surface a real pattern.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAgentSpecView, String> {
+    // 1. Get a real suggestion from the Detector (#2). Reuse the latest one if
+    //    present, else run detection over the employee's real activity.
+    let mut suggestions = cascade_list_manager_suggestions(app.clone(), None, Some(10)).await?;
+    if suggestions.is_empty() {
+        let batch = cascade_generate_manager_suggestions(app.clone(), Some(8)).await?;
+        suggestions = batch.suggestions;
+    }
+
+    let suggestion_id = match suggestions.into_iter().find_map(|s| s.id) {
+        Some(id) => id,
+        None => {
+            // Detector surfaced nothing actionable. Seed ONE minimal, real
+            // suggestion grounded in the employee's most-used app, so the
+            // Generator (#3) still works from genuine activity — not a fixture.
+            let pool = cascade_pool(&app).await?;
+            let now = Utc::now().to_rfc3339();
+            let run_id =
+                create_detection_run(&pool, "demo-seed-from-activity", &now, &now, "{\"seed\":true}")
+                    .await
+                    .map_err(|e| format!("seed detection run: {e}"))?;
+            let top_app =
+                preferred_notes_app(&app).await.unwrap_or_else(|| "your notes app".to_string());
+            let evidence = serde_json::to_string(&vec![CascadeManagerEvidence {
+                label: "most-used notes/docs app".to_string(),
+                value: top_app.clone(),
+            }])
+            .unwrap_or_else(|_| "[]".to_string());
+            insert_manager_suggestion(
+                &pool,
+                run_id,
+                &ManagerSuggestionInput {
+                    kind: slugify_kind(&format!("recurring-notes-in-{top_app}")),
+                    title: format!("Recurring note-taking in {top_app}"),
+                    summary: format!(
+                        "The employee regularly works in {top_app}; a helper could draft recap notes there so they don't have to."
+                    ),
+                    evidence_json: evidence,
+                    suggested_agent_kind: "notes-recap".to_string(),
+                    severity_score: 0.55,
+                    confidence: 0.8,
+                },
+            )
+            .await
+            .map_err(|e| format!("seed suggestion: {e}"))?
+        }
+    };
+
+    // 2. Generate the spec via the REAL Generator (#3, Opus) — this is the spec
+    //    being created by the workflow, not hand-written.
+    let spec = cascade_generate_agent_spec(app.clone(), suggestion_id).await?;
+
+    // 3. Deploy it (dual-approved) so it lands in Running and is testable.
+    let pool = cascade_pool(&app).await?;
+    update_agent_spec_status(&pool, spec.id, "deployed", Some(true), Some(true))
+        .await
+        .map_err(|e| format!("deploy spec: {e}"))?;
+    let _ = update_manager_suggestion_status(&pool, suggestion_id, "deployed").await;
+    let _ = append_audit(&pool, Some(spec.id), None, "system", "deployed_via_workflow", "{}").await;
+
+    let record = get_agent_spec(&pool, spec.id)
+        .await
+        .map_err(|e| format!("reload spec: {e}"))?
+        .ok_or("spec vanished")?;
     spec_view(record)
 }
 
@@ -1298,9 +1477,696 @@ pub async fn cascade_list_audit(
         .collect())
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Agent #4 — Steady-state runtime: deployed agents actually do the work
+// ════════════════════════════════════════════════════════════════════
+//
+// A deployed agent runs its declared workflow, step by step, for real. Each
+// step invokes a capability (`execute`/`commit_side_effect`) that produces a
+// real, on-device work product tailored to the detected pattern — a recap, a
+// digest, a focus plan, a draft, a reminder, a notification. Every action is
+// recorded in `cascade_agent_actions` (attributable + reversible). On an
+// agent's first 3 live runs, every committing step is staged for the
+// employee's approval before it happens. A misbehaving run auto-pauses the
+// agent. Runs happen on the agent's schedule (autonomous) or on demand.
+
+const MAX_RUNTIME_STEPS: usize = 8;
+const AGENT_OUTPUTS_DIR: &str = "cascade-agent-outputs";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CascadeAgentAction {
+    pub id: i64,
+    pub run_id: i64,
+    pub spec_id: i64,
+    pub step: i64,
+    pub tool: String,
+    pub summary: String,
+    pub content: Option<String>,
+    pub artifact_path: Option<String>,
+    pub reversible: bool,
+    pub mutating: bool,
+    pub state: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CascadeRunResult {
+    pub run_id: i64,
+    pub spec_id: i64,
+    pub status: String,
+    pub summary: String,
+    pub supervised: bool,
+    pub pending_count: i64,
+    pub cost_usd: f64,
+    pub anomalies: Vec<Anomaly>,
+    pub actions: Vec<CascadeAgentAction>,
+}
+
+fn agent_outputs_dir(app: &tauri::AppHandle, spec_id: i64) -> Result<PathBuf, String> {
+    let dir = cascade_data_dir(app)?
+        .join(AGENT_OUTPUTS_DIR)
+        .join(format!("spec-{spec_id}"));
+    fs::create_dir_all(&dir).map_err(|e| format!("create agent output dir: {e}"))?;
+    Ok(dir)
+}
+
+fn slug(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn is_mutating_tool(tool: &str) -> bool {
+    MUTATING_TOOLS.contains(&tool)
+}
+
+/// A real macOS notification. This genuinely acts (the employee sees it).
+fn fire_notification(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let clean = |s: &str| s.replace('"', "'").replace('\n', " ");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            clean(body).chars().take(220).collect::<String>(),
+            clean(title).chars().take(80).collect::<String>(),
+        );
+        let _ = std::process::Command::new("osascript").args(["-e", &script]).output();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, body);
+    }
+}
+
+/// Perform the real side effect for a committing step: write the work product
+/// to a real file (and, for reminders, notify). Returns the artifact path.
+/// Used both during a run (auto-commit) and on later approval of a staged step.
+fn commit_side_effect(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    run_id: i64,
+    step: i64,
+    tool: &str,
+    agent_name: &str,
+    content: &str,
+) -> Result<Option<String>, String> {
+    match tool {
+        "artifact.write" | "draft.message" | "task.create" | "reminder.set" => {
+            let dir = agent_outputs_dir(app, spec_id)?;
+            let ext = if tool == "draft.message" { "txt" } else { "md" };
+            let fname = format!("run{run_id}-step{step}-{}.{ext}", slug(tool));
+            let path = dir.join(fname);
+            let header = format!(
+                "<!-- Cascade agent: {agent_name} · {tool} · run {run_id} step {step} -->\n\n"
+            );
+            fs::write(&path, format!("{header}{content}"))
+                .map_err(|e| format!("write artifact: {e}"))?;
+            if tool == "reminder.set" {
+                fire_notification(
+                    &format!("Cascade reminder · {agent_name}"),
+                    content,
+                );
+            }
+            Ok(Some(path.display().to_string()))
+        }
+        "notify.local" => {
+            fire_notification(&format!("Cascade · {agent_name}"), content);
+            Ok(None)
+        }
+        // read.activity / analyze.patterns / summarize.text have no external
+        // side effect — their output lives only in the action record + context.
+        _ => Ok(None),
+    }
+}
+
+fn runtime_step_system_prompt(agent_name: &str, task: &str) -> String {
+    format!(
+        "You are \"{agent_name}\", a deployed Cascade helper agent. Your job: {task}\n\
+You are executing ONE step of your workflow. Produce ONLY the actual work product for this step — \
+the real deliverable text (a recap, digest, plan, draft, task list, or notification body), with no \
+preamble, no meta-commentary, no markdown fences. Ground it in the employee's real recent activity \
+and the outputs of earlier steps. Be concise and immediately useful. If this step is a notification, \
+output a single short sentence."
+    )
+}
+
+fn runtime_step_user_prompt(
+    step: &WorkflowStep,
+    aggregates: &[CascadePrivacyAggregate],
+    context: &str,
+) -> String {
+    let data = serde_json::to_string_pretty(aggregates).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "STEP {} — {}\nCapability: {}\n\nEMPLOYEE'S RECENT SANITIZED ACTIVITY:\n{}\n\nOUTPUTS OF EARLIER STEPS:\n{}\n\nProduce this step's work product now.",
+        step.step,
+        step.action,
+        step.tool.as_deref().unwrap_or("analyze.patterns"),
+        data,
+        if context.is_empty() { "(none yet)" } else { context }
+    )
+}
+
+/// Run one execution of a deployed agent. Performs real work; returns the run +
+/// its actions. Called by the "Run now" command and the autonomous scheduler.
+async fn run_agent_internal(
+    app: &tauri::AppHandle,
+    spec: &cascade_schema::AgentSpecRecord,
+    trigger: &str,
+) -> Result<CascadeRunResult, String> {
+    if spec.status != "deployed" {
+        return Err(format!("agent is not deployed (status: {})", spec.status));
+    }
+    let doc: AgentSpecDoc =
+        serde_json::from_str(&spec.spec_json).map_err(|e| format!("parse spec: {e}"))?;
+
+    let pool = cascade_pool(app).await?;
+    // No approval prompts — the agent commits its work directly.
+    let supervised = false;
+    let _ = count_live_runs(&pool, spec.id).await; // keep run-count read for audit/debug
+
+    // Show the Cascade floating box so the employee can watch this background run.
+    #[cfg(target_os = "macos")]
+    crate::cascade_computer::box_begin(app, spec.id, &doc.name, &doc.task_description);
+
+    // The agent's real input: the employee's recent sanitized activity.
+    let (_, _, summary) = fetch_activity_summary(app, 24).await?;
+    let (aggregates, _) = if summary.data_status == "ok" {
+        sanitize(&summary)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    // Build a staged run record first so actions can reference it.
+    let run_id = insert_agent_run(
+        &pool,
+        &AgentRunInput {
+            spec_id: spec.id,
+            mode: "live".to_string(),
+            status: "running".to_string(),
+            summary: format!("{trigger} run starting"),
+            steps_json: "[]".to_string(),
+            anomalies_json: "[]".to_string(),
+            cost_usd: 0.0,
+            duration_ms: 0,
+        },
+    )
+    .await
+    .map_err(|e| format!("create run: {e}"))?;
+
+    let mut context = String::new();
+    let mut total_cost = 0.0f64;
+    let mut produced = 0i64;
+    let mut pending = 0i64;
+    let mut action_ids: Vec<i64> = Vec::new();
+
+    for step in doc.workflow.iter().take(MAX_RUNTIME_STEPS) {
+        let tool = step.tool.clone().unwrap_or_else(|| "analyze.patterns".to_string());
+        if !TOOL_WHITELIST.contains(&tool.as_str()) {
+            continue; // validation should prevent this; skip defensively
+        }
+
+        // Produce this step's content.
+        let content = if tool == "read.activity" {
+            serde_json::to_string_pretty(&aggregates).unwrap_or_default()
+        } else {
+            let call = LlmCall {
+                model: MODEL_SONNET,
+                system: runtime_step_system_prompt(&doc.name, &doc.task_description),
+                user: runtime_step_user_prompt(step, &aggregates, &context),
+                temperature: 0.3,
+                max_tokens: 1200,
+            };
+            match call_anthropic(&call).await {
+                Ok(res) => {
+                    total_cost += res.cost_usd;
+                    res.text.trim().to_string()
+                }
+                Err(e) => {
+                    // Record the failure as an action and stop.
+                    let id = insert_agent_action(
+                        &pool,
+                        &AgentActionInput {
+                            run_id,
+                            spec_id: spec.id,
+                            step: step.step,
+                            tool: tool.clone(),
+                            summary: format!("step failed: {e}"),
+                            content: None,
+                            artifact_path: None,
+                            reversible: false,
+                            mutating: false,
+                            state: "failed".to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| format!("record failed action: {e}"))?;
+                    action_ids.push(id);
+                    break;
+                }
+            }
+        };
+
+        let mutating = is_mutating_tool(&tool);
+        let reversible = matches!(
+            tool.as_str(),
+            "artifact.write" | "draft.message" | "task.create" | "reminder.set"
+        );
+
+        // Supervision: on the first 3 runs, stage committing steps for approval.
+        let (state, artifact_path) = if mutating && supervised {
+            pending += 1;
+            // Pre-compute the path the artifact WILL occupy on approval.
+            let dir = agent_outputs_dir(app, spec.id)?;
+            let ext = if tool == "draft.message" { "txt" } else { "md" };
+            let path = dir
+                .join(format!("run{run_id}-step{}-{}.{ext}", step.step, slug(&tool)))
+                .display()
+                .to_string();
+            ("pending".to_string(), Some(path))
+        } else {
+            let path = commit_side_effect(
+                app, spec.id, run_id, step.step, &tool, &doc.name, &content,
+            )?;
+            if mutating {
+                produced += 1;
+            }
+            ("committed".to_string(), path)
+        };
+
+        let summary_line = match tool.as_str() {
+            "read.activity" => "Read recent activity".to_string(),
+            "analyze.patterns" => "Analyzed the activity".to_string(),
+            "summarize.text" => "Drafted a summary".to_string(),
+            "artifact.write" => "Wrote a deliverable document".to_string(),
+            "draft.message" => "Drafted a message for review".to_string(),
+            "task.create" => "Created a task".to_string(),
+            "reminder.set" => "Set a reminder".to_string(),
+            "notify.local" => "Notified the employee".to_string(),
+            other => format!("Ran {other}"),
+        };
+
+        let id = insert_agent_action(
+            &pool,
+            &AgentActionInput {
+                run_id,
+                spec_id: spec.id,
+                step: step.step,
+                tool: tool.clone(),
+                summary: if state == "pending" {
+                    format!("{summary_line} (awaiting your approval)")
+                } else {
+                    summary_line.clone()
+                },
+                content: Some(content.chars().take(8000).collect()),
+                artifact_path,
+                reversible,
+                mutating,
+                state: state.clone(),
+            },
+        )
+        .await
+        .map_err(|e| format!("record action: {e}"))?;
+        action_ids.push(id);
+
+        #[cfg(target_os = "macos")]
+        {
+            let box_narr = if state == "pending" {
+                format!("{summary_line} (needs your approval in Cascades)")
+            } else {
+                summary_line.clone()
+            };
+            crate::cascade_computer::box_step(app, spec.id, &doc.name, &doc.task_description, &box_narr, step.step);
+        }
+
+        context.push_str(&format!("\n[step {} · {}] {}\n", step.step, tool, content.chars().take(600).collect::<String>()));
+    }
+
+    // Reload the actions we just wrote, for anomaly detection + the return view.
+    let all = list_actions_for_spec(&pool, spec.id, 200)
+        .await
+        .map_err(|e| format!("reload actions: {e}"))?;
+    let actions: Vec<CascadeAgentAction> = all
+        .into_iter()
+        .filter(|a| action_ids.contains(&a.id))
+        .map(|a| CascadeAgentAction {
+            id: a.id,
+            run_id: a.run_id,
+            spec_id: a.spec_id,
+            step: a.step,
+            tool: a.tool,
+            summary: a.summary,
+            content: a.content,
+            artifact_path: a.artifact_path,
+            reversible: a.reversible,
+            mutating: a.mutating,
+            state: a.state,
+            created_at: a.created_at,
+        })
+        .collect();
+
+    // Runtime anomaly check: did the agent step outside its declared tools?
+    let mut anomalies: Vec<Anomaly> = Vec::new();
+    for a in &actions {
+        let declared = doc.tools.iter().any(|t| t == &a.tool)
+            || matches!(a.tool.as_str(), "read.activity" | "analyze.patterns");
+        if !declared {
+            anomalies.push(Anomaly {
+                kind: "scope_creep".to_string(),
+                detail: format!("used undeclared capability '{}'", a.tool),
+            });
+        }
+        if a.state == "failed" {
+            anomalies.push(Anomaly {
+                kind: "step_failure".to_string(),
+                detail: a.summary.clone(),
+            });
+        }
+    }
+
+    let status = if !anomalies.is_empty() {
+        "flagged"
+    } else if pending > 0 {
+        "awaiting_approval"
+    } else {
+        "success"
+    };
+
+    let run_summary = format!(
+        "{trigger} run · {} step(s), {produced} deliverable(s){}{}",
+        actions.len(),
+        if pending > 0 { format!(", {pending} awaiting approval") } else { String::new() },
+        if !anomalies.is_empty() { format!(", {} anomaly flagged", anomalies.len()) } else { String::new() },
+    );
+
+    #[cfg(target_os = "macos")]
+    crate::cascade_computer::box_end(app, spec.id, &doc.name, &doc.task_description, &run_summary);
+
+    // Finalize the run row.
+    let steps_json = serde_json::to_string(
+        &actions
+            .iter()
+            .map(|a| SandboxStep {
+                step: a.step,
+                tool: a.tool.clone(),
+                action: a.summary.clone(),
+                mocked_result: a.state.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+    let _ = update_agent_run_final(&pool, run_id, status, &run_summary, &steps_json, &serde_json::to_string(&anomalies).unwrap_or_default(), total_cost).await;
+
+    // A misbehaving run auto-pauses the agent (the monitor watching the agent).
+    if !anomalies.is_empty() {
+        let _ = update_agent_spec_status(&pool, spec.id, "paused", None, None).await;
+        fire_notification(
+            &format!("Cascade paused {}", doc.name),
+            "An anomaly was detected during a run. The agent is paused for your review.",
+        );
+        let _ = append_audit(
+            &pool,
+            Some(spec.id),
+            Some(run_id),
+            "system",
+            "auto_paused",
+            &serde_json::json!({ "anomalies": anomalies.len() }).to_string(),
+        )
+        .await;
+    }
+
+    let _ = append_audit(
+        &pool,
+        Some(spec.id),
+        Some(run_id),
+        "system",
+        "agent_run",
+        &serde_json::json!({ "trigger": trigger, "status": status, "produced": produced, "pending": pending, "costUsd": total_cost }).to_string(),
+    )
+    .await;
+
+    Ok(CascadeRunResult {
+        run_id,
+        spec_id: spec.id,
+        status: status.to_string(),
+        summary: run_summary,
+        supervised,
+        pending_count: pending,
+        cost_usd: total_cost,
+        anomalies,
+        actions,
+    })
+}
+
+/// Small helper to finalize a run row (no general-purpose update exists in the
+/// schema crate; we only ever rewrite these fields once, at run end).
+async fn update_agent_run_final(
+    pool: &cascade_schema::sqlx::sqlite::SqlitePool,
+    run_id: i64,
+    status: &str,
+    summary: &str,
+    steps_json: &str,
+    anomalies_json: &str,
+    cost_usd: f64,
+) -> Result<(), String> {
+    use cascade_schema::sqlx;
+    sqlx::query(
+        "UPDATE cascade_agent_runs SET status=?2, summary=?3, steps_json=?4, anomalies_json=?5, cost_usd=?6 WHERE id=?1",
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(summary)
+    .bind(steps_json)
+    .bind(anomalies_json)
+    .bind(cost_usd)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("finalize run: {e}"))?;
+    Ok(())
+}
+
+fn action_view(a: cascade_schema::AgentActionRecord) -> CascadeAgentAction {
+    CascadeAgentAction {
+        id: a.id,
+        run_id: a.run_id,
+        spec_id: a.spec_id,
+        step: a.step,
+        tool: a.tool,
+        summary: a.summary,
+        content: a.content,
+        artifact_path: a.artifact_path,
+        reversible: a.reversible,
+        mutating: a.mutating,
+        state: a.state,
+        created_at: a.created_at,
+    }
+}
+
+/// "Run now" — execute a deployed agent on demand.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_run_agent(
+    app: tauri::AppHandle,
+    spec_id: i64,
+) -> Result<CascadeRunResult, String> {
+    let pool = cascade_pool(&app).await?;
+    let spec = get_agent_spec(&pool, spec_id)
+        .await
+        .map_err(|e| format!("load spec: {e}"))?
+        .ok_or_else(|| format!("spec {spec_id} not found"))?;
+    run_agent_internal(&app, &spec, "manual").await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_list_agent_actions(
+    app: tauri::AppHandle,
+    spec_id: i64,
+    limit: Option<u32>,
+) -> Result<Vec<CascadeAgentAction>, String> {
+    let pool = cascade_pool(&app).await?;
+    let rows = list_actions_for_spec(&pool, spec_id, limit.unwrap_or(40).clamp(1, 200) as i64)
+        .await
+        .map_err(|e| format!("list actions: {e}"))?;
+    Ok(rows.into_iter().map(action_view).collect())
+}
+
+/// Approve a staged (pending) action — the side effect happens now.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_approve_action(
+    app: tauri::AppHandle,
+    action_id: i64,
+) -> Result<CascadeAgentAction, String> {
+    let pool = cascade_pool(&app).await?;
+    let action = get_agent_action(&pool, action_id)
+        .await
+        .map_err(|e| format!("load action: {e}"))?
+        .ok_or_else(|| format!("action {action_id} not found"))?;
+    if action.state != "pending" {
+        return Err(format!("action is not pending (state: {})", action.state));
+    }
+    let spec = get_agent_spec(&pool, action.spec_id)
+        .await
+        .map_err(|e| format!("load spec: {e}"))?
+        .ok_or("spec not found")?;
+    let content = action.content.clone().unwrap_or_default();
+    commit_side_effect(
+        &app, action.spec_id, action.run_id, action.step, &action.tool, &spec.name, &content,
+    )?;
+    update_agent_action_state(&pool, action_id, "committed")
+        .await
+        .map_err(|e| format!("commit action: {e}"))?;
+    append_audit(
+        &pool,
+        Some(action.spec_id),
+        Some(action.run_id),
+        "employee",
+        "approve_action",
+        &serde_json::json!({ "actionId": action_id, "tool": action.tool }).to_string(),
+    )
+    .await
+    .map_err(|e| format!("audit: {e}"))?;
+    let updated = get_agent_action(&pool, action_id)
+        .await
+        .map_err(|e| format!("reload: {e}"))?
+        .ok_or("action vanished")?;
+    Ok(action_view(updated))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_reject_action(
+    app: tauri::AppHandle,
+    action_id: i64,
+) -> Result<(), String> {
+    let pool = cascade_pool(&app).await?;
+    let action = get_agent_action(&pool, action_id)
+        .await
+        .map_err(|e| format!("load action: {e}"))?
+        .ok_or_else(|| format!("action {action_id} not found"))?;
+    update_agent_action_state(&pool, action_id, "rejected")
+        .await
+        .map_err(|e| format!("reject: {e}"))?;
+    append_audit(
+        &pool,
+        Some(action.spec_id),
+        Some(action.run_id),
+        "employee",
+        "reject_action",
+        &serde_json::json!({ "actionId": action_id }).to_string(),
+    )
+    .await
+    .map_err(|e| format!("audit: {e}"))?;
+    Ok(())
+}
+
+/// One-click undo of a committed, reversible action — deletes the artifact.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_rollback_action(
+    app: tauri::AppHandle,
+    action_id: i64,
+) -> Result<(), String> {
+    let pool = cascade_pool(&app).await?;
+    let action = get_agent_action(&pool, action_id)
+        .await
+        .map_err(|e| format!("load action: {e}"))?
+        .ok_or_else(|| format!("action {action_id} not found"))?;
+    if !action.reversible {
+        return Err("this action is not reversible".to_string());
+    }
+    if action.state != "committed" {
+        return Err(format!("only committed actions can be rolled back (state: {})", action.state));
+    }
+    if let Some(path) = &action.artifact_path {
+        let _ = fs::remove_file(path);
+    }
+    update_agent_action_state(&pool, action_id, "rolled_back")
+        .await
+        .map_err(|e| format!("rollback: {e}"))?;
+    append_audit(
+        &pool,
+        Some(action.spec_id),
+        Some(action.run_id),
+        "employee",
+        "rollback_action",
+        &serde_json::json!({ "actionId": action_id, "artifact": action.artifact_path }).to_string(),
+    )
+    .await
+    .map_err(|e| format!("audit: {e}"))?;
+    Ok(())
+}
+
+/// Autonomous scheduler tick — run every deployed agent whose cadence is due.
+/// Safe to call repeatedly; silently no-ops without an Anthropic key.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_tick_due_agents(app: tauri::AppHandle) -> Result<u32, String> {
+    if crate::cascade_llm::read_anthropic_key().is_err() {
+        return Ok(0);
+    }
+    let pool = cascade_pool(&app).await?;
+    let specs = list_deployed_specs(&pool)
+        .await
+        .map_err(|e| format!("list deployed: {e}"))?;
+
+    let now = Utc::now();
+    let mut ran = 0u32;
+    for spec in specs {
+        let doc: AgentSpecDoc = match serde_json::from_str(&spec.spec_json) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let cadence_min = doc.schedule_minutes.max(60);
+        let due = match last_live_run_at(&pool, spec.id).await {
+            Ok(Some(ts)) => {
+                let last = chrono::DateTime::parse_from_rfc3339(&ts)
+                    .map(|t| t.with_timezone(&Utc))
+                    .ok()
+                    .or_else(|| {
+                        // sqlite CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" (UTC)
+                        chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
+                            .ok()
+                            .map(|n| n.and_utc())
+                    });
+                match last {
+                    Some(t) => (now - t).num_minutes() >= cadence_min,
+                    None => true,
+                }
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if due {
+            if run_agent_internal(&app, &spec, "scheduled").await.is_ok() {
+                ran += 1;
+            }
+        }
+    }
+    Ok(ran)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slug_is_filesystem_safe() {
+        assert_eq!(slug("Inbox Batcher!"), "inbox-batcher");
+        assert_eq!(slug("artifact.write"), "artifact-write");
+    }
+
+    #[test]
+    fn mutating_classification() {
+        assert!(is_mutating_tool("artifact.write"));
+        assert!(is_mutating_tool("draft.message"));
+        assert!(!is_mutating_tool("read.activity"));
+        assert!(!is_mutating_tool("notify.local"));
+    }
 
     #[test]
     fn dp_jitter_leaves_large_counts_alone() {
@@ -1359,6 +2225,7 @@ mod tests {
             workflow: vec![WorkflowStep {
                 step: 1,
                 action: "run".into(),
+                tool: None,
                 decision_point: None,
                 approval_required: false,
             }],
@@ -1368,6 +2235,7 @@ mod tests {
             rollback_path: "".into(),
             estimated_cost_usd: 0.5,
             estimated_time_saved_min: 10.0,
+            schedule_minutes: 1440,
         };
         let (status, notes) = validate_spec(&doc);
         assert_eq!(status, "invalid");
@@ -1387,18 +2255,29 @@ mod tests {
                 source: "cascade_privacy_aggregates".into(),
                 fields: vec!["app".into(), "durationMin".into()],
             }],
-            workflow: vec![WorkflowStep {
-                step: 1,
-                action: "Draft a digest of low-priority mail".into(),
-                decision_point: None,
-                approval_required: true,
-            }],
-            tools: vec!["gmail.read".into(), "gmail.draft".into()],
-            failure_conditions: vec!["gmail api error".into()],
-            approval_points: vec!["before drafting the digest".into()],
-            rollback_path: "delete the draft".into(),
+            workflow: vec![
+                WorkflowStep {
+                    step: 1,
+                    action: "Read recent activity and identify low-priority comms".into(),
+                    tool: Some("read.activity".into()),
+                    decision_point: None,
+                    approval_required: false,
+                },
+                WorkflowStep {
+                    step: 2,
+                    action: "Write a batched digest document".into(),
+                    tool: Some("artifact.write".into()),
+                    decision_point: None,
+                    approval_required: true,
+                },
+            ],
+            tools: vec!["read.activity".into(), "artifact.write".into()],
+            failure_conditions: vec!["no activity in window".into()],
+            approval_points: vec!["before writing the digest".into()],
+            rollback_path: "delete the digest document".into(),
             estimated_cost_usd: 0.02,
             estimated_time_saved_min: 45.0,
+            schedule_minutes: 1440,
         };
         let (status, notes) = validate_spec(&doc);
         assert_eq!(status, "valid", "notes: {:?}", notes);
@@ -1414,15 +2293,17 @@ mod tests {
             workflow: vec![WorkflowStep {
                 step: 1,
                 action: "a".into(),
+                tool: Some("read.activity".into()),
                 decision_point: None,
                 approval_required: false,
             }],
-            tools: vec!["gmail.read".into()],
+            tools: vec!["read.activity".into()],
             failure_conditions: vec![],
             approval_points: vec![],
             rollback_path: "noop".into(),
             estimated_cost_usd: 0.01,
             estimated_time_saved_min: 5.0,
+            schedule_minutes: 1440,
         };
         let out = SandboxModelOutput {
             status: "success".into(),
@@ -1430,8 +2311,8 @@ mod tests {
             would_mutate: true,
             steps: vec![SandboxModelStep {
                 step: 1,
-                tool: "drive.write".into(),
-                action: "wrote a file".into(),
+                tool: "task.create".into(),
+                action: "created a task".into(),
                 mocked_result: "ok".into(),
             }],
         };

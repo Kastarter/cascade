@@ -119,10 +119,13 @@ pub async fn call_anthropic(call: &LlmCall) -> Result<LlmResult, String> {
     let key = read_anthropic_key()?;
     let client = reqwest::Client::new();
 
+    // NOTE: `temperature` is intentionally NOT sent — newer Claude models reject
+    // it ("temperature is deprecated for this model" → 400). The field is kept on
+    // LlmCall for callers' intent but not transmitted.
+    let _ = call.temperature;
     let body = serde_json::json!({
         "model": call.model,
         "max_tokens": call.max_tokens,
-        "temperature": call.temperature,
         "system": call.system,
         "messages": [{ "role": "user", "content": call.user }],
     });
@@ -164,6 +167,80 @@ pub async fn call_anthropic(call: &LlmCall) -> Result<LlmResult, String> {
 
     Ok(LlmResult {
         cost_usd: cost_for(call.model, parsed.usage.input_tokens, parsed.usage.output_tokens),
+        input_tokens: parsed.usage.input_tokens,
+        output_tokens: parsed.usage.output_tokens,
+        text,
+    })
+}
+
+/// Vision call: send a screenshot (base64 PNG) plus instructions, return text.
+/// Used by the computer-use agent to decide its next action from the screen.
+pub async fn call_anthropic_vision(
+    model: &str,
+    system: &str,
+    user_text: &str,
+    image_png_base64: &str,
+    temperature: f32,
+    max_tokens: u32,
+) -> Result<LlmResult, String> {
+    let key = read_anthropic_key()?;
+    let client = reqwest::Client::new();
+
+    // `temperature` not sent (deprecated / rejected by newer models).
+    let _ = temperature;
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_png_base64,
+                    }
+                },
+                { "type": "text", "text": user_text }
+            ]
+        }],
+    });
+
+    let response = client
+        .post(ANTHROPIC_URL)
+        .header("x-api-key", key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("content-type", "application/json")
+        .timeout(Duration::from_secs(90))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("anthropic vision request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "anthropic vision returned {status}: {}",
+            detail.chars().take(400).collect::<String>()
+        ));
+    }
+
+    let parsed = response
+        .json::<AnthropicResponse>()
+        .await
+        .map_err(|e| format!("parse vision response: {e}"))?;
+    let text = parsed
+        .content
+        .iter()
+        .filter(|b| b.block_type == "text")
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(LlmResult {
+        cost_usd: cost_for(model, parsed.usage.input_tokens, parsed.usage.output_tokens),
         input_tokens: parsed.usage.input_tokens,
         output_tokens: parsed.usage.output_tokens,
         text,

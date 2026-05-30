@@ -522,9 +522,13 @@ function PatternCard({
             fontSize: 9,
             letterSpacing: 1.2,
             textTransform: "uppercase",
+            maxWidth: 180,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
           }}
         >
-          {pattern.kind}
+          {pattern.kindLabel}
         </div>
       </div>
 

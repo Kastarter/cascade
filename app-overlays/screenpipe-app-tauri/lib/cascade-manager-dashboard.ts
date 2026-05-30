@@ -12,6 +12,8 @@ export interface ManagerDashboardPattern {
   suggestionId?: number | null;
   heat: number;
   kind: "focus" | "inbox" | "meetings" | "wrap" | "code";
+  /** The detector's own free-form slug for the observed behavior (display). */
+  kindLabel: string;
   title: string;
   detail: string;
   metric: string;
@@ -155,6 +157,7 @@ export function toDashboardPattern(suggestion: CascadeManagerSuggestion): Manage
     suggestionId: suggestion.id,
     heat: suggestion.severityScore,
     kind: kindToDash(suggestion.kind),
+    kindLabel: (suggestion.kind || "pattern").replace(/-/g, " "),
     title: suggestion.title,
     detail: suggestion.summary,
     metric,
