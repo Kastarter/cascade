@@ -11,6 +11,7 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
 interface Frame {
   imageBase64: string;
@@ -42,6 +43,21 @@ export default function HandsBox() {
   const [agents, setAgents] = useState<Record<number, StatusState>>({});
   const [controlsOpen, setControlsOpen] = useState(false);
   const [paused, setPaused] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+
+  const toggleMinimize = async () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    try {
+      const win = getCurrentWindow();
+      const sz = await win.innerSize();
+      const sf = await win.scaleFactor();
+      const logicalW = sz.width / sf;
+      await win.setSize(new LogicalSize(logicalW, next ? 58 : 470));
+    } catch {
+      /* non-fatal */
+    }
+  };
 
   useEffect(() => {
     document.documentElement.style.background = "transparent";
@@ -101,10 +117,10 @@ export default function HandsBox() {
           flexDirection: "column",
         }}
       >
-        {/* header */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
-          <span style={{ width: 8, height: 8, borderRadius: "50%", background: working ? "#5ad8aa" : "#7a8a82", boxShadow: working ? "0 0 8px #5ad8aa" : "none", animation: working ? "cPulse 1.4s ease-in-out infinite" : "none" }} />
-          <span style={{ font: "700 11px ui-monospace, Menlo, monospace", letterSpacing: 1, color: "#9ff0cc" }}>
+        {/* header — drag region (move the box by dragging here) */}
+        <div data-tauri-drag-region style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: collapsed ? 0 : 9, cursor: "grab" }}>
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: working ? "#5ad8aa" : "#7a8a82", boxShadow: working ? "0 0 8px #5ad8aa" : "none", animation: working ? "cPulse 1.4s ease-in-out infinite" : "none", pointerEvents: "none" }} />
+          <span style={{ font: "700 11px ui-monospace, Menlo, monospace", letterSpacing: 1, color: "#9ff0cc", pointerEvents: "none" }}>
             CASCADE HANDS · {working} working
           </span>
           <span style={{ flex: 1 }} />
@@ -118,10 +134,17 @@ export default function HandsBox() {
           >
             {paused ? "RESUME" : "PAUSE"}
           </button>
+          <button onClick={toggleMinimize} style={minBtn} title={collapsed ? "Expand" : "Minimize"}>
+            {collapsed ? "▢" : "—"}
+          </button>
           <button onClick={() => invoke("cascade_stop_computer_task", { specId: 0 }).catch(() => {})} style={stopAll}>
             STOP
           </button>
         </div>
+
+        {!collapsed && (
+          <>
+        {/* body */}
 
         {/* live screen preview */}
         <div
@@ -177,6 +200,8 @@ export default function HandsBox() {
             ))}
           </div>
         )}
+          </>
+        )}
       </div>
       <style>{`@keyframes cPulse { 0%,100%{opacity:1} 50%{opacity:.35} } @keyframes cRipple { from{transform:scale(.4);opacity:1} to{transform:scale(1.9);opacity:0} }`}</style>
     </div>
@@ -225,6 +250,16 @@ const pauseBtn: React.CSSProperties = {
   font: "700 9px ui-monospace, Menlo, monospace",
   letterSpacing: 1,
   cursor: "pointer",
+};
+const minBtn: React.CSSProperties = {
+  padding: "3px 8px",
+  borderRadius: 6,
+  background: "rgba(255,255,255,0.06)",
+  border: "1px solid rgba(255,255,255,0.15)",
+  color: "#cfe6da",
+  font: "700 10px ui-monospace, Menlo, monospace",
+  cursor: "pointer",
+  lineHeight: 1,
 };
 const miniBtn: React.CSSProperties = {
   padding: "2px 7px",

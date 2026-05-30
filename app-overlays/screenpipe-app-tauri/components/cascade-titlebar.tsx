@@ -37,6 +37,7 @@ export function CascadeTitlebar() {
   return (
     <>
       <div
+        data-tauri-drag-region
         style={{
           height: 44,
           flexShrink: 0,

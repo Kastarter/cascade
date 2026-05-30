@@ -320,6 +320,7 @@ fn ensure_box_window(app: &tauri::AppHandle) {
             if let Ok(win) = WebviewWindowBuilder::new(&app2, HANDS_WINDOW, WebviewUrl::App("hands-box".into()))
                 .title("")
                 .inner_size(500.0, 470.0)
+                .min_inner_size(280.0, 90.0)
                 .position((w - 520.0).max(20.0), 44.0)
                 .always_on_top(true)
                 .decorations(false)
@@ -327,7 +328,7 @@ fn ensure_box_window(app: &tauri::AppHandle) {
                 .focused(false)
                 .transparent(true)
                 .shadow(false)
-                .resizable(false)
+                .resizable(true)
                 .visible(false)
                 .build()
             {
