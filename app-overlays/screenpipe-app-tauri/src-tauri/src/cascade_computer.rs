@@ -417,20 +417,28 @@ fn capture_logical_screenshot(app: &tauri::AppHandle) -> Result<(String, f64, f6
 
 fn computer_system_prompt(name: &str, w: f64, h: f64) -> String {
     format!(
-        "You are \"{name}\", a careful Cascade computer-use agent operating a macOS screen of \
-{w:.0}x{h:.0} points (top-left origin). You share the screen with the user and possibly other \
-agents — ignore other agents' floating cursors/labels. You're given a screenshot and a GOAL. Decide \
-the SINGLE next action that makes progress, then stop and wait for the next screenshot. Be \
-conservative; never take destructive actions (deleting, sending money, changing security settings).\n\n\
-Actions: open_app (set `app`), move (x,y), click/double_click (x,y), type (`text`), key (`key` like \
-\"cmd+s\"), wait, done.\n\n\
-Return ONLY JSON: {{\"narration\":\"short present-tense\",\"action\":\"open_app|move|click|double_click|type|key|wait|done\",\
+        "You are \"{name}\", a careful Cascade agent operating YOUR OWN web browser (a {w:.0}x{h:.0} \
+viewport, top-left origin). This is an isolated browser — NOT the user's screen — so the user keeps \
+working while you do the task here. You're given a screenshot of your browser and a GOAL.\n\n\
+Use web apps to accomplish the goal: to use a tool, NAVIGATE to its website (Notion → https://www.notion.so, \
+Gmail → https://mail.google.com, Google Docs → https://docs.google.com, etc.). Decide the SINGLE next \
+action, then wait for the next screenshot. Be conservative; never take destructive or irreversible \
+actions (deleting, sending money, changing account/security settings, posting publicly).\n\n\
+Actions:\n\
+- navigate: go to a URL (put the full https URL in `text`)\n\
+- click / double_click: click at (x,y) in the viewport\n\
+- type: type `text` into the focused field\n\
+- key: press a key (`key`, e.g. \"Enter\")\n\
+- scroll: scroll the page (put pixels in `y`, negative = up)\n\
+- wait: let the page load\n\
+- done: the goal is complete\n\n\
+Return ONLY JSON: {{\"narration\":\"short present-tense\",\"action\":\"navigate|click|double_click|type|key|scroll|wait|done\",\
 \"x\":0,\"y\":0,\"text\":\"\",\"app\":\"\",\"key\":\"\"}}"
     )
 }
 
 fn is_committing(action: &str) -> bool {
-    matches!(action, "click" | "double_click" | "type" | "key" | "open_app")
+    matches!(action, "click" | "double_click" | "type" | "key" | "navigate" | "open_app")
 }
 
 fn execute_action(action: &ComputerAction) {
@@ -489,6 +497,162 @@ async fn record_run_start(
 }
 
 /// One agent's computer-use loop.
+// ════════════════════════════════════════════════════════════════════
+// Agent BROWSER sandbox — each agent works in its OWN offscreen browser,
+// driven entirely by JS injection (NEVER the user's real screen/cursor/
+// keyboard). The box streams this browser so the employee can watch while
+// continuing their own work uninterrupted.
+// (Phase-2 seam: swap this layer for a cloud VM sandbox for native-app tasks.)
+// ════════════════════════════════════════════════════════════════════
+
+const BROWSER_W: f64 = 1280.0;
+const BROWSER_H: f64 = 820.0;
+
+fn browser_label(spec_id: i64) -> String {
+    format!("cascade-agent-browser-{spec_id}")
+}
+
+/// Map a known app/goal to a starting URL so the agent lands somewhere useful.
+fn start_url_for_goal(goal: &str) -> String {
+    let g = goal.to_lowercase();
+    let pick = [
+        ("notion", "https://www.notion.so"),
+        ("gmail", "https://mail.google.com"),
+        ("google docs", "https://docs.google.com"),
+        ("docs.google", "https://docs.google.com"),
+        ("spreadsheet", "https://docs.google.com/spreadsheets"),
+        ("sheet", "https://docs.google.com/spreadsheets"),
+        ("linkedin", "https://www.linkedin.com/feed/"),
+        ("slack", "https://app.slack.com"),
+        ("calendar", "https://calendar.google.com"),
+        ("github", "https://github.com"),
+        ("trello", "https://trello.com"),
+    ];
+    for (kw, url) in pick {
+        if g.contains(kw) {
+            return url.to_string();
+        }
+    }
+    "https://www.google.com".to_string()
+}
+
+/// Create (once) the agent's own browser window, OFFSCREEN so the user never
+/// sees or interacts with it; the agent drives it and the box streams it.
+fn ensure_agent_browser(app: &tauri::AppHandle, spec_id: i64, start_url: &str) {
+    let app2 = app.clone();
+    let label = browser_label(spec_id);
+    let url = start_url.to_string();
+    let _ = app.run_on_main_thread(move || {
+        if app2.get_webview_window(&label).is_none() {
+            let parsed = tauri::Url::parse(&url)
+                .unwrap_or_else(|_| tauri::Url::parse("https://www.google.com").unwrap());
+            let _ = WebviewWindowBuilder::new(&app2, &label, WebviewUrl::External(parsed))
+                .title("Cascade Agent")
+                .inner_size(BROWSER_W, BROWSER_H)
+                .position(-6000.0, 0.0) // offscreen — invisible to the user
+                .decorations(false)
+                .skip_taskbar(true)
+                .focused(false)
+                .visible(true)
+                .build();
+        }
+    });
+}
+
+fn close_agent_browser(app: &tauri::AppHandle, spec_id: i64) {
+    if let Some(w) = app.get_webview_window(&browser_label(spec_id)) {
+        let _ = w.close();
+    }
+}
+
+/// CGWindowID of the agent browser, for window-only capture.
+fn browser_cg_window_id(app: &tauri::AppHandle, spec_id: i64) -> Option<i64> {
+    let win = app.get_webview_window(&browser_label(spec_id))?;
+    let raw = win.ns_window().ok()?;
+    use objc::{msg_send, sel, sel_impl};
+    let ns = raw as *mut objc::runtime::Object;
+    let num: i64 = unsafe { msg_send![ns, windowNumber] };
+    if num > 0 {
+        Some(num)
+    } else {
+        None
+    }
+}
+
+/// Capture ONLY the agent browser window (not the user's screen).
+async fn capture_browser(app: &tauri::AppHandle, spec_id: i64) -> Result<(String, f64, f64), String> {
+    let id = browser_cg_window_id(app, spec_id).ok_or("agent browser not ready")?;
+    let path = std::env::temp_dir().join(format!("cascade-agent-browser-{spec_id}.png"));
+    let out = std::process::Command::new("screencapture")
+        .args(["-l", &id.to_string(), "-o", "-x", "-t", "png", path.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|e| format!("capture browser: {e}"))?;
+    if !out.status.success() {
+        return Err("window capture failed".to_string());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("read browser shot: {e}"))?;
+    if bytes.len() < 200 {
+        return Err("empty browser capture".to_string());
+    }
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("decode browser shot: {e}"))?;
+    let resized = img.resize_exact(BROWSER_W as u32, BROWSER_H as u32, image::imageops::FilterType::Triangle);
+    let mut buf = Vec::new();
+    resized
+        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| format!("encode browser shot: {e}"))?;
+    Ok((STANDARD.encode(&buf), BROWSER_W, BROWSER_H))
+}
+
+fn browser_eval(app: &tauri::AppHandle, spec_id: i64, js: &str) {
+    if let Some(win) = app.get_webview_window(&browser_label(spec_id)) {
+        let _ = win.eval(js);
+    }
+}
+
+/// Execute an action inside the agent browser via JS injection — this is the
+/// whole point: it changes the agent's browser, NOT the user's screen.
+fn browser_execute(app: &tauri::AppHandle, spec_id: i64, action: &ComputerAction) {
+    match action.action.as_str() {
+        "navigate" | "open_app" => {
+            let url = if action.text.starts_with("http") {
+                action.text.clone()
+            } else if action.app.starts_with("http") {
+                action.app.clone()
+            } else if !action.app.is_empty() {
+                start_url_for_goal(&action.app)
+            } else {
+                start_url_for_goal(&action.text)
+            };
+            let safe = serde_json::to_string(&url).unwrap_or_else(|_| "\"https://www.google.com\"".into());
+            browser_eval(app, spec_id, &format!("window.location.href={safe};"));
+        }
+        "click" | "double_click" => {
+            browser_eval(app, spec_id, &format!(
+                "(function(){{var el=document.elementFromPoint({x},{y});if(el){{if(el.focus)el.focus();if(el.click)el.click();}}}})();",
+                x = action.x, y = action.y
+            ));
+        }
+        "type" => {
+            let t = serde_json::to_string(&action.text).unwrap_or_else(|_| "\"\"".into());
+            browser_eval(app, spec_id, &format!(
+                "(function(){{var t={t};var el=document.activeElement;if(!el)return;if(el.isContentEditable){{document.execCommand('insertText',false,t);}}else if('value' in el){{el.value=(el.value||'')+t;el.dispatchEvent(new Event('input',{{bubbles:true}}));}}}})();"
+            ));
+        }
+        "key" => {
+            let key = if action.key.is_empty() { "Enter".to_string() } else { action.key.clone() };
+            let k = serde_json::to_string(&key).unwrap_or_else(|_| "\"Enter\"".into());
+            browser_eval(app, spec_id, &format!(
+                "(function(){{var el=document.activeElement||document.body;['keydown','keypress','keyup'].forEach(function(ty){{el.dispatchEvent(new KeyboardEvent(ty,{{key:{k},bubbles:true}}));}});if(el.form&&el.form.requestSubmit){{el.form.requestSubmit();}}}})();"
+            ));
+        }
+        "scroll" => {
+            let dy = if action.y != 0.0 { action.y } else { 500.0 };
+            browser_eval(app, spec_id, &format!("window.scrollBy(0,{dy});"));
+        }
+        _ => {}
+    }
+}
+
 /// One task cycle: screenshot → decide → act, up to MAX_STEPS. Records its own
 /// run and returns the count of committing actions taken. The persistent
 /// `run_loop` calls this once on start and again on the agent's cadence.
@@ -504,15 +668,20 @@ async fn run_task_cycle(
     let mut history = String::new();
     let mut produced = 0i64;
 
+    // The agent's OWN browser (offscreen). Created once; reused across cycles.
+    ensure_agent_browser(app, spec_id, &start_url_for_goal(goal));
+    tokio::time::sleep(Duration::from_millis(1600)).await; // let the page load
+
     for step in 1..=MAX_STEPS {
         if stop_requested(spec_id) || is_paused(spec_id) {
             break;
         }
-        let (b64, lw, lh) = match capture_logical_screenshot(app) {
+        let (b64, lw, lh) = match capture_browser(app, spec_id).await {
             Ok(v) => v,
             Err(e) => {
                 emit_status(app, status_err(spec_id, name, goal, step, supervised, hue, e));
-                break;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
             }
         };
         let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64.clone(), img_w: lw, img_h: lh });
@@ -557,18 +726,16 @@ async fn run_task_cycle(
         }
 
         emit_cursor(app, CursorEvent { spec_id, name: name.to_string(), x: action.x, y: action.y, clicking: true, visible: true, hue });
+        // Act INSIDE the agent's own browser (never the user's screen).
+        browser_execute(app, spec_id, &action);
         if is_committing(&action.action) {
-            let _guard = INPUT_LOCK.lock().await;
-            execute_action(&action);
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            drop(_guard);
             produced += 1;
             if let Some((pool, run_id)) = &recording {
                 let _ = insert_agent_action(pool, &AgentActionInput {
                     run_id: *run_id,
                     spec_id,
                     step,
-                    tool: format!("computer.{}", action.action),
+                    tool: format!("browser.{}", action.action),
                     summary: narrate(&action),
                     content: None,
                     artifact_path: None,
@@ -577,12 +744,10 @@ async fn run_task_cycle(
                     state: "committed".to_string(),
                 }).await;
             }
-        } else {
-            execute_action(&action);
         }
 
         history.push_str(&format!("- step {step}: {}\n", narrate(&action)));
-        let pause = if action.action == "open_app" { 1800 } else { 850 };
+        let pause = if matches!(action.action.as_str(), "navigate" | "open_app") { 2400 } else { 900 };
         tokio::time::sleep(Duration::from_millis(pause)).await;
     }
 
@@ -633,8 +798,8 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
             break;
         }
         let paused = is_paused(spec_id);
-        // Keep the box alive: stream the current screen so the user always sees it.
-        if let Ok((b64, lw, lh)) = capture_logical_screenshot(&app) {
+        // Keep the box alive: stream the agent's browser (not the user's screen).
+        if let Ok((b64, lw, lh)) = capture_browser(&app, spec_id).await {
             let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64, img_w: lw, img_h: lh });
         }
         emit_status(
@@ -676,7 +841,8 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
         }
     }
 
-    // Stopped → tear down.
+    // Stopped → tear down (close the agent's browser too).
+    close_agent_browser(&app, spec_id);
     emit_cursor(&app, CursorEvent { spec_id, name: name.clone(), x: 0.0, y: 0.0, clicking: false, visible: false, hue });
     emit_status(
         &app,
@@ -856,6 +1022,41 @@ pub async fn cascade_approve_computer_step(spec_id: i64) -> Result<(), String> {
 #[specta::specta]
 pub async fn cascade_reject_computer_step(spec_id: i64) -> Result<(), String> {
     set_approval(spec_id, false);
+    Ok(())
+}
+
+/// Open a VISIBLE browser window so the employee can log the agent into a
+/// service (Notion, Gmail, …). WKWebView's default cookie store is shared
+/// app-wide and persistent, so once logged in here, the agent's own offscreen
+/// browser is authenticated for that service on every future run — and only the
+/// services the employee chose to log in. The employee closes this window when
+/// done.
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_open_agent_login(app: tauri::AppHandle, url: Option<String>) -> Result<(), String> {
+    let url = url.unwrap_or_else(|| "https://www.google.com".to_string());
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let label = "cascade-agent-login";
+        if let Some(win) = app2.get_webview_window(label) {
+            let safe = serde_json::to_string(&url).unwrap_or_else(|_| "\"https://www.google.com\"".into());
+            let _ = win.eval(&format!("window.location.href={safe};"));
+            let _ = win.show();
+            let _ = win.set_focus();
+        } else if let Ok(parsed) = tauri::Url::parse(&url) {
+            if let Ok(win) = WebviewWindowBuilder::new(&app2, label, WebviewUrl::External(parsed))
+                .title("Log Cascade's agent in — sign in, then close this window")
+                .inner_size(1100.0, 760.0)
+                .center()
+                .resizable(true)
+                .focused(true)
+                .visible(true)
+                .build()
+            {
+                let _ = win.set_focus();
+            }
+        }
+    });
     Ok(())
 }
 

@@ -256,6 +256,11 @@ export async function pauseComputerTask(paused: boolean, specId = 0): Promise<vo
   return invoke("cascade_pause_computer_task", { specId, paused });
 }
 
+/** Open a visible browser to log the agent into a service (session persists). */
+export async function openAgentLogin(url?: string): Promise<void> {
+  return invoke("cascade_open_agent_login", { url: url ?? null });
+}
+
 export async function approveComputerStep(specId: number): Promise<void> {
   return invoke("cascade_approve_computer_step", { specId });
 }

@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
 import { CascadeByokDialog } from "@/components/cascade-byok-dialog";
+import { openAgentLogin } from "@/lib/cascade-agents";
 import {
   CASCADE_DEFAULT_PROVIDER,
   CASCADE_ADVANCED_MODEL,
@@ -110,6 +111,33 @@ export default function SettingsPage() {
           >
             Get a key at console.anthropic.com/settings/keys →
           </a>
+        </Section>
+
+        {/* Agent logins */}
+        <Section
+          title="Agent logins"
+          sub="Your agents work in their own private browser — never your screen. Log that browser into the apps you want agents to use; the session is remembered for future runs, and agents can only touch services you log in here."
+        >
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {[
+              { label: "Notion", url: "https://www.notion.so/login" },
+              { label: "Gmail", url: "https://mail.google.com" },
+              { label: "Google Docs", url: "https://docs.google.com" },
+              { label: "LinkedIn", url: "https://www.linkedin.com/login" },
+              { label: "Slack", url: "https://slack.com/signin" },
+            ].map((s) => (
+              <button key={s.label} style={ghostBtn} onClick={() => openAgentLogin(s.url).catch(() => {})}>
+                Log in to {s.label}
+              </button>
+            ))}
+            <button style={ghostBtn} onClick={() => openAgentLogin("https://www.google.com").catch(() => {})}>
+              Other (open browser)
+            </button>
+          </div>
+          <p style={{ fontSize: 12, color: "var(--cascade-text-4)", lineHeight: 1.5, marginTop: 12 }}>
+            A browser window opens — sign in normally, then close it. Note: Google sign-in sometimes blocks
+            embedded browsers; most other apps (Notion, LinkedIn, Slack, internal tools) work.
+          </p>
         </Section>
 
         {/* Recording & privacy */}
