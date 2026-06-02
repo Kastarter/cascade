@@ -29,6 +29,81 @@ import {
 
 type DashboardTab = "pulse" | "patterns" | "cascades";
 
+type PatternEvidenceView = {
+  automation: string;
+  repeatSignal: string;
+  target: string;
+  apps: string[];
+  webTools: string[];
+  workflow: string[];
+  completion: string[];
+  citations: { label: string; value: string }[];
+};
+
+function normalizeEvidenceLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+function displayEvidenceLabel(label: string): string {
+  return label.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function splitEvidenceValue(value: string): string[] {
+  return value
+    .split(/(?:\||->|,|·)/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function summarizeEvidence(pattern: ManagerDashboardPattern): PatternEvidenceView {
+  const view: PatternEvidenceView = {
+    automation: pattern.proposal.what,
+    repeatSignal: "",
+    target: "",
+    apps: [],
+    webTools: [],
+    workflow: [],
+    completion: [],
+    citations: [],
+  };
+
+  for (const item of pattern.evidence) {
+    const label = normalizeEvidenceLabel(item.label);
+    if (label === "tier") continue;
+    if (label === "proposed automation") {
+      view.automation = item.value;
+      continue;
+    }
+    if (label === "repeat signal") {
+      view.repeatSignal = item.value;
+      continue;
+    }
+    if (label === "starting url") {
+      view.target = item.value;
+      continue;
+    }
+    if (label === "apps used") {
+      view.apps = splitEvidenceValue(item.value);
+      continue;
+    }
+    if (label === "web tools used") {
+      view.webTools = splitEvidenceValue(item.value);
+      continue;
+    }
+    if (label === "workflow observed") {
+      view.workflow = splitEvidenceValue(item.value);
+      continue;
+    }
+    if (label === "how they finished it") {
+      view.completion = splitEvidenceValue(item.value);
+      continue;
+    }
+    view.citations.push({ label: displayEvidenceLabel(item.label), value: item.value });
+  }
+
+  return view;
+}
+
 export function CascadeManagerDashboard() {
   const router = useRouter();
   const [tab, setTab] = useState<DashboardTab>("pulse");
@@ -101,7 +176,7 @@ export function CascadeManagerDashboard() {
   }
 
   return (
-    <div data-screen-label="Cascade Manager" style={{ minHeight: "100vh", background: "var(--cascade-bg)" }}>
+    <div data-screen-label="Cascade Manager" style={{ height: "100vh", overflowY: "auto", background: "var(--cascade-bg)" }}>
       <ManagerShell
         tab={tab}
         setTab={setTab}
@@ -491,6 +566,7 @@ function PatternCard({
   onCompose: (pattern: ManagerDashboardPattern) => void;
 }) {
   const color = kindColor(pattern.kind);
+  const evidence = summarizeEvidence(pattern);
   return (
     <article
       onClick={() => onCompose(pattern)}
@@ -536,13 +612,61 @@ function PatternCard({
         {pattern.title}
       </h3>
 
-      {big && <p style={{ margin: "12px 0 0", fontSize: 13.5, lineHeight: 1.55, color: "var(--cascade-text-2)" }}>{pattern.detail}</p>}
+      <p
+        style={{
+          margin: "10px 0 0",
+          fontSize: big ? 13.5 : 12.5,
+          lineHeight: 1.55,
+          color: "var(--cascade-text-2)",
+          display: "-webkit-box",
+          WebkitLineClamp: big ? 3 : 2,
+          WebkitBoxOrient: "vertical",
+          overflow: "hidden",
+        }}
+      >
+        {pattern.detail}
+      </p>
+
+      <div
+        style={{
+          marginTop: 12,
+          padding: "10px 12px",
+          borderRadius: 8,
+          background: "rgba(255,255,255,0.03)",
+          border: "1px solid var(--cascade-border)",
+        }}
+      >
+        <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 9, letterSpacing: 1.1, textTransform: "uppercase", color: "var(--cascade-text-4)" }}>
+          Suggested automation
+        </div>
+        <div
+          style={{
+            marginTop: 6,
+            fontSize: big ? 12.75 : 11.75,
+            lineHeight: 1.5,
+            color: "var(--cascade-text-2)",
+            display: "-webkit-box",
+            WebkitLineClamp: big ? 3 : 2,
+            WebkitBoxOrient: "vertical",
+            overflow: "hidden",
+          }}
+        >
+          {evidence.automation}
+        </div>
+      </div>
 
       <div style={{ flex: 1 }} />
 
-      <div style={{ marginTop: big ? 22 : 14, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+      <div style={{ marginTop: big ? 18 : 14, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <span style={{ fontFamily: "var(--cascade-mono)", fontSize: big ? 26 : 18, fontWeight: 600, color }}>
+          <span
+            style={{
+              fontFamily: "var(--cascade-mono)",
+              fontSize: big ? (pattern.metric.length > 16 ? 18 : 26) : pattern.metric.length > 16 ? 13 : 18,
+              fontWeight: 600,
+              color,
+            }}
+          >
             {pattern.metric}
           </span>
           <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-4)", textTransform: "uppercase", letterSpacing: 1.1 }}>
@@ -675,6 +799,8 @@ function ComposeConsole({
   const busy = phase === "generating" || phase === "sending";
   const invalid = spec?.validationStatus === "invalid";
   const alreadySent = spec ? spec.status !== "generated" : false;
+  const evidence = summarizeEvidence(pattern);
+  const targetLabel = evidence.target || evidence.webTools.join(", ") || evidence.apps.join(", ");
 
   return (
     <div
@@ -710,6 +836,11 @@ function ComposeConsole({
           </div>
 
           <div style={{ padding: "14px 18px", background: "var(--cascade-bg)", border: "1px solid var(--cascade-border)", borderRadius: 8 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+              <SpecBadge label={pattern.kindLabel} />
+              <SpecBadge label={`${Math.round(pattern.confidence * 100)}% confidence`} />
+              <SpecBadge label={pattern.proposal.name} />
+            </div>
             <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 9.5, letterSpacing: 1.4, textTransform: "uppercase", color: "var(--cascade-text-3)", marginBottom: 8 }}>
               Detected pattern
             </div>
@@ -719,16 +850,84 @@ function ComposeConsole({
         </div>
 
         <div style={{ padding: "16px 28px", borderBottom: "1px solid var(--cascade-border)" }}>
-          <Field label="What the detector saw (from sanitized metrics only)">
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              {pattern.evidence.map((item) => (
-                <div key={`${item.label}-${item.value}`} style={evidenceCardStyle}>
-                  <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 9, color: "var(--cascade-text-4)", textTransform: "uppercase", letterSpacing: 1.2 }}>
-                    {item.label}
-                  </div>
-                  <div style={{ marginTop: 6, fontSize: 13, color: "var(--cascade-text-2)" }}>{item.value}</div>
+          <Field label="What the detector saw">
+            <div style={{ ...evidenceCardStyle, padding: "14px 16px", background: "linear-gradient(180deg, oklch(0.21 0.025 150), var(--cascade-panel))" }}>
+              <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 9, color: "var(--cascade-text-4)", textTransform: "uppercase", letterSpacing: 1.2 }}>
+                Proposed automation
+              </div>
+              <div style={{ marginTop: 8, fontSize: 15, lineHeight: 1.6, color: "var(--cascade-text)" }}>{evidence.automation}</div>
+            </div>
+          </Field>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <Field label="Why this looks consistent">
+              <div style={{ ...evidenceCardStyle, minHeight: 96 }}>
+                <div style={{ fontSize: 13.5, lineHeight: 1.6, color: "var(--cascade-text-2)" }}>
+                  {evidence.repeatSignal || "The detector found a repeatable path in the same tools and completion pattern."}
                 </div>
-              ))}
+              </div>
+            </Field>
+
+            <Field label="Where an agent can run it">
+              <div style={{ ...evidenceCardStyle, minHeight: 96 }}>
+                <div style={{ fontSize: 13.5, lineHeight: 1.6, color: "var(--cascade-text-2)" }}>
+                  {targetLabel || "Grounded to the recorded workflow only."}
+                </div>
+                {(evidence.webTools.length > 0 || evidence.apps.length > 0) && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+                    {[...evidence.webTools, ...evidence.apps].slice(0, 5).map((item) => (
+                      <span key={item} style={miniChipStyle}>
+                        {item}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </Field>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <Field label="Recent workflow sample">
+              <StepList
+                empty="No short workflow path recovered from the recording yet."
+                steps={evidence.workflow}
+              />
+            </Field>
+
+            <Field label="How they usually finish it">
+              <StepList
+                empty="No repeated completion pattern recovered yet."
+                steps={evidence.completion}
+              />
+            </Field>
+          </div>
+
+          {evidence.citations.length > 0 && (
+            <Field label="Detector citations">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {evidence.citations.map((item) => (
+                  <div key={`${item.label}-${item.value}`} style={evidenceCardStyle}>
+                    <div style={{ fontFamily: "var(--cascade-mono)", fontSize: 9, color: "var(--cascade-text-4)", textTransform: "uppercase", letterSpacing: 1.2 }}>
+                      {item.label}
+                    </div>
+                    <div style={{ marginTop: 6, fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.55 }}>{item.value}</div>
+                  </div>
+                ))}
+              </div>
+            </Field>
+          )}
+
+          <Field label="Proposed cascade">
+            <div style={{ ...evidenceCardStyle, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 15, fontWeight: 600 }}>{pattern.proposal.name}</div>
+              <div style={{ fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.55 }}>{pattern.proposal.trigger}</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {(pattern.proposal.scope.length > 0 ? pattern.proposal.scope : ["Grounded to recorded tools"]).map((item) => (
+                  <span key={item} style={miniChipStyle}>
+                    {item}
+                  </span>
+                ))}
+              </div>
             </div>
           </Field>
         </div>
@@ -869,6 +1068,35 @@ function SpecBadge({ label, warn }: { label: string; warn?: boolean }) {
   );
 }
 
+function StepList({ steps, empty }: { steps: string[]; empty: string }) {
+  if (steps.length === 0) {
+    return <div style={{ ...evidenceCardStyle, fontSize: 12.5, color: "var(--cascade-text-4)" }}>{empty}</div>;
+  }
+  return (
+    <div style={{ ...evidenceCardStyle, display: "grid", gap: 8 }}>
+      {steps.map((step, index) => (
+        <div
+          key={`${step}-${index}`}
+          style={{
+            display: "grid",
+            gridTemplateColumns: "22px 1fr",
+            gap: 10,
+            alignItems: "start",
+            fontSize: 13,
+            lineHeight: 1.55,
+            color: "var(--cascade-text-2)",
+          }}
+        >
+          <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, color: "var(--cascade-text-4)", marginTop: 2 }}>
+            {String(index + 1).padStart(2, "0")}
+          </span>
+          <span>{step}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div style={{ marginBottom: 16 }}>
@@ -912,6 +1140,16 @@ const evidenceCardStyle: CSSProperties = {
   borderRadius: 8,
   border: "1px solid var(--cascade-border)",
   background: "var(--cascade-panel)",
+};
+
+const miniChipStyle: CSSProperties = {
+  padding: "4px 8px",
+  borderRadius: 999,
+  border: "1px solid var(--cascade-border)",
+  background: "rgba(255,255,255,0.03)",
+  fontFamily: "var(--cascade-mono)",
+  fontSize: 10,
+  color: "var(--cascade-text-3)",
 };
 
 const closeBtnStyle: CSSProperties = {

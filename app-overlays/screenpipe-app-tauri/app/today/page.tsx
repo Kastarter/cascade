@@ -17,7 +17,7 @@ export default function TodayPage() {
   const dateLabel = now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
 
   return (
-    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
+    <div style={{ height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
       <CascadeTitlebar />
 
       <div

@@ -55,75 +55,83 @@ export interface ManagerDashboardMetrics {
   outboxPath: string;
 }
 
+function titleCaseSlug(value: string): string {
+  return (value || "helper-agent")
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function normalizeEvidenceLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+function findEvidenceValue(evidence: CascadeManagerEvidence[], label: string): string {
+  return evidence.find((item) => normalizeEvidenceLabel(item.label) === label)?.value ?? "";
+}
+
+function splitEvidenceList(value: string): string[] {
+  return value
+    .split(/(?:,|\||->|·)/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function kindToDash(kind: string): ManagerDashboardPattern["kind"] {
-  switch (kind) {
-    case "communication_churn":
-      return "inbox";
-    case "meeting_load":
-      return "meetings";
-    case "manual_admin_work":
-      return "wrap";
-    case "research_friction":
-      return "code";
-    case "context_switching":
-    default:
-      return "focus";
-  }
+  const value = kind.toLowerCase();
+  if (/(mail|message|inbox|notif|slack|reply|follow-up|followup)/.test(value)) return "inbox";
+  if (/(meeting|calendar|zoom|call|recap)/.test(value)) return "meetings";
+  if (/(admin|portal|status|update|check|digest|triage|review)/.test(value)) return "wrap";
+  if (/(research|compare|doc|content|code|build|investigation)/.test(value)) return "code";
+  return "focus";
 }
 
-function agentProposal(agentKind: string) {
-  switch (agentKind) {
-    case "focus-guard":
-      return {
-        name: "Focus guard",
-        what: "Suppress noisy side-channels and nudge the employee back into a single task when rapid switching starts compounding.",
-        trigger: "When rapid switching is detected",
-        scope: ["Slack", "Browser", "Notifications"],
-        verb: "mute" as const,
-      };
-    case "inbox-batcher":
-      return {
-        name: "Inbox batcher",
-        what: "Batch low-priority communication into scheduled digests so the employee can hold a real focus block.",
-        trigger: "Continuous · releases on a schedule",
-        scope: ["Slack", "Mail", "Messages"],
-        verb: "defer" as const,
-      };
-    case "meeting-recap":
-      return {
-        name: "Meeting recap",
-        what: "Summarize recurring meetings into a tight recap so the employee doesn’t need to keep reopening recordings or notes.",
-        trigger: "When a meeting ends",
-        scope: ["Meeting notes", "Recordings", "Calendar"],
-        verb: "summarize" as const,
-      };
-    case "research-assistant":
-      return {
-        name: "Research assistant",
-        what: "Capture browser findings and turn repeated lookup loops into a reusable, task-scoped summary.",
-        trigger: "When browser-heavy execution loops appear",
-        scope: ["Browser", "Docs", "Knowledge base"],
-        verb: "summarize" as const,
-      };
-    case "status-automation":
-    default:
-      return {
-        name: "Status automation",
-        what: "Convert repetitive update and admin work into a reusable workflow the employee can review instead of rewriting from scratch.",
-        trigger: "When repetitive admin work is detected",
-        scope: ["Docs", "Task tracker", "Status surfaces"],
-        verb: "remind" as const,
-      };
-  }
+function inferProposalVerb(purpose: string): "mute" | "defer" | "summarize" | "remind" {
+  const text = purpose.toLowerCase();
+  if (/(digest|summar|recap|compile|collect)/.test(text)) return "summarize";
+  if (/(delay|batch|triage|queue|defer)/.test(text)) return "defer";
+  if (/(mute|suppress|silence|block)/.test(text)) return "mute";
+  return "remind";
 }
 
-function evidenceMetric(evidence: CascadeManagerEvidence[]): { metric: string; metricLabel: string } {
-  if (evidence.length === 0) {
-    return { metric: "—", metricLabel: "no evidence yet" };
+function inferProposalTrigger(purpose: string): string {
+  const text = purpose.toLowerCase();
+  if (/(schedule|scheduled|every|daily|weekly)/.test(text)) return "Scheduled recurring run";
+  if (/(when|after)\b/.test(text)) return "Triggered by observed workflow";
+  return "Recurring on-demand workflow";
+}
+
+function agentProposal(agentKind: string, evidence: CascadeManagerEvidence[]) {
+  const purpose =
+    findEvidenceValue(evidence, "proposed automation") ||
+    "Automate this recurring workflow using the same tools the user already touches.";
+  const scope = splitEvidenceList(findEvidenceValue(evidence, "web tools used") || findEvidenceValue(evidence, "apps used")).slice(0, 4);
+  return {
+    name: titleCaseSlug(agentKind),
+    what: purpose,
+    trigger: inferProposalTrigger(purpose),
+    scope,
+    verb: inferProposalVerb(purpose),
+  };
+}
+
+function evidenceMetric(suggestion: CascadeManagerSuggestion): { metric: string; metricLabel: string } {
+  const tools = splitEvidenceList(findEvidenceValue(suggestion.evidence, "web tools used"));
+  if (tools.length > 0) {
+    return { metric: tools.slice(0, 2).join(" · "), metricLabel: "runs in" };
+  }
+  const apps = splitEvidenceList(findEvidenceValue(suggestion.evidence, "apps used"));
+  if (apps.length > 0) {
+    return { metric: apps.slice(0, 2).join(" · "), metricLabel: "observed in" };
+  }
+  const workflow = splitEvidenceList(findEvidenceValue(suggestion.evidence, "workflow observed"));
+  if (workflow.length > 0) {
+    return { metric: `${workflow.length}`, metricLabel: "steps captured" };
   }
   return {
-    metric: evidence[0].value,
-    metricLabel: evidence[0].label,
+    metric: `${Math.round((suggestion.confidence || 0) * 100)}%`,
+    metricLabel: "confidence",
   };
 }
 
@@ -150,8 +158,8 @@ function daysSince(iso?: string | null): number {
 }
 
 export function toDashboardPattern(suggestion: CascadeManagerSuggestion): ManagerDashboardPattern {
-  const proposal = agentProposal(suggestion.suggestedAgentKind);
-  const { metric, metricLabel } = evidenceMetric(suggestion.evidence);
+  const proposal = agentProposal(suggestion.suggestedAgentKind, suggestion.evidence);
+  const { metric, metricLabel } = evidenceMetric(suggestion);
   return {
     id: suggestion.id ? `pattern-${suggestion.id}` : `${suggestion.kind}-${suggestion.title}`,
     suggestionId: suggestion.id,
@@ -173,11 +181,12 @@ export function toDashboardPattern(suggestion: CascadeManagerSuggestion): Manage
 
 export function toDashboardCascade(suggestion: CascadeManagerSuggestion): ManagerDashboardCascade {
   const state = cascadeState(suggestion.status);
+  const proposal = agentProposal(suggestion.suggestedAgentKind, suggestion.evidence);
   return {
     id: suggestion.id ? `cascade-${suggestion.id}` : `cascade-${suggestion.kind}`,
     suggestionId: suggestion.id,
     code: `CS-${String(suggestion.id ?? 0).padStart(3, "0")}`,
-    name: agentProposal(suggestion.suggestedAgentKind).name,
+    name: proposal.name,
     to: "This employee",
     sentDays: daysSince(suggestion.createdAt),
     installed: state === "deployed" ? 1 : 0,

@@ -30,6 +30,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -139,6 +140,17 @@ pub(crate) async fn cascade_pool(
     Ok(pool)
 }
 
+pub(crate) async fn should_supervise_live_run(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+) -> Result<bool, String> {
+    let pool = cascade_pool(app).await?;
+    let live_runs = count_live_runs(&pool, spec_id)
+        .await
+        .map_err(|e| format!("count live runs: {e}"))?;
+    Ok(live_runs < 3)
+}
+
 // NOTE: the /activity-summary server response is plain snake_case
 // (`data_status`, `total_frames`, `app_name`, …) — NOT camelCase. We must match
 // that exactly or serde fails with "error decoding response body". We only pull
@@ -204,6 +216,922 @@ async fn fetch_activity_summary(
         .await
         .map_err(|e| format!("parse activity summary: {e}"))?;
     Ok((start_iso, end_iso, body))
+}
+
+// ─── The Rewind: actual on-screen content from the recording ─────────
+//
+// The detector + the agents read THIS — what the employee was really doing
+// (window titles + OCR of the screen) — not thin app-minute aggregates. Sensitive
+// apps/windows are still dropped before anything is summarized or leaves the device.
+
+#[derive(Debug, Default, Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    data: Vec<SearchItem>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct SearchItem {
+    #[serde(default)]
+    content: SearchContent,
+}
+#[derive(Debug, Default, Deserialize)]
+struct SearchContent {
+    // screenpipe's OCRContent serializes `browser_url` (and may serialize other
+    // string fields) as JSON `null` for non-browser frames — `#[serde(default)]`
+    // only covers a MISSING key, not an explicit `null`, so a plain `String` here
+    // makes `response.json()` fail with "error decoding response body" on almost
+    // every real recording. de_null_string maps null → "" so the parse survives.
+    #[serde(default, deserialize_with = "de_null_string")]
+    timestamp: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    app_name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    window_name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    text: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    browser_url: String,
+}
+
+/// Fetch the raw Rewind frames (OCR) over the last `hours`, sorted by time.
+async fn fetch_rewind_frames(
+    app: &tauri::AppHandle,
+    hours: u32,
+    max_frames: u32,
+) -> Result<Vec<SearchContent>, String> {
+    let end = Utc::now();
+    let start = end - Duration::hours(hours as i64);
+    let path = format!(
+        "/search?content_type=ocr&start_time={}&end_time={}&limit={}",
+        urlencoding::encode(&start.to_rfc3339()),
+        urlencoding::encode(&end.to_rfc3339()),
+        max_frames,
+    );
+    let api = crate::recording::local_api_context_from_app(app);
+    let client = Client::new();
+    let response = api
+        .apply_auth(client.get(api.url(&path)))
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| format!("fetch rewind: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("rewind search returned {}", response.status()));
+    }
+    // Read the body as text first so a decode failure can log the ACTUAL JSON
+    // that broke (e.g. a field shape the struct doesn't tolerate), instead of an
+    // opaque "error decoding response body".
+    let raw = response
+        .text()
+        .await
+        .map_err(|e| format!("read rewind body: {e}"))?;
+    let body: SearchResponse = serde_json::from_str(&raw).map_err(|e| {
+        eprintln!(
+            "[cascade-rewind] parse FAILED: {e} — first 400 bytes: {}",
+            raw.chars().take(400).collect::<String>()
+        );
+        format!("parse rewind: {e}")
+    })?;
+    let mut frames: Vec<SearchContent> = body.data.into_iter().map(|i| i.content).collect();
+    frames.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    eprintln!("[cascade-rewind] parsed {} frames over last {hours}h", frames.len());
+    Ok(frames)
+}
+
+/// host portion of a URL (no scheme crate needed). "https://d2l.x.ca/foo" → "d2l.x.ca".
+fn host_from_url(u: &str) -> Option<String> {
+    let s = u.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let after = s.split("://").nth(1).unwrap_or(s);
+    let host = after.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+fn task_keywords(task: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for part in task
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s.len() >= 3)
+    {
+        if seen.insert(part.clone()) {
+            out.push(part);
+        }
+    }
+    out
+}
+
+fn frame_text_blob(frame: &SearchContent) -> String {
+    format!(
+        "{} {} {} {}",
+        frame.app_name, frame.window_name, frame.text, frame.browser_url
+    )
+    .to_lowercase()
+}
+
+fn rewind_snippet(frame: &SearchContent, max_chars: usize) -> String {
+    frame.text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn dedupe_push(items: &mut Vec<String>, value: String) {
+    if value.trim().is_empty() {
+        return;
+    }
+    if items.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
+        return;
+    }
+    items.push(value);
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn preview_delimited(value: &str, delimiter: &str, max_items: usize, max_chars: usize, joiner: &str) -> String {
+    let mut items = value
+        .split(delimiter)
+        .map(collapse_whitespace)
+        .filter(|item| !item.is_empty())
+        .take(max_items)
+        .map(|item| truncate_chars(&item, max_chars))
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        String::new()
+    } else {
+        items.truncate(max_items);
+        items.join(joiner)
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn sanitize_detector_text(value: &str, max_chars: usize) -> String {
+    truncate_chars(&collapse_whitespace(value), max_chars)
+}
+
+fn sanitize_evidence_label(label: &str) -> String {
+    let normalized = collapse_whitespace(label).to_lowercase();
+    match normalized.as_str() {
+        "app" | "apps" | "app used" | "apps used" => "apps used".to_string(),
+        "site" | "sites" | "tool" | "tools" | "web tools" | "web tools used" => {
+            "web tools used".to_string()
+        }
+        "url" | "start url" | "starting url" | "target url" => "starting url".to_string(),
+        "workflow" | "workflow observed" | "observed workflow" => "workflow observed".to_string(),
+        "how they finished it" | "completion pattern" | "finished with" => {
+            "how they finished it".to_string()
+        }
+        "proposed automation" | "automation" | "agent purpose" => {
+            "proposed automation".to_string()
+        }
+        _ => normalized,
+    }
+}
+
+fn sanitize_evidence_value(label: &str, value: &str) -> String {
+    let normalized_label = sanitize_evidence_label(label);
+    let cleaned = collapse_whitespace(value);
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    match normalized_label.as_str() {
+        "workflow observed" => preview_delimited(&cleaned, "|", 4, 82, " | "),
+        "how they finished it" => preview_delimited(&cleaned, "->", 4, 72, " -> "),
+        "apps used" | "web tools used" => preview_delimited(&cleaned, ",", 4, 28, ", "),
+        "starting url" => truncate_chars(&cleaned, 110),
+        _ => truncate_chars(&cleaned, 180),
+    }
+}
+
+fn sanitize_detector_evidence(items: Vec<CascadeManagerEvidence>) -> Vec<CascadeManagerEvidence> {
+    let mut out = Vec::new();
+    for item in items {
+        let label = sanitize_evidence_label(&item.label);
+        let value = sanitize_evidence_value(&label, &item.value);
+        if value.is_empty()
+            || out
+                .iter()
+                .any(|existing: &CascadeManagerEvidence| existing.label == label && existing.value == value)
+        {
+            continue;
+        }
+        out.push(CascadeManagerEvidence { label, value });
+        if out.len() >= 7 {
+            break;
+        }
+    }
+    out
+}
+
+fn suggestion_purpose(s: &CascadeManagerSuggestion) -> String {
+    s.evidence
+        .iter()
+        .find(|e| e.label == "proposed automation")
+        .map(|e| e.value.clone())
+        .unwrap_or_default()
+}
+
+fn suggestion_descriptor_blob(s: &CascadeManagerSuggestion) -> String {
+    format!(
+        "{} {} {} {}",
+        s.kind,
+        s.title,
+        s.summary,
+        suggestion_purpose(s)
+    )
+    .to_lowercase()
+}
+
+fn repeatability_score(s: &CascadeManagerSuggestion, grounding: &WorkflowGrounding) -> f64 {
+    let text = suggestion_descriptor_blob(s);
+    let recurring_cues = [
+        "daily",
+        "every",
+        "each",
+        "recurring",
+        "repeat",
+        "repeated",
+        "repeatedly",
+        "routine",
+        "schedule",
+        "scheduled",
+        "monitor",
+        "check",
+        "digest",
+        "triage",
+        "follow-up",
+        "follow up",
+        "status",
+        "recap",
+        "deadline",
+        "availability",
+        "grades",
+    ];
+    let one_off_cues = [
+        "fix",
+        "debug",
+        "investigate",
+        "migration",
+        "migrate",
+        "install",
+        "setup",
+        "set up",
+        "refactor",
+        "rename",
+        "repair",
+        "clean up",
+        "one-time",
+        "one off",
+    ];
+
+    let mut score: f64 = 0.0;
+    if contains_any(&text, &recurring_cues) {
+        score += 0.45;
+    }
+    if grounding.observed_workflow.len() >= 3 {
+        score += 0.2;
+    }
+    if !grounding.completion_pattern.trim().is_empty() {
+        score += 0.15;
+    }
+    if grounding.target_hosts.len() + grounding.observed_apps.len() >= 2 {
+        score += 0.2;
+    }
+    if contains_any(&text, &one_off_cues) {
+        score -= 0.45;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn agent_fit_score(s: &CascadeManagerSuggestion, grounding: &WorkflowGrounding) -> f64 {
+    let text = suggestion_descriptor_blob(s);
+    let feasible_cues = [
+        "summarize",
+        "summary",
+        "draft",
+        "digest",
+        "check",
+        "monitor",
+        "post",
+        "send",
+        "collect",
+        "compile",
+        "copy",
+        "sync",
+        "review",
+        "update",
+        "triage",
+        "remind",
+        "notify",
+        "compare",
+        "track",
+        "log in",
+        "login",
+        "open",
+    ];
+    let hard_cues = [
+        "brainstorm",
+        "decide",
+        "strategy",
+        "creative",
+        "design",
+        "architect",
+        "write code",
+        "coding",
+        "learn",
+        "study",
+    ];
+
+    let mut score: f64 = 0.0;
+    if contains_any(&text, &feasible_cues) {
+        score += 0.5;
+    }
+    if grounding.execution_mode == "browser"
+        && (!grounding.target_hosts.is_empty() || !grounding.primary_url.is_empty())
+    {
+        score += 0.25;
+    }
+    if !grounding.observed_apps.is_empty() {
+        score += 0.1;
+    }
+    if !grounding.observed_workflow.is_empty() || !grounding.completion_pattern.is_empty() {
+        score += 0.15;
+    }
+    if contains_any(&text, &hard_cues) {
+        score -= 0.5;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn repeat_signal_summary(grounding: &WorkflowGrounding) -> String {
+    let mut parts = Vec::new();
+    if !grounding.target_hosts.is_empty() {
+        parts.push(format!(
+            "Keeps happening in {}",
+            grounding.target_hosts.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    } else if !grounding.observed_apps.is_empty() {
+        parts.push(format!(
+            "Shows up across {}",
+            grounding.observed_apps.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if grounding.observed_workflow.len() >= 3 {
+        parts.push(format!(
+            "{} repeatable screens matched this task",
+            grounding.observed_workflow.len()
+        ));
+    }
+    if !grounding.completion_pattern.trim().is_empty() {
+        parts.push(format!(
+            "Often ends with {}",
+            preview_delimited(&grounding.completion_pattern, "->", 2, 48, " -> ")
+        ));
+    }
+    truncate_chars(&parts.join(" · "), 180)
+}
+
+fn should_keep_manager_suggestion(s: &CascadeManagerSuggestion, grounding: &WorkflowGrounding) -> bool {
+    if s.title.trim().is_empty() || s.summary.trim().is_empty() {
+        return false;
+    }
+    if suggestion_purpose(s).chars().count() < 18 {
+        return false;
+    }
+    if s.confidence < 0.55 || s.severity_score < 0.35 {
+        return false;
+    }
+    if grounding.observed_workflow.len() < 2
+        && grounding.target_hosts.is_empty()
+        && grounding.observed_apps.is_empty()
+    {
+        return false;
+    }
+    repeatability_score(s, grounding) >= 0.55 && agent_fit_score(s, grounding) >= 0.55
+}
+
+fn top_ranked(mut counts: HashMap<String, i64>, limit: usize) -> Vec<String> {
+    let mut items: Vec<(String, i64)> = counts.drain().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items
+        .into_iter()
+        .map(|(value, _)| value)
+        .filter(|value| !value.trim().is_empty())
+        .take(limit)
+        .collect()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowGrounding {
+    #[serde(default = "default_execution_mode", deserialize_with = "de_null_string")]
+    pub execution_mode: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub primary_url: String,
+    #[serde(default)]
+    pub target_hosts: Vec<String>,
+    #[serde(default)]
+    pub observed_apps: Vec<String>,
+    #[serde(default)]
+    pub observed_workflow: Vec<String>,
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub completion_pattern: String,
+}
+
+fn derive_rewind_grounding(frames: &[SearchContent], task: &str) -> WorkflowGrounding {
+    let keywords = task_keywords(task);
+    let visible: Vec<&SearchContent> = frames
+        .iter()
+        .filter(|f| {
+            !(f.app_name.is_empty() && f.window_name.is_empty() && f.text.trim().is_empty())
+                && !is_sensitive(&f.app_name)
+                && !is_sensitive(&f.window_name)
+                && !is_sensitive(&f.text)
+        })
+        .collect();
+    let matched: Vec<&SearchContent> = visible
+        .iter()
+        .copied()
+        .filter(|f| {
+            if keywords.is_empty() {
+                return true;
+            }
+            let blob = frame_text_blob(f);
+            keywords.iter().any(|kw| blob.contains(kw))
+        })
+        .collect();
+    let relevant: Vec<&SearchContent> = if matched.len() >= 3 { matched } else { visible };
+
+    let mut host_counts: HashMap<String, i64> = HashMap::new();
+    let mut app_counts: HashMap<String, i64> = HashMap::new();
+    let mut observed_workflow = Vec::new();
+    let mut workflow_seen = HashSet::new();
+    let mut completion = Vec::new();
+    let mut primary_url = String::new();
+
+    for frame in &relevant {
+        if !frame.app_name.trim().is_empty() {
+            *app_counts
+                .entry(frame.app_name.trim().to_string())
+                .or_insert(0) += 1;
+        }
+        if let Some(host) = host_from_url(&frame.browser_url) {
+            if host != "google.com"
+                && host != "www.google.com"
+                && host != "localhost"
+                && host != "127.0.0.1"
+                && !host.starts_with("newtab")
+                && !is_sensitive(&host)
+            {
+                let entry = host_counts.entry(host.clone()).or_insert(0);
+                *entry += 1;
+                if primary_url.is_empty() {
+                    primary_url = format!("https://{host}");
+                }
+            }
+        }
+
+        let hhmm = frame.timestamp.get(11..16).unwrap_or("");
+        let host = host_from_url(&frame.browser_url).unwrap_or_default();
+        let app = if frame.app_name.trim().is_empty() {
+            "Browser"
+        } else {
+            frame.app_name.trim()
+        };
+        let window = frame.window_name.trim();
+        let snippet = rewind_snippet(frame, 120);
+        let key = format!("{app}|{window}|{host}");
+        if workflow_seen.insert(key) {
+            let mut line = format!("[{hhmm}] {app}");
+            if !host.is_empty() {
+                line.push_str(&format!(" ({host})"));
+            }
+            if !window.is_empty() {
+                line.push_str(&format!(" — {window}"));
+            }
+            if !snippet.is_empty() {
+                line.push_str(&format!(" :: {snippet}"));
+            }
+            if observed_workflow.len() < 6 {
+                dedupe_push(&mut observed_workflow, line);
+            }
+        }
+    }
+
+    for frame in relevant.iter().rev().take(3).rev() {
+        let host = host_from_url(&frame.browser_url).unwrap_or_default();
+        let window = frame.window_name.trim();
+        let snippet = rewind_snippet(frame, 80);
+        let mut line = if !host.is_empty() {
+            host
+        } else if !window.is_empty() {
+            window.to_string()
+        } else if !frame.app_name.trim().is_empty() {
+            frame.app_name.trim().to_string()
+        } else {
+            snippet.clone()
+        };
+        if !snippet.is_empty() && !line.contains(&snippet) {
+            line.push_str(&format!(" ({snippet})"));
+        }
+        dedupe_push(&mut completion, line);
+    }
+
+    let target_hosts = top_ranked(host_counts, 4);
+    let observed_apps = top_ranked(app_counts, 4);
+    let execution_mode = if !target_hosts.is_empty() || !primary_url.is_empty() {
+        "browser".to_string()
+    } else {
+        default_execution_mode()
+    };
+
+    WorkflowGrounding {
+        execution_mode,
+        primary_url,
+        target_hosts,
+        observed_apps,
+        observed_workflow,
+        completion_pattern: completion.join(" -> "),
+    }
+}
+
+pub(crate) async fn fetch_rewind_grounding(
+    app: &tauri::AppHandle,
+    hours: u32,
+    task: &str,
+    max_frames: u32,
+) -> Result<WorkflowGrounding, String> {
+    let frames = fetch_rewind_frames(app, hours, max_frames).await?;
+    Ok(derive_rewind_grounding(&frames, task))
+}
+
+fn add_grounding_evidence(s: &mut CascadeManagerSuggestion, grounding: &WorkflowGrounding) {
+    let repeat_signal = repeat_signal_summary(grounding);
+    if !repeat_signal.is_empty() {
+        s.evidence.push(CascadeManagerEvidence {
+            label: "repeat signal".to_string(),
+            value: repeat_signal,
+        });
+    }
+    if !grounding.primary_url.is_empty() {
+        s.evidence.push(CascadeManagerEvidence {
+            label: "starting url".to_string(),
+            value: sanitize_evidence_value("starting url", &grounding.primary_url),
+        });
+    }
+    if !grounding.observed_apps.is_empty() {
+        s.evidence.push(CascadeManagerEvidence {
+            label: "apps used".to_string(),
+            value: sanitize_evidence_value("apps used", &grounding.observed_apps.join(", ")),
+        });
+    }
+    if !grounding.target_hosts.is_empty() {
+        s.evidence.push(CascadeManagerEvidence {
+            label: "web tools used".to_string(),
+            value: sanitize_evidence_value("web tools used", &grounding.target_hosts.join(", ")),
+        });
+    }
+    if !grounding.observed_workflow.is_empty() {
+        s.evidence.push(CascadeManagerEvidence {
+            label: "workflow observed".to_string(),
+            value: sanitize_evidence_value("workflow observed", &grounding.observed_workflow.join(" | ")),
+        });
+    }
+    if !grounding.completion_pattern.is_empty() {
+        s.evidence.push(CascadeManagerEvidence {
+            label: "how they finished it".to_string(),
+            value: sanitize_evidence_value("how they finished it", &grounding.completion_pattern),
+        });
+    }
+}
+
+fn merge_grounding_into_spec(doc: &mut AgentSpecDoc, grounding: &WorkflowGrounding) {
+    if doc.execution_mode.trim().is_empty() || grounding.execution_mode == "browser" {
+        doc.execution_mode = grounding.execution_mode.clone();
+    }
+    if doc.target_url.trim().is_empty() {
+        doc.target_url = grounding.primary_url.clone();
+    }
+    for host in &grounding.target_hosts {
+        if !doc
+            .target_hosts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(host))
+        {
+            doc.target_hosts.push(host.clone());
+        }
+    }
+    for app in &grounding.observed_apps {
+        if !doc
+            .observed_apps
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(app))
+        {
+            doc.observed_apps.push(app.clone());
+        }
+    }
+    for step in &grounding.observed_workflow {
+        if !doc
+            .observed_workflow
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(step))
+        {
+            doc.observed_workflow.push(step.clone());
+        }
+    }
+    if doc.completion_pattern.trim().is_empty() {
+        doc.completion_pattern = grounding.completion_pattern.clone();
+    }
+    let required_sources = [
+        "cascade_rewind_digest",
+        "cascade_rewind_workflow",
+        "cascade_rewind_tools",
+    ];
+    for source in required_sources {
+        if !doc
+            .required_inputs
+            .iter()
+            .any(|input| input.source.eq_ignore_ascii_case(source))
+        {
+            doc.required_inputs.push(RequiredInput {
+                source: source.to_string(),
+                fields: Vec::new(),
+            });
+        }
+    }
+}
+
+/// The web app this agent should actually operate in — derived from the Rewind,
+/// NOT a hardcoded list. We pick the site the employee uses most for this kind of
+/// work: count the hosts they actually browsed (dropping search/new-tab noise and
+/// sensitive sites), and bias toward one whose host matches a word in the task.
+/// Returns the origin ("https://host") to open + sign into, or None.
+pub(crate) async fn rewind_primary_url(app: &tauri::AppHandle, hours: u32, task: &str) -> Option<String> {
+    let frames = fetch_rewind_frames(app, hours, 500).await.ok()?;
+    let task_l = task.to_lowercase();
+    let keywords: Vec<&str> = task_l
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .collect();
+
+    use std::collections::HashMap;
+    let mut score: HashMap<String, i64> = HashMap::new();
+    for f in &frames {
+        let Some(host) = host_from_url(&f.browser_url) else { continue };
+        // Drop noise + sensitive.
+        if host == "google.com" || host == "www.google.com" || host == "localhost"
+            || host == "127.0.0.1" || host.starts_with("newtab") || is_sensitive(&host)
+        {
+            continue;
+        }
+        let entry = score.entry(host.clone()).or_insert(0);
+        *entry += 1;
+        // Strong boost if the host matches what the task is about (e.g. task "D2L"
+        // → host "d2l.school.ca"; task "Notion" → "notion.so").
+        if keywords.iter().any(|k| host.contains(k)) {
+            *entry += 50;
+        }
+    }
+    let best = score.into_iter().max_by_key(|(_, n)| *n)?.0;
+    Some(format!("https://{best}"))
+}
+
+/// A compact, chronological digest of what the employee actually did on screen
+/// over the last `hours`, built from the Rewind recording (OCR + window titles).
+/// Returns (digest, frames_used, sensitive_excluded). Sensitive frames dropped.
+pub(crate) async fn fetch_rewind_digest(
+    app: &tauri::AppHandle,
+    hours: u32,
+    max_frames: u32,
+) -> Result<(String, usize, u32), String> {
+    let owned = fetch_rewind_frames(app, hours, max_frames).await?;
+    let frames: Vec<&SearchContent> = owned.iter().collect();
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_key = String::new();
+    let mut used = 0usize;
+    let mut excluded = 0u32;
+    let mut total_len = 0usize;
+
+    for f in frames {
+        if f.app_name.is_empty() && f.window_name.is_empty() && f.text.trim().is_empty() {
+            continue;
+        }
+        if is_sensitive(&f.app_name) || is_sensitive(&f.window_name) || is_sensitive(&f.text) {
+            excluded += 1;
+            continue;
+        }
+        used += 1;
+        let hhmm = f.timestamp.get(11..16).unwrap_or("");
+        let app_name = if f.app_name.is_empty() { "?" } else { f.app_name.trim() };
+        let win = f.window_name.trim();
+        let key = format!("{app_name}|{win}");
+        if key != last_key {
+            let header = format!("\n[{hhmm}] {app_name} — {win}");
+            total_len += header.len();
+            lines.push(header);
+            last_key = key;
+        }
+        // One deduped, whitespace-collapsed OCR snippet per distinct screen.
+        let snippet: String = f.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet: String = snippet.chars().take(220).collect();
+        if !snippet.is_empty() && seen.insert(snippet.clone()) {
+            let line = format!("    {snippet}");
+            total_len += line.len();
+            lines.push(line);
+        }
+        if total_len > 7000 {
+            break;
+        }
+    }
+
+    Ok((lines.join("\n").trim().to_string(), used, excluded))
+}
+
+/// One recorded user action (from screenpipe's accessibility-derived `ui_events`).
+struct UiStep {
+    event_type: String,
+    app: String,
+    window: String,
+    element: String,
+    text: String,
+}
+
+/// The actual click-by-click PLAYBOOK the employee performed for their work —
+/// labeled clicks and app switches, in order (typed text is deliberately excluded
+/// for privacy; see the query). Feeding this to an agent lets it FOLLOW the real
+/// path instead of re-deriving every step from vision (which is why agents
+/// otherwise "don't know what to do"). Fully general: reads whatever `ui_events`
+/// recorded, with NO app/site-specific handling.
+/// Returns "" when nothing usable was recorded.
+/// True for the common desktop browsers — used to keep a browser agent's playbook
+/// focused on web steps instead of unrelated Finder/terminal/desktop clicks.
+fn is_browser_app(app: &str) -> bool {
+    let a = app.to_lowercase();
+    ["chrome", "safari", "firefox", "edge", "arc", "brave", "chromium", "opera", "vivaldi"]
+        .iter()
+        .any(|b| a.contains(b))
+}
+
+/// Structural accessibility labels that name a container, not a real target —
+/// clicking "cell"/"scroll area" tells the agent nothing, so they're dropped.
+fn is_generic_element(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    if n.chars().count() <= 2 {
+        return true;
+    }
+    matches!(
+        n.as_str(),
+        "cell" | "scroll area" | "list view" | "row" | "group" | "button" | "image"
+            | "text" | "web area" | "html content" | "generic" | "document" | "list"
+            | "table" | "list item" | "heading" | "main" | "navigation" | "banner"
+            | "link" | "static text" | "contentinfo" | "complementary" | "toolbar"
+    )
+}
+
+pub(crate) async fn fetch_rewind_steps(
+    app: &tauri::AppHandle,
+    hours: u32,
+    max_events: u32,
+    browser_only: bool,
+) -> Result<String, String> {
+    use cascade_schema::sqlx::{self, Row};
+    let pool = cascade_pool(app).await?;
+    let since = (Utc::now() - Duration::hours(hours as i64)).to_rfc3339();
+    // ui_events.timestamp is RFC3339 with a fixed +00:00 offset, so lexicographic
+    // compare == chronological. We take only actionable events (no move/scroll).
+    let rows = sqlx::query(
+        // We intentionally do NOT read 'text'/keystroke events: ui_events stores
+        // raw typed characters (not masked like OCR) with no secure-field marker
+        // (element_role is null), and this playbook is sent to the LLM — so typed
+        // content could leak passwords. The click/app-switch path is the real
+        // signal; the agent types from the live screen.
+        "SELECT event_type, \
+                COALESCE(app_name,'')     AS app_name, \
+                COALESCE(window_title,'') AS window_title, \
+                COALESCE(element_role,'') AS element_role, \
+                COALESCE(element_name,'') AS element_name, \
+                COALESCE(text_content,'') AS text_content \
+         FROM ui_events \
+         WHERE event_type IN ('click','app_switch') AND timestamp >= ?1 \
+         ORDER BY timestamp ASC, id ASC \
+         LIMIT ?2",
+    )
+    .bind(&since)
+    .bind(max_events as i64)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("query ui_events: {e}"))?;
+
+    let steps: Vec<UiStep> = rows
+        .iter()
+        .map(|r| UiStep {
+            event_type: r.try_get::<String, _>("event_type").unwrap_or_default(),
+            app: r.try_get::<String, _>("app_name").unwrap_or_default(),
+            window: r.try_get::<String, _>("window_title").unwrap_or_default(),
+            element: r.try_get::<String, _>("element_name").unwrap_or_default(),
+            text: r.try_get::<String, _>("text_content").unwrap_or_default(),
+        })
+        .collect();
+
+    let playbook = build_step_playbook(&steps, browser_only);
+    eprintln!(
+        "[cascade-steps] {} ui_events over {hours}h → {}-step playbook (browser_only={browser_only})",
+        rows.len(),
+        playbook.lines().count()
+    );
+    Ok(playbook)
+}
+
+fn build_step_playbook(rows: &[UiStep], browser_only: bool) -> String {
+    // Typed text is deliberately excluded upstream (see the query) for privacy —
+    // this builds the path from clicks + app switches only.
+    let mut out: Vec<String> = Vec::new();
+    let mut last_app = String::new();
+
+    for r in rows {
+        if is_sensitive(&r.app)
+            || is_sensitive(&r.window)
+            || is_sensitive(&r.element)
+            || is_sensitive(&r.text)
+        {
+            continue;
+        }
+        // For a browser agent, keep only web steps — Finder/terminal/desktop
+        // clicks aren't part of the workflow it will reproduce.
+        if browser_only && !is_browser_app(&r.app) {
+            continue;
+        }
+        match r.event_type.as_str() {
+            "app_switch" => {
+                let app = r.app.trim();
+                if !app.is_empty() && !app.eq_ignore_ascii_case(&last_app) {
+                    out.push(format!("Open {app}"));
+                    last_app = app.to_string();
+                }
+            }
+            "click" => {
+                // Skip unlabeled or purely-structural clicks — accessibility names
+                // cover only some clicks, and "cell"/"" tells the agent nothing.
+                let name = r.element.trim();
+                if name.is_empty() || is_generic_element(name) {
+                    continue;
+                }
+                let where_ = if !r.window.trim().is_empty() {
+                    r.window.trim()
+                } else {
+                    r.app.trim()
+                };
+                let mut line = format!("Click \"{}\"", name.chars().take(50).collect::<String>());
+                if !where_.is_empty() {
+                    line.push_str(&format!(" — {}", where_.chars().take(40).collect::<String>()));
+                }
+                out.push(line);
+            }
+            _ => {}
+        }
+    }
+
+    // Dedupe consecutive repeats, number, cap to a readable length.
+    let mut numbered: Vec<String> = Vec::new();
+    let mut prev = String::new();
+    for s in out {
+        if s == prev {
+            continue;
+        }
+        prev = s.clone();
+        numbered.push(format!("{}. {}", numbered.len() + 1, s));
+        if numbered.len() >= 20 {
+            break;
+        }
+    }
+    numbered.join("\n")
 }
 
 fn cmp_f64_desc(a: f64, b: f64) -> Ordering {
@@ -446,15 +1374,21 @@ struct DetectorOutput {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DetectorSuggestion {
+    #[serde(default, deserialize_with = "de_null_string")]
     kind: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     title: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     summary: String,
-    #[serde(default = "default_tier")]
+    #[serde(default = "default_tier", deserialize_with = "de_null_string")]
     tier: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     suggested_agent_kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     suggested_agent_purpose: String,
+    #[serde(default, deserialize_with = "de_null_f64")]
     severity_score: f64,
+    #[serde(default, deserialize_with = "de_null_f64")]
     confidence: f64,
     #[serde(default)]
     evidence: Vec<CascadeManagerEvidence>,
@@ -463,29 +1397,48 @@ fn default_tier() -> String {
     "suggest".to_string()
 }
 
+/// Models sometimes emit `null` for a string/number field. Coerce null (and a
+/// missing key) to the type's default rather than failing the whole parse.
+fn de_null_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+fn de_null_f64<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(0.0))
+}
+
 fn detector_system_prompt() -> String {
-    // No preset pattern/agent taxonomy. The detector names whatever it actually
-    // observes and proposes a bespoke agent for exactly that — so an unusual but
-    // automatable behavior gets its own agent rather than being forced into a box.
-    "You are Cascade's Waste Detector. You receive ONLY a privacy-sanitized, allowlisted activity \
-summary (per-app: app, category, duration in minutes, context-switch count). You never see screen \
-text, window titles, or any content.\n\n\
-Find SPECIFIC, RECURRING things this person does that a software agent could take off their plate — \
-real repetitive workflows, not personality judgments, and NOT forced into preset categories. \
-Describe the actual behavior the data shows. For each finding, propose a BESPOKE helper agent built \
-for exactly that task.\n\n\
+    // No preset pattern/agent taxonomy. The detector reads the ACTUAL on-screen
+    // content from the Rewind recording and names whatever recurring toil it can
+    // literally see, proposing a bespoke agent for exactly that.
+    "You are Cascade's Waste Detector. You are given a chronological digest of what the employee \
+actually did on screen over a recent window — window titles and on-screen text (OCR) from the Rewind \
+recording. Sensitive apps (banking, health, legal, dating, private browsing) were already removed.\n\n\
+From this REAL activity, find SPECIFIC, RECURRING things this person does that a software agent could \
+take off their plate — concrete repetitive workflows you can SEE in the content (e.g. \"rewrites the \
+same standup recap each morning from terminal history\", \"copies figures from a sheet into a doc\"), \
+NOT personality judgments and NOT forced into preset categories. Distinguish genuine TOIL (repetitive, \
+mechanical, low-judgment) from normal creative/deep work — only the former should become an agent. \
+For each finding, propose a BESPOKE helper agent built for exactly that task.\n\n\
 HARD RULES:\n\
-- Surface at most 6 findings. Fewer is better; only flag what the data clearly supports.\n\
-- `kind`: a short kebab-case slug YOU invent that names the observed behavior (e.g. \
-\"repeated-spreadsheet-reconciliation\", \"doc-to-chat-context-thrash\"). Do NOT use a fixed list.\n\
+- Surface at most 6 findings. Fewer is better; only flag what the content clearly supports.\n\
+- Only surface a workflow if it looks likely to recur as part of the person's ongoing routine, queue, or schedule. \
+If it looks one-off, exploratory, or like troubleshooting, omit it.\n\
+- Only surface work that a constrained browser/background agent could actually execute using the same sites, \
+apps, and steps visible in the recording. If you cannot describe a concrete agent action path, omit it.\n\
+- `kind`: a short kebab-case slug YOU invent naming the observed behavior. Do NOT use a fixed list.\n\
 - `suggestedAgentKind`: a short kebab-case slug for the bespoke agent you'd build (e.g. \
 \"daily-standup-drafter\"). Invent it to fit the finding.\n\
 - `suggestedAgentPurpose`: ONE plain sentence — what the agent would actually DO to remove this \
-specific toil.\n\
+specific toil, and in which app the employee already does it. It must read like a task the agent can repeatedly run.\n\
 - `tier`: info | suggest | urgent. Reserve `urgent` for clear, costly, frequent toil.\n\
-- If the day skews toward off-hours or overload, DEMOTE tier (do not reward overwork).\n\
 - Never use evaluative language about the person (\"unfocused\", \"wasted time\"). Describe the workflow only.\n\
-- `evidence` items must be derived strictly from the numbers given (label + value). No invented metrics.\n\
+- `evidence` items must quote/cite what you actually saw (app, window, or a short snippet). No invented facts.\n\
 - severityScore and confidence are floats 0..1.\n\n\
 Return ONLY JSON: {\"suggestions\":[{\"kind\":...,\"title\":...,\"summary\":...,\"tier\":...,\
 \"suggestedAgentKind\":...,\"suggestedAgentPurpose\":...,\"severityScore\":0.0,\"confidence\":0.0,\
@@ -493,18 +1446,12 @@ Return ONLY JSON: {\"suggestions\":[{\"kind\":...,\"title\":...,\"summary\":...,
         .to_string()
 }
 
-fn detector_user_prompt(
-    aggregates: &[CascadePrivacyAggregate],
-    hours: u32,
-    excluded_count: u32,
-) -> String {
-    let total: f64 = aggregates.iter().map(|a| a.duration_min).sum();
-    let rows = serde_json::to_string_pretty(aggregates).unwrap_or_else(|_| "[]".to_string());
+fn detector_user_prompt(digest: &str, hours: u32, frames: usize, excluded_count: u32) -> String {
     format!(
-        "Analyzed window: last {hours} hours. Total tracked active time: {total:.0} minutes. \
-{excluded_count} sensitive app/window groups were excluded by the privacy aggregator before you \
-saw anything.\n\nPer-app sanitized aggregates (JSON):\n{rows}\n\n\
-Surface the workflow inefficiency patterns this data supports."
+        "Recorded window: last {hours} hours ({frames} screens analyzed, {excluded_count} sensitive \
+screens excluded before you saw anything).\n\n\
+WHAT THE EMPLOYEE DID ON SCREEN (chronological — [time] App — Window, then on-screen text):\n{digest}\n\n\
+Surface the recurring, automatable workflows this REAL activity shows."
     )
 }
 
@@ -535,15 +1482,15 @@ fn normalize_suggestion(s: DetectorSuggestion) -> CascadeManagerSuggestion {
     if !s.suggested_agent_purpose.trim().is_empty() {
         evidence.push(CascadeManagerEvidence {
             label: "proposed automation".to_string(),
-            value: s.suggested_agent_purpose.trim().to_string(),
+            value: sanitize_detector_text(s.suggested_agent_purpose.trim(), 220),
         });
     }
-    evidence.extend(s.evidence);
+    evidence.extend(sanitize_detector_evidence(s.evidence));
     CascadeManagerSuggestion {
         id: None,
         kind: slugify_kind(&s.kind),
-        title: s.title,
-        summary: s.summary,
+        title: sanitize_detector_text(&s.title, 120),
+        summary: sanitize_detector_text(&s.summary, 240),
         tier,
         evidence,
         suggested_agent_kind: slugify_kind(&s.suggested_agent_kind),
@@ -567,18 +1514,38 @@ pub async fn cascade_generate_manager_suggestions(
     // Surface the Cascade floating box while detection runs so it's visible the
     // moment the manager clicks "Refresh signals". Uses spec_id -1 (the detector).
     #[cfg(target_os = "macos")]
-    crate::cascade_computer::box_begin(&app, -1, "Cascade Detector", "Reading your recent activity");
+    crate::cascade_computer::box_begin(&app, -1, "Cascade Detector", "Reading your Rewind recording");
 
-    // #5 first — the detector is only ever allowed to read this.
-    let report = cascade_run_privacy_aggregation(app.clone(), Some(hours)).await?;
+    // Read the Rewind: what the employee ACTUALLY did on screen (window titles +
+    // OCR), sensitive apps dropped. This is the detector's real input now.
+    let (mut digest, frames, excluded) = fetch_rewind_digest(&app, hours, 400).await?;
+    // Add the employee's ACTUAL recorded steps (clicks/typing/app switches) so the
+    // detector grounds its proposal in the real workflow and the generated spec
+    // carries that step sequence for the agent to later follow. General: whatever
+    // `ui_events` recorded, no per-app handling.
+    if let Ok(steps) = fetch_rewind_steps(&app, hours, 400, false).await {
+        if !steps.trim().is_empty() {
+            digest.push_str(&format!(
+                "\n\nRECORDED STEPS THE EMPLOYEE TOOK (clicks/typing/app switches, in order):\n{steps}"
+            ));
+        }
+    }
+    // Keep the privacy aggregates table fresh for the dashboards (non-fatal).
+    let (window_start, window_end) = match cascade_run_privacy_aggregation(app.clone(), Some(hours)).await {
+        Ok(r) => (r.window_start, r.window_end),
+        Err(_) => {
+            let end = Utc::now();
+            ((end - Duration::hours(hours as i64)).to_rfc3339(), end.to_rfc3339())
+        }
+    };
 
     #[cfg(target_os = "macos")]
-    crate::cascade_computer::box_step(&app, -1, "Cascade Detector", "Privacy aggregation", "Sanitized your activity — finding automatable patterns…", 1);
+    crate::cascade_computer::box_step(&app, -1, "Cascade Detector", "Rewind", &format!("Read {frames} screens from your recording — finding repetitive work…"), 1);
 
     let mut batch = CascadeManagerSuggestionBatch {
         generated_at: Utc::now().to_rfc3339(),
-        window_start: report.window_start.clone(),
-        window_end: report.window_end.clone(),
+        window_start: window_start.clone(),
+        window_end: window_end.clone(),
         hours_analyzed: hours,
         delivery_mode: "local_outbox".to_string(),
         model: MODEL_OPUS.to_string(),
@@ -587,38 +1554,53 @@ pub async fn cascade_generate_manager_suggestions(
         suggestions: Vec::new(),
     };
 
-    if report.aggregates.is_empty() {
+    if digest.trim().is_empty() {
         batch.outbox_path = write_json_outbox(&app, MANAGER_OUTBOX_DIR, &batch)?;
         #[cfg(target_os = "macos")]
-        crate::cascade_computer::box_end(&app, -1, "Cascade Detector", "Detection", "No activity to analyze yet.");
+        crate::cascade_computer::box_end(&app, -1, "Cascade Detector", "Detection", "Nothing recorded to analyze yet — let the Rewind capture some work first.");
         return Ok(batch);
     }
 
     let call = LlmCall {
         model: MODEL_OPUS,
         system: detector_system_prompt(),
-        user: detector_user_prompt(&report.aggregates, hours, report.excluded_count),
+        user: detector_user_prompt(&digest, hours, frames, excluded),
         temperature: 0.2,
         max_tokens: 2000,
     };
     let (output, usage) = call_anthropic_json::<DetectorOutput>(&call).await?;
     batch.cost_usd = usage.cost_usd;
 
-    let mut suggestions: Vec<CascadeManagerSuggestion> =
-        output.suggestions.into_iter().take(6).map(normalize_suggestion).collect();
-    suggestions.sort_by(|a, b| cmp_f64_desc(a.severity_score, b.severity_score));
+    let mut suggestions = Vec::new();
+    for mut suggestion in output.suggestions.into_iter().map(normalize_suggestion) {
+        let query = format!("{} {}", suggestion.title, suggestion.summary);
+        let grounding = fetch_rewind_grounding(&app, hours, &query, 250)
+            .await
+            .unwrap_or_default();
+        if !should_keep_manager_suggestion(&suggestion, &grounding) {
+            continue;
+        }
+        add_grounding_evidence(&mut suggestion, &grounding);
+        suggestion.evidence = sanitize_detector_evidence(suggestion.evidence);
+        suggestions.push(suggestion);
+    }
+    suggestions.sort_by(|a, b| {
+        cmp_f64_desc(a.severity_score, b.severity_score)
+            .then_with(|| cmp_f64_desc(a.confidence, b.confidence))
+    });
+    suggestions.truncate(6);
 
     // Persist run + suggestions.
     let pool = cascade_pool(&app).await?;
     let run_id = create_detection_run(
         &pool,
         DETECTOR_NAME,
-        &report.window_start,
-        &report.window_end,
+        &window_start,
+        &window_end,
         &serde_json::json!({
             "model": MODEL_OPUS,
-            "aggregateCount": report.aggregates.len(),
-            "excludedCount": report.excluded_count,
+            "framesAnalyzed": frames,
+            "excludedCount": excluded,
             "suggestionCount": suggestions.len(),
             "costUsd": usage.cost_usd,
         })
@@ -749,6 +1731,7 @@ const TOOL_WHITELIST: &[&str] = &[
     "read.activity",   // read the employee's recent sanitized activity (input)
     "analyze.patterns", // LLM reasoning over the inputs
     "summarize.text",  // LLM summary / recap content
+    "browser.use",     // work inside the same website/tool the employee used
     "artifact.write",  // write a real deliverable document (recap/digest/plan/checklist)
     "draft.message",   // draft a message the employee can review + send themselves
     "task.create",     // create a task/checklist item as a real artifact
@@ -766,14 +1749,18 @@ const MAX_PER_EXEC_COST_USD: f64 = 0.10;
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct RequiredInput {
+    #[serde(default, deserialize_with = "de_null_string")]
     pub source: String,
+    #[serde(default)]
     pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowStep {
+    #[serde(default)]
     pub step: i64,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub action: String,
     /// Which capability this step invokes at runtime (from the whitelist), or
     /// null for a pure reasoning/decision step whose output feeds later steps.
@@ -785,19 +1772,46 @@ pub struct WorkflowStep {
     pub approval_required: bool,
 }
 
+fn default_execution_mode() -> String {
+    "background".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSpecDoc {
+    #[serde(default, deserialize_with = "de_null_string")]
     pub name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub task_description: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub rationale: String,
+    #[serde(default = "default_execution_mode", deserialize_with = "de_null_string")]
+    pub execution_mode: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub target_url: String,
+    #[serde(default)]
+    pub target_hosts: Vec<String>,
+    #[serde(default)]
+    pub observed_apps: Vec<String>,
+    #[serde(default)]
+    pub observed_workflow: Vec<String>,
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub completion_pattern: String,
+    #[serde(default)]
     pub required_inputs: Vec<RequiredInput>,
+    #[serde(default)]
     pub workflow: Vec<WorkflowStep>,
+    #[serde(default)]
     pub tools: Vec<String>,
+    #[serde(default)]
     pub failure_conditions: Vec<String>,
+    #[serde(default)]
     pub approval_points: Vec<String>,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub rollback_path: String,
+    #[serde(default, deserialize_with = "de_null_f64")]
     pub estimated_cost_usd: f64,
+    #[serde(default, deserialize_with = "de_null_f64")]
     pub estimated_time_saved_min: f64,
     /// How often the deployed agent should run itself, in minutes. The runtime
     /// clamps to >= 60. Default daily when the model omits it.
@@ -838,6 +1852,7 @@ AVAILABLE CAPABILITIES (vendor-neutral; each does real on-device work):\n\
 - read.activity — read the employee's recent sanitized activity (the agent's input)\n\
 - analyze.patterns — reason over the inputs to decide what to produce\n\
 - summarize.text — produce recap/summary content\n\
+- browser.use — work inside the SAME website/tool the employee already used, following the observed workflow and target URL/hosts\n\
 - artifact.write — write a real deliverable document the employee will use\n\
 - draft.message — draft a message the employee can review and send THEMSELVES\n\
 - task.create — create a task/checklist item as a real artifact\n\
@@ -846,15 +1861,18 @@ AVAILABLE CAPABILITIES (vendor-neutral; each does real on-device work):\n\
 HARD RULES (a violated rule means the spec is rejected — follow all):\n\
 - `tools` may ONLY contain capabilities from the list above. NEVER invent tools. NEVER request shell/exec/network/file-system access.\n\
 - EVERY workflow step must set `tool` to one of those capabilities, OR null for a pure reasoning step. The agent does the work BY running these steps in order — make the workflow concrete and runnable, not abstract.\n\
+- If the observed workflow clearly happens inside a website/tool the employee already uses, set `executionMode` to `browser`, include at least one `browser.use` step, keep `targetUrl`/`targetHosts` tied to the observed tool, and DO NOT swap in a different app.\n\
+- If the work is not tied to interacting with a website/tool, set `executionMode` to `background` and do not use `browser.use`.\n\
 - The workflow must be linear or branch only on schema-checkable conditions — never \"the agent decides what to do next\".\n\
 - Every step whose tool produces an outward-facing/committing artifact (artifact.write, draft.message, task.create, reminder.set) MUST have approvalRequired=true AND a matching entry in `approvalPoints`.\n\
 - `rollbackPath` is REQUIRED — describe how to undo the agent's outputs (delete the artifact, dismiss the reminder).\n\
 - `estimatedCostUsd` must be realistic per-execution and SHOULD be <= {:.2}.\n\
 - `scheduleMinutes`: how often it should run itself (>= 60). Most agents are daily (1440) or a few times a day.\n\
 - `taskDescription` is one plain-English sentence (readable, no jargon).\n\
-- `requiredInputs[].source` should reference Cascade data the agent reads, e.g. \"cascade_privacy_aggregates\".\n\n\
+- `requiredInputs[].source` should reference Cascade data the agent reads, e.g. \"cascade_rewind_digest\", \"cascade_rewind_workflow\", \"cascade_rewind_tools\".\n\n\
 Return ONLY JSON with EXACTLY these camelCase keys:\n\
-{{\"name\":str,\"taskDescription\":str,\"rationale\":str,\
+{{\"name\":str,\"taskDescription\":str,\"rationale\":str,\"executionMode\":\"background\"|\"browser\",\
+\"targetUrl\":str,\"targetHosts\":[str],\"observedApps\":[str],\"observedWorkflow\":[str],\"completionPattern\":str,\
 \"requiredInputs\":[{{\"source\":str,\"fields\":[str]}}],\
 \"workflow\":[{{\"step\":int,\"action\":str,\"tool\":str|null,\"decisionPoint\":str|null,\"approvalRequired\":bool}}],\
 \"tools\":[str],\"failureConditions\":[str],\"approvalPoints\":[str],\"rollbackPath\":str,\
@@ -863,25 +1881,71 @@ Return ONLY JSON with EXACTLY these camelCase keys:\n\
     )
 }
 
-fn generator_user_prompt(s: &CascadeManagerSuggestion) -> String {
+fn generator_user_prompt(s: &CascadeManagerSuggestion, grounding: &WorkflowGrounding) -> String {
     let evidence = s
         .evidence
         .iter()
         .map(|e| format!("- {}: {}", e.label, e.value))
         .collect::<Vec<_>>()
         .join("\n");
+    let observed_workflow = if grounding.observed_workflow.is_empty() {
+        "(not enough exact steps recovered from Rewind)".to_string()
+    } else {
+        grounding
+            .observed_workflow
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
         "Observed behavior (kind): {}\nTitle: {}\nWhat the person keeps doing: {}\n\
 Proposed bespoke agent slug: {}\nSeverity: {:.2}  Confidence: {:.2}\nSignals:\n{}\n\n\
+OBSERVED TOOL GROUNDING FROM THE REWIND:\n\
+- execution mode hint: {}\n\
+- starting url: {}\n\
+- target hosts: {}\n\
+- apps used: {}\n\
+- how they finished it: {}\n\
+- observed workflow:\n{}\n\n\
 Design a BESPOKE agent for THIS specific recurring task — not a generic template. Its workflow \
 should concretely remove this exact toil using the least intrusive, most reversible steps.",
-        s.kind, s.title, s.summary, s.suggested_agent_kind, s.severity_score, s.confidence, evidence
+        s.kind,
+        s.title,
+        s.summary,
+        s.suggested_agent_kind,
+        s.severity_score,
+        s.confidence,
+        evidence,
+        grounding.execution_mode,
+        if grounding.primary_url.is_empty() {
+            "(none recovered)"
+        } else {
+            &grounding.primary_url
+        },
+        if grounding.target_hosts.is_empty() {
+            "(none recovered)".to_string()
+        } else {
+            grounding.target_hosts.join(", ")
+        },
+        if grounding.observed_apps.is_empty() {
+            "(none recovered)".to_string()
+        } else {
+            grounding.observed_apps.join(", ")
+        },
+        if grounding.completion_pattern.is_empty() {
+            "(none recovered)".to_string()
+        } else {
+            grounding.completion_pattern.clone()
+        },
+        observed_workflow
     )
 }
 
 /// Returns (status, notes). status is "valid" or "invalid".
 fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
     let mut problems: Vec<String> = Vec::new();
+    let execution_mode = doc.execution_mode.trim().to_lowercase();
 
     if doc.workflow.is_empty() {
         problems.push("workflow is empty".into());
@@ -891,6 +1955,9 @@ fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
     }
     if doc.task_description.trim().is_empty() {
         problems.push("missing task description".into());
+    }
+    if !matches!(execution_mode.as_str(), "background" | "browser") {
+        problems.push("executionMode must be `background` or `browser`".into());
     }
 
     // Tool whitelist + no shell.
@@ -926,6 +1993,21 @@ fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
             .any(|s| s.tool.as_deref().map(|t| MUTATING_TOOLS.contains(&t)).unwrap_or(false));
     if has_mutating && doc.approval_points.is_empty() {
         problems.push("state-mutating tools declared but no approval points".into());
+    }
+
+    let has_browser_step = doc
+        .workflow
+        .iter()
+        .any(|s| s.tool.as_deref() == Some("browser.use"));
+    if execution_mode == "browser" {
+        if doc.target_url.trim().is_empty() && doc.target_hosts.is_empty() {
+            problems.push("browser execution requires targetUrl or targetHosts".into());
+        }
+        if !has_browser_step {
+            problems.push("browser execution requires at least one browser.use step".into());
+        }
+    } else if has_browser_step {
+        problems.push("browser.use steps require executionMode=browser".into());
     }
 
     // Cost cap.
@@ -981,15 +2063,18 @@ pub async fn cascade_generate_agent_spec(
     suggestion_id: i64,
 ) -> Result<CascadeAgentSpecView, String> {
     let suggestion = load_suggestion(&app, suggestion_id).await?;
+    let grounding_query = format!("{} {}", suggestion.title, suggestion.summary);
+    let grounding = fetch_rewind_grounding(&app, 24, &grounding_query, 300).await.unwrap_or_default();
 
     let call = LlmCall {
         model: MODEL_OPUS,
         system: generator_system_prompt(),
-        user: generator_user_prompt(&suggestion),
+        user: generator_user_prompt(&suggestion, &grounding),
         temperature: 0.1,
         max_tokens: 2500,
     };
-    let (doc, _usage) = call_anthropic_json::<AgentSpecDoc>(&call).await?;
+    let (mut doc, _usage) = call_anthropic_json::<AgentSpecDoc>(&call).await?;
+    merge_grounding_into_spec(&mut doc, &grounding);
     let (validation_status, validation_notes) = validate_spec(&doc);
 
     let spec_json = serde_json::to_string(&doc).map_err(|e| format!("serialize spec: {e}"))?;
@@ -1180,21 +2265,50 @@ pub struct CascadeAuditEntry {
 }
 
 fn sandbox_system_prompt() -> String {
-    "You are Cascade's sandbox executor (Agent #4). You are given an agent spec and a sample of the \
-employee's recent sanitized activity. Simulate ONE execution of the agent. ALL external tool calls \
-are MOCKED — never claim a real email was sent or a real change was made; describe the mocked result. \
-Be faithful to the spec's declared tools and workflow.\n\n\
+    "You are Cascade's sandbox executor (Agent #4). You are given an agent spec plus Rewind-grounded \
+context about how the employee actually did this task. Simulate ONE execution to judge whether the agent \
+is SAFE and its WORKFLOW is SOUND — NOT whether live data happens to be present right now.\n\n\
+ALL external tool calls are MOCKED. Treat each mocked call as SUCCEEDING with PLAUSIBLE, representative \
+results for this task: a browse/read step returns the kind of pages/records/items it would realistically \
+find, with reasonable example values. Specific live details (URLs, IDs, counts, due dates, exact contents) \
+are NOT available in the sandbox and are resolved at real run time — so DO NOT fail the run just because the \
+spec, digest, or grounding is missing a target URL, course/record ID, count, or other live value. Assume \
+sensible values and continue. Never claim a real email was sent or a real change was made; describe the \
+mocked result.\n\n\
+Return status \"failed\" ONLY for a genuine spec or SAFETY problem, such as: a step uses a tool the spec did \
+NOT declare; the run would make a destructive or irreversible EXTERNAL change (send, delete, post publicly, \
+pay, submit, change account/security settings) with no matching approval point; or the declared workflow is \
+internally contradictory and cannot work even given good data. A read-only or information-gathering agent \
+that merely lacks live data in the mock is status \"success\". Set wouldMutate true only if the run would \
+actually change external state.\n\n\
 Return ONLY JSON: {\"status\":\"success\"|\"failed\",\"summary\":str,\
 \"steps\":[{\"step\":int,\"tool\":str,\"action\":str,\"mockedResult\":str}],\"wouldMutate\":bool}"
         .to_string()
 }
 
-fn sandbox_user_prompt(doc: &AgentSpecDoc, aggregates: &[CascadePrivacyAggregate]) -> String {
+fn sandbox_user_prompt(doc: &AgentSpecDoc, rewind: &str, grounding: &WorkflowGrounding) -> String {
     let spec = serde_json::to_string_pretty(doc).unwrap_or_default();
-    let data = serde_json::to_string_pretty(aggregates).unwrap_or_else(|_| "[]".to_string());
+    let workflow = if grounding.observed_workflow.is_empty() {
+        "[]".to_string()
+    } else {
+        serde_json::to_string_pretty(&grounding.observed_workflow).unwrap_or_else(|_| "[]".to_string())
+    };
     format!(
-        "AGENT SPEC:\n{spec}\n\nHISTORICAL SANITIZED ACTIVITY (mock inputs):\n{data}\n\n\
-Simulate one run. Use only the spec's declared tools."
+        "AGENT SPEC:\n{spec}\n\nREWIND DIGEST (mock input):\n{}\n\nOBSERVED TOOL GROUNDING:\n\
+- executionMode: {}\n\
+- targetUrl: {}\n\
+- targetHosts: {}\n\
+- observedApps: {}\n\
+- completionPattern: {}\n\
+- observedWorkflow: {}\n\n\
+Simulate one run. Use only the spec's declared tools.",
+        if rewind.trim().is_empty() { "(nothing recorded yet)" } else { rewind },
+        grounding.execution_mode,
+        if grounding.primary_url.is_empty() { "(none recovered)" } else { &grounding.primary_url },
+        if grounding.target_hosts.is_empty() { "[]".to_string() } else { grounding.target_hosts.join(", ") },
+        if grounding.observed_apps.is_empty() { "[]".to_string() } else { grounding.observed_apps.join(", ") },
+        if grounding.completion_pattern.is_empty() { "(none recovered)".to_string() } else { grounding.completion_pattern.clone() },
+        workflow
     )
 }
 
@@ -1258,19 +2372,18 @@ pub async fn cascade_sandbox_test(
         ));
     }
 
-    // Sample recent sanitized activity for the mock inputs (30-day proxy: last 24h).
-    let (ws, we, summary) = fetch_activity_summary(&app, 24).await?;
-    let (aggregates, _) = if summary.data_status == "ok" {
-        sanitize(&summary)
-    } else {
-        (Vec::new(), 0)
-    };
-    let _ = (ws, we);
+    let rewind = fetch_rewind_digest(&app, 24, 400)
+        .await
+        .map(|(digest, _, _)| digest)
+        .unwrap_or_default();
+    let grounding = fetch_rewind_grounding(&app, 24, &doc.task_description, 400)
+        .await
+        .unwrap_or_default();
 
     let call = LlmCall {
         model: MODEL_SONNET,
         system: sandbox_system_prompt(),
-        user: sandbox_user_prompt(&doc, &aggregates),
+        user: sandbox_user_prompt(&doc, &rewind, &grounding),
         temperature: 0.0,
         max_tokens: 1800,
     };
@@ -1544,6 +2657,19 @@ fn is_mutating_tool(tool: &str) -> bool {
     MUTATING_TOOLS.contains(&tool)
 }
 
+/// Friendly label for the deliverable a capability produces (box result card).
+fn deliverable_title(tool: &str) -> &'static str {
+    match tool {
+        "artifact.write" => "Document",
+        "draft.message" => "Draft message",
+        "task.create" => "Task",
+        "reminder.set" => "Reminder",
+        "summarize.text" => "Summary",
+        "notify.local" => "Notification",
+        _ => "Result",
+    }
+}
+
 /// A real macOS notification. This genuinely acts (the employee sees it).
 fn fire_notification(title: &str, body: &str) {
     #[cfg(target_os = "macos")]
@@ -1562,9 +2688,152 @@ fn fire_notification(title: &str, body: &str) {
     }
 }
 
-/// Perform the real side effect for a committing step: write the work product
-/// to a real file (and, for reminders, notify). Returns the artifact path.
-/// Used both during a run (auto-commit) and on later approval of a staged step.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Derive a note title from the first usable line of the produced content.
+fn first_line_title(content: &str) -> String {
+    for line in content.lines() {
+        let t = line.trim().trim_start_matches('#').trim();
+        if !t.is_empty() && !t.starts_with("<!--") {
+            return t.chars().take(80).collect();
+        }
+    }
+    "Cascade note".to_string()
+}
+
+/// Create a REAL Apple Note (zero setup, native macOS). Body is simple HTML.
+fn apple_notes_create(title: &str, content: &str) -> Result<(), String> {
+    let body_html = format!(
+        "<div><b>{}</b></div>{}",
+        html_escape(title),
+        content
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("<!--"))
+            .map(|l| format!("<div>{}</div>", html_escape(l)))
+            .collect::<String>()
+    );
+    let script = format!(
+        "tell application \"Notes\" to make new note with properties {{name:\"{}\", body:\"{}\"}}",
+        applescript_escape(title),
+        applescript_escape(&body_html),
+    );
+    let out = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("apple notes: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("apple notes failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+/// The Obsidian vault path (most-recently-opened), parsed from obsidian.json.
+fn obsidian_vault() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let cfg = PathBuf::from(home).join("Library/Application Support/obsidian/obsidian.json");
+    let text = fs::read_to_string(&cfg).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let vaults = v.get("vaults")?.as_object()?;
+    let mut first: Option<String> = None;
+    for (_, val) in vaults {
+        if let Some(p) = val.get("path").and_then(|p| p.as_str()) {
+            if val.get("open").and_then(|o| o.as_bool()).unwrap_or(false) {
+                return Some(PathBuf::from(p));
+            }
+            first.get_or_insert_with(|| p.to_string());
+        }
+    }
+    first.map(PathBuf::from)
+}
+
+/// Write a note into the Obsidian vault (a Cascade/ folder). Returns
+/// (path, "url:obsidian://…" open ref).
+fn obsidian_write(title: &str, content: &str) -> Result<(String, String), String> {
+    let vault = obsidian_vault().ok_or("no Obsidian vault found")?;
+    let dir = vault.join("Cascade");
+    fs::create_dir_all(&dir).map_err(|e| format!("create vault folder: {e}"))?;
+    let fname = format!("{}.md", slug(title));
+    let path = dir.join(&fname);
+    let clean: String = content
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("<!--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, &clean).map_err(|e| format!("write vault note: {e}"))?;
+    let rel = format!("Cascade/{fname}");
+    let vault_name = vault.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let open = format!(
+        "url:obsidian://open?vault={}&file={}",
+        urlencoding::encode(vault_name),
+        urlencoding::encode(&rel)
+    );
+    Ok((path.display().to_string(), open))
+}
+
+/// Is a process whose name matches `pattern` (case-insensitive) running now?
+fn app_running(pattern: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-i", pattern])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Which app to deliver the recap into. Strongest signal first: a notes app you
+/// have OPEN RIGHT NOW (so working in Obsidian routes there even if screenpipe's
+/// historical summary missed it). Else the most-used notes app from activity.
+/// Else Apple Notes. (Notion needs a one-time connect, handled when requested.)
+async fn resolve_delivery_target(app: &tauri::AppHandle) -> &'static str {
+    // 1. Obsidian open right now + a vault present → write where you're working.
+    if obsidian_vault().is_some() && app_running("obsidian") {
+        return "obsidian";
+    }
+    // 2. Historical most-used notes app from activity.
+    match preferred_notes_app(app).await {
+        Some(a) if a.to_lowercase().contains("obsidian") && obsidian_vault().is_some() => "obsidian",
+        _ => "applenotes",
+    }
+}
+
+/// What a committed step produced + how the box opens it.
+#[derive(Default, Clone)]
+pub struct Delivered {
+    /// Local file path (for rollback); None for app-native targets like Notes.
+    pub path: Option<String>,
+    /// Where it landed: "Apple Notes" | "Obsidian" | "File" | "Notification".
+    pub app_label: String,
+    /// Open reference for the box: "app:Notes", "url:…", or "path:…".
+    pub open_ref: Option<String>,
+}
+
+fn write_local_record(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    run_id: i64,
+    step: i64,
+    tool: &str,
+    agent_name: &str,
+    content: &str,
+) -> Result<String, String> {
+    let dir = agent_outputs_dir(app, spec_id)?;
+    let ext = if tool == "draft.message" { "txt" } else { "md" };
+    let fname = format!("run{run_id}-step{step}-{}.{ext}", slug(tool));
+    let path = dir.join(fname);
+    let header = format!("<!-- Cascade agent: {agent_name} · {tool} · run {run_id} step {step} -->\n\n");
+    fs::write(&path, format!("{header}{content}")).map_err(|e| format!("write artifact: {e}"))?;
+    Ok(path.display().to_string())
+}
+
+/// Perform the real side effect for a committing step. The primary deliverable
+/// (`artifact.write`) lands in the app the employee actually uses (`target`,
+/// resolved from their activity): Obsidian if they use it, else Apple Notes —
+/// a real, visible app, not a buried file — falling back to a file only if the
+/// target is unavailable.
 fn commit_side_effect(
     app: &tauri::AppHandle,
     spec_id: i64,
@@ -1573,39 +2842,76 @@ fn commit_side_effect(
     tool: &str,
     agent_name: &str,
     content: &str,
-) -> Result<Option<String>, String> {
+    target: &str,
+) -> Result<Delivered, String> {
     match tool {
-        "artifact.write" | "draft.message" | "task.create" | "reminder.set" => {
-            let dir = agent_outputs_dir(app, spec_id)?;
-            let ext = if tool == "draft.message" { "txt" } else { "md" };
-            let fname = format!("run{run_id}-step{step}-{}.{ext}", slug(tool));
-            let path = dir.join(fname);
-            let header = format!(
-                "<!-- Cascade agent: {agent_name} · {tool} · run {run_id} step {step} -->\n\n"
-            );
-            fs::write(&path, format!("{header}{content}"))
-                .map_err(|e| format!("write artifact: {e}"))?;
-            if tool == "reminder.set" {
-                fire_notification(
-                    &format!("Cascade reminder · {agent_name}"),
-                    content,
-                );
+        "artifact.write" => {
+            let title = first_line_title(content);
+            // Route into the detected app; fall back to Apple Notes, then a file.
+            if target == "obsidian" {
+                if let Ok((path, open)) = obsidian_write(&title, content) {
+                    return Ok(Delivered { path: Some(path), app_label: "Obsidian".into(), open_ref: Some(open) });
+                }
             }
-            Ok(Some(path.display().to_string()))
+            match apple_notes_create(&title, content) {
+                Ok(()) => Ok(Delivered {
+                    path: None,
+                    app_label: "Apple Notes".into(),
+                    open_ref: Some("app:Notes".into()),
+                }),
+                // Notes denied/unavailable → keep a file so the work isn't lost.
+                Err(_) => {
+                    let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
+                    Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
+                }
+            }
+        }
+        "draft.message" | "task.create" | "reminder.set" => {
+            let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
+            if tool == "reminder.set" {
+                fire_notification(&format!("Cascade reminder · {agent_name}"), content);
+            }
+            Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
         }
         "notify.local" => {
             fire_notification(&format!("Cascade · {agent_name}"), content);
-            Ok(None)
+            Ok(Delivered { app_label: "Notification".into(), ..Default::default() })
         }
-        // read.activity / analyze.patterns / summarize.text have no external
-        // side effect — their output lives only in the action record + context.
-        _ => Ok(None),
+        // read.activity / analyze.patterns / summarize.text have no side effect.
+        _ => Ok(Delivered::default()),
     }
 }
 
-fn runtime_step_system_prompt(agent_name: &str, task: &str) -> String {
+/// Deliver a real recap/document through Cascade's normal write path:
+/// Obsidian if that's where the employee is working, else Apple Notes, else a
+/// file fallback so browser-only agents can still land useful output.
+pub(crate) async fn deliver_artifact_write(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    run_id: i64,
+    step: i64,
+    agent_name: &str,
+    content: &str,
+) -> Result<Delivered, String> {
+    let target = resolve_delivery_target(app).await;
+    commit_side_effect(
+        app,
+        spec_id,
+        run_id,
+        step,
+        "artifact.write",
+        agent_name,
+        content,
+        target,
+    )
+}
+
+fn runtime_step_system_prompt(agent_name: &str, task: &str, today: &str) -> String {
     format!(
         "You are \"{agent_name}\", a deployed Cascade helper agent. Your job: {task}\n\
+Today's date is {today}. The activity data you are given covers roughly the last 24 hours up to now. \
+Use ONLY this real date — never invent or guess a date, and do not assume the data is from a specific \
+prior day unless the timestamps say so.\n\
 You are executing ONE step of your workflow. Produce ONLY the actual work product for this step — \
 the real deliverable text (a recap, digest, plan, draft, task list, or notification body), with no \
 preamble, no meta-commentary, no markdown fences. Ground it in the employee's real recent activity \
@@ -1614,20 +2920,25 @@ output a single short sentence."
     )
 }
 
-fn runtime_step_user_prompt(
-    step: &WorkflowStep,
-    aggregates: &[CascadePrivacyAggregate],
-    context: &str,
-) -> String {
-    let data = serde_json::to_string_pretty(aggregates).unwrap_or_else(|_| "[]".to_string());
+fn runtime_step_user_prompt(step: &WorkflowStep, rewind: &str, context: &str) -> String {
     format!(
-        "STEP {} — {}\nCapability: {}\n\nEMPLOYEE'S RECENT SANITIZED ACTIVITY:\n{}\n\nOUTPUTS OF EARLIER STEPS:\n{}\n\nProduce this step's work product now.",
+        "STEP {} — {}\nCapability: {}\n\nWHAT THE EMPLOYEE ACTUALLY DID ON SCREEN (from the Rewind — \
+[time] App — Window, then on-screen text):\n{}\n\nOUTPUTS OF EARLIER STEPS:\n{}\n\n\
+Produce this step's work product now, grounded in the REAL activity above.",
         step.step,
         step.action,
         step.tool.as_deref().unwrap_or("analyze.patterns"),
-        data,
+        if rewind.trim().is_empty() { "(nothing recorded yet)" } else { rewind },
         if context.is_empty() { "(none yet)" } else { context }
     )
+}
+
+fn is_browser_execution(doc: &AgentSpecDoc) -> bool {
+    doc.execution_mode.eq_ignore_ascii_case("browser")
+        || doc
+            .workflow
+            .iter()
+            .any(|step| step.tool.as_deref() == Some("browser.use"))
 }
 
 /// Run one execution of a deployed agent. Performs real work; returns the run +
@@ -1642,23 +2953,24 @@ async fn run_agent_internal(
     }
     let doc: AgentSpecDoc =
         serde_json::from_str(&spec.spec_json).map_err(|e| format!("parse spec: {e}"))?;
+    if is_browser_execution(&doc) {
+        return Err(
+            "This agent works in the observed website/tool. Start it with `Start & watch` so it can use the browser runtime."
+                .to_string(),
+        );
+    }
 
     let pool = cascade_pool(app).await?;
-    // No approval prompts — the agent commits its work directly.
-    let supervised = false;
-    let _ = count_live_runs(&pool, spec.id).await; // keep run-count read for audit/debug
+    let supervised = should_supervise_live_run(app, spec.id).await.unwrap_or(false);
 
     // Show the Cascade floating box so the employee can watch this background run.
     #[cfg(target_os = "macos")]
     crate::cascade_computer::box_begin(app, spec.id, &doc.name, &doc.task_description);
 
-    // The agent's real input: the employee's recent sanitized activity.
-    let (_, _, summary) = fetch_activity_summary(app, 24).await?;
-    let (aggregates, _) = if summary.data_status == "ok" {
-        sanitize(&summary)
-    } else {
-        (Vec::new(), 0)
-    };
+    // The agent's real input: the Rewind — what the employee actually did on
+    // screen over the last 24h (window titles + OCR), sensitive apps dropped.
+    let (rewind, _frames, _excluded) =
+        fetch_rewind_digest(app, 24, 500).await.unwrap_or_default();
 
     // Build a staged run record first so actions can reference it.
     let run_id = insert_agent_run(
@@ -1682,6 +2994,13 @@ async fn run_agent_internal(
     let mut produced = 0i64;
     let mut pending = 0i64;
     let mut action_ids: Vec<i64> = Vec::new();
+    // The real local date, so the model never invents one in the deliverable.
+    let today = chrono::Local::now().format("%A, %Y-%m-%d").to_string();
+    // Where this agent's recap should land, resolved from the employee's activity.
+    let target = resolve_delivery_target(app).await;
+    // The document deliverable, for the box's result snapshot.
+    // (app_label, title, content, open_ref)
+    let mut snapshot: Option<(String, String, String, Option<String>)> = None;
 
     for step in doc.workflow.iter().take(MAX_RUNTIME_STEPS) {
         let tool = step.tool.clone().unwrap_or_else(|| "analyze.patterns".to_string());
@@ -1691,12 +3010,12 @@ async fn run_agent_internal(
 
         // Produce this step's content.
         let content = if tool == "read.activity" {
-            serde_json::to_string_pretty(&aggregates).unwrap_or_default()
+            if rewind.is_empty() { "(nothing recorded in the Rewind yet)".to_string() } else { rewind.clone() }
         } else {
             let call = LlmCall {
                 model: MODEL_SONNET,
-                system: runtime_step_system_prompt(&doc.name, &doc.task_description),
-                user: runtime_step_user_prompt(step, &aggregates, &context),
+                system: runtime_step_system_prompt(&doc.name, &doc.task_description, &today),
+                user: runtime_step_user_prompt(step, &rewind, &context),
                 temperature: 0.3,
                 max_tokens: 1200,
             };
@@ -1748,19 +3067,29 @@ async fn run_agent_internal(
                 .to_string();
             ("pending".to_string(), Some(path))
         } else {
-            let path = commit_side_effect(
-                app, spec.id, run_id, step.step, &tool, &doc.name, &content,
+            let delivered = commit_side_effect(
+                app, spec.id, run_id, step.step, &tool, &doc.name, &content, target,
             )?;
             if mutating {
                 produced += 1;
             }
-            ("committed".to_string(), path)
+            // The recap document is what the box shows as its result snapshot.
+            if tool == "artifact.write" {
+                snapshot = Some((
+                    delivered.app_label.clone(),
+                    first_line_title(&content),
+                    content.clone(),
+                    delivered.open_ref.clone(),
+                ));
+            }
+            ("committed".to_string(), delivered.path)
         };
 
         let summary_line = match tool.as_str() {
             "read.activity" => "Read recent activity".to_string(),
             "analyze.patterns" => "Analyzed the activity".to_string(),
             "summarize.text" => "Drafted a summary".to_string(),
+            "browser.use" => "Worked inside the observed website".to_string(),
             "artifact.write" => "Wrote a deliverable document".to_string(),
             "draft.message" => "Drafted a message for review".to_string(),
             "task.create" => "Created a task".to_string(),
@@ -1861,6 +3190,40 @@ async fn run_agent_internal(
         if pending > 0 { format!(", {pending} awaiting approval") } else { String::new() },
         if !anomalies.is_empty() { format!(", {} anomaly flagged", anomalies.len()) } else { String::new() },
     );
+
+    // Snapshot the REAL produced deliverable into the box: prefer the recap
+    // document (delivered into Apple Notes), else the last action with usable
+    // content (a summary/draft). Read-activity JSON dumps are skipped.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some((app_label, title, content, open_ref)) = &snapshot {
+            crate::cascade_computer::box_result(
+                app,
+                spec.id,
+                &doc.name,
+                app_label,
+                title,
+                content,
+                open_ref.as_deref(),
+            );
+        } else if let Some(a) = actions.iter().rev().find(|a| {
+            matches!(
+                a.tool.as_str(),
+                "summarize.text" | "draft.message" | "task.create" | "reminder.set"
+            ) && a.content.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false)
+        }) {
+            let open = a.artifact_path.as_ref().map(|p| format!("path:{p}"));
+            crate::cascade_computer::box_result(
+                app,
+                spec.id,
+                &doc.name,
+                "File",
+                deliverable_title(&a.tool),
+                a.content.as_deref().unwrap_or(""),
+                open.as_deref(),
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     crate::cascade_computer::box_end(app, spec.id, &doc.name, &doc.task_description, &run_summary);
@@ -1980,6 +3343,22 @@ pub async fn cascade_run_agent(
     run_agent_internal(&app, &spec, "manual").await
 }
 
+/// Run ONE headless execution of a deployed agent by id. Used by the persistent
+/// "Start & watch" loop in `cascade_computer` — the work + box narration all
+/// happen inside `run_agent_internal`.
+pub(crate) async fn run_agent_once(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    trigger: &str,
+) -> Result<CascadeRunResult, String> {
+    let pool = cascade_pool(app).await?;
+    let spec = get_agent_spec(&pool, spec_id)
+        .await
+        .map_err(|e| format!("load spec: {e}"))?
+        .ok_or_else(|| format!("spec {spec_id} not found"))?;
+    run_agent_internal(app, &spec, trigger).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn cascade_list_agent_actions(
@@ -2014,8 +3393,9 @@ pub async fn cascade_approve_action(
         .map_err(|e| format!("load spec: {e}"))?
         .ok_or("spec not found")?;
     let content = action.content.clone().unwrap_or_default();
-    commit_side_effect(
-        &app, action.spec_id, action.run_id, action.step, &action.tool, &spec.name, &content,
+    let target = resolve_delivery_target(&app).await;
+    let _ = commit_side_effect(
+        &app, action.spec_id, action.run_id, action.step, &action.tool, &spec.name, &content, target,
     )?;
     update_agent_action_state(&pool, action_id, "committed")
         .await
@@ -2121,6 +3501,9 @@ pub async fn cascade_tick_due_agents(app: tauri::AppHandle) -> Result<u32, Strin
             Ok(d) => d,
             Err(_) => continue,
         };
+        if is_browser_execution(&doc) {
+            continue;
+        }
         let cadence_min = doc.schedule_minutes.max(60);
         let due = match last_live_run_at(&pool, spec.id).await {
             Ok(Some(ts)) => {

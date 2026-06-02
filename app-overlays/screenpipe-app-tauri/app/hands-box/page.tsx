@@ -44,6 +44,17 @@ export default function HandsBox() {
   const [controlsOpen, setControlsOpen] = useState(false);
   const [paused, setPaused] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [controlledSpecId, setControlledSpecId] = useState<number | null>(null);
+  const [result, setResult] = useState<{ app: string; title: string; content: string; open: string | null } | null>(null);
+
+  const openResult = () => {
+    const ref = result?.open;
+    if (!ref) return;
+    const args = ref.startsWith("app:") ? ["-a", ref.slice(4)] : [ref.replace(/^(path:|url:)/, "")];
+    import("@tauri-apps/plugin-shell")
+      .then(({ Command }) => Command.create("open", args).execute())
+      .catch(() => {});
+  };
 
   const toggleMinimize = async () => {
     const next = !collapsed;
@@ -89,6 +100,11 @@ export default function HandsBox() {
           }, 3500);
         }
       }),
+      // Headless runs (Run now / scheduled) produce a deliverable shown as a card.
+      listen<{ app: string; title: string; content: string; open: string | null }>(
+        "cascade-hands-result",
+        (e) => setResult(e.payload),
+      ),
     ];
     return () => {
       subs.forEach((u) => u.then((f) => f()));
@@ -99,6 +115,32 @@ export default function HandsBox() {
   const working = rows.filter((r) => !r.done).length;
   const cursorList = Object.values(cursors);
   const latest = rows.find((r) => !r.done) ?? rows[0];
+  const latestActive = rows.find((r) => !r.done) ?? null;
+  const controllingLatest = latestActive ? controlledSpecId === latestActive.specId : false;
+
+  useEffect(() => {
+    if (controlledSpecId == null) return;
+    const active = agents[controlledSpecId];
+    if (!active || active.done) {
+      setControlledSpecId(null);
+    }
+  }, [agents, controlledSpecId]);
+
+  const toggleTakeControl = async (specId: number) => {
+    if (controlledSpecId === specId) {
+      await invoke("cascade_pause_computer_task", { specId, paused: false }).catch(() => {});
+      setControlledSpecId(null);
+      return;
+    }
+    if (controlledSpecId != null) {
+      await invoke("cascade_pause_computer_task", { specId: controlledSpecId, paused: false }).catch(() => {});
+    }
+    const ok = await invoke("cascade_take_control_computer_task", { specId })
+      .then(() => true)
+      .catch(() => false);
+    if (!ok) return;
+    setControlledSpecId(specId);
+  };
 
   return (
     <div style={{ fontFamily: "ui-sans-serif, -apple-system, system-ui, sans-serif", padding: 10, boxSizing: "border-box", background: "transparent", height: "100%" }}>
@@ -192,11 +234,53 @@ export default function HandsBox() {
           {latest ? `▸ ${latest.narration}` : "Starting…"}
         </div>
 
+        {latestActive && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+            <button
+              onClick={() => toggleTakeControl(latestActive.specId)}
+              style={controllingLatest ? releaseBtn : takeControlBtn}
+            >
+              {controllingLatest ? "Let the agent do it" : "Take control"}
+            </button>
+            <span style={{ fontSize: 11, color: "#89a79a" }}>
+              {controllingLatest
+                ? `You are driving ${latestActive.name} in its browser now.`
+                : `Jump into ${latestActive.name}'s browser and drive it yourself.`}
+            </span>
+          </div>
+        )}
+
+        {/* deliverable card (headless runs: the recap it wrote, where it landed) */}
+        {result && (
+          <div style={{ marginTop: 9, border: "1px solid rgba(255,255,255,0.08)", borderRadius: 9, overflow: "hidden", background: "rgba(0,0,0,0.25)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 9px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+              <span style={{ fontSize: 11 }}>{result.app === "Apple Notes" ? "🗒️" : "📄"}</span>
+              <span style={{ font: "600 10px ui-monospace, Menlo, monospace", color: "#7fd6ab", letterSpacing: 0.4 }}>{result.app}</span>
+              <span style={{ color: "#5e7569", fontSize: 10 }}>·</span>
+              <span style={{ font: "600 10.5px ui-monospace, Menlo, monospace", color: "#bfe6d3", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{result.title}</span>
+              <span style={{ flex: 1 }} />
+              {result.open && (
+                <button onClick={openResult} style={openBtn}>
+                  {result.app === "Apple Notes" ? "Open in Notes" : "Open"}
+                </button>
+              )}
+            </div>
+            <pre style={{ margin: 0, padding: "8px 10px", maxHeight: 140, overflowY: "auto", fontSize: 11, lineHeight: 1.45, color: "#dcebe3", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, Menlo, monospace" }}>
+              {result.content || "(no preview)"}
+            </pre>
+          </div>
+        )}
+
         {/* per-cursor control boxes (revealed on click) */}
         {controlsOpen && rows.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 9, paddingTop: 9, borderTop: "1px solid rgba(255,255,255,0.07)" }}>
             {rows.map((s) => (
-              <CursorControl key={s.specId} s={s} />
+              <CursorControl
+                key={s.specId}
+                s={s}
+                controlled={controlledSpecId === s.specId}
+                onToggleControl={() => toggleTakeControl(s.specId)}
+              />
             ))}
           </div>
         )}
@@ -208,19 +292,34 @@ export default function HandsBox() {
   );
 }
 
-function CursorControl({ s }: { s: StatusState }) {
+function CursorControl({
+  s,
+  controlled,
+  onToggleControl,
+}: {
+  s: StatusState;
+  controlled: boolean;
+  onToggleControl: () => void;
+}) {
   const color = `oklch(0.82 0.15 ${s.hue})`;
   const stop = () => invoke("cascade_stop_computer_task", { specId: s.specId }).catch(() => {});
   const approve = () => invoke("cascade_approve_computer_step", { specId: s.specId }).catch(() => {});
   const reject = () => invoke("cascade_reject_computer_step", { specId: s.specId }).catch(() => {});
   return (
     <div style={{ border: `1px solid ${color}55`, borderRadius: 9, padding: "6px 8px", background: "rgba(255,255,255,0.02)", minWidth: 120 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: s.awaitingApproval ? 6 : 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: s.awaitingApproval || !s.done ? 6 : 0 }}>
         <span style={{ width: 6, height: 6, borderRadius: "50%", background: s.done ? "#7a8a82" : color, flexShrink: 0 }} />
         <span style={{ font: "700 10px ui-monospace, Menlo, monospace", color, maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.name}</span>
         <span style={{ flex: 1 }} />
         {!s.done && <button onClick={stop} style={miniBtn}>stop</button>}
       </div>
+      {!s.done && (
+        <div style={{ display: "flex", gap: 5, marginBottom: s.awaitingApproval ? 6 : 0 }}>
+          <button onClick={onToggleControl} style={controlled ? releaseMiniBtn : takeoverMiniBtn}>
+            {controlled ? "let agent do it" : "take control"}
+          </button>
+        </div>
+      )}
       {s.awaitingApproval && (
         <div style={{ display: "flex", gap: 5 }}>
           <button onClick={approve} style={okBtn}>✓ do it</button>
@@ -251,6 +350,26 @@ const pauseBtn: React.CSSProperties = {
   letterSpacing: 1,
   cursor: "pointer",
 };
+const takeControlBtn: React.CSSProperties = {
+  padding: "5px 10px",
+  borderRadius: 7,
+  background: "rgba(255,214,102,0.18)",
+  border: "1px solid rgba(255,214,102,0.45)",
+  color: "#ffe6a0",
+  font: "700 10px ui-monospace, Menlo, monospace",
+  letterSpacing: 0.3,
+  cursor: "pointer",
+};
+const releaseBtn: React.CSSProperties = {
+  padding: "5px 10px",
+  borderRadius: 7,
+  background: "rgba(90,200,160,0.16)",
+  border: "1px solid rgba(90,200,160,0.45)",
+  color: "#9ff0cc",
+  font: "700 10px ui-monospace, Menlo, monospace",
+  letterSpacing: 0.3,
+  cursor: "pointer",
+};
 const minBtn: React.CSSProperties = {
   padding: "3px 8px",
   borderRadius: 6,
@@ -267,6 +386,26 @@ const miniBtn: React.CSSProperties = {
   background: "rgba(220,80,60,0.15)",
   border: "1px solid rgba(220,90,70,0.5)",
   color: "#ffb4a0",
+  font: "600 9px ui-monospace, Menlo, monospace",
+  cursor: "pointer",
+};
+const takeoverMiniBtn: React.CSSProperties = {
+  flex: 1,
+  padding: "4px 6px",
+  borderRadius: 6,
+  background: "rgba(255,214,102,0.14)",
+  border: "1px solid rgba(255,214,102,0.4)",
+  color: "#ffe6a0",
+  font: "600 9px ui-monospace, Menlo, monospace",
+  cursor: "pointer",
+};
+const releaseMiniBtn: React.CSSProperties = {
+  flex: 1,
+  padding: "4px 6px",
+  borderRadius: 6,
+  background: "rgba(90,200,160,0.14)",
+  border: "1px solid rgba(90,200,160,0.4)",
+  color: "#9ff0cc",
   font: "600 9px ui-monospace, Menlo, monospace",
   cursor: "pointer",
 };
@@ -288,5 +427,14 @@ const noBtn: React.CSSProperties = {
   border: "1px solid rgba(160,180,170,0.4)",
   color: "#c7d6cd",
   font: "600 10px ui-sans-serif, system-ui",
+  cursor: "pointer",
+};
+const openBtn: React.CSSProperties = {
+  padding: "2px 9px",
+  borderRadius: 5,
+  background: "rgba(90,200,160,0.16)",
+  border: "1px solid rgba(90,200,160,0.45)",
+  color: "#9ff0cc",
+  font: "600 9.5px ui-sans-serif, system-ui",
   cursor: "pointer",
 };

@@ -62,6 +62,12 @@ export interface AgentSpecDoc {
   name: string;
   taskDescription: string;
   rationale: string;
+  executionMode: "background" | "browser";
+  targetUrl: string;
+  targetHosts: string[];
+  observedApps: string[];
+  observedWorkflow: string[];
+  completionPattern: string;
   requiredInputs: RequiredInput[];
   workflow: WorkflowStep[];
   tools: string[];

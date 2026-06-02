@@ -34,6 +34,8 @@ import {
   seedDemoAgent,
   startAllComputerTasks,
   startComputerTask,
+  stopComputerTask,
+  pauseComputerTask,
   transitionAgentSpec,
 } from "@/lib/cascade-agents";
 
@@ -88,6 +90,10 @@ export function CascadesView() {
     }
     return map;
   }, [specs]);
+  const browserRunningCount = useMemo(
+    () => buckets.running.filter((s) => s.spec.executionMode === "browser").length,
+    [buckets.running],
+  );
 
   const run = useCallback(
     async (id: number, fn: () => Promise<unknown>, ok: string) => {
@@ -112,6 +118,18 @@ export function CascadesView() {
     run(
       s.id,
       async () => {
+        if (s.status !== "sandbox_passed") {
+          // sandboxTest records `sandbox_failed` WITHOUT throwing, so we must
+          // inspect its result. Without this, "approve_employee" would flip
+          // employee_approved=true on a failed spec and only "deploy" would
+          // reject — leaving a surprising partial-approved state behind.
+          const r = await sandboxTest(s.id);
+          if (r.status !== "success") {
+            throw new Error(
+              `Sandbox test didn't pass (${r.status}) — review the flagged items before installing.`,
+            );
+          }
+        }
         await transitionAgentSpec(s.id, "approve_employee");
         await transitionAgentSpec(s.id, "deploy");
       },
@@ -120,10 +138,17 @@ export function CascadesView() {
   const onDecline = (s: CascadeAgentSpecView) =>
     run(s.id, () => transitionAgentSpec(s.id, "reject"), `Declined “${s.name}”`);
   const onPause = (s: CascadeAgentSpecView) =>
-    run(s.id, () => transitionAgentSpec(s.id, s.status === "paused" ? "resume" : "pause"),
-      s.status === "paused" ? `Resumed “${s.name}”` : `Paused “${s.name}”`);
+    run(s.id, async () => {
+      // Pause/resume the live agent (if it's running in the box) too.
+      await pauseComputerTask(s.status !== "paused", s.id).catch(() => {});
+      await transitionAgentSpec(s.id, s.status === "paused" ? "resume" : "pause");
+    }, s.status === "paused" ? `Resumed “${s.name}”` : `Paused “${s.name}”`);
   const onUninstall = (s: CascadeAgentSpecView) =>
-    run(s.id, () => transitionAgentSpec(s.id, "reject"), `Uninstalled “${s.name}”`);
+    run(s.id, async () => {
+      // Stop the running agent (close its browser + loop) before removing it.
+      await stopComputerTask(s.id).catch(() => {});
+      await transitionAgentSpec(s.id, "reject");
+    }, `Uninstalled “${s.name}”`);
   const [lastRunSummary, setLastRunSummary] = useState<Record<number, string>>({});
   const onRunNow = (s: CascadeAgentSpecView) =>
     run(
@@ -138,7 +163,7 @@ export function CascadesView() {
     run(
       s.id,
       () => startComputerTask(s.id),
-      `${s.name} is doing it on-screen — watch its cursor`,
+      `${s.name} is working — watch the steps in the floating box`,
     );
   const onWatchAll = async () => {
     setError(null);
@@ -146,8 +171,8 @@ export function CascadesView() {
       const n = await startAllComputerTasks();
       setNote(
         n === 0
-          ? "No installed agents to run yet."
-          : `${n} agent${n === 1 ? "" : "s"} now working on-screen — one cursor each.`,
+          ? "No browser-grounded installed agents are ready to watch yet."
+          : `${n} agent${n === 1 ? "" : "s"} now working — watch each one in the floating box.`,
       );
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -169,7 +194,7 @@ export function CascadesView() {
   };
 
   return (
-    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
+    <div style={{ height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
       <CascadeTitlebar />
 
       <div
@@ -265,30 +290,40 @@ export function CascadesView() {
               }
             />
 
-            {buckets.running.length > 1 && (
+            {browserRunningCount > 1 && (
               <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -18 }}>
                 <PrimaryBtn onClick={onWatchAll}>
-                  ▶ Watch all {buckets.running.length} agents work on-screen
+                  ▶ Watch all {browserRunningCount} browser agents work
                 </PrimaryBtn>
               </div>
             )}
 
             <StageSection
               title="3 · Running on this Mac"
-              sub="Active helpers doing real work on their schedule. The first 3 runs are supervised — you approve each thing the agent produces. Every action is audit-logged and reversible. Pause or uninstall anytime."
+              sub="Active helpers doing real work. Browser-grounded agents open the same observed site when you press Start & watch. Background agents run locally with Run now. The first 3 live runs stage committing outputs for approval. Every action is audit-logged and reversible."
               specs={buckets.running}
               busyId={busyId}
               lastRunSummary={lastRunSummary}
               showRuntime
               renderActions={(s) => (
                 <>
-                  <PrimaryBtn
-                    disabled={busyId === s.id}
-                    onClick={() => onWatch(s)}
-                    title="Start the agent — its cursor does the task on-screen in the live box"
-                  >
-                    {busyId === s.id ? "Starting…" : "▶ Start & watch"}
-                  </PrimaryBtn>
+                  {s.spec.executionMode === "browser" ? (
+                    <PrimaryBtn
+                      disabled={busyId === s.id}
+                      onClick={() => onWatch(s)}
+                      title="Start the agent in the observed website and watch the steps in the floating box"
+                    >
+                      {busyId === s.id ? "Starting…" : "▶ Start & watch"}
+                    </PrimaryBtn>
+                  ) : (
+                    <PrimaryBtn
+                      disabled={busyId === s.id}
+                      onClick={() => onRunNow(s)}
+                      title="Run this background agent now"
+                    >
+                      {busyId === s.id ? "Running…" : "▶ Run now"}
+                    </PrimaryBtn>
+                  )}
                   <GhostBtn disabled={busyId === s.id} onClick={() => onUninstall(s)}>
                     Uninstall
                   </GhostBtn>

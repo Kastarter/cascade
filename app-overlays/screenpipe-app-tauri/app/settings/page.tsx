@@ -10,7 +10,6 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
 import { CascadeByokDialog } from "@/components/cascade-byok-dialog";
-import { openAgentLogin } from "@/lib/cascade-agents";
 import {
   CASCADE_DEFAULT_PROVIDER,
   CASCADE_ADVANCED_MODEL,
@@ -51,7 +50,7 @@ export default function SettingsPage() {
   };
 
   return (
-    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
+    <div style={{ height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
       <CascadeTitlebar />
 
       <div
@@ -113,30 +112,14 @@ export default function SettingsPage() {
           </a>
         </Section>
 
-        {/* Agent logins */}
+        {/* How agents work */}
         <Section
-          title="Agent logins"
-          sub="Your agents work in their own private browser — never your screen. Log that browser into the apps you want agents to use; the session is remembered for future runs, and agents can only touch services you log in here."
+          title="How your agents work"
+          sub="An agent works in its OWN sandbox browser — never your screen. The first time you start an agent that needs a tool (e.g. Notion), Cascade pops that tool's sign-in for you; sign in once, close it, and the agent gets to work. The session is remembered for future runs."
         >
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {[
-              { label: "Notion", url: "https://www.notion.so/login" },
-              { label: "Gmail", url: "https://mail.google.com" },
-              { label: "Google Docs", url: "https://docs.google.com" },
-              { label: "LinkedIn", url: "https://www.linkedin.com/login" },
-              { label: "Slack", url: "https://slack.com/signin" },
-            ].map((s) => (
-              <button key={s.label} style={ghostBtn} onClick={() => openAgentLogin(s.url).catch(() => {})}>
-                Log in to {s.label}
-              </button>
-            ))}
-            <button style={ghostBtn} onClick={() => openAgentLogin("https://www.google.com").catch(() => {})}>
-              Other (open browser)
-            </button>
-          </div>
-          <p style={{ fontSize: 12, color: "var(--cascade-text-4)", lineHeight: 1.5, marginTop: 12 }}>
-            A browser window opens — sign in normally, then close it. Note: Google sign-in sometimes blocks
-            embedded browsers; most other apps (Notion, LinkedIn, Slack, internal tools) work.
+          <p style={{ fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.55, margin: 0 }}>
+            You never have to set up logins ahead of time — they're requested in context, only when an agent
+            actually needs them, and only for the services that agent uses.
           </p>
         </Section>
 
@@ -159,7 +142,7 @@ export default function SettingsPage() {
           <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
             <Meta label="Product" value="Cascade" />
             <Meta label="Layer 1" value="Reel · rewind + Q&A" />
-            <Meta label="Layer 2" value="Detector · agents · computer-use" />
+            <Meta label="Layer 2" value="Detector · agents · headless runtime" />
           </div>
         </Section>
       </div>
