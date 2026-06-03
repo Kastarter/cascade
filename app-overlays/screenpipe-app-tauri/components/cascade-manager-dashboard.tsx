@@ -5,7 +5,6 @@
 
 import type { CSSProperties, ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
 import {
   CascadeManagerSuggestion,
   CascadeManagerSuggestionBatch,
@@ -26,8 +25,7 @@ import {
   toDashboardCascade,
   toDashboardPattern,
 } from "@/lib/cascade-manager-dashboard";
-
-type DashboardTab = "pulse" | "patterns" | "cascades";
+import { CascadeTitlebar } from "@/components/cascade-titlebar";
 
 type PatternEvidenceView = {
   automation: string;
@@ -105,8 +103,6 @@ function summarizeEvidence(pattern: ManagerDashboardPattern): PatternEvidenceVie
 }
 
 export function CascadeManagerDashboard() {
-  const router = useRouter();
-  const [tab, setTab] = useState<DashboardTab>("pulse");
   const [selected, setSelected] = useState<ManagerDashboardPattern | null>(null);
   const [batch, setBatch] = useState<CascadeManagerSuggestionBatch | null>(null);
   const [suggestions, setSuggestions] = useState<CascadeManagerSuggestion[]>([]);
@@ -176,13 +172,14 @@ export function CascadeManagerDashboard() {
   }
 
   return (
-    <div data-screen-label="Cascade Manager" style={{ height: "100vh", overflowY: "auto", background: "var(--cascade-bg)" }}>
-      <ManagerShell
-        tab={tab}
-        setTab={setTab}
-        onRefresh={refreshSuggestions}
-        refreshing={refreshing}
-        onBackToReel={() => router.push("/home")}
+    <div data-screen-label="Cascade Manager" style={{ height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column", background: "var(--cascade-bg)" }}>
+      <CascadeTitlebar />
+      <div
+        style={{
+          flex: 1,
+          background:
+            "radial-gradient(ellipse at top, oklch(0.24 0.03 145 / 0.35), transparent 58%), var(--cascade-bg)",
+        }}
       >
         <main
           style={{
@@ -193,6 +190,39 @@ export function CascadeManagerDashboard() {
             color: "var(--cascade-text)",
           }}
         >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 18 }}>
+            <span
+              style={{
+                fontFamily: "var(--cascade-mono)",
+                fontSize: 10,
+                color: "var(--cascade-accent)",
+                letterSpacing: 1.6,
+                textTransform: "uppercase",
+                padding: "2px 7px",
+                border: "1px solid var(--cascade-accent)",
+                borderRadius: 4,
+              }}
+            >
+              Manager
+            </span>
+            <button
+              onClick={refreshSuggestions}
+              disabled={refreshing}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                background: "var(--cascade-panel)",
+                border: "1px solid var(--cascade-border)",
+                color: "var(--cascade-text-2)",
+                fontFamily: "var(--cascade-mono)",
+                fontSize: 10.5,
+                cursor: "pointer",
+              }}
+            >
+              {refreshing ? "Refreshing…" : "Refresh signals"}
+            </button>
+          </div>
+
           <ManagerBanner metrics={metrics} />
           <MetricsRail metrics={metrics} />
 
@@ -202,25 +232,19 @@ export function CascadeManagerDashboard() {
             <EmptyState title="No manager patterns yet" detail="Run detection once the employee app has enough activity history to analyze." />
           ) : (
             <>
-              {(tab === "pulse" || tab === "patterns") && (
-                <>
-                  <SectionHeader
-                    label={tab === "pulse" ? "Patterns Cascade noticed" : "All patterns"}
-                    right={`${patterns.length} surfaced · backed by recorded activity`}
-                  />
-                  <PatternsBento patterns={patterns} onCompose={setSelected} />
-                </>
-              )}
+              <SectionHeader
+                label="Patterns Cascade noticed"
+                right={`${patterns.length} surfaced · backed by recorded activity`}
+              />
+              <PatternsBento patterns={patterns} onCompose={setSelected} />
 
-              {(tab === "pulse" || tab === "cascades") && (
-                <div style={{ marginTop: 28 }}>
-                  <SectionHeader
-                    label="Cascades in flight"
-                    right={`${cascades.length} deployed or approved`}
-                  />
-                  <CascadesTable cascades={cascades} />
-                </div>
-              )}
+              <div style={{ marginTop: 28 }}>
+                <SectionHeader
+                  label="Cascades in flight"
+                  right={`${cascades.length} deployed or approved`}
+                />
+                <CascadesTable cascades={cascades} />
+              </div>
             </>
           )}
 
@@ -243,7 +267,7 @@ export function CascadeManagerDashboard() {
             <span>{metrics.outboxPath}</span>
           </div>
         </main>
-      </ManagerShell>
+      </div>
 
       {selected && (
         <ComposeConsole
@@ -275,137 +299,6 @@ export function CascadeManagerDashboard() {
           {toast}
         </div>
       )}
-    </div>
-  );
-}
-
-function ManagerShell({
-  tab,
-  setTab,
-  onRefresh,
-  refreshing,
-  onBackToReel,
-  children,
-}: {
-  tab: DashboardTab;
-  setTab: (tab: DashboardTab) => void;
-  onRefresh: () => void;
-  refreshing: boolean;
-  onBackToReel: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background:
-          "radial-gradient(ellipse at top, oklch(0.24 0.03 145 / 0.35), transparent 58%), var(--cascade-bg)",
-      }}
-    >
-      <div
-        style={{
-          height: 56,
-          borderBottom: "1px solid var(--cascade-border)",
-          display: "flex",
-          alignItems: "center",
-          padding: "0 32px",
-          gap: 26,
-          backdropFilter: "blur(16px) saturate(140%)",
-          background: "oklch(0.175 0.010 140 / 0.82)",
-          position: "sticky",
-          top: 0,
-          zIndex: 20,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-            <path d="M3 7l9 4 9-4" stroke="var(--cascade-accent)" strokeWidth="1.6" strokeLinecap="round" opacity="0.45" />
-            <path d="M3 12l9 4 9-4" stroke="var(--cascade-accent)" strokeWidth="1.6" strokeLinecap="round" opacity="0.75" />
-            <path d="M3 17l9 4 9-4" stroke="var(--cascade-accent)" strokeWidth="1.6" strokeLinecap="round" />
-          </svg>
-          <span style={{ fontSize: 16, fontWeight: 600 }}>Cascade</span>
-          <span
-            style={{
-              fontFamily: "var(--cascade-mono)",
-              fontSize: 10,
-              color: "var(--cascade-accent)",
-              letterSpacing: 1.6,
-              textTransform: "uppercase",
-              padding: "2px 7px",
-              border: "1px solid var(--cascade-accent)",
-              borderRadius: 4,
-            }}
-          >
-            Manager
-          </span>
-        </div>
-
-        <nav style={{ display: "flex", gap: 22 }}>
-          {[
-            { id: "pulse", label: "Pulse" },
-            { id: "patterns", label: "Patterns" },
-            { id: "cascades", label: "Cascades" },
-          ].map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setTab(item.id as DashboardTab)}
-              style={{
-                background: "transparent",
-                border: "none",
-                cursor: "pointer",
-                padding: 0,
-                fontFamily: "var(--cascade-mono)",
-                fontSize: 11,
-                fontWeight: 700,
-                letterSpacing: 1.4,
-                textTransform: "uppercase",
-                color: tab === item.id ? "var(--cascade-text)" : "var(--cascade-text-3)",
-                borderBottom: tab === item.id ? "1.5px solid var(--cascade-accent)" : "1.5px solid transparent",
-                paddingBottom: 4,
-                marginBottom: -4,
-              }}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
-
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
-          <button
-            onClick={onBackToReel}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 8,
-              background: "transparent",
-              border: "1px solid var(--cascade-border)",
-              color: "var(--cascade-text-3)",
-              fontFamily: "var(--cascade-mono)",
-              fontSize: 10.5,
-              cursor: "pointer",
-            }}
-          >
-            Back to Reel
-          </button>
-          <button
-            onClick={onRefresh}
-            disabled={refreshing}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 8,
-              background: "var(--cascade-panel)",
-              border: "1px solid var(--cascade-border)",
-              color: "var(--cascade-text-2)",
-              fontFamily: "var(--cascade-mono)",
-              fontSize: 10.5,
-              cursor: "pointer",
-            }}
-          >
-            {refreshing ? "Refreshing…" : "Refresh signals"}
-          </button>
-        </div>
-      </div>
-
-      {children}
     </div>
   );
 }

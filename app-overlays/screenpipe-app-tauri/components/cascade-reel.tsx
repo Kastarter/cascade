@@ -8,7 +8,7 @@
 
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   appColor,
@@ -24,6 +24,7 @@ import {
   toMinutesFromMidnight,
 } from "@/lib/cascade-api";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
+import { resolveAppColor, subscribeAppColors } from "@/lib/app-colors";
 
 const SITE_NAMES: Record<string, string> = {
   linkedin: "LinkedIn",
@@ -134,6 +135,17 @@ export function CascadeReel() {
 
   // Group frames into segments
   const segments = useMemo(() => framesToSegments(frames), [frames]);
+
+  // Each app's timeline color comes from its real icon (lib/app-colors). Kick
+  // off resolution for every app in view, and re-render as colors arrive —
+  // results are cached, so this only does work the first time we see an app.
+  const [, bumpColors] = useReducer((x: number) => x + 1, 0);
+  useEffect(() => subscribeAppColors(bumpColors), []);
+  useEffect(() => {
+    const apps = new Set<string>();
+    for (const f of frames) if (f.app_name) apps.add(f.app_name);
+    apps.forEach((a) => resolveAppColor(a));
+  }, [frames]);
 
   // Dynamic time range: earliest frame → exactly now (no future padding —
   // showing the next 5 unrecorded minutes felt weird/misleading).

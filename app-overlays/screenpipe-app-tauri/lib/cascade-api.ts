@@ -14,6 +14,7 @@
  */
 
 import { localFetch } from "@/lib/api";
+import { appColorHex } from "@/lib/app-colors";
 
 export interface CascadeFrame {
   frame_id: number;
@@ -158,31 +159,19 @@ export function durMins(mins: number): string {
   return `${h}h ${m}m`;
 }
 
-/** Tight harmonious palette matching the prototype's APPS object. */
-export const APP_COLORS: Record<string, { name: string; color: string }> = {
-  "Code":            { name: "VS Code",        color: "oklch(0.74 0.11 220)" },
-  "Visual Studio Code": { name: "VS Code",     color: "oklch(0.74 0.11 220)" },
-  "Cursor":          { name: "Cursor",         color: "oklch(0.74 0.11 220)" },
-  "zoom.us":         { name: "Zoom",           color: "oklch(0.74 0.11 255)" },
-  "Linear":          { name: "Linear",         color: "oklch(0.72 0.13 290)" },
-  "Slack":           { name: "Slack",          color: "oklch(0.74 0.13 335)" },
-  "Figma":           { name: "Figma",          color: "oklch(0.74 0.14 15)"  },
-  "Google Chrome":   { name: "Chrome",         color: "oklch(0.76 0.12 50)"  },
-  "Safari":          { name: "Safari",         color: "oklch(0.76 0.12 50)"  },
-  "Notion":          { name: "Notion",         color: "oklch(0.80 0.04 95)"  },
-  "Terminal":        { name: "Terminal",       color: "oklch(0.74 0.11 155)" },
-  "iTerm2":          { name: "Terminal",       color: "oklch(0.74 0.11 155)" },
-  "Mail":            { name: "Mail",           color: "oklch(0.74 0.10 195)" },
-};
-
+/**
+ * Timeline color for an app, derived from the app's real icon (see
+ * lib/app-colors). Returns a hex string so callers can append an alpha pair
+ * (`${appColor(app)}33`). Resolution is async + cached; call `resolveAppColor`
+ * for the apps on screen and re-render via `subscribeAppColors`.
+ */
 export function appColor(app: string | null): string {
-  if (!app) return "oklch(0.50 0.02 140)";
-  return APP_COLORS[app]?.color ?? "oklch(0.65 0.08 140)";
+  return appColorHex(app);
 }
 
 export function appDisplayName(app: string | null): string {
   if (!app) return "—";
-  return APP_COLORS[app]?.name ?? app;
+  return app.replace(/\.app$/i, "");
 }
 
 /**

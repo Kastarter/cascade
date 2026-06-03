@@ -1,30 +1,78 @@
 # Cascade
 
-Enterprise productivity intelligence — passive monitoring + retrospective Q&A on the employee side; waste-detection + cascadeable fix-agents on the admin side.
+**Your day, recorded locally — then turned into answers and agents.**
 
-This repo is a **soft fork of [Screenpipe](https://github.com/mediar-ai/screenpipe)**: upstream is vendored as a git submodule under `vendor/screenpipe/`, our changes live as a `quilt` patch series in `patches/` plus overlay files in `app-overlays/`, and our additive sidecar tables live in `crates/cascade-schema/`.
+Cascade is a privacy-first macOS app that passively records what happens on your
+screen, keeps it entirely on your Mac, and turns it into two things: a searchable
+*rewind* of your day that you can ask questions about, and AI agents that take the
+repetitive work off your plate.
 
-## What's here
+Everything runs locally and on your own Anthropic (Claude) API key — nothing leaves
+your machine except the calls you choose to make to Claude.
 
-- `plan.md` — the canonical Layer 1 implementation plan
-- `vendor/screenpipe/` — upstream Screenpipe at a pinned SHA (submodule, not yet added)
-- `patches/` — quilt patch series applied on top of upstream
-- `app-overlays/screenpipe-app-tauri/` — files copied over the vendored Tauri app
-- `crates/cascade-schema/` — our additive SQLite tables (forward-compat for Layer 2)
-- `pipes/cascade-rewind-qa/` — the v1 Q&A agent (a single Screenpipe pipe)
-- `scripts/` — apply-patches, refresh-from-upstream, overlay, build-macos
-- `.github/workflows/` — CI + release pipelines
+## What it does
 
-## Status
+### Reel — rewind your day
+A cinematic timeline of everything you worked on, reconstructed from on-screen text
+(OCR) and app/window context. Scrub through the day, see what was on screen at any
+moment, and watch each segment colored by the real icon of the app you were using.
 
-Pre-M0. See `plan.md` for the full milestone breakdown and the M0 verification gate that must pass before any patch is written.
+### Ask your day
+Ask plain-language questions about what you did — *"what was that error in Cursor
+this morning?"*, *"summarize the doc I read in Obsidian"* — and get answers grounded
+in your actual recorded activity instead of a guess.
 
-## Quickstart
+### Manager — spot the repetitive work
+Cascade watches for patterns in how you work and surfaces the repetitive, low-value
+loops that are the best candidates to automate.
 
-Nothing to build yet — scaffolding only. After the Screenpipe submodule is added and the M0 gate passes:
+### Agents — automate the loop
+From a surfaced pattern, Cascade can generate an agent that does the work for you.
+Agents run one of two ways:
+
+- **In the background** — inside a sandboxed browser the agent drives itself, so you
+  keep using your computer while it works (web apps).
+- **On your screen** — the agent uses your real screen and cursor, so it can operate
+  any app, then delivers the result into the tool you actually use (e.g. a note in
+  Obsidian or Apple Notes).
+
+## Privacy & local-first
+
+- **All capture and storage stays on your Mac.**
+- **Sensitive apps are excluded** entirely — banking, health, legal, dating, private
+  browsing.
+- A **Privacy Aggregator** sanitizes activity down to an allowlist *before* any agent
+  is ever allowed to read it.
+- **Bring your own key (BYOK)** — your Anthropic API key lives in the macOS Keychain
+  and is used only for the Claude calls Cascade makes on your behalf.
+
+## Requirements
+
+- macOS on Apple Silicon
+- An [Anthropic API key](https://console.anthropic.com/settings/keys)
+- To build from source: [Bun](https://bun.sh) and a Rust toolchain
+
+## Build & run
 
 ```sh
-./scripts/apply-patches.sh
-./scripts/overlay.sh
-./scripts/build-macos.sh
+# sync the app source and build a release .app
+bash scripts/overlay.sh
+cd vendor/screenpipe/apps/screenpipe-app-tauri
+bun install
+bun run tauri build
+
+# install it
+cp -R src-tauri/target/release/bundle/macos/Cascade.app /Applications/
+xattr -dr com.apple.quarantine /Applications/Cascade.app
 ```
+
+On first launch, grant Screen Recording permission and add your Anthropic key in
+**Settings**.
+
+## Project layout
+
+- `app-overlays/screenpipe-app-tauri/` — Cascade's app UI and native commands
+- `crates/cascade-schema/` — the local SQLite tables Cascade adds
+- `pipes/cascade-rewind-qa/` — the rewind Q&A agent
+- `scripts/` — overlay + build helpers
+- `vendor/screenpipe/` — the vendored on-device capture engine the app is built on
