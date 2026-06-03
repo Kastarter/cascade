@@ -29,18 +29,27 @@ interface CascadeByokDialogProps {
 export function CascadeByokDialog({ open, onOpenChange, onSaved }: CascadeByokDialogProps) {
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
+  // Surface failures inline too, not only via toast — a save that errors must
+  // never look like "nothing happened" even if the toast host isn't mounted.
+  const [error, setError] = useState<string | null>(null);
 
   async function handleSave() {
-    if (!key.startsWith("sk-ant-")) {
-      toast.error("That doesn't look like an Anthropic API key (expected prefix: sk-ant-)");
+    // Pasted keys often carry a trailing newline/space; trim before validating
+    // and storing so it doesn't corrupt the Keychain value or fail the prefix check.
+    const trimmed = key.trim();
+    if (!trimmed.startsWith("sk-ant-")) {
+      const msg = "That doesn't look like an Anthropic API key (expected prefix: sk-ant-)";
+      setError(msg);
+      toast.error(msg);
       return;
     }
+    setError(null);
     setSaving(true);
     try {
-      await invoke("cascade_set_anthropic_key", { key });
+      await invoke("cascade_set_anthropic_key", { key: trimmed });
       // Cache for the in-browser Reel Q&A chat so it uses the same key.
       try {
-        window.localStorage.setItem("cascade-anthropic-key", key);
+        window.localStorage.setItem("cascade-anthropic-key", trimmed);
       } catch {
         /* non-fatal */
       }
@@ -49,7 +58,9 @@ export function CascadeByokDialog({ open, onOpenChange, onSaved }: CascadeByokDi
       onSaved();
       onOpenChange(false);
     } catch (err) {
-      toast.error(`Failed to save key: ${err}`);
+      const msg = `Failed to save key: ${err}`;
+      setError(msg);
+      toast.error(msg);
     } finally {
       setSaving(false);
     }
@@ -88,10 +99,21 @@ export function CascadeByokDialog({ open, onOpenChange, onSaved }: CascadeByokDi
             type="password"
             placeholder="sk-ant-..."
             value={key}
-            onChange={(e) => setKey(e.target.value)}
+            onChange={(e) => {
+              setKey(e.target.value);
+              if (error) setError(null);
+            }}
             autoComplete="off"
             spellCheck={false}
           />
+          {error && (
+            <p
+              role="alert"
+              className="text-xs text-red-400 break-words"
+            >
+              {error}
+            </p>
+          )}
         </div>
 
         <DialogFooter>

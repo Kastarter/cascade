@@ -218,7 +218,7 @@ export function CascadeReel() {
         padding: 22,
         gap: 18,
         background: `radial-gradient(ellipse at 30% 0%, ${segColor}14, transparent 55%),
-                     radial-gradient(ellipse at 80% 100%, oklch(0.17 0.05 290 / 0.4), transparent 55%),
+                     radial-gradient(ellipse at 80% 100%, oklch(0.19 0.05 45 / 0.4), transparent 55%),
                      var(--cascade-bg)`,
         transition: "background 0.5s ease",
         color: "var(--cascade-text)",
@@ -314,10 +314,10 @@ export function CascadeReel() {
             position: "relative",
             borderRadius: 16,
             overflow: "hidden",
-            background: "oklch(0.10 0.012 250)",
-            border: "1px solid oklch(0.35 0.018 250)",
+            background: "oklch(0.10 0.012 140)",
+            border: "1px solid oklch(0.35 0.018 140)",
             boxShadow: `
-              0 24px 80px oklch(0.06 0.02 250 / 0.55),
+              0 24px 80px oklch(0.06 0.02 140 / 0.55),
               0 0 0 1px rgba(255,255,255,0.04) inset,
               0 0 0 1px ${segColor}33,
               0 0 60px ${segColor}20
@@ -333,7 +333,7 @@ export function CascadeReel() {
               position: "absolute",
               inset: 0,
               pointerEvents: "none",
-              background: "radial-gradient(ellipse at center, transparent 55%, oklch(0.06 0.02 250 / 0.4) 100%)",
+              background: "radial-gradient(ellipse at center, transparent 55%, oklch(0.06 0.02 140 / 0.4) 100%)",
             }}
           />
 
@@ -348,10 +348,10 @@ export function CascadeReel() {
               gap: 7,
               padding: "5px 11px 5px 9px",
               borderRadius: 999,
-              background: "oklch(0.10 0.014 250 / 0.8)",
+              background: "oklch(0.10 0.014 140 / 0.8)",
               backdropFilter: "blur(12px)",
               WebkitBackdropFilter: "blur(12px)",
-              border: "1px solid oklch(0.30 0.020 250 / 0.5)",
+              border: "1px solid oklch(0.30 0.020 140 / 0.5)",
               fontFamily: "var(--cascade-mono)",
               fontSize: 9.5,
               color: "oklch(0.85 0.08 25)",
@@ -503,7 +503,7 @@ function Scene({ frame, loading, segApp }: { frame: CascadeFrame | null; loading
       <div
         style={{
           padding: "10px 16px",
-          borderBottom: "1px solid oklch(0.20 0.015 250)",
+          borderBottom: "1px solid oklch(0.20 0.015 140)",
           display: "flex",
           alignItems: "center",
           gap: 10,
@@ -511,7 +511,7 @@ function Scene({ frame, loading, segApp }: { frame: CascadeFrame | null; loading
           fontSize: 10.5,
           color: "var(--cascade-text-3)",
           letterSpacing: 0.4,
-          background: "oklch(0.10 0.012 250 / 0.8)",
+          background: "oklch(0.10 0.012 140 / 0.8)",
           backdropFilter: "blur(8px)",
           WebkitBackdropFilter: "blur(8px)",
           zIndex: 2,
@@ -558,7 +558,7 @@ function Scene({ frame, loading, segApp }: { frame: CascadeFrame | null; loading
       </div>
 
       {/* Image body */}
-      <div style={{ flex: 1, position: "relative", overflow: "hidden", background: "oklch(0.07 0.010 250)" }}>
+      <div style={{ flex: 1, position: "relative", overflow: "hidden", background: "oklch(0.07 0.010 140)" }}>
         {imgState === "loading" && (
           <div style={{ ...sceneCenter, color: "var(--cascade-text-4)" }}>
             <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 10, letterSpacing: 1.4 }}>LOADING FRAME…</span>
@@ -574,7 +574,7 @@ function Scene({ frame, loading, segApp }: { frame: CascadeFrame | null; loading
               width: "100%",
               height: "100%",
               objectFit: "contain",
-              backgroundColor: "oklch(0.05 0.005 250)",
+              backgroundColor: "oklch(0.05 0.005 140)",
             }}
           />
         )}
@@ -597,7 +597,7 @@ function Scene({ frame, loading, segApp }: { frame: CascadeFrame | null; loading
               bottom: 0,
               maxHeight: "60%",
               padding: "20px 32px",
-              background: "linear-gradient(0deg, oklch(0.07 0.010 250 / 0.92), oklch(0.07 0.010 250 / 0.7) 70%, transparent)",
+              background: "linear-gradient(0deg, oklch(0.07 0.010 140 / 0.92), oklch(0.07 0.010 140 / 0.7) 70%, transparent)",
               backdropFilter: "blur(4px)",
               WebkitBackdropFilter: "blur(4px)",
               overflow: "auto",
@@ -1115,7 +1115,7 @@ function SceneChatPanel({
         border: "1px solid var(--cascade-border)",
         borderRadius: 14,
         overflow: "hidden",
-        boxShadow: "0 16px 48px oklch(0.06 0.02 250 / 0.4)",
+        boxShadow: "0 16px 48px oklch(0.06 0.02 140 / 0.4)",
       }}
     >
       <div
