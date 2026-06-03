@@ -101,6 +101,27 @@ fn get_start_url(spec_id: i64) -> Option<String> {
     START_URLS.lock().ok().and_then(|m| m.get(&spec_id).cloned())
 }
 
+/// The ONLY two ways an agent does its work, chosen by the user in Settings and
+/// applied to every agent. There is no third path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunTarget {
+    /// Isolated sandbox browser, shown in the floating box. Web apps only; the
+    /// user keeps working uninterrupted while it runs. (Default.)
+    Sandbox,
+    /// The user's REAL screen — synthesized mouse/keyboard via `cascade_input`,
+    /// so the agent can drive ANY app, not just websites.
+    Screen,
+}
+
+impl RunTarget {
+    fn from_opt(s: Option<&str>) -> RunTarget {
+        match s {
+            Some("screen") => RunTarget::Screen,
+            _ => RunTarget::Sandbox,
+        }
+    }
+}
+
 /// Only one agent drives the real input at a time — their cursors still move in
 /// parallel, but clicks/keystrokes are serialized so they don't collide.
 static INPUT_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -464,7 +485,10 @@ fn capture_logical_screenshot(app: &tauri::AppHandle) -> Result<(String, f64, f6
     Ok((STANDARD.encode(&buf), lw, lh))
 }
 
-fn computer_system_prompt(name: &str, w: f64, h: f64) -> String {
+fn computer_system_prompt(name: &str, w: f64, h: f64, target: RunTarget) -> String {
+    if target == RunTarget::Screen {
+        return computer_system_prompt_screen(name, w, h);
+    }
     format!(
         "You are \"{name}\", a careful Cascade agent operating YOUR OWN web browser (a {w:.0}x{h:.0} \
 viewport, top-left origin). This is an isolated browser — NOT the user's screen — so the user keeps \
@@ -503,6 +527,53 @@ fn is_committing(action: &str) -> bool {
     matches!(action, "click" | "double_click" | "type" | "key" | "navigate" | "open_app")
 }
 
+/// Real-screen variant: the agent drives the USER'S actual screen, so it can use
+/// any application — not just a website.
+fn computer_system_prompt_screen(name: &str, w: f64, h: f64) -> String {
+    format!(
+        "You are \"{name}\", a careful Cascade agent operating the USER'S REAL SCREEN (a {w:.0}x{h:.0} \
+desktop, top-left origin). Your clicks and keystrokes move the user's actual mouse and keyboard, so act \
+deliberately. You're given a screenshot of the whole screen and a GOAL.\n\n\
+You can use ANY application to accomplish the goal: switch or launch apps with `open_app`, then click \
+menus/buttons and type, exactly as a person would. Read what's on screen before each move and make real \
+forward progress every step.\n\n\
+PRIMARY PLAN — if the GOAL includes a \"STEPS THE EMPLOYEE ACTUALLY TOOK\" list, that is the real path for \
+this task: reproduce that exact sequence of app switches / clicks / typing here, in order, adapting only to \
+what the current screen actually shows. Find the on-screen element that matches each recorded step and \
+click it; don't re-derive the route from scratch.\n\n\
+Coordinates: (x,y) are EXACT pixels in the screenshot you were given (its top-left is 0,0). To click a \
+thing, give the pixel at its CENTER. After each action you'll get a fresh screenshot — verify it changed; \
+if nothing changed, your last click missed, so pick a clearer target or scroll.\n\n\
+Be conservative; never take destructive or irreversible actions (deleting, submitting, sending, paying, \
+changing account/security settings, posting publicly).\n\n\
+Actions:\n\
+- click / double_click: click at (x,y)\n\
+- type: type `text` into the focused field\n\
+- key: press a key (`key`, e.g. \"Enter\")\n\
+- scroll: scroll the page (put pixels in `y`, negative = up)\n\
+- open_app: launch or focus an application by name (`app`, e.g. \"Obsidian\")\n\
+- navigate: open a URL in the browser (full https URL in `text`)\n\
+- record: save a finding into your notes (`text`) WITHOUT touching anything on screen.\n\
+- wait: let the screen settle\n\
+- done: the goal is complete. Before `done`, make sure every important finding is already captured with \
+`record`. You may put a 1-2 sentence wrap-up in `text`.\n\n\
+Return ONLY JSON: {{\"narration\":\"short present-tense\",\"action\":\"click|double_click|type|key|scroll|open_app|navigate|record|wait|done\",\
+\"x\":0,\"y\":0,\"text\":\"\",\"app\":\"\",\"key\":\"\"}}"
+    )
+}
+
+/// Open a URL in the user's default browser — the real-screen target's `navigate`.
+fn open_url_real(action: &ComputerAction) {
+    let raw = if action.text.starts_with("http") {
+        action.text.as_str()
+    } else if action.app.starts_with("http") {
+        action.app.as_str()
+    } else {
+        return;
+    };
+    let _ = std::process::Command::new("open").arg(raw).spawn();
+}
+
 fn execute_action(action: &ComputerAction) {
     match action.action.as_str() {
         "click" => cascade_input::click(action.x, action.y),
@@ -510,6 +581,8 @@ fn execute_action(action: &ComputerAction) {
         "type" => cascade_input::type_text(&action.text),
         "key" => cascade_input::press_key(&action.key),
         "open_app" => cascade_input::open_app(&action.app),
+        "scroll" => cascade_input::scroll(if action.y != 0.0 { action.y } else { 500.0 }),
+        "navigate" => open_url_real(action),
         _ => {}
     }
 }
@@ -847,6 +920,38 @@ try{{ if(t.click) t.click(); }}catch(e){{}}\
     }
 }
 
+/// Capture what the agent sees, per target: the isolated sandbox browser window,
+/// or the user's real screen. (The floating box excludes itself from capture, so
+/// the screen shot never contains the box — no infinite mirror.)
+async fn capture_for(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    target: RunTarget,
+) -> Result<(String, f64, f64), String> {
+    match target {
+        RunTarget::Sandbox => capture_browser(app, spec_id).await,
+        RunTarget::Screen => capture_logical_screenshot(app),
+    }
+}
+
+/// Perform an action, per target: inside the sandbox browser via JS injection, or
+/// on the user's real screen via synthesized input. Real input is serialized
+/// through INPUT_LOCK so concurrent agents don't collide on the keyboard/mouse.
+async fn act_for(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    action: &ComputerAction,
+    target: RunTarget,
+) {
+    match target {
+        RunTarget::Sandbox => browser_execute(app, spec_id, action),
+        RunTarget::Screen => {
+            let _guard = INPUT_LOCK.lock().await;
+            execute_action(action);
+        }
+    }
+}
+
 /// One task cycle: screenshot → decide → act, up to MAX_STEPS. Records its own
 /// run and returns the count of committing actions taken. The persistent
 /// `run_loop` calls this once on start and again on the agent's cadence.
@@ -857,6 +962,7 @@ async fn run_task_cycle(
     goal: &str,
     supervised: bool,
     hue: i64,
+    target: RunTarget,
 ) -> i64 {
     let recording = record_run_start(app, spec_id).await;
     let mut history = String::new();
@@ -864,52 +970,65 @@ async fn run_task_cycle(
     let mut notes: Vec<String> = Vec::new();
     let mut transient_failures = 0u32;
 
-    // The agent's OWN browser. It only opens on a Rewind-grounded site that was
-    // observed for this workflow; if we don't have one, fail closed.
-    let Some(start_url) = get_start_url(spec_id) else {
-        if let Some((pool, run_id)) = &recording {
-            use cascade_schema::sqlx;
-            let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
-                .bind(*run_id)
-                .bind("failed")
-                .bind("computer-use run failed: no Rewind-grounded start URL")
-                .execute(pool)
-                .await;
+    match target {
+        RunTarget::Sandbox => {
+            // The agent's OWN browser. It only opens on a Rewind-grounded site that
+            // was observed for this workflow; if we don't have one, fail closed.
+            let Some(start_url) = get_start_url(spec_id) else {
+                if let Some((pool, run_id)) = &recording {
+                    use cascade_schema::sqlx;
+                    let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
+                        .bind(*run_id)
+                        .bind("failed")
+                        .bind("computer-use run failed: no Rewind-grounded start URL")
+                        .execute(pool)
+                        .await;
+                }
+                emit_status(
+                    app,
+                    status_err(
+                        spec_id,
+                        name,
+                        goal,
+                        0,
+                        supervised,
+                        hue,
+                        "No Rewind-grounded start URL was found for this agent".to_string(),
+                    ),
+                );
+                return 0;
+            };
+            if let Err(e) = ensure_agent_browser(app, spec_id, &start_url) {
+                if let Some((pool, run_id)) = &recording {
+                    use cascade_schema::sqlx;
+                    let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
+                        .bind(*run_id)
+                        .bind("failed")
+                        .bind(format!("computer-use run failed: {e}"))
+                        .execute(pool)
+                        .await;
+                }
+                emit_status(app, status_err(spec_id, name, goal, 0, supervised, hue, e));
+                return 0;
+            }
+            tokio::time::sleep(Duration::from_millis(1600)).await; // let the page load
         }
-        emit_status(
-            app,
-            status_err(
-                spec_id,
-                name,
-                goal,
-                0,
-                supervised,
-                hue,
-                "No Rewind-grounded start URL was found for this agent".to_string(),
-            ),
-        );
-        return 0;
-    };
-    if let Err(e) = ensure_agent_browser(app, spec_id, &start_url) {
-        if let Some((pool, run_id)) = &recording {
-            use cascade_schema::sqlx;
-            let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
-                .bind(*run_id)
-                .bind("failed")
-                .bind(format!("computer-use run failed: {e}"))
-                .execute(pool)
-                .await;
+        RunTarget::Screen => {
+            // No sandbox window — the agent works on the user's real screen. If we
+            // recovered the observed site, open it there first so the agent starts
+            // in the right place; otherwise it works with whatever is on screen.
+            if let Some(start_url) = get_start_url(spec_id) {
+                let _ = std::process::Command::new("open").arg(&start_url).spawn();
+                tokio::time::sleep(Duration::from_millis(2200)).await;
+            }
         }
-        emit_status(app, status_err(spec_id, name, goal, 0, supervised, hue, e));
-        return 0;
     }
-    tokio::time::sleep(Duration::from_millis(1600)).await; // let the page load
 
     for step in 1..=MAX_STEPS {
         if stop_requested(spec_id) || is_paused(spec_id) {
             break;
         }
-        let (b64, lw, lh) = match capture_browser(app, spec_id).await {
+        let (b64, lw, lh) = match capture_for(app, spec_id, target).await {
             Ok(v) => {
                 transient_failures = 0;
                 v
@@ -946,7 +1065,7 @@ async fn run_task_cycle(
             "GOAL: {goal}\n\nSteps so far:\n{}\n\nThe screenshot is the current screen ({lw:.0}x{lh:.0} points). Single next action as JSON.",
             if history.is_empty() { "(none yet)" } else { &history }
         );
-        let res = match call_anthropic_vision(MODEL_SONNET, &computer_system_prompt(name, lw, lh), &user, &b64, 0.0, 700).await {
+        let res = match call_anthropic_vision(MODEL_SONNET, &computer_system_prompt(name, lw, lh, target), &user, &b64, 0.0, 700).await {
             Ok(r) => {
                 transient_failures = 0;
                 r
@@ -1144,8 +1263,8 @@ async fn run_task_cycle(
         }
 
         emit_cursor(app, CursorEvent { spec_id, name: name.to_string(), x: action.x, y: action.y, clicking: true, visible: true, hue });
-        // Act INSIDE the agent's own browser (never the user's screen).
-        browser_execute(app, spec_id, &action);
+        // Act per the chosen target: inside the sandbox browser, or on the real screen.
+        act_for(app, spec_id, &action, target).await;
         if is_committing(&action.action) {
             produced += 1;
             if let Some((pool, run_id)) = &recording {
@@ -1168,7 +1287,7 @@ async fn run_task_cycle(
         let pause = if matches!(action.action.as_str(), "navigate" | "open_app") { 2400 } else { 900 };
         tokio::time::sleep(Duration::from_millis(pause)).await;
         if matches!(action.action.as_str(), "click" | "double_click") {
-            if let Ok((after_b64, after_w, after_h)) = capture_browser(app, spec_id).await {
+            if let Ok((after_b64, after_w, after_h)) = capture_for(app, spec_id, target).await {
                 let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: after_b64.clone(), img_w: after_w, img_h: after_h });
                 if after_b64 == b64 {
                     history.push_str(&format!(
@@ -1206,7 +1325,7 @@ async fn run_task_cycle(
     produced
 }
 
-async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool) {
+async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool, target: RunTarget) {
     let hue = hue_for(spec_id);
     let mut goal = goal;
     // The box shows the screen + the agent cursor inside it, so we no longer
@@ -1220,13 +1339,17 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
     // "waiting to sign in") until they've logged in and closed it. Then work.
     // Sign in to the agent's OWN site if needed — serialized + keyed PER HOST,
     // so multiple agents (Watch all) can never release each other's logins.
-    if let Some(url) = get_start_url(spec_id) {
-        let host = host_of(&url);
-        if !host.is_empty() && !is_signed_in(&host) {
-            ensure_host_login(&app, spec_id, &name, &goal, supervised, hue, &host, &url).await;
-            if stop_requested(spec_id) {
-                end_agent(spec_id);
-                return;
+    // Real-screen runs use the user's already-signed-in apps, so there's no
+    // sandbox sign-in to manage there.
+    if target == RunTarget::Sandbox {
+        if let Some(url) = get_start_url(spec_id) {
+            let host = host_of(&url);
+            if !host.is_empty() && !is_signed_in(&host) {
+                ensure_host_login(&app, spec_id, &name, &goal, supervised, hue, &host, &url).await;
+                if stop_requested(spec_id) {
+                    end_agent(spec_id);
+                    return;
+                }
             }
         }
     }
@@ -1261,7 +1384,7 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
         },
     );
 
-    let mut produced = run_task_cycle(&app, spec_id, &name, &goal, supervised, hue).await;
+    let mut produced = run_task_cycle(&app, spec_id, &name, &goal, supervised, hue, target).await;
     // PERSIST: the agent does not die after finishing a task. It stays alive —
     // the box stays open, the screen keeps streaming, the cursor stays put — and
     // it re-runs its task periodically. It only shuts down when the user stops it.
@@ -1272,8 +1395,9 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
             break;
         }
         let paused = is_paused(spec_id);
-        // Keep the box alive: stream the agent's browser (not the user's screen).
-        if let Ok((b64, lw, lh)) = capture_browser(&app, spec_id).await {
+        // Keep the box alive: stream what the agent sees (sandbox browser, or the
+        // real screen) so the user can watch its progress in the floating box.
+        if let Ok((b64, lw, lh)) = capture_for(&app, spec_id, target).await {
             let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64, img_w: lw, img_h: lh });
         }
         emit_status(
@@ -1311,7 +1435,7 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
             if stop_requested(spec_id) {
                 break;
             }
-            produced += run_task_cycle(&app, spec_id, &name, &goal, supervised, hue).await;
+            produced += run_task_cycle(&app, spec_id, &name, &goal, supervised, hue, target).await;
         }
     }
 
@@ -1494,23 +1618,27 @@ async fn resolve_browser_start_url(
     if let Some(existing) = get_start_url(spec_id) {
         return Ok(existing);
     }
+    // An explicit destination pinned in the spec wins — some agents WRITE into a
+    // specific tool (e.g. "take notes in Notion"), so their site is the task's
+    // destination, not the most-used site from the Rewind. Generated agents store
+    // their Rewind-derived site here too, so this stays dynamic for them.
+    if let Some(url) = spec_target_url(spec_json) {
+        return Ok(url);
+    }
     if let Ok(grounding) = crate::cascade_agents::fetch_rewind_grounding(app, 24, task, 300).await {
         if !grounding.primary_url.trim().is_empty() {
             return Ok(grounding.primary_url);
         }
     }
-    if let Some(url) = spec_target_url(spec_json) {
-        return Ok(url);
-    }
-    Err("No observed start URL was recovered from the Rewind or the generated spec".to_string())
+    Err("No observed start URL was recovered from the spec or the Rewind".to_string())
 }
 
-fn spawn_agent(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool) {
+fn spawn_agent(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool, target: RunTarget) {
     if !try_begin(spec_id) {
         return; // already running
     }
     tauri::async_runtime::spawn(async move {
-        run_loop(app, spec_id, name, goal, supervised).await;
+        run_loop(app, spec_id, name, goal, supervised, target).await;
     });
 }
 
@@ -1523,7 +1651,9 @@ pub async fn cascade_start_computer_task(
     app: tauri::AppHandle,
     spec_id: i64,
     goal: Option<String>,
+    target: Option<String>,
 ) -> Result<(), String> {
+    let target = RunTarget::from_opt(target.as_deref());
     let pool = db_pool(&app).await?;
     let spec = get_agent_spec(&pool, spec_id)
         .await
@@ -1532,8 +1662,10 @@ pub async fn cascade_start_computer_task(
     if spec.status != "deployed" {
         return Err("agent must be installed/deployed before it can act".to_string());
     }
-    if !spec_uses_browser(&spec.spec_json) {
-        return Err("This agent is not a browser-grounded workflow. Use the normal run path instead.".to_string());
+    // The sandbox is web-only, so it requires a browser-grounded workflow. The
+    // real-screen target can drive ANY app, so it accepts any deployed agent.
+    if target == RunTarget::Sandbox && !spec_uses_browser(&spec.spec_json) {
+        return Err("This agent isn't a browser workflow, so it can't run in the Local Sandbox. Switch to \"On your screen\" in Settings to run it.".to_string());
     }
     // Browser computer-use is NOT per-click supervised: every click/type/navigate
     // counts as "committing", so per-step approval would block the agent on its
@@ -1555,36 +1687,54 @@ pub async fn cascade_start_computer_task(
     }
     // Where should the agent work? Resolve the site DYNAMICALLY from the Rewind —
     // wherever the employee actually does this kind of work — never a hardcoded
-    // app. Open the agent's browser there and pop that site's sign-in (first time).
-    let start_url = resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await?;
-    set_start_url(spec_id, start_url.clone());
-    eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} url={start_url}", spec.name);
+    // app. The sandbox REQUIRES this site (it opens the agent's browser there and
+    // pops its sign-in). On the real screen it's just a helpful starting point, so
+    // it's optional — the agent can also work with whatever's already on screen.
+    match target {
+        RunTarget::Sandbox => {
+            let start_url = resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await?;
+            set_start_url(spec_id, start_url.clone());
+            eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} url={start_url} target=sandbox", spec.name);
+        }
+        RunTarget::Screen => {
+            if let Ok(start_url) = resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await {
+                set_start_url(spec_id, start_url.clone());
+                eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} url={start_url} target=screen", spec.name);
+            } else {
+                eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} (no start URL) target=screen", spec.name);
+            }
+        }
+    }
     // Sign-in (if needed) now happens inside the agent's run_loop — serialized
     // and per-host — so it can't release a different agent's login.
-    spawn_agent(app, spec_id, spec.name, g, supervised);
+    spawn_agent(app, spec_id, spec.name, g, supervised, target);
     Ok(())
 }
 
 /// Start EVERY installed (deployed) agent at once — one cursor per agent.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_start_all_computer_tasks(app: tauri::AppHandle) -> Result<u32, String> {
+pub async fn cascade_start_all_computer_tasks(app: tauri::AppHandle, target: Option<String>) -> Result<u32, String> {
+    let target = RunTarget::from_opt(target.as_deref());
     let pool = db_pool(&app).await?;
     let specs = list_deployed_specs(&pool).await.map_err(|e| format!("list deployed: {e}"))?;
     let mut started = 0u32;
     for spec in specs {
-        if !spec_uses_browser(&spec.spec_json) {
+        // The sandbox is web-only; the real screen can drive any app.
+        if target == RunTarget::Sandbox && !spec_uses_browser(&spec.spec_json) {
             continue;
         }
         let task = derive_goal(&spec.spec_json);
-        let Ok(url) = resolve_browser_start_url(&app, spec.id, &task, &spec.spec_json).await else {
-            continue;
-        };
-        set_start_url(spec.id, url.clone());
+        match resolve_browser_start_url(&app, spec.id, &task, &spec.spec_json).await {
+            Ok(url) => set_start_url(spec.id, url),
+            // Sandbox needs a site; the real screen can proceed without one.
+            Err(_) if target == RunTarget::Sandbox => continue,
+            Err(_) => {}
+        }
         // Login happens inside each agent's run_loop, serialized + per-host — so
         // starting many agents here can't cross-release their sign-ins.
         // Browser computer-use is not per-click supervised (see cascade_start_computer_task).
-        spawn_agent(app.clone(), spec.id, spec.name.clone(), task, false);
+        spawn_agent(app.clone(), spec.id, spec.name.clone(), task, false, target);
         started += 1;
     }
     Ok(started)

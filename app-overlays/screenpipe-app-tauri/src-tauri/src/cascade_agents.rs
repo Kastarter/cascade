@@ -2184,6 +2184,85 @@ pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAge
     spec_view(record)
 }
 
+/// Seed the day-recap-into-Notion agent the way the product is meant to work:
+/// hand the task to the Waste Detector (#2) as a signal, then let the real Agent
+/// Generator (#3) build the spec from it. We do NOT hand-write or deploy the spec
+/// — the agent that lands in Review was genuinely CREATED by the pipeline, which
+/// is the whole point of this button (it validates that agent creation works).
+/// From Review it flows through sandbox → approval → deploy → run like any other
+/// cascade. (Notion is a web app, so it runs in the Local Sandbox by default;
+/// flip Settings → "On your screen" to drive the real Notion.)
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_seed_notion_notes_agent(
+    app: tauri::AppHandle,
+) -> Result<CascadeAgentSpecView, String> {
+    let pool = cascade_pool(&app).await?;
+
+    // 1. Give the info to the Waste Detector (#2): record a detection run and a
+    //    suggestion describing the task, exactly as if the detector had surfaced
+    //    it from the Rewind. This is the pipeline's real entry point — everything
+    //    after here is the standard workflow, nothing hand-built.
+    let now = Utc::now().to_rfc3339();
+    let run_id = create_detection_run(
+        &pool,
+        "notion-day-recap-seed",
+        &now,
+        &now,
+        "{\"seed\":\"notion-day-recap\"}",
+    )
+    .await
+    .map_err(|e| format!("seed detection run: {e}"))?;
+    let evidence = serde_json::to_string(&vec![
+        CascadeManagerEvidence {
+            label: "what they do".to_string(),
+            value: "Reviews the day's work in the Rewind and writes the recap by hand".to_string(),
+        },
+        CascadeManagerEvidence {
+            label: "where the recap should land".to_string(),
+            value: "Notion (notion.so)".to_string(),
+        },
+    ])
+    .unwrap_or_else(|_| "[]".to_string());
+    let suggestion_id = insert_manager_suggestion(
+        &pool,
+        run_id,
+        &ManagerSuggestionInput {
+            kind: slugify_kind("day-recap-notes-in-notion"),
+            title: "Day-recap notes in Notion".to_string(),
+            summary:
+                "Look at what the employee did today (from the Rewind) and write it up as a dated \
+day-recap note in Notion, so they don't have to stop and write it themselves."
+                    .to_string(),
+            evidence_json: evidence,
+            suggested_agent_kind: "notes-recap".to_string(),
+            severity_score: 0.55,
+            confidence: 0.85,
+        },
+    )
+    .await
+    .map_err(|e| format!("seed suggestion: {e}"))?;
+
+    // 2. Let the agent handle it from there: run the REAL Generator (#3, Opus) on
+    //    that suggestion. It produces the spec (status `generated` → Review stage).
+    //    We DON'T deploy — it runs through review → sandbox → approval → deploy →
+    //    run on its own, so the full agent-creation workflow is exercised.
+    let spec = cascade_generate_agent_spec(app.clone(), suggestion_id).await?;
+
+    let _ = update_manager_suggestion_status(&pool, suggestion_id, "sent").await;
+    let _ = append_audit(
+        &pool,
+        Some(spec.id),
+        None,
+        "system",
+        "seeded_via_detector",
+        "{\"seed\":\"notion-day-recap\"}",
+    )
+    .await;
+
+    Ok(spec)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn cascade_list_agent_specs(
@@ -2941,375 +3020,6 @@ fn is_browser_execution(doc: &AgentSpecDoc) -> bool {
             .any(|step| step.tool.as_deref() == Some("browser.use"))
 }
 
-/// Run one execution of a deployed agent. Performs real work; returns the run +
-/// its actions. Called by the "Run now" command and the autonomous scheduler.
-async fn run_agent_internal(
-    app: &tauri::AppHandle,
-    spec: &cascade_schema::AgentSpecRecord,
-    trigger: &str,
-) -> Result<CascadeRunResult, String> {
-    if spec.status != "deployed" {
-        return Err(format!("agent is not deployed (status: {})", spec.status));
-    }
-    let doc: AgentSpecDoc =
-        serde_json::from_str(&spec.spec_json).map_err(|e| format!("parse spec: {e}"))?;
-    if is_browser_execution(&doc) {
-        return Err(
-            "This agent works in the observed website/tool. Start it with `Start & watch` so it can use the browser runtime."
-                .to_string(),
-        );
-    }
-
-    let pool = cascade_pool(app).await?;
-    let supervised = should_supervise_live_run(app, spec.id).await.unwrap_or(false);
-
-    // Show the Cascade floating box so the employee can watch this background run.
-    #[cfg(target_os = "macos")]
-    crate::cascade_computer::box_begin(app, spec.id, &doc.name, &doc.task_description);
-
-    // The agent's real input: the Rewind — what the employee actually did on
-    // screen over the last 24h (window titles + OCR), sensitive apps dropped.
-    let (rewind, _frames, _excluded) =
-        fetch_rewind_digest(app, 24, 500).await.unwrap_or_default();
-
-    // Build a staged run record first so actions can reference it.
-    let run_id = insert_agent_run(
-        &pool,
-        &AgentRunInput {
-            spec_id: spec.id,
-            mode: "live".to_string(),
-            status: "running".to_string(),
-            summary: format!("{trigger} run starting"),
-            steps_json: "[]".to_string(),
-            anomalies_json: "[]".to_string(),
-            cost_usd: 0.0,
-            duration_ms: 0,
-        },
-    )
-    .await
-    .map_err(|e| format!("create run: {e}"))?;
-
-    let mut context = String::new();
-    let mut total_cost = 0.0f64;
-    let mut produced = 0i64;
-    let mut pending = 0i64;
-    let mut action_ids: Vec<i64> = Vec::new();
-    // The real local date, so the model never invents one in the deliverable.
-    let today = chrono::Local::now().format("%A, %Y-%m-%d").to_string();
-    // Where this agent's recap should land, resolved from the employee's activity.
-    let target = resolve_delivery_target(app).await;
-    // The document deliverable, for the box's result snapshot.
-    // (app_label, title, content, open_ref)
-    let mut snapshot: Option<(String, String, String, Option<String>)> = None;
-
-    for step in doc.workflow.iter().take(MAX_RUNTIME_STEPS) {
-        let tool = step.tool.clone().unwrap_or_else(|| "analyze.patterns".to_string());
-        if !TOOL_WHITELIST.contains(&tool.as_str()) {
-            continue; // validation should prevent this; skip defensively
-        }
-
-        // Produce this step's content.
-        let content = if tool == "read.activity" {
-            if rewind.is_empty() { "(nothing recorded in the Rewind yet)".to_string() } else { rewind.clone() }
-        } else {
-            let call = LlmCall {
-                model: MODEL_SONNET,
-                system: runtime_step_system_prompt(&doc.name, &doc.task_description, &today),
-                user: runtime_step_user_prompt(step, &rewind, &context),
-                temperature: 0.3,
-                max_tokens: 1200,
-            };
-            match call_anthropic(&call).await {
-                Ok(res) => {
-                    total_cost += res.cost_usd;
-                    res.text.trim().to_string()
-                }
-                Err(e) => {
-                    // Record the failure as an action and stop.
-                    let id = insert_agent_action(
-                        &pool,
-                        &AgentActionInput {
-                            run_id,
-                            spec_id: spec.id,
-                            step: step.step,
-                            tool: tool.clone(),
-                            summary: format!("step failed: {e}"),
-                            content: None,
-                            artifact_path: None,
-                            reversible: false,
-                            mutating: false,
-                            state: "failed".to_string(),
-                        },
-                    )
-                    .await
-                    .map_err(|e| format!("record failed action: {e}"))?;
-                    action_ids.push(id);
-                    break;
-                }
-            }
-        };
-
-        let mutating = is_mutating_tool(&tool);
-        let reversible = matches!(
-            tool.as_str(),
-            "artifact.write" | "draft.message" | "task.create" | "reminder.set"
-        );
-
-        // Supervision: on the first 3 runs, stage committing steps for approval.
-        let (state, artifact_path) = if mutating && supervised {
-            pending += 1;
-            // Pre-compute the path the artifact WILL occupy on approval.
-            let dir = agent_outputs_dir(app, spec.id)?;
-            let ext = if tool == "draft.message" { "txt" } else { "md" };
-            let path = dir
-                .join(format!("run{run_id}-step{}-{}.{ext}", step.step, slug(&tool)))
-                .display()
-                .to_string();
-            ("pending".to_string(), Some(path))
-        } else {
-            let delivered = commit_side_effect(
-                app, spec.id, run_id, step.step, &tool, &doc.name, &content, target,
-            )?;
-            if mutating {
-                produced += 1;
-            }
-            // The recap document is what the box shows as its result snapshot.
-            if tool == "artifact.write" {
-                snapshot = Some((
-                    delivered.app_label.clone(),
-                    first_line_title(&content),
-                    content.clone(),
-                    delivered.open_ref.clone(),
-                ));
-            }
-            ("committed".to_string(), delivered.path)
-        };
-
-        let summary_line = match tool.as_str() {
-            "read.activity" => "Read recent activity".to_string(),
-            "analyze.patterns" => "Analyzed the activity".to_string(),
-            "summarize.text" => "Drafted a summary".to_string(),
-            "browser.use" => "Worked inside the observed website".to_string(),
-            "artifact.write" => "Wrote a deliverable document".to_string(),
-            "draft.message" => "Drafted a message for review".to_string(),
-            "task.create" => "Created a task".to_string(),
-            "reminder.set" => "Set a reminder".to_string(),
-            "notify.local" => "Notified the employee".to_string(),
-            other => format!("Ran {other}"),
-        };
-
-        let id = insert_agent_action(
-            &pool,
-            &AgentActionInput {
-                run_id,
-                spec_id: spec.id,
-                step: step.step,
-                tool: tool.clone(),
-                summary: if state == "pending" {
-                    format!("{summary_line} (awaiting your approval)")
-                } else {
-                    summary_line.clone()
-                },
-                content: Some(content.chars().take(8000).collect()),
-                artifact_path,
-                reversible,
-                mutating,
-                state: state.clone(),
-            },
-        )
-        .await
-        .map_err(|e| format!("record action: {e}"))?;
-        action_ids.push(id);
-
-        #[cfg(target_os = "macos")]
-        {
-            let box_narr = if state == "pending" {
-                format!("{summary_line} (needs your approval in Cascades)")
-            } else {
-                summary_line.clone()
-            };
-            crate::cascade_computer::box_step(app, spec.id, &doc.name, &doc.task_description, &box_narr, step.step);
-        }
-
-        context.push_str(&format!("\n[step {} · {}] {}\n", step.step, tool, content.chars().take(600).collect::<String>()));
-    }
-
-    // Reload the actions we just wrote, for anomaly detection + the return view.
-    let all = list_actions_for_spec(&pool, spec.id, 200)
-        .await
-        .map_err(|e| format!("reload actions: {e}"))?;
-    let actions: Vec<CascadeAgentAction> = all
-        .into_iter()
-        .filter(|a| action_ids.contains(&a.id))
-        .map(|a| CascadeAgentAction {
-            id: a.id,
-            run_id: a.run_id,
-            spec_id: a.spec_id,
-            step: a.step,
-            tool: a.tool,
-            summary: a.summary,
-            content: a.content,
-            artifact_path: a.artifact_path,
-            reversible: a.reversible,
-            mutating: a.mutating,
-            state: a.state,
-            created_at: a.created_at,
-        })
-        .collect();
-
-    // Runtime anomaly check: did the agent step outside its declared tools?
-    let mut anomalies: Vec<Anomaly> = Vec::new();
-    for a in &actions {
-        let declared = doc.tools.iter().any(|t| t == &a.tool)
-            || matches!(a.tool.as_str(), "read.activity" | "analyze.patterns");
-        if !declared {
-            anomalies.push(Anomaly {
-                kind: "scope_creep".to_string(),
-                detail: format!("used undeclared capability '{}'", a.tool),
-            });
-        }
-        if a.state == "failed" {
-            anomalies.push(Anomaly {
-                kind: "step_failure".to_string(),
-                detail: a.summary.clone(),
-            });
-        }
-    }
-
-    let status = if !anomalies.is_empty() {
-        "flagged"
-    } else if pending > 0 {
-        "awaiting_approval"
-    } else {
-        "success"
-    };
-
-    let run_summary = format!(
-        "{trigger} run · {} step(s), {produced} deliverable(s){}{}",
-        actions.len(),
-        if pending > 0 { format!(", {pending} awaiting approval") } else { String::new() },
-        if !anomalies.is_empty() { format!(", {} anomaly flagged", anomalies.len()) } else { String::new() },
-    );
-
-    // Snapshot the REAL produced deliverable into the box: prefer the recap
-    // document (delivered into Apple Notes), else the last action with usable
-    // content (a summary/draft). Read-activity JSON dumps are skipped.
-    #[cfg(target_os = "macos")]
-    {
-        if let Some((app_label, title, content, open_ref)) = &snapshot {
-            crate::cascade_computer::box_result(
-                app,
-                spec.id,
-                &doc.name,
-                app_label,
-                title,
-                content,
-                open_ref.as_deref(),
-            );
-        } else if let Some(a) = actions.iter().rev().find(|a| {
-            matches!(
-                a.tool.as_str(),
-                "summarize.text" | "draft.message" | "task.create" | "reminder.set"
-            ) && a.content.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false)
-        }) {
-            let open = a.artifact_path.as_ref().map(|p| format!("path:{p}"));
-            crate::cascade_computer::box_result(
-                app,
-                spec.id,
-                &doc.name,
-                "File",
-                deliverable_title(&a.tool),
-                a.content.as_deref().unwrap_or(""),
-                open.as_deref(),
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    crate::cascade_computer::box_end(app, spec.id, &doc.name, &doc.task_description, &run_summary);
-
-    // Finalize the run row.
-    let steps_json = serde_json::to_string(
-        &actions
-            .iter()
-            .map(|a| SandboxStep {
-                step: a.step,
-                tool: a.tool.clone(),
-                action: a.summary.clone(),
-                mocked_result: a.state.clone(),
-            })
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| "[]".to_string());
-    let _ = update_agent_run_final(&pool, run_id, status, &run_summary, &steps_json, &serde_json::to_string(&anomalies).unwrap_or_default(), total_cost).await;
-
-    // A misbehaving run auto-pauses the agent (the monitor watching the agent).
-    if !anomalies.is_empty() {
-        let _ = update_agent_spec_status(&pool, spec.id, "paused", None, None).await;
-        fire_notification(
-            &format!("Cascade paused {}", doc.name),
-            "An anomaly was detected during a run. The agent is paused for your review.",
-        );
-        let _ = append_audit(
-            &pool,
-            Some(spec.id),
-            Some(run_id),
-            "system",
-            "auto_paused",
-            &serde_json::json!({ "anomalies": anomalies.len() }).to_string(),
-        )
-        .await;
-    }
-
-    let _ = append_audit(
-        &pool,
-        Some(spec.id),
-        Some(run_id),
-        "system",
-        "agent_run",
-        &serde_json::json!({ "trigger": trigger, "status": status, "produced": produced, "pending": pending, "costUsd": total_cost }).to_string(),
-    )
-    .await;
-
-    Ok(CascadeRunResult {
-        run_id,
-        spec_id: spec.id,
-        status: status.to_string(),
-        summary: run_summary,
-        supervised,
-        pending_count: pending,
-        cost_usd: total_cost,
-        anomalies,
-        actions,
-    })
-}
-
-/// Small helper to finalize a run row (no general-purpose update exists in the
-/// schema crate; we only ever rewrite these fields once, at run end).
-async fn update_agent_run_final(
-    pool: &cascade_schema::sqlx::sqlite::SqlitePool,
-    run_id: i64,
-    status: &str,
-    summary: &str,
-    steps_json: &str,
-    anomalies_json: &str,
-    cost_usd: f64,
-) -> Result<(), String> {
-    use cascade_schema::sqlx;
-    sqlx::query(
-        "UPDATE cascade_agent_runs SET status=?2, summary=?3, steps_json=?4, anomalies_json=?5, cost_usd=?6 WHERE id=?1",
-    )
-    .bind(run_id)
-    .bind(status)
-    .bind(summary)
-    .bind(steps_json)
-    .bind(anomalies_json)
-    .bind(cost_usd)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("finalize run: {e}"))?;
-    Ok(())
-}
 
 fn action_view(a: cascade_schema::AgentActionRecord) -> CascadeAgentAction {
     CascadeAgentAction {
@@ -3328,36 +3038,6 @@ fn action_view(a: cascade_schema::AgentActionRecord) -> CascadeAgentAction {
     }
 }
 
-/// "Run now" — execute a deployed agent on demand.
-#[tauri::command]
-#[specta::specta]
-pub async fn cascade_run_agent(
-    app: tauri::AppHandle,
-    spec_id: i64,
-) -> Result<CascadeRunResult, String> {
-    let pool = cascade_pool(&app).await?;
-    let spec = get_agent_spec(&pool, spec_id)
-        .await
-        .map_err(|e| format!("load spec: {e}"))?
-        .ok_or_else(|| format!("spec {spec_id} not found"))?;
-    run_agent_internal(&app, &spec, "manual").await
-}
-
-/// Run ONE headless execution of a deployed agent by id. Used by the persistent
-/// "Start & watch" loop in `cascade_computer` — the work + box narration all
-/// happen inside `run_agent_internal`.
-pub(crate) async fn run_agent_once(
-    app: &tauri::AppHandle,
-    spec_id: i64,
-    trigger: &str,
-) -> Result<CascadeRunResult, String> {
-    let pool = cascade_pool(app).await?;
-    let spec = get_agent_spec(&pool, spec_id)
-        .await
-        .map_err(|e| format!("load spec: {e}"))?
-        .ok_or_else(|| format!("spec {spec_id} not found"))?;
-    run_agent_internal(app, &spec, trigger).await
-}
 
 #[tauri::command]
 #[specta::specta]
@@ -3481,57 +3161,6 @@ pub async fn cascade_rollback_action(
     Ok(())
 }
 
-/// Autonomous scheduler tick — run every deployed agent whose cadence is due.
-/// Safe to call repeatedly; silently no-ops without an Anthropic key.
-#[tauri::command]
-#[specta::specta]
-pub async fn cascade_tick_due_agents(app: tauri::AppHandle) -> Result<u32, String> {
-    if crate::cascade_llm::read_anthropic_key().is_err() {
-        return Ok(0);
-    }
-    let pool = cascade_pool(&app).await?;
-    let specs = list_deployed_specs(&pool)
-        .await
-        .map_err(|e| format!("list deployed: {e}"))?;
-
-    let now = Utc::now();
-    let mut ran = 0u32;
-    for spec in specs {
-        let doc: AgentSpecDoc = match serde_json::from_str(&spec.spec_json) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if is_browser_execution(&doc) {
-            continue;
-        }
-        let cadence_min = doc.schedule_minutes.max(60);
-        let due = match last_live_run_at(&pool, spec.id).await {
-            Ok(Some(ts)) => {
-                let last = chrono::DateTime::parse_from_rfc3339(&ts)
-                    .map(|t| t.with_timezone(&Utc))
-                    .ok()
-                    .or_else(|| {
-                        // sqlite CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" (UTC)
-                        chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
-                            .ok()
-                            .map(|n| n.and_utc())
-                    });
-                match last {
-                    Some(t) => (now - t).num_minutes() >= cadence_min,
-                    None => true,
-                }
-            }
-            Ok(None) => true,
-            Err(_) => false,
-        };
-        if due {
-            if run_agent_internal(&app, &spec, "scheduled").await.is_ok() {
-                ran += 1;
-            }
-        }
-    }
-    Ok(ran)
-}
 
 #[cfg(test)]
 mod tests {

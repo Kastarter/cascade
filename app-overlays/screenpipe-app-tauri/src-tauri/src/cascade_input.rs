@@ -55,7 +55,18 @@ extern "C" {
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGWarpMouseCursorPosition(new_position: CGPoint) -> c_int;
+    // Variadic in C, but always called here with wheelCount = 1, so a fixed
+    // 4-arg declaration matches the bytes we pass.
+    fn CGEventCreateScrollWheelEvent(
+        source: CGEventSourceRef,
+        units: u32,
+        wheel_count: u32,
+        wheel1: i32,
+    ) -> CGEventRef;
 }
+
+// CGScrollEventUnit
+const SCROLL_UNIT_PIXEL: u32 = 0;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -98,6 +109,19 @@ pub fn click(x: f64, y: f64) {
 pub fn double_click(x: f64, y: f64) {
     click(x, y);
     click(x, y);
+}
+
+/// Scroll via a synthesized scroll-wheel event. `dy` follows the agent's
+/// convention: positive = down, negative = up (in pixels). CoreGraphics treats a
+/// positive wheel value as scroll-up, so we negate.
+pub fn scroll(dy: f64) {
+    unsafe {
+        let ev = CGEventCreateScrollWheelEvent(std::ptr::null(), SCROLL_UNIT_PIXEL, 1, -(dy as i32));
+        if !ev.is_null() {
+            CGEventPost(HID_EVENT_TAP, ev);
+            CFRelease(ev);
+        }
+    }
 }
 
 /// Type a unicode string into the focused element via synthesized key events.

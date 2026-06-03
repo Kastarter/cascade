@@ -14,12 +14,26 @@ import {
   CASCADE_DEFAULT_PROVIDER,
   CASCADE_ADVANCED_MODEL,
   CASCADE_PRIVACY_PROMISE,
+  CascadeRunMode,
+  getRunMode,
+  setRunMode,
 } from "@/lib/cascade-defaults";
 
 export default function SettingsPage() {
   const [hasKey, setHasKey] = useState<boolean | null>(null);
   const [byokOpen, setByokOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [runMode, setRunModeState] = useState<CascadeRunMode>("sandbox");
+
+  // localStorage is only available in the browser — read it after mount.
+  useEffect(() => {
+    setRunModeState(getRunMode());
+  }, []);
+
+  const chooseRunMode = (mode: CascadeRunMode) => {
+    setRunMode(mode);
+    setRunModeState(mode);
+  };
 
   const refreshKey = useCallback(async () => {
     try {
@@ -112,10 +126,23 @@ export default function SettingsPage() {
           </a>
         </Section>
 
-        {/* How agents work */}
+        {/* How agents run — on screen vs background */}
         <Section
-          title="How your agents work"
-          sub="An agent works in its OWN sandbox browser — never your screen. The first time you start an agent that needs a tool (e.g. Notion), Cascade pops that tool's sign-in for you; sign in once, close it, and the agent gets to work. The session is remembered for future runs."
+          title="How agents run"
+          sub="Pick how every agent works. You can change this anytime — it applies to all your agents."
+        >
+          <RunModeToggle value={runMode} onChange={chooseRunMode} />
+          <p style={{ fontSize: 12.5, color: "var(--cascade-text-3)", lineHeight: 1.55, margin: "14px 0 0" }}>
+            {runMode === "screen"
+              ? "On your screen — the agent uses your real screen and cursor, so it can operate any app (websites, Obsidian, Apple Notes…). Needs macOS Accessibility permission, and you'll see your cursor move while it works."
+              : "In the background — the agent works inside the Local Sandbox shown in the floating box. Web apps only, and you can keep using your computer while it runs."}
+          </p>
+        </Section>
+
+        {/* Logins */}
+        <Section
+          title="Logins"
+          sub="The first time you start an agent that needs a tool (e.g. Notion), Cascade pops that tool's sign-in for you; sign in once, close it, and the agent gets to work. The session is remembered for future runs."
         >
           <p style={{ fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.55, margin: 0 }}>
             You never have to set up logins ahead of time — they're requested in context, only when an agent
@@ -167,6 +194,58 @@ function Section({ title, sub, children }: { title: string; sub: string; childre
       {sub && <div style={{ fontSize: 13, color: "var(--cascade-text-3)", lineHeight: 1.5, marginBottom: 16, maxWidth: 620 }}>{sub}</div>}
       {children}
     </section>
+  );
+}
+
+function RunModeToggle({
+  value,
+  onChange,
+}: {
+  value: CascadeRunMode;
+  onChange: (m: CascadeRunMode) => void;
+}) {
+  const options: { id: CascadeRunMode; title: string; hint: string }[] = [
+    { id: "sandbox", title: "In the background", hint: "Local Sandbox (floating box) · web apps · keep working" },
+    { id: "screen", title: "On your screen", hint: "Uses your real screen · any app" },
+  ];
+  return (
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+      {options.map((o) => {
+        const active = value === o.id;
+        return (
+          <button
+            key={o.id}
+            onClick={() => onChange(o.id)}
+            style={{
+              flex: "1 1 240px",
+              textAlign: "left",
+              padding: "14px 16px",
+              borderRadius: 10,
+              cursor: "pointer",
+              background: active ? "var(--cascade-accent)" : "var(--cascade-bg)",
+              color: active ? "var(--cascade-on-accent)" : "var(--cascade-text-2)",
+              border: `1px solid ${active ? "var(--cascade-accent)" : "var(--cascade-border)"}`,
+              fontFamily: "var(--cascade-sans)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, fontWeight: 600 }}>
+              <span
+                style={{
+                  width: 14,
+                  height: 14,
+                  borderRadius: "50%",
+                  border: `2px solid ${active ? "var(--cascade-on-accent)" : "var(--cascade-text-4)"}`,
+                  background: active ? "var(--cascade-on-accent)" : "transparent",
+                  flexShrink: 0,
+                }}
+              />
+              {o.title}
+            </div>
+            <div style={{ fontSize: 12, marginTop: 5, marginLeft: 22, opacity: active ? 0.85 : 0.7 }}>{o.hint}</div>
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

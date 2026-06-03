@@ -18,6 +18,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
 import {
+  CascadeRunMode,
+  getRunMode,
+  CASCADE_RUN_MODE_EVENT,
+  CASCADE_RUN_MODE_KEY,
+} from "@/lib/cascade-defaults";
+import {
   CascadeAgentAction,
   CascadeAgentRun,
   CascadeAgentSpecView,
@@ -29,9 +35,9 @@ import {
   listAudit,
   rejectAction,
   rollbackAction,
-  runAgent,
   sandboxTest,
   seedDemoAgent,
+  seedNotionNotesAgent,
   startAllComputerTasks,
   startComputerTask,
   stopComputerTask,
@@ -58,6 +64,23 @@ export function CascadesView() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // Global "on screen vs Local Sandbox" preference, set in Settings.
+  const [runMode, setRunMode] = useState<CascadeRunMode>("sandbox");
+
+  useEffect(() => {
+    setRunMode(getRunMode());
+    const onChange = () => setRunMode(getRunMode());
+    // Same-document (custom event) + cross-window (native storage event).
+    window.addEventListener(CASCADE_RUN_MODE_EVENT, onChange);
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === CASCADE_RUN_MODE_KEY) onChange();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(CASCADE_RUN_MODE_EVENT, onChange);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -90,10 +113,8 @@ export function CascadesView() {
     }
     return map;
   }, [specs]);
-  const browserRunningCount = useMemo(
-    () => buckets.running.filter((s) => s.spec.executionMode === "browser").length,
-    [buckets.running],
-  );
+  // How many installed agents can be started in one go (any mode).
+  const watchableRunningCount = useMemo(() => buckets.running.length, [buckets.running]);
 
   const run = useCallback(
     async (id: number, fn: () => Promise<unknown>, ok: string) => {
@@ -149,30 +170,22 @@ export function CascadesView() {
       await stopComputerTask(s.id).catch(() => {});
       await transitionAgentSpec(s.id, "reject");
     }, `Uninstalled “${s.name}”`);
-  const [lastRunSummary, setLastRunSummary] = useState<Record<number, string>>({});
-  const onRunNow = (s: CascadeAgentSpecView) =>
-    run(
-      s.id,
-      async () => {
-        const r = await runAgent(s.id);
-        setLastRunSummary((m) => ({ ...m, [s.id]: r.summary }));
-      },
-      `${s.name} ran — see the work below`,
-    );
   const onWatch = (s: CascadeAgentSpecView) =>
     run(
       s.id,
-      () => startComputerTask(s.id),
-      `${s.name} is working — watch the steps in the floating box`,
+      () => startComputerTask(s.id, undefined, runMode),
+      runMode === "screen"
+        ? `${s.name} is working on your screen — follow along in the floating box`
+        : `${s.name} is working in the sandbox — watch the steps in the floating box`,
     );
   const onWatchAll = async () => {
     setError(null);
     try {
-      const n = await startAllComputerTasks();
+      const n = await startAllComputerTasks(runMode);
       setNote(
         n === 0
-          ? "No browser-grounded installed agents are ready to watch yet."
-          : `${n} agent${n === 1 ? "" : "s"} now working — watch each one in the floating box.`,
+          ? "No installed agents are ready to start yet."
+          : `${n} agent${n === 1 ? "" : "s"} now working — follow each one in the floating box.`,
       );
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -190,6 +203,23 @@ export function CascadesView() {
       setError(String(e?.message ?? e));
     } finally {
       setSeeding(false);
+    }
+  };
+  const [seedingNotion, setSeedingNotion] = useState(false);
+  const onSeedNotion = async () => {
+    setSeedingNotion(true);
+    setError(null);
+    try {
+      const s = await seedNotionNotesAgent();
+      await refresh();
+      setNote(
+        `Handed the day-recap → Notion task to the detector — the pipeline generated “${s.name}”. ` +
+          `It's in Review now: open it, run the sandbox test, approve it, then Start.`,
+      );
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setSeedingNotion(false);
     }
   };
 
@@ -228,12 +258,15 @@ export function CascadesView() {
             You see the full spec — every tool it can touch, every step, and how to undo it — before anything runs.
             It only runs for real after a sandbox test passes and you approve it. Pause or uninstall anytime.
           </p>
-          <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <PrimaryBtn disabled={seeding} onClick={onSeedDemo}>
               {seeding ? "Generating via the workflow…" : "+ Generate a demo agent"}
             </PrimaryBtn>
+            <GhostBtn disabled={seedingNotion} onClick={onSeedNotion}>
+              {seedingNotion ? "Sending to detector…" : "+ Notion day-recap"}
+            </GhostBtn>
             <span style={{ fontSize: 12, color: "var(--cascade-text-4)" }}>
-              Runs the detector on your real activity, generates a real agent (#3), and deploys it — takes a few seconds.
+              Both go detector → real agent (#3). Demo lands deployed; Notion day-recap lands in Review so you can watch it run the whole workflow.
             </span>
           </div>
         </div>
@@ -290,40 +323,41 @@ export function CascadesView() {
               }
             />
 
-            {browserRunningCount > 1 && (
+            {watchableRunningCount > 1 && (
               <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -18 }}>
                 <PrimaryBtn onClick={onWatchAll}>
-                  ▶ Watch all {browserRunningCount} browser agents work
+                  ▶ Start all {watchableRunningCount} agents{runMode === "screen" ? " on your screen" : " in the sandbox"}
                 </PrimaryBtn>
               </div>
             )}
 
             <StageSection
               title="3 · Running on this Mac"
-              sub="Active helpers doing real work. Browser-grounded agents open the same observed site when you press Start & watch. Background agents run locally with Run now. The first 3 live runs stage committing outputs for approval. Every action is audit-logged and reversible."
+              sub={
+                runMode === "screen"
+                  ? "Active helpers doing real work. Press Start and the agent uses your real screen and cursor to do the task — it can operate any app. Switch to the Local Sandbox anytime in Settings → How agents run. Every action is audit-logged and reversible."
+                  : "Active helpers doing real work. Press Start and the agent works in the Local Sandbox shown in the floating box (web apps), so you can keep working. Switch to on-screen runs anytime in Settings → How agents run. Every action is audit-logged and reversible."
+              }
               specs={buckets.running}
               busyId={busyId}
-              lastRunSummary={lastRunSummary}
               showRuntime
               renderActions={(s) => (
                 <>
-                  {s.spec.executionMode === "browser" ? (
-                    <PrimaryBtn
-                      disabled={busyId === s.id}
-                      onClick={() => onWatch(s)}
-                      title="Start the agent in the observed website and watch the steps in the floating box"
-                    >
-                      {busyId === s.id ? "Starting…" : "▶ Start & watch"}
-                    </PrimaryBtn>
-                  ) : (
-                    <PrimaryBtn
-                      disabled={busyId === s.id}
-                      onClick={() => onRunNow(s)}
-                      title="Run this background agent now"
-                    >
-                      {busyId === s.id ? "Running…" : "▶ Run now"}
-                    </PrimaryBtn>
-                  )}
+                  <PrimaryBtn
+                    disabled={busyId === s.id}
+                    onClick={() => onWatch(s)}
+                    title={
+                      runMode === "screen"
+                        ? "Start the agent on your real screen and follow along in the floating box"
+                        : "Start the agent in the Local Sandbox and watch the steps in the floating box"
+                    }
+                  >
+                    {busyId === s.id
+                      ? "Starting…"
+                      : runMode === "screen"
+                        ? "▶ Start on my screen"
+                        : "▶ Start in the box"}
+                  </PrimaryBtn>
                   <GhostBtn disabled={busyId === s.id} onClick={() => onUninstall(s)}>
                     Uninstall
                   </GhostBtn>

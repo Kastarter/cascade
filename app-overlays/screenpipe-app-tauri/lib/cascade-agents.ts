@@ -117,6 +117,14 @@ export async function seedDemoAgent(): Promise<CascadeAgentSpecView> {
   return invoke<CascadeAgentSpecView>("cascade_seed_demo_agent", {});
 }
 
+/**
+ * Seed the "Notion Work Notes" agent (deployed) — it watches what you're doing
+ * (from the Rewind) and writes it up as dated notes in Notion while you work.
+ */
+export async function seedNotionNotesAgent(): Promise<CascadeAgentSpecView> {
+  return invoke<CascadeAgentSpecView>("cascade_seed_notion_notes_agent", {});
+}
+
 // ─── #4 Deployment & Runtime Monitor ────────────────────────────────
 
 export interface SandboxStep {
@@ -211,10 +219,6 @@ export interface CascadeRunResult {
   actions: CascadeAgentAction[];
 }
 
-export async function runAgent(specId: number): Promise<CascadeRunResult> {
-  return invoke<CascadeRunResult>("cascade_run_agent", { specId });
-}
-
 export async function listAgentActions(specId: number, limit = 40): Promise<CascadeAgentAction[]> {
   return invoke<CascadeAgentAction[]>("cascade_list_agent_actions", { specId, limit });
 }
@@ -231,10 +235,6 @@ export async function rollbackAction(actionId: number): Promise<void> {
   return invoke("cascade_rollback_action", { actionId });
 }
 
-export async function tickDueAgents(): Promise<number> {
-  return invoke<number>("cascade_tick_due_agents", {});
-}
-
 // ─── Computer use ("Cascade Hands") ─────────────────────────────────
 
 export interface ComputerAgentStatus {
@@ -242,14 +242,25 @@ export interface ComputerAgentStatus {
   awaitingApproval: boolean;
 }
 
-/** Start ONE deployed agent doing its task on-screen with its own cursor. */
-export async function startComputerTask(specId: number, goal?: string): Promise<void> {
-  return invoke("cascade_start_computer_task", { specId, goal: goal ?? null });
+/**
+ * How an agent does its work — the user's Settings choice, passed straight to
+ * the backend run target. "sandbox" = isolated floating-box browser; "screen" =
+ * the user's real screen.
+ */
+export type CascadeRunTarget = "screen" | "sandbox";
+
+/** Start ONE deployed agent doing its task, in the sandbox or on the real screen. */
+export async function startComputerTask(
+  specId: number,
+  goal?: string,
+  target?: CascadeRunTarget,
+): Promise<void> {
+  return invoke("cascade_start_computer_task", { specId, goal: goal ?? null, target: target ?? null });
 }
 
 /** Start EVERY installed agent at once — one cursor per agent. */
-export async function startAllComputerTasks(): Promise<number> {
-  return invoke<number>("cascade_start_all_computer_tasks", {});
+export async function startAllComputerTasks(target?: CascadeRunTarget): Promise<number> {
+  return invoke<number>("cascade_start_all_computer_tasks", { target: target ?? null });
 }
 
 /** Stop one agent (specId), or all of them (specId = 0). */

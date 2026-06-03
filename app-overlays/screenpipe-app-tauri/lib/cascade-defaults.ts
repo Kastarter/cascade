@@ -43,3 +43,40 @@ export const CASCADE_TAGLINE =
 
 export const CASCADE_PRIVACY_PROMISE =
   "Everything stays on this Mac. Your recordings never leave your machine unless you explicitly share them.";
+
+/**
+ * The ONLY two ways an agent does its work, chosen in Settings and applied to
+ * every agent. The same value is passed straight through to the computer-use
+ * engine as its run target — there is no third execution path.
+ *
+ *  - "sandbox" → the agent works in an isolated browser shown in the floating
+ *                box (the "Local Sandbox"); web apps only, and you keep working
+ *                while it runs. (Default.)
+ *  - "screen"  → the agent uses your REAL screen and cursor, so it can operate
+ *                any app — not just websites.
+ */
+export type CascadeRunMode = "screen" | "sandbox";
+
+export const CASCADE_RUN_MODE_KEY = "cascade-run-mode";
+export const CASCADE_RUN_MODE_DEFAULT: CascadeRunMode = "sandbox";
+
+/** Fired on `window` after the run mode changes (same-document listeners). */
+export const CASCADE_RUN_MODE_EVENT = "cascade-run-mode-changed";
+
+export function getRunMode(): CascadeRunMode {
+  try {
+    const v = window.localStorage.getItem(CASCADE_RUN_MODE_KEY);
+    return v === "screen" || v === "sandbox" ? v : CASCADE_RUN_MODE_DEFAULT;
+  } catch {
+    return CASCADE_RUN_MODE_DEFAULT;
+  }
+}
+
+export function setRunMode(mode: CascadeRunMode): void {
+  try {
+    window.localStorage.setItem(CASCADE_RUN_MODE_KEY, mode);
+    window.dispatchEvent(new CustomEvent(CASCADE_RUN_MODE_EVENT, { detail: mode }));
+  } catch {
+    /* non-fatal */
+  }
+}
