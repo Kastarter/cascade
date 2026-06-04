@@ -269,7 +269,14 @@ fn primary_logical_size(app: &tauri::AppHandle) -> (f64, f64) {
     (1440.0, 900.0)
 }
 
-fn ensure_overlays(app: &tauri::AppHandle) {
+/// Screen mode: show ONLY the click-through agent-cursor overlay on the user's
+/// REAL screen — NO floating box. The agent's own pointer (labeled + colored, one
+/// per agent) flies to where it's about to act so the user can watch it work.
+/// `promote_overlay(.., true)` makes it click-through and `setSharingType:0` keeps
+/// it out of the agent's own screenshots (so it never sees/clicks its own cursor).
+/// Covers the primary display in logical points, matching the screenshot coords
+/// the vision model returns, so the pointer lands exactly where the agent acts.
+fn ensure_cursor_overlay(app: &tauri::AppHandle) {
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         let (w, h) = primary_logical_size(&app2);
@@ -294,30 +301,6 @@ fn ensure_overlays(app: &tauri::AppHandle) {
             {
                 promote_overlay(&win, true);
             }
-        }
-        if app2.get_webview_window(HANDS_WINDOW).is_none() {
-            if let Ok(win) = WebviewWindowBuilder::new(
-                &app2,
-                HANDS_WINDOW,
-                WebviewUrl::App("hands-box".into()),
-            )
-            .title("")
-            .inner_size(500.0, 470.0)
-            .position((w - 520.0).max(20.0), 44.0)
-            .always_on_top(true)
-            .decorations(false)
-            .skip_taskbar(true)
-            .focused(false)
-            .transparent(true)
-            .shadow(false)
-            .resizable(false)
-            .visible(false)
-            .build()
-            {
-                promote_overlay(&win, false);
-            }
-        } else if let Some(win) = app2.get_webview_window(HANDS_WINDOW) {
-            let _ = win.show();
         }
         if let Some(win) = app2.get_webview_window(CURSOR_WINDOW) {
             let _ = win.show();
@@ -1060,7 +1043,11 @@ async fn run_task_cycle(
                 break;
             }
         };
-        let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64.clone(), img_w: lw, img_h: lh });
+        // Sandbox streams its browser into the box; screen mode has no box (the
+        // user watches their real screen directly), so don't ship frames there.
+        if target == RunTarget::Sandbox {
+            let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64.clone(), img_w: lw, img_h: lh });
+        }
         let user = format!(
             "GOAL: {goal}\n\nSteps so far:\n{}\n\nThe screenshot is the current screen ({lw:.0}x{lh:.0} points). Single next action as JSON.",
             if history.is_empty() { "(none yet)" } else { &history }
@@ -1328,10 +1315,14 @@ async fn run_task_cycle(
 async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool, target: RunTarget) {
     let hue = hue_for(spec_id);
     let mut goal = goal;
-    // The box shows the screen + the agent cursor inside it, so we no longer
-    // need the separate fullscreen cursor overlay (it'd also show duplicate
-    // cursors in the captured screenshot).
-    ensure_box_window(&app);
+    // Sandbox → the floating box (streams the isolated browser with the agent
+    // cursor drawn INSIDE it; the user keeps working uninterrupted). Screen →
+    // NO box: a click-through cursor overlay so the agent's OWN pointer moves on
+    // the user's REAL screen, right where it's about to act.
+    match target {
+        RunTarget::Sandbox => ensure_box_window(&app),
+        RunTarget::Screen => ensure_cursor_overlay(&app),
+    }
     // Let the freshly-created overlay webview register its event listeners.
     tokio::time::sleep(Duration::from_millis(850)).await;
 
@@ -1395,10 +1386,13 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
             break;
         }
         let paused = is_paused(spec_id);
-        // Keep the box alive: stream what the agent sees (sandbox browser, or the
-        // real screen) so the user can watch its progress in the floating box.
-        if let Ok((b64, lw, lh)) = capture_for(&app, spec_id, target).await {
-            let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64, img_w: lw, img_h: lh });
+        // Sandbox only: keep the box alive by streaming the agent's browser so the
+        // user can watch progress. Screen mode has no box (and no agent cursor
+        // moves while idle), so skip the wasteful full-screen captures.
+        if target == RunTarget::Sandbox {
+            if let Ok((b64, lw, lh)) = capture_for(&app, spec_id, target).await {
+                let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64, img_w: lw, img_h: lh });
+            }
         }
         emit_status(
             &app,

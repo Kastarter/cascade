@@ -28,13 +28,14 @@ loops that are the best candidates to automate.
 
 ### Agents — automate the loop
 From a surfaced pattern, Cascade can generate an agent that does the work for you.
-Agents run one of two ways:
+The important part is that the work still feels like your work: the agent follows
+the same workflow, in the same tools, and leaves the result where you already work.
+You can watch it in a floating box or let it operate directly on your screen.
 
-- **In the background** — inside a sandboxed browser the agent drives itself, so you
-  keep using your computer while it works (web apps).
+- **Floating box** — watch the agent work step by step in a visible box while it
+  follows the workflow.
 - **On your screen** — the agent uses your real screen and cursor, so it can operate
-  any app, then delivers the result into the tool you actually use (e.g. a note in
-  Obsidian or Apple Notes).
+  the same app you would have used yourself.
 
 ## Privacy & local-first
 

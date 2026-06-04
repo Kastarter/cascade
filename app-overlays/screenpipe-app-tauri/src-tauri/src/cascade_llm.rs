@@ -38,6 +38,10 @@ pub struct LlmResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cost_usd: f64,
+    /// True when the model hit `max_tokens` (stop_reason == "max_tokens"), so the
+    /// text is almost certainly truncated — JSON callers use this to report a
+    /// clear "hit the token limit" error instead of a cryptic parse failure.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +49,8 @@ struct AnthropicResponse {
     content: Vec<AnthropicContentBlock>,
     #[serde(default)]
     usage: AnthropicUsage,
+    #[serde(default)]
+    stop_reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +175,7 @@ pub async fn call_anthropic(call: &LlmCall) -> Result<LlmResult, String> {
         cost_usd: cost_for(call.model, parsed.usage.input_tokens, parsed.usage.output_tokens),
         input_tokens: parsed.usage.input_tokens,
         output_tokens: parsed.usage.output_tokens,
+        truncated: parsed.stop_reason == "max_tokens",
         text,
     })
 }
@@ -243,6 +250,7 @@ pub async fn call_anthropic_vision(
         cost_usd: cost_for(model, parsed.usage.input_tokens, parsed.usage.output_tokens),
         input_tokens: parsed.usage.input_tokens,
         output_tokens: parsed.usage.output_tokens,
+        truncated: parsed.stop_reason == "max_tokens",
         text,
     })
 }
@@ -304,9 +312,28 @@ pub async fn call_anthropic_json<T: DeserializeOwned>(
     call: &LlmCall,
 ) -> Result<(T, LlmResult), String> {
     let result = call_anthropic(call).await?;
-    let json_str = extract_json_str(&result.text)?;
-    let value = serde_json::from_str::<T>(&json_str)
-        .map_err(|e| format!("model JSON did not match expected shape: {e}"))?;
+    // If the reply was cut off at the token limit, the JSON is almost certainly
+    // unclosed. Report THAT (actionable) rather than a cryptic "unbalanced JSON".
+    let json_str = extract_json_str(&result.text).map_err(|e| {
+        if result.truncated {
+            format!(
+                "the model's reply was cut off at the {}-token limit, so its JSON is incomplete — raise max_tokens for this call",
+                call.max_tokens
+            )
+        } else {
+            e
+        }
+    })?;
+    let value = serde_json::from_str::<T>(&json_str).map_err(|e| {
+        if result.truncated {
+            format!(
+                "the model's reply was cut off at the {}-token limit, so its JSON is incomplete — raise max_tokens for this call",
+                call.max_tokens
+            )
+        } else {
+            format!("model JSON did not match expected shape: {e}")
+        }
+    })?;
     Ok((value, result))
 }
 

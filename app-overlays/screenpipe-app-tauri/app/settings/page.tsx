@@ -142,11 +142,11 @@ export default function SettingsPage() {
         {/* Logins */}
         <Section
           title="Logins"
-          sub="The first time you start an agent that needs a tool (e.g. Notion), Cascade pops that tool's sign-in for you; sign in once, close it, and the agent gets to work. The session is remembered for future runs."
+          sub="The first time an agent needs a tool, Cascade opens that tool's sign-in in context. Once you're in, the agent continues in the same product you already use."
         >
           <p style={{ fontSize: 13, color: "var(--cascade-text-2)", lineHeight: 1.55, margin: 0 }}>
-            You never have to set up logins ahead of time — they're requested in context, only when an agent
-            actually needs them, and only for the services that agent uses.
+            You never have to pre-wire a separate automation workspace. Logins are requested only when
+            a cascade actually needs them, and the saved session is reused on future runs.
           </p>
         </Section>
 
@@ -169,7 +169,7 @@ export default function SettingsPage() {
           <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
             <Meta label="Product" value="Cascade" />
             <Meta label="Layer 1" value="Reel · rewind + Q&A" />
-            <Meta label="Layer 2" value="Detector · agents · headless runtime" />
+            <Meta label="Layer 2" value="Detector · manager review · cascaded agents" />
           </div>
         </Section>
       </div>

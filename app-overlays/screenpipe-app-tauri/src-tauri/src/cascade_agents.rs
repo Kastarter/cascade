@@ -2464,7 +2464,10 @@ pub async fn cascade_sandbox_test(
         system: sandbox_system_prompt(),
         user: sandbox_user_prompt(&doc, &rewind, &grounding),
         temperature: 0.0,
-        max_tokens: 1800,
+        // The sandbox sim emits one mocked step (with a result blurb) per workflow
+        // step, so the JSON grows with the spec. 1800 truncated longer specs mid-
+        // object → "unbalanced JSON". Give it room for a full multi-step run.
+        max_tokens: 4000,
     };
     let (out, usage) = call_anthropic_json::<SandboxModelOutput>(&call).await?;
 
