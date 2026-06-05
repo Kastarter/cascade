@@ -1,4 +1,4 @@
-# Cascade — Session Handoff (2026-05-31)
+# Cascade — Session Handoff (2026-06-05)
 
 ## 2026-06-05 update
 
@@ -18,6 +18,124 @@ Pick-up doc for continuing in a fresh session. Cascade = privacy-respecting
 enterprise AI-agent product, soft-forked from screenpipe (`mediar-ai/screenpipe`).
 
 ---
+
+## 2026-06-05 session — sandbox now reuses existing browser sessions
+
+User goal: stop making the employee log in separately inside Cascade's local
+sandbox just so the agent can access the same web app the employee already uses.
+
+### What changed
+
+- Added sandbox session hydration in
+  `app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_computer.rs`.
+- Synced it into the vendored app with `./scripts/overlay.sh`; overlay and vendor
+  copies match.
+- New flow:
+  1. `run_loop` resolves the sandbox start URL from the Rewind as before.
+  2. Before opening the manual login window, it calls `hydrate_sandbox_session`.
+  3. `hydrate_sandbox_session` reads matching cookies from the user's supported
+     real browsers through the existing `owned_browser_cookies::cookies_for_host`
+     path.
+  4. It injects those cookies into the shared WKWebView `WKHTTPCookieStore`.
+  5. If cookie injection succeeds, the host is marked signed-in for this app
+     session and the sandbox starts without the separate local login.
+  6. If no portable cookies exist, injection fails, or the site stores auth in
+     localStorage/IndexedDB/passkeys/WebAuthn, the old visible login fallback
+     still runs.
+
+This does **not** read saved passwords. It only copies already-existing session
+cookies into the local sandbox webview.
+
+### Update (same day) — load-and-verify fallback (closes the step-5 gap)
+
+The step-5 logic above marked the host signed-in after injecting **any** cookie,
+so localStorage/passkey sites and **expired** sessions silently skipped the
+fallback and the agent got stuck logged-out. Now the decision is based on where
+the page actually LANDS, not the cookie count:
+
+1. `hydrate_sandbox_session` injects cookies (best-effort).
+2. The agent browser is opened at the start URL immediately, so it loads WITH
+   those cookies. `ensure_agent_browser` got an `on_page_load` recorder
+   (`AGENT_BROWSER_URL`).
+3. After ~3s, `sandbox_landed_authenticated(spec_id, host)` checks the landed URL:
+   on the target host AND not a login/SSO/MFA URL (`looks_like_auth_url`) → signed
+   in. Otherwise → `ensure_host_login` (visible login), then `reload_agent_browser`
+   to pick up the fresh session.
+
+Verified the auth-detection heuristic in isolation (8 cases pass). Still NOT
+compiled in the full app crate (cidre/Xcode). Known limit: a same-URL SPA login
+(no path/host change) reads as authed — URL-only heuristic.
+
+### Exact files touched this session
+
+- `app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_computer.rs`
+- `vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri/src/cascade_computer.rs`
+  via `./scripts/overlay.sh`
+
+Pre-existing dirty files remain dirty and were not reverted:
+
+- `app-overlays/screenpipe-app-tauri/app/hands-cursor/page.tsx`
+- `app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_agents.rs`
+- `crates/cascade-schema/src/lib.rs`
+- `app-overlays/screenpipe-app-tauri/lib/cursor-flight.ts`
+- `crates/cascade-schema/migrations/0005_daily_summaries.sql`
+- `vendor/screenpipe` submodule dirty state
+
+### Verification
+
+- Ran `./scripts/overlay.sh` successfully.
+- Confirmed overlay and vendor `cascade_computer.rs` match with `cmp`.
+- Ran:
+  `PATH="/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" cargo test -p cascade-schema`
+  Result: **7 passed**.
+- Tried a focused Tauri app compile check:
+  `cargo check --manifest-path vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri/Cargo.toml --bin screenpipe-app`
+  It did **not** reach app-level checking. It failed in native dependency `cidre`
+  because the active developer directory is Command Line Tools, not full Xcode:
+  `xcode-select: error: tool 'xcodebuild' requires Xcode`.
+- `rustfmt` was not available in the active toolchain:
+  `/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustfmt`
+  missing.
+
+### Important caveat
+
+The implementation duplicates the macOS WK cookie injection logic locally in
+`cascade_computer.rs` instead of reusing `owned_browser.rs`, because the existing
+owned-browser injector is private and attached to `BrowserSidebar`/owned-browser
+navigation. This was the quickest scoped fix. Later cleanup should extract a
+shared helper so both owned-browser and Cascade sandbox use one cookie injection
+implementation.
+
+### Next clean steps
+
+1. Install full Xcode or point `xcode-select` at a full Xcode install, then rerun
+   the Tauri compile check.
+2. Install `rustfmt` for the active toolchain, then format `cascade_computer.rs`.
+3. Build and install a debug app:
+   ```
+   export PATH="/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH"
+   ./scripts/overlay.sh
+   cd vendor/screenpipe/apps/screenpipe-app-tauri
+   bun run tauri build --debug --bundles app
+   SRC=src-tauri/target/debug/bundle/macos/Cascade.app
+   osascript -e 'tell application "Cascade" to quit' || true
+   pkill -f "Cascade.app/Contents/MacOS/screenpipe-app" || true
+   rm -rf /Applications/Cascade.app
+   cp -R "$SRC" /Applications/Cascade.app
+   xattr -dr com.apple.quarantine /Applications/Cascade.app
+   ```
+4. Runtime test:
+   - Log into a target site in Arc/Chrome/Brave/Edge.
+   - Start a browser workflow in Local Sandbox.
+   - Expected: Hands box says it is using the existing browser session, then the
+     sandbox opens already signed in.
+   - If macOS Keychain prompts for browser safe storage, approve it.
+   - If the site still asks for login, check whether it uses localStorage,
+     IndexedDB, passkeys, or WebAuthn; those still need the fallback.
+
+---
+
+# Previous Handoff (2026-05-31)
 
 ## 0. READ THIS FIRST — state of the tree
 

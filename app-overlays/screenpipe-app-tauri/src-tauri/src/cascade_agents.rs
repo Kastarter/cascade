@@ -15,17 +15,20 @@
 //!
 //! Agent #1 (Reel Q&A) lives in the `pi` subprocess, not here.
 
-use crate::cascade_llm::{call_anthropic, call_anthropic_json, LlmCall, MODEL_OPUS, MODEL_SONNET};
+use crate::cascade_llm::{
+    call_anthropic, call_anthropic_json, LlmCall, LlmResult, MODEL_OPUS, MODEL_SONNET,
+};
 use cascade_schema::{
     append_audit, count_live_runs, create_detection_run, get_agent_action, get_agent_spec,
     insert_agent_action, insert_agent_run, insert_agent_spec, insert_manager_suggestion,
-    last_live_run_at, list_actions_for_spec, list_agent_runs, list_agent_specs, list_audit,
-    list_deployed_specs, list_manager_suggestions, list_privacy_aggregates, migrate, open,
-    replace_privacy_aggregates, update_agent_action_state, update_agent_spec_status,
-    update_manager_suggestion_status, AgentActionInput, AgentRunInput, AgentSpecInput,
-    ManagerSuggestionInput, PrivacyAggregateInput,
+    last_daily_summary_at, last_detection_run_at, last_live_run_at, list_actions_for_spec,
+    list_agent_runs, list_agent_specs, list_audit, list_deployed_specs, list_manager_suggestions,
+    list_privacy_aggregates, list_recent_daily_summaries, migrate, open, replace_privacy_aggregates,
+    update_agent_action_state, update_agent_spec_status, update_manager_suggestion_status,
+    upsert_daily_summary, AgentActionInput, AgentRunInput, AgentSpecInput, ManagerSuggestionInput,
+    PrivacyAggregateInput,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -261,6 +264,18 @@ async fn fetch_rewind_frames(
 ) -> Result<Vec<SearchContent>, String> {
     let end = Utc::now();
     let start = end - Duration::hours(hours as i64);
+    fetch_rewind_frames_range(app, start, end, max_frames).await
+}
+
+/// OCR frames over an explicit UTC time range (used to summarize a specific
+/// calendar day, where a trailing-hours window won't do). `fetch_rewind_frames`
+/// is the trailing-window wrapper over this.
+async fn fetch_rewind_frames_range(
+    app: &tauri::AppHandle,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    max_frames: u32,
+) -> Result<Vec<SearchContent>, String> {
     let path = format!(
         "/search?content_type=ocr&start_time={}&end_time={}&limit={}",
         urlencoding::encode(&start.to_rfc3339()),
@@ -294,7 +309,12 @@ async fn fetch_rewind_frames(
     })?;
     let mut frames: Vec<SearchContent> = body.data.into_iter().map(|i| i.content).collect();
     frames.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    eprintln!("[cascade-rewind] parsed {} frames over last {hours}h", frames.len());
+    eprintln!(
+        "[cascade-rewind] parsed {} frames for {}..{}",
+        frames.len(),
+        start.to_rfc3339(),
+        end.to_rfc3339()
+    );
     Ok(frames)
 }
 
@@ -831,8 +851,26 @@ fn add_grounding_evidence(s: &mut CascadeManagerSuggestion, grounding: &Workflow
 }
 
 fn merge_grounding_into_spec(doc: &mut AgentSpecDoc, grounding: &WorkflowGrounding) {
-    if doc.execution_mode.trim().is_empty() || grounding.execution_mode == "browser" {
-        doc.execution_mode = grounding.execution_mode.clone();
+    // Reconcile execution mode with the Rewind signal WITHOUT forcing a state the
+    // rest of the spec can't satisfy. Grounding often reads "browser" just because
+    // the employee's work touched a website, but if the model deliberately designed
+    // a background workflow (no browser.use step), forcing browser here only makes
+    // validate_spec reject an otherwise-valid spec. So grounding may push toward
+    // "browser" ONLY when there's a browser.use step to back it (correcting a model
+    // that built browser work but mislabeled the mode); a heuristic "browser" with
+    // no such step degrades to background instead of self-invalidating.
+    let has_browser_step = doc
+        .workflow
+        .iter()
+        .any(|s| s.tool.as_deref() == Some("browser.use"));
+    if doc.execution_mode.trim().is_empty() {
+        doc.execution_mode = if grounding.execution_mode == "browser" && !has_browser_step {
+            default_execution_mode()
+        } else {
+            grounding.execution_mode.clone()
+        };
+    } else if grounding.execution_mode == "browser" && has_browser_step {
+        doc.execution_mode = "browser".to_string();
     }
     if doc.target_url.trim().is_empty() {
         doc.target_url = grounding.primary_url.clone();
@@ -930,6 +968,13 @@ pub(crate) async fn fetch_rewind_digest(
     max_frames: u32,
 ) -> Result<(String, usize, u32), String> {
     let owned = fetch_rewind_frames(app, hours, max_frames).await?;
+    Ok(build_digest_from_frames(&owned))
+}
+
+/// Build a compact, deduped chronological digest from already-fetched frames —
+/// the frame→text step shared by the trailing-window digest and the per-day
+/// summarizer. Returns (digest, frames_used, sensitive_excluded).
+fn build_digest_from_frames(owned: &[SearchContent]) -> (String, usize, u32) {
     let frames: Vec<&SearchContent> = owned.iter().collect();
 
     let mut lines: Vec<String> = Vec::new();
@@ -971,7 +1016,7 @@ pub(crate) async fn fetch_rewind_digest(
         }
     }
 
-    Ok((lines.join("\n").trim().to_string(), used, excluded))
+    (lines.join("\n").trim().to_string(), used, excluded)
 }
 
 /// One recorded user action (from screenpipe's accessibility-derived `ui_events`).
@@ -1501,6 +1546,70 @@ fn normalize_suggestion(s: DetectorSuggestion) -> CascadeManagerSuggestion {
     }
 }
 
+/// How the detector grounds each surfaced suggestion. The manual command grounds
+/// PER suggestion against the live Rewind; the scheduled detector grounds against
+/// a single WorkflowGrounding merged from the stored daily summaries, so it never
+/// re-reads raw frames.
+enum GroundingMode<'a> {
+    LivePerSuggestion { hours: u32, max_frames: u32 },
+    Fixed(&'a WorkflowGrounding),
+}
+
+/// Run the waste-detector model over a prepared user prompt and return normalized
+/// suggestions (not yet grounded/filtered/persisted) plus token usage. The system
+/// prompt is shared; only the user prompt differs (live window vs cross-day).
+async fn run_detector_llm(
+    user_prompt: String,
+) -> Result<(Vec<CascadeManagerSuggestion>, LlmResult), String> {
+    let call = LlmCall {
+        model: MODEL_OPUS,
+        system: detector_system_prompt(),
+        user: user_prompt,
+        temperature: 0.2,
+        max_tokens: 2000,
+    };
+    let (output, usage) = call_anthropic_json::<DetectorOutput>(&call).await?;
+    let normalized = output
+        .suggestions
+        .into_iter()
+        .map(normalize_suggestion)
+        .collect();
+    Ok((normalized, usage))
+}
+
+/// Ground, filter, rank, and cap a batch of normalized suggestions. Shared by the
+/// manual command and the scheduled detector — only the grounding source differs.
+async fn assemble_suggestions(
+    app: &tauri::AppHandle,
+    raw: Vec<CascadeManagerSuggestion>,
+    mode: GroundingMode<'_>,
+) -> Vec<CascadeManagerSuggestion> {
+    let mut out = Vec::new();
+    for mut suggestion in raw {
+        let grounding = match &mode {
+            GroundingMode::LivePerSuggestion { hours, max_frames } => {
+                let query = format!("{} {}", suggestion.title, suggestion.summary);
+                fetch_rewind_grounding(app, *hours, &query, *max_frames)
+                    .await
+                    .unwrap_or_default()
+            }
+            GroundingMode::Fixed(g) => (*g).clone(),
+        };
+        if !should_keep_manager_suggestion(&suggestion, &grounding) {
+            continue;
+        }
+        add_grounding_evidence(&mut suggestion, &grounding);
+        suggestion.evidence = sanitize_detector_evidence(suggestion.evidence);
+        out.push(suggestion);
+    }
+    out.sort_by(|a, b| {
+        cmp_f64_desc(a.severity_score, b.severity_score)
+            .then_with(|| cmp_f64_desc(a.confidence, b.confidence))
+    });
+    out.truncate(6);
+    out
+}
+
 /// Agent #2. Runs the privacy aggregator (#5) first, then asks Opus to surface
 /// patterns over the sanitized output only. Persists suggestions + the run.
 #[tauri::command]
@@ -1561,34 +1670,15 @@ pub async fn cascade_generate_manager_suggestions(
         return Ok(batch);
     }
 
-    let call = LlmCall {
-        model: MODEL_OPUS,
-        system: detector_system_prompt(),
-        user: detector_user_prompt(&digest, hours, frames, excluded),
-        temperature: 0.2,
-        max_tokens: 2000,
-    };
-    let (output, usage) = call_anthropic_json::<DetectorOutput>(&call).await?;
+    let (normalized, usage) =
+        run_detector_llm(detector_user_prompt(&digest, hours, frames, excluded)).await?;
     batch.cost_usd = usage.cost_usd;
-
-    let mut suggestions = Vec::new();
-    for mut suggestion in output.suggestions.into_iter().map(normalize_suggestion) {
-        let query = format!("{} {}", suggestion.title, suggestion.summary);
-        let grounding = fetch_rewind_grounding(&app, hours, &query, 250)
-            .await
-            .unwrap_or_default();
-        if !should_keep_manager_suggestion(&suggestion, &grounding) {
-            continue;
-        }
-        add_grounding_evidence(&mut suggestion, &grounding);
-        suggestion.evidence = sanitize_detector_evidence(suggestion.evidence);
-        suggestions.push(suggestion);
-    }
-    suggestions.sort_by(|a, b| {
-        cmp_f64_desc(a.severity_score, b.severity_score)
-            .then_with(|| cmp_f64_desc(a.confidence, b.confidence))
-    });
-    suggestions.truncate(6);
+    let mut suggestions = assemble_suggestions(
+        &app,
+        normalized,
+        GroundingMode::LivePerSuggestion { hours, max_frames: 250 },
+    )
+    .await;
 
     // Persist run + suggestions.
     let pool = cascade_pool(&app).await?;
@@ -1649,6 +1739,315 @@ pub async fn cascade_generate_manager_suggestions(
     batch.suggestions = suggestions;
     batch.outbox_path = write_json_outbox(&app, MANAGER_OUTBOX_DIR, &batch)?;
     Ok(batch)
+}
+
+// ── Stage A · daily Rewind summarizer ("the Rewind agent") ──────────────────
+// Once per day, draft a COMPACT, workflow-focused summary of that day from the
+// Rewind and store ONE row per day. These compact rows — not 72h of raw frames —
+// are what the scheduled detector reads for cross-day consistency.
+
+const DETECTOR_NAME_SCHEDULED: &str = "cascade-waste-detector-scheduled-v1";
+
+fn summarizer_system_prompt() -> String {
+    "You are Cascade's Rewind summarizer. You are given a chronological digest of \
+what ONE employee did on screen during a SINGLE day — window titles and on-screen \
+text (OCR) from the Rewind recording; sensitive apps were already removed. Write a \
+COMPACT factual summary (at most ~180 words) of what they actually worked on that \
+day, focused on RECURRING, concrete workflows and the specific apps/sites/steps \
+involved — the kind of repeatable task an agent could later take over. Plain prose, \
+no headings, no preamble. Never evaluate the person (\"unfocused\", \"wasted time\"); \
+describe the work only. If little happened, say so in one line."
+        .to_string()
+}
+
+fn summarizer_user_prompt(day: &str, digest: &str, used: usize, excluded: u32) -> String {
+    format!(
+        "Day: {day} ({used} screens summarized, {excluded} sensitive screens excluded).\n\n\
+WHAT THE EMPLOYEE DID ON SCREEN (chronological — [time] App — Window, then OCR text):\n{digest}\n\n\
+Write the compact daily workflow summary."
+    )
+}
+
+/// Local calendar day → [start, end) as UTC instants.
+fn local_day_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    let to_utc = |n: chrono::NaiveDateTime| {
+        Local
+            .from_local_datetime(&n)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|| Utc.from_utc_datetime(&n))
+    };
+    let start = date.and_hms_opt(0, 0, 0).unwrap();
+    let end = date.succ_opt().unwrap_or(date).and_hms_opt(0, 0, 0).unwrap();
+    (to_utc(start), to_utc(end))
+}
+
+/// Age in hours of a SQLite `CURRENT_TIMESTAMP` ('YYYY-MM-DD HH:MM:SS', UTC) or an
+/// rfc3339 string. None if unparseable.
+fn sqlite_ts_age_hours(ts: &str) -> Option<f64> {
+    let naive = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .or_else(|| DateTime::parse_from_rfc3339(ts).ok().map(|d| d.naive_utc()))?;
+    let then = Utc.from_utc_datetime(&naive);
+    Some((Utc::now() - then).num_seconds() as f64 / 3600.0)
+}
+
+/// Draft (or re-draft) the compact summary for one local calendar `date`.
+async fn draft_daily_summary(app: &tauri::AppHandle, date: NaiveDate) -> Result<(), String> {
+    let (start, end) = local_day_bounds(date);
+    let frames = fetch_rewind_frames_range(app, start, end, 600).await?;
+    if frames.is_empty() {
+        return Ok(()); // nothing recorded for this day — don't store an empty row
+    }
+    let (digest, used, excluded) = build_digest_from_frames(&frames);
+    if digest.trim().is_empty() {
+        return Ok(());
+    }
+    let grounding = derive_rewind_grounding(&frames, "");
+    let day = date.format("%Y-%m-%d").to_string();
+
+    let call = LlmCall {
+        model: MODEL_OPUS,
+        system: summarizer_system_prompt(),
+        user: summarizer_user_prompt(&day, &digest, used, excluded),
+        temperature: 0.2,
+        max_tokens: 700,
+    };
+    let summary_text = call_anthropic(&call).await?.text.trim().to_string();
+    if summary_text.is_empty() {
+        return Ok(());
+    }
+    let grounding_json = serde_json::to_string(&grounding).unwrap_or_else(|_| "{}".to_string());
+    let apps_json =
+        serde_json::to_string(&grounding.observed_apps).unwrap_or_else(|_| "[]".to_string());
+
+    let pool = cascade_pool(app).await?;
+    upsert_daily_summary(&pool, &day, &summary_text, &grounding_json, &apps_json)
+        .await
+        .map_err(|e| format!("upsert daily summary: {e}"))?;
+    eprintln!("[cascade-rewind] drafted daily summary for {day} ({used} screens)");
+    Ok(())
+}
+
+// ── Stage B · scheduled consistency detector ────────────────────────────────
+
+fn scheduled_detector_user_prompt(digest: &str, days: usize) -> String {
+    format!(
+        "Below are compact day-by-day summaries of what the employee did over the last {days} day(s), \
+each drafted from the Rewind. Every '=== <date> ===' block is one day.\n\n{digest}\n\n\
+Surface ONLY workflows that recur CONSISTENTLY ACROSS MULTIPLE DAYS — the repetitive toil this person \
+does day after day that a constrained agent could take over using the same apps/sites. Ignore anything \
+that appears on only a single day or looks one-off."
+    )
+}
+
+/// Union one day's grounding into the running merged grounding. Stage B grounds
+/// every suggestion from the stored summaries' grounding, never re-reading frames.
+fn merge_groundings(into: &mut WorkflowGrounding, from: &WorkflowGrounding) {
+    if from.execution_mode == "browser" {
+        into.execution_mode = "browser".to_string();
+    }
+    if into.primary_url.trim().is_empty() {
+        into.primary_url = from.primary_url.clone();
+    }
+    if into.completion_pattern.trim().is_empty() {
+        into.completion_pattern = from.completion_pattern.clone();
+    }
+    for h in &from.target_hosts {
+        if !into.target_hosts.iter().any(|e| e.eq_ignore_ascii_case(h)) {
+            into.target_hosts.push(h.clone());
+        }
+    }
+    for a in &from.observed_apps {
+        if !into.observed_apps.iter().any(|e| e.eq_ignore_ascii_case(a)) {
+            into.observed_apps.push(a.clone());
+        }
+    }
+    for w in &from.observed_workflow {
+        if !into.observed_workflow.iter().any(|e| e.eq_ignore_ascii_case(w)) {
+            into.observed_workflow.push(w.clone());
+        }
+    }
+}
+
+/// Stage B run: detect patterns consistent across the last 3 daily summaries,
+/// dedup against already-surfaced suggestions, insert only genuinely new ones, and
+/// notify. Returns the number of NEW suggestions sent to the manager.
+pub(crate) async fn run_scheduled_detection(app: &tauri::AppHandle) -> Result<usize, String> {
+    let pool = cascade_pool(app).await?;
+    let summaries = list_recent_daily_summaries(&pool, 3)
+        .await
+        .map_err(|e| format!("list daily summaries: {e}"))?;
+    if summaries.is_empty() {
+        return Ok(0);
+    }
+
+    // Oldest-first digest + merged grounding from the stored summaries.
+    let mut digest = String::new();
+    let mut merged = WorkflowGrounding::default();
+    for s in summaries.iter().rev() {
+        digest.push_str(&format!("=== {} ===\n{}\n\n", s.day, s.summary_text.trim()));
+        if let Ok(g) = serde_json::from_str::<WorkflowGrounding>(&s.grounding_json) {
+            merge_groundings(&mut merged, &g);
+        }
+    }
+    let digest = digest.trim().to_string();
+    if digest.is_empty() {
+        return Ok(0);
+    }
+
+    let (normalized, _usage) =
+        run_detector_llm(scheduled_detector_user_prompt(&digest, summaries.len())).await?;
+    let detected = assemble_suggestions(app, normalized, GroundingMode::Fixed(&merged)).await;
+    if detected.is_empty() {
+        return Ok(0);
+    }
+
+    // Dedup against existing suggestions (any status) by kind / agent-kind slug, so
+    // the same consistent pattern is surfaced and notified ONCE, not every cycle.
+    let existing = cascade_list_manager_suggestions(app.clone(), None, Some(100))
+        .await
+        .unwrap_or_default();
+    let existing_keys: HashSet<String> = existing
+        .iter()
+        .flat_map(|s| [s.kind.clone(), s.suggested_agent_kind.clone()])
+        .collect();
+    let fresh: Vec<CascadeManagerSuggestion> = detected
+        .into_iter()
+        .filter(|s| {
+            !existing_keys.contains(&s.kind) && !existing_keys.contains(&s.suggested_agent_kind)
+        })
+        .collect();
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let window_start = summaries
+        .last()
+        .map(|s| s.day.clone())
+        .unwrap_or_else(|| now.clone());
+    let run_id = create_detection_run(
+        &pool,
+        DETECTOR_NAME_SCHEDULED,
+        &window_start,
+        &now,
+        &serde_json::json!({ "scheduled": true, "days": summaries.len(), "new": fresh.len() })
+            .to_string(),
+    )
+    .await
+    .map_err(|e| format!("create detection run: {e}"))?;
+
+    let count = fresh.len();
+    for s in &fresh {
+        let mut evidence = vec![CascadeManagerEvidence {
+            label: "tier".to_string(),
+            value: s.tier.clone(),
+        }];
+        evidence.extend(s.evidence.clone());
+        insert_manager_suggestion(
+            &pool,
+            run_id,
+            &ManagerSuggestionInput {
+                kind: s.kind.clone(),
+                title: s.title.clone(),
+                summary: s.summary.clone(),
+                evidence_json: serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".to_string()),
+                suggested_agent_kind: s.suggested_agent_kind.clone(),
+                severity_score: s.severity_score,
+                confidence: s.confidence,
+            },
+        )
+        .await
+        .map_err(|e| format!("insert suggestion: {e}"))?;
+    }
+
+    fire_notification(
+        "Cascade found repetitive work",
+        &format!("{count} new pattern(s) ready to review in Manager"),
+    );
+    eprintln!("[cascade-agent] scheduled detection surfaced {count} new pattern(s)");
+    Ok(count)
+}
+
+// ── Scheduler · daily summary + 4h detector, key-gated, restart-safe ─────────
+
+/// Ensure the last 3 local days have a daily summary: past days are drafted once
+/// and frozen; "today" is re-drafted when its summary is older than ~4h.
+async fn ensure_daily_summaries(app: &tauri::AppHandle) -> Result<(), String> {
+    let pool = cascade_pool(app).await?;
+    let recent = list_recent_daily_summaries(&pool, 6)
+        .await
+        .map_err(|e| format!("list daily summaries: {e}"))?;
+    let by_day: HashMap<String, String> =
+        recent.into_iter().map(|r| (r.day, r.updated_at)).collect();
+
+    let today = Local::now().date_naive();
+    for back in 0..3i64 {
+        let date = today - Duration::days(back);
+        let day = date.format("%Y-%m-%d").to_string();
+        let need = match by_day.get(&day) {
+            None => true,
+            Some(updated) => {
+                back == 0 && sqlite_ts_age_hours(updated).map(|h| h > 4.0).unwrap_or(true)
+            }
+        };
+        if need {
+            if let Err(e) = draft_daily_summary(app, date).await {
+                eprintln!("[cascade-rewind] draft daily summary {day} failed: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the 4h detector should run now: ≥4h since the last detection AND a daily
+/// summary has been (re)drafted since then (else nothing new to look at).
+async fn should_run_scheduled_detection(app: &tauri::AppHandle) -> Result<bool, String> {
+    let pool = cascade_pool(app).await?;
+    let Some(last_sum) = last_daily_summary_at(&pool)
+        .await
+        .map_err(|e| format!("last summary: {e}"))?
+    else {
+        return Ok(false); // nothing to detect over yet
+    };
+    match last_detection_run_at(&pool)
+        .await
+        .map_err(|e| format!("last detection: {e}"))?
+    {
+        None => Ok(true),
+        Some(det) => {
+            let age_ok = sqlite_ts_age_hours(&det).map(|h| h >= 4.0).unwrap_or(true);
+            Ok(age_ok && last_sum.as_str() > det.as_str())
+        }
+    }
+}
+
+/// Spawn the always-on background loop: daily Rewind summaries + the 4h consistency
+/// detector. Key-gated (idle without an Anthropic key) and restart-safe (cadence is
+/// computed from DB timestamps, not in-memory timers). Called once from setup().
+pub fn spawn_background_schedulers(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // Let the app + recording server settle before the first tick.
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        loop {
+            if crate::cascade_llm::read_anthropic_key().is_ok() {
+                if let Err(e) = ensure_daily_summaries(&app).await {
+                    eprintln!("[cascade-agent] daily summary tick failed: {e}");
+                }
+                match should_run_scheduled_detection(&app).await {
+                    Ok(true) => {
+                        if let Err(e) = run_scheduled_detection(&app).await {
+                            eprintln!("[cascade-agent] scheduled detection failed: {e}");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("[cascade-agent] detection gate failed: {e}"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1800)).await; // 30 min
+        }
+    });
 }
 
 fn parse_evidence(json: &str) -> Vec<CascadeManagerEvidence> {

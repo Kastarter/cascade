@@ -67,6 +67,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         include_str!("../migrations/0002_manager_suggestions.sql"),
         include_str!("../migrations/0003_layer2_agents.sql"),
         include_str!("../migrations/0004_agent_runtime.sql"),
+        include_str!("../migrations/0005_daily_summaries.sql"),
     ];
 
     for sql in sql_files {
@@ -150,6 +151,101 @@ pub struct ManagerSuggestionRecord {
     pub created_at: String,
     pub sent_at: Option<String>,
     pub reviewed_at: Option<String>,
+}
+
+/// Most recent detection run's `created_at` (UTC `YYYY-MM-DD HH:MM:SS`), or None
+/// if detection has never run. Drives the scheduler's restart-safe 4h cadence:
+/// cadence is computed from this DB timestamp, not an in-memory timer.
+pub async fn last_detection_run_at(pool: &SqlitePool) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT created_at FROM cascade_detection_runs ORDER BY id DESC LIMIT 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get::<String, _>("created_at")))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySummaryRecord {
+    pub id: i64,
+    pub day: String,
+    pub summary_text: String,
+    pub grounding_json: String,
+    pub apps_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Insert or refresh the compact summary for one calendar `day` (idempotent by
+/// day). Past days are written once and frozen; "today" is re-drafted in place.
+pub async fn upsert_daily_summary(
+    pool: &SqlitePool,
+    day: &str,
+    summary_text: &str,
+    grounding_json: &str,
+    apps_json: &str,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO cascade_daily_summaries (day, summary_text, grounding_json, apps_json) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(day) DO UPDATE SET \
+            summary_text = excluded.summary_text, \
+            grounding_json = excluded.grounding_json, \
+            apps_json = excluded.apps_json, \
+            updated_at = CURRENT_TIMESTAMP \
+         RETURNING id",
+    )
+    .bind(day)
+    .bind(summary_text)
+    .bind(grounding_json)
+    .bind(apps_json)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+/// The `days` most recent daily summaries, newest first.
+pub async fn list_recent_daily_summaries(
+    pool: &SqlitePool,
+    days: i64,
+) -> Result<Vec<DailySummaryRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, day, summary_text, grounding_json, apps_json, created_at, updated_at \
+         FROM cascade_daily_summaries ORDER BY day DESC LIMIT ?1",
+    )
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DailySummaryRecord {
+            id: row.get("id"),
+            day: row.get("day"),
+            summary_text: row.get("summary_text"),
+            grounding_json: row.get("grounding_json"),
+            apps_json: row.get("apps_json"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+/// Whether a summary already exists for `day` (so backfill skips drafted days).
+pub async fn daily_summary_exists(pool: &SqlitePool, day: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 AS one FROM cascade_daily_summaries WHERE day = ?1 LIMIT 1")
+        .bind(day)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Newest `updated_at` across all daily summaries (UTC `YYYY-MM-DD HH:MM:SS`),
+/// or None. Lets the detector skip re-running when no summary changed since the
+/// last detection.
+pub async fn last_daily_summary_at(pool: &SqlitePool) -> Result<Option<String>> {
+    let row =
+        sqlx::query("SELECT updated_at FROM cascade_daily_summaries ORDER BY updated_at DESC LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.get::<String, _>("updated_at")))
 }
 
 pub async fn create_detection_run(
@@ -854,6 +950,63 @@ mod tests {
         let sent = list_manager_suggestions(&pool, Some("sent"), 10).await?;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].id, suggestion_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daily_summaries_upsert_and_list() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        std::fs::File::create(&db).unwrap();
+        let pool = open(&db).await?;
+        stub_frames(&pool).await?;
+        migrate(&pool).await?;
+
+        assert!(last_daily_summary_at(&pool).await?.is_none());
+        assert!(!daily_summary_exists(&pool, "2026-06-03").await?);
+
+        let id1 = upsert_daily_summary(
+            &pool,
+            "2026-06-03",
+            "did A then B",
+            r#"{"primaryUrl":"https://notion.so"}"#,
+            r#"["Notion"]"#,
+        )
+        .await?;
+        assert!(id1 > 0);
+        assert!(daily_summary_exists(&pool, "2026-06-03").await?);
+
+        // Re-drafting the same day updates in place (same row id, no duplicate).
+        let id2 = upsert_daily_summary(&pool, "2026-06-03", "did A then B then C", "{}", "[]").await?;
+        assert_eq!(id1, id2);
+
+        upsert_daily_summary(&pool, "2026-06-04", "did X", "{}", "[]").await?;
+        upsert_daily_summary(&pool, "2026-06-05", "did Y", "{}", "[]").await?;
+
+        let recent = list_recent_daily_summaries(&pool, 3).await?;
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].day, "2026-06-05"); // newest first
+        assert_eq!(recent[2].day, "2026-06-03");
+        assert_eq!(recent[2].summary_text, "did A then B then C"); // updated value kept
+
+        assert_eq!(list_recent_daily_summaries(&pool, 2).await?.len(), 2);
+        assert!(last_daily_summary_at(&pool).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn last_detection_run_at_tracks_newest() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        std::fs::File::create(&db).unwrap();
+        let pool = open(&db).await?;
+        stub_frames(&pool).await?;
+        migrate(&pool).await?;
+
+        assert!(last_detection_run_at(&pool).await?.is_none());
+        create_detection_run(&pool, "d1", "S", "E", "{}").await?;
+        create_detection_run(&pool, "d2", "S", "E", "{}").await?;
+        assert!(last_detection_run_at(&pool).await?.is_some());
         Ok(())
     }
 
