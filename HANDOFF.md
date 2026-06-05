@@ -1,5 +1,19 @@
 # Cascade — Session Handoff (2026-05-31)
 
+## 2026-06-05 update
+
+- The "read-from-web agent has nowhere to write" problem is now resolved in source:
+  `cascade_computer.rs` supports a `record` action, builds a digest from recorded
+  findings on `done`, shows it in the floating box, and writes it through
+  `cascade_agents::deliver_artifact_write` to Obsidian, Apple Notes, or a file
+  fallback.
+- The current strategy is Screenpipe for employee context/monitoring, OpenClicky
+  as the native-control reference, and Glide as product/integration reference.
+  See `docs/product-strategy.md`.
+- Computer-use reliability work should now focus on real SPA behavior and loop
+  prevention: controlled-input typing, click targeting, same-screen/no-effect
+  detection, login robustness, and clear audit/result delivery.
+
 Pick-up doc for continuing in a fresh session. Cascade = privacy-respecting
 enterprise AI-agent product, soft-forked from screenpipe (`mediar-ai/screenpipe`).
 
@@ -88,31 +102,20 @@ store persists the session for the agent browser.
 - Detector/generator no longer crash on `null` JSON (`de_null_string`/`de_null_f64`). ✅
 - Uninstall/Pause now stop the running computer task. ✅
 
-## 4. THE OPEN PROBLEM (start here next session)
+## 4. Current computer-use reliability focus
 
-**A read-from-web agent gathers info but has nowhere to WRITE its result.**
-"D2L Coursework Digest" navigates D2L and reads assignments, but D2L is not a doc
-tool — the digest has nowhere to land. This is the #1 design question.
+The read-only web-result delivery path exists now: the vision agent can `record`
+findings, then `done` writes a digest through the same artifact delivery path used
+by headless agents.
 
-Options (an audit workflow was mid-flight on exactly this when the session ended):
-1. Surface the gathered digest in the floating box as the run's result card
-   (`box_result` already exists, emitted on `cascade-hands-result`).
-2. Hand the gathered text to the HEADLESS engine to write into Apple Notes /
-   Obsidian (`resolve_delivery_target` already exists in cascade_agents.rs).
-3. Both.
-Recommended: add a "record/note" action the vision agent can emit to accumulate
-findings, and on `done` either show it in the box AND/OR write it via the headless
-delivery path. Decide + wire this.
-
-**Also fix next (computer-use reliability — the audit lenses):**
-- Interaction reliability on SPAs: `browser_execute` typing into React/controlled
-  inputs (needs native value setter + input event), iframes (D2L embeds a lot —
-  `elementFromPoint` can't see into cross-origin iframes), no wait-for-navigation
-  between actions.
-- Stuck/loop detection in `run_task_cycle`: nothing detects "screen didn't change
-  after my action" → repeats/oscillation; `MAX_STEPS=24`; weak history feedback.
-- Resilience: blank/failed captures looping silently, vision JSON parse failure
-  aborting the run, login-window race, stale `START_URLS`.
+Fix next:
+- Interaction reliability on SPAs: keep improving `browser_execute` for React /
+  controlled inputs, iframes, shadow DOM, and post-action settle/wait behavior.
+- Stuck/loop detection in `run_task_cycle`: keep strengthening "screen did not
+  change" feedback, repeated-action loop brakes, and history given back to the
+  vision model.
+- Resilience: blank/failed captures, vision JSON parse failures, login-window
+  race cases, and stale `START_URLS`.
 
 ## 5. Latest fixes BUILT but NOT yet installed
 

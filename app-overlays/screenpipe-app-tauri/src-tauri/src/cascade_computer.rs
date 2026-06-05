@@ -68,6 +68,8 @@ fn promote_overlay(win: &WebviewWindow, click_through: bool) {
 const MAX_STEPS: i64 = 24;
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 10;
+const STALL_WARN_AFTER: u32 = 2;
+const STALL_FAIL_AFTER: u32 = 4;
 const CURSOR_WINDOW: &str = "cascade-cursor";
 const HANDS_WINDOW: &str = "cascade-hands";
 const EVT_CURSOR: &str = "cascade-hands-cursor";
@@ -466,6 +468,28 @@ fn capture_logical_screenshot(app: &tauri::AppHandle) -> Result<(String, f64, f6
         .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|e| format!("encode screenshot: {e}"))?;
     Ok((STANDARD.encode(&buf), lw, lh))
+}
+
+fn frame_fingerprint(image_base64: &str) -> Option<u64> {
+    let bytes = STANDARD.decode(image_base64).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_luma8();
+    let small = image::imageops::resize(&img, 8, 8, image::imageops::FilterType::Triangle);
+    let pixels: Vec<u8> = small.pixels().map(|p| p.0[0]).collect();
+    let avg = pixels.iter().map(|v| *v as u32).sum::<u32>() / pixels.len().max(1) as u32;
+    let mut hash = 0u64;
+    for (idx, value) in pixels.iter().enumerate() {
+        if *value as u32 >= avg {
+            hash |= 1u64 << idx;
+        }
+    }
+    Some(hash)
+}
+
+fn frames_look_same(before: &str, after: &str) -> bool {
+    match (frame_fingerprint(before), frame_fingerprint(after)) {
+        (Some(a), Some(b)) => (a ^ b).count_ones() <= 3,
+        _ => before == after,
+    }
 }
 
 fn computer_system_prompt(name: &str, w: f64, h: f64, target: RunTarget) -> String {
@@ -885,14 +909,42 @@ try{{ if(t.click) t.click(); }}catch(e){{}}\
         "type" => {
             let t = serde_json::to_string(&action.text).unwrap_or_else(|_| "\"\"".into());
             browser_eval(app, spec_id, &format!(
-                "(function(){{var t={t};var el=document.activeElement;if(!el)return;if(el.isContentEditable){{document.execCommand('insertText',false,t);}}else if('value' in el){{el.value=(el.value||'')+t;el.dispatchEvent(new Event('input',{{bubbles:true}}));}}}})();"
+                "(function(){{\
+var t={t};\
+var el=document.activeElement;\
+if(!el)return;\
+if(el.isContentEditable){{\
+  try{{document.execCommand('insertText',false,t);}}catch(e){{\
+    el.textContent=(el.textContent||'')+t;\
+    el.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:t}}));\
+  }}\
+  return;\
+}}\
+if(!('value' in el))return;\
+var proto=Object.getPrototypeOf(el);\
+var desc=proto&&Object.getOwnPropertyDescriptor(proto,'value');\
+var next=(el.value||'')+t;\
+if(desc&&desc.set){{desc.set.call(el,next);}}else{{el.value=next;}}\
+el.dispatchEvent(new InputEvent('beforeinput',{{bubbles:true,cancelable:true,inputType:'insertText',data:t}}));\
+el.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:t}}));\
+el.dispatchEvent(new Event('change',{{bubbles:true}}));\
+}})();"
             ));
         }
         "key" => {
             let key = if action.key.is_empty() { "Enter".to_string() } else { action.key.clone() };
             let k = serde_json::to_string(&key).unwrap_or_else(|_| "\"Enter\"".into());
             browser_eval(app, spec_id, &format!(
-                "(function(){{var el=document.activeElement||document.body;['keydown','keypress','keyup'].forEach(function(ty){{el.dispatchEvent(new KeyboardEvent(ty,{{key:{k},bubbles:true}}));}});if(el.form&&el.form.requestSubmit){{el.form.requestSubmit();}}}})();"
+                "(function(){{\
+var key={k};\
+var el=document.activeElement||document.body;\
+['keydown','keypress','keyup'].forEach(function(ty){{\
+  try{{el.dispatchEvent(new KeyboardEvent(ty,{{key:key,bubbles:true,cancelable:true}}));}}catch(e){{}}\
+}});\
+if((key==='Enter'||key==='Return')&&el.form&&el.form.requestSubmit){{\
+  try{{el.form.requestSubmit();}}catch(e){{}}\
+}}\
+}})();"
             ));
         }
         "scroll" => {
@@ -952,6 +1004,7 @@ async fn run_task_cycle(
     let mut produced = 0i64;
     let mut notes: Vec<String> = Vec::new();
     let mut transient_failures = 0u32;
+    let mut stalled_commits = 0u32;
 
     match target {
         RunTarget::Sandbox => {
@@ -1273,12 +1326,16 @@ async fn run_task_cycle(
         history.push_str(&format!("- step {step}: {}\n", narrate(&action)));
         let pause = if matches!(action.action.as_str(), "navigate" | "open_app") { 2400 } else { 900 };
         tokio::time::sleep(Duration::from_millis(pause)).await;
-        if matches!(action.action.as_str(), "click" | "double_click") {
+        if is_committing(&action.action) {
             if let Ok((after_b64, after_w, after_h)) = capture_for(app, spec_id, target).await {
-                let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: after_b64.clone(), img_w: after_w, img_h: after_h });
-                if after_b64 == b64 {
+                if target == RunTarget::Sandbox {
+                    let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: after_b64.clone(), img_w: after_w, img_h: after_h });
+                }
+                if frames_look_same(&b64, &after_b64) {
+                    stalled_commits += 1;
                     history.push_str(&format!(
-                        "- step {step}: click had no visible effect; stay on this page and try another visible UI action instead of navigating away\n"
+                        "- step {step}: {} had no visible effect; pick a different visible target, scroll, wait for loading, or record what you can see instead of repeating it\n",
+                        action.action
                     ));
                     emit_status(
                         app,
@@ -1286,7 +1343,11 @@ async fn run_task_cycle(
                             spec_id,
                             name: name.to_string(),
                             goal: goal.to_string(),
-                            narration: "That click did nothing visible. Trying another on-page action…".to_string(),
+                            narration: if stalled_commits >= STALL_WARN_AFTER {
+                                "The screen is not changing. Trying a different route instead of repeating the same action…".to_string()
+                            } else {
+                                "That action did nothing visible. Trying another on-page action…".to_string()
+                            },
                             step,
                             supervised,
                             awaiting_approval: false,
@@ -1295,6 +1356,29 @@ async fn run_task_cycle(
                             hue,
                         },
                     );
+                    if stalled_commits >= STALL_FAIL_AFTER {
+                        history.push_str(&format!(
+                            "- step {step}: stopped after {stalled_commits} no-effect actions to avoid an automation loop\n"
+                        ));
+                        emit_status(
+                            app,
+                            StatusEvent {
+                                spec_id,
+                                name: name.to_string(),
+                                goal: goal.to_string(),
+                                narration: "I stopped because the screen was not responding to repeated actions.".to_string(),
+                                step,
+                                supervised,
+                                awaiting_approval: false,
+                                done: true,
+                                error: Some("stopped after repeated no-effect actions".to_string()),
+                                hue,
+                            },
+                        );
+                        break;
+                    }
+                } else {
+                    stalled_commits = 0;
                 }
             }
         }

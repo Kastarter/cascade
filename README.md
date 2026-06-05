@@ -77,3 +77,10 @@ On first launch, grant Screen Recording permission and add your Anthropic key in
 - `pipes/cascade-rewind-qa/` — the rewind Q&A agent
 - `scripts/` — overlay + build helpers
 - `vendor/screenpipe/` — the vendored on-device capture engine the app is built on
+
+## Product direction
+
+Cascade's wedge is employee context and monitoring first, then agent execution.
+See [`docs/product-strategy.md`](docs/product-strategy.md) for how Cascade uses
+Screenpipe, OpenClicky, and Glide as references without turning this repo into a
+dump of multiple desktop apps.
