@@ -1,5 +1,26 @@
 # Cascade — Session Handoff (2026-06-05)
 
+## 2026-06-05 update — sandbox no longer waits for sign-in when credentials exist
+
+The sandbox login decision in `cascade_computer.rs` `run_loop` now gates purely on
+whether **credentials were handed over**, not on a landed-URL check:
+
+- `hydrate_sandbox_session` **Ok(n)** (≥1 real-browser cookie injected) → `mark_signed_in`
+  and start working **immediately** — no sign-in prompt, no waiting.
+- `hydrate_sandbox_session` **Err** (no portable cookies / injection produced 0) → the
+  visible `ensure_host_login` is the FALLBACK, and the only thing that prompts.
+
+This removes the earlier "load-and-verify" path (open agent browser, wait 3s,
+`sandbox_landed_authenticated` URL heuristic) — its false negatives were prompting for
+sign-in even when cookies were injected fine, which defeated the reuse. Deleted with it:
+`sandbox_landed_authenticated`, `agent_browser_url`/`note_agent_browser_url`/
+`clear_agent_browser_url`, the `AGENT_BROWSER_URL` static, the agent-browser
+`on_page_load` recorder, and `reload_agent_browser`. The agent browser is now opened only
+by `run_task_cycle` (same shared cookie store, so the injected session is already in
+place). Tradeoff: present-but-expired cookies are trusted (agent lands on the site's login
+page rather than popping the manual window). Overlay synced to vendor (`cmp` match); full
+app compile still blocked on Xcode (see toolchain notes).
+
 ## 2026-06-05 update
 
 - The "read-from-web agent has nowhere to write" problem is now resolved in source:

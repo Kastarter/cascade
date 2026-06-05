@@ -841,54 +841,6 @@ async fn inject_sandbox_cookies_macos(
     injected
 }
 
-/// Latest main-document URL each agent browser has finished loading, recorded by
-/// the browser's `on_page_load`. Read right after the sandbox opens to tell
-/// whether a hydrated session landed us authenticated or on a login/SSO page.
-static AGENT_BROWSER_URL: LazyLock<Mutex<HashMap<i64, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn note_agent_browser_url(spec_id: i64, url: &str) {
-    if let Ok(mut m) = AGENT_BROWSER_URL.lock() {
-        m.insert(spec_id, url.to_string());
-    }
-}
-fn clear_agent_browser_url(spec_id: i64) {
-    if let Ok(mut m) = AGENT_BROWSER_URL.lock() {
-        m.remove(&spec_id);
-    }
-}
-fn agent_browser_url(spec_id: i64) -> Option<String> {
-    AGENT_BROWSER_URL
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&spec_id).cloned())
-}
-
-/// True if the agent browser, after loading its start URL with the hydrated
-/// cookies, ended up on the target host and NOT on a login/SSO/MFA page — i.e. the
-/// reused session actually authenticated us. Conservative: an unknown/blank URL
-/// counts as not-authenticated, so we fall back to the visible login.
-fn sandbox_landed_authenticated(spec_id: i64, target_host: &str) -> bool {
-    let Some(cur) = agent_browser_url(spec_id) else {
-        return false;
-    };
-    let h = host_of(&cur);
-    if h.is_empty() {
-        return false;
-    }
-    let on_target = h == target_host
-        || h.ends_with(&format!(".{target_host}"))
-        || target_host.ends_with(&format!(".{h}"));
-    on_target && !looks_like_auth_url(&cur)
-}
-
-/// Navigate the agent browser back to `url` — e.g. after a manual sign-in landed
-/// fresh session cookies in the shared store — so it reloads authenticated.
-fn reload_agent_browser(app: &tauri::AppHandle, spec_id: i64, url: &str) {
-    let safe = serde_json::to_string(url).unwrap_or_else(|_| "\"about:blank\"".to_string());
-    browser_eval(app, spec_id, &format!("window.location.href={safe};"));
-}
-
 /// Create (once) the agent's own browser window. It is VISIBLE and on-screen —
 /// macOS does not reliably render a fully off-screen window for `screencapture`,
 /// so the box was coming up blank. On-screen it captures reliably AND the user
@@ -912,16 +864,6 @@ fn ensure_agent_browser(app: &tauri::AppHandle, spec_id: i64, start_url: &str) -
                 .skip_taskbar(true)
                 .focused(false)
                 .visible(true)
-                // Record where the page actually lands (reliable main-document URL
-                // on macOS) so the login flow can tell whether a hydrated session
-                // authenticated us or hit a login wall.
-                .on_page_load(move |webview, payload| {
-                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                        if let Ok(u) = webview.url() {
-                            note_agent_browser_url(spec_id, u.as_str());
-                        }
-                    }
-                })
                 .build();
         }
     });
@@ -1605,43 +1547,42 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
                         hue,
                     },
                 );
-                // 1. Inject the user's existing browser cookies into the shared
-                //    WKWebView store (best-effort; misses if expired/non-cookie).
-                let _ = hydrate_sandbox_session(&app, &url).await;
-                // 2. Open the agent browser NOW so it loads the start URL WITH those
-                //    cookies, then check where it actually LANDED. A cookie count
-                //    can't tell us if we're really in — the injected cookies may be
-                //    absent, expired, or insufficient (auth in localStorage/passkeys).
-                //    The page can: if it bounced to a login/SSO page, we're not in.
-                clear_agent_browser_url(spec_id);
-                if let Err(e) = ensure_agent_browser(&app, spec_id, &url) {
-                    eprintln!("[cascade-login] {host}: couldn't open agent browser to verify session — {e}");
-                }
-                tokio::time::sleep(Duration::from_millis(3000)).await; // load + any auth redirect
-                if sandbox_landed_authenticated(spec_id, &host) {
-                    mark_signed_in(&host);
-                    eprintln!("[cascade-login] {host}: reused your existing browser session — signed in");
-                } else {
-                    // Cookies didn't get us in. Fall back to the visible login, then
-                    // reload the agent browser so it picks up the fresh session.
-                    eprintln!("[cascade-login] {host}: existing session insufficient — falling back to manual login");
-                    emit_status(
-                        &app,
-                        StatusEvent {
-                            spec_id,
-                            name: name.clone(),
-                            goal: goal.clone(),
-                            narration: format!("Couldn't reuse your saved session — please sign in to {host}…"),
-                            step: 0,
-                            supervised,
-                            awaiting_approval: false,
-                            done: false,
-                            error: None,
-                            hue,
-                        },
-                    );
-                    ensure_host_login(&app, spec_id, &name, &goal, supervised, hue, &host, &url).await;
-                    reload_agent_browser(&app, spec_id, &url);
+                // Hand the sandbox the user's existing browser session by injecting
+                // their real cookies into the shared WKWebView store. If that
+                // SUCCEEDS, the agent already HAS the credentials it needs — it
+                // starts working immediately, with NO sign-in prompt and no waiting.
+                // The visible login is a FALLBACK that runs ONLY when there's no
+                // reusable session to hand over (no portable cookies, or injection
+                // failed). The agent browser itself is opened later by
+                // run_task_cycle, which reads this same shared cookie store, so the
+                // injected session is already in place when it loads.
+                match hydrate_sandbox_session(&app, &url).await {
+                    Ok(n) => {
+                        mark_signed_in(&host);
+                        eprintln!(
+                            "[cascade-login] {host}: reused your existing browser session ({n} cookie(s)) — agent proceeding, no sign-in needed"
+                        );
+                    }
+                    Err(e) => {
+                        // No credentials to give the sandbox — only now do we ask.
+                        eprintln!("[cascade-login] {host}: no reusable browser session ({e}) — asking the user to sign in once");
+                        emit_status(
+                            &app,
+                            StatusEvent {
+                                spec_id,
+                                name: name.clone(),
+                                goal: goal.clone(),
+                                narration: format!("No saved session for {host} — sign in once and I'll take it from there…"),
+                                step: 0,
+                                supervised,
+                                awaiting_approval: false,
+                                done: false,
+                                error: None,
+                                hue,
+                            },
+                        );
+                        ensure_host_login(&app, spec_id, &name, &goal, supervised, hue, &host, &url).await;
+                    }
                 }
                 if stop_requested(spec_id) {
                     end_agent(spec_id);
