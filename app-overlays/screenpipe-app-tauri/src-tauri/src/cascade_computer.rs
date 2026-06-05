@@ -852,19 +852,29 @@ fn ensure_agent_browser(app: &tauri::AppHandle, spec_id: i64, start_url: &str) -
     let parsed = parse_external_url(start_url)?;
     let _ = app.run_on_main_thread(move || {
         if app2.get_webview_window(&label).is_none() {
-            let _ = WebviewWindowBuilder::new(&app2, &label, WebviewUrl::External(parsed))
+            // Created on-screen (so macOS keeps the WKWebView painting and
+            // `takeSnapshotWithConfiguration` keeps returning live frames) but
+            // INVISIBLE: set_window_user_visible drops it to alphaValue 0 +
+            // click-through right after build, so the user never sees a second
+            // browser window. The agent reads the page through the snapshot and the
+            // floating box streams those frames; it's only revealed (alpha 1 +
+            // focus) when the user takes control. See set_agent_browser_user_visible.
+            //
+            // decorations(false): no title bar. The snapshot is the WKWebView's own
+            // content (the 1280x820 viewport, 1:1 with document.elementFromPoint),
+            // so there's nothing to offset the agent's click coords.
+            if let Ok(win) = WebviewWindowBuilder::new(&app2, &label, WebviewUrl::External(parsed))
                 .title("Cascade Agent — working")
                 .inner_size(BROWSER_W, BROWSER_H)
-                .position(48.0, 96.0) // on-screen so it renders + captures reliably
-                // decorations(false): NO title bar. A title bar shifts the captured
-                // image down ~28px, so the agent's click coords (computed from the
-                // screenshot) would miss every element. Without it the capture is the
-                // raw 1280x820 viewport, 1:1 with document.elementFromPoint(x,y).
+                .position(48.0, 96.0)
                 .decorations(false)
                 .skip_taskbar(true)
                 .focused(false)
                 .visible(true)
-                .build();
+                .build()
+            {
+                set_window_user_visible(&win, false);
+            }
         }
     });
     Ok(())
@@ -876,41 +886,154 @@ fn close_agent_browser(app: &tauri::AppHandle, spec_id: i64) {
     }
 }
 
-/// CGWindowID of the agent browser, for window-only capture.
-fn browser_cg_window_id(app: &tauri::AppHandle, spec_id: i64) -> Option<i64> {
-    let win = app.get_webview_window(&browser_label(spec_id))?;
-    let raw = win.ns_window().ok()?;
+/// Show or hide the agent's browser window WITHOUT destroying it. Hidden =
+/// alphaValue 0 (invisible) + click-through, so the user's clicks pass straight to
+/// whatever is behind it, while the WKWebView keeps painting (macOS still counts an
+/// on-screen alpha-0 window as visible, so it isn't throttled) and
+/// `takeSnapshotWithConfiguration` keeps returning frames. Shown = alpha 1 +
+/// interactive, for take-control. MUST run on the main thread.
+fn set_window_user_visible(win: &tauri::WebviewWindow, shown: bool) {
+    use cocoa::base::{NO, YES};
     use objc::{msg_send, sel, sel_impl};
-    let ns = raw as *mut objc::runtime::Object;
-    let num: i64 = unsafe { msg_send![ns, windowNumber] };
-    if num > 0 {
-        Some(num)
-    } else {
-        None
+    if let Ok(raw) = win.ns_window() {
+        let ns = raw as *mut objc::runtime::Object;
+        let alpha: f64 = if shown { 1.0 } else { 0.0 };
+        let ignore_mouse = if shown { NO } else { YES };
+        unsafe {
+            let _: () = msg_send![ns, setAlphaValue: alpha];
+            let _: () = msg_send![ns, setIgnoresMouseEvents: ignore_mouse];
+        }
     }
 }
 
-/// Capture ONLY the agent browser window (not the user's screen).
+/// Reveal (shown=true, for take-control) or re-hide (shown=false, the agent is back
+/// to working on its own) the agent browser for `spec_id`, off the calling thread.
+fn set_agent_browser_user_visible(app: &tauri::AppHandle, spec_id: i64, shown: bool) {
+    let app2 = app.clone();
+    let label = browser_label(spec_id);
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = app2.get_webview_window(&label) {
+            set_window_user_visible(&win, shown);
+            if shown {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }
+    });
+}
+
+/// NSImage → PNG bytes, run inside the snapshot completion handler (main thread).
+unsafe fn nsimage_to_png(image: cocoa::base::id) -> Option<Vec<u8>> {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+    if image.is_null() {
+        return None;
+    }
+    let tiff: id = msg_send![image, TIFFRepresentation];
+    if tiff.is_null() {
+        return None;
+    }
+    let rep: id = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+    if rep.is_null() {
+        return None;
+    }
+    // NSBitmapImageFileTypePNG = 4
+    let png: id = msg_send![rep, representationUsingType: 4u64 properties: nil];
+    if png.is_null() {
+        return None;
+    }
+    let len: usize = msg_send![png, length];
+    let ptr: *const u8 = msg_send![png, bytes];
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr, len).to_vec())
+}
+
+/// Capture the agent's page as an image WITHOUT a visible browser window. The old
+/// path shelled out to `screencapture -l <windowID>`, which only works when the
+/// window is on screen — that's why a second browser used to pop up on every run.
+/// Now we ask WKWebView itself for a snapshot, which renders the live web content
+/// to an NSImage even while the window is invisible (alpha 0), so the agent can
+/// "see" and the floating box can stream while the user only ever sees the box.
 async fn capture_browser(app: &tauri::AppHandle, spec_id: i64) -> Result<(String, f64, f64), String> {
-    let id = browser_cg_window_id(app, spec_id).ok_or("agent browser not ready")?;
-    let path = std::env::temp_dir().join(format!("cascade-agent-browser-{spec_id}.png"));
-    let out = std::process::Command::new("screencapture")
-        .args(["-l", &id.to_string(), "-o", "-x", "-t", "png", path.to_string_lossy().as_ref()])
-        .output()
-        .map_err(|e| format!("capture browser: {e}"))?;
-    if !out.status.success() {
-        return Err("window capture failed".to_string());
+    let label = browser_label(spec_id);
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+    let slot_main = slot.clone();
+    let app2 = app.clone();
+
+    // takeSnapshot must be called on the main thread; its completion handler fires
+    // later on the main run loop and hands the PNG back through `slot`.
+    let dispatched = app.run_on_main_thread(move || {
+        let Some(win) = app2.get_webview_window(&label) else {
+            if let Ok(mut g) = slot_main.lock() {
+                if let Some(t) = g.take() {
+                    let _ = t.send(None);
+                }
+            }
+            return;
+        };
+        let slot_block = slot_main.clone();
+        let slot_err = slot_main.clone();
+        let wv = win.with_webview(move |platform| {
+            use block::ConcreteBlock;
+            use cocoa::base::{id, nil};
+            use objc::{msg_send, sel, sel_impl};
+            let wk = platform.inner() as id; // WKWebView*
+            if wk.is_null() {
+                if let Ok(mut g) = slot_block.lock() {
+                    if let Some(t) = g.take() {
+                        let _ = t.send(None);
+                    }
+                }
+                return;
+            }
+            let slot_done = slot_block.clone();
+            let handler = ConcreteBlock::new(move |image: id, _err: id| {
+                let png = unsafe { nsimage_to_png(image) };
+                if let Ok(mut g) = slot_done.lock() {
+                    if let Some(t) = g.take() {
+                        let _ = t.send(png);
+                    }
+                }
+            });
+            let handler = handler.copy();
+            // nil configuration → snapshot the full visible viewport at view bounds.
+            unsafe {
+                let _: () = msg_send![wk, takeSnapshotWithConfiguration: nil completionHandler: &*handler];
+            }
+        });
+        if wv.is_err() {
+            if let Ok(mut g) = slot_err.lock() {
+                if let Some(t) = g.take() {
+                    let _ = t.send(None);
+                }
+            }
+        }
+    });
+    if dispatched.is_err() {
+        if let Ok(mut g) = slot.lock() {
+            if let Some(t) = g.take() {
+                let _ = t.send(None);
+            }
+        }
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("read browser shot: {e}"))?;
-    if bytes.len() < 200 {
-        return Err("empty browser capture".to_string());
+
+    let png = tokio::time::timeout(Duration::from_millis(2500), rx)
+        .await
+        .map_err(|_| "browser snapshot timed out".to_string())?
+        .map_err(|_| "browser snapshot cancelled".to_string())?
+        .ok_or_else(|| "browser snapshot empty".to_string())?;
+    if png.len() < 200 {
+        return Err("empty browser snapshot".to_string());
     }
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("decode browser shot: {e}"))?;
+    let img = image::load_from_memory(&png).map_err(|e| format!("decode browser snapshot: {e}"))?;
     let resized = img.resize_exact(BROWSER_W as u32, BROWSER_H as u32, image::imageops::FilterType::Triangle);
     let mut buf = Vec::new();
     resized
         .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-        .map_err(|e| format!("encode browser shot: {e}"))?;
+        .map_err(|e| format!("encode browser snapshot: {e}"))?;
     Ok((STANDARD.encode(&buf), BROWSER_W, BROWSER_H))
 }
 
@@ -2020,24 +2143,41 @@ pub async fn cascade_stop_computer_task(app: tauri::AppHandle, spec_id: i64) -> 
     Ok(())
 }
 
-/// Pause/resume an agent without shutting it down (spec_id <= 0 = all).
+/// Pause/resume an agent without shutting it down (spec_id <= 0 = all). Resuming
+/// also re-hides the agent's browser: the agent is back to working on its own, so
+/// the window tucks out of sight (alpha 0) and the user watches via the floating
+/// box. Only cascade_take_control_computer_task reveals it.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_pause_computer_task(spec_id: i64, paused: bool) -> Result<(), String> {
-    if spec_id <= 0 {
+pub async fn cascade_pause_computer_task(
+    app: tauri::AppHandle,
+    spec_id: i64,
+    paused: bool,
+) -> Result<(), String> {
+    let ids: Vec<i64> = if spec_id <= 0 {
         if let Ok(mut m) = AGENTS.lock() {
             for c in m.values_mut() {
                 c.paused = paused;
             }
+            m.keys().copied().collect()
+        } else {
+            vec![]
         }
     } else {
         set_paused(spec_id, paused);
+        vec![spec_id]
+    };
+    if !paused {
+        for id in ids {
+            set_agent_browser_user_visible(&app, id, false);
+        }
     }
     Ok(())
 }
 
-/// Pause one agent and focus its visible browser so the employee can take over
-/// manually inside the exact screen the agent was using.
+/// Pause one agent and REVEAL its (normally invisible) browser so the employee can
+/// take over manually inside the exact screen the agent was using. Releasing
+/// control (resume) re-hides it — see cascade_pause_computer_task.
 #[tauri::command]
 #[specta::specta]
 pub async fn cascade_take_control_computer_task(
@@ -2048,16 +2188,7 @@ pub async fn cascade_take_control_computer_task(
         return Err("spec_id must be a running agent".to_string());
     }
     set_paused(spec_id, true);
-    let label = browser_label(spec_id);
-    let app2 = app.clone();
-    app.run_on_main_thread(move || {
-        if let Some(win) = app2.get_webview_window(&label) {
-            let _ = win.show();
-            let _ = win.unminimize();
-            let _ = win.set_focus();
-        }
-    })
-    .map_err(|e| format!("focus browser: {e}"))?;
+    set_agent_browser_user_visible(&app, spec_id, true);
     Ok(())
 }
 

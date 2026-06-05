@@ -1,5 +1,24 @@
 # Cascade — Session Handoff (2026-06-05)
 
+## 2026-06-05 update — sandbox agent browser is now invisible (box-only)
+
+The Local Sandbox agent browser no longer opens as a visible on-screen window. It's
+created invisible (`alphaValue 0` + `ignoresMouseEvents`, on-screen so WebKit keeps
+painting) and the agent "sees" its page via WKWebView `takeSnapshotWithConfiguration`
+instead of `screencapture -l <windowID>` — which required the window on-screen and was
+why a second browser used to pop up every run. The floating box streams those snapshot
+frames, so the user only ever watches the box.
+
+Reveal/hide wiring (no new commands / no frontend change — reuses the box's existing
+toggle): `cascade_take_control_computer_task` pauses + reveals (alpha 1 + focus);
+`cascade_pause_computer_task` gained an `app` param and, on **resume**, re-hides the
+browser — so "Let the agent do it" hides it and the agent keeps working in the box.
+Removed `browser_cg_window_id` + the screencapture path. Snapshot capture is in
+`capture_browser` (async: `run_on_main_thread` → `with_webview` → `block::ConcreteBlock`
+completion → PNG via `nsimage_to_png` → oneshot channel, 2.5s timeout). Compiled clean +
+installed; **runtime-unverified**: if the box shows frozen/blank frames, WebKit is
+throttling the alpha-0 snapshot — fallback needed.
+
 ## 2026-06-05 update — sandbox no longer waits for sign-in when credentials exist
 
 The sandbox login decision in `cascade_computer.rs` `run_loop` now gates purely on
