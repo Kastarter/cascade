@@ -1,14 +1,10 @@
 // cascade — passive monitoring + retrospective Q&A
 // https://github.com/Mohanad139/Cascade
 //
-// Each app's color is derived from the app ITSELF — its real icon — not a
-// hardcoded table. The icon is the brand color: Cursor reads grey, Claude
-// orange, Obsidian purple, and any app we've never seen still gets the right
-// color automatically. We pull the OS-provided icon from the app's local icon
-// server (already used elsewhere in the timeline) and extract its dominant
-// chromatic color on a canvas, caching the result per app name. Apps the OS
-// has no icon for fall back to a stable, distinct hue hashed from the name, so
-// every app still reads as "itself" with zero hardcoding.
+// Each app's color is derived from the app itself: its real OS-provided icon.
+// We extract the dominant chromatic color on a canvas and cache it per app
+// name. Apps the OS has no icon for fall back to a stable, distinct hue hashed
+// from the name, so new tools still read as themselves.
 
 const ICON_ENDPOINT = "http://localhost:11435/app-icon?name=";
 const CACHE_KEY = "cascade-app-colors-v1";

@@ -558,7 +558,7 @@ Actions:\n\
 - type: type `text` into the focused field\n\
 - key: press a key (`key`, e.g. \"Enter\")\n\
 - scroll: scroll the page (put pixels in `y`, negative = up)\n\
-- open_app: launch or focus an application by name (`app`, e.g. \"Obsidian\")\n\
+- open_app: launch or focus an application by name (`app`)\n\
 - navigate: open a URL in the browser (full https URL in `text`)\n\
 - record: save a finding into your notes (`text`) WITHOUT touching anything on screen.\n\
 - wait: let the screen settle\n\
@@ -1051,7 +1051,7 @@ fn browser_execute(app: &tauri::AppHandle, spec_id: i64, action: &ComputerAction
             // Never "guess" a destination from free text here. If the model asks
             // to navigate, it must provide a real URL, and we only allow it on
             // the CURRENT site. API/raw-data routes are blocked. Otherwise we
-            // no-op so the agent stays in D2L.
+            // no-op so the agent stays in the observed tool.
             let raw = if action.text.starts_with("http") {
                 action.text.clone()
             } else if action.app.starts_with("http") {
@@ -1092,8 +1092,8 @@ try{{\
         "click" | "double_click" => {
             // Dispatch pointer + mouse events on the best interactive target at
             // the point, searching the full paint stack and same-origin iframes.
-            // D2L-style nav menus often ignore a bare `el.click()` or the first
-            // topmost span; they want the actual buttonish node plus pointerdown.
+            // Some nav menus ignore a bare `el.click()` or the first topmost
+            // span; they want the actual buttonish node plus pointerdown.
             let dbl = if action.action == "double_click" { ",'dblclick'" } else { "" };
             browser_eval(app, spec_id, &format!(
                 "(function(){{\
@@ -1905,14 +1905,27 @@ fn spec_uses_browser(spec_json: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn spec_target_url(spec_json: &str) -> Option<String> {
+fn validated_spec_target_url(spec_json: &str, observed_hosts: &[String]) -> Option<String> {
     parse_spec_doc(spec_json).and_then(|doc| {
         let url = doc.target_url.trim();
         if url.is_empty() {
-            None
-        } else {
-            Some(url.to_string())
+            return None;
         }
+        let host = crate::cascade_agents::host_from_url(url)?;
+        if !crate::cascade_agents::is_candidate_target_host(&host) {
+            return None;
+        }
+        if !doc.target_hosts.is_empty()
+            && !crate::cascade_agents::host_matches_any(&host, &doc.target_hosts)
+        {
+            return None;
+        }
+        if !observed_hosts.is_empty()
+            && !crate::cascade_agents::host_matches_any(&host, observed_hosts)
+        {
+            return None;
+        }
+        Some(url.to_string())
     })
 }
 
@@ -1982,19 +1995,19 @@ async fn resolve_browser_start_url(
     if let Some(existing) = get_start_url(spec_id) {
         return Ok(existing);
     }
-    // An explicit destination pinned in the spec wins — some agents WRITE into a
-    // specific tool (e.g. "take notes in Notion"), so their site is the task's
-    // destination, not the most-used site from the Rewind. Generated agents store
-    // their Rewind-derived site here too, so this stays dynamic for them.
-    if let Some(url) = spec_target_url(spec_json) {
-        return Ok(url);
-    }
+    let mut observed_hosts = Vec::new();
     if let Ok(grounding) = crate::cascade_agents::fetch_rewind_grounding(app, 24, task, 300).await {
-        if !grounding.primary_url.trim().is_empty() {
-            return Ok(grounding.primary_url);
+        observed_hosts = grounding.target_hosts.clone();
+        if let Some(host) = crate::cascade_agents::host_from_url(&grounding.primary_url) {
+            if crate::cascade_agents::is_candidate_target_host(&host) {
+                return Ok(grounding.primary_url);
+            }
         }
     }
-    Err("No observed start URL was recovered from the spec or the Rewind".to_string())
+    if let Some(url) = validated_spec_target_url(spec_json, &observed_hosts) {
+        return Ok(url);
+    }
+    Err("No observed or validated start URL was recovered from the Rewind/spec".to_string())
 }
 
 fn spawn_agent(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool, target: RunTarget) {
@@ -2050,8 +2063,8 @@ pub async fn cascade_start_computer_task(
         }
     }
     // Where should the agent work? Resolve the site DYNAMICALLY from the Rewind —
-    // wherever the employee actually does this kind of work — never a hardcoded
-    // app. The sandbox REQUIRES this site (it opens the agent's browser there and
+    // wherever the employee actually does this kind of work — never a fixed app.
+    // The sandbox REQUIRES this site (it opens the agent's browser there and
     // pops its sign-in). On the real screen it's just a helpful starting point, so
     // it's optional — the agent can also work with whatever's already on screen.
     match target {
@@ -2301,7 +2314,7 @@ fn note_login_navigation(url: &str) {
     );
 }
 
-/// host of a URL ("https://d2l.x.ca/foo" → "d2l.x.ca"), for the login key.
+/// Host of a URL, for the login key.
 fn host_of(url: &str) -> String {
     let after = url.split("://").nth(1).unwrap_or(url);
     after.split(['/', '?', '#']).next().unwrap_or("").to_lowercase()
@@ -2359,8 +2372,8 @@ fn open_login_window(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
 /// HOST: a host is only marked signed-in once THIS host's sign-in is actually
 /// detected (or the user closes the window), so one agent's login can never
 /// release another agent waiting on a different site, and an abandoned/failed
-/// login re-prompts on the next run. The URL is Rewind-derived — nothing
-/// hardcoded per app.
+    /// login re-prompts on the next run. The URL is Rewind-derived, not fixed
+    /// per app.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_host_login(
     app: &tauri::AppHandle,

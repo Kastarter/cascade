@@ -35,9 +35,9 @@ import {
   listAudit,
   rejectAction,
   rollbackAction,
+  seedDailyRecapAgent,
   sandboxTest,
   seedDemoAgent,
-  seedNotionNotesAgent,
   startAllComputerTasks,
   startComputerTask,
   stopComputerTask,
@@ -205,21 +205,21 @@ export function CascadesView() {
       setSeeding(false);
     }
   };
-  const [seedingNotion, setSeedingNotion] = useState(false);
-  const onSeedNotion = async () => {
-    setSeedingNotion(true);
+  const [seedingRecap, setSeedingRecap] = useState(false);
+  const onSeedRecap = async () => {
+    setSeedingRecap(true);
     setError(null);
     try {
-      const s = await seedNotionNotesAgent();
+      const s = await seedDailyRecapAgent();
       await refresh();
       setNote(
-        `Handed the day-recap → Notion task to the detector — the pipeline generated “${s.name}”. ` +
+        `Handed the daily-recap task to the detector — the pipeline generated “${s.name}”. ` +
           `It's in Review now: open it, run the sandbox test, approve it, then Start.`,
       );
     } catch (e: any) {
       setError(String(e?.message ?? e));
     } finally {
-      setSeedingNotion(false);
+      setSeedingRecap(false);
     }
   };
 
@@ -262,11 +262,11 @@ export function CascadesView() {
             <PrimaryBtn disabled={seeding} onClick={onSeedDemo}>
               {seeding ? "Generating via the workflow…" : "+ Generate a demo agent"}
             </PrimaryBtn>
-            <GhostBtn disabled={seedingNotion} onClick={onSeedNotion}>
-              {seedingNotion ? "Sending to detector…" : "+ Notion day-recap"}
+            <GhostBtn disabled={seedingRecap} onClick={onSeedRecap}>
+              {seedingRecap ? "Sending to detector…" : "+ Daily recap"}
             </GhostBtn>
             <span style={{ fontSize: 12, color: "var(--cascade-text-4)" }}>
-              Both go detector → real agent (#3). Demo lands deployed; Notion day-recap lands in Review so you can watch it run the whole workflow.
+              Both go detector → real agent (#3). Demo lands deployed; daily recap lands in Review so you can watch the whole workflow.
             </span>
           </div>
         </div>

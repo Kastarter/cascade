@@ -118,11 +118,11 @@ export async function seedDemoAgent(): Promise<CascadeAgentSpecView> {
 }
 
 /**
- * Seed the "Notion Work Notes" agent (deployed) — it watches what you're doing
- * (from the Rewind) and writes it up as dated notes in Notion while you work.
+ * Seed a daily-recap agent into Review using the same detector -> generator path
+ * as a real surfaced pattern. The destination is inferred from recent activity.
  */
-export async function seedNotionNotesAgent(): Promise<CascadeAgentSpecView> {
-  return invoke<CascadeAgentSpecView>("cascade_seed_notion_notes_agent", {});
+export async function seedDailyRecapAgent(): Promise<CascadeAgentSpecView> {
+  return invoke<CascadeAgentSpecView>("cascade_seed_daily_recap_agent", {});
 }
 
 // ─── #4 Deployment & Runtime Monitor ────────────────────────────────

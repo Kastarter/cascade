@@ -103,10 +103,9 @@ fn is_sensitive(text: &str) -> bool {
     SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// The notes/docs app the employee actually uses most (Notion, Notes, Obsidian,
-/// Google Docs, …) over the recent window — so a computer-use agent writes
-/// where the employee already works instead of a hardcoded app. None if they
-/// haven't used a writing app recently.
+/// The notes/docs app the employee actually uses most over the recent window,
+/// so a computer-use agent writes where the employee already works instead of
+/// a fixed destination. None if they haven't used a writing app recently.
 pub(crate) async fn preferred_notes_app(app: &tauri::AppHandle) -> Option<String> {
     let (_, _, summary) = fetch_activity_summary(app, 24).await.ok()?;
     let mut best: Option<(String, f64)> = None;
@@ -318,8 +317,8 @@ async fn fetch_rewind_frames_range(
     Ok(frames)
 }
 
-/// host portion of a URL (no scheme crate needed). "https://d2l.x.ca/foo" → "d2l.x.ca".
-fn host_from_url(u: &str) -> Option<String> {
+/// Host portion of a URL (no scheme crate needed).
+pub(crate) fn host_from_url(u: &str) -> Option<String> {
     let s = u.trim();
     if s.is_empty() {
         return None;
@@ -331,6 +330,64 @@ fn host_from_url(u: &str) -> Option<String> {
     } else {
         Some(host.to_lowercase())
     }
+}
+
+fn normalized_host(host: &str) -> String {
+    let mut h = host.trim().trim_end_matches('.').to_lowercase();
+    if h.starts_with('[') {
+        if let Some(end) = h.find(']') {
+            h = h[1..end].to_string();
+        }
+    } else if h.matches(':').count() == 1 {
+        if let Some((base, port)) = h.rsplit_once(':') {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                h = base.to_string();
+            }
+        }
+    }
+    h
+}
+
+fn is_noise_host(host: &str) -> bool {
+    let h = normalized_host(host);
+    if h.is_empty()
+        || h == "localhost"
+        || h == "127.0.0.1"
+        || h == "::1"
+        || h.ends_with(".localhost")
+        || h.starts_with("newtab")
+    {
+        return true;
+    }
+    let search_or_start_hosts = [
+        "google.com",
+        "www.google.com",
+        "bing.com",
+        "www.bing.com",
+        "duckduckgo.com",
+        "www.duckduckgo.com",
+        "search.brave.com",
+        "search.yahoo.com",
+        "startpage.com",
+        "www.startpage.com",
+    ];
+    search_or_start_hosts.iter().any(|noise| h == *noise)
+}
+
+pub(crate) fn is_candidate_target_host(host: &str) -> bool {
+    !is_noise_host(host) && !is_sensitive(host)
+}
+
+pub(crate) fn host_matches_any(host: &str, candidates: &[String]) -> bool {
+    let h = normalized_host(host);
+    if h.is_empty() {
+        return false;
+    }
+    candidates.iter().any(|candidate| {
+        let raw = host_from_url(candidate).unwrap_or_else(|| candidate.to_string());
+        let c = normalized_host(&raw);
+        !c.is_empty() && (h == c || h.ends_with(&format!(".{c}")) || c.ends_with(&format!(".{h}")))
+    })
 }
 
 fn task_keywords(task: &str) -> Vec<String> {
@@ -721,13 +778,7 @@ fn derive_rewind_grounding(frames: &[SearchContent], task: &str) -> WorkflowGrou
                 .or_insert(0) += 1;
         }
         if let Some(host) = host_from_url(&frame.browser_url) {
-            if host != "google.com"
-                && host != "www.google.com"
-                && host != "localhost"
-                && host != "127.0.0.1"
-                && !host.starts_with("newtab")
-                && !is_sensitive(&host)
-            {
+            if is_candidate_target_host(&host) {
                 let entry = host_counts.entry(host.clone()).or_insert(0);
                 *entry += 1;
                 if primary_url.is_empty() {
@@ -925,7 +976,7 @@ fn merge_grounding_into_spec(doc: &mut AgentSpecDoc, grounding: &WorkflowGroundi
 }
 
 /// The web app this agent should actually operate in — derived from the Rewind,
-/// NOT a hardcoded list. We pick the site the employee uses most for this kind of
+/// not from a fixed destination. We pick the site the employee uses most for this kind of
 /// work: count the hosts they actually browsed (dropping search/new-tab noise and
 /// sensitive sites), and bias toward one whose host matches a word in the task.
 /// Returns the origin ("https://host") to open + sign into, or None.
@@ -941,16 +992,13 @@ pub(crate) async fn rewind_primary_url(app: &tauri::AppHandle, hours: u32, task:
     let mut score: HashMap<String, i64> = HashMap::new();
     for f in &frames {
         let Some(host) = host_from_url(&f.browser_url) else { continue };
-        // Drop noise + sensitive.
-        if host == "google.com" || host == "www.google.com" || host == "localhost"
-            || host == "127.0.0.1" || host.starts_with("newtab") || is_sensitive(&host)
-        {
+        // Drop browser/search/local noise plus sensitive hosts before scoring.
+        if !is_candidate_target_host(&host) {
             continue;
         }
         let entry = score.entry(host.clone()).or_insert(0);
         *entry += 1;
-        // Strong boost if the host matches what the task is about (e.g. task "D2L"
-        // → host "d2l.school.ca"; task "Notion" → "notion.so").
+        // Strong boost if the host matches what the task is about.
         if keywords.iter().any(|k| host.contains(k)) {
             *entry += 50;
         }
@@ -2122,7 +2170,7 @@ pub async fn cascade_update_manager_suggestion_status(
 
 /// Capabilities a generated agent may declare. Deliberately VENDOR-NEUTRAL —
 /// the agent does whatever work the detected pattern calls for (a recap, a
-/// digest, a focus plan, a status draft, a reminder…), not a hardcoded
+/// digest, a focus plan, a status draft, a reminder…), not a fixed
 /// "send a Slack/Gmail message". Each maps to a real on-device implementation
 /// in the runtime (see `execute_tool`). Anything off this list — especially
 /// shell/exec — is rejected at validation time.
@@ -2402,6 +2450,21 @@ fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
         if doc.target_url.trim().is_empty() && doc.target_hosts.is_empty() {
             problems.push("browser execution requires targetUrl or targetHosts".into());
         }
+        if let Some(host) = host_from_url(&doc.target_url) {
+            if !is_candidate_target_host(&host) {
+                problems.push("targetUrl points to search, local, or sensitive host".into());
+            }
+            if !doc.target_hosts.is_empty() && !host_matches_any(&host, &doc.target_hosts) {
+                problems.push("targetUrl host does not match targetHosts".into());
+            }
+        } else if !doc.target_url.trim().is_empty() {
+            problems.push("targetUrl is not a valid URL or host".into());
+        }
+        for host in &doc.target_hosts {
+            if !is_candidate_target_host(host) {
+                problems.push(format!("targetHosts includes search, local, or sensitive host: {host}"));
+            }
+        }
         if !has_browser_step {
             problems.push("browser execution requires at least one browser.use step".into());
         }
@@ -2583,20 +2646,22 @@ pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAge
     spec_view(record)
 }
 
-/// Seed the day-recap-into-Notion agent the way the product is meant to work:
-/// hand the task to the Waste Detector (#2) as a signal, then let the real Agent
-/// Generator (#3) build the spec from it. We do NOT hand-write or deploy the spec
-/// — the agent that lands in Review was genuinely CREATED by the pipeline, which
-/// is the whole point of this button (it validates that agent creation works).
-/// From Review it flows through sandbox → approval → deploy → run like any other
-/// cascade. (Notion is a web app, so it runs in the Local Sandbox by default;
-/// flip Settings → "On your screen" to drive the real Notion.)
+/// Seed a daily-recap agent the way the product is meant to work: hand the task
+/// to the Waste Detector (#2) as a signal, then let the real Agent Generator (#3)
+/// build the spec from it. We do NOT hand-write or deploy the spec — the agent
+/// that lands in Review was genuinely CREATED by the pipeline, which is the whole
+/// point of this button. The destination is inferred from the employee's recent
+/// notes/docs activity instead of being fixed to one vendor.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_seed_notion_notes_agent(
+pub async fn cascade_seed_daily_recap_agent(
     app: tauri::AppHandle,
 ) -> Result<CascadeAgentSpecView, String> {
     let pool = cascade_pool(&app).await?;
+    let preferred_notes = preferred_notes_app(&app)
+        .await
+        .unwrap_or_else(|| "the notes or docs app they already use".to_string());
+    let seed_slug = slugify_kind(&format!("daily-recap-in-{preferred_notes}"));
 
     // 1. Give the info to the Waste Detector (#2): record a detection run and a
     //    suggestion describing the task, exactly as if the detector had surfaced
@@ -2605,10 +2670,10 @@ pub async fn cascade_seed_notion_notes_agent(
     let now = Utc::now().to_rfc3339();
     let run_id = create_detection_run(
         &pool,
-        "notion-day-recap-seed",
+        "daily-recap-seed",
         &now,
         &now,
-        "{\"seed\":\"notion-day-recap\"}",
+        &serde_json::json!({ "seed": "daily-recap", "preferredNotesApp": preferred_notes }).to_string(),
     )
     .await
     .map_err(|e| format!("seed detection run: {e}"))?;
@@ -2619,7 +2684,7 @@ pub async fn cascade_seed_notion_notes_agent(
         },
         CascadeManagerEvidence {
             label: "where the recap should land".to_string(),
-            value: "Notion (notion.so)".to_string(),
+            value: preferred_notes.clone(),
         },
     ])
     .unwrap_or_else(|_| "[]".to_string());
@@ -2627,14 +2692,14 @@ pub async fn cascade_seed_notion_notes_agent(
         &pool,
         run_id,
         &ManagerSuggestionInput {
-            kind: slugify_kind("day-recap-notes-in-notion"),
-            title: "Day-recap notes in Notion".to_string(),
+            kind: seed_slug,
+            title: format!("Daily recap in {preferred_notes}"),
             summary:
                 "Look at what the employee did today (from the Rewind) and write it up as a dated \
-day-recap note in Notion, so they don't have to stop and write it themselves."
+daily recap in the notes or docs tool they already use, so they don't have to stop and write it themselves."
                     .to_string(),
             evidence_json: evidence,
-            suggested_agent_kind: "notes-recap".to_string(),
+            suggested_agent_kind: "daily-recap".to_string(),
             severity_score: 0.55,
             confidence: 0.85,
         },
@@ -2655,7 +2720,7 @@ day-recap note in Notion, so they don't have to stop and write it themselves."
         None,
         "system",
         "seeded_via_detector",
-        "{\"seed\":\"notion-day-recap\"}",
+        "{\"seed\":\"daily-recap\"}",
     )
     .await;
 
@@ -3265,28 +3330,48 @@ fn app_running(pattern: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Which app to deliver the recap into. Strongest signal first: a notes app you
-/// have OPEN RIGHT NOW (so working in Obsidian routes there even if screenpipe's
-/// historical summary missed it). Else the most-used notes app from activity.
-/// Else Apple Notes. (Notion needs a one-time connect, handled when requested.)
-async fn resolve_delivery_target(app: &tauri::AppHandle) -> &'static str {
-    // 1. Obsidian open right now + a vault present → write where you're working.
+#[derive(Debug, Clone)]
+enum DeliveryTarget {
+    Obsidian,
+    AppleNotes,
+    LocalFile { preferred_app: Option<String> },
+}
+
+/// Which destination to deliver the recap into. Strongest signal first: a notes
+/// app with an integration we can actually write to, then a neutral local file.
+/// Browser/native agents can still operate other tools directly; this headless
+/// path must not pretend it can write to an app it has no integration for.
+async fn resolve_delivery_target(app: &tauri::AppHandle) -> DeliveryTarget {
     if obsidian_vault().is_some() && app_running("obsidian") {
-        return "obsidian";
+        return DeliveryTarget::Obsidian;
     }
-    // 2. Historical most-used notes app from activity.
-    match preferred_notes_app(app).await {
-        Some(a) if a.to_lowercase().contains("obsidian") && obsidian_vault().is_some() => "obsidian",
-        _ => "applenotes",
+
+    let preferred = preferred_notes_app(app).await;
+    if let Some(a) = preferred.as_deref() {
+        let lower = a.to_lowercase();
+        if lower.contains("obsidian") && obsidian_vault().is_some() {
+            return DeliveryTarget::Obsidian;
+        }
+        if lower == "notes" || lower.contains("apple notes") {
+            return DeliveryTarget::AppleNotes;
+        }
+    }
+
+    if app_running("notes") {
+        return DeliveryTarget::AppleNotes;
+    }
+
+    DeliveryTarget::LocalFile {
+        preferred_app: preferred,
     }
 }
 
 /// What a committed step produced + how the box opens it.
 #[derive(Default, Clone)]
 pub struct Delivered {
-    /// Local file path (for rollback); None for app-native targets like Notes.
+    /// Local file path (for rollback); None for app-native targets.
     pub path: Option<String>,
-    /// Where it landed: "Apple Notes" | "Obsidian" | "File" | "Notification".
+    /// Where it landed, for display/open buttons.
     pub app_label: String,
     /// Open reference for the box: "app:Notes", "url:…", or "path:…".
     pub open_ref: Option<String>,
@@ -3311,10 +3396,9 @@ fn write_local_record(
 }
 
 /// Perform the real side effect for a committing step. The primary deliverable
-/// (`artifact.write`) lands in the app the employee actually uses (`target`,
-/// resolved from their activity): Obsidian if they use it, else Apple Notes —
-/// a real, visible app, not a buried file — falling back to a file only if the
-/// target is unavailable.
+/// (`artifact.write`) lands through a writable integration resolved from the
+/// employee's activity, falling back to a local file when no such integration is
+/// available.
 fn commit_side_effect(
     app: &tauri::AppHandle,
     spec_id: i64,
@@ -3323,27 +3407,37 @@ fn commit_side_effect(
     tool: &str,
     agent_name: &str,
     content: &str,
-    target: &str,
+    target: DeliveryTarget,
 ) -> Result<Delivered, String> {
     match tool {
         "artifact.write" => {
             let title = first_line_title(content);
-            // Route into the detected app; fall back to Apple Notes, then a file.
-            if target == "obsidian" {
-                if let Ok((path, open)) = obsidian_write(&title, content) {
-                    return Ok(Delivered { path: Some(path), app_label: "Obsidian".into(), open_ref: Some(open) });
-                }
-            }
-            match apple_notes_create(&title, content) {
-                Ok(()) => Ok(Delivered {
-                    path: None,
-                    app_label: "Apple Notes".into(),
-                    open_ref: Some("app:Notes".into()),
-                }),
-                // Notes denied/unavailable → keep a file so the work isn't lost.
-                Err(_) => {
+            match target {
+                DeliveryTarget::Obsidian => {
+                    if let Ok((path, open)) = obsidian_write(&title, content) {
+                        return Ok(Delivered { path: Some(path), app_label: "Obsidian".into(), open_ref: Some(open) });
+                    }
                     let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
                     Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
+                }
+                DeliveryTarget::AppleNotes => match apple_notes_create(&title, content) {
+                    Ok(()) => Ok(Delivered {
+                        path: None,
+                        app_label: "Apple Notes".into(),
+                        open_ref: Some("app:Notes".into()),
+                    }),
+                    Err(_) => {
+                        let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
+                        Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
+                    }
+                },
+                DeliveryTarget::LocalFile { preferred_app } => {
+                    let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
+                    let app_label = preferred_app
+                        .filter(|name| !name.trim().is_empty())
+                        .map(|name| format!("File for {name}"))
+                        .unwrap_or_else(|| "File".to_string());
+                    Ok(Delivered { path: Some(path.clone()), app_label, open_ref: Some(format!("path:{path}")) })
                 }
             }
         }

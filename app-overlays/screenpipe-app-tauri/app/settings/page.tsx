@@ -134,7 +134,7 @@ export default function SettingsPage() {
           <RunModeToggle value={runMode} onChange={chooseRunMode} />
           <p style={{ fontSize: 12.5, color: "var(--cascade-text-3)", lineHeight: 1.55, margin: "14px 0 0" }}>
             {runMode === "screen"
-              ? "On your screen — the agent uses your real screen and cursor, so it can operate any app (websites, Obsidian, Apple Notes…). Needs macOS Accessibility permission, and you'll see your cursor move while it works."
+              ? "On your screen — the agent uses your real screen and cursor, so it can operate any app you already use. Needs macOS Accessibility permission, and you'll see your cursor move while it works."
               : "In the background — the agent works inside the Local Sandbox shown in the floating box. Web apps only, and you can keep using your computer while it runs."}
           </p>
         </Section>
