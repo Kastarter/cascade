@@ -16,7 +16,7 @@
 #![cfg(target_os = "macos")]
 
 use crate::cascade_input;
-use crate::cascade_llm::{call_anthropic_vision, extract_json_str, MODEL_SONNET};
+use crate::cascade_llm::{call_anthropic_vision, extract_json_str, read_anthropic_key, MODEL_SONNET};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cascade_schema::{
     get_agent_spec, insert_agent_action, insert_agent_run, list_deployed_specs, open,
@@ -52,9 +52,12 @@ fn promote_overlay(win: &WebviewWindow, click_through: bool) {
         // KEY: NSPanel hides on app deactivation by default — that's why the box
         // vanished the instant you switched to another app. Keep it visible.
         panel.set_hides_on_deactivate(false);
-        // EXCLUDE the box from screen capture (NSWindowSharingNone = 0) so the
-        // agent's screenshots don't contain the box itself (no infinite mirror).
-        let _: () = unsafe { msg_send![&*panel, setSharingType: 0_u64] };
+        // EXCLUDE only the click-through cursor layer from screen capture
+        // (NSWindowSharingNone = 0). The visible Hands box must remain capturable
+        // so Computer Use and support screenshots can verify it.
+        if click_through {
+            let _: () = unsafe { msg_send![&*panel, setSharingType: 0_u64] };
+        }
         // Show on every Space, ignore window cycling, allow over fullscreen apps.
         panel.set_collection_behaviour(
             NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
@@ -75,6 +78,12 @@ const HANDS_WINDOW: &str = "cascade-hands";
 const EVT_CURSOR: &str = "cascade-hands-cursor";
 const EVT_STATUS: &str = "cascade-hands-status";
 const EVT_FRAME: &str = "cascade-hands-frame";
+
+fn require_anthropic_key_for(action: &str) -> Result<(), String> {
+    read_anthropic_key()
+        .map(|_| ())
+        .map_err(|_| format!("Add your Anthropic API key in Settings before {action}."))
+}
 
 /// Per-agent control block.
 #[derive(Default)]
@@ -434,7 +443,18 @@ pub fn box_result(
 /// A background run finished — emit done + hide the box when nothing's working.
 pub fn box_end(app: &tauri::AppHandle, spec_id: i64, name: &str, goal: &str, summary: &str) {
     emit_status(app, box_status(spec_id, name, goal, summary, -1, true));
-    let remaining = BOX_USERS.fetch_sub(1, Ordering::SeqCst) - 1;
+    let remaining = loop {
+        let current = BOX_USERS.load(Ordering::SeqCst);
+        if current <= 0 {
+            break 0;
+        }
+        if BOX_USERS
+            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break current - 1;
+        }
+    };
     let computer_use_active = AGENTS.lock().map(|m| m.values().filter(|c| c.running).count()).unwrap_or(0);
     if remaining <= 0 && computer_use_active == 0 {
         let app2 = app.clone();
@@ -2030,6 +2050,7 @@ pub async fn cascade_start_computer_task(
     goal: Option<String>,
     target: Option<String>,
 ) -> Result<(), String> {
+    require_anthropic_key_for("starting a Cascade agent")?;
     let target = RunTarget::from_opt(target.as_deref());
     let pool = db_pool(&app).await?;
     let spec = get_agent_spec(&pool, spec_id)
@@ -2092,6 +2113,7 @@ pub async fn cascade_start_computer_task(
 #[tauri::command]
 #[specta::specta]
 pub async fn cascade_start_all_computer_tasks(app: tauri::AppHandle, target: Option<String>) -> Result<u32, String> {
+    require_anthropic_key_for("starting Cascade agents")?;
     let target = RunTarget::from_opt(target.as_deref());
     let pool = db_pool(&app).await?;
     let specs = list_deployed_specs(&pool).await.map_err(|e| format!("list deployed: {e}"))?;
@@ -2151,6 +2173,10 @@ pub async fn cascade_stop_computer_task(app: tauri::AppHandle, spec_id: i64) -> 
         }
         if let Some(w) = app2.get_webview_window(LOGIN_WINDOW) {
             let _ = w.close();
+        }
+        if spec_id <= 0 {
+            BOX_USERS.store(0, Ordering::SeqCst);
+            hide_overlays(&app2);
         }
     });
     Ok(())

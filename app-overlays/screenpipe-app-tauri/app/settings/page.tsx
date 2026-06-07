@@ -52,11 +52,6 @@ export default function SettingsPage() {
     setBusy(true);
     try {
       await invoke("cascade_clear_anthropic_key");
-      try {
-        window.localStorage.removeItem("cascade-anthropic-key");
-      } catch {
-        /* non-fatal */
-      }
       await refreshKey();
     } finally {
       setBusy(false);

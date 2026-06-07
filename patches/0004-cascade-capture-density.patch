@@ -2,7 +2,7 @@ Index: screenpipe/crates/screenpipe-engine/src/event_driven_capture.rs
 ===================================================================
 --- screenpipe.orig/crates/screenpipe-engine/src/event_driven_capture.rs
 +++ screenpipe/crates/screenpipe-engine/src/event_driven_capture.rs
-@@ -197,7 +197,12 @@ impl Default for EventDrivenCaptureConfi
+@@ -260,7 +260,12 @@ impl Default for EventDrivenCaptureConfig {
      fn default() -> Self {
          Self {
              min_capture_interval_ms: 200,
@@ -15,4 +15,13 @@ Index: screenpipe/crates/screenpipe-engine/src/event_driven_capture.rs
 +            idle_capture_interval_ms: 15_000,
              jpeg_quality: 80,
              capture_on_click: true,
-             capture_on_keystroke: false,
+             capture_on_keystroke: true,
+@@ -2506,7 +2511,7 @@ mod tests {
+     fn test_default_config() {
+         let config = EventDrivenCaptureConfig::default();
+         assert_eq!(config.min_capture_interval_ms, 200);
+-        assert_eq!(config.idle_capture_interval_ms, 30_000);
++        assert_eq!(config.idle_capture_interval_ms, 15_000);
+         assert_eq!(config.jpeg_quality, 80);
+         assert!(config.capture_on_click);
+         assert!(config.capture_on_clipboard);

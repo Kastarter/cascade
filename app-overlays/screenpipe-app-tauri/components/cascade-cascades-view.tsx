@@ -16,6 +16,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { CascadeTitlebar } from "@/components/cascade-titlebar";
 import {
   CascadeRunMode,
@@ -64,8 +65,18 @@ export function CascadesView() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [hasAnthropicKey, setHasAnthropicKey] = useState(false);
   // Global "on screen vs Local Sandbox" preference, set in Settings.
   const [runMode, setRunMode] = useState<CascadeRunMode>("sandbox");
+
+  const refreshKeyStatus = useCallback(async () => {
+    try {
+      const status = await invoke<{ hasAnthropicKey: boolean }>("cascade_key_status");
+      setHasAnthropicKey(Boolean(status?.hasAnthropicKey));
+    } catch {
+      setHasAnthropicKey(false);
+    }
+  }, []);
 
   useEffect(() => {
     setRunMode(getRunMode());
@@ -96,9 +107,10 @@ export function CascadesView() {
 
   useEffect(() => {
     refresh();
+    refreshKeyStatus();
     const id = setInterval(refresh, 30_000);
     return () => clearInterval(id);
-  }, [refresh]);
+  }, [refresh, refreshKeyStatus]);
 
   const buckets = useMemo(() => {
     const map: Record<Stage, CascadeAgentSpecView[]> = {
@@ -133,13 +145,26 @@ export function CascadesView() {
     [refresh],
   );
 
+  const requireKey = useCallback(
+    (action: string) => {
+      if (hasAnthropicKey) return true;
+      setError(`Add your Anthropic API key in Settings before ${action}.`);
+      return false;
+    },
+    [hasAnthropicKey],
+  );
+
   const onSandbox = (s: CascadeAgentSpecView) =>
+    requireKey("running a sandbox test") &&
     run(s.id, () => sandboxTest(s.id), `Sandbox test finished for “${s.name}”`);
   const onInstall = (s: CascadeAgentSpecView) =>
     run(
       s.id,
       async () => {
         if (s.status !== "sandbox_passed") {
+          if (!requireKey("running a sandbox test")) {
+            throw new Error("Add your Anthropic API key in Settings before running a sandbox test.");
+          }
           // sandboxTest records `sandbox_failed` WITHOUT throwing, so we must
           // inspect its result. Without this, "approve_employee" would flip
           // employee_approved=true on a failed spec and only "deploy" would
@@ -171,6 +196,7 @@ export function CascadesView() {
       await transitionAgentSpec(s.id, "reject");
     }, `Uninstalled “${s.name}”`);
   const onWatch = (s: CascadeAgentSpecView) =>
+    requireKey("starting an agent") &&
     run(
       s.id,
       () => startComputerTask(s.id, undefined, runMode),
@@ -180,6 +206,7 @@ export function CascadesView() {
     );
   const onWatchAll = async () => {
     setError(null);
+    if (!requireKey("starting agents")) return;
     try {
       const n = await startAllComputerTasks(runMode);
       setNote(
@@ -193,6 +220,7 @@ export function CascadesView() {
   };
   const [seeding, setSeeding] = useState(false);
   const onSeedDemo = async () => {
+    if (!requireKey("generating a demo agent")) return;
     setSeeding(true);
     setError(null);
     try {
@@ -207,6 +235,7 @@ export function CascadesView() {
   };
   const [seedingRecap, setSeedingRecap] = useState(false);
   const onSeedRecap = async () => {
+    if (!requireKey("generating a daily recap agent")) return;
     setSeedingRecap(true);
     setError(null);
     try {
@@ -259,11 +288,11 @@ export function CascadesView() {
             It only runs for real after a sandbox test passes and you approve it. Pause or uninstall anytime.
           </p>
           <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <PrimaryBtn disabled={seeding} onClick={onSeedDemo}>
-              {seeding ? "Generating via the workflow…" : "+ Generate a demo agent"}
+            <PrimaryBtn disabled={seeding || !hasAnthropicKey} onClick={onSeedDemo}>
+              {seeding ? "Generating via the workflow…" : hasAnthropicKey ? "+ Generate a demo agent" : "Add key first"}
             </PrimaryBtn>
-            <GhostBtn disabled={seedingRecap} onClick={onSeedRecap}>
-              {seedingRecap ? "Sending to detector…" : "+ Daily recap"}
+            <GhostBtn disabled={seedingRecap || !hasAnthropicKey} onClick={onSeedRecap}>
+              {seedingRecap ? "Sending to detector…" : hasAnthropicKey ? "+ Daily recap" : "Daily recap needs key"}
             </GhostBtn>
             <span style={{ fontSize: 12, color: "var(--cascade-text-4)" }}>
               Both go detector → real agent (#3). Demo lands deployed; daily recap lands in Review so you can watch the whole workflow.
@@ -285,8 +314,8 @@ export function CascadesView() {
               busyId={busyId}
               renderActions={(s) => (
                 <>
-                  <PrimaryBtn disabled={busyId === s.id} onClick={() => onSandbox(s)}>
-                    {busyId === s.id ? "Testing…" : "Run sandbox test"}
+                  <PrimaryBtn disabled={busyId === s.id || !hasAnthropicKey} onClick={() => onSandbox(s)}>
+                    {busyId === s.id ? "Testing…" : hasAnthropicKey ? "Run sandbox test" : "Add key first"}
                   </PrimaryBtn>
                   <GhostBtn disabled={busyId === s.id} onClick={() => onDecline(s)}>
                     Decline
@@ -312,8 +341,8 @@ export function CascadesView() {
                   </>
                 ) : (
                   <>
-                    <GhostBtn disabled={busyId === s.id} onClick={() => onSandbox(s)}>
-                      Re-test
+                    <GhostBtn disabled={busyId === s.id || !hasAnthropicKey} onClick={() => onSandbox(s)}>
+                      {hasAnthropicKey ? "Re-test" : "Add key first"}
                     </GhostBtn>
                     <GhostBtn disabled={busyId === s.id} onClick={() => onDecline(s)}>
                       Decline
@@ -325,7 +354,7 @@ export function CascadesView() {
 
             {watchableRunningCount > 1 && (
               <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -18 }}>
-                <PrimaryBtn onClick={onWatchAll}>
+                <PrimaryBtn disabled={!hasAnthropicKey} onClick={onWatchAll}>
                   ▶ Start all {watchableRunningCount} agents{runMode === "screen" ? " on your screen" : " in the sandbox"}
                 </PrimaryBtn>
               </div>
@@ -344,7 +373,7 @@ export function CascadesView() {
               renderActions={(s) => (
                 <>
                   <PrimaryBtn
-                    disabled={busyId === s.id}
+                    disabled={busyId === s.id || !hasAnthropicKey}
                     onClick={() => onWatch(s)}
                     title={
                       runMode === "screen"
@@ -354,7 +383,9 @@ export function CascadesView() {
                   >
                     {busyId === s.id
                       ? "Starting…"
-                      : runMode === "screen"
+                      : !hasAnthropicKey
+                        ? "Add key first"
+                        : runMode === "screen"
                         ? "▶ Start on my screen"
                         : "▶ Start in the box"}
                   </PrimaryBtn>

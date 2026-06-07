@@ -16,17 +16,18 @@
 //! Agent #1 (Reel Q&A) lives in the `pi` subprocess, not here.
 
 use crate::cascade_llm::{
-    call_anthropic, call_anthropic_json, LlmCall, LlmResult, MODEL_OPUS, MODEL_SONNET,
+    call_anthropic, call_anthropic_json, read_anthropic_key, LlmCall, LlmResult, MODEL_OPUS,
+    MODEL_SONNET,
 };
 use cascade_schema::{
     append_audit, count_live_runs, create_detection_run, get_agent_action, get_agent_spec,
     insert_agent_action, insert_agent_run, insert_agent_spec, insert_manager_suggestion,
     last_daily_summary_at, last_detection_run_at, last_live_run_at, list_actions_for_spec,
     list_agent_runs, list_agent_specs, list_audit, list_deployed_specs, list_manager_suggestions,
-    list_privacy_aggregates, list_recent_daily_summaries, migrate, open, replace_privacy_aggregates,
-    update_agent_action_state, update_agent_spec_status, update_manager_suggestion_status,
-    upsert_daily_summary, AgentActionInput, AgentRunInput, AgentSpecInput, ManagerSuggestionInput,
-    PrivacyAggregateInput,
+    list_privacy_aggregates, list_recent_daily_summaries, migrate, open,
+    replace_privacy_aggregates, update_agent_action_state, update_agent_spec_status,
+    update_manager_suggestion_status, upsert_daily_summary, AgentActionInput, AgentRunInput,
+    AgentSpecInput, ManagerSuggestionInput, PrivacyAggregateInput,
 };
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
@@ -41,27 +42,75 @@ const MANAGER_OUTBOX_DIR: &str = "cascade-manager-outbox";
 const PRIVACY_OUTBOX_DIR: &str = "cascade-privacy-outbox";
 const DETECTOR_NAME: &str = "cascade-waste-detector-llm-v1";
 
+fn require_anthropic_key_for(action: &str) -> Result<(), String> {
+    read_anthropic_key()
+        .map(|_| ())
+        .map_err(|_| format!("Add your Anthropic API key in Settings before {action}."))
+}
+
 // ─── App → category classifier (shared, deterministic) ──────────────
 
 const CODING_APPS: &[&str] = &[
-    "wezterm", "iterm2", "terminal", "alacritty", "kitty", "warp", "hyper", "vscode",
-    "visual studio code", "code", "zed", "xcode", "intellij idea", "webstorm", "pycharm",
-    "cursor", "neovim", "vim",
+    "wezterm",
+    "iterm2",
+    "terminal",
+    "alacritty",
+    "kitty",
+    "warp",
+    "hyper",
+    "vscode",
+    "visual studio code",
+    "code",
+    "zed",
+    "xcode",
+    "intellij idea",
+    "webstorm",
+    "pycharm",
+    "cursor",
+    "neovim",
+    "vim",
 ];
 const BROWSER_APPS: &[&str] = &[
-    "arc", "google chrome", "chrome", "safari", "firefox", "brave browser", "microsoft edge",
+    "arc",
+    "google chrome",
+    "chrome",
+    "safari",
+    "firefox",
+    "brave browser",
+    "microsoft edge",
     "opera",
 ];
 const MEETING_APPS: &[&str] = &[
-    "zoom.us", "zoom", "microsoft teams", "teams", "google meet", "slack huddle", "facetime",
-    "webex", "discord",
+    "zoom.us",
+    "zoom",
+    "microsoft teams",
+    "teams",
+    "google meet",
+    "slack huddle",
+    "facetime",
+    "webex",
+    "discord",
 ];
 const COMMUNICATION_APPS: &[&str] = &[
-    "slack", "messages", "telegram", "whatsapp", "signal", "mail", "gmail", "outlook",
+    "slack",
+    "messages",
+    "telegram",
+    "whatsapp",
+    "signal",
+    "mail",
+    "gmail",
+    "outlook",
     "thunderbird",
 ];
 const WRITING_APPS: &[&str] = &[
-    "obsidian", "notion", "notes", "bear", "ulysses", "typora", "google docs", "microsoft word",
+    "obsidian",
+    "notion",
+    "notes",
+    "bear",
+    "ulysses",
+    "typora",
+    "google docs",
+    "microsoft word",
     "pages",
 ];
 
@@ -69,16 +118,44 @@ const WRITING_APPS: &[&str] = &[
 /// Banking / health / legal / dating / private browsing (agents.md #5 guardrail).
 const SENSITIVE_MARKERS: &[&str] = &[
     // finance
-    "bank", "chase", "wells fargo", "fidelity", "vanguard", "robinhood", "coinbase", "venmo",
-    "paypal", "mint", "quickbooks", "turbotax",
+    "bank",
+    "chase",
+    "wells fargo",
+    "fidelity",
+    "vanguard",
+    "robinhood",
+    "coinbase",
+    "venmo",
+    "paypal",
+    "mint",
+    "quickbooks",
+    "turbotax",
     // health / medical
-    "mychart", "teladoc", "doctor", "clinic", "pharmacy", "calm", "headspace", "clue", "flo",
+    "mychart",
+    "teladoc",
+    "doctor",
+    "clinic",
+    "pharmacy",
+    "calm",
+    "headspace",
+    "clue",
+    "flo",
     // legal
-    "docusign", "clio", "lawpay", "legalzoom",
+    "docusign",
+    "clio",
+    "lawpay",
+    "legalzoom",
     // dating
-    "tinder", "hinge", "bumble", "grindr", "okcupid", "match.com",
+    "tinder",
+    "hinge",
+    "bumble",
+    "grindr",
+    "okcupid",
+    "match.com",
     // private browsing
-    "private browsing", "incognito", "inprivate",
+    "private browsing",
+    "incognito",
+    "inprivate",
 ];
 
 fn classify_app(app_name: &str) -> &'static str {
@@ -137,8 +214,12 @@ pub(crate) async fn cascade_pool(
     if !db_path.exists() {
         return Err(format!("database not found at {}", db_path.display()));
     }
-    let pool = open(&db_path).await.map_err(|e| format!("open cascade schema: {e}"))?;
-    migrate(&pool).await.map_err(|e| format!("migrate cascade schema: {e}"))?;
+    let pool = open(&db_path)
+        .await
+        .map_err(|e| format!("open cascade schema: {e}"))?;
+    migrate(&pool)
+        .await
+        .map_err(|e| format!("migrate cascade schema: {e}"))?;
     Ok(pool)
 }
 
@@ -414,7 +495,8 @@ fn frame_text_blob(frame: &SearchContent) -> String {
 }
 
 fn rewind_snippet(frame: &SearchContent, max_chars: usize) -> String {
-    frame.text
+    frame
+        .text
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -427,7 +509,10 @@ fn dedupe_push(items: &mut Vec<String>, value: String) {
     if value.trim().is_empty() {
         return;
     }
-    if items.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
+    if items
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&value))
+    {
         return;
     }
     items.push(value);
@@ -447,7 +532,13 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn preview_delimited(value: &str, delimiter: &str, max_items: usize, max_chars: usize, joiner: &str) -> String {
+fn preview_delimited(
+    value: &str,
+    delimiter: &str,
+    max_items: usize,
+    max_chars: usize,
+    joiner: &str,
+) -> String {
     let mut items = value
         .split(delimiter)
         .map(collapse_whitespace)
@@ -483,9 +574,7 @@ fn sanitize_evidence_label(label: &str) -> String {
         "how they finished it" | "completion pattern" | "finished with" => {
             "how they finished it".to_string()
         }
-        "proposed automation" | "automation" | "agent purpose" => {
-            "proposed automation".to_string()
-        }
+        "proposed automation" | "automation" | "agent purpose" => "proposed automation".to_string(),
         _ => normalized,
     }
 }
@@ -511,9 +600,9 @@ fn sanitize_detector_evidence(items: Vec<CascadeManagerEvidence>) -> Vec<Cascade
         let label = sanitize_evidence_label(&item.label);
         let value = sanitize_evidence_value(&label, &item.value);
         if value.is_empty()
-            || out
-                .iter()
-                .any(|existing: &CascadeManagerEvidence| existing.label == label && existing.value == value)
+            || out.iter().any(|existing: &CascadeManagerEvidence| {
+                existing.label == label && existing.value == value
+            })
         {
             continue;
         }
@@ -670,12 +759,24 @@ fn repeat_signal_summary(grounding: &WorkflowGrounding) -> String {
     if !grounding.target_hosts.is_empty() {
         parts.push(format!(
             "Keeps happening in {}",
-            grounding.target_hosts.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+            grounding
+                .target_hosts
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     } else if !grounding.observed_apps.is_empty() {
         parts.push(format!(
             "Shows up across {}",
-            grounding.observed_apps.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+            grounding
+                .observed_apps
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if grounding.observed_workflow.len() >= 3 {
@@ -693,7 +794,10 @@ fn repeat_signal_summary(grounding: &WorkflowGrounding) -> String {
     truncate_chars(&parts.join(" · "), 180)
 }
 
-fn should_keep_manager_suggestion(s: &CascadeManagerSuggestion, grounding: &WorkflowGrounding) -> bool {
+fn should_keep_manager_suggestion(
+    s: &CascadeManagerSuggestion,
+    grounding: &WorkflowGrounding,
+) -> bool {
     if s.title.trim().is_empty() || s.summary.trim().is_empty() {
         return false;
     }
@@ -726,7 +830,10 @@ fn top_ranked(mut counts: HashMap<String, i64>, limit: usize) -> Vec<String> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowGrounding {
-    #[serde(default = "default_execution_mode", deserialize_with = "de_null_string")]
+    #[serde(
+        default = "default_execution_mode",
+        deserialize_with = "de_null_string"
+    )]
     pub execution_mode: String,
     #[serde(default, deserialize_with = "de_null_string")]
     pub primary_url: String,
@@ -890,7 +997,10 @@ fn add_grounding_evidence(s: &mut CascadeManagerSuggestion, grounding: &Workflow
     if !grounding.observed_workflow.is_empty() {
         s.evidence.push(CascadeManagerEvidence {
             label: "workflow observed".to_string(),
-            value: sanitize_evidence_value("workflow observed", &grounding.observed_workflow.join(" | ")),
+            value: sanitize_evidence_value(
+                "workflow observed",
+                &grounding.observed_workflow.join(" | "),
+            ),
         });
     }
     if !grounding.completion_pattern.is_empty() {
@@ -980,7 +1090,11 @@ fn merge_grounding_into_spec(doc: &mut AgentSpecDoc, grounding: &WorkflowGroundi
 /// work: count the hosts they actually browsed (dropping search/new-tab noise and
 /// sensitive sites), and bias toward one whose host matches a word in the task.
 /// Returns the origin ("https://host") to open + sign into, or None.
-pub(crate) async fn rewind_primary_url(app: &tauri::AppHandle, hours: u32, task: &str) -> Option<String> {
+pub(crate) async fn rewind_primary_url(
+    app: &tauri::AppHandle,
+    hours: u32,
+    task: &str,
+) -> Option<String> {
     let frames = fetch_rewind_frames(app, hours, 500).await.ok()?;
     let task_l = task.to_lowercase();
     let keywords: Vec<&str> = task_l
@@ -991,7 +1105,9 @@ pub(crate) async fn rewind_primary_url(app: &tauri::AppHandle, hours: u32, task:
     use std::collections::HashMap;
     let mut score: HashMap<String, i64> = HashMap::new();
     for f in &frames {
-        let Some(host) = host_from_url(&f.browser_url) else { continue };
+        let Some(host) = host_from_url(&f.browser_url) else {
+            continue;
+        };
         // Drop browser/search/local noise plus sensitive hosts before scoring.
         if !is_candidate_target_host(&host) {
             continue;
@@ -1042,7 +1158,11 @@ fn build_digest_from_frames(owned: &[SearchContent]) -> (String, usize, u32) {
         }
         used += 1;
         let hhmm = f.timestamp.get(11..16).unwrap_or("");
-        let app_name = if f.app_name.is_empty() { "?" } else { f.app_name.trim() };
+        let app_name = if f.app_name.is_empty() {
+            "?"
+        } else {
+            f.app_name.trim()
+        };
         let win = f.window_name.trim();
         let key = format!("{app_name}|{win}");
         if key != last_key {
@@ -1087,9 +1207,11 @@ struct UiStep {
 /// focused on web steps instead of unrelated Finder/terminal/desktop clicks.
 fn is_browser_app(app: &str) -> bool {
     let a = app.to_lowercase();
-    ["chrome", "safari", "firefox", "edge", "arc", "brave", "chromium", "opera", "vivaldi"]
-        .iter()
-        .any(|b| a.contains(b))
+    [
+        "chrome", "safari", "firefox", "edge", "arc", "brave", "chromium", "opera", "vivaldi",
+    ]
+    .iter()
+    .any(|b| a.contains(b))
 }
 
 /// Structural accessibility labels that name a container, not a real target —
@@ -1101,10 +1223,30 @@ fn is_generic_element(name: &str) -> bool {
     }
     matches!(
         n.as_str(),
-        "cell" | "scroll area" | "list view" | "row" | "group" | "button" | "image"
-            | "text" | "web area" | "html content" | "generic" | "document" | "list"
-            | "table" | "list item" | "heading" | "main" | "navigation" | "banner"
-            | "link" | "static text" | "contentinfo" | "complementary" | "toolbar"
+        "cell"
+            | "scroll area"
+            | "list view"
+            | "row"
+            | "group"
+            | "button"
+            | "image"
+            | "text"
+            | "web area"
+            | "html content"
+            | "generic"
+            | "document"
+            | "list"
+            | "table"
+            | "list item"
+            | "heading"
+            | "main"
+            | "navigation"
+            | "banner"
+            | "link"
+            | "static text"
+            | "contentinfo"
+            | "complementary"
+            | "toolbar"
     )
 }
 
@@ -1203,7 +1345,10 @@ fn build_step_playbook(rows: &[UiStep], browser_only: bool) -> String {
                 };
                 let mut line = format!("Click \"{}\"", name.chars().take(50).collect::<String>());
                 if !where_.is_empty() {
-                    line.push_str(&format!(" — {}", where_.chars().take(40).collect::<String>()));
+                    line.push_str(&format!(
+                        " — {}",
+                        where_.chars().take(40).collect::<String>()
+                    ));
                 }
                 out.push(line);
             }
@@ -1353,12 +1498,11 @@ pub async fn cascade_run_privacy_aggregation(
     let hours = hours.unwrap_or(8).clamp(1, 24);
     let (window_start, window_end, summary) = fetch_activity_summary(&app, hours).await?;
 
-    let (aggregates, excluded_count) =
-        if summary.data_status == "ok" && summary.total_frames > 0 {
-            sanitize(&summary)
-        } else {
-            (Vec::new(), 0)
-        };
+    let (aggregates, excluded_count) = if summary.data_status == "ok" && summary.total_frames > 0 {
+        sanitize(&summary)
+    } else {
+        (Vec::new(), 0)
+    };
 
     // Persist to the single-writer aggregate table.
     let pool = cascade_pool(&app).await?;
@@ -1490,7 +1634,7 @@ fn default_tier() -> String {
     "suggest".to_string()
 }
 
-/// Models sometimes emit `null` for a string/number field. Coerce null (and a
+/// Models sometimes emit `null` for a string/number/bool field. Coerce null (and a
 /// missing key) to the type's default rather than failing the whole parse.
 fn de_null_string<'de, D>(d: D) -> Result<String, D::Error>
 where
@@ -1503,6 +1647,12 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<f64>::deserialize(d)?.unwrap_or(0.0))
+}
+fn de_null_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<bool>::deserialize(d)?.unwrap_or(false))
 }
 
 fn detector_system_prompt() -> String {
@@ -1666,12 +1816,18 @@ pub async fn cascade_generate_manager_suggestions(
     app: tauri::AppHandle,
     hours: Option<u32>,
 ) -> Result<CascadeManagerSuggestionBatch, String> {
+    require_anthropic_key_for("generating manager suggestions")?;
     let hours = hours.unwrap_or(8).clamp(1, 24);
 
     // Surface the Cascade floating box while detection runs so it's visible the
     // moment the manager clicks "Refresh signals". Uses spec_id -1 (the detector).
     #[cfg(target_os = "macos")]
-    crate::cascade_computer::box_begin(&app, -1, "Cascade Detector", "Reading your Rewind recording");
+    crate::cascade_computer::box_begin(
+        &app,
+        -1,
+        "Cascade Detector",
+        "Reading your Rewind recording",
+    );
 
     // Read the Rewind: what the employee ACTUALLY did on screen (window titles +
     // OCR), sensitive apps dropped. This is the detector's real input now.
@@ -1688,16 +1844,27 @@ pub async fn cascade_generate_manager_suggestions(
         }
     }
     // Keep the privacy aggregates table fresh for the dashboards (non-fatal).
-    let (window_start, window_end) = match cascade_run_privacy_aggregation(app.clone(), Some(hours)).await {
-        Ok(r) => (r.window_start, r.window_end),
-        Err(_) => {
-            let end = Utc::now();
-            ((end - Duration::hours(hours as i64)).to_rfc3339(), end.to_rfc3339())
-        }
-    };
+    let (window_start, window_end) =
+        match cascade_run_privacy_aggregation(app.clone(), Some(hours)).await {
+            Ok(r) => (r.window_start, r.window_end),
+            Err(_) => {
+                let end = Utc::now();
+                (
+                    (end - Duration::hours(hours as i64)).to_rfc3339(),
+                    end.to_rfc3339(),
+                )
+            }
+        };
 
     #[cfg(target_os = "macos")]
-    crate::cascade_computer::box_step(&app, -1, "Cascade Detector", "Rewind", &format!("Read {frames} screens from your recording — finding repetitive work…"), 1);
+    crate::cascade_computer::box_step(
+        &app,
+        -1,
+        "Cascade Detector",
+        "Rewind",
+        &format!("Read {frames} screens from your recording — finding repetitive work…"),
+        1,
+    );
 
     let mut batch = CascadeManagerSuggestionBatch {
         generated_at: Utc::now().to_rfc3339(),
@@ -1714,7 +1881,13 @@ pub async fn cascade_generate_manager_suggestions(
     if digest.trim().is_empty() {
         batch.outbox_path = write_json_outbox(&app, MANAGER_OUTBOX_DIR, &batch)?;
         #[cfg(target_os = "macos")]
-        crate::cascade_computer::box_end(&app, -1, "Cascade Detector", "Detection", "Nothing recorded to analyze yet — let the Rewind capture some work first.");
+        crate::cascade_computer::box_end(
+            &app,
+            -1,
+            "Cascade Detector",
+            "Detection",
+            "Nothing recorded to analyze yet — let the Rewind capture some work first.",
+        );
         return Ok(batch);
     }
 
@@ -1724,7 +1897,10 @@ pub async fn cascade_generate_manager_suggestions(
     let mut suggestions = assemble_suggestions(
         &app,
         normalized,
-        GroundingMode::LivePerSuggestion { hours, max_frames: 250 },
+        GroundingMode::LivePerSuggestion {
+            hours,
+            max_frames: 250,
+        },
     )
     .await;
 
@@ -1781,7 +1957,10 @@ pub async fn cascade_generate_manager_suggestions(
         -1,
         "Cascade Detector",
         "Detection",
-        &format!("Found {} pattern(s) to review in Manager.", suggestions.len()),
+        &format!(
+            "Found {} pattern(s) to review in Manager.",
+            suggestions.len()
+        ),
     );
 
     batch.suggestions = suggestions;
@@ -1826,7 +2005,11 @@ fn local_day_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
             .unwrap_or_else(|| Utc.from_utc_datetime(&n))
     };
     let start = date.and_hms_opt(0, 0, 0).unwrap();
-    let end = date.succ_opt().unwrap_or(date).and_hms_opt(0, 0, 0).unwrap();
+    let end = date
+        .succ_opt()
+        .unwrap_or(date)
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
     (to_utc(start), to_utc(end))
 }
 
@@ -1912,7 +2095,11 @@ fn merge_groundings(into: &mut WorkflowGrounding, from: &WorkflowGrounding) {
         }
     }
     for w in &from.observed_workflow {
-        if !into.observed_workflow.iter().any(|e| e.eq_ignore_ascii_case(w)) {
+        if !into
+            .observed_workflow
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(w))
+        {
             into.observed_workflow.push(w.clone());
         }
     }
@@ -2000,7 +2187,8 @@ pub(crate) async fn run_scheduled_detection(app: &tauri::AppHandle) -> Result<us
                 kind: s.kind.clone(),
                 title: s.title.clone(),
                 summary: s.summary.clone(),
-                evidence_json: serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".to_string()),
+                evidence_json: serde_json::to_string(&evidence)
+                    .unwrap_or_else(|_| "[]".to_string()),
                 suggested_agent_kind: s.suggested_agent_kind.clone(),
                 severity_score: s.severity_score,
                 confidence: s.confidence,
@@ -2037,7 +2225,10 @@ async fn ensure_daily_summaries(app: &tauri::AppHandle) -> Result<(), String> {
         let need = match by_day.get(&day) {
             None => true,
             Some(updated) => {
-                back == 0 && sqlite_ts_age_hours(updated).map(|h| h > 4.0).unwrap_or(true)
+                back == 0
+                    && sqlite_ts_age_hours(updated)
+                        .map(|h| h > 4.0)
+                        .unwrap_or(true)
             }
         };
         if need {
@@ -2175,21 +2366,26 @@ pub async fn cascade_update_manager_suggestion_status(
 /// in the runtime (see `execute_tool`). Anything off this list — especially
 /// shell/exec — is rejected at validation time.
 const TOOL_WHITELIST: &[&str] = &[
-    "read.activity",   // read the employee's recent sanitized activity (input)
+    "read.activity",    // read the employee's recent sanitized activity (input)
     "analyze.patterns", // LLM reasoning over the inputs
-    "summarize.text",  // LLM summary / recap content
-    "browser.use",     // work inside the same website/tool the employee used
-    "artifact.write",  // write a real deliverable document (recap/digest/plan/checklist)
-    "draft.message",   // draft a message the employee can review + send themselves
-    "task.create",     // create a task/checklist item as a real artifact
-    "reminder.set",    // set a reminder as a real artifact
-    "notify.local",    // a real macOS notification to the employee
+    "summarize.text",   // LLM summary / recap content
+    "browser.use",      // work inside the same website/tool the employee used
+    "artifact.write",   // write a real deliverable document (recap/digest/plan/checklist)
+    "draft.message",    // draft a message the employee can review + send themselves
+    "task.create",      // create a task/checklist item as a real artifact
+    "reminder.set",     // set a reminder as a real artifact
+    "notify.local",     // a real macOS notification to the employee
 ];
 
 /// Capabilities that produce an outward-facing / committing work product →
 /// supervised (require employee approval) on an agent's first 3 live runs.
 /// Pure analysis, reads, and local notifications auto-run.
-const MUTATING_TOOLS: &[&str] = &["artifact.write", "draft.message", "task.create", "reminder.set"];
+const MUTATING_TOOLS: &[&str] = &[
+    "artifact.write",
+    "draft.message",
+    "task.create",
+    "reminder.set",
+];
 
 const MAX_PER_EXEC_COST_USD: f64 = 0.10;
 
@@ -2232,7 +2428,10 @@ pub struct AgentSpecDoc {
     pub task_description: String,
     #[serde(default, deserialize_with = "de_null_string")]
     pub rationale: String,
-    #[serde(default = "default_execution_mode", deserialize_with = "de_null_string")]
+    #[serde(
+        default = "default_execution_mode",
+        deserialize_with = "de_null_string"
+    )]
     pub execution_mode: String,
     #[serde(default, deserialize_with = "de_null_string")]
     pub target_url: String,
@@ -2433,11 +2632,16 @@ fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
     }
 
     // Mutating tool requires at least one approval point.
-    let has_mutating = doc.tools.iter().any(|t| MUTATING_TOOLS.contains(&t.as_str()))
-        || doc
-            .workflow
-            .iter()
-            .any(|s| s.tool.as_deref().map(|t| MUTATING_TOOLS.contains(&t)).unwrap_or(false));
+    let has_mutating = doc
+        .tools
+        .iter()
+        .any(|t| MUTATING_TOOLS.contains(&t.as_str()))
+        || doc.workflow.iter().any(|s| {
+            s.tool
+                .as_deref()
+                .map(|t| MUTATING_TOOLS.contains(&t))
+                .unwrap_or(false)
+        });
     if has_mutating && doc.approval_points.is_empty() {
         problems.push("state-mutating tools declared but no approval points".into());
     }
@@ -2462,7 +2666,9 @@ fn validate_spec(doc: &AgentSpecDoc) -> (String, Option<String>) {
         }
         for host in &doc.target_hosts {
             if !is_candidate_target_host(host) {
-                problems.push(format!("targetHosts includes search, local, or sensitive host: {host}"));
+                problems.push(format!(
+                    "targetHosts includes search, local, or sensitive host: {host}"
+                ));
             }
         }
         if !has_browser_step {
@@ -2524,9 +2730,12 @@ pub async fn cascade_generate_agent_spec(
     app: tauri::AppHandle,
     suggestion_id: i64,
 ) -> Result<CascadeAgentSpecView, String> {
+    require_anthropic_key_for("generating a Cascade agent spec")?;
     let suggestion = load_suggestion(&app, suggestion_id).await?;
     let grounding_query = format!("{} {}", suggestion.title, suggestion.summary);
-    let grounding = fetch_rewind_grounding(&app, 24, &grounding_query, 300).await.unwrap_or_default();
+    let grounding = fetch_rewind_grounding(&app, 24, &grounding_query, 300)
+        .await
+        .unwrap_or_default();
 
     let call = LlmCall {
         model: MODEL_OPUS,
@@ -2562,7 +2771,8 @@ pub async fn cascade_generate_agent_spec(
         None,
         "system",
         "spec_generated",
-        &serde_json::json!({ "validation": validation_status, "notes": validation_notes }).to_string(),
+        &serde_json::json!({ "validation": validation_status, "notes": validation_notes })
+            .to_string(),
     )
     .await
     .map_err(|e| format!("audit: {e}"))?;
@@ -2579,7 +2789,10 @@ pub async fn cascade_generate_agent_spec(
 /// can be tested without waiting for the detector to surface a real pattern.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAgentSpecView, String> {
+pub async fn cascade_seed_demo_agent(
+    app: tauri::AppHandle,
+) -> Result<CascadeAgentSpecView, String> {
+    require_anthropic_key_for("generating a demo Cascade agent")?;
     // 1. Get a real suggestion from the Detector (#2). Reuse the latest one if
     //    present, else run detection over the employee's real activity.
     let mut suggestions = cascade_list_manager_suggestions(app.clone(), None, Some(10)).await?;
@@ -2596,12 +2809,18 @@ pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAge
             // Generator (#3) still works from genuine activity — not a fixture.
             let pool = cascade_pool(&app).await?;
             let now = Utc::now().to_rfc3339();
-            let run_id =
-                create_detection_run(&pool, "demo-seed-from-activity", &now, &now, "{\"seed\":true}")
-                    .await
-                    .map_err(|e| format!("seed detection run: {e}"))?;
-            let top_app =
-                preferred_notes_app(&app).await.unwrap_or_else(|| "your notes app".to_string());
+            let run_id = create_detection_run(
+                &pool,
+                "demo-seed-from-activity",
+                &now,
+                &now,
+                "{\"seed\":true}",
+            )
+            .await
+            .map_err(|e| format!("seed detection run: {e}"))?;
+            let top_app = preferred_notes_app(&app)
+                .await
+                .unwrap_or_else(|| "your notes app".to_string());
             let evidence = serde_json::to_string(&vec![CascadeManagerEvidence {
                 label: "most-used notes/docs app".to_string(),
                 value: top_app.clone(),
@@ -2637,7 +2856,15 @@ pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAge
         .await
         .map_err(|e| format!("deploy spec: {e}"))?;
     let _ = update_manager_suggestion_status(&pool, suggestion_id, "deployed").await;
-    let _ = append_audit(&pool, Some(spec.id), None, "system", "deployed_via_workflow", "{}").await;
+    let _ = append_audit(
+        &pool,
+        Some(spec.id),
+        None,
+        "system",
+        "deployed_via_workflow",
+        "{}",
+    )
+    .await;
 
     let record = get_agent_spec(&pool, spec.id)
         .await
@@ -2657,6 +2884,7 @@ pub async fn cascade_seed_demo_agent(app: tauri::AppHandle) -> Result<CascadeAge
 pub async fn cascade_seed_daily_recap_agent(
     app: tauri::AppHandle,
 ) -> Result<CascadeAgentSpecView, String> {
+    require_anthropic_key_for("generating the daily recap Cascade agent")?;
     let pool = cascade_pool(&app).await?;
     let preferred_notes = preferred_notes_app(&app)
         .await
@@ -2673,7 +2901,8 @@ pub async fn cascade_seed_daily_recap_agent(
         "daily-recap-seed",
         &now,
         &now,
-        &serde_json::json!({ "seed": "daily-recap", "preferredNotesApp": preferred_notes }).to_string(),
+        &serde_json::json!({ "seed": "daily-recap", "preferredNotesApp": preferred_notes })
+            .to_string(),
     )
     .await
     .map_err(|e| format!("seed detection run: {e}"))?;
@@ -2747,11 +2976,13 @@ pub async fn cascade_list_agent_specs(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SandboxModelOutput {
+    #[serde(default, deserialize_with = "de_null_string")]
     status: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     summary: String,
     #[serde(default)]
     steps: Vec<SandboxModelStep>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_bool")]
     would_mutate: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2767,11 +2998,11 @@ pub struct SandboxStep {
 struct SandboxModelStep {
     #[serde(default)]
     step: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     tool: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     action: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     mocked_result: String,
 }
 
@@ -2834,7 +3065,8 @@ fn sandbox_user_prompt(doc: &AgentSpecDoc, rewind: &str, grounding: &WorkflowGro
     let workflow = if grounding.observed_workflow.is_empty() {
         "[]".to_string()
     } else {
-        serde_json::to_string_pretty(&grounding.observed_workflow).unwrap_or_else(|_| "[]".to_string())
+        serde_json::to_string_pretty(&grounding.observed_workflow)
+            .unwrap_or_else(|_| "[]".to_string())
     };
     format!(
         "AGENT SPEC:\n{spec}\n\nREWIND DIGEST (mock input):\n{}\n\nOBSERVED TOOL GROUNDING:\n\
@@ -2845,12 +3077,32 @@ fn sandbox_user_prompt(doc: &AgentSpecDoc, rewind: &str, grounding: &WorkflowGro
 - completionPattern: {}\n\
 - observedWorkflow: {}\n\n\
 Simulate one run. Use only the spec's declared tools.",
-        if rewind.trim().is_empty() { "(nothing recorded yet)" } else { rewind },
+        if rewind.trim().is_empty() {
+            "(nothing recorded yet)"
+        } else {
+            rewind
+        },
         grounding.execution_mode,
-        if grounding.primary_url.is_empty() { "(none recovered)" } else { &grounding.primary_url },
-        if grounding.target_hosts.is_empty() { "[]".to_string() } else { grounding.target_hosts.join(", ") },
-        if grounding.observed_apps.is_empty() { "[]".to_string() } else { grounding.observed_apps.join(", ") },
-        if grounding.completion_pattern.is_empty() { "(none recovered)".to_string() } else { grounding.completion_pattern.clone() },
+        if grounding.primary_url.is_empty() {
+            "(none recovered)"
+        } else {
+            &grounding.primary_url
+        },
+        if grounding.target_hosts.is_empty() {
+            "[]".to_string()
+        } else {
+            grounding.target_hosts.join(", ")
+        },
+        if grounding.observed_apps.is_empty() {
+            "[]".to_string()
+        } else {
+            grounding.observed_apps.join(", ")
+        },
+        if grounding.completion_pattern.is_empty() {
+            "(none recovered)".to_string()
+        } else {
+            grounding.completion_pattern.clone()
+        },
         workflow
     )
 }
@@ -2875,7 +3127,8 @@ fn detect_anomalies(doc: &AgentSpecDoc, out: &SandboxModelOutput) -> Vec<Anomaly
     if out.would_mutate && doc.approval_points.is_empty() {
         anomalies.push(Anomaly {
             kind: "missing_approval".to_string(),
-            detail: "run would mutate external state but spec declares no approval points".to_string(),
+            detail: "run would mutate external state but spec declares no approval points"
+                .to_string(),
         });
     }
     if out.steps.len() as i64 > (doc.workflow.len() as i64) * 3 {
@@ -2900,13 +3153,14 @@ pub async fn cascade_sandbox_test(
     app: tauri::AppHandle,
     spec_id: i64,
 ) -> Result<CascadeAgentRun, String> {
+    require_anthropic_key_for("running a Cascade sandbox test")?;
     let pool = cascade_pool(&app).await?;
     let record = get_agent_spec(&pool, spec_id)
         .await
         .map_err(|e| format!("load spec: {e}"))?
         .ok_or_else(|| format!("spec {spec_id} not found"))?;
-    let doc: AgentSpecDoc = serde_json::from_str(&record.spec_json)
-        .map_err(|e| format!("parse spec: {e}"))?;
+    let doc: AgentSpecDoc =
+        serde_json::from_str(&record.spec_json).map_err(|e| format!("parse spec: {e}"))?;
 
     if record.validation_status != "valid" {
         return Err(format!(
@@ -2973,7 +3227,11 @@ pub async fn cascade_sandbox_test(
     .await
     .map_err(|e| format!("insert run: {e}"))?;
 
-    let next_status = if passed { "sandbox_passed" } else { "sandbox_failed" };
+    let next_status = if passed {
+        "sandbox_passed"
+    } else {
+        "sandbox_failed"
+    };
     update_agent_spec_status(&pool, spec_id, next_status, None, None)
         .await
         .map_err(|e| format!("advance spec: {e}"))?;
@@ -3193,7 +3451,13 @@ fn agent_outputs_dir(app: &tauri::AppHandle, spec_id: i64) -> Result<PathBuf, St
 
 fn slug(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -3226,7 +3490,9 @@ fn fire_notification(title: &str, body: &str) {
             clean(body).chars().take(220).collect::<String>(),
             clean(title).chars().take(80).collect::<String>(),
         );
-        let _ = std::process::Command::new("osascript").args(["-e", &script]).output();
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output();
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -3238,7 +3504,9 @@ fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Derive a note title from the first usable line of the produced content.
@@ -3273,7 +3541,10 @@ fn apple_notes_create(title: &str, content: &str) -> Result<(), String> {
         .output()
         .map_err(|e| format!("apple notes: {e}"))?;
     if !out.status.success() {
-        return Err(format!("apple notes failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!(
+            "apple notes failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(())
 }
@@ -3390,7 +3661,8 @@ fn write_local_record(
     let ext = if tool == "draft.message" { "txt" } else { "md" };
     let fname = format!("run{run_id}-step{step}-{}.{ext}", slug(tool));
     let path = dir.join(fname);
-    let header = format!("<!-- Cascade agent: {agent_name} · {tool} · run {run_id} step {step} -->\n\n");
+    let header =
+        format!("<!-- Cascade agent: {agent_name} · {tool} · run {run_id} step {step} -->\n\n");
     fs::write(&path, format!("{header}{content}")).map_err(|e| format!("write artifact: {e}"))?;
     Ok(path.display().to_string())
 }
@@ -3415,10 +3687,19 @@ fn commit_side_effect(
             match target {
                 DeliveryTarget::Obsidian => {
                     if let Ok((path, open)) = obsidian_write(&title, content) {
-                        return Ok(Delivered { path: Some(path), app_label: "Obsidian".into(), open_ref: Some(open) });
+                        return Ok(Delivered {
+                            path: Some(path),
+                            app_label: "Obsidian".into(),
+                            open_ref: Some(open),
+                        });
                     }
-                    let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
-                    Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
+                    let path =
+                        write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
+                    Ok(Delivered {
+                        path: Some(path.clone()),
+                        app_label: "File".into(),
+                        open_ref: Some(format!("path:{path}")),
+                    })
                 }
                 DeliveryTarget::AppleNotes => match apple_notes_create(&title, content) {
                     Ok(()) => Ok(Delivered {
@@ -3427,17 +3708,28 @@ fn commit_side_effect(
                         open_ref: Some("app:Notes".into()),
                     }),
                     Err(_) => {
-                        let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
-                        Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
+                        let path = write_local_record(
+                            app, spec_id, run_id, step, tool, agent_name, content,
+                        )?;
+                        Ok(Delivered {
+                            path: Some(path.clone()),
+                            app_label: "File".into(),
+                            open_ref: Some(format!("path:{path}")),
+                        })
                     }
                 },
                 DeliveryTarget::LocalFile { preferred_app } => {
-                    let path = write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
+                    let path =
+                        write_local_record(app, spec_id, run_id, step, tool, agent_name, content)?;
                     let app_label = preferred_app
                         .filter(|name| !name.trim().is_empty())
                         .map(|name| format!("File for {name}"))
                         .unwrap_or_else(|| "File".to_string());
-                    Ok(Delivered { path: Some(path.clone()), app_label, open_ref: Some(format!("path:{path}")) })
+                    Ok(Delivered {
+                        path: Some(path.clone()),
+                        app_label,
+                        open_ref: Some(format!("path:{path}")),
+                    })
                 }
             }
         }
@@ -3446,11 +3738,18 @@ fn commit_side_effect(
             if tool == "reminder.set" {
                 fire_notification(&format!("Cascade reminder · {agent_name}"), content);
             }
-            Ok(Delivered { path: Some(path.clone()), app_label: "File".into(), open_ref: Some(format!("path:{path}")) })
+            Ok(Delivered {
+                path: Some(path.clone()),
+                app_label: "File".into(),
+                open_ref: Some(format!("path:{path}")),
+            })
         }
         "notify.local" => {
             fire_notification(&format!("Cascade · {agent_name}"), content);
-            Ok(Delivered { app_label: "Notification".into(), ..Default::default() })
+            Ok(Delivered {
+                app_label: "Notification".into(),
+                ..Default::default()
+            })
         }
         // read.activity / analyze.patterns / summarize.text have no side effect.
         _ => Ok(Delivered::default()),
@@ -3516,7 +3815,6 @@ fn is_browser_execution(doc: &AgentSpecDoc) -> bool {
             .any(|step| step.tool.as_deref() == Some("browser.use"))
 }
 
-
 fn action_view(a: cascade_schema::AgentActionRecord) -> CascadeAgentAction {
     CascadeAgentAction {
         id: a.id,
@@ -3533,7 +3831,6 @@ fn action_view(a: cascade_schema::AgentActionRecord) -> CascadeAgentAction {
         created_at: a.created_at,
     }
 }
-
 
 #[tauri::command]
 #[specta::specta]
@@ -3571,7 +3868,14 @@ pub async fn cascade_approve_action(
     let content = action.content.clone().unwrap_or_default();
     let target = resolve_delivery_target(&app).await;
     let _ = commit_side_effect(
-        &app, action.spec_id, action.run_id, action.step, &action.tool, &spec.name, &content, target,
+        &app,
+        action.spec_id,
+        action.run_id,
+        action.step,
+        &action.tool,
+        &spec.name,
+        &content,
+        target,
     )?;
     update_agent_action_state(&pool, action_id, "committed")
         .await
@@ -3595,10 +3899,7 @@ pub async fn cascade_approve_action(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_reject_action(
-    app: tauri::AppHandle,
-    action_id: i64,
-) -> Result<(), String> {
+pub async fn cascade_reject_action(app: tauri::AppHandle, action_id: i64) -> Result<(), String> {
     let pool = cascade_pool(&app).await?;
     let action = get_agent_action(&pool, action_id)
         .await
@@ -3623,10 +3924,7 @@ pub async fn cascade_reject_action(
 /// One-click undo of a committed, reversible action — deletes the artifact.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_rollback_action(
-    app: tauri::AppHandle,
-    action_id: i64,
-) -> Result<(), String> {
+pub async fn cascade_rollback_action(app: tauri::AppHandle, action_id: i64) -> Result<(), String> {
     let pool = cascade_pool(&app).await?;
     let action = get_agent_action(&pool, action_id)
         .await
@@ -3636,7 +3934,10 @@ pub async fn cascade_rollback_action(
         return Err("this action is not reversible".to_string());
     }
     if action.state != "committed" {
-        return Err(format!("only committed actions can be rolled back (state: {})", action.state));
+        return Err(format!(
+            "only committed actions can be rolled back (state: {})",
+            action.state
+        ));
     }
     if let Some(path) = &action.artifact_path {
         let _ = fs::remove_file(path);
@@ -3656,7 +3957,6 @@ pub async fn cascade_rollback_action(
     .map_err(|e| format!("audit: {e}"))?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3729,6 +4029,12 @@ mod tests {
             name: "x".into(),
             task_description: "do a thing".into(),
             rationale: "r".into(),
+            execution_mode: default_execution_mode(),
+            target_url: String::new(),
+            target_hosts: vec![],
+            observed_apps: vec![],
+            observed_workflow: vec![],
+            completion_pattern: String::new(),
             required_inputs: vec![],
             workflow: vec![WorkflowStep {
                 step: 1,
@@ -3759,6 +4065,12 @@ mod tests {
             name: "Inbox batcher".into(),
             task_description: "Batch low-priority email into a daily digest.".into(),
             rationale: "Reduces context switching.".into(),
+            execution_mode: default_execution_mode(),
+            target_url: String::new(),
+            target_hosts: vec![],
+            observed_apps: vec![],
+            observed_workflow: vec![],
+            completion_pattern: String::new(),
             required_inputs: vec![RequiredInput {
                 source: "cascade_privacy_aggregates".into(),
                 fields: vec!["app".into(), "durationMin".into()],
@@ -3797,6 +4109,12 @@ mod tests {
             name: "x".into(),
             task_description: "t".into(),
             rationale: "r".into(),
+            execution_mode: default_execution_mode(),
+            target_url: String::new(),
+            target_hosts: vec![],
+            observed_apps: vec![],
+            observed_workflow: vec![],
+            completion_pattern: String::new(),
             required_inputs: vec![],
             workflow: vec![WorkflowStep {
                 step: 1,
@@ -3828,5 +4146,26 @@ mod tests {
         let kinds: Vec<&str> = anomalies.iter().map(|a| a.kind.as_str()).collect();
         assert!(kinds.contains(&"scope_creep"));
         assert!(kinds.contains(&"missing_approval"));
+    }
+
+    #[test]
+    fn sandbox_output_accepts_nullable_model_strings() {
+        let out: SandboxModelOutput = serde_json::from_value(serde_json::json!({
+            "status": "success",
+            "summary": null,
+            "wouldMutate": null,
+            "steps": [{
+                "step": 1,
+                "tool": "read.activity",
+                "action": null,
+                "mockedResult": null
+            }]
+        }))
+        .expect("sandbox output should tolerate null strings from the model");
+
+        assert_eq!(out.summary, "");
+        assert!(!out.would_mutate);
+        assert_eq!(out.steps[0].action, "");
+        assert_eq!(out.steps[0].mocked_result, "");
     }
 }

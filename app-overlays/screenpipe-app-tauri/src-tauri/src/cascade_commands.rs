@@ -7,6 +7,7 @@
 //! The Layer 2 agents (#2 detector, #3 generator, #4 monitor, #5 aggregator)
 //! live in `cascade_agents.rs`.
 
+use crate::cascade_llm::{call_anthropic, LlmCall, MODEL_SONNET};
 use cascade_schema::{tag_event, TagSource};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -20,6 +21,15 @@ const ANTHROPIC_KEY_NAME: &str = "anthropic-api-key";
 #[serde(rename_all = "camelCase")]
 pub struct CascadeKeyStatus {
     pub has_anthropic_key: bool,
+}
+
+#[derive(Debug, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub struct CascadeReelFrameInput {
+    pub timestamp: Option<String>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub text: Option<String>,
 }
 
 fn pi_config_dir() -> std::io::Result<PathBuf> {
@@ -190,6 +200,112 @@ pub async fn cascade_clear_anthropic_key() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn reel_system_prompt() -> String {
+    r#"You are Cascade. You have read-only access to one moment of the user's recorded workday (provided in MOMENT METADATA + OCR TEXT below). Your job is to answer the user's exact question briefly, with cited evidence.
+
+HARD RULES - NEVER VIOLATE:
+1. Never fabricate timestamps, app names, file names, or quotes. If the provided context doesn't contain enough information, say so plainly.
+2. No psychological judgments. Forbidden phrasings: "you seemed unfocused", "you wasted time", "you were distracted", "you should have", "you procrastinated". Describe data, not the user.
+3. Retrospective only - never generative. Refuse to write emails, draft replies, compose messages, or take forward-looking actions. If asked, redirect: "I only answer about what you've already done."
+4. No fishing. Refuse questions about other people's screens or anything not derivable from this moment.
+5. No PII echoing. If OCR text contains anything that looks like a password, API key, credit card, or token, do not include it. Say "[sensitive content detected, hidden]" if relevant.
+
+ANSWER SHAPE - BE BRIEF BUT COMPLETE:
+- Lead with the direct answer in ONE sentence. No preamble. No "Let me", "I'll", "Based on", "Looking at", "Sure".
+- Then AT MOST 2 short bullets of the key supporting facts (only if they add real info). Each <= 1 line.
+- HARD CAP: 4 lines total. Be terse - pack the information densely, cut every filler word. Never pad.
+- Cite inline only when it matters: (HH:MMam/pm, App detail). Don't cite every line.
+- Don't end with "Want me to dig deeper?" or "Anything else?".
+- Never use markdown bold (**...**). Plain text only.
+
+REFUSALS:
+- Zero evidence: "I don't see evidence of that in this moment."
+- Out of scope: "I only have what was on your screen at this captured moment."
+- Generative request: "I only answer about what you've already done - I don't compose or send.""#.to_string()
+}
+
+fn redact_pii(text: &str) -> String {
+    let mut out = text.to_string();
+    let patterns = [
+        (r"sk-ant-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]"),
+        (r"sk-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]"),
+        (r"gh[opsu]_[A-Za-z0-9]{36,}", "[REDACTED_GH_TOKEN]"),
+        (r"AKIA[0-9A-Z]{16}", "[REDACTED_AWS_KEY]"),
+        (
+            r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}",
+            "[REDACTED_JWT]",
+        ),
+        (r"(?i)Bearer\s+[A-Za-z0-9_.-]{20,}", "Bearer [REDACTED]"),
+        (
+            r"(?i)(password|passwd|pwd|secret)\s*[:=]\s*\S+",
+            "$1: [REDACTED]",
+        ),
+    ];
+
+    for (pattern, replacement) in patterns {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            out = re.replace_all(&out, replacement).into_owned();
+        }
+    }
+
+    if let Ok(re) = regex::Regex::new(r"\b(?:\d[ -]?){13,19}\b") {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                let raw = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+                let digits = raw.chars().filter(|c| c.is_ascii_digit()).count();
+                if (13..=19).contains(&digits) {
+                    "[REDACTED_CARD]".to_string()
+                } else {
+                    raw.to_string()
+                }
+            })
+            .into_owned();
+    }
+
+    out
+}
+
+fn reel_context(frame: Option<CascadeReelFrameInput>) -> String {
+    let Some(frame) = frame else {
+        return "(no specific frame is selected - answer from general knowledge of recording behavior, or ask the user to scrub to a moment)".to_string();
+    };
+
+    let safe_text = redact_pii(&frame.text.unwrap_or_default())
+        .chars()
+        .take(4_000)
+        .collect::<String>();
+
+    format!(
+        "MOMENT METADATA\n- timestamp: {}\n- app: {}\n- window: {}\n\nOCR TEXT (verbatim from screen, may contain noise):\n\"\"\"\n{}\n\"\"\"",
+        frame.timestamp.unwrap_or_else(|| "unknown".to_string()),
+        frame.app_name.unwrap_or_else(|| "unknown".to_string()),
+        frame.window_name.unwrap_or_else(|| "unknown".to_string()),
+        if safe_text.trim().is_empty() { "(no text captured)" } else { safe_text.as_str() }
+    )
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_ask_reel_question(
+    question: String,
+    frame: Option<CascadeReelFrameInput>,
+) -> Result<String, String> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Err("question is empty".to_string());
+    }
+
+    let call = LlmCall {
+        model: MODEL_SONNET,
+        system: reel_system_prompt(),
+        user: format!("{}\n\nQUESTION: {}", reel_context(frame), question),
+        temperature: 0.1,
+        max_tokens: 260,
+    };
+
+    Ok(call_anthropic(&call).await?.text.trim().to_string())
 }
 
 /// Tag a frame manually. Forward-compat hook for Layer 2's classifier.

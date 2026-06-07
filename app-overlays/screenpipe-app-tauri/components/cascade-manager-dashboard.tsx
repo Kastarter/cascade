@@ -5,6 +5,7 @@
 
 import type { CSSProperties, ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   CascadeManagerSuggestion,
   CascadeManagerSuggestionBatch,
@@ -109,9 +110,11 @@ export function CascadeManagerDashboard() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [hasAnthropicKey, setHasAnthropicKey] = useState(false);
 
   useEffect(() => {
     void loadSuggestions();
+    void loadKeyStatus();
   }, []);
 
   useEffect(() => {
@@ -147,7 +150,20 @@ export function CascadeManagerDashboard() {
     }
   }
 
+  async function loadKeyStatus() {
+    try {
+      const status = await invoke<{ hasAnthropicKey: boolean }>("cascade_key_status");
+      setHasAnthropicKey(Boolean(status?.hasAnthropicKey));
+    } catch {
+      setHasAnthropicKey(false);
+    }
+  }
+
   async function refreshSuggestions() {
+    if (!hasAnthropicKey) {
+      setToast("Add your Anthropic API key in Settings before refreshing manager signals.");
+      return;
+    }
     setRefreshing(true);
     try {
       const generated = await generateManagerSuggestions(8);
@@ -207,7 +223,7 @@ export function CascadeManagerDashboard() {
             </span>
             <button
               onClick={refreshSuggestions}
-              disabled={refreshing}
+              disabled={refreshing || !hasAnthropicKey}
               style={{
                 padding: "8px 12px",
                 borderRadius: 8,
@@ -216,10 +232,11 @@ export function CascadeManagerDashboard() {
                 color: "var(--cascade-text-2)",
                 fontFamily: "var(--cascade-mono)",
                 fontSize: 10.5,
-                cursor: "pointer",
+                cursor: refreshing || !hasAnthropicKey ? "not-allowed" : "pointer",
+                opacity: refreshing || !hasAnthropicKey ? 0.55 : 1,
               }}
             >
-              {refreshing ? "Refreshing…" : "Refresh signals"}
+              {refreshing ? "Refreshing…" : hasAnthropicKey ? "Refresh signals" : "Add key first"}
             </button>
           </div>
 
@@ -272,6 +289,7 @@ export function CascadeManagerDashboard() {
       {selected && (
         <ComposeConsole
           pattern={selected}
+          hasAnthropicKey={hasAnthropicKey}
           onClose={() => setSelected(null)}
           onSent={handleSent}
         />
@@ -622,10 +640,12 @@ function CascadesTable({ cascades }: { cascades: ManagerDashboardCascade[] }) {
 
 function ComposeConsole({
   pattern,
+  hasAnthropicKey,
   onClose,
   onSent,
 }: {
   pattern: ManagerDashboardPattern;
+  hasAnthropicKey: boolean;
   onClose: () => void;
   onSent: (name: string) => void;
 }) {
@@ -664,6 +684,10 @@ function ComposeConsole({
 
   async function handleGenerate() {
     if (!pattern.suggestionId) return;
+    if (!hasAnthropicKey) {
+      setError("Add your Anthropic API key in Settings before generating an agent spec.");
+      return;
+    }
     setPhase("generating");
     setError(null);
     try {
@@ -838,8 +862,17 @@ function ComposeConsole({
               the exact tools it may touch, every approval point, and a rollback path. You review it before the
               employee ever sees it.
             </p>
-            <button onClick={handleGenerate} disabled={busy} style={{ ...primaryBtnStyle, padding: "11px 22px", fontSize: 12.5 }}>
-              {phase === "generating" ? "Generating spec…" : "Generate agent spec"}
+            <button
+              onClick={handleGenerate}
+              disabled={busy || !hasAnthropicKey}
+              style={{
+                ...primaryBtnStyle,
+                padding: "11px 22px",
+                fontSize: 12.5,
+                opacity: busy || !hasAnthropicKey ? 0.5 : 1,
+              }}
+            >
+              {phase === "generating" ? "Generating spec…" : hasAnthropicKey ? "Generate agent spec" : "Add key first"}
             </button>
           </div>
         ) : (
@@ -856,8 +889,12 @@ function ComposeConsole({
                   : "Sending requires the employee to sandbox-test + approve before it runs."}
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={handleGenerate} disabled={busy} style={ghostBtnStyle}>
-                {phase === "generating" ? "…" : "Regenerate"}
+              <button
+                onClick={handleGenerate}
+                disabled={busy || !hasAnthropicKey}
+                style={{ ...ghostBtnStyle, opacity: busy || !hasAnthropicKey ? 0.5 : 1 }}
+              >
+                {phase === "generating" ? "…" : hasAnthropicKey ? "Regenerate" : "Add key first"}
               </button>
               <button onClick={handleSend} disabled={busy || invalid || alreadySent} style={{ ...primaryBtnStyle, opacity: busy || invalid || alreadySent ? 0.5 : 1 }}>
                 {phase === "sending" ? "Sending…" : "Send to employee"}

@@ -1,5 +1,5 @@
 // cascade — passive monitoring + retrospective Q&A
-// https://github.com/Mohanad119/Cascade
+// https://github.com/Mohanad139/Cascade
 //
 // Cascade Reel — cinematic playback of your day.
 // Visual identity ported from the Cascade-2 prototype (reel.jsx + chat panel).
@@ -1034,21 +1034,13 @@ function SceneChatPanel({
   const [keyInput, setKeyInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Detect whether the Anthropic key is set. Source of truth is the key saved
-  // in Settings (Keychain); localStorage is just a cache for fast reads.
+  // Detect whether the Anthropic key is set. Source of truth is macOS Keychain.
   useEffect(() => {
     if (typeof window === "undefined") return;
     (async () => {
-      if (window.localStorage.getItem("cascade-anthropic-key")) {
-        setHasKey(true);
-        return;
-      }
       try {
-        const k = await invoke<string | null>("cascade_get_anthropic_key");
-        if (k) {
-          window.localStorage.setItem("cascade-anthropic-key", k);
-          setHasKey(true);
-        }
+        const status = await invoke<{ hasAnthropicKey: boolean }>("cascade_key_status");
+        setHasKey(Boolean(status?.hasAnthropicKey));
       } catch {
         /* non-fatal */
       }
@@ -1061,20 +1053,20 @@ function SceneChatPanel({
     setInput("");
   }, [segId]);
 
-  const saveKey = () => {
+  const saveKey = async () => {
     const k = keyInput.trim();
     if (!k.startsWith("sk-ant-")) return;
-    window.localStorage.setItem("cascade-anthropic-key", k);
-    // Persist to the Keychain too so the agents (detector/generator/computer-use)
-    // and the Reel chat all share one key.
-    invoke("cascade_set_anthropic_key", { key: k }).catch(() => {});
-    setHasKey(true);
-    setKeyInput("");
+    try {
+      await invoke("cascade_set_anthropic_key", { key: k });
+      setHasKey(true);
+      setKeyInput("");
+    } catch {
+      setHasKey(false);
+    }
   };
 
-  const clearKey = () => {
-    window.localStorage.removeItem("cascade-anthropic-key");
-    invoke("cascade_clear_anthropic_key").catch(() => {});
+  const clearKey = async () => {
+    await invoke("cascade_clear_anthropic_key").catch(() => {});
     setHasKey(false);
   };
 
@@ -1293,7 +1285,7 @@ function SceneChatPanel({
             }}
           >
             <div style={{ marginBottom: 6 }}>
-              Paste your Anthropic API key to ask questions. Stored locally only — never sent anywhere except api.anthropic.com.
+              Paste your Anthropic API key to ask questions. Stored in macOS Keychain and used only for Cascade's Anthropic calls.
             </div>
             <div style={{ display: "flex", gap: 6 }}>
               <input
@@ -1427,120 +1419,6 @@ function SceneChatPanel({
   );
 }
 
-/**
- * Call Claude directly from the browser using the user's BYOK Anthropic key.
- * Key is stored in localStorage under `cascade-anthropic-key`. Stored from
- * Settings (or onboarding once that's wired in M3 follow-up).
- */
-/**
- * Cascade Q&A system prompt — tight guardrails from the architecture spec.
- * Mirrors pipes/cascade-rewind-qa/pipe.md so behavior is consistent whether
- * the agent is invoked via Screenpipe's pi runtime or directly from the Reel
- * chat panel.
- */
-const CASCADE_SYSTEM_PROMPT = `You are Cascade. You have read-only access to one moment of the user's recorded workday (provided in MOMENT METADATA + OCR TEXT below). Your job is to answer the user's exact question briefly, with cited evidence.
-
-HARD RULES — NEVER VIOLATE:
-1. Never fabricate timestamps, app names, file names, or quotes. If the provided context doesn't contain enough information, say so plainly.
-2. No psychological judgments. Forbidden phrasings: "you seemed unfocused", "you wasted time", "you were distracted", "you should have", "you procrastinated". Describe data, not the user.
-3. Retrospective only — never generative. Refuse to write emails, draft replies, compose messages, or take forward-looking actions. If asked, redirect: "I only answer about what you've already done."
-4. No fishing. Refuse questions about other people's screens or anything not derivable from this moment.
-5. No PII echoing. If OCR text contains anything that looks like a password, API key, credit card, or token, do not include it. Say "[sensitive content detected, hidden]" if relevant.
-
-ANSWER SHAPE — BE BRIEF BUT COMPLETE:
-- Lead with the direct answer in ONE sentence. No preamble. No "Let me", "I'll", "Based on", "Looking at", "Sure".
-- Then AT MOST 2 short bullets of the key supporting facts (only if they add real info). Each ≤ 1 line.
-- HARD CAP: 4 lines total. Be terse — pack the information densely, cut every filler word. Never pad.
-- Cite inline only when it matters: (HH:MMam/pm, App · detail). Don't cite every line.
-- Don't end with "Want me to dig deeper?" or "Anything else?".
-- Never use markdown bold (**...**). Plain text only.
-
-REFUSALS:
-- Zero evidence: "I don't see evidence of that in this moment."
-- Out of scope: "I only have what was on your screen at this captured moment."
-- Generative request: "I only answer about what you've already done — I don't compose or send."`;
-
-/**
- * Defensive PII redaction before sending OCR to Claude. Removes obvious
- * password / token / card patterns. Not exhaustive — entropy-based detection
- * is a follow-up. Better to over-redact than leak.
- */
-function redactPII(text: string): string {
-  if (!text) return text;
-  return text
-    // Anthropic + OpenAI-style API keys
-    .replace(/sk-[a-zA-Z0-9_-]{20,}/g, "[REDACTED_API_KEY]")
-    .replace(/sk-ant-[a-zA-Z0-9_-]{20,}/g, "[REDACTED_API_KEY]")
-    // GitHub PATs
-    .replace(/gh[opsu]_[a-zA-Z0-9]{36,}/g, "[REDACTED_GH_TOKEN]")
-    // AWS access keys
-    .replace(/AKIA[0-9A-Z]{16}/g, "[REDACTED_AWS_KEY]")
-    // JWTs
-    .replace(/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED_JWT]")
-    // Credit card patterns (Luhn not enforced, but 13-19 digits with separators)
-    .replace(/\b(?:\d[ -]?){13,19}\b/g, (m) => {
-      const digits = m.replace(/\D/g, "");
-      return digits.length >= 13 && digits.length <= 19 ? "[REDACTED_CARD]" : m;
-    })
-    // Bearer tokens
-    .replace(/Bearer\s+[a-zA-Z0-9_.-]{20,}/gi, "Bearer [REDACTED]")
-    // Password labels like "password: secret123"
-    .replace(/(password|passwd|pwd|secret)\s*[:=]\s*\S+/gi, "$1: [REDACTED]");
-}
-
-async function getAnthropicKey(): Promise<string> {
-  // Prefer the key saved in Settings (Keychain); fall back to the localStorage cache.
-  try {
-    const k = await invoke<string | null>("cascade_get_anthropic_key");
-    if (k) return k;
-  } catch {
-    /* fall through to cache */
-  }
-  return (typeof window !== "undefined" && (window.localStorage.getItem("cascade-anthropic-key") ?? "")) || "";
-}
-
 async function askClaude(question: string, frame: CascadeFrame | null): Promise<string> {
-  const key = await getAnthropicKey();
-  if (!key) {
-    return "I need an Anthropic API key to answer. Add one in Settings (key starts with sk-ant-).";
-  }
-
-  // Redact PII patterns before sending OCR to Claude. Defensive — even though
-  // the user trusts their own key, OCR text may include passwords, API keys,
-  // credit cards, tokens.
-  const safeText = redactPII(frame?.text ?? "").slice(0, 4000);
-
-  const context = frame
-    ? `MOMENT METADATA
-- timestamp: ${new Date(frame.timestamp).toLocaleString()}
-- app: ${frame.app_name ?? "unknown"}
-- window: ${frame.window_name ?? "unknown"}
-
-OCR TEXT (verbatim from screen, may contain noise):
-"""
-${safeText || "(no text captured)"}
-"""`
-    : "(no specific frame is selected — answer from general knowledge of recording behavior, or ask the user to scrub to a moment)";
-
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 260,
-      system: CASCADE_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: `${context}\n\nQUESTION: ${question}` }],
-    }),
-  });
-  if (!r.ok) {
-    const errText = await r.text();
-    throw new Error(`Anthropic ${r.status}: ${errText.slice(0, 200)}`);
-  }
-  const json = await r.json();
-  return json?.content?.[0]?.text ?? "(no response)";
+  return invoke<string>("cascade_ask_reel_question", { question, frame });
 }
