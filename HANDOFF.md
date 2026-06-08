@@ -1,321 +1,97 @@
-# Cascade — Session Handoff (2026-06-05)
+# Cascade Swift-First Handoff
 
-## 2026-06-05 update — sandbox agent browser is now invisible (box-only)
+Last updated: 2026-06-08.
 
-The Local Sandbox agent browser no longer opens as a visible on-screen window. It's
-created invisible (`alphaValue 0` + `ignoresMouseEvents`, on-screen so WebKit keeps
-painting) and the agent "sees" its page via WKWebView `takeSnapshotWithConfiguration`
-instead of `screencapture -l <windowID>` — which required the window on-screen and was
-why a second browser used to pop up every run. The floating box streams those snapshot
-frames, so the user only ever watches the box.
+## Current Direction
 
-Reveal/hide wiring (no new commands / no frontend change — reuses the box's existing
-toggle): `cascade_take_control_computer_task` pauses + reveals (alpha 1 + focus);
-`cascade_pause_computer_task` gained an `app` param and, on **resume**, re-hides the
-browser — so "Let the agent do it" hides it and the agent keeps working in the box.
-Removed `browser_cg_window_id` + the screencapture path. Snapshot capture is in
-`capture_browser` (async: `run_on_main_thread` → `with_webview` → `block::ConcreteBlock`
-completion → PNG via `nsimage_to_png` → oneshot channel, 2.5s timeout). Compiled clean +
-installed; **runtime-unverified**: if the box shows frozen/blank frames, WebKit is
-throttling the alpha-0 snapshot — fallback needed.
+Cascade has been rebased into a clean Swift-first macOS app at the repository root. The old Screenpipe/Tauri/Rust implementation paths have been removed from this branch. Keep the architecture focused on employee-owned local context first, then supervised agents.
 
-## 2026-06-05 update — sandbox no longer waits for sign-in when credentials exist
+The app is not an OpenClicky fork yet. OpenClicky/TipTour are reference implementations we are porting into Cascade-owned Swift modules.
 
-The sandbox login decision in `cascade_computer.rs` `run_loop` now gates purely on
-whether **credentials were handed over**, not on a landed-URL check:
+## Build
 
-- `hydrate_sandbox_session` **Ok(n)** (≥1 real-browser cookie injected) → `mark_signed_in`
-  and start working **immediately** — no sign-in prompt, no waiting.
-- `hydrate_sandbox_session` **Err** (no portable cookies / injection produced 0) → the
-  visible `ensure_host_login` is the FALLBACK, and the only thing that prompts.
-
-This removes the earlier "load-and-verify" path (open agent browser, wait 3s,
-`sandbox_landed_authenticated` URL heuristic) — its false negatives were prompting for
-sign-in even when cookies were injected fine, which defeated the reuse. Deleted with it:
-`sandbox_landed_authenticated`, `agent_browser_url`/`note_agent_browser_url`/
-`clear_agent_browser_url`, the `AGENT_BROWSER_URL` static, the agent-browser
-`on_page_load` recorder, and `reload_agent_browser`. The agent browser is now opened only
-by `run_task_cycle` (same shared cookie store, so the injected session is already in
-place). Tradeoff: present-but-expired cookies are trusted (agent lands on the site's login
-page rather than popping the manual window). Overlay synced to vendor (`cmp` match); full
-app compile still blocked on Xcode (see toolchain notes).
-
-## 2026-06-05 update
-
-- The "read-from-web agent has nowhere to write" problem is now resolved in source:
-  `cascade_computer.rs` supports a `record` action, builds a digest from recorded
-  findings on `done`, shows it in the floating box, and writes it through
-  `cascade_agents::deliver_artifact_write` to Obsidian, Apple Notes, or a file
-  fallback.
-- The current strategy is Screenpipe for employee context/monitoring, OpenClicky
-  as the native-control reference, and Glide as product/integration reference.
-  See `docs/product-strategy.md`.
-- Computer-use reliability work should now focus on real SPA behavior and loop
-  prevention: controlled-input typing, click targeting, same-screen/no-effect
-  detection, login robustness, and clear audit/result delivery.
-
-Pick-up doc for continuing in a fresh session. Cascade = privacy-respecting
-enterprise AI-agent product, soft-forked from screenpipe (`mediar-ai/screenpipe`).
-
----
-
-## 2026-06-05 session — sandbox now reuses existing browser sessions
-
-User goal: stop making the employee log in separately inside Cascade's local
-sandbox just so the agent can access the same web app the employee already uses.
-
-### What changed
-
-- Added sandbox session hydration in
-  `app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_computer.rs`.
-- Synced it into the vendored app with `./scripts/overlay.sh`; overlay and vendor
-  copies match.
-- New flow:
-  1. `run_loop` resolves the sandbox start URL from the Rewind as before.
-  2. Before opening the manual login window, it calls `hydrate_sandbox_session`.
-  3. `hydrate_sandbox_session` reads matching cookies from the user's supported
-     real browsers through the existing `owned_browser_cookies::cookies_for_host`
-     path.
-  4. It injects those cookies into the shared WKWebView `WKHTTPCookieStore`.
-  5. If cookie injection succeeds, the host is marked signed-in for this app
-     session and the sandbox starts without the separate local login.
-  6. If no portable cookies exist, injection fails, or the site stores auth in
-     localStorage/IndexedDB/passkeys/WebAuthn, the old visible login fallback
-     still runs.
-
-This does **not** read saved passwords. It only copies already-existing session
-cookies into the local sandbox webview.
-
-### Update (same day) — load-and-verify fallback (closes the step-5 gap)
-
-The step-5 logic above marked the host signed-in after injecting **any** cookie,
-so localStorage/passkey sites and **expired** sessions silently skipped the
-fallback and the agent got stuck logged-out. Now the decision is based on where
-the page actually LANDS, not the cookie count:
-
-1. `hydrate_sandbox_session` injects cookies (best-effort).
-2. The agent browser is opened at the start URL immediately, so it loads WITH
-   those cookies. `ensure_agent_browser` got an `on_page_load` recorder
-   (`AGENT_BROWSER_URL`).
-3. After ~3s, `sandbox_landed_authenticated(spec_id, host)` checks the landed URL:
-   on the target host AND not a login/SSO/MFA URL (`looks_like_auth_url`) → signed
-   in. Otherwise → `ensure_host_login` (visible login), then `reload_agent_browser`
-   to pick up the fresh session.
-
-Verified the auth-detection heuristic in isolation (8 cases pass). Still NOT
-compiled in the full app crate (cidre/Xcode). Known limit: a same-URL SPA login
-(no path/host change) reads as authed — URL-only heuristic.
-
-### Exact files touched this session
-
-- `app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_computer.rs`
-- `vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri/src/cascade_computer.rs`
-  via `./scripts/overlay.sh`
-
-Pre-existing dirty files remain dirty and were not reverted:
-
-- `app-overlays/screenpipe-app-tauri/app/hands-cursor/page.tsx`
-- `app-overlays/screenpipe-app-tauri/src-tauri/src/cascade_agents.rs`
-- `crates/cascade-schema/src/lib.rs`
-- `app-overlays/screenpipe-app-tauri/lib/cursor-flight.ts`
-- `crates/cascade-schema/migrations/0005_daily_summaries.sql`
-- `vendor/screenpipe` submodule dirty state
-
-### Verification
-
-- Ran `./scripts/overlay.sh` successfully.
-- Confirmed overlay and vendor `cascade_computer.rs` match with `cmp`.
-- Ran:
-  `PATH="/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" cargo test -p cascade-schema`
-  Result: **7 passed**.
-- Tried a focused Tauri app compile check:
-  `cargo check --manifest-path vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri/Cargo.toml --bin screenpipe-app`
-  It did **not** reach app-level checking. It failed in native dependency `cidre`
-  because the active developer directory is Command Line Tools, not full Xcode:
-  `xcode-select: error: tool 'xcodebuild' requires Xcode`.
-- `rustfmt` was not available in the active toolchain:
-  `/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustfmt`
-  missing.
-
-### Important caveat
-
-The implementation duplicates the macOS WK cookie injection logic locally in
-`cascade_computer.rs` instead of reusing `owned_browser.rs`, because the existing
-owned-browser injector is private and attached to `BrowserSidebar`/owned-browser
-navigation. This was the quickest scoped fix. Later cleanup should extract a
-shared helper so both owned-browser and Cascade sandbox use one cookie injection
-implementation.
-
-### Next clean steps
-
-1. Install full Xcode or point `xcode-select` at a full Xcode install, then rerun
-   the Tauri compile check.
-2. Install `rustfmt` for the active toolchain, then format `cascade_computer.rs`.
-3. Build and install a debug app:
-   ```
-   export PATH="/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH"
-   ./scripts/overlay.sh
-   cd vendor/screenpipe/apps/screenpipe-app-tauri
-   bun run tauri build --debug --bundles app
-   SRC=src-tauri/target/debug/bundle/macos/Cascade.app
-   osascript -e 'tell application "Cascade" to quit' || true
-   pkill -f "Cascade.app/Contents/MacOS/screenpipe-app" || true
-   rm -rf /Applications/Cascade.app
-   cp -R "$SRC" /Applications/Cascade.app
-   xattr -dr com.apple.quarantine /Applications/Cascade.app
-   ```
-4. Runtime test:
-   - Log into a target site in Arc/Chrome/Brave/Edge.
-   - Start a browser workflow in Local Sandbox.
-   - Expected: Hands box says it is using the existing browser session, then the
-     sandbox opens already signed in.
-   - If macOS Keychain prompts for browser safe storage, approve it.
-   - If the site still asks for login, check whether it uses localStorage,
-     IndexedDB, passkeys, or WebAuthn; those still need the fallback.
-
----
-
-# Previous Handoff (2026-05-31)
-
-## 0. READ THIS FIRST — state of the tree
-
-- **Nothing from this session is committed.** Git HEAD is still `7f4f212`
-  ("isolated agent browser sandbox + persistent login"). The ENTIRE session's
-  work (Rewind-based detection, two-engine execution, dynamic target URL,
-  contextual login, all bug fixes) lives in the **uncommitted working tree**.
-  Run `git diff` to see it. **Commit early** if you want to preserve it.
-- **Source of truth = `app-overlays/screenpipe-app-tauri/`.** It is rsync'd into
-  the vendored submodule with `bash scripts/overlay.sh` (no `--delete`).
-  - EXCEPTION: `vendor/.../src-tauri/src/main.rs` is edited **directly in the
-    submodule** (not in app-overlays) — it's the command registry. Don't lose it.
-- **Installed app** (`/Applications/Cascade.app`) is the **18:47 build**
-  (dynamic-URL + visible-browser + 5 fixes). The **latest** build (adds the
-  click/coordinate/prompt fixes) finished compiling but was **NOT installed**
-  (install was interrupted). To install the latest, see §5.
-
-## 1. Build / install (toolchain on this Mac)
-
-`cargo` is NOT on the default PATH. Prepend the toolchain bin:
+```bash
+cd /Users/khalidsh/Humain/cascade
+swift test
+./scripts/build-app.sh
+open .build/Cascade.app
 ```
-export PATH="/Users/mohanadbahammam/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH"
+
+`scripts/build-app.sh` writes `.build/Cascade.app`, signs it ad hoc, and sets:
+
+- `CFBundleIdentifier = com.humain.cascade`
+- Keychain service = `com.humain.cascade`
+- Permission log subsystem = `com.humain.cascade`
+
+Open in Xcode for live logs:
+
+```bash
+xed /Users/khalidsh/Humain/cascade
 ```
-- Sync overlay → vendor:  `bash scripts/overlay.sh`
-- Compile-check (fast):   `cd vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri && cargo check`
-- Type-check FE:          `cd vendor/screenpipe/apps/screenpipe-app-tauri && bunx tsc --noEmit`
-- Build (~10 min, debug): `cd vendor/screenpipe/apps/screenpipe-app-tauri && bun run tauri build --debug --bundles app`
-  (release build needs Xcode/cidre and ~30 min — use `--debug`.)
-- Install:
-```
-SRC=vendor/screenpipe/apps/screenpipe-app-tauri/src-tauri/target/debug/bundle/macos/Cascade.app
-osascript -e 'tell application "Cascade" to quit'; pkill -f "Cascade.app/Contents/MacOS/screenpipe-app"
-rm -rf /Applications/Cascade.app && cp -R "$SRC" /Applications/Cascade.app && xattr -dr com.apple.quarantine /Applications/Cascade.app
-```
-- bun sidecars are pre-placed (`src-tauri/bun-{aarch64,x86_64}-apple-darwin`) so the build doesn't stall on download.
 
-## 2. Product architecture (current, post-pivot)
+Run the `Cascade` executable target. In Console.app, filter by subsystem `com.humain.cascade` and category `permissions`.
 
-Full detail in memory: `~/.claude/projects/-Users-mohanadbahammam-Desktop-Cascade/memory/cascade-agent-execution-architecture.md`.
+## What Is In The App Now
 
-**The 5-agent pipeline** (cascade_agents.rs): #5 Privacy Aggregator → #2 Waste
-Detector → #3 Agent Generator → #4 Deploy/Runtime Monitor. UI: Reel · Cascades ·
-Manager · Settings (cascade-titlebar nav).
+- SwiftPM package at repo root.
+- `Sources/CascadeApp`: app entry point and menu bar item.
+- `Sources/AppShell`: native SwiftUI UI.
+- `Sources/MacContextKit`: permission preflight, app/window observation, context recorder.
+- `Sources/ComputerUseKit`: action types, hotkey monitor, native actuator shell, STOP dock model.
+- `Sources/CascadeMemory`: SQLite context/audit store.
+- `Sources/SuggestionEngine`: evidence-backed suggestion cards.
+- `Sources/ProviderKit`: local Q&A placeholder and Keychain-backed Anthropic key storage.
+- `Sources/AgentOrchestrator`: `AgentDriver` protocol and `LocalMacDriver` shell.
 
-**Detection reads the REWIND, not app-minute aggregates** (user was emphatic).
-`fetch_rewind_digest(app, hours, max)` hits screenpipe `/search?content_type=ocr`
-→ window titles + OCR of what's actually on screen, sensitive apps dropped. The
-detector (`cascade_generate_manager_suggestions`) and the recap runtime both read
-this. (This is why "D2L Coursework Digest" got detected correctly.)
+## What Works
 
-**Two execution engines, two buttons:**
-- **Run now** → `run_agent_internal` (HEADLESS). Produces a recap grounded in the
-  Rewind, delivers into the app the user actually uses via `resolve_delivery_target`
-  (Obsidian if running+vault found → vault file; else Apple Notes via AppleScript;
-  file fallback). Box shows a result card (`box_result` → `cascade-hands-result` event).
-- **Start & watch** → `cascade_start_computer_task` (BROWSER SANDBOX computer-use,
-  cascade_computer.rs). A **visible** WKWebView the agent drives via a Claude
-  vision loop (screenshot → `computer_system_prompt` → `ComputerAction` →
-  `browser_execute` JS injection), streamed into the floating box with a cursor.
-  **Web apps only.**
+- App launches as `com.humain.cascade`.
+- Settings shows exact app identity/path being evaluated by macOS TCC.
+- Screen Recording, Accessibility, and Input Monitoring use preflight checks.
+- Permission prompts are only called from explicit buttons.
+- `Open Settings` is debounced and reveals the app bundle in Finder.
+- Claude key card is visible and stores the key in macOS Keychain.
+- Reel has Moment, timeline, Ask panel, Audit, and Computer Use status panel.
+- `Control-Option-Space` opens the supervised dock and logs `device.intent hotkey`.
+- STOP dock visibility bug was fixed by forwarding nested observable changes.
+- Cascades view uses adaptive grid instead of clipping horizontally.
+- Manager view shows aggregate-only prototype metrics.
+- Tests pass: 4 Swift tests.
 
-**Dynamic target site (NOT hardcoded):** `cascade_agents::rewind_primary_url(app,
-hours, task)` picks the site the user actually uses for this work by counting
-hosts in the Rewind's `browser_url`s (drops google/newtab/localhost/sensitive),
-biased toward a host matching a task keyword. Stored per-agent in `START_URLS`;
-the run loop opens the agent browser there. Old hardcoded `login_target_for_goal`
-table is GONE.
+## What Is Not Done
 
-**Contextual login (user's explicit design):** NOT a Settings section. On Start,
-`maybe_prompt_login_url` pops the resolved site's sign-in (first time per host,
-tracked in `LOGGED_IN`). `run_loop` shows "Waiting for you to sign in…" and blocks
-until the `cascade-agent-login` window closes, then works. Shared WKWebView cookie
-store persists the session for the agent browser.
+- Real ScreenCaptureKit screenshots/OCR are not ported yet.
+- OpenClicky-style display metadata and app/window enumeration are not ported yet.
+- TipTour/OpenClicky AX action routing is not ported yet.
+- Claude does not yet generate executable computer-use plans.
+- Suggestions are review cards only, not runnable workflows.
+- Local Browser driver and Local VM driver are not built in this Swift base.
+- Native cursor overlay/control dock polish is first-slice only.
 
-## 3. What works (verified by the user)
+## Immediate Next Steps
 
-- Rewind-based detection → produced "D2L Coursework Digest" from real D2L usage. ✅
-- Floating box capture/streaming — "working perfectly." ✅
-- Visible agent browser navigates INTO the target site (D2L Assignments page seen). ✅
-- App scroll fixed (globals.css forced `html,body{overflow:hidden}`; cascade view
-  roots now `height:100vh; overflowY:auto`, titlebar `position:sticky`). ✅
-- Detector/generator no longer crash on `null` JSON (`de_null_string`/`de_null_f64`). ✅
-- Uninstall/Pause now stop the running computer task. ✅
+1. Verify macOS permissions against the new bundle id `com.humain.cascade`.
+2. If Settings still says denied, remove old duplicate Cascade entries from Privacy settings and add `.build/Cascade.app`.
+3. Port ScreenCaptureKit capture into `MacContextKit` from OpenClicky/TipTour, strictly gated by `CGPreflightScreenCaptureAccess()`.
+4. Port AX/action routing into `ComputerUseKit` from TipTour `ActionExecutor` and `TipTourActionDriver`.
+5. Add display/cursor metadata and app/window enumeration from OpenClicky runtime files.
+6. Wire Claude provider behind `ProviderKit` to generate reviewed single-step plans first.
+7. Keep STOP visible and audit every proposed/approved action.
 
-## 4. Current computer-use reliability focus
+## Reference Port Map
 
-The read-only web-result delivery path exists now: the vision agent can `record`
-findings, then `done` writes a digest through the same artifact delivery path used
-by headless agents.
+Use `docs/PORT_MAP.md` as the source of truth for what to copy and where. Preserve MIT notices in `docs/THIRD_PARTY_NOTICES.md`.
 
-Fix next:
-- Interaction reliability on SPAs: keep improving `browser_execute` for React /
-  controlled inputs, iframes, shadow DOM, and post-action settle/wait behavior.
-- Stuck/loop detection in `run_task_cycle`: keep strengthening "screen did not
-  change" feedback, repeated-action loop brakes, and history given back to the
-  vision model.
-- Resilience: blank/failed captures, vision JSON parse failures, login-window
-  race cases, and stale `START_URLS`.
+Most important source areas:
 
-## 5. Latest fixes BUILT but NOT yet installed
+- OpenClicky: `CompanionScreenCaptureUtility.swift`, `OpenClickyApplicationUsageLogStore.swift`, `OpenClickyComputerUseRuntime.swift`.
+- TipTour: `WindowPositionManager.swift`, `GlobalPushToTalkShortcutMonitor.swift`, `ActionExecutor.swift`, `TipTourActionDriver.swift`, `OverlayWindow.swift`.
+- Glide: `OnboardingView.swift` listen-event access patterns.
 
-Source already has them (synced + compiled in the last `--debug` build). To install
-the latest, just `cp` the bundle (see §1). These three fixes target "agent didn't
-do the work, went back to D2L":
-- `ensure_agent_browser`: `decorations(false)` — a title bar shifted the screenshot
-  ~28px so every click missed; now capture is 1:1 with `document.elementFromPoint`.
-- `browser_execute` click: dispatches real `mouseover/mousedown/mouseup/click` on the
-  nearest clickable ancestor (was a bare `el.click()` that misses on SPAs).
-- `computer_system_prompt`: rewritten — "you're already on the right site + signed
-  in, work WITHIN it, don't bounce to the home page." Removed Notion/Gmail nudges.
+## User Feedback To Address
 
-## 6. Key files
-
-- `app-overlays/.../src-tauri/src/cascade_agents.rs` — pipeline, Rewind
-  (`fetch_rewind_digest`, `fetch_rewind_frames`, `rewind_primary_url`,
-  `host_from_url`), headless runtime (`run_agent_internal`), delivery
-  (`resolve_delivery_target`, `apple_notes_create`, `obsidian_write`), Notion-null
-  tolerant parse structs (`de_null_string`/`de_null_f64`).
-- `app-overlays/.../src-tauri/src/cascade_computer.rs` — browser sandbox: vision
-  loop (`run_task_cycle`/`run_loop`), `ensure_agent_browser` (VISIBLE @48,96),
-  `capture_browser`, `browser_execute`, `computer_system_prompt`, `START_URLS`,
-  `maybe_prompt_login_url`/`open_login_window`, `box_begin/step/result/end`.
-- `app-overlays/.../app/hands-box/page.tsx` — the floating box (frame + cursor +
-  result card listening on `cascade-hands-result`).
-- `app-overlays/.../components/cascade-cascades-view.tsx` — Cascades inbox
-  (Start & watch / Run now / Uninstall→stopComputerTask).
-- `app-overlays/.../app/settings/page.tsx` — Settings (Claude key, "How your agents
-  work" note; no login section — login is contextual now).
-- `vendor/.../src-tauri/src/main.rs` — command registry (edited direct in submodule).
-
-## 7. Phase 2 (acknowledged, not built)
-
-Cloud VM "real sandbox screen" for native apps (Obsidian/Apple Notes inside the
-sandbox) — needs real infra (VM provider, streaming, billing). The local browser
-sandbox uses the same control loop and is the swap point.
-
-## 8. User working style (from this session)
-
-Tests live and reports specific bugs with screenshots — iterate from runtime
-behavior, not static assumptions. Dislikes over-engineering / building 3 things at
-once; wants the ONE right thing, testable. Wants dynamic behavior derived from the
-Rewind, never hardcoded per app. Build + install + report back each iteration.
-Ultracode is ON (xhigh + workflow orchestration).
+- The user wants to know where to test real computer use. Keep the Reel Computer Use panel obvious.
+- The user expects a hotkey. Current hotkey is `Control-Option-Space`.
+- The user expects the Claude key field. It is in Settings.
+- The user does not want old Screenpipe/Tauri code in the active base.
+- The user wants Cascade to feel native, smooth, small, white/blue, and trust-forward.
