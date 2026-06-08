@@ -7,8 +7,7 @@
 //
 // The cursor keeps OpenClicky's fast bezier flight, but the rendered pointer is
 // Cascade's own crisp blue/white arrow. Per-agent hue is an accent for glow and
-// labels, not the whole pointer body, so a default agent never looks like an old
-// green crosshair.
+// labels, not the whole pointer body, so the default agent stays crisp blue/white.
 
 "use client";
 
@@ -33,17 +32,13 @@ interface CursorState {
   hue: number;
 }
 
-// Triangle geometry (equilateral, apex up — matches the Swift original's
-// sqrt(3)/2 height). Sized up a touch from OpenClicky's 16px since this rides on
-// the full real screen, not a 320px companion panel.
-const SIZE = 24;
-const PAD = 8;
+// Lucide-style pointer geometry inspired by Clicky/OpenClicky/TipTour: white
+// body, blue rim, soft glow. It is deliberately agent-owned and modern.
+const SIZE = 34;
+const PAD = 10;
 const BOX = SIZE + PAD * 2;
 const HALF = SIZE / 2;
-const TRI_H = (SIZE * Math.sqrt(3)) / 2;
-const TOP_Y = HALF - TRI_H / 1.5;
-const BOT_Y = HALF + TRI_H / 3;
-const POINTS = `${HALF},${TOP_Y.toFixed(2)} 0,${BOT_Y.toFixed(2)} ${SIZE},${BOT_Y.toFixed(2)}`;
+const POINTER_PATH = "M7 3.5 L7 30 L15.1 22 L19.4 31.6 L24 29.5 L19.6 20 L30.5 20 Z";
 
 // Glow grows with the flight scale, exactly like BlueCursorTriangle's
 // drop-shadow(0 0 glowIntensity + (scale-1)*k).
@@ -78,7 +73,6 @@ interface Meta {
 const accentFor = (hue: number) => `oklch(0.68 0.18 ${hue})`;
 const glowFor = (hue: number) => `oklch(0.72 0.20 ${hue})`;
 const labelBorderFor = (hue: number) => `oklch(0.62 0.16 ${hue} / 0.52)`;
-const POINTER_STROKE = "rgba(8, 13, 27, 0.92)";
 const POINTER_CORE = "#f8fbff";
 const POINTER_BLUE = "#4c8dff";
 
@@ -235,7 +229,7 @@ export default function HandsCursor() {
             ref={(el) => setPosNode(id, el)}
             style={{ position: "absolute", left: 0, top: 0, willChange: "transform" }}
           >
-            {/* Triangle (rotates + scales; glow rides the scale). */}
+            {/* Pointer (rotates + scales; glow rides the scale). */}
             <div
               ref={(el) => setTriNode(id, el)}
               style={{
@@ -249,28 +243,32 @@ export default function HandsCursor() {
             >
               <svg width={BOX} height={BOX} viewBox={`${-PAD} ${-PAD} ${BOX} ${BOX}`}>
                 <defs>
-                  <linearGradient id={gradId} x1="4" y1="-2" x2="20" y2="25" gradientUnits="userSpaceOnUse">
+                  <linearGradient id={gradId} x1="4" y1="-2" x2="24" y2="31" gradientUnits="userSpaceOnUse">
                     <stop offset="0" stopColor={POINTER_CORE} />
-                    <stop offset="0.48" stopColor="#dbe8ff" />
-                    <stop offset="1" stopColor={POINTER_BLUE} />
+                    <stop offset="0.7" stopColor="#f4f8ff" />
+                    <stop offset="1" stopColor="#dce8ff" />
                   </linearGradient>
-                  <linearGradient id={shineId} x1="7" y1="-2" x2="16" y2="18" gradientUnits="userSpaceOnUse">
+                  <linearGradient id={shineId} x1="9" y1="3" x2="17" y2="24" gradientUnits="userSpaceOnUse">
                     <stop offset="0" stopColor="#ffffff" stopOpacity="0.92" />
                     <stop offset="1" stopColor="#ffffff" stopOpacity="0" />
                   </linearGradient>
                 </defs>
                 <circle cx={HALF} cy={HALF} r={SIZE * 0.68} fill={accent} opacity="0.12" />
-                <polygon
-                  points={POINTS}
+                <path
+                  d={POINTER_PATH}
                   fill={`url(#${gradId})`}
-                  stroke={POINTER_STROKE}
-                  strokeWidth={1.35}
+                  stroke={POINTER_BLUE}
+                  strokeWidth={2.2}
                   strokeLinejoin="round"
+                  strokeLinecap="round"
                 />
-                <polygon
-                  points={`${HALF},${(TOP_Y + 3).toFixed(2)} 6,${(BOT_Y - 4).toFixed(2)} ${HALF},${(BOT_Y - 2).toFixed(2)}`}
+                <path
+                  d="M10.2 8.2 L10.2 22.5 L14.5 18.6"
                   fill={`url(#${shineId})`}
-                  opacity="0.64"
+                  stroke="#ffffff"
+                  strokeWidth={1.5}
+                  strokeLinecap="round"
+                  opacity="0.58"
                 />
               </svg>
             </div>

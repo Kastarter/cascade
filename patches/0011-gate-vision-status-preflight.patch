@@ -1,0 +1,39 @@
+diff --git screenpipe.orig/crates/screenpipe-engine/src/routes/health.rs screenpipe/crates/screenpipe-engine/src/routes/health.rs
+index 43f639c..c803d5e 100644
+--- screenpipe.orig/crates/screenpipe-engine/src/routes/health.rs
++++ screenpipe/crates/screenpipe-engine/src/routes/health.rs
+@@ -37,6 +37,20 @@ const AUDIO_RECONCILIATION_LOOKBACK_HOURS: i64 = 24 * 7;
+ const AUDIO_RECONCILIATION_FRESHNESS_DELAY_SECS: i64 = 10 * 60;
+ const AUDIO_RECONCILIATION_BACKLOG_CACHE_TTL_SECS: i64 = 30;
+ 
++#[cfg(target_os = "macos")]
++fn screen_recording_preflight_ready() -> bool {
++    matches!(
++        screenpipe_core::permissions::check_screen_recording_preflight(),
++        screenpipe_core::permissions::PermissionStatus::Granted
++            | screenpipe_core::permissions::PermissionStatus::NotNeeded
++    )
++}
++
++#[cfg(not(target_os = "macos"))]
++fn screen_recording_preflight_ready() -> bool {
++    true
++}
++
+ /// Decide whether the audio transcription backlog should be flagged as a real
+ /// stall. Real stall = the reconciliation worker has fallen behind. A "stall"
+ /// is intentionally NOT flagged when batch mode is parking the queue while a
+@@ -1033,6 +1047,13 @@ pub async fn api_list_monitors(
+ }
+ 
+ pub async fn api_vision_status() -> JsonResponse<serde_json::Value> {
++    if !screen_recording_preflight_ready() {
++        return JsonResponse(json!({
++            "status": "permission_denied",
++            "message": "Screen recording permission not granted. Grant access in System Settings > Privacy & Security > Screen Recording"
++        }));
++    }
++
+     match list_monitors_detailed().await {
+         Ok(monitors) if monitors.is_empty() => JsonResponse(json!({
+             "status": "no_monitors",

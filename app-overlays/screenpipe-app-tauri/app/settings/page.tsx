@@ -23,7 +23,7 @@ export default function SettingsPage() {
   const [hasKey, setHasKey] = useState<boolean | null>(null);
   const [byokOpen, setByokOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [runMode, setRunModeState] = useState<CascadeRunMode>("sandbox");
+  const [runMode, setRunModeState] = useState<CascadeRunMode>("local_browser");
 
   // localStorage is only available in the browser — read it after mount.
   useEffect(() => {
@@ -129,8 +129,10 @@ export default function SettingsPage() {
           <RunModeToggle value={runMode} onChange={chooseRunMode} />
           <p style={{ fontSize: 12.5, color: "var(--cascade-text-3)", lineHeight: 1.55, margin: "14px 0 0" }}>
             {runMode === "screen"
-              ? "On your screen — the agent uses your real screen and cursor, so it can operate any app you already use. Needs macOS Accessibility permission, and you'll see your cursor move while it works."
-              : "In the background — the agent works inside the Local Sandbox shown in the floating box. Web apps only, and you can keep using your computer while it runs."}
+              ? "On your screen — the agent uses your real screen and cursor, so it can operate any app you already use. Requires Screen Recording, Accessibility, Input Monitoring, and a healthy UI recorder."
+              : runMode === "local_vm"
+                ? "Local VM — the driver contract is defined, but Cascade blocks this mode until a local VM provider is configured."
+                : "Local Browser — the agent works inside the isolated browser shown in the control box. Web apps only, and you can keep using your computer while it runs."}
           </p>
         </Section>
 
@@ -200,8 +202,9 @@ function RunModeToggle({
   onChange: (m: CascadeRunMode) => void;
 }) {
   const options: { id: CascadeRunMode; title: string; hint: string }[] = [
-    { id: "sandbox", title: "In the background", hint: "Local Sandbox (floating box) · web apps · keep working" },
+    { id: "local_browser", title: "Local Browser", hint: "Isolated browser · web apps · keep working" },
     { id: "screen", title: "On your screen", hint: "Uses your real screen · any app" },
+    { id: "local_vm", title: "Local VM", hint: "Driver defined · blocked until provider is configured" },
   ];
   return (
     <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>

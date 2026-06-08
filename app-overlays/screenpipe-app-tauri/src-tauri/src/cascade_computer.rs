@@ -7,7 +7,7 @@
 //! cursor. 5 installed agents → 5 cursors flying around doing their tasks while
 //! the employee keeps working; their real pointer is never seized. Per agent the
 //! loop is: screenshot -> Claude (vision) -> next action -> fly that agent's
-//! cursor + narrate -> act via synthesized events (cascade_input), snapping the
+//! cursor + narrate -> act via native ComputerUseKit events, snapping the
 //! user's pointer back. Actual input is serialized through one lock so the
 //! agents don't fight over the keyboard/mouse, but their cursors move in
 //! parallel. A stacked floating panel shows each agent with a STOP + per-step
@@ -15,8 +15,9 @@
 
 #![cfg(target_os = "macos")]
 
-use crate::cascade_input;
-use crate::cascade_llm::{call_anthropic_vision, extract_json_str, read_anthropic_key, MODEL_SONNET};
+use crate::cascade_llm::{
+    call_anthropic_vision, extract_json_str, read_anthropic_key, MODEL_SONNET,
+};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cascade_schema::{
     get_agent_spec, insert_agent_action, insert_agent_run, list_deployed_specs, open,
@@ -28,9 +29,12 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_nspanel::WebviewWindowExt;
+
+#[path = "cascade_macos_computer_use.rs"]
+mod macos_computer_use;
 
 /// Promote an overlay window to a non-activating panel that floats above
 /// everything (incl. other apps + fullscreen) WITHOUT stealing focus and —
@@ -49,8 +53,8 @@ fn promote_overlay(win: &WebviewWindow, click_through: bool) {
 
         panel.set_level(1001); // above CGShieldingWindowLevel
         panel.set_style_mask(128); // NSWindowStyleMaskNonactivatingPanel
-        // KEY: NSPanel hides on app deactivation by default — that's why the box
-        // vanished the instant you switched to another app. Keep it visible.
+                                   // KEY: NSPanel hides on app deactivation by default — that's why the box
+                                   // vanished the instant you switched to another app. Keep it visible.
         panel.set_hides_on_deactivate(false);
         // EXCLUDE only the click-through cursor layer from screen capture
         // (NSWindowSharingNone = 0). The visible Hands box must remain capturable
@@ -69,10 +73,13 @@ fn promote_overlay(win: &WebviewWindow, click_through: bool) {
 }
 
 const MAX_STEPS: i64 = 24;
+const SCREEN_MAX_STEPS: i64 = 12;
+const SCREEN_MAX_COMMITTING_ACTIONS: i64 = 8;
+const SCREEN_MAX_CYCLE_SECS: u64 = 90;
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 10;
-const STALL_WARN_AFTER: u32 = 3;
-const STALL_FAIL_AFTER: u32 = 7;
+const UNCLEAR_VERIFY_WARN_AFTER: u32 = 3;
+const REPEATED_ACTION_FAIL_AFTER: u32 = 3;
 const DEFAULT_ACTION_PAUSE_MS: u64 = 1300;
 const TEXT_ACTION_PAUSE_MS: u64 = 1550;
 const NAV_ACTION_PAUSE_MS: u64 = 2600;
@@ -91,6 +98,168 @@ fn require_anthropic_key_for(action: &str) -> Result<(), String> {
     read_anthropic_key()
         .map(|_| ())
         .map_err(|_| format!("Add your Anthropic API key in Settings before {action}."))
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenAgentReadiness {
+    pub ready: bool,
+    pub missing: Vec<String>,
+    pub message: String,
+    pub screen_recording: bool,
+    pub accessibility: bool,
+    pub input_monitoring: bool,
+    pub native_bridge_available: bool,
+    pub native_screen_capture_available: bool,
+    pub frame_status_ok: bool,
+    pub ui_recorder_running: bool,
+    pub input_tap_running: bool,
+    pub app_events_running: bool,
+}
+
+fn json_bool_at(v: &serde_json::Value, path: &[&str]) -> Option<bool> {
+    let mut cur = v;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    cur.as_bool()
+}
+
+fn json_str_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut cur = v;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    cur.as_str()
+}
+
+async fn local_health_json(app: &tauri::AppHandle) -> Option<serde_json::Value> {
+    let api = crate::recording::local_api_context_from_app(app);
+    let client = reqwest::Client::new();
+    let res = api
+        .apply_auth(client.get(api.url("/health")))
+        .send()
+        .await
+        .ok()?;
+    res.json::<serde_json::Value>().await.ok()
+}
+
+async fn screen_agent_readiness(app: &tauri::AppHandle) -> ScreenAgentReadiness {
+    let permissions = crate::permissions::do_permissions_check(false);
+    let input_monitoring = crate::permissions::check_input_monitoring_permission_cmd();
+    let health = local_health_json(app).await;
+    let native_status = macos_computer_use::status();
+
+    let screen_recording_ok = permissions.screen_recording.permitted();
+    let accessibility_ok = permissions.accessibility.permitted();
+    let input_monitoring_ok = input_monitoring.permitted();
+    let frame_status_ok = health
+        .as_ref()
+        .and_then(|h| json_str_at(h, &["frame_status"]))
+        .map(|s| s == "ok")
+        .unwrap_or(false);
+    let ui_recorder_running = health
+        .as_ref()
+        .and_then(|h| json_bool_at(h, &["ui_recorder", "running"]))
+        .unwrap_or(false);
+    let input_tap_running = health
+        .as_ref()
+        .and_then(|h| json_bool_at(h, &["ui_recorder", "input_tap_running"]))
+        .unwrap_or(false);
+    let app_events_running = health
+        .as_ref()
+        .and_then(|h| json_bool_at(h, &["ui_recorder", "app_events_running"]))
+        .unwrap_or(false);
+    let (native_bridge_available, native_screen_capture_available, native_missing) =
+        match native_status {
+            Ok(status) => {
+                let bridge_available = status
+                    .available
+                    .or(status.bridge_available)
+                    .or(status.healthy)
+                    .unwrap_or(true);
+                (
+                    bridge_available,
+                    status.screen_capture_available,
+                    status.missing,
+                )
+            }
+            Err(e) => (false, false, vec![format!("native ComputerUseKit ({e})")]),
+        };
+
+    let mut missing = Vec::new();
+    if !screen_recording_ok {
+        missing.push("Screen Recording".to_string());
+    }
+    if !accessibility_ok {
+        missing.push("Accessibility".to_string());
+    }
+    if !input_monitoring_ok {
+        missing.push("Input Monitoring".to_string());
+    }
+    if !native_bridge_available {
+        missing.push("native ComputerUseKit".to_string());
+    }
+    if !native_screen_capture_available {
+        missing.push("native screen capture".to_string());
+    }
+    for item in native_missing {
+        let normalized = item.trim().to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "screen_recording" | "accessibility" | "input_monitoring"
+        ) {
+            continue;
+        }
+        if !item.trim().is_empty() && !missing.iter().any(|existing| existing == &item) {
+            missing.push(item);
+        }
+    }
+    if !frame_status_ok {
+        missing.push("healthy screen frames".to_string());
+    }
+    if !ui_recorder_running {
+        missing.push("UI recorder".to_string());
+    }
+    if !input_tap_running {
+        missing.push("input event tap".to_string());
+    }
+    if !app_events_running {
+        missing.push("app/window event recorder".to_string());
+    }
+
+    let ready = missing.is_empty();
+    let message = if ready {
+        "Screen agent is ready.".to_string()
+    } else {
+        format!(
+            "Screen mode is blocked until these are healthy: {}.",
+            missing.join(", ")
+        )
+    };
+
+    ScreenAgentReadiness {
+        ready,
+        missing,
+        message,
+        screen_recording: screen_recording_ok,
+        accessibility: accessibility_ok,
+        input_monitoring: input_monitoring_ok,
+        native_bridge_available,
+        native_screen_capture_available,
+        frame_status_ok,
+        ui_recorder_running,
+        input_tap_running,
+        app_events_running,
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn cascade_screen_agent_readiness(
+    app: tauri::AppHandle,
+) -> Result<ScreenAgentReadiness, String> {
+    Ok(screen_agent_readiness(&app).await)
 }
 
 /// Per-agent control block.
@@ -117,36 +286,215 @@ fn set_start_url(spec_id: i64, url: String) {
     }
 }
 fn get_start_url(spec_id: i64) -> Option<String> {
-    START_URLS.lock().ok().and_then(|m| m.get(&spec_id).cloned())
+    START_URLS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&spec_id).cloned())
 }
 
-/// The ONLY two ways an agent does its work, chosen by the user in Settings and
-/// applied to every agent. There is no third path.
+/// The three driver backends Cascade understands. The Local VM backend is
+/// intentionally fail-closed until a local VM provider is configured; defining it
+/// here keeps the planner/driver contract stable while the current implementation
+/// still routes work through Local Browser or Screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RunTarget {
-    /// Isolated sandbox browser, shown in the floating box. Web apps only; the
-    /// user keeps working uninterrupted while it runs. (Default.)
+    /// Isolated local browser, shown in the floating box. Web apps only; the user
+    /// keeps working uninterrupted while it runs. (Default.)
     Sandbox,
-    /// The user's REAL screen — synthesized mouse/keyboard via `cascade_input`,
+    /// The user's REAL screen — synthesized mouse/keyboard via ComputerUseKit,
     /// so the agent can drive ANY app, not just websites.
     Screen,
+    /// Future local VM/sandbox driver. Defined now, unavailable until provisioned.
+    LocalVm,
 }
 
 impl RunTarget {
     fn from_opt(s: Option<&str>) -> RunTarget {
         match s {
             Some("screen") => RunTarget::Screen,
+            Some("local_vm") | Some("vm") => RunTarget::LocalVm,
+            Some("local_browser") | Some("sandbox") => RunTarget::Sandbox,
             _ => RunTarget::Sandbox,
         }
+    }
+
+    fn driver_key(self) -> &'static str {
+        match self {
+            RunTarget::Sandbox => "local_browser",
+            RunTarget::Screen => "screen",
+            RunTarget::LocalVm => "local_vm",
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct DriverObservation {
+    image_base64: String,
+    logical_width: f64,
+    logical_height: f64,
+    driver: &'static str,
+    ocr_text: Option<String>,
+    accessibility_summary: Option<String>,
+    app_context: Option<String>,
+    rewind_context: Option<String>,
+    display_scale: f64,
+}
+
+impl DriverObservation {
+    fn prompt_context(&self) -> String {
+        let mut lines = vec![format!("Driver: {}", self.driver)];
+        if let Some(text) = self.ocr_text.as_deref().filter(|s| !s.trim().is_empty()) {
+            lines.push(format!(
+                "OCR text: {}",
+                text.chars().take(1200).collect::<String>()
+            ));
+        }
+        if let Some(ax) = self
+            .accessibility_summary
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            lines.push(format!(
+                "Accessibility/app context: {}",
+                ax.chars().take(1200).collect::<String>()
+            ));
+        }
+        if let Some(ctx) = self.app_context.as_deref().filter(|s| !s.trim().is_empty()) {
+            lines.push(format!(
+                "Active app/window: {}",
+                ctx.chars().take(600).collect::<String>()
+            ));
+        }
+        if let Some(rewind) = self
+            .rewind_context
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            lines.push(format!(
+                "Recent Rewind context: {}",
+                rewind.chars().take(1400).collect::<String>()
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationVerdict {
+    Changed,
+    Unclear,
+}
+
+struct VerificationOutcome {
+    verdict: VerificationVerdict,
+    summary: String,
+}
+
+struct AgentDriver {
+    target: RunTarget,
+}
+
+impl AgentDriver {
+    fn new(target: RunTarget) -> Self {
+        Self { target }
+    }
+
+    fn key(&self) -> &'static str {
+        self.target.driver_key()
+    }
+
+    fn max_steps(&self) -> i64 {
+        match self.target {
+            RunTarget::Screen => SCREEN_MAX_STEPS,
+            RunTarget::Sandbox => MAX_STEPS,
+            RunTarget::LocalVm => 0,
+        }
+    }
+
+    fn max_committing_actions(&self) -> Option<i64> {
+        match self.target {
+            RunTarget::Screen => Some(SCREEN_MAX_COMMITTING_ACTIONS),
+            RunTarget::Sandbox | RunTarget::LocalVm => None,
+        }
+    }
+
+    fn cycle_timeout(&self) -> Option<Duration> {
+        match self.target {
+            RunTarget::Screen => Some(Duration::from_secs(SCREEN_MAX_CYCLE_SECS)),
+            RunTarget::Sandbox | RunTarget::LocalVm => None,
+        }
+    }
+
+    async fn observe(
+        &self,
+        app: &tauri::AppHandle,
+        spec_id: i64,
+    ) -> Result<DriverObservation, String> {
+        match self.target {
+            RunTarget::Sandbox => {
+                let (image_base64, logical_width, logical_height) =
+                    capture_for(app, spec_id, self.target).await?;
+                Ok(DriverObservation {
+                    image_base64,
+                    logical_width,
+                    logical_height,
+                    driver: self.key(),
+                    // Screenpipe already owns OCR/AX capture. The next step is to
+                    // thread specific snippets from that store into this
+                    // observation; leaving the slots explicit prevents the driver
+                    // contract from collapsing back into "screenshot only."
+                    ocr_text: None,
+                    accessibility_summary: None,
+                    app_context: None,
+                    rewind_context: None,
+                    display_scale: 1.0,
+                })
+            }
+            RunTarget::Screen => capture_screen_observation(app),
+            RunTarget::LocalVm => Err(
+                "Local VM driver is defined but no local VM provider is configured yet."
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn act(
+        &self,
+        app: &tauri::AppHandle,
+        spec_id: i64,
+        action: &ComputerAction,
+    ) -> Result<(), String> {
+        match self.target {
+            RunTarget::Sandbox => {
+                browser_execute(app, spec_id, action);
+                Ok(())
+            }
+            RunTarget::Screen => {
+                let _guard = INPUT_LOCK.lock().await;
+                execute_screen_action(action)
+            }
+            RunTarget::LocalVm => Err(
+                "Local VM driver is defined but no local VM provider is configured yet."
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn verify(
+        &self,
+        action: &ComputerAction,
+        before_b64: &str,
+        after_b64: &str,
+    ) -> VerificationOutcome {
+        verify_action_outcome(self.target, action, before_b64, after_b64)
     }
 }
 
 /// Only one agent drives the real input at a time — their cursors still move in
 /// parallel, but clicks/keystrokes are serialized so they don't collide.
-static INPUT_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static INPUT_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ComputerAction {
     #[serde(default)]
@@ -227,15 +575,36 @@ fn end_agent(spec_id: i64) -> usize {
     m.values().filter(|c| c.running).count()
 }
 
-fn set_stop(spec_id: i64) {
-    if let Ok(mut m) = AGENTS.lock() {
-        if let Some(c) = m.get_mut(&spec_id) {
-            c.stop = true;
-        }
+fn active_agent_count() -> usize {
+    AGENTS
+        .lock()
+        .map(|m| m.values().filter(|c| c.running).count())
+        .unwrap_or(0)
+}
+
+async fn cleanup_orphaned_computer_runs(app: &tauri::AppHandle) {
+    if active_agent_count() > 0 {
+        return;
+    }
+    if let Ok(pool) = db_pool(app).await {
+        use cascade_schema::sqlx;
+        let _ = sqlx::query(
+            "UPDATE cascade_agent_runs
+                 SET status='interrupted',
+                     summary=COALESCE(summary, 'computer-use run') || ' · interrupted after app restart',
+                 duration_ms=CAST((julianday('now') - julianday(created_at)) * 86400000 AS INTEGER)
+             WHERE status='running'",
+        )
+        .execute(&pool)
+        .await;
     }
 }
+
 fn stop_requested(spec_id: i64) -> bool {
-    AGENTS.lock().map(|m| m.get(&spec_id).map(|c| c.stop).unwrap_or(true)).unwrap_or(true)
+    AGENTS
+        .lock()
+        .map(|m| m.get(&spec_id).map(|c| c.stop).unwrap_or(true))
+        .unwrap_or(true)
 }
 fn set_approval(spec_id: i64, v: bool) {
     if let Ok(mut m) = AGENTS.lock() {
@@ -246,7 +615,10 @@ fn set_approval(spec_id: i64, v: bool) {
     }
 }
 fn is_paused(spec_id: i64) -> bool {
-    AGENTS.lock().map(|m| m.get(&spec_id).map(|c| c.paused).unwrap_or(false)).unwrap_or(false)
+    AGENTS
+        .lock()
+        .map(|m| m.get(&spec_id).map(|c| c.paused).unwrap_or(false))
+        .unwrap_or(false)
 }
 fn set_paused(spec_id: i64, v: bool) {
     if let Ok(mut m) = AGENTS.lock() {
@@ -267,7 +639,10 @@ async fn await_approval(spec_id: i64) -> bool {
         if stop_requested(spec_id) {
             return false;
         }
-        let decided = AGENTS.lock().ok().and_then(|m| m.get(&spec_id).and_then(|c| c.approval));
+        let decided = AGENTS
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&spec_id).and_then(|c| c.approval));
         if let Some(v) = decided {
             return v;
         }
@@ -356,20 +731,21 @@ fn ensure_box_window(app: &tauri::AppHandle) {
     let _ = app.run_on_main_thread(move || {
         let (w, _h) = primary_logical_size(&app2);
         if app2.get_webview_window(HANDS_WINDOW).is_none() {
-            if let Ok(win) = WebviewWindowBuilder::new(&app2, HANDS_WINDOW, WebviewUrl::App("hands-box".into()))
-                .title("")
-                .inner_size(500.0, 470.0)
-                .min_inner_size(280.0, 90.0)
-                .position((w - 520.0).max(20.0), 44.0)
-                .always_on_top(true)
-                .decorations(false)
-                .skip_taskbar(true)
-                .focused(false)
-                .transparent(true)
-                .shadow(false)
-                .resizable(true)
-                .visible(false)
-                .build()
+            if let Ok(win) =
+                WebviewWindowBuilder::new(&app2, HANDS_WINDOW, WebviewUrl::App("hands-box".into()))
+                    .title("")
+                    .inner_size(500.0, 470.0)
+                    .min_inner_size(280.0, 90.0)
+                    .position((w - 520.0).max(20.0), 44.0)
+                    .always_on_top(true)
+                    .decorations(false)
+                    .skip_taskbar(true)
+                    .focused(false)
+                    .transparent(true)
+                    .shadow(false)
+                    .resizable(true)
+                    .visible(false)
+                    .build()
             {
                 promote_overlay(&win, false);
             }
@@ -379,7 +755,14 @@ fn ensure_box_window(app: &tauri::AppHandle) {
     });
 }
 
-fn box_status(spec_id: i64, name: &str, goal: &str, narration: &str, step: i64, done: bool) -> StatusEvent {
+fn box_status(
+    spec_id: i64,
+    name: &str,
+    goal: &str,
+    narration: &str,
+    step: i64,
+    done: bool,
+) -> StatusEvent {
     StatusEvent {
         spec_id,
         name: name.to_string(),
@@ -406,12 +789,22 @@ pub fn box_begin(app: &tauri::AppHandle, spec_id: i64, name: &str, goal: &str) {
     let goal = goal.to_string();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(750)).await;
-        let _ = app2.emit(EVT_STATUS, box_status(spec_id, &name, &goal, "Working…", 0, false));
+        let _ = app2.emit(
+            EVT_STATUS,
+            box_status(spec_id, &name, &goal, "Working…", 0, false),
+        );
     });
 }
 
 /// Narrate one step of a background run in the box.
-pub fn box_step(app: &tauri::AppHandle, spec_id: i64, name: &str, goal: &str, narration: &str, step: i64) {
+pub fn box_step(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    name: &str,
+    goal: &str,
+    narration: &str,
+    step: i64,
+) {
     emit_status(app, box_status(spec_id, name, goal, narration, step, false));
 }
 
@@ -463,12 +856,18 @@ pub fn box_end(app: &tauri::AppHandle, spec_id: i64, name: &str, goal: &str, sum
             break current - 1;
         }
     };
-    let computer_use_active = AGENTS.lock().map(|m| m.values().filter(|c| c.running).count()).unwrap_or(0);
+    let computer_use_active = AGENTS
+        .lock()
+        .map(|m| m.values().filter(|c| c.running).count())
+        .unwrap_or(0);
     if remaining <= 0 && computer_use_active == 0 {
         let app2 = app.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(4000)).await;
-            let cu = AGENTS.lock().map(|m| m.values().filter(|c| c.running).count()).unwrap_or(0);
+            let cu = AGENTS
+                .lock()
+                .map(|m| m.values().filter(|c| c.running).count())
+                .unwrap_or(0);
             if BOX_USERS.load(Ordering::SeqCst) <= 0 && cu == 0 {
                 if let Some(w) = app2.get_webview_window(HANDS_WINDOW) {
                     let _ = w.hide();
@@ -478,24 +877,143 @@ pub fn box_end(app: &tauri::AppHandle, spec_id: i64, name: &str, goal: &str, sum
     }
 }
 
-fn capture_logical_screenshot(app: &tauri::AppHandle) -> Result<(String, f64, f64), String> {
-    let (lw, lh) = primary_logical_size(app);
-    let path = std::env::temp_dir().join("cascade-hands.png");
-    let out = std::process::Command::new("screencapture")
-        .args(["-x", "-t", "png", path.to_string_lossy().as_ref()])
-        .output()
-        .map_err(|e| format!("screencapture failed: {e}"))?;
-    if !out.status.success() {
-        return Err("screencapture returned an error".to_string());
+fn observation_png_base64(
+    observation: &macos_computer_use::ComputerUseObservation,
+) -> Result<String, String> {
+    let mime = observation.effective_image_mime_type();
+    if mime.eq_ignore_ascii_case("image/png") {
+        return Ok(observation.image_base64.clone());
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("read screenshot: {e}"))?;
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("decode screenshot: {e}"))?;
-    let resized = img.resize_exact(lw as u32, lh as u32, image::imageops::FilterType::Triangle);
+
+    let bytes = STANDARD
+        .decode(&observation.image_base64)
+        .map_err(|e| format!("decode ComputerUseKit {mime} screenshot: {e}"))?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("decode ComputerUseKit {mime} screenshot: {e}"))?;
     let mut buf = Vec::new();
-    resized
-        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-        .map_err(|e| format!("encode screenshot: {e}"))?;
-    Ok((STANDARD.encode(&buf), lw, lh))
+    img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| format!("encode ComputerUseKit screenshot as PNG: {e}"))?;
+    Ok(STANDARD.encode(&buf))
+}
+
+fn native_window_label(window: &macos_computer_use::ComputerUseWindow) -> String {
+    let app = window
+        .app_name
+        .as_deref()
+        .or(window.owner_name.as_deref())
+        .or(window.bundle_id.as_deref())
+        .unwrap_or("Unknown app");
+    let title = window.title.as_deref().unwrap_or("untitled");
+    let id = window
+        .window_id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let bounds = window
+        .frame
+        .map(|r| {
+            format!(
+                "x={:.0} y={:.0} w={:.0} h={:.0}",
+                r.x, r.y, r.width, r.height
+            )
+        })
+        .unwrap_or_else(|| "bounds unknown".to_string());
+    format!("{app} — {title} (window {id}, {bounds})")
+}
+
+fn native_app_context(observation: &macos_computer_use::ComputerUseObservation) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(app_name) = observation
+        .active_app_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        parts.push(format!("active app: {app_name}"));
+    }
+    if let Some(bundle) = observation
+        .active_bundle_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        parts.push(format!("bundle: {bundle}"));
+    }
+    if let Some(title) = observation
+        .active_window_title
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        parts.push(format!("active window: {title}"));
+    }
+    if let Some(focused) = observation.focused_window.as_ref() {
+        parts.push(format!("focused target: {}", native_window_label(focused)));
+    }
+    if let Some(cursor) = observation.cursor {
+        parts.push(format!("cursor: x={:.0} y={:.0}", cursor.x, cursor.y));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
+    }
+}
+
+fn native_window_summary(
+    observation: &macos_computer_use::ComputerUseObservation,
+) -> Option<String> {
+    if observation.windows.is_empty() {
+        return None;
+    }
+    let windows = observation
+        .windows
+        .iter()
+        .take(10)
+        .map(native_window_label)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "{} visible window(s): {windows}",
+        observation.windows.len()
+    ))
+}
+
+fn capture_screen_observation(app: &tauri::AppHandle) -> Result<DriverObservation, String> {
+    let native = macos_computer_use::observe(&macos_computer_use::ComputerUseObserveConfig {
+        mode: "cursorScreen".to_string(),
+        max_dimension: 1600,
+        jpeg_quality: 0.88,
+        exclude_own_windows: true,
+        ..Default::default()
+    })?;
+    let image_base64 = observation_png_base64(&native)?;
+    let (fallback_w, fallback_h) = primary_logical_size(app);
+    let frame = native.display_frame;
+    let logical_width = if native.logical_width > 0.0 {
+        native.logical_width
+    } else {
+        frame
+            .map(|r| r.width)
+            .filter(|v| *v > 0.0)
+            .unwrap_or(fallback_w)
+    };
+    let logical_height = if native.logical_height > 0.0 {
+        native.logical_height
+    } else {
+        frame
+            .map(|r| r.height)
+            .filter(|v| *v > 0.0)
+            .unwrap_or(fallback_h)
+    };
+
+    Ok(DriverObservation {
+        image_base64,
+        logical_width,
+        logical_height,
+        driver: "screen",
+        ocr_text: None,
+        accessibility_summary: native_window_summary(&native),
+        app_context: native_app_context(&native),
+        rewind_context: None,
+        display_scale: native.display_scale.unwrap_or(1.0),
+    })
 }
 
 fn frame_fingerprint_from_cells(pixels: &[u8]) -> u64 {
@@ -530,7 +1048,11 @@ impl FrameChange {
     fn summary(self) -> String {
         format!(
             "mean_delta={:.2}, changed_cells={}, strong_cells={}, max_delta={}, hash_distance={}",
-            self.mean_delta, self.changed_cells, self.strong_cells, self.max_delta, self.hash_distance
+            self.mean_delta,
+            self.changed_cells,
+            self.strong_cells,
+            self.max_delta,
+            self.hash_distance
         )
     }
 }
@@ -540,8 +1062,18 @@ fn frame_change(before: &str, after: &str) -> Option<FrameChange> {
     let after_bytes = STANDARD.decode(after).ok()?;
     let before_img = image::load_from_memory(&before_bytes).ok()?.to_luma8();
     let after_img = image::load_from_memory(&after_bytes).ok()?.to_luma8();
-    let before_small = image::imageops::resize(&before_img, FRAME_DIFF_W, FRAME_DIFF_H, image::imageops::FilterType::Triangle);
-    let after_small = image::imageops::resize(&after_img, FRAME_DIFF_W, FRAME_DIFF_H, image::imageops::FilterType::Triangle);
+    let before_small = image::imageops::resize(
+        &before_img,
+        FRAME_DIFF_W,
+        FRAME_DIFF_H,
+        image::imageops::FilterType::Triangle,
+    );
+    let after_small = image::imageops::resize(
+        &after_img,
+        FRAME_DIFF_W,
+        FRAME_DIFF_H,
+        image::imageops::FilterType::Triangle,
+    );
     let before_cells: Vec<u8> = before_small.pixels().map(|p| p.0[0]).collect();
     let after_cells: Vec<u8> = after_small.pixels().map(|p| p.0[0]).collect();
     if before_cells.is_empty() || before_cells.len() != after_cells.len() {
@@ -569,7 +1101,9 @@ fn frame_change(before: &str, after: &str) -> Option<FrameChange> {
         changed_cells,
         strong_cells,
         max_delta,
-        hash_distance: (frame_fingerprint_from_cells(&before_cells) ^ frame_fingerprint_from_cells(&after_cells)).count_ones(),
+        hash_distance: (frame_fingerprint_from_cells(&before_cells)
+            ^ frame_fingerprint_from_cells(&after_cells))
+        .count_ones(),
     })
 }
 
@@ -581,6 +1115,52 @@ fn frames_changed_meaningfully(before: &str, after: &str) -> bool {
     }
 }
 
+fn verify_action_outcome(
+    target: RunTarget,
+    action: &ComputerAction,
+    before_b64: &str,
+    after_b64: &str,
+) -> VerificationOutcome {
+    if !is_committing(&action.action) {
+        return VerificationOutcome {
+            verdict: VerificationVerdict::Changed,
+            summary: "non-mutating action".to_string(),
+        };
+    }
+
+    match frame_change(before_b64, after_b64) {
+        Some(change) if change.is_meaningful() => VerificationOutcome {
+            verdict: VerificationVerdict::Changed,
+            summary: format!("verified visual delta ({})", change.summary()),
+        },
+        Some(change) => {
+            let action_kind = action.action.as_str();
+            let reason = match action_kind {
+                "type" | "key" => "text input can be a tiny OCR/DOM change",
+                "scroll" => "scrolling can keep the same page chrome visible",
+                "click" | "double_click" => "clicks can open subtle menus or focus fields",
+                "navigate" | "open_app" => "navigation/app focus can still be painting",
+                _ => "state change is visually subtle",
+            };
+            VerificationOutcome {
+                verdict: VerificationVerdict::Unclear,
+                summary: format!(
+                    "{} verifier is uncertain: {reason}; frame delta {}",
+                    target.driver_key(),
+                    change.summary()
+                ),
+            }
+        }
+        None => VerificationOutcome {
+            verdict: VerificationVerdict::Unclear,
+            summary: format!(
+                "{} verifier could not compare frames; re-observe before deciding",
+                target.driver_key()
+            ),
+        },
+    }
+}
+
 fn post_action_pause_ms(action: &str) -> u64 {
     match action {
         "navigate" | "open_app" => NAV_ACTION_PAUSE_MS,
@@ -589,20 +1169,29 @@ fn post_action_pause_ms(action: &str) -> u64 {
     }
 }
 
-fn can_blame_stale_frame(action: &str) -> bool {
-    matches!(action, "click" | "double_click" | "navigate" | "open_app")
-}
-
 fn action_signature(action: &ComputerAction) -> String {
     let x_bucket = (action.x / 16.0).round() * 16.0;
     let y_bucket = (action.y / 16.0).round() * 16.0;
-    let text = action.text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect::<String>();
-    format!("{}:{x_bucket:.0}:{y_bucket:.0}:{}:{}:{}", action.action, action.app, action.key, text)
+    let text = action
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    format!(
+        "{}:{x_bucket:.0}:{y_bucket:.0}:{}:{}:{}",
+        action.action, action.app, action.key, text
+    )
 }
 
 fn computer_system_prompt(name: &str, w: f64, h: f64, target: RunTarget) -> String {
     if target == RunTarget::Screen {
         return computer_system_prompt_screen(name, w, h);
+    }
+    if target == RunTarget::LocalVm {
+        return computer_system_prompt_local_vm(name, w, h);
     }
     format!(
         "You are \"{name}\", a careful Cascade agent operating YOUR OWN web browser (a {w:.0}x{h:.0} \
@@ -639,8 +1228,19 @@ Return ONLY JSON: {{\"narration\":\"short present-tense\",\"action\":\"click|dou
     )
 }
 
+fn computer_system_prompt_local_vm(name: &str, w: f64, h: f64) -> String {
+    format!(
+        "You are \"{name}\", a careful Cascade agent operating a LOCAL VM sandbox ({w:.0}x{h:.0} \
+viewport, top-left origin). The VM driver is isolated from the employee's real desktop and must expose \
+the same observe/act/verify contract as the local browser and real-screen drivers. Return ONLY JSON."
+    )
+}
+
 fn is_committing(action: &str) -> bool {
-    matches!(action, "click" | "double_click" | "type" | "key" | "navigate" | "open_app")
+    matches!(
+        action,
+        "click" | "double_click" | "type" | "key" | "navigate" | "open_app"
+    )
 }
 
 /// Real-screen variant: the agent drives the USER'S actual screen, so it can use
@@ -691,16 +1291,40 @@ fn open_url_real(action: &ComputerAction) {
     let _ = std::process::Command::new("open").arg(raw).spawn();
 }
 
-fn execute_action(action: &ComputerAction) {
-    match action.action.as_str() {
-        "click" => cascade_input::click(action.x, action.y),
-        "double_click" => cascade_input::double_click(action.x, action.y),
-        "type" => cascade_input::type_text(&action.text),
-        "key" => cascade_input::press_key(&action.key),
-        "open_app" => cascade_input::open_app(&action.app),
-        "scroll" => cascade_input::scroll(if action.y != 0.0 { action.y } else { 500.0 }),
-        "navigate" => open_url_real(action),
-        _ => {}
+fn execute_screen_action(action: &ComputerAction) -> Result<(), String> {
+    if action.action == "navigate" {
+        open_url_real(action);
+        return Ok(());
+    }
+
+    let mut request =
+        serde_json::to_value(action).map_err(|e| format!("serialize native screen action: {e}"))?;
+    if let Some(obj) = request.as_object_mut() {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(action.action.clone()),
+        );
+        if action.action == "scroll" {
+            let dy = if action.y != 0.0 { action.y } else { 500.0 };
+            obj.insert(
+                "dy".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(-dy)
+                        .unwrap_or_else(|| serde_json::Number::from(-500)),
+                ),
+            );
+        }
+    }
+    let result = macos_computer_use::act(&request)?;
+    if result.success {
+        Ok(())
+    } else {
+        Err(result.message.unwrap_or_else(|| {
+            format!(
+                "ComputerUseKit action {:?} did not report success",
+                result.action
+            )
+        }))
     }
 }
 
@@ -781,7 +1405,7 @@ fn build_recorded_digest(
 }
 
 /// Stable per-agent hue so each cursor/row has a consistent color. The first
-/// agent deliberately lands on Cascade blue instead of the old green default.
+/// agent deliberately lands on Cascade blue.
 fn hue_for(spec_id: i64) -> i64 {
     const HUES: [i64; 10] = [222, 276, 18, 198, 326, 44, 252, 304, 12, 236];
     let idx = spec_id.unsigned_abs().saturating_sub(1) as usize;
@@ -835,7 +1459,8 @@ fn parse_external_url(url: &str) -> Result<tauri::Url, String> {
     if trimmed.is_empty() {
         return Err("missing Rewind-grounded start URL".to_string());
     }
-    let parsed = tauri::Url::parse(trimmed).map_err(|e| format!("invalid start URL `{trimmed}`: {e}"))?;
+    let parsed =
+        tauri::Url::parse(trimmed).map_err(|e| format!("invalid start URL `{trimmed}`: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => Ok(parsed),
         other => Err(format!("unsupported start URL scheme `{other}`")),
@@ -858,7 +1483,9 @@ async fn hydrate_sandbox_session(app: &tauri::AppHandle, url: &str) -> Result<us
     }
     let injected = inject_sandbox_cookies_macos(app, cookies).await;
     if injected == 0 {
-        Err(format!("browser session cookies for {host} could not be injected"))
+        Err(format!(
+            "browser session cookies for {host} could not be injected"
+        ))
     } else {
         eprintln!("[cascade-login] {host}: hydrated sandbox with {injected} browser cookie(s)");
         Ok(injected)
@@ -900,9 +1527,24 @@ async fn inject_sandbox_cookies_macos(
                     }
                 };
 
-                push("Name", NSString::alloc(nil).init_str(&c.name), &mut keys, &mut vals);
-                push("Value", NSString::alloc(nil).init_str(&c.value), &mut keys, &mut vals);
-                push("Domain", NSString::alloc(nil).init_str(&c.domain), &mut keys, &mut vals);
+                push(
+                    "Name",
+                    NSString::alloc(nil).init_str(&c.name),
+                    &mut keys,
+                    &mut vals,
+                );
+                push(
+                    "Value",
+                    NSString::alloc(nil).init_str(&c.value),
+                    &mut keys,
+                    &mut vals,
+                );
+                push(
+                    "Domain",
+                    NSString::alloc(nil).init_str(&c.domain),
+                    &mut keys,
+                    &mut vals,
+                );
                 push(
                     "Path",
                     NSString::alloc(nil).init_str(if c.path.is_empty() { "/" } else { &c.path }),
@@ -910,17 +1552,33 @@ async fn inject_sandbox_cookies_macos(
                     &mut vals,
                 );
                 if c.secure {
-                    push("Secure", NSString::alloc(nil).init_str("TRUE"), &mut keys, &mut vals);
+                    push(
+                        "Secure",
+                        NSString::alloc(nil).init_str("TRUE"),
+                        &mut keys,
+                        &mut vals,
+                    );
                 }
                 if c.http_only {
-                    push("HttpOnly", NSString::alloc(nil).init_str("TRUE"), &mut keys, &mut vals);
+                    push(
+                        "HttpOnly",
+                        NSString::alloc(nil).init_str("TRUE"),
+                        &mut keys,
+                        &mut vals,
+                    );
                 }
                 if let Some(secs) = c.expires_at {
                     let date_class = class!(NSDate);
-                    let date: id = msg_send![date_class, dateWithTimeIntervalSince1970: secs as f64];
+                    let date: id =
+                        msg_send![date_class, dateWithTimeIntervalSince1970: secs as f64];
                     push("Expires", date, &mut keys, &mut vals);
                 } else {
-                    push("Discard", NSString::alloc(nil).init_str("TRUE"), &mut keys, &mut vals);
+                    push(
+                        "Discard",
+                        NSString::alloc(nil).init_str("TRUE"),
+                        &mut keys,
+                        &mut vals,
+                    );
                 }
                 if let Some(same_site) = match c.same_site {
                     0 => Some("None"),
@@ -928,13 +1586,24 @@ async fn inject_sandbox_cookies_macos(
                     2 => Some("Strict"),
                     _ => None,
                 } {
-                    push("SameSite", NSString::alloc(nil).init_str(same_site), &mut keys, &mut vals);
+                    push(
+                        "SameSite",
+                        NSString::alloc(nil).init_str(same_site),
+                        &mut keys,
+                        &mut vals,
+                    );
                 }
-                push("Version", NSString::alloc(nil).init_str("0"), &mut keys, &mut vals);
+                push(
+                    "Version",
+                    NSString::alloc(nil).init_str("0"),
+                    &mut keys,
+                    &mut vals,
+                );
 
                 let keys_arr = NSArray::arrayWithObjects(nil, &keys);
                 let vals_arr = NSArray::arrayWithObjects(nil, &vals);
-                let dict: id = NSDictionary::dictionaryWithObjects_forKeys_(nil, vals_arr, keys_arr);
+                let dict: id =
+                    NSDictionary::dictionaryWithObjects_forKeys_(nil, vals_arr, keys_arr);
                 let cookie_class = class!(NSHTTPCookie);
                 let ns_cookie: id = msg_send![cookie_class, cookieWithProperties: dict];
                 if ns_cookie.is_null() {
@@ -959,7 +1628,11 @@ async fn inject_sandbox_cookies_macos(
 /// so the box was coming up blank. On-screen it captures reliably AND the user
 /// can watch the agent work directly. It never takes focus, so the user keeps
 /// working in their own app; the box (a non-activating panel) floats above it.
-fn ensure_agent_browser(app: &tauri::AppHandle, spec_id: i64, start_url: &str) -> Result<(), String> {
+fn ensure_agent_browser(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+    start_url: &str,
+) -> Result<(), String> {
     let app2 = app.clone();
     let label = browser_label(spec_id);
     let parsed = parse_external_url(start_url)?;
@@ -1069,7 +1742,10 @@ unsafe fn nsimage_to_png(image: cocoa::base::id) -> Option<Vec<u8>> {
 /// Now we ask WKWebView itself for a snapshot, which renders the live web content
 /// to an NSImage even while the window is invisible (alpha 0), so the agent can
 /// "see" and the floating box can stream while the user only ever sees the box.
-async fn capture_browser(app: &tauri::AppHandle, spec_id: i64) -> Result<(String, f64, f64), String> {
+async fn capture_browser(
+    app: &tauri::AppHandle,
+    spec_id: i64,
+) -> Result<(String, f64, f64), String> {
     let label = browser_label(spec_id);
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
@@ -1114,7 +1790,8 @@ async fn capture_browser(app: &tauri::AppHandle, spec_id: i64) -> Result<(String
             let handler = handler.copy();
             // nil configuration → snapshot the full visible viewport at view bounds.
             unsafe {
-                let _: () = msg_send![wk, takeSnapshotWithConfiguration: nil completionHandler: &*handler];
+                let _: () =
+                    msg_send![wk, takeSnapshotWithConfiguration: nil completionHandler: &*handler];
             }
         });
         if wv.is_err() {
@@ -1142,7 +1819,11 @@ async fn capture_browser(app: &tauri::AppHandle, spec_id: i64) -> Result<(String
         return Err("empty browser snapshot".to_string());
     }
     let img = image::load_from_memory(&png).map_err(|e| format!("decode browser snapshot: {e}"))?;
-    let resized = img.resize_exact(BROWSER_W as u32, BROWSER_H as u32, image::imageops::FilterType::Triangle);
+    let resized = img.resize_exact(
+        BROWSER_W as u32,
+        BROWSER_H as u32,
+        image::imageops::FilterType::Triangle,
+    );
     let mut buf = Vec::new();
     resized
         .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -1207,7 +1888,11 @@ try{{\
             // the point, searching the full paint stack and same-origin iframes.
             // Some nav menus ignore a bare `el.click()` or the first topmost
             // span; they want the actual buttonish node plus pointerdown.
-            let dbl = if action.action == "double_click" { ",'dblclick'" } else { "" };
+            let dbl = if action.action == "double_click" {
+                ",'dblclick'"
+            } else {
+                ""
+            };
             browser_eval(app, spec_id, &format!(
                 "(function(){{\
 var CLICKABLE='a,button,[role=\\\"button\\\"],[onclick],input,select,textarea,label,[tabindex],summary,[aria-haspopup],li,td';\
@@ -1280,7 +1965,11 @@ el.dispatchEvent(new Event('change',{{bubbles:true}}));\
             ));
         }
         "key" => {
-            let key = if action.key.is_empty() { "Enter".to_string() } else { action.key.clone() };
+            let key = if action.key.is_empty() {
+                "Enter".to_string()
+            } else {
+                action.key.clone()
+            };
             let k = serde_json::to_string(&key).unwrap_or_else(|_| "\"Enter\"".into());
             browser_eval(app, spec_id, &format!(
                 "(function(){{\
@@ -1313,25 +2002,17 @@ async fn capture_for(
 ) -> Result<(String, f64, f64), String> {
     match target {
         RunTarget::Sandbox => capture_browser(app, spec_id).await,
-        RunTarget::Screen => capture_logical_screenshot(app),
-    }
-}
-
-/// Perform an action, per target: inside the sandbox browser via JS injection, or
-/// on the user's real screen via synthesized input. Real input is serialized
-/// through INPUT_LOCK so concurrent agents don't collide on the keyboard/mouse.
-async fn act_for(
-    app: &tauri::AppHandle,
-    spec_id: i64,
-    action: &ComputerAction,
-    target: RunTarget,
-) {
-    match target {
-        RunTarget::Sandbox => browser_execute(app, spec_id, action),
         RunTarget::Screen => {
-            let _guard = INPUT_LOCK.lock().await;
-            execute_action(action);
+            let observation = capture_screen_observation(app)?;
+            Ok((
+                observation.image_base64,
+                observation.logical_width,
+                observation.logical_height,
+            ))
         }
+        RunTarget::LocalVm => Err(
+            "Local VM driver is defined but no local VM provider is configured yet.".to_string(),
+        ),
     }
 }
 
@@ -1347,13 +2028,17 @@ async fn run_task_cycle(
     hue: i64,
     target: RunTarget,
 ) -> i64 {
+    let driver = AgentDriver::new(target);
     let recording = record_run_start(app, spec_id).await;
     let mut history = String::new();
     let mut produced = 0i64;
     let mut notes: Vec<String> = Vec::new();
     let mut transient_failures = 0u32;
-    let mut stalled_commits = 0u32;
-    let mut last_stall_signature: Option<String> = None;
+    let mut committing_actions = 0i64;
+    let mut unclear_verifications = 0u32;
+    let mut repeated_action_count = 0u32;
+    let mut last_action_signature: Option<String> = None;
+    let cycle_started = Instant::now();
 
     match target {
         RunTarget::Sandbox => {
@@ -1362,12 +2047,14 @@ async fn run_task_cycle(
             let Some(start_url) = get_start_url(spec_id) else {
                 if let Some((pool, run_id)) = &recording {
                     use cascade_schema::sqlx;
-                    let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
-                        .bind(*run_id)
-                        .bind("failed")
-                        .bind("computer-use run failed: no Rewind-grounded start URL")
-                        .execute(pool)
-                        .await;
+                    let _ = sqlx::query(
+                        "UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1",
+                    )
+                    .bind(*run_id)
+                    .bind("failed")
+                    .bind("computer-use run failed: no Rewind-grounded start URL")
+                    .execute(pool)
+                    .await;
                 }
                 emit_status(
                     app,
@@ -1386,12 +2073,14 @@ async fn run_task_cycle(
             if let Err(e) = ensure_agent_browser(app, spec_id, &start_url) {
                 if let Some((pool, run_id)) = &recording {
                     use cascade_schema::sqlx;
-                    let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
-                        .bind(*run_id)
-                        .bind("failed")
-                        .bind(format!("computer-use run failed: {e}"))
-                        .execute(pool)
-                        .await;
+                    let _ = sqlx::query(
+                        "UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1",
+                    )
+                    .bind(*run_id)
+                    .bind("failed")
+                    .bind(format!("computer-use run failed: {e}"))
+                    .execute(pool)
+                    .await;
                 }
                 emit_status(app, status_err(spec_id, name, goal, 0, supervised, hue, e));
                 return 0;
@@ -1407,13 +2096,53 @@ async fn run_task_cycle(
                 tokio::time::sleep(Duration::from_millis(2200)).await;
             }
         }
+        RunTarget::LocalVm => {
+            if let Some((pool, run_id)) = &recording {
+                use cascade_schema::sqlx;
+                let _ =
+                    sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
+                        .bind(*run_id)
+                        .bind("failed")
+                        .bind("computer-use run failed: Local VM driver is not configured")
+                        .execute(pool)
+                        .await;
+            }
+            emit_status(
+                app,
+                status_err(
+                    spec_id,
+                    name,
+                    goal,
+                    0,
+                    supervised,
+                    hue,
+                    "Local VM driver is defined but no local VM provider is configured yet."
+                        .to_string(),
+                ),
+            );
+            return 0;
+        }
     }
 
-    for step in 1..=MAX_STEPS {
+    for step in 1..=driver.max_steps() {
         if stop_requested(spec_id) || is_paused(spec_id) {
             break;
         }
-        let (b64, lw, lh) = match capture_for(app, spec_id, target).await {
+        if let Some(timeout) = driver.cycle_timeout() {
+            if cycle_started.elapsed() >= timeout {
+                let msg = format!(
+                    "Stopped after {}s screen-mode safety timeout.",
+                    timeout.as_secs()
+                );
+                history.push_str(&format!("- step {step}: {msg}\n"));
+                emit_status(
+                    app,
+                    status_err(spec_id, name, goal, step, supervised, hue, msg),
+                );
+                break;
+            }
+        }
+        let observation = match driver.observe(app, spec_id).await {
             Ok(v) => {
                 transient_failures = 0;
                 v
@@ -1441,20 +2170,44 @@ async fn run_task_cycle(
                     tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
                     continue;
                 }
-                emit_status(app, status_err(spec_id, name, goal, step, supervised, hue, e));
+                emit_status(
+                    app,
+                    status_err(spec_id, name, goal, step, supervised, hue, e),
+                );
                 break;
             }
         };
-        // Sandbox streams its browser into the box; screen mode has no box (the
-        // user watches their real screen directly), so don't ship frames there.
+        let b64 = observation.image_base64.clone();
+        let lw = observation.logical_width;
+        let lh = observation.logical_height;
+        // Local Browser streams frames into the control box. Screen mode keeps the
+        // same STOP/PAUSE box visible, but the user watches their real desktop
+        // directly, so we do not mirror the whole screen into the box.
         if target == RunTarget::Sandbox {
-            let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64.clone(), img_w: lw, img_h: lh });
+            let _ = app.emit(
+                EVT_FRAME,
+                FrameEvent {
+                    image_base64: b64.clone(),
+                    img_w: lw,
+                    img_h: lh,
+                },
+            );
         }
         let user = format!(
-            "GOAL: {goal}\n\nSteps so far:\n{}\n\nThe screenshot is the current screen ({lw:.0}x{lh:.0} points). Single next action as JSON.",
+            "GOAL: {goal}\n\n{}\n\nSteps so far:\n{}\n\nThe screenshot is the current screen ({lw:.0}x{lh:.0} points). Single next action as JSON.",
+            observation.prompt_context(),
             if history.is_empty() { "(none yet)" } else { &history }
         );
-        let res = match call_anthropic_vision(MODEL_SONNET, &computer_system_prompt(name, lw, lh, target), &user, &b64, 0.0, 700).await {
+        let res = match call_anthropic_vision(
+            MODEL_SONNET,
+            &computer_system_prompt(name, lw, lh, target),
+            &user,
+            &b64,
+            0.0,
+            700,
+        )
+        .await
+        {
             Ok(r) => {
                 transient_failures = 0;
                 r
@@ -1482,11 +2235,17 @@ async fn run_task_cycle(
                     tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
                     continue;
                 }
-                emit_status(app, status_err(spec_id, name, goal, step, supervised, hue, e));
+                emit_status(
+                    app,
+                    status_err(spec_id, name, goal, step, supervised, hue, e),
+                );
                 break;
             }
         };
-        let action: ComputerAction = match extract_json_str(&res.text).ok().and_then(|j| serde_json::from_str(&j).ok()) {
+        let action: ComputerAction = match extract_json_str(&res.text)
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+        {
             Some(a) => {
                 transient_failures = 0;
                 a
@@ -1515,13 +2274,41 @@ async fn run_task_cycle(
                     tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
                     continue;
                 }
-                emit_status(app, status_err(spec_id, name, goal, step, supervised, hue, err));
+                emit_status(
+                    app,
+                    status_err(spec_id, name, goal, step, supervised, hue, err),
+                );
                 break;
             }
         };
 
-        emit_cursor(app, CursorEvent { spec_id, name: name.to_string(), x: action.x, y: action.y, clicking: false, visible: true, hue });
-        emit_status(app, StatusEvent { spec_id, name: name.to_string(), goal: goal.to_string(), narration: narrate(&action), step, supervised, awaiting_approval: false, done: false, error: None, hue });
+        emit_cursor(
+            app,
+            CursorEvent {
+                spec_id,
+                name: name.to_string(),
+                x: action.x,
+                y: action.y,
+                clicking: false,
+                visible: true,
+                hue,
+            },
+        );
+        emit_status(
+            app,
+            StatusEvent {
+                spec_id,
+                name: name.to_string(),
+                goal: goal.to_string(),
+                narration: narrate(&action),
+                step,
+                supervised,
+                awaiting_approval: false,
+                done: false,
+                error: None,
+                hue,
+            },
+        );
 
         if action.action == "record" {
             let note = recorded_text(if action.text.trim().is_empty() {
@@ -1530,26 +2317,35 @@ async fn run_task_cycle(
                 &action.text
             });
             if !note.is_empty() {
-                if !notes.iter().any(|existing| existing.eq_ignore_ascii_case(&note)) {
+                if !notes
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&note))
+                {
                     notes.push(note.clone());
                 }
                 if let Some((pool, run_id)) = &recording {
-                    let _ = insert_agent_action(pool, &AgentActionInput {
-                        run_id: *run_id,
-                        spec_id,
-                        step,
-                        tool: "browser.record".to_string(),
-                        summary: "Recorded a finding".to_string(),
-                        content: Some(note.clone()),
-                        artifact_path: None,
-                        reversible: false,
-                        mutating: false,
-                        state: "committed".to_string(),
-                    }).await;
+                    let _ = insert_agent_action(
+                        pool,
+                        &AgentActionInput {
+                            run_id: *run_id,
+                            spec_id,
+                            step,
+                            tool: "browser.record".to_string(),
+                            summary: "Recorded a finding".to_string(),
+                            content: Some(note.clone()),
+                            artifact_path: None,
+                            reversible: false,
+                            mutating: false,
+                            state: "committed".to_string(),
+                        },
+                    )
+                    .await;
                 }
                 history.push_str(&format!("- step {step}: recorded finding: {note}\n"));
             } else {
-                history.push_str(&format!("- step {step}: tried to record, but captured nothing useful\n"));
+                history.push_str(&format!(
+                    "- step {step}: tried to record, but captured nothing useful\n"
+                ));
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -1561,12 +2357,7 @@ async fn run_task_cycle(
                 match &recording {
                     Some((pool, run_id)) => {
                         match crate::cascade_agents::deliver_artifact_write(
-                            app,
-                            spec_id,
-                            *run_id,
-                            step,
-                            name,
-                            &document,
+                            app, spec_id, *run_id, step, name, &document,
                         )
                         .await
                         {
@@ -1576,18 +2367,22 @@ async fn run_task_cycle(
                                     "Wrote the gathered result into {}",
                                     delivered.app_label
                                 );
-                                let _ = insert_agent_action(pool, &AgentActionInput {
-                                    run_id: *run_id,
-                                    spec_id,
-                                    step,
-                                    tool: "artifact.write".to_string(),
-                                    summary: summary.clone(),
-                                    content: Some(document.clone()),
-                                    artifact_path: delivered.path.clone(),
-                                    reversible: true,
-                                    mutating: true,
-                                    state: "committed".to_string(),
-                                }).await;
+                                let _ = insert_agent_action(
+                                    pool,
+                                    &AgentActionInput {
+                                        run_id: *run_id,
+                                        spec_id,
+                                        step,
+                                        tool: "artifact.write".to_string(),
+                                        summary: summary.clone(),
+                                        content: Some(document.clone()),
+                                        artifact_path: delivered.path.clone(),
+                                        reversible: true,
+                                        mutating: true,
+                                        state: "committed".to_string(),
+                                    },
+                                )
+                                .await;
                                 box_step(app, spec_id, name, goal, &summary, step);
                                 box_result(
                                     app,
@@ -1600,30 +2395,39 @@ async fn run_task_cycle(
                                 );
                             }
                             Err(e) => {
-                                let _ = insert_agent_action(pool, &AgentActionInput {
-                                    run_id: *run_id,
-                                    spec_id,
-                                    step,
-                                    tool: "artifact.write".to_string(),
-                                    summary: format!("failed to write gathered result: {e}"),
-                                    content: Some(document.clone()),
-                                    artifact_path: None,
-                                    reversible: false,
-                                    mutating: true,
-                                    state: "failed".to_string(),
-                                }).await;
-                                emit_status(app, StatusEvent {
-                                    spec_id,
-                                    name: name.to_string(),
-                                    goal: goal.to_string(),
-                                    narration: format!("Read the site, but couldn't save the result — {e}"),
-                                    step,
-                                    supervised,
-                                    awaiting_approval: false,
-                                    done: false,
-                                    error: None,
-                                    hue,
-                                });
+                                let _ = insert_agent_action(
+                                    pool,
+                                    &AgentActionInput {
+                                        run_id: *run_id,
+                                        spec_id,
+                                        step,
+                                        tool: "artifact.write".to_string(),
+                                        summary: format!("failed to write gathered result: {e}"),
+                                        content: Some(document.clone()),
+                                        artifact_path: None,
+                                        reversible: false,
+                                        mutating: true,
+                                        state: "failed".to_string(),
+                                    },
+                                )
+                                .await;
+                                emit_status(
+                                    app,
+                                    StatusEvent {
+                                        spec_id,
+                                        name: name.to_string(),
+                                        goal: goal.to_string(),
+                                        narration: format!(
+                                            "Read the site, but couldn't save the result — {e}"
+                                        ),
+                                        step,
+                                        supervised,
+                                        awaiting_approval: false,
+                                        done: false,
+                                        error: None,
+                                        hue,
+                                    },
+                                );
                             }
                         }
                     }
@@ -1633,7 +2437,21 @@ async fn run_task_cycle(
             break;
         }
         if supervised && is_committing(&action.action) {
-            emit_status(app, StatusEvent { spec_id, name: name.to_string(), goal: goal.to_string(), narration: format!("Waiting for your OK: {}", narrate(&action)), step, supervised, awaiting_approval: true, done: false, error: None, hue });
+            emit_status(
+                app,
+                StatusEvent {
+                    spec_id,
+                    name: name.to_string(),
+                    goal: goal.to_string(),
+                    narration: format!("Waiting for your OK: {}", narrate(&action)),
+                    step,
+                    supervised,
+                    awaiting_approval: true,
+                    done: false,
+                    error: None,
+                    hue,
+                },
+            );
             let approved = await_approval(spec_id).await;
             if stop_requested(spec_id) {
                 break;
@@ -1647,81 +2465,184 @@ async fn run_task_cycle(
             break;
         }
         if is_paused(spec_id) {
-            history.push_str(&format!("- step {step}: paused before {}\n", narrate(&action)));
+            history.push_str(&format!(
+                "- step {step}: paused before {}\n",
+                narrate(&action)
+            ));
             break;
         }
 
-        emit_cursor(app, CursorEvent { spec_id, name: name.to_string(), x: action.x, y: action.y, clicking: true, visible: true, hue });
-        // Act per the chosen target: inside the sandbox browser, or on the real screen.
-        act_for(app, spec_id, &action, target).await;
+        if is_committing(&action.action) {
+            if let Some(max) = driver.max_committing_actions() {
+                if committing_actions >= max {
+                    let msg = format!(
+                        "Stopped after {max} real-screen actions so the agent cannot run away."
+                    );
+                    history.push_str(&format!("- step {step}: {msg}\n"));
+                    emit_status(
+                        app,
+                        status_err(spec_id, name, goal, step, supervised, hue, msg),
+                    );
+                    break;
+                }
+            }
+
+            let signature = action_signature(&action);
+            if last_action_signature.as_deref() == Some(signature.as_str()) {
+                repeated_action_count += 1;
+            } else {
+                repeated_action_count = 1;
+                last_action_signature = Some(signature);
+            }
+            if repeated_action_count >= REPEATED_ACTION_FAIL_AFTER {
+                let msg = format!(
+                    "Stopped before repeating the same {} action {} times.",
+                    action.action, repeated_action_count
+                );
+                history.push_str(&format!("- step {step}: {msg}\n"));
+                emit_status(
+                    app,
+                    StatusEvent {
+                        spec_id,
+                        name: name.to_string(),
+                        goal: goal.to_string(),
+                        narration: msg.clone(),
+                        step,
+                        supervised,
+                        awaiting_approval: false,
+                        done: true,
+                        error: Some("repeated-action guard".to_string()),
+                        hue,
+                    },
+                );
+                break;
+            }
+        }
+
+        emit_cursor(
+            app,
+            CursorEvent {
+                spec_id,
+                name: name.to_string(),
+                x: action.x,
+                y: action.y,
+                clicking: true,
+                visible: true,
+                hue,
+            },
+        );
+        // Act per the selected driver: local browser, real screen, or future VM.
+        if let Err(e) = driver.act(app, spec_id, &action).await {
+            history.push_str(&format!(
+                "- step {step}: action {} failed: {e}\n",
+                action.action
+            ));
+            if let Some((pool, run_id)) = &recording {
+                let _ = insert_agent_action(
+                    pool,
+                    &AgentActionInput {
+                        run_id: *run_id,
+                        spec_id,
+                        step,
+                        tool: format!("{}.{}", driver.key(), action.action),
+                        summary: format!("native action failed: {e}"),
+                        content: None,
+                        artifact_path: None,
+                        reversible: false,
+                        mutating: is_committing(&action.action),
+                        state: "failed".to_string(),
+                    },
+                )
+                .await;
+            }
+            emit_status(
+                app,
+                status_err(
+                    spec_id,
+                    name,
+                    goal,
+                    step,
+                    supervised,
+                    hue,
+                    format!("Action failed: {e}"),
+                ),
+            );
+            break;
+        }
         if is_committing(&action.action) {
             produced += 1;
+            committing_actions += 1;
             if let Some((pool, run_id)) = &recording {
-                let _ = insert_agent_action(pool, &AgentActionInput {
-                    run_id: *run_id,
-                    spec_id,
-                    step,
-                    tool: format!("browser.{}", action.action),
-                    summary: narrate(&action),
-                    content: None,
-                    artifact_path: None,
-                    reversible: false,
-                    mutating: true,
-                    state: "committed".to_string(),
-                }).await;
+                let _ = insert_agent_action(
+                    pool,
+                    &AgentActionInput {
+                        run_id: *run_id,
+                        spec_id,
+                        step,
+                        tool: format!("{}.{}", driver.key(), action.action),
+                        summary: narrate(&action),
+                        content: None,
+                        artifact_path: None,
+                        reversible: false,
+                        mutating: true,
+                        state: "committed".to_string(),
+                    },
+                )
+                .await;
             }
         }
 
         history.push_str(&format!("- step {step}: {}\n", narrate(&action)));
         tokio::time::sleep(Duration::from_millis(post_action_pause_ms(&action.action))).await;
         if is_committing(&action.action) {
-            if let Ok((mut after_b64, mut after_w, mut after_h)) = capture_for(app, spec_id, target).await {
-                let mut change = frame_change(&b64, &after_b64);
-                if !change.map(|c| c.is_meaningful()).unwrap_or_else(|| b64 != after_b64) {
+            if let Ok(mut after) = driver.observe(app, spec_id).await {
+                let mut verification = driver.verify(&action, &b64, &after.image_base64).await;
+                if verification.verdict == VerificationVerdict::Unclear {
                     tokio::time::sleep(Duration::from_millis(STALE_RECHECK_DELAY_MS)).await;
-                    if let Ok((retry_b64, retry_w, retry_h)) = capture_for(app, spec_id, target).await {
-                        let retry_change = frame_change(&b64, &retry_b64);
-                        if retry_change.map(|c| c.is_meaningful()).unwrap_or_else(|| b64 != retry_b64) {
-                            after_b64 = retry_b64;
-                            after_w = retry_w;
-                            after_h = retry_h;
-                            change = retry_change;
-                        } else if change.is_none() && retry_change.is_some() {
-                            after_b64 = retry_b64;
-                            after_w = retry_w;
-                            after_h = retry_h;
-                            change = retry_change;
+                    if let Ok(retry) = driver.observe(app, spec_id).await {
+                        let retry_verification =
+                            driver.verify(&action, &b64, &retry.image_base64).await;
+                        if retry_verification.verdict == VerificationVerdict::Changed {
+                            after = retry;
+                            verification = retry_verification;
                         }
                     }
                 }
                 if target == RunTarget::Sandbox {
-                    let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: after_b64.clone(), img_w: after_w, img_h: after_h });
+                    let _ = app.emit(
+                        EVT_FRAME,
+                        FrameEvent {
+                            image_base64: after.image_base64.clone(),
+                            img_w: after.logical_width,
+                            img_h: after.logical_height,
+                        },
+                    );
                 }
-                let changed = change.map(|c| c.is_meaningful()).unwrap_or_else(|| b64 != after_b64);
-                if !changed {
-                    let diagnostic = change.map(|c| c.summary()).unwrap_or_else(|| "comparison unavailable".to_string());
-                    history.push_str(&format!(
-                        "- step {step}: {} did not produce a large visible change yet ({diagnostic}); verify the current screen before deciding whether to wait, continue, or choose another target\n",
-                        action.action
-                    ));
-                    if can_blame_stale_frame(&action.action) {
-                        let signature = action_signature(&action);
-                        if last_stall_signature.as_deref() == Some(signature.as_str()) {
-                            stalled_commits += 1;
-                        } else {
-                            stalled_commits = 1;
-                            last_stall_signature = Some(signature);
-                        }
+
+                match verification.verdict {
+                    VerificationVerdict::Changed => {
+                        unclear_verifications = 0;
+                        history.push_str(&format!(
+                            "- step {step}: verifier confirmed progress ({})\n",
+                            verification.summary
+                        ));
+                    }
+                    VerificationVerdict::Unclear => {
+                        unclear_verifications += 1;
+                        history.push_str(&format!(
+                            "- step {step}: state after {} is unclear, not failed ({}); re-observe before deciding the next move\n",
+                            action.action, verification.summary
+                        ));
                         emit_status(
                             app,
                             StatusEvent {
                                 spec_id,
                                 name: name.to_string(),
                                 goal: goal.to_string(),
-                                narration: if stalled_commits >= STALL_WARN_AFTER {
-                                    "The same target still looks unchanged. Checking the screen before choosing another route…".to_string()
+                                narration: if unclear_verifications >= UNCLEAR_VERIFY_WARN_AFTER {
+                                    "The verifier is still uncertain, so I am re-reading the current state instead of assuming the last action failed.".to_string()
                                 } else {
-                                    "The screen looks similar after that action. Verifying before the next move…".to_string()
+                                    "That change is subtle or still settling. Re-reading the current state before the next move…".to_string()
                                 },
                                 step,
                                 supervised,
@@ -1731,34 +2652,7 @@ async fn run_task_cycle(
                                 hue,
                             },
                         );
-                        if stalled_commits >= STALL_FAIL_AFTER {
-                            history.push_str(&format!(
-                                "- step {step}: stopped after {stalled_commits} repeated stale snapshots for the same target to avoid an automation loop\n"
-                            ));
-                            emit_status(
-                                app,
-                                StatusEvent {
-                                    spec_id,
-                                    name: name.to_string(),
-                                    goal: goal.to_string(),
-                                    narration: "I stopped because the same target stayed visually unchanged after repeated attempts.".to_string(),
-                                    step,
-                                    supervised,
-                                    awaiting_approval: false,
-                                    done: true,
-                                    error: Some("stopped after repeated stale snapshots".to_string()),
-                                    hue,
-                                },
-                            );
-                            break;
-                        }
-                    } else {
-                        stalled_commits = 0;
-                        last_stall_signature = None;
                     }
-                } else {
-                    stalled_commits = 0;
-                    last_stall_signature = None;
                 }
             }
         }
@@ -1768,24 +2662,41 @@ async fn run_task_cycle(
         use cascade_schema::sqlx;
         let _ = sqlx::query("UPDATE cascade_agent_runs SET status=?2, summary=?3 WHERE id=?1")
             .bind(*run_id)
-            .bind(if stop_requested(spec_id) { "flagged" } else { "success" })
-            .bind(format!("computer-use run · {produced} action(s)"))
+            .bind(if stop_requested(spec_id) {
+                "stopped"
+            } else {
+                "success"
+            })
+            .bind(format!(
+                "{} computer-use run · {produced} action(s)",
+                driver.key()
+            ))
             .execute(pool)
             .await;
     }
     produced
 }
 
-async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool, target: RunTarget) {
+async fn run_loop(
+    app: tauri::AppHandle,
+    spec_id: i64,
+    name: String,
+    goal: String,
+    supervised: bool,
+    target: RunTarget,
+) {
     let hue = hue_for(spec_id);
     let mut goal = goal;
-    // Sandbox → the floating box (streams the isolated browser with the agent
-    // cursor drawn INSIDE it; the user keeps working uninterrupted). Screen →
-    // NO box: a click-through cursor overlay so the agent's OWN pointer moves on
-    // the user's REAL screen, right where it's about to act.
+    // Local Browser → floating box streams the isolated browser. Screen → keep
+    // the same control box visible for STOP/PAUSE plus a click-through cursor
+    // overlay on the user's real screen.
     match target {
         RunTarget::Sandbox => ensure_box_window(&app),
-        RunTarget::Screen => ensure_cursor_overlay(&app),
+        RunTarget::Screen => {
+            ensure_box_window(&app);
+            ensure_cursor_overlay(&app);
+        }
+        RunTarget::LocalVm => ensure_box_window(&app),
     }
     // Let the freshly-created overlay webview register its event listeners.
     tokio::time::sleep(Duration::from_millis(850)).await;
@@ -1849,7 +2760,10 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
                                 hue,
                             },
                         );
-                        ensure_host_login(&app, spec_id, &name, &goal, supervised, hue, &host, &url).await;
+                        ensure_host_login(
+                            &app, spec_id, &name, &goal, supervised, hue, &host, &url,
+                        )
+                        .await;
                     }
                 }
                 if stop_requested(spec_id) {
@@ -1901,12 +2815,19 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
             break;
         }
         let paused = is_paused(spec_id);
-        // Sandbox only: keep the box alive by streaming the agent's browser so the
-        // user can watch progress. Screen mode has no box (and no agent cursor
-        // moves while idle), so skip the wasteful full-screen captures.
+        // Local Browser streams its browser into the control box while idle.
+        // Screen mode keeps STOP/PAUSE visible but does not mirror the whole
+        // desktop into the box.
         if target == RunTarget::Sandbox {
             if let Ok((b64, lw, lh)) = capture_for(&app, spec_id, target).await {
-                let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: b64, img_w: lw, img_h: lh });
+                let _ = app.emit(
+                    EVT_FRAME,
+                    FrameEvent {
+                        image_base64: b64,
+                        img_w: lw,
+                        img_h: lh,
+                    },
+                );
             }
         }
         emit_status(
@@ -1949,9 +2870,23 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
     }
 
     // Stopped → tear down (close the agent's browser too).
-    eprintln!("[cascade-agent] run_loop tearing down spec_id={spec_id} (stop={})", stop_requested(spec_id));
+    eprintln!(
+        "[cascade-agent] run_loop tearing down spec_id={spec_id} (stop={})",
+        stop_requested(spec_id)
+    );
     close_agent_browser(&app, spec_id);
-    emit_cursor(&app, CursorEvent { spec_id, name: name.clone(), x: 0.0, y: 0.0, clicking: false, visible: false, hue });
+    emit_cursor(
+        &app,
+        CursorEvent {
+            spec_id,
+            name: name.clone(),
+            x: 0.0,
+            y: 0.0,
+            clicking: false,
+            visible: false,
+            hue,
+        },
+    );
     emit_status(
         &app,
         StatusEvent {
@@ -1971,7 +2906,10 @@ async fn run_loop(app: tauri::AppHandle, spec_id: i64, name: String, goal: Strin
     let remaining = end_agent(spec_id);
     if remaining == 0 {
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let still = AGENTS.lock().map(|m| m.values().filter(|c| c.running).count()).unwrap_or(0);
+        let still = AGENTS
+            .lock()
+            .map(|m| m.values().filter(|c| c.running).count())
+            .unwrap_or(0);
         if still == 0 {
             hide_overlays(&app);
         }
@@ -1983,15 +2921,27 @@ async fn spec_cadence_minutes(app: &tauri::AppHandle, spec_id: i64) -> i64 {
     if spec_id <= 0 {
         return 5;
     }
-    let Ok(pool) = crate::cascade_agents::cascade_pool(app).await else { return 5 };
-    let Ok(Some(spec)) = get_agent_spec(&pool, spec_id).await else { return 5 };
+    let Ok(pool) = crate::cascade_agents::cascade_pool(app).await else {
+        return 5;
+    };
+    let Ok(Some(spec)) = get_agent_spec(&pool, spec_id).await else {
+        return 5;
+    };
     serde_json::from_str::<serde_json::Value>(&spec.spec_json)
         .ok()
         .and_then(|v| v.get("scheduleMinutes").and_then(|s| s.as_i64()))
         .unwrap_or(5)
 }
 
-fn status_err(spec_id: i64, name: &str, goal: &str, step: i64, supervised: bool, hue: i64, e: String) -> StatusEvent {
+fn status_err(
+    spec_id: i64,
+    name: &str,
+    goal: &str,
+    step: i64,
+    supervised: bool,
+    hue: i64,
+    e: String,
+) -> StatusEvent {
     StatusEvent {
         spec_id,
         name: name.to_string(),
@@ -2120,7 +3070,9 @@ fn derive_goal(spec_json: &str) -> String {
     goal
 }
 
-async fn db_pool(app: &tauri::AppHandle) -> Result<cascade_schema::sqlx::sqlite::SqlitePool, String> {
+async fn db_pool(
+    app: &tauri::AppHandle,
+) -> Result<cascade_schema::sqlx::sqlite::SqlitePool, String> {
     let db_path = {
         let store = crate::store::SettingsStore::get(app)
             .map_err(|e| format!("settings: {e}"))?
@@ -2155,7 +3107,14 @@ async fn resolve_browser_start_url(
     Err("No observed or validated start URL was recovered from the Rewind/spec".to_string())
 }
 
-fn spawn_agent(app: tauri::AppHandle, spec_id: i64, name: String, goal: String, supervised: bool, target: RunTarget) {
+fn spawn_agent(
+    app: tauri::AppHandle,
+    spec_id: i64,
+    name: String,
+    goal: String,
+    supervised: bool,
+    target: RunTarget,
+) {
     if !try_begin(spec_id) {
         return; // already running
     }
@@ -2177,6 +3136,22 @@ pub async fn cascade_start_computer_task(
 ) -> Result<(), String> {
     require_anthropic_key_for("starting a Cascade agent")?;
     let target = RunTarget::from_opt(target.as_deref());
+    match target {
+        RunTarget::Screen => {
+            let readiness = screen_agent_readiness(&app).await;
+            if !readiness.ready {
+                return Err(readiness.message);
+            }
+        }
+        RunTarget::LocalVm => {
+            return Err(
+                "Local VM driver is defined, but no local VM provider is configured yet."
+                    .to_string(),
+            );
+        }
+        RunTarget::Sandbox => {}
+    }
+    cleanup_orphaned_computer_runs(&app).await;
     let pool = db_pool(&app).await?;
     let spec = get_agent_spec(&pool, spec_id)
         .await
@@ -2188,7 +3163,7 @@ pub async fn cascade_start_computer_task(
     // The sandbox is web-only, so it requires a browser-grounded workflow. The
     // real-screen target can drive ANY app, so it accepts any deployed agent.
     if target == RunTarget::Sandbox && !spec_uses_browser(&spec.spec_json) {
-        return Err("This agent isn't a browser workflow, so it can't run in the Local Sandbox. Switch to \"On your screen\" in Settings to run it.".to_string());
+        return Err("This agent isn't a browser workflow, so it can't run in the Local Browser. Switch to \"On your screen\" in Settings to run it.".to_string());
     }
     // Browser computer-use is NOT per-click supervised: every click/type/navigate
     // counts as "committing", so per-step approval would block the agent on its
@@ -2215,18 +3190,25 @@ pub async fn cascade_start_computer_task(
     // it's optional — the agent can also work with whatever's already on screen.
     match target {
         RunTarget::Sandbox => {
-            let start_url = resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await?;
+            let start_url =
+                resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await?;
             set_start_url(spec_id, start_url.clone());
-            eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} url={start_url} target=sandbox", spec.name);
+            eprintln!(
+                "[cascade-agent] start spec_id={spec_id} name={:?} url={start_url} target=sandbox",
+                spec.name
+            );
         }
         RunTarget::Screen => {
-            if let Ok(start_url) = resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await {
+            if let Ok(start_url) =
+                resolve_browser_start_url(&app, spec_id, &task, &spec.spec_json).await
+            {
                 set_start_url(spec_id, start_url.clone());
                 eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} url={start_url} target=screen", spec.name);
             } else {
                 eprintln!("[cascade-agent] start spec_id={spec_id} name={:?} (no start URL) target=screen", spec.name);
             }
         }
+        RunTarget::LocalVm => unreachable!("Local VM target returns before start"),
     }
     // Sign-in (if needed) now happens inside the agent's run_loop — serialized
     // and per-host — so it can't release a different agent's login.
@@ -2237,11 +3219,32 @@ pub async fn cascade_start_computer_task(
 /// Start EVERY installed (deployed) agent at once — one cursor per agent.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_start_all_computer_tasks(app: tauri::AppHandle, target: Option<String>) -> Result<u32, String> {
+pub async fn cascade_start_all_computer_tasks(
+    app: tauri::AppHandle,
+    target: Option<String>,
+) -> Result<u32, String> {
     require_anthropic_key_for("starting Cascade agents")?;
     let target = RunTarget::from_opt(target.as_deref());
+    match target {
+        RunTarget::Screen => {
+            let readiness = screen_agent_readiness(&app).await;
+            if !readiness.ready {
+                return Err(readiness.message);
+            }
+        }
+        RunTarget::LocalVm => {
+            return Err(
+                "Local VM driver is defined, but no local VM provider is configured yet."
+                    .to_string(),
+            );
+        }
+        RunTarget::Sandbox => {}
+    }
+    cleanup_orphaned_computer_runs(&app).await;
     let pool = db_pool(&app).await?;
-    let specs = list_deployed_specs(&pool).await.map_err(|e| format!("list deployed: {e}"))?;
+    let specs = list_deployed_specs(&pool)
+        .await
+        .map_err(|e| format!("list deployed: {e}"))?;
     let mut started = 0u32;
     for spec in specs {
         // The sandbox is web-only; the real screen can drive any app.
@@ -2284,11 +3287,38 @@ pub async fn cascade_stop_computer_task(app: tauri::AppHandle, spec_id: i64) -> 
     } else {
         vec![]
     };
+    if let Ok(pool) = db_pool(&app).await {
+        use cascade_schema::sqlx;
+        if spec_id <= 0 {
+            let _ = sqlx::query(
+                "UPDATE cascade_agent_runs
+                 SET status='stopped',
+                     summary=COALESCE(summary, 'computer-use run') || ' · stopped by user',
+                     duration_ms=CAST((julianday('now') - julianday(created_at)) * 86400000 AS INTEGER)
+                 WHERE status='running'",
+            )
+            .execute(&pool)
+            .await;
+        } else {
+            let _ = sqlx::query(
+                "UPDATE cascade_agent_runs
+                 SET status='stopped',
+                     summary=COALESCE(summary, 'computer-use run') || ' · stopped by user',
+                     duration_ms=CAST((julianday('now') - julianday(created_at)) * 86400000 AS INTEGER)
+                 WHERE status='running' AND spec_id=?1",
+            )
+            .bind(spec_id)
+            .execute(&pool)
+            .await;
+        }
+    }
     // 2. IMMEDIATELY close the visible agent browser(s) + any open login window so
     //    STOP is felt at once. The async loop also unwinds on the stop flag (its
     //    next capture fails and it breaks), but don't make the user wait for it —
     //    a slow in-flight vision call could otherwise leave the browser on screen.
-    eprintln!("[cascade-agent] STOP flagged ids={ids:?} — closing their browsers + any login window");
+    eprintln!(
+        "[cascade-agent] STOP flagged ids={ids:?} — closing their browsers + any login window"
+    );
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         for id in &ids {
@@ -2409,7 +3439,8 @@ static LOGIN_GATE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sy
 /// Host the login window was opened for (the site the agent will drive).
 static LOGIN_TARGET_HOST: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 /// We navigated to a host OTHER than the target (e.g. an SSO identity provider).
-static LOGIN_SAW_EXTERNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOGIN_SAW_EXTERNAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// We were on an auth/login/MFA URL at some point (same-host login forms too).
 static LOGIN_SAW_AUTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Sign-in looks complete — the run loop closes the window and proceeds.
@@ -2420,9 +3451,29 @@ static LOGIN_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 fn looks_like_auth_url(url: &str) -> bool {
     let u = url.to_lowercase();
     [
-        "login", "signin", "sign-in", "sign_in", "logon", "/sso", "oauth", "/auth",
-        "saml", "/idp", "adfs", "/cas", "shibboleth", "microsoftonline", "okta",
-        "auth0", "/sts", "wayf", "openid", "duosecurity", "/mfa", "/2fa", "passport",
+        "login",
+        "signin",
+        "sign-in",
+        "sign_in",
+        "logon",
+        "/sso",
+        "oauth",
+        "/auth",
+        "saml",
+        "/idp",
+        "adfs",
+        "/cas",
+        "shibboleth",
+        "microsoftonline",
+        "okta",
+        "auth0",
+        "/sts",
+        "wayf",
+        "openid",
+        "duosecurity",
+        "/mfa",
+        "/2fa",
+        "passport",
     ]
     .iter()
     .any(|m| u.contains(m))
@@ -2437,7 +3488,10 @@ fn note_login_navigation(url: &str) {
     if host.is_empty() {
         return;
     }
-    let target = LOGIN_TARGET_HOST.lock().map(|t| t.clone()).unwrap_or_default();
+    let target = LOGIN_TARGET_HOST
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_default();
     let on_target = !target.is_empty()
         && (host == target
             || host.ends_with(&format!(".{target}"))
@@ -2468,7 +3522,11 @@ fn note_login_navigation(url: &str) {
 /// Host of a URL, for the login key.
 fn host_of(url: &str) -> String {
     let after = url.split("://").nth(1).unwrap_or(url);
-    after.split(['/', '?', '#']).next().unwrap_or("").to_lowercase()
+    after
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
 }
 
 /// Open the visible sign-in window at `url`. WKWebView's default cookie store is
@@ -2494,23 +3552,24 @@ fn open_login_window(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
             let _ = win.eval(&format!("window.location.href={safe};"));
             let _ = win.show();
             let _ = win.set_focus();
-        } else if let Ok(win) = WebviewWindowBuilder::new(&app2, LOGIN_WINDOW, WebviewUrl::External(parsed))
-            .title("Sign in — Cascade's agent continues automatically once you're in")
-            .inner_size(1100.0, 760.0)
-            .center()
-            .resizable(true)
-            .focused(true)
-            .visible(true)
-            // Reliable main-document URL on macOS (unlike on_navigation), read on
-            // each finished load to detect a completed sign-in.
-            .on_page_load(|webview, payload| {
-                if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                    if let Ok(u) = webview.url() {
-                        note_login_navigation(u.as_str());
+        } else if let Ok(win) =
+            WebviewWindowBuilder::new(&app2, LOGIN_WINDOW, WebviewUrl::External(parsed))
+                .title("Sign in — Cascade's agent continues automatically once you're in")
+                .inner_size(1100.0, 760.0)
+                .center()
+                .resizable(true)
+                .focused(true)
+                .visible(true)
+                // Reliable main-document URL on macOS (unlike on_navigation), read on
+                // each finished load to detect a completed sign-in.
+                .on_page_load(|webview, payload| {
+                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                        if let Ok(u) = webview.url() {
+                            note_login_navigation(u.as_str());
+                        }
                     }
-                }
-            })
-            .build()
+                })
+                .build()
         {
             let _ = win.set_focus();
         }
@@ -2523,8 +3582,8 @@ fn open_login_window(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
 /// HOST: a host is only marked signed-in once THIS host's sign-in is actually
 /// detected (or the user closes the window), so one agent's login can never
 /// release another agent waiting on a different site, and an abandoned/failed
-    /// login re-prompts on the next run. The URL is Rewind-derived, not fixed
-    /// per app.
+/// login re-prompts on the next run. The URL is Rewind-derived, not fixed
+/// per app.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_host_login(
     app: &tauri::AppHandle,
@@ -2601,7 +3660,10 @@ async fn ensure_host_login(
 /// login automatically when an agent that needs a tool is started.
 #[tauri::command]
 #[specta::specta]
-pub async fn cascade_open_agent_login(app: tauri::AppHandle, url: Option<String>) -> Result<(), String> {
+pub async fn cascade_open_agent_login(
+    app: tauri::AppHandle,
+    url: Option<String>,
+) -> Result<(), String> {
     let url = url.ok_or_else(|| "A real login URL is required".to_string())?;
     open_login_window(&app, &url)
 }
@@ -2634,6 +3696,18 @@ mod tests {
 
     fn blank_frame() -> RgbaImage {
         RgbaImage::from_pixel(320, 205, Rgba([248, 248, 246, 255]))
+    }
+
+    fn test_action(kind: &str) -> ComputerAction {
+        ComputerAction {
+            narration: String::new(),
+            action: kind.to_string(),
+            x: 96.0,
+            y: 88.0,
+            text: String::new(),
+            app: String::new(),
+            key: String::new(),
+        }
     }
 
     #[test]
@@ -2687,5 +3761,75 @@ mod tests {
         let after = png_base64(&after_img);
 
         assert!(frames_changed_meaningfully(&before, &after));
+    }
+
+    #[test]
+    fn run_target_accepts_new_and_legacy_names() {
+        assert_eq!(
+            RunTarget::from_opt(Some("local_browser")),
+            RunTarget::Sandbox
+        );
+        assert_eq!(RunTarget::from_opt(Some("sandbox")), RunTarget::Sandbox);
+        assert_eq!(RunTarget::from_opt(Some("screen")), RunTarget::Screen);
+        assert_eq!(RunTarget::from_opt(Some("local_vm")), RunTarget::LocalVm);
+        assert_eq!(RunTarget::from_opt(Some("vm")), RunTarget::LocalVm);
+    }
+
+    #[test]
+    fn verify_identical_committing_frame_is_unclear_not_failed() {
+        let before = png_base64(&blank_frame());
+        let after = before.clone();
+
+        let outcome =
+            verify_action_outcome(RunTarget::Sandbox, &test_action("type"), &before, &after);
+
+        assert_eq!(outcome.verdict, VerificationVerdict::Unclear);
+        assert!(outcome.summary.contains("uncertain"));
+    }
+
+    #[test]
+    fn verify_meaningful_text_delta_is_changed() {
+        let before_img = blank_frame();
+        let mut after_img = before_img.clone();
+
+        for y in 82..94 {
+            for x in 88..164 {
+                if (x / 4 + y / 3) % 3 != 0 {
+                    after_img.put_pixel(x, y, Rgba([28, 35, 43, 255]));
+                }
+            }
+        }
+
+        let before = png_base64(&before_img);
+        let after = png_base64(&after_img);
+        let outcome =
+            verify_action_outcome(RunTarget::Screen, &test_action("type"), &before, &after);
+
+        assert_eq!(outcome.verdict, VerificationVerdict::Changed);
+    }
+
+    #[test]
+    fn verify_non_committing_actions_do_not_need_frame_delta() {
+        let before = png_base64(&blank_frame());
+        let after = before.clone();
+
+        let outcome =
+            verify_action_outcome(RunTarget::Screen, &test_action("wait"), &before, &after);
+
+        assert_eq!(outcome.verdict, VerificationVerdict::Changed);
+        assert_eq!(outcome.summary, "non-mutating action");
+    }
+
+    #[test]
+    fn repeated_action_signature_buckets_nearby_coordinates() {
+        let mut a = test_action("click");
+        let mut b = test_action("click");
+        b.x += 5.0;
+        b.y += 6.0;
+
+        assert_eq!(action_signature(&a), action_signature(&b));
+        a.text = "same words   with spacing".to_string();
+        b.text = "same words with spacing".to_string();
+        assert_eq!(action_signature(&a), action_signature(&b));
     }
 }

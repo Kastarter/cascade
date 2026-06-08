@@ -1,0 +1,252 @@
+Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
++++ screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
+@@ -5,11 +5,9 @@
+ use crate::tray::QUIT_REQUESTED;
+ use serde::{Deserialize, Serialize};
+ use specta::Type;
+-#[allow(unused_imports)] // used on macOS
+-use std::sync::atomic::Ordering;
+ use tracing::{debug, error, info, warn};
+ 
+-#[derive(Serialize, Deserialize, Type, Clone)]
++#[derive(Serialize, Deserialize, Type, Clone, Copy)]
+ #[serde(rename_all = "camelCase")]
+ pub enum OSPermission {
+     ScreenRecording,
+@@ -17,6 +15,103 @@
+     Accessibility,
+     Automation,
+     InputMonitoring,
++}
++
++#[cfg(target_os = "macos")]
++mod macos_permission_flow {
++    use super::OSPermission;
++    use once_cell::sync::Lazy;
++    use std::{
++        collections::HashMap,
++        process::Command,
++        sync::{
++            atomic::{AtomicBool, Ordering},
++            Mutex,
++        },
++        time::{Duration, Instant},
++    };
++    use tracing::{debug, warn};
++
++    // Clicky/OpenClicky/TipTour use one native prompt first, then Settings on a
++    // later attempt. Opening both on the same click makes System Settings stack.
++    static SCREEN_PROMPT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
++    static ACCESSIBILITY_PROMPT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
++    static INPUT_MONITORING_PROMPT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
++    static SETTINGS_LAST_OPENED: Lazy<Mutex<HashMap<&'static str, Instant>>> =
++        Lazy::new(|| Mutex::new(HashMap::new()));
++    const SETTINGS_OPEN_COOLDOWN: Duration = Duration::from_secs(8);
++
++    fn permission_key(permission: &OSPermission) -> &'static str {
++        match permission {
++            OSPermission::ScreenRecording => "screenRecording",
++            OSPermission::Microphone => "microphone",
++            OSPermission::Accessibility => "accessibility",
++            OSPermission::Automation => "automation",
++            OSPermission::InputMonitoring => "inputMonitoring",
++        }
++    }
++
++    pub fn settings_url(permission: &OSPermission) -> &'static str {
++        match permission {
++            OSPermission::ScreenRecording => {
++                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
++            }
++            OSPermission::Microphone => {
++                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
++            }
++            OSPermission::Accessibility => {
++                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
++            }
++            OSPermission::Automation => {
++                "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
++            }
++            OSPermission::InputMonitoring => {
++                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
++            }
++        }
++    }
++
++    pub fn should_use_system_prompt(permission: &OSPermission) -> bool {
++        match permission {
++            OSPermission::ScreenRecording => {
++                !SCREEN_PROMPT_ATTEMPTED.swap(true, Ordering::SeqCst)
++            }
++            OSPermission::Accessibility => {
++                !ACCESSIBILITY_PROMPT_ATTEMPTED.swap(true, Ordering::SeqCst)
++            }
++            OSPermission::InputMonitoring => {
++                !INPUT_MONITORING_PROMPT_ATTEMPTED.swap(true, Ordering::SeqCst)
++            }
++            OSPermission::Microphone | OSPermission::Automation => true,
++        }
++    }
++
++    pub fn open_settings(permission: &OSPermission) {
++        let key = permission_key(permission);
++        {
++            let mut last_opened = match SETTINGS_LAST_OPENED.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            if let Some(previous) = last_opened.get(key) {
++                if previous.elapsed() < SETTINGS_OPEN_COOLDOWN {
++                    debug!(
++                        "Skipping duplicate macOS privacy settings open for {}",
++                        key
++                    );
++                    return;
++                }
++            }
++            last_opened.insert(key, Instant::now());
++        }
++
++        if let Err(error) = Command::new("open").arg(settings_url(permission)).spawn() {
++            warn!(
++                "Failed to open macOS privacy settings for {}: {}",
++                key, error
++            );
++        }
++    }
+ }
+ 
+ #[tauri::command(async)]
+@@ -25,34 +120,7 @@
+ pub fn open_permission_settings(permission: OSPermission) {
+     #[cfg(target_os = "macos")]
+     {
+-        use std::process::Command;
+-
+-        match permission {
+-            OSPermission::ScreenRecording => Command::new("open")
+-                .arg(
+-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+-                )
+-                .spawn()
+-                .expect("Failed to open Screen Recording settings"),
+-            OSPermission::Microphone => Command::new("open")
+-                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+-                .spawn()
+-                .expect("Failed to open Microphone settings"),
+-            OSPermission::Accessibility => Command::new("open")
+-                .arg(
+-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+-                )
+-                .spawn()
+-                .expect("Failed to open Accessibility settings"),
+-            OSPermission::Automation => Command::new("open")
+-                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+-                .spawn()
+-                .expect("Failed to open Automation settings"),
+-            OSPermission::InputMonitoring => Command::new("open")
+-                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+-                .spawn()
+-                .expect("Failed to open Input Monitoring settings"),
+-        };
++        macos_permission_flow::open_settings(&permission);
+     }
+ }
+ 
+@@ -67,11 +135,11 @@
+             OSPermission::ScreenRecording => {
+                 use core_graphics_helmer_fork::access::ScreenCaptureAccess;
+                 if !ScreenCaptureAccess.preflight() {
+-                    // Open System Settings first so it's in the background,
+-                    // then request() shows the native modal on top (macOS 15+).
+-                    // If the user dismisses the modal, Settings is already open.
+-                    open_permission_settings(OSPermission::ScreenRecording);
+-                    ScreenCaptureAccess.request();
++                    if macos_permission_flow::should_use_system_prompt(&permission) {
++                        ScreenCaptureAccess.request();
++                    } else {
++                        open_permission_settings(OSPermission::ScreenRecording);
++                    }
+                 }
+             }
+             OSPermission::Microphone => {
+@@ -95,10 +163,14 @@
+                 }
+             }
+             OSPermission::Accessibility => {
+-                // Request accessibility permission (shows system prompt)
+-                // AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt
+-                // handles both NotDetermined and Denied cases on macOS
+-                request_accessibility_permission();
++                if check_accessibility_permission().permitted() {
++                    return;
++                }
++                if macos_permission_flow::should_use_system_prompt(&permission) {
++                    request_accessibility_permission();
++                } else {
++                    open_permission_settings(OSPermission::Accessibility);
++                }
+             }
+             OSPermission::Automation => {
+                 // Open Automation settings — user must toggle manually
+@@ -188,8 +260,8 @@
+                 return;
+             }
+             Err(e) => {
+-                let transient = e.contains("Server not running")
+-                    || e.contains("Server not responding");
++                let transient =
++                    e.contains("Server not running") || e.contains("Server not responding");
+                 if !transient {
+                     warn!("start_capture after mic grant: {}", e);
+                     return;
+@@ -339,11 +411,10 @@
+ 
+ /// Request Input Monitoring permission (macOS only).
+ ///
+-/// Calls `cg_access::listen_request()` to trigger the system permission
+-/// flow. On first call this either shows the native prompt (if NotDetermined)
+-/// or silently no-ops (if already Denied — macOS doesn't re-prompt). For
+-/// reliability we also open System Settings → Input Monitoring so the user
+-/// can grant manually if the prompt didn't appear.
++/// Calls `cg_access::listen_request()` once to trigger the system permission
++/// flow, then falls back to System Settings on later clicks. This mirrors the
++/// Clicky/OpenClicky/TipTour flow and avoids stacking Settings windows while
++/// macOS is still presenting or settling the first TCC request.
+ ///
+ /// Returns the post-request permission status so the UI can update without
+ /// waiting for the next poll.
+@@ -352,23 +423,18 @@
+ pub async fn request_input_monitoring_permission() -> OSPermissionStatus {
+     #[cfg(target_os = "macos")]
+     {
+-        use std::process::Command;
+         if screenpipe_a11y::check_input_monitoring() {
+             return OSPermissionStatus::Granted;
+         }
+-        // Open the Input Monitoring pane first so when the OS prompt
+-        // appears it's layered on top of the settings UI the user lands
+-        // in if they dismiss the prompt. Matches the pattern used by
+-        // request_permission for ScreenRecording above.
+-        let _ = Command::new("open")
+-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+-            .spawn();
+-        // Triggers the native consent prompt the first time the process
+-        // calls it. Subsequent calls are no-ops if denied — the user has
+-        // to enable from System Settings, which we just opened.
+-        if screenpipe_a11y::request_input_monitoring() {
+-            OSPermissionStatus::Granted
++
++        if macos_permission_flow::should_use_system_prompt(&OSPermission::InputMonitoring) {
++            if screenpipe_a11y::request_input_monitoring() {
++                OSPermissionStatus::Granted
++            } else {
++                OSPermissionStatus::Denied
++            }
+         } else {
++            macos_permission_flow::open_settings(&OSPermission::InputMonitoring);
+             OSPermissionStatus::Denied
+         }
+     }

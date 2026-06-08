@@ -146,11 +146,11 @@ export default function HandsBox() {
     <div style={{ fontFamily: "ui-sans-serif, -apple-system, system-ui, sans-serif", padding: 10, boxSizing: "border-box", background: "transparent", height: "100%" }}>
       <div
         style={{
-          background: "linear-gradient(180deg, rgba(16,24,20,0.98), rgba(10,16,13,0.98))",
-          border: "1px solid rgba(90,200,160,0.35)",
-          borderRadius: 16,
+          background: "linear-gradient(180deg, rgba(12,16,28,0.98), rgba(6,9,18,0.98))",
+          border: "1px solid rgba(92,142,255,0.36)",
+          borderRadius: 12,
           padding: 11,
-          color: "#e7f3ec",
+          color: "#e8efff",
           boxShadow: "0 18px 50px rgba(0,0,0,0.55)",
           backdropFilter: "blur(14px)",
           height: "100%",
@@ -161,9 +161,9 @@ export default function HandsBox() {
       >
         {/* header — drag region (move the box by dragging here) */}
         <div data-tauri-drag-region style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: collapsed ? 0 : 9, cursor: "grab" }}>
-          <span style={{ width: 8, height: 8, borderRadius: "50%", background: working ? "#5ad8aa" : "#7a8a82", boxShadow: working ? "0 0 8px #5ad8aa" : "none", animation: working ? "cPulse 1.4s ease-in-out infinite" : "none", pointerEvents: "none" }} />
-          <span style={{ font: "700 11px ui-monospace, Menlo, monospace", letterSpacing: 1, color: "#9ff0cc", pointerEvents: "none" }}>
-            CASCADE HANDS · {working} working
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: working ? "#5f8dff" : "#778196", boxShadow: working ? "0 0 10px #5f8dff" : "none", animation: working ? "cPulse 1.4s ease-in-out infinite" : "none", pointerEvents: "none" }} />
+          <span style={{ font: "700 11px ui-monospace, Menlo, monospace", letterSpacing: 0.6, color: "#c8d7ff", pointerEvents: "none" }}>
+            CASCADE AGENT · {working} working
           </span>
           <span style={{ flex: 1 }} />
           <button
@@ -192,12 +192,12 @@ export default function HandsBox() {
         <div
           onClick={() => setControlsOpen((v) => !v)}
           title="Click for cursor controls"
-          style={{ position: "relative", width: "100%", borderRadius: 10, overflow: "hidden", background: "#06100c", border: "1px solid rgba(255,255,255,0.06)", cursor: "pointer", minHeight: 120 }}
+          style={{ position: "relative", width: "100%", borderRadius: 8, overflow: "hidden", background: "#070b14", border: "1px solid rgba(255,255,255,0.08)", cursor: "pointer", minHeight: 120 }}
         >
           {frame ? (
             <img src={`data:image/png;base64,${frame.imageBase64}`} alt="agent screen" style={{ width: "100%", display: "block" }} />
           ) : (
-            <div style={{ padding: "40px 0", textAlign: "center", color: "#6f8a7d", fontSize: 12.5 }}>
+            <div style={{ padding: "40px 0", textAlign: "center", color: "#8794b2", fontSize: 12.5 }}>
               {working ? "Looking at your screen…" : "Idle"}
             </div>
           )}
@@ -220,9 +220,9 @@ export default function HandsBox() {
                   <span style={{ position: "absolute", left: -9, top: -9, width: 18, height: 18, borderRadius: "50%", border: `2px solid oklch(0.82 0.16 ${c.hue})`, animation: "cRipple 0.5s ease-out" }} />
                 )}
                 <svg width="16" height="16" viewBox="0 0 24 24" style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.6))" }}>
-                  <path d="M4 2 L4 20 L9 15 L12.5 22 L15.5 20.5 L12 13.5 L19 13.5 Z" fill={`oklch(0.82 0.16 ${c.hue})`} stroke="#0b2018" strokeWidth="1.1" strokeLinejoin="round" />
+                  <path d="M4 2 L4 20 L9 15 L12.5 22 L15.5 20.5 L12 13.5 L19 13.5 Z" fill="#f8fbff" stroke="#4c8dff" strokeWidth="1.3" strokeLinejoin="round" />
                 </svg>
-                <span style={{ position: "absolute", left: 14, top: 3, padding: "1px 5px", borderRadius: 4, background: `oklch(0.26 0.08 ${c.hue})`, color: `oklch(0.86 0.14 ${c.hue})`, font: "600 8.5px ui-monospace, Menlo, monospace", whiteSpace: "nowrap" }}>
+                <span style={{ position: "absolute", left: 14, top: 3, padding: "1px 5px", borderRadius: 4, background: "rgba(8,12,24,0.88)", color: "#dfe7ff", font: "600 8.5px ui-monospace, Menlo, monospace", whiteSpace: "nowrap" }}>
                   {c.name}
                 </span>
               </div>
@@ -230,7 +230,7 @@ export default function HandsBox() {
         </div>
 
         {/* narration */}
-        <div style={{ fontSize: 12.5, lineHeight: 1.35, marginTop: 9, minHeight: 17, color: latest?.error ? "#ffb4a0" : "#dcebe3" }}>
+        <div style={{ fontSize: 12.5, lineHeight: 1.35, marginTop: 9, minHeight: 17, color: latest?.error ? "#ffb4a0" : "#dce5ff" }}>
           {latest ? `▸ ${latest.narration}` : "Starting…"}
         </div>
 
@@ -242,7 +242,7 @@ export default function HandsBox() {
             >
               {controllingLatest ? "Let the agent do it" : "Take control"}
             </button>
-            <span style={{ fontSize: 11, color: "#89a79a" }}>
+            <span style={{ fontSize: 11, color: "#9aa9c8" }}>
               {controllingLatest
                 ? `You are driving ${latestActive.name} in its browser now.`
                 : `Jump into ${latestActive.name}'s browser and drive it yourself.`}
@@ -255,9 +255,9 @@ export default function HandsBox() {
           <div style={{ marginTop: 9, border: "1px solid rgba(255,255,255,0.08)", borderRadius: 9, overflow: "hidden", background: "rgba(0,0,0,0.25)" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 9px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
               <span style={{ fontSize: 11 }}>{result.app === "Apple Notes" ? "🗒️" : "📄"}</span>
-              <span style={{ font: "600 10px ui-monospace, Menlo, monospace", color: "#7fd6ab", letterSpacing: 0.4 }}>{result.app}</span>
-              <span style={{ color: "#5e7569", fontSize: 10 }}>·</span>
-              <span style={{ font: "600 10.5px ui-monospace, Menlo, monospace", color: "#bfe6d3", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{result.title}</span>
+              <span style={{ font: "600 10px ui-monospace, Menlo, monospace", color: "#9fb8ff", letterSpacing: 0.2 }}>{result.app}</span>
+              <span style={{ color: "#66708a", fontSize: 10 }}>·</span>
+              <span style={{ font: "600 10.5px ui-monospace, Menlo, monospace", color: "#dce5ff", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{result.title}</span>
               <span style={{ flex: 1 }} />
               {result.open && (
                 <button onClick={openResult} style={openBtn}>
@@ -265,7 +265,7 @@ export default function HandsBox() {
                 </button>
               )}
             </div>
-            <pre style={{ margin: 0, padding: "8px 10px", maxHeight: 140, overflowY: "auto", fontSize: 11, lineHeight: 1.45, color: "#dcebe3", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, Menlo, monospace" }}>
+            <pre style={{ margin: 0, padding: "8px 10px", maxHeight: 140, overflowY: "auto", fontSize: 11, lineHeight: 1.45, color: "#dce5ff", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, Menlo, monospace" }}>
               {result.content || "(no preview)"}
             </pre>
           </div>
@@ -343,9 +343,9 @@ const stopAll: React.CSSProperties = {
 const pauseBtn: React.CSSProperties = {
   padding: "3px 9px",
   borderRadius: 6,
-  background: "rgba(90,180,150,0.16)",
-  border: "1px solid rgba(90,200,160,0.5)",
-  color: "#9ff0cc",
+  background: "rgba(92,142,255,0.16)",
+  border: "1px solid rgba(92,142,255,0.5)",
+  color: "#c8d7ff",
   font: "700 9px ui-monospace, Menlo, monospace",
   letterSpacing: 1,
   cursor: "pointer",
@@ -363,9 +363,9 @@ const takeControlBtn: React.CSSProperties = {
 const releaseBtn: React.CSSProperties = {
   padding: "5px 10px",
   borderRadius: 7,
-  background: "rgba(90,200,160,0.16)",
-  border: "1px solid rgba(90,200,160,0.45)",
-  color: "#9ff0cc",
+  background: "rgba(92,142,255,0.16)",
+  border: "1px solid rgba(92,142,255,0.45)",
+  color: "#c8d7ff",
   font: "700 10px ui-monospace, Menlo, monospace",
   letterSpacing: 0.3,
   cursor: "pointer",
@@ -375,7 +375,7 @@ const minBtn: React.CSSProperties = {
   borderRadius: 6,
   background: "rgba(255,255,255,0.06)",
   border: "1px solid rgba(255,255,255,0.15)",
-  color: "#cfe6da",
+  color: "#dce5ff",
   font: "700 10px ui-monospace, Menlo, monospace",
   cursor: "pointer",
   lineHeight: 1,
@@ -403,9 +403,9 @@ const releaseMiniBtn: React.CSSProperties = {
   flex: 1,
   padding: "4px 6px",
   borderRadius: 6,
-  background: "rgba(90,200,160,0.14)",
-  border: "1px solid rgba(90,200,160,0.4)",
-  color: "#9ff0cc",
+  background: "rgba(92,142,255,0.14)",
+  border: "1px solid rgba(92,142,255,0.4)",
+  color: "#c8d7ff",
   font: "600 9px ui-monospace, Menlo, monospace",
   cursor: "pointer",
 };
@@ -413,9 +413,9 @@ const okBtn: React.CSSProperties = {
   flex: 1,
   padding: "4px 0",
   borderRadius: 6,
-  background: "#2f9e74",
+  background: "#5f8dff",
   border: "none",
-  color: "#04130d",
+  color: "#07101f",
   font: "700 10px ui-sans-serif, system-ui",
   cursor: "pointer",
 };
@@ -425,16 +425,16 @@ const noBtn: React.CSSProperties = {
   borderRadius: 6,
   background: "transparent",
   border: "1px solid rgba(160,180,170,0.4)",
-  color: "#c7d6cd",
+  color: "#c8d7ff",
   font: "600 10px ui-sans-serif, system-ui",
   cursor: "pointer",
 };
 const openBtn: React.CSSProperties = {
   padding: "2px 9px",
   borderRadius: 5,
-  background: "rgba(90,200,160,0.16)",
-  border: "1px solid rgba(90,200,160,0.45)",
-  color: "#9ff0cc",
+  background: "rgba(92,142,255,0.16)",
+  border: "1px solid rgba(92,142,255,0.45)",
+  color: "#c8d7ff",
   font: "600 9.5px ui-sans-serif, system-ui",
   cursor: "pointer",
 };

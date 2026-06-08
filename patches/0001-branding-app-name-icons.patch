@@ -19,7 +19,7 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
 -  "productName": "screenpipe - Development",
 -  "identifier": "screenpi.pe.dev",
 +  "productName": "Cascade",
-+  "identifier": "com.cascade.app",
++  "identifier": "com.humain.cascade",
    "build": {
      "beforeDevCommand": "bun run dev",
      "beforeBuildCommand": "bun run build",
@@ -83,3 +83,207 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/tauri.macos.conf.json
              "provisioningProfile": null,
              "dmg": {
                  "background": "assets/dmg-background.png"
+Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/main.rs
+===================================================================
+--- screenpipe.orig/apps/screenpipe-app-tauri/src-tauri/src/main.rs
++++ screenpipe/apps/screenpipe-app-tauri/src-tauri/src/main.rs
+@@ -957,8 +957,8 @@
+                 use tauri::menu::{MenuBuilder, SubmenuBuilder, PredefinedMenuItem, MenuItemBuilder};
+                 let app_ui_hidden = crate::enterprise_policy::is_app_ui_hidden();
+ 
+-                let mut app_submenu_builder = SubmenuBuilder::new(app, "screenpipe")
+-                    .item(&PredefinedMenuItem::about(app, Some("About screenpipe"), None)?)
++                let mut app_submenu_builder = SubmenuBuilder::new(app, "Cascade")
++                    .item(&PredefinedMenuItem::about(app, Some("About Cascade"), None)?)
+                     .separator();
+                 if !crate::updates::is_enterprise_build(&app_handle) {
+                     app_submenu_builder = app_submenu_builder
+@@ -974,7 +974,7 @@
+                         .separator();
+                 }
+                 let app_submenu = app_submenu_builder
+-                    .item(&PredefinedMenuItem::quit(app, Some("Quit screenpipe"))?)
++                    .item(&PredefinedMenuItem::quit(app, Some("Quit Cascade"))?)
+                     .build()?;
+ 
+                 let edit_submenu = SubmenuBuilder::new(app, "Edit")
+@@ -1653,7 +1653,7 @@
+             app_handle.manage(update_manager.clone()); // Register for state::<Arc<UpdatesManager>>()
+ 
+             // Setup tray
+-            if let Some(_) = app_handle.tray_by_id("screenpipe_main") {
++            if let Some(_) = app_handle.tray_by_id("cascade_main") {
+                 if let Err(e) = tray::setup_tray(&app_handle, update_manager.update_now_menu_item_ref()) {
+                     error!("Failed to setup tray: {}", e);
+                 }
+diff --git a/apps/screenpipe-app-tauri/src-tauri/src/tray.rs b/apps/screenpipe-app-tauri/src-tauri/src/tray.rs
+index 8a2ce3a..c477973 100644
+--- a/apps/screenpipe-app-tauri/src-tauri/src/tray.rs
++++ b/apps/screenpipe-app-tauri/src-tauri/src/tray.rs
+@@ -32,7 +32,7 @@ use tauri_plugin_opener::OpenerExt;
+ 
+ use tracing::{debug, error, info};
+ 
+-/// Flag set by the "quit screenpipe" menu item so that the ExitRequested
++/// Flag set by the "Quit Cascade" menu item so that the ExitRequested
+ /// handler in main.rs knows this is an intentional quit (not just a window close).
+ pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+ 
+@@ -238,7 +238,7 @@ pub(crate) fn force_tray_rebuild(app: &AppHandle) -> Result<()> {
+ 
+     let data = prefetch_tray_menu_data(app);
+     let menu = create_dynamic_menu(app, &new_state, update_item.as_ref(), &data)?;
+-    if let Some(tray) = app.tray_by_id("screenpipe_main") {
++    if let Some(tray) = app.tray_by_id("cascade_main") {
+         install_tray_menu(&tray, menu)?;
+         clear_pending_tray_menu();
+     }
+@@ -346,7 +346,7 @@ fn apply_pending_tray_menu(app: &AppHandle) -> Result<()> {
+         .unwrap_or_else(|e| e.into_inner())
+         .clone();
+     let menu = create_dynamic_menu(app, &state, update_item.as_ref(), &data)?;
+-    if let Some(tray) = app.tray_by_id("screenpipe_main") {
++    if let Some(tray) = app.tray_by_id("cascade_main") {
+         install_tray_menu(&tray, menu)?;
+     }
+     Ok(())
+@@ -370,7 +370,7 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
+         *guard = update_item.cloned();
+     }
+ 
+-    if let Some(main_tray) = app.tray_by_id("screenpipe_main") {
++    if let Some(main_tray) = app.tray_by_id("cascade_main") {
+         // Initial menu setup with empty state
+         let data = prefetch_tray_menu_data(app);
+         let menu = create_dynamic_menu(app, &MenuState::default(), update_item, &data)?;
+@@ -401,7 +401,7 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
+ /// Log the tray icon position for debugging notch visibility issues.
+ #[allow(dead_code)] // called only on macOS
+ pub fn log_tray_position(app: &AppHandle) {
+-    if let Some(tray) = app.tray_by_id("screenpipe_main") {
++    if let Some(tray) = app.tray_by_id("cascade_main") {
+         match tray.rect() {
+             Ok(Some(rect)) => {
+                 info!(
+@@ -417,7 +417,7 @@ pub fn log_tray_position(app: &AppHandle) {
+             }
+         }
+     } else {
+-        error!("tray icon 'screenpipe_main' not found");
++        error!("tray icon 'cascade_main' not found");
+     }
+ }
+ 
+@@ -440,7 +440,7 @@ pub fn recreate_tray(app: &AppHandle) {
+ 
+                 // Remove the old tray icon (must be on main thread for NSStatusBar)
+                 debug!("recreate_tray: removing old tray icon");
+-                let _old = app.remove_tray_by_id("screenpipe_main");
++                let _old = app.remove_tray_by_id("cascade_main");
+                 // Drop the old tray icon explicitly on main thread
+                 drop(_old);
+                 debug!("recreate_tray: old tray removed, building new one");
+@@ -456,7 +456,7 @@ pub fn recreate_tray(app: &AppHandle) {
+                     }
+                 };
+ 
+-                let mut builder = TrayIconBuilder::<Wry>::with_id("screenpipe_main")
++                let mut builder = TrayIconBuilder::<Wry>::with_id("cascade_main")
+                     .icon_as_template(true)
+                     .show_menu_on_left_click(!cfg!(target_os = "windows"));
+ 
+@@ -559,7 +559,7 @@ fn create_dynamic_menu(
+             .item(&PredefinedMenuItem::separator(app)?)
+             .item(&MenuItemBuilder::with_id("skip_onboarding", "Skip onboarding").build(app)?)
+             .item(&PredefinedMenuItem::separator(app)?)
+-            .item(&MenuItemBuilder::with_id("quit", "Quit screenpipe").build(app)?);
++            .item(&MenuItemBuilder::with_id("quit", "Quit Cascade").build(app)?);
+ 
+         return menu_builder.build().map_err(Into::into);
+     }
+@@ -568,10 +568,10 @@ fn create_dynamic_menu(
+     let search_shortcut = &data.search_shortcut;
+     let chat_shortcut = &data.chat_shortcut;
+ 
+-    // --- Open screenpipe ---
++    // --- Open Cascade ---
+     if !data.app_ui_hidden {
+         menu_builder = menu_builder
+-            .item(&MenuItemBuilder::with_id("open_app", "Open screenpipe").build(app)?)
++            .item(&MenuItemBuilder::with_id("open_app", "Open Cascade").build(app)?)
+             .item(&PredefinedMenuItem::separator(app)?);
+     }
+ 
+@@ -720,9 +720,9 @@ fn create_dynamic_menu(
+     let is_beta = app.config().identifier.contains("beta");
+     let is_enterprise = cfg!(feature = "enterprise-build");
+     let version_text = match (is_beta, is_enterprise) {
+-        (_, true) => format!("screenpipe v{} (Enterprise)", app.package_info().version),
+-        (true, false) => format!("screenpipe v{} (Beta)", app.package_info().version),
+-        (false, false) => format!("screenpipe v{}", app.package_info().version),
++        (_, true) => format!("Cascade v{} (Enterprise)", app.package_info().version),
++        (true, false) => format!("Cascade v{} (Beta)", app.package_info().version),
++        (false, false) => format!("Cascade v{}", app.package_info().version),
+     };
+     menu_builder = menu_builder.item(
+         &MenuItemBuilder::with_id("version", version_text)
+@@ -821,7 +821,7 @@ fn create_dynamic_menu(
+         );
+     }
+     menu_builder = menu_builder.item(
+-        &MenuItemBuilder::with_id("quit", "Quit screenpipe")
++        &MenuItemBuilder::with_id("quit", "Quit Cascade")
+             .accelerator("CmdOrCtrl+Q")
+             .build(app)?,
+     );
+@@ -1000,7 +1000,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
+             let handle = tauri::async_runtime::spawn(async move {
+                 tokio::time::sleep(total).await;
+                 let _ = app_for_resume.emit("shortcut-start-recording", ());
+-                send_notify("Recording resumed", "screenpipe is recording again.");
++                send_notify("Recording resumed", "Cascade is recording again.");
+             });
+             *PAUSE_TIMER.lock().unwrap_or_else(|e| e.into_inner()) = Some(PauseTimer {
+                 handle,
+@@ -1022,7 +1022,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
+             };
+             send_notify(
+                 "Recording paused",
+-                format!("screenpipe will auto-resume in {}.", pretty),
++                format!("Cascade will auto-resume in {}.", pretty),
+             );
+             // Repaint the tray so "Recording" flips to "Paused" immediately.
+             let app_for_rebuild = app_handle.clone();
+@@ -1409,18 +1409,18 @@ async fn update_menu_if_needed(
+     // has changed. Cheap: just an NSString swap on the existing status item.
+     let has_perm_issue = new_state.has_permission_issue;
+     let tooltip: String = if has_perm_issue {
+-        "screenpipe — ⚠️ permissions needed".to_string()
++        "Cascade — permissions needed".to_string()
+     } else if effective_status == RecordingStatus::Paused {
+         match pause_remaining() {
+-            Some(d) => format!("screenpipe — paused, resumes in {}", format_remaining(d)),
+-            None => "screenpipe — paused".to_string(),
++            Some(d) => format!("Cascade — paused, resumes in {}", format_remaining(d)),
++            None => "Cascade — paused".to_string(),
+         }
+     } else {
+-        "screenpipe".to_string()
++        "Cascade".to_string()
+     };
+     let app_for_tooltip = app.clone();
+     let _ = app.run_on_main_thread(move || {
+-        if let Some(tray) = app_for_tooltip.tray_by_id("screenpipe_main") {
++        if let Some(tray) = app_for_tooltip.tray_by_id("cascade_main") {
+             let _ = tray.set_tooltip(Some(&tooltip));
+         }
+     });
+@@ -1442,7 +1442,7 @@ async fn update_menu_if_needed(
+             let update_item = update_item.clone();
+             let _ = app.run_on_main_thread(move || {
+                 if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+-                    if let Some(tray) = app_for_thread.tray_by_id("screenpipe_main") {
++                    if let Some(tray) = app_for_thread.tray_by_id("cascade_main") {
+                         debug!("tray_menu_update: setting menu");
+                         if let Ok(menu) = create_dynamic_menu(
+                             &app_for_thread,

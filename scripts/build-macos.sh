@@ -4,8 +4,8 @@
 #   - Rust toolchain matching vendor/screenpipe/rust-toolchain.toml
 #   - bun >= 1.3
 #   - Tauri CLI v2.x (installed via `bun add -D @tauri-apps/cli@=2.10.0` in screenpipe-app-tauri)
-#   - For SIGNED builds: APPLE_SIGNING_IDENTITY env var + APPLE_NOTARIZE_* secrets
-#   - For UNSIGNED dev builds: leave APPLE_SIGNING_IDENTITY unset
+#   - For signed builds: CASCADE_SIGNING_IDENTITY or APPLE_SIGNING_IDENTITY.
+#   - If unset, the script auto-detects Developer ID Application or Apple Development.
 
 set -euo pipefail
 
@@ -23,12 +23,17 @@ cd "$APP_DIR"
 echo "==> installing bun deps"
 bun install --frozen-lockfile
 
-if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-  echo "==> signed build (identity: $APPLE_SIGNING_IDENTITY)"
-  bun run tauri:build
+IDENTITY="${CASCADE_SIGNING_IDENTITY:-${APPLE_SIGNING_IDENTITY:-}}"
+if [[ -z "$IDENTITY" ]]; then
+  IDENTITY="$(bash scripts/cascade_codesign_macos_app.sh --detect-identity || true)"
+fi
+
+if [[ -n "$IDENTITY" ]]; then
+  echo "==> signed build (identity: $IDENTITY)"
+  CASCADE_SIGNING_IDENTITY="$IDENTITY" bun run tauri:build
 else
-  echo "==> unsigned dev build (set APPLE_SIGNING_IDENTITY for production)"
-  bun run tauri build --no-bundle || bun run tauri build
+  echo "==> unsigned build (set CASCADE_SIGNING_IDENTITY for stable macOS permissions)"
+  bun run tauri build --bundles app --no-sign
 fi
 
 echo "==> build artifacts:"

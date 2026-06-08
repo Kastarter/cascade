@@ -143,7 +143,7 @@ export interface CascadeAgentRun {
   id: number;
   specId: number;
   mode: "sandbox" | "live";
-  status: "success" | "failed" | "flagged";
+  status: "success" | "failed" | "flagged" | "running" | "stopped" | "interrupted";
   summary: string;
   steps: SandboxStep[];
   anomalies: Anomaly[];
@@ -244,10 +244,25 @@ export interface ComputerAgentStatus {
 
 /**
  * How an agent does its work — the user's Settings choice, passed straight to
- * the backend run target. "sandbox" = isolated floating-box browser; "screen" =
- * the user's real screen.
+ * the backend driver. "local_browser" = isolated browser; "screen" = the user's
+ * real screen; "local_vm" = fail-closed VM driver placeholder.
  */
-export type CascadeRunTarget = "screen" | "sandbox";
+export type CascadeRunTarget = "screen" | "local_browser" | "local_vm";
+
+export interface ScreenAgentReadiness {
+  ready: boolean;
+  missing: string[];
+  message: string;
+  screenRecording: boolean;
+  accessibility: boolean;
+  inputMonitoring: boolean;
+  nativeBridgeAvailable: boolean;
+  nativeScreenCaptureAvailable: boolean;
+  frameStatusOk: boolean;
+  uiRecorderRunning: boolean;
+  inputTapRunning: boolean;
+  appEventsRunning: boolean;
+}
 
 /** Start ONE deployed agent doing its task, in the sandbox or on the real screen. */
 export async function startComputerTask(
@@ -261,6 +276,11 @@ export async function startComputerTask(
 /** Start EVERY installed agent at once — one cursor per agent. */
 export async function startAllComputerTasks(target?: CascadeRunTarget): Promise<number> {
   return invoke<number>("cascade_start_all_computer_tasks", { target: target ?? null });
+}
+
+/** Readiness gate for real-screen agents. */
+export async function screenAgentReadiness(): Promise<ScreenAgentReadiness> {
+  return invoke<ScreenAgentReadiness>("cascade_screen_agent_readiness", {});
 }
 
 /** Stop one agent (specId), or all of them (specId = 0). */
