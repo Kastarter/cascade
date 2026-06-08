@@ -71,8 +71,16 @@ fn promote_overlay(win: &WebviewWindow, click_through: bool) {
 const MAX_STEPS: i64 = 24;
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 10;
-const STALL_WARN_AFTER: u32 = 2;
-const STALL_FAIL_AFTER: u32 = 4;
+const STALL_WARN_AFTER: u32 = 3;
+const STALL_FAIL_AFTER: u32 = 7;
+const DEFAULT_ACTION_PAUSE_MS: u64 = 1300;
+const TEXT_ACTION_PAUSE_MS: u64 = 1550;
+const NAV_ACTION_PAUSE_MS: u64 = 2600;
+const STALE_RECHECK_DELAY_MS: u64 = 1100;
+const FRAME_DIFF_W: u32 = 64;
+const FRAME_DIFF_H: u32 = 36;
+const FRAME_CELL_DELTA: u8 = 2;
+const FRAME_STRONG_CELL_DELTA: u8 = 8;
 const CURSOR_WINDOW: &str = "cascade-cursor";
 const HANDS_WINDOW: &str = "cascade-hands";
 const EVT_CURSOR: &str = "cascade-hands-cursor";
@@ -490,26 +498,106 @@ fn capture_logical_screenshot(app: &tauri::AppHandle) -> Result<(String, f64, f6
     Ok((STANDARD.encode(&buf), lw, lh))
 }
 
-fn frame_fingerprint(image_base64: &str) -> Option<u64> {
-    let bytes = STANDARD.decode(image_base64).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_luma8();
-    let small = image::imageops::resize(&img, 8, 8, image::imageops::FilterType::Triangle);
-    let pixels: Vec<u8> = small.pixels().map(|p| p.0[0]).collect();
+fn frame_fingerprint_from_cells(pixels: &[u8]) -> u64 {
     let avg = pixels.iter().map(|v| *v as u32).sum::<u32>() / pixels.len().max(1) as u32;
     let mut hash = 0u64;
-    for (idx, value) in pixels.iter().enumerate() {
+    for (idx, value) in pixels.iter().take(64).enumerate() {
         if *value as u32 >= avg {
             hash |= 1u64 << idx;
         }
     }
-    Some(hash)
+    hash
 }
 
-fn frames_look_same(before: &str, after: &str) -> bool {
-    match (frame_fingerprint(before), frame_fingerprint(after)) {
-        (Some(a), Some(b)) => (a ^ b).count_ones() <= 3,
-        _ => before == after,
+#[derive(Debug, Clone, Copy)]
+struct FrameChange {
+    mean_delta: f32,
+    changed_cells: u32,
+    strong_cells: u32,
+    max_delta: u8,
+    hash_distance: u32,
+}
+
+impl FrameChange {
+    fn is_meaningful(self) -> bool {
+        self.strong_cells >= 1
+            || self.changed_cells >= 3
+            || self.max_delta >= 6
+            || self.mean_delta >= 0.25
+            || self.hash_distance >= 4
     }
+
+    fn summary(self) -> String {
+        format!(
+            "mean_delta={:.2}, changed_cells={}, strong_cells={}, max_delta={}, hash_distance={}",
+            self.mean_delta, self.changed_cells, self.strong_cells, self.max_delta, self.hash_distance
+        )
+    }
+}
+
+fn frame_change(before: &str, after: &str) -> Option<FrameChange> {
+    let before_bytes = STANDARD.decode(before).ok()?;
+    let after_bytes = STANDARD.decode(after).ok()?;
+    let before_img = image::load_from_memory(&before_bytes).ok()?.to_luma8();
+    let after_img = image::load_from_memory(&after_bytes).ok()?.to_luma8();
+    let before_small = image::imageops::resize(&before_img, FRAME_DIFF_W, FRAME_DIFF_H, image::imageops::FilterType::Triangle);
+    let after_small = image::imageops::resize(&after_img, FRAME_DIFF_W, FRAME_DIFF_H, image::imageops::FilterType::Triangle);
+    let before_cells: Vec<u8> = before_small.pixels().map(|p| p.0[0]).collect();
+    let after_cells: Vec<u8> = after_small.pixels().map(|p| p.0[0]).collect();
+    if before_cells.is_empty() || before_cells.len() != after_cells.len() {
+        return None;
+    }
+
+    let mut sum_delta = 0u64;
+    let mut changed_cells = 0u32;
+    let mut strong_cells = 0u32;
+    let mut max_delta = 0u8;
+    for (a, b) in before_cells.iter().zip(after_cells.iter()) {
+        let delta = a.abs_diff(*b);
+        sum_delta += delta as u64;
+        if delta >= FRAME_CELL_DELTA {
+            changed_cells += 1;
+        }
+        if delta >= FRAME_STRONG_CELL_DELTA {
+            strong_cells += 1;
+        }
+        max_delta = max_delta.max(delta);
+    }
+
+    Some(FrameChange {
+        mean_delta: sum_delta as f32 / before_cells.len() as f32,
+        changed_cells,
+        strong_cells,
+        max_delta,
+        hash_distance: (frame_fingerprint_from_cells(&before_cells) ^ frame_fingerprint_from_cells(&after_cells)).count_ones(),
+    })
+}
+
+#[cfg(test)]
+fn frames_changed_meaningfully(before: &str, after: &str) -> bool {
+    match frame_change(before, after) {
+        Some(change) => change.is_meaningful(),
+        None => before != after,
+    }
+}
+
+fn post_action_pause_ms(action: &str) -> u64 {
+    match action {
+        "navigate" | "open_app" => NAV_ACTION_PAUSE_MS,
+        "type" | "key" => TEXT_ACTION_PAUSE_MS,
+        _ => DEFAULT_ACTION_PAUSE_MS,
+    }
+}
+
+fn can_blame_stale_frame(action: &str) -> bool {
+    matches!(action, "click" | "double_click" | "navigate" | "open_app")
+}
+
+fn action_signature(action: &ComputerAction) -> String {
+    let x_bucket = (action.x / 16.0).round() * 16.0;
+    let y_bucket = (action.y / 16.0).round() * 16.0;
+    let text = action.text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect::<String>();
+    format!("{}:{x_bucket:.0}:{y_bucket:.0}:{}:{}:{}", action.action, action.app, action.key, text)
 }
 
 fn computer_system_prompt(name: &str, w: f64, h: f64, target: RunTarget) -> String {
@@ -531,8 +619,9 @@ current screen actually shows. Find the on-screen element that matches each reco
 don't re-derive the route from scratch or explore elsewhere. If a step's target isn't visible yet, scroll \
 or open the menu that would reveal it, just as the employee did.\n\n\
 Coordinates: (x,y) are EXACT pixels in the screenshot you were given (its top-left is 0,0). To click a \
-thing, give the pixel at its CENTER. After each action you'll get a fresh screenshot — verify it changed; \
-if nothing changed, your last click missed, so pick a clearer target or scroll.\n\n\
+thing, give the pixel at its CENTER. After each action you'll get a fresh screenshot; verify the current \
+state before deciding what to do next. Some web apps update subtly or slowly, so if the screen appears \
+similar, inspect it carefully, wait when loading is plausible, or choose a clearer visible target.\n\n\
 Be conservative; never take destructive or irreversible actions (deleting, submitting, sending, paying, \
 changing account/security settings, posting publicly).\n\n\
 Actions:\n\
@@ -569,8 +658,9 @@ this task: reproduce that exact sequence of app switches / clicks / typing here,
 what the current screen actually shows. Find the on-screen element that matches each recorded step and \
 click it; don't re-derive the route from scratch.\n\n\
 Coordinates: (x,y) are EXACT pixels in the screenshot you were given (its top-left is 0,0). To click a \
-thing, give the pixel at its CENTER. After each action you'll get a fresh screenshot — verify it changed; \
-if nothing changed, your last click missed, so pick a clearer target or scroll.\n\n\
+thing, give the pixel at its CENTER. After each action you'll get a fresh screenshot; verify the current \
+state before deciding what to do next. Desktop apps can update subtly or slowly, so if the screen appears \
+similar, inspect it carefully, wait when loading is plausible, or choose a clearer visible target.\n\n\
 Be conservative; never take destructive or irreversible actions (deleting, submitting, sending, paying, \
 changing account/security settings, posting publicly).\n\n\
 Actions:\n\
@@ -690,9 +780,12 @@ fn build_recorded_digest(
     Some(out.trim().to_string())
 }
 
-/// Stable per-agent hue so each cursor/row has a consistent color.
+/// Stable per-agent hue so each cursor/row has a consistent color. The first
+/// agent deliberately lands on Cascade blue instead of the old green default.
 fn hue_for(spec_id: i64) -> i64 {
-    ((spec_id.unsigned_abs() % 360) as i64 + 145) % 360
+    const HUES: [i64; 10] = [222, 276, 18, 198, 326, 44, 252, 304, 12, 236];
+    let idx = spec_id.unsigned_abs().saturating_sub(1) as usize;
+    HUES[idx % HUES.len()]
 }
 
 async fn record_run_start(
@@ -1260,6 +1353,7 @@ async fn run_task_cycle(
     let mut notes: Vec<String> = Vec::new();
     let mut transient_failures = 0u32;
     let mut stalled_commits = 0u32;
+    let mut last_stall_signature: Option<String> = None;
 
     match target {
         RunTarget::Sandbox => {
@@ -1579,61 +1673,92 @@ async fn run_task_cycle(
         }
 
         history.push_str(&format!("- step {step}: {}\n", narrate(&action)));
-        let pause = if matches!(action.action.as_str(), "navigate" | "open_app") { 2400 } else { 900 };
-        tokio::time::sleep(Duration::from_millis(pause)).await;
+        tokio::time::sleep(Duration::from_millis(post_action_pause_ms(&action.action))).await;
         if is_committing(&action.action) {
-            if let Ok((after_b64, after_w, after_h)) = capture_for(app, spec_id, target).await {
+            if let Ok((mut after_b64, mut after_w, mut after_h)) = capture_for(app, spec_id, target).await {
+                let mut change = frame_change(&b64, &after_b64);
+                if !change.map(|c| c.is_meaningful()).unwrap_or_else(|| b64 != after_b64) {
+                    tokio::time::sleep(Duration::from_millis(STALE_RECHECK_DELAY_MS)).await;
+                    if let Ok((retry_b64, retry_w, retry_h)) = capture_for(app, spec_id, target).await {
+                        let retry_change = frame_change(&b64, &retry_b64);
+                        if retry_change.map(|c| c.is_meaningful()).unwrap_or_else(|| b64 != retry_b64) {
+                            after_b64 = retry_b64;
+                            after_w = retry_w;
+                            after_h = retry_h;
+                            change = retry_change;
+                        } else if change.is_none() && retry_change.is_some() {
+                            after_b64 = retry_b64;
+                            after_w = retry_w;
+                            after_h = retry_h;
+                            change = retry_change;
+                        }
+                    }
+                }
                 if target == RunTarget::Sandbox {
                     let _ = app.emit(EVT_FRAME, FrameEvent { image_base64: after_b64.clone(), img_w: after_w, img_h: after_h });
                 }
-                if frames_look_same(&b64, &after_b64) {
-                    stalled_commits += 1;
+                let changed = change.map(|c| c.is_meaningful()).unwrap_or_else(|| b64 != after_b64);
+                if !changed {
+                    let diagnostic = change.map(|c| c.summary()).unwrap_or_else(|| "comparison unavailable".to_string());
                     history.push_str(&format!(
-                        "- step {step}: {} had no visible effect; pick a different visible target, scroll, wait for loading, or record what you can see instead of repeating it\n",
+                        "- step {step}: {} did not produce a large visible change yet ({diagnostic}); verify the current screen before deciding whether to wait, continue, or choose another target\n",
                         action.action
                     ));
-                    emit_status(
-                        app,
-                        StatusEvent {
-                            spec_id,
-                            name: name.to_string(),
-                            goal: goal.to_string(),
-                            narration: if stalled_commits >= STALL_WARN_AFTER {
-                                "The screen is not changing. Trying a different route instead of repeating the same action…".to_string()
-                            } else {
-                                "That action did nothing visible. Trying another on-page action…".to_string()
-                            },
-                            step,
-                            supervised,
-                            awaiting_approval: false,
-                            done: false,
-                            error: None,
-                            hue,
-                        },
-                    );
-                    if stalled_commits >= STALL_FAIL_AFTER {
-                        history.push_str(&format!(
-                            "- step {step}: stopped after {stalled_commits} no-effect actions to avoid an automation loop\n"
-                        ));
+                    if can_blame_stale_frame(&action.action) {
+                        let signature = action_signature(&action);
+                        if last_stall_signature.as_deref() == Some(signature.as_str()) {
+                            stalled_commits += 1;
+                        } else {
+                            stalled_commits = 1;
+                            last_stall_signature = Some(signature);
+                        }
                         emit_status(
                             app,
                             StatusEvent {
                                 spec_id,
                                 name: name.to_string(),
                                 goal: goal.to_string(),
-                                narration: "I stopped because the screen was not responding to repeated actions.".to_string(),
+                                narration: if stalled_commits >= STALL_WARN_AFTER {
+                                    "The same target still looks unchanged. Checking the screen before choosing another route…".to_string()
+                                } else {
+                                    "The screen looks similar after that action. Verifying before the next move…".to_string()
+                                },
                                 step,
                                 supervised,
                                 awaiting_approval: false,
-                                done: true,
-                                error: Some("stopped after repeated no-effect actions".to_string()),
+                                done: false,
+                                error: None,
                                 hue,
                             },
                         );
-                        break;
+                        if stalled_commits >= STALL_FAIL_AFTER {
+                            history.push_str(&format!(
+                                "- step {step}: stopped after {stalled_commits} repeated stale snapshots for the same target to avoid an automation loop\n"
+                            ));
+                            emit_status(
+                                app,
+                                StatusEvent {
+                                    spec_id,
+                                    name: name.to_string(),
+                                    goal: goal.to_string(),
+                                    narration: "I stopped because the same target stayed visually unchanged after repeated attempts.".to_string(),
+                                    step,
+                                    supervised,
+                                    awaiting_approval: false,
+                                    done: true,
+                                    error: Some("stopped after repeated stale snapshots".to_string()),
+                                    hue,
+                                },
+                            );
+                            break;
+                        }
+                    } else {
+                        stalled_commits = 0;
+                        last_stall_signature = None;
                     }
                 } else {
                     stalled_commits = 0;
+                    last_stall_signature = None;
                 }
             }
         }
@@ -2492,4 +2617,75 @@ pub async fn cascade_computer_status() -> Result<Vec<ComputerAgentStatus>, Strin
             awaiting_approval: c.awaiting,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+
+    fn png_base64(img: &RgbaImage) -> String {
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(img.clone())
+            .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        STANDARD.encode(&buf)
+    }
+
+    fn blank_frame() -> RgbaImage {
+        RgbaImage::from_pixel(320, 205, Rgba([248, 248, 246, 255]))
+    }
+
+    #[test]
+    fn frame_change_keeps_identical_frames_stale() {
+        let before = png_base64(&blank_frame());
+        let after = before.clone();
+
+        let change = frame_change(&before, &after).unwrap();
+
+        assert!(!change.is_meaningful(), "{change:?}");
+        assert!(!frames_changed_meaningfully(&before, &after));
+    }
+
+    #[test]
+    fn frame_change_detects_text_field_progress() {
+        let before_img = blank_frame();
+        let mut after_img = before_img.clone();
+
+        for y in 82..94 {
+            for x in 88..164 {
+                if (x / 4 + y / 3) % 3 != 0 {
+                    after_img.put_pixel(x, y, Rgba([28, 35, 43, 255]));
+                }
+            }
+        }
+
+        let before = png_base64(&before_img);
+        let after = png_base64(&after_img);
+
+        assert!(frames_changed_meaningfully(&before, &after));
+    }
+
+    #[test]
+    fn frame_change_detects_dropdown_sized_progress() {
+        let before_img = blank_frame();
+        let mut after_img = before_img.clone();
+
+        for y in 58..142 {
+            for x in 116..226 {
+                let edge = x == 116 || x == 225 || y == 58 || y == 141;
+                let rgba = if edge {
+                    Rgba([58, 70, 86, 255])
+                } else {
+                    Rgba([235, 240, 246, 255])
+                };
+                after_img.put_pixel(x, y, rgba);
+            }
+        }
+
+        let before = png_base64(&before_img);
+        let after = png_base64(&after_img);
+
+        assert!(frames_changed_meaningfully(&before, &after));
+    }
 }

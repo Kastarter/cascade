@@ -5,14 +5,10 @@
 // cursor — one labeled, colored pointer per installed agent. The real macOS
 // pointer is never touched.
 //
-// The cursor is the OpenClicky "blue triangle": instead of CSS-easing left/top
-// between the discrete positions the backend emits, each cursor *flies* to its
-// next target along an upward bezier arc, rotates to face its direction of
-// travel, and swoops (scales up) at mid-flight — driven per-frame by
-// requestAnimationFrame. See lib/cursor-flight.ts for the engine and its
-// provenance (jasonkneen/openclicky + jasonkneen/CursorBuddy). Cascade keeps one
-// hue per agent so multiple cursors stay distinguishable; a lone agent lands on
-// the signature blue.
+// The cursor keeps OpenClicky's fast bezier flight, but the rendered pointer is
+// Cascade's own crisp blue/white arrow. Per-agent hue is an accent for glow and
+// labels, not the whole pointer body, so a default agent never looks like an old
+// green crosshair.
 
 "use client";
 
@@ -40,8 +36,8 @@ interface CursorState {
 // Triangle geometry (equilateral, apex up — matches the Swift original's
 // sqrt(3)/2 height). Sized up a touch from OpenClicky's 16px since this rides on
 // the full real screen, not a 320px companion panel.
-const SIZE = 22;
-const PAD = 6;
+const SIZE = 24;
+const PAD = 8;
 const BOX = SIZE + PAD * 2;
 const HALF = SIZE / 2;
 const TRI_H = (SIZE * Math.sqrt(3)) / 2;
@@ -79,9 +75,12 @@ interface Meta {
   clickNonce: number;
 }
 
-const fillFor = (hue: number) => `oklch(0.74 0.18 ${hue})`;
-const glowFor = (hue: number) => `oklch(0.72 0.22 ${hue})`;
-const deepFor = (hue: number) => `oklch(0.30 0.10 ${hue})`;
+const accentFor = (hue: number) => `oklch(0.68 0.18 ${hue})`;
+const glowFor = (hue: number) => `oklch(0.72 0.20 ${hue})`;
+const labelBorderFor = (hue: number) => `oklch(0.62 0.16 ${hue} / 0.52)`;
+const POINTER_STROKE = "rgba(8, 13, 27, 0.92)";
+const POINTER_CORE = "#f8fbff";
+const POINTER_BLUE = "#4c8dff";
 
 export default function HandsCursor() {
   const [meta, setMeta] = useState<Record<number, Meta>>({});
@@ -227,8 +226,9 @@ export default function HandsCursor() {
     >
       {Object.entries(meta).map(([idStr, m]) => {
         const id = Number(idStr);
-        const fill = fillFor(m.hue);
-        const deep = deepFor(m.hue);
+        const accent = accentFor(m.hue);
+        const gradId = `cascade-cursor-fill-${id}`;
+        const shineId = `cascade-cursor-shine-${id}`;
         return (
           <div
             key={id}
@@ -248,7 +248,30 @@ export default function HandsCursor() {
               }}
             >
               <svg width={BOX} height={BOX} viewBox={`${-PAD} ${-PAD} ${BOX} ${BOX}`}>
-                <polygon points={POINTS} fill={fill} stroke={deep} strokeWidth={1} strokeLinejoin="round" />
+                <defs>
+                  <linearGradient id={gradId} x1="4" y1="-2" x2="20" y2="25" gradientUnits="userSpaceOnUse">
+                    <stop offset="0" stopColor={POINTER_CORE} />
+                    <stop offset="0.48" stopColor="#dbe8ff" />
+                    <stop offset="1" stopColor={POINTER_BLUE} />
+                  </linearGradient>
+                  <linearGradient id={shineId} x1="7" y1="-2" x2="16" y2="18" gradientUnits="userSpaceOnUse">
+                    <stop offset="0" stopColor="#ffffff" stopOpacity="0.92" />
+                    <stop offset="1" stopColor="#ffffff" stopOpacity="0" />
+                  </linearGradient>
+                </defs>
+                <circle cx={HALF} cy={HALF} r={SIZE * 0.68} fill={accent} opacity="0.12" />
+                <polygon
+                  points={POINTS}
+                  fill={`url(#${gradId})`}
+                  stroke={POINTER_STROKE}
+                  strokeWidth={1.35}
+                  strokeLinejoin="round"
+                />
+                <polygon
+                  points={`${HALF},${(TOP_Y + 3).toFixed(2)} 6,${(BOT_Y - 4).toFixed(2)} ${HALF},${(BOT_Y - 2).toFixed(2)}`}
+                  fill={`url(#${shineId})`}
+                  opacity="0.64"
+                />
               </svg>
             </div>
 
@@ -263,7 +286,8 @@ export default function HandsCursor() {
                   width: 32,
                   height: 32,
                   borderRadius: "50%",
-                  border: `2px solid ${glowFor(m.hue)}`,
+                  border: `2px solid ${accent}`,
+                  boxShadow: `0 0 14px ${glowFor(m.hue)}`,
                   animation: "cascadeRipple 0.5s ease-out",
                 }}
               />
@@ -277,10 +301,12 @@ export default function HandsCursor() {
                 top: -4,
                 padding: "2px 7px",
                 borderRadius: 6,
-                background: deep,
-                color: fill,
-                font: "600 10px ui-monospace, SFMono-Regular, Menlo, monospace",
-                letterSpacing: 0.4,
+                background: "rgba(7, 11, 22, 0.84)",
+                border: `1px solid ${labelBorderFor(m.hue)}`,
+                boxShadow: `0 8px 22px rgba(4, 7, 16, 0.24), 0 0 16px ${glowFor(m.hue)}`,
+                color: "#f8fbff",
+                font: "650 10px ui-monospace, SFMono-Regular, Menlo, monospace",
+                letterSpacing: 0,
                 whiteSpace: "nowrap",
                 maxWidth: 160,
                 overflow: "hidden",
