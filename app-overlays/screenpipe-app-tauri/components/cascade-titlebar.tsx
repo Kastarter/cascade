@@ -37,11 +37,10 @@ export function CascadeTitlebar() {
   return (
     <>
       <div
-        data-tauri-drag-region
         style={{
           height: 44,
           flexShrink: 0,
-          background: "oklch(0.175 0.010 140 / 0.74)",
+          background: "oklch(0.175 0.018 250 / 0.76)",
           backdropFilter: "blur(16px) saturate(140%)",
           WebkitBackdropFilter: "blur(16px) saturate(140%)",
           borderBottom: "1px solid var(--cascade-border)",
@@ -56,8 +55,17 @@ export function CascadeTitlebar() {
           fontFamily: "var(--cascade-sans)",
         }}
       >
+        <div
+          data-tauri-drag-region
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 0,
+          }}
+        />
         {/* Brand */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ position: "relative", zIndex: 1, display: "flex", alignItems: "center", gap: 8 }}>
           <BrandMark />
           <span style={{ color: "var(--cascade-text)", fontSize: 13, fontWeight: 500 }}>Cascade</span>
         </div>
@@ -68,6 +76,7 @@ export function CascadeTitlebar() {
             position: "absolute",
             left: "50%",
             transform: "translateX(-50%)",
+            zIndex: 1,
             display: "flex",
             gap: 0,
             background: "var(--cascade-panel)",
@@ -103,7 +112,7 @@ export function CascadeTitlebar() {
         </div>
 
         {/* Right cluster: date · storage · REC pill */}
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ position: "relative", zIndex: 1, marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontFamily: "var(--cascade-mono)", fontSize: 11, color: "var(--cascade-text-3)" }}>
             {dateLabel}
           </span>
@@ -146,7 +155,7 @@ function switcherBtn(active: boolean): React.CSSProperties {
   return {
     padding: "5px 14px",
     borderRadius: 6,
-    background: active ? "oklch(0.255 0.012 140)" : "transparent",
+    background: active ? "oklch(0.285 0.052 250)" : "transparent",
     color: active ? "var(--cascade-text)" : "var(--cascade-text-3)",
     border: "none",
     cursor: "pointer",

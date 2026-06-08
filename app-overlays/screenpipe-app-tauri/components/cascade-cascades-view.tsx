@@ -39,11 +39,13 @@ import {
   seedDailyRecapAgent,
   sandboxTest,
   seedDemoAgent,
+  screenAgentReadiness,
   startAllComputerTasks,
   startComputerTask,
   stopComputerTask,
   pauseComputerTask,
   transitionAgentSpec,
+  type ScreenAgentReadiness,
 } from "@/lib/cascade-agents";
 
 type Stage = "review" | "sandbox" | "running" | "history";
@@ -66,8 +68,9 @@ export function CascadesView() {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [hasAnthropicKey, setHasAnthropicKey] = useState(false);
-  // Global "on screen vs Local Sandbox" preference, set in Settings.
-  const [runMode, setRunMode] = useState<CascadeRunMode>("sandbox");
+  // Global driver preference: Local Browser, real screen, or future Local VM.
+  const [runMode, setRunMode] = useState<CascadeRunMode>("local_browser");
+  const [screenReadiness, setScreenReadiness] = useState<ScreenAgentReadiness | null>(null);
 
   const refreshKeyStatus = useCallback(async () => {
     try {
@@ -112,6 +115,43 @@ export function CascadesView() {
     return () => clearInterval(id);
   }, [refresh, refreshKeyStatus]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      if (runMode !== "screen") {
+        setScreenReadiness(null);
+        return;
+      }
+      try {
+        const readiness = await screenAgentReadiness();
+        if (!cancelled) setScreenReadiness(readiness);
+      } catch {
+        if (!cancelled) {
+          setScreenReadiness({
+            ready: false,
+            missing: ["screen agent readiness check"],
+            message: "Screen mode is blocked until Cascade can verify permissions and recorder health.",
+            screenRecording: false,
+            accessibility: false,
+            inputMonitoring: false,
+            nativeBridgeAvailable: false,
+            nativeScreenCaptureAvailable: false,
+            frameStatusOk: false,
+            uiRecorderRunning: false,
+            inputTapRunning: false,
+            appEventsRunning: false,
+          });
+        }
+      }
+    };
+    check();
+    const id = runMode === "screen" ? window.setInterval(check, 5_000) : 0;
+    return () => {
+      cancelled = true;
+      if (id) window.clearInterval(id);
+    };
+  }, [runMode]);
+
   const buckets = useMemo(() => {
     const map: Record<Stage, CascadeAgentSpecView[]> = {
       review: [],
@@ -127,6 +167,16 @@ export function CascadesView() {
   }, [specs]);
   // How many installed agents can be started in one go (any mode).
   const watchableRunningCount = useMemo(() => buckets.running.length, [buckets.running]);
+  const screenBlocked = runMode === "screen" && screenReadiness != null && !screenReadiness.ready;
+  const localVmBlocked = runMode === "local_vm";
+  const runtimeBlocked = screenBlocked || localVmBlocked;
+  const runtimeBlockedMessage = screenBlocked
+    ? screenReadiness?.message ?? "Screen mode is blocked until permissions and recorder health are verified."
+    : localVmBlocked
+      ? "Local VM driver is defined, but no local VM provider is configured yet."
+      : null;
+  const runtimeLabel =
+    runMode === "screen" ? "on your screen" : runMode === "local_vm" ? "in the Local VM" : "in the Local Browser";
 
   const run = useCallback(
     async (id: number, fn: () => Promise<unknown>, ok: string) => {
@@ -176,6 +226,9 @@ export function CascadesView() {
             );
           }
         }
+        if (!s.managerApproved) {
+          await transitionAgentSpec(s.id, "approve_manager");
+        }
         await transitionAgentSpec(s.id, "approve_employee");
         await transitionAgentSpec(s.id, "deploy");
       },
@@ -197,22 +250,29 @@ export function CascadesView() {
     }, `Uninstalled “${s.name}”`);
   const onWatch = (s: CascadeAgentSpecView) =>
     requireKey("starting an agent") &&
+    (!runtimeBlockedMessage || (setError(runtimeBlockedMessage), false)) &&
     run(
       s.id,
       () => startComputerTask(s.id, undefined, runMode),
       runMode === "screen"
-        ? `${s.name} is working on your screen — follow along in the floating box`
-        : `${s.name} is working in the sandbox — watch the steps in the floating box`,
+        ? `${s.name} is working on your screen — keep the control dock visible`
+        : runMode === "local_vm"
+          ? `${s.name} is queued for the Local VM`
+          : `${s.name} is working in the Local Browser — watch the steps in the control box`,
     );
   const onWatchAll = async () => {
     setError(null);
     if (!requireKey("starting agents")) return;
+    if (runtimeBlockedMessage) {
+      setError(runtimeBlockedMessage);
+      return;
+    }
     try {
       const n = await startAllComputerTasks(runMode);
       setNote(
         n === 0
           ? "No installed agents are ready to start yet."
-          : `${n} agent${n === 1 ? "" : "s"} now working — follow each one in the floating box.`,
+          : `${n} agent${n === 1 ? "" : "s"} now working ${runtimeLabel} — keep the control dock visible.`,
       );
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -354,18 +414,21 @@ export function CascadesView() {
 
             {watchableRunningCount > 1 && (
               <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -18 }}>
-                <PrimaryBtn disabled={!hasAnthropicKey} onClick={onWatchAll}>
-                  ▶ Start all {watchableRunningCount} agents{runMode === "screen" ? " on your screen" : " in the sandbox"}
+                <PrimaryBtn disabled={!hasAnthropicKey || runtimeBlocked} onClick={onWatchAll}>
+                  ▶ Start all {watchableRunningCount} agents {runtimeLabel}
                 </PrimaryBtn>
               </div>
             )}
+            {runtimeBlockedMessage && <InfoBanner message={runtimeBlockedMessage} onClose={() => setNote(null)} />}
 
             <StageSection
               title="3 · Running on this Mac"
               sub={
                 runMode === "screen"
-                  ? "Active helpers doing real work. Press Start and the agent uses your real screen and cursor to do the task — it can operate any app. Switch to the Local Sandbox anytime in Settings → How agents run. Every action is audit-logged and reversible."
-                  : "Active helpers doing real work. Press Start and the agent works in the Local Sandbox shown in the floating box (web apps), so you can keep working. Switch to on-screen runs anytime in Settings → How agents run. Every action is audit-logged and reversible."
+                  ? "Active helpers doing real work. Screen mode can operate any app, but only starts when Screen Recording, Accessibility, Input Monitoring, and UI recorder health are all healthy. STOP stays visible in the control dock."
+                  : runMode === "local_vm"
+                    ? "The Local VM driver is part of the contract, but it is blocked until a VM provider is configured. Use Local Browser or Screen mode today."
+                    : "Active helpers doing real work. Press Start and the agent works in the Local Browser shown in the control box (web apps), so you can keep working. Switch modes anytime in Settings → How agents run."
               }
               specs={buckets.running}
               busyId={busyId}
@@ -373,21 +436,27 @@ export function CascadesView() {
               renderActions={(s) => (
                 <>
                   <PrimaryBtn
-                    disabled={busyId === s.id || !hasAnthropicKey}
+                    disabled={busyId === s.id || !hasAnthropicKey || runtimeBlocked}
                     onClick={() => onWatch(s)}
                     title={
                       runMode === "screen"
-                        ? "Start the agent on your real screen and follow along in the floating box"
-                        : "Start the agent in the Local Sandbox and watch the steps in the floating box"
+                        ? "Start the agent on your real screen with the control dock visible"
+                        : runMode === "local_vm"
+                          ? "Local VM provider is not configured yet"
+                          : "Start the agent in the Local Browser and watch the steps in the control box"
                     }
                   >
                     {busyId === s.id
                       ? "Starting…"
                       : !hasAnthropicKey
                         ? "Add key first"
+                        : runtimeBlocked
+                          ? runMode === "local_vm"
+                            ? "VM not configured"
+                            : "Screen blocked"
                         : runMode === "screen"
                         ? "▶ Start on my screen"
-                        : "▶ Start in the box"}
+                        : "▶ Start in Local Browser"}
                   </PrimaryBtn>
                   <GhostBtn disabled={busyId === s.id} onClick={() => onUninstall(s)}>
                     Uninstall
@@ -538,7 +607,7 @@ function SpecCard({
   return (
     <article
       style={{
-        background: "linear-gradient(180deg, oklch(0.225 0.012 55), oklch(0.180 0.010 140))",
+        background: "linear-gradient(180deg, oklch(0.225 0.012 55), oklch(0.180 0.018 250))",
         border: "1px solid var(--cascade-border)",
         borderRadius: 14,
         padding: "20px 22px",
@@ -985,8 +1054,8 @@ const anomalyBoxStyle: React.CSSProperties = {
 function bannerStyle(tone: "warn" | "ok"): React.CSSProperties {
   const warn = tone === "warn";
   return {
-    background: warn ? "oklch(0.24 0.045 30 / 0.5)" : "oklch(0.22 0.03 145 / 0.5)",
-    border: `1px solid ${warn ? "oklch(0.45 0.085 30 / 0.6)" : "oklch(0.44 0.08 145 / 0.6)"}`,
+    background: warn ? "oklch(0.24 0.045 30 / 0.5)" : "oklch(0.23 0.045 250 / 0.5)",
+    border: `1px solid ${warn ? "oklch(0.45 0.085 30 / 0.6)" : "oklch(0.46 0.09 250 / 0.6)"}`,
     color: warn ? "oklch(0.84 0.085 35)" : "var(--cascade-text)",
     padding: "12px 16px",
     borderRadius: 9,

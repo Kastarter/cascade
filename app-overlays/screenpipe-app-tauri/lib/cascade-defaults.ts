@@ -10,7 +10,7 @@
  */
 
 export const CASCADE_PRODUCT_NAME = "Cascade";
-export const CASCADE_BUNDLE_ID = "com.cascade.app";
+export const CASCADE_BUNDLE_ID = "com.humain.cascade";
 export const CASCADE_TRAY_ID = "cascade_main";
 
 export const CASCADE_DEFAULT_PROVIDER = {
@@ -24,7 +24,8 @@ export const CASCADE_ADVANCED_MODEL = "claude-opus-4-7";
 
 /**
  * Keychain entry name for the user's Anthropic API key.
- * Matches the SERVICE prefix used by screenpipe-secrets but in our namespace.
+ * Keep this legacy service stable so existing local BYOK entries survive app-id
+ * and signing migrations.
  */
 export const CASCADE_KEYCHAIN_SERVICE = "com.cascade.app";
 export const CASCADE_ANTHROPIC_KEY_NAME = "anthropic-api-key";
@@ -49,16 +50,17 @@ export const CASCADE_PRIVACY_PROMISE =
  * every agent. The same value is passed straight through to the computer-use
  * engine as its run target — there is no third execution path.
  *
- *  - "sandbox" → the agent works in an isolated browser shown in the floating
- *                box (the "Local Sandbox"); web apps only, and you keep working
- *                while it runs. (Default.)
- *  - "screen"  → the agent uses your REAL screen and cursor, so it can operate
- *                any app — not just websites.
+ *  - "local_browser" → the agent works in an isolated browser shown in the
+ *                      control box; web apps only. (Default.)
+ *  - "screen"        → the agent uses your REAL screen and cursor, so it can
+ *                      operate any app.
+ *  - "local_vm"      → planned local VM driver. Defined in the contract but
+ *                      currently fail-closed until a VM provider is configured.
  */
-export type CascadeRunMode = "screen" | "sandbox";
+export type CascadeRunMode = "screen" | "local_browser" | "local_vm";
 
 export const CASCADE_RUN_MODE_KEY = "cascade-run-mode";
-export const CASCADE_RUN_MODE_DEFAULT: CascadeRunMode = "sandbox";
+export const CASCADE_RUN_MODE_DEFAULT: CascadeRunMode = "local_browser";
 
 /** Fired on `window` after the run mode changes (same-document listeners). */
 export const CASCADE_RUN_MODE_EVENT = "cascade-run-mode-changed";
@@ -66,7 +68,8 @@ export const CASCADE_RUN_MODE_EVENT = "cascade-run-mode-changed";
 export function getRunMode(): CascadeRunMode {
   try {
     const v = window.localStorage.getItem(CASCADE_RUN_MODE_KEY);
-    return v === "screen" || v === "sandbox" ? v : CASCADE_RUN_MODE_DEFAULT;
+    if (v === "sandbox") return "local_browser";
+    return v === "screen" || v === "local_browser" || v === "local_vm" ? v : CASCADE_RUN_MODE_DEFAULT;
   } catch {
     return CASCADE_RUN_MODE_DEFAULT;
   }

@@ -69,9 +69,9 @@ export function CascadeHandsInline() {
     >
       <div
         style={{
-          background: "linear-gradient(180deg, oklch(0.20 0.02 150 / 0.97), oklch(0.15 0.015 150 / 0.97))",
-          border: "1px solid oklch(0.5 0.12 155 / 0.4)",
-          borderRadius: 14,
+          background: "linear-gradient(180deg, rgba(12,16,28,0.97), rgba(6,9,18,0.97))",
+          border: "1px solid rgba(92,142,255,0.36)",
+          borderRadius: 12,
           padding: "11px 13px",
           color: "var(--cascade-text)",
           boxShadow: "0 18px 50px rgba(0,0,0,0.5)",
@@ -80,7 +80,7 @@ export function CascadeHandsInline() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: rows.length ? 9 : 0 }}>
           <CascadeSpark />
-          <span style={{ font: "700 10.5px var(--cascade-mono)", letterSpacing: 1, color: "oklch(0.86 0.13 155)" }}>
+          <span style={{ font: "700 10.5px var(--cascade-mono)", letterSpacing: 0.6, color: "#c8d7ff" }}>
             CASCADE {working > 0 ? "IS WORKING" : "FINISHED"}
           </span>
           <span style={{ flex: 1 }} />
@@ -150,8 +150,8 @@ function Row({ s }: { s: HandsStatus }) {
 function CascadeSpark() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-      <path d="M4 7c4 0 4 4 8 4s4-4 8-4" stroke="oklch(0.82 0.14 155)" strokeWidth="1.6" strokeLinecap="round" opacity="0.5" />
-      <path d="M4 13c4 0 4 4 8 4s4-4 8-4" stroke="oklch(0.82 0.14 155)" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M4 7c4 0 4 4 8 4s4-4 8-4" stroke="#8fb0ff" strokeWidth="1.6" strokeLinecap="round" opacity="0.5" />
+      <path d="M4 13c4 0 4 4 8 4s4-4 8-4" stroke="#8fb0ff" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
@@ -171,9 +171,9 @@ const ok: React.CSSProperties = {
   flex: 1,
   padding: "6px 0",
   borderRadius: 7,
-  background: "oklch(0.6 0.13 155)",
+  background: "#5f8dff",
   border: "none",
-  color: "oklch(0.14 0.03 155)",
+  color: "#07101f",
   font: "700 11.5px var(--cascade-sans)",
   cursor: "pointer",
 };

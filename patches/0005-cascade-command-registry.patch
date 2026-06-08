@@ -22,7 +22,6 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/main.rs
 +mod cascade_agents;
 +mod cascade_commands;
 +mod cascade_computer;
-+mod cascade_input;
 +mod cascade_llm;
 +
  #[cfg(target_os = "macos")]

@@ -1,0 +1,71 @@
+diff --git screenpipe.orig/crates/screenpipe-engine/src/permission_monitor.rs screenpipe/crates/screenpipe-engine/src/permission_monitor.rs
+index d93a140..294cfd5 100644
+--- screenpipe.orig/crates/screenpipe-engine/src/permission_monitor.rs
++++ screenpipe/crates/screenpipe-engine/src/permission_monitor.rs
+@@ -12,9 +12,9 @@
+ //! Detection comes from two sources that funnel through a single emission
+ //! path (so events are deduped and dedup'd state is shared):
+ //!
+-//! 1. **Polling** (this task). Every 5s checks `check_permissions()` and
+-//!    emits on transition. The only way to detect accessibility state
+-//!    changes (no stream-failure signal for that permission).
++//! 1. **Polling** (this task). Every 5s checks a preflight-safe permission
++//!    snapshot and emits on transition. The only way to detect accessibility
++//!    state changes (no stream-failure signal for that permission).
+ //!
+ //! 2. **Eager reports from capture modules**. Vision (`monitor_watcher`)
+ //!    calls [`report_state`] when `SCStream` errors with `PermissionDenied`.
+@@ -40,7 +40,9 @@ use std::sync::Mutex;
+ use std::time::{Duration, Instant};
+ 
+ use once_cell::sync::Lazy;
+-use screenpipe_core::permissions::{check_permissions, PermissionStatus};
++use screenpipe_core::permissions::{
++    check_accessibility, check_microphone, check_screen_recording_preflight, PermissionStatus,
++};
+ use screenpipe_events::{send_event, PermissionEvent, PermissionKind};
+ use tokio::task::JoinHandle;
+ use tracing::{debug, info};
+@@ -103,6 +105,24 @@ static STATE: Lazy<Mutex<State>> = Lazy::new(|| {
+     })
+ });
+ 
++struct PermissionSnapshot {
++    screen_recording: PermissionStatus,
++    microphone: PermissionStatus,
++    accessibility: PermissionStatus,
++}
++
++fn poll_permissions() -> PermissionSnapshot {
++    PermissionSnapshot {
++        // Strictly use the TCC preflight read for Screen Recording. The broader
++        // core check falls back to a real capture probe on false negatives,
++        // which is useful for CLI doctor flows but too aggressive for a
++        // background app permission monitor while access is denied.
++        screen_recording: check_screen_recording_preflight(),
++        microphone: check_microphone(),
++        accessibility: check_accessibility(),
++    }
++}
++
+ /// Start the monitor. Idempotent — calling twice returns early; the first
+ /// call wins. Returns the join handle of the polling task (first call) or
+ /// `None` on subsequent calls.
+@@ -116,7 +136,7 @@ pub fn start() -> Option<JoinHandle<()>> {
+         // Seed last-known with current state so the first poll tick doesn't
+         // emit spurious events for permissions that were already denied at
+         // process start.
+-        let perms = check_permissions();
++        let perms = poll_permissions();
+         state.screen = LastKnown::new(perms.screen_recording.is_granted());
+         state.mic = LastKnown::new(perms.microphone.is_granted());
+         state.accessibility = LastKnown::new(perms.accessibility.is_granted());
+@@ -222,7 +242,7 @@ async fn run() {
+ 
+     loop {
+         ticker.tick().await;
+-        let perms = check_permissions();
++        let perms = poll_permissions();
+         report_state(
+             PermissionKind::ScreenRecording,
+             granted(perms.screen_recording),
