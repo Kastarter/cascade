@@ -11,60 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  patches-apply:
-    name: patches apply cleanly
+  swift:
+    name: swift test
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: install quilt
-        run: brew install quilt
-
-      - name: apply quilt series
-        run: ./scripts/apply-patches.sh
-
-      - name: ensure no patch needed adjustment vs pinned upstream
-        env:
-          QUILT_PATCHES: ${{ github.workspace }}/patches
-          QUILT_SERIES: ${{ github.workspace }}/patches/series
-        run: |
-          # Refresh every patch in the series. If a patch applied with fuzz or
-          # line-offset against the pinned upstream SHA, quilt refresh rewrites
-          # the patch file — and `git diff --exit-code patches/` catches it.
-          cd vendor/screenpipe
-          while quilt top >/dev/null 2>&1; do
-            quilt refresh
-            quilt pop || break
-          done
-
-          cd "$GITHUB_WORKSPACE"
-          if ! git diff --exit-code patches/; then
-            echo "::error::a patch drifted vs upstream — run scripts/refresh-from-upstream.sh and commit the result"
-            exit 1
-          fi
-          echo "all patches apply with zero fuzz against pinned upstream"
-
-  cascade-schema-build:
-    name: cascade-schema crate builds
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/cascade-schema
-
-      - name: cargo check (cascade-schema only, no vendor)
-        working-directory: crates/cascade-schema
-        run: cargo check
-
-      - name: cargo test
-        working-directory: crates/cascade-schema
-        run: cargo test
+      - name: Swift version
+        run: swift --version
+      - name: Test
+        run: swift test

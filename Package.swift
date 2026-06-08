@@ -1,0 +1,55 @@
+// swift-tools-version: 6.0
+
+import PackageDescription
+
+let package = Package(
+    name: "CascadeNative",
+    defaultLocalization: "en",
+    platforms: [.macOS(.v14)],
+    products: [
+        .executable(name: "Cascade", targets: ["CascadeApp"]),
+        .library(name: "CascadeMemory", targets: ["CascadeMemory"]),
+        .library(name: "MacContextKit", targets: ["MacContextKit"]),
+        .library(name: "ComputerUseKit", targets: ["ComputerUseKit"]),
+        .library(name: "AgentOrchestrator", targets: ["AgentOrchestrator"])
+    ],
+    targets: [
+        .target(name: "CascadeDesignSystem"),
+        .target(name: "CascadeMemory"),
+        .target(name: "MacContextKit", dependencies: ["CascadeMemory"]),
+        .target(name: "ComputerUseKit", dependencies: ["CascadeMemory", "MacContextKit"]),
+        .target(name: "ProviderKit", dependencies: ["CascadeMemory"]),
+        .target(name: "SuggestionEngine", dependencies: ["CascadeMemory"]),
+        .target(
+            name: "AgentOrchestrator",
+            dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "SuggestionEngine"]
+        ),
+        .target(
+            name: "AppShell",
+            dependencies: [
+                "AgentOrchestrator",
+                "CascadeDesignSystem",
+                "CascadeMemory",
+                "ComputerUseKit",
+                "MacContextKit",
+                "ProviderKit",
+                "SuggestionEngine"
+            ]
+        ),
+        .executableTarget(
+            name: "CascadeApp",
+            dependencies: ["AppShell"],
+            resources: [.process("Resources")]
+        ),
+        .testTarget(name: "CascadeMemoryTests", dependencies: ["CascadeMemory"]),
+        .testTarget(
+            name: "SuggestionEngineTests",
+            dependencies: ["CascadeMemory", "SuggestionEngine"]
+        ),
+        .testTarget(
+            name: "AgentOrchestratorTests",
+            dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit"]
+        ),
+        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit"])
+    ]
+)
