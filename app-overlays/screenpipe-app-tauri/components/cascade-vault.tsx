@@ -65,7 +65,14 @@ export function CascadeVault({ open, onClose }: CascadeVaultProps) {
       if (!r.ok) return;
       const j = await r.json();
       const status = String(j?.status ?? "").toLowerCase();
-      setRecording(status === "recording" || status === "healthy" || status === "starting");
+      const frameStatus = String(j?.frame_status ?? "").toLowerCase();
+      const uiRecorderRunning = Boolean(j?.ui_recorder?.running);
+      setRecording(
+        status === "recording" ||
+          status === "healthy" ||
+          status === "starting" ||
+          (frameStatus === "ok" && uiRecorderRunning),
+      );
     } catch {
       // keep last UI state
     }
@@ -182,6 +189,7 @@ export function CascadeVault({ open, onClose }: CascadeVaultProps) {
       >
         <button
           onClick={onClose}
+          aria-label="Close Vault"
           style={{
             position: "absolute",
             top: 14,
@@ -326,6 +334,7 @@ export function CascadeVault({ open, onClose }: CascadeVaultProps) {
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: 11, color: "var(--cascade-text-3)", minWidth: 60 }}>1 GB</span>
             <input
+              aria-label="Recording quota"
               type="range"
               min={1}
               max={50}
@@ -409,7 +418,7 @@ export function CascadeVault({ open, onClose }: CascadeVaultProps) {
             color: "var(--cascade-text-4)",
           }}
         >
-          ● running locally · nothing leaves this Mac
+          {recording ? "● recording locally · nothing leaves this Mac" : "⏸ recording paused · nothing leaves this Mac"}
         </div>
       </div>
     </div>

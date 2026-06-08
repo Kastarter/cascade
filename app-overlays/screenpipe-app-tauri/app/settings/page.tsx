@@ -156,8 +156,9 @@ export default function SettingsPage() {
             {CASCADE_PRIVACY_PROMISE}
           </p>
           <p style={{ fontSize: 12.5, color: "var(--cascade-text-3)", lineHeight: 1.5, marginTop: 10 }}>
-            The Privacy Aggregator sanitizes activity to an allowlist before any agent reads it; sensitive apps
-            (banking, health, legal, dating, private browsing) are excluded entirely.
+            Agent suggestions use filtered Rewind context: sensitive apps (banking, health, legal,
+            dating, private browsing) are excluded, typed text is skipped, and manager dashboards use
+            allowlisted privacy aggregates.
           </p>
         </Section>
 

@@ -679,6 +679,7 @@ function Transport({
         <IconBtn onClick={() => onScrub(Math.max(dayStart, time - 1))} label="−1m">‹</IconBtn>
         <button
           onClick={onPlay}
+          aria-label={playing ? "Pause Rewind" : "Play Rewind"}
           style={{
             width: 36,
             height: 32,
@@ -692,7 +693,7 @@ function Transport({
             cursor: "pointer",
             padding: 0,
             boxShadow: playing ? "0 0 16px var(--cascade-accent)" : "none",
-            transition: "all 0.15s",
+            transition: "background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s",
             fontSize: 14,
             fontWeight: 600,
           }}

@@ -119,6 +119,7 @@ export function CascadeTitlebar() {
           <button
             onClick={() => setVaultOpen(true)}
             title="Vault — storage & privacy"
+            aria-label="Open Vault"
             style={iconBtn}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
@@ -163,7 +164,7 @@ function switcherBtn(active: boolean): React.CSSProperties {
     fontSize: 12,
     fontWeight: 500,
     letterSpacing: 0.1,
-    transition: "all 0.15s",
+    transition: "background 0.15s, color 0.15s, box-shadow 0.15s",
     boxShadow: active ? "0 1px 2px rgba(0,0,0,0.3)" : "none",
     opacity: 1,
   };

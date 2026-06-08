@@ -15,7 +15,7 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
  #[serde(rename_all = "camelCase")]
  pub enum OSPermission {
      ScreenRecording,
-@@ -17,6 +15,103 @@
+@@ -17,6 +15,147 @@
      Accessibility,
      Automation,
      InputMonitoring,
@@ -27,6 +27,7 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
 +    use once_cell::sync::Lazy;
 +    use std::{
 +        collections::HashMap,
++        path::PathBuf,
 +        process::Command,
 +        sync::{
 +            atomic::{AtomicBool, Ordering},
@@ -90,7 +91,43 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
 +        }
 +    }
 +
-+    pub fn open_settings(permission: &OSPermission) {
++    fn current_app_bundle() -> Option<PathBuf> {
++        let mut path = std::env::current_exe().ok()?;
++        loop {
++            if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
++                return Some(path);
++            }
++            if !path.pop() {
++                return None;
++            }
++        }
++    }
++
++    pub fn reveal_current_app_in_finder() {
++        let Some(bundle_path) = current_app_bundle() else {
++            warn!("Could not locate current .app bundle to reveal in Finder");
++            return;
++        };
++
++        if let Err(error) = Command::new("open").arg("-R").arg(&bundle_path).spawn() {
++            warn!(
++                "Failed to reveal current app bundle in Finder ({}): {}",
++                bundle_path.display(),
++                error
++            );
++        }
++    }
++
++    fn should_reveal_app(permission: &OSPermission) -> bool {
++        matches!(
++            permission,
++            OSPermission::ScreenRecording
++                | OSPermission::Accessibility
++                | OSPermission::InputMonitoring
++        )
++    }
++
++    pub fn open_settings(permission: &OSPermission) -> bool {
 +        let key = permission_key(permission);
 +        {
 +            let mut last_opened = match SETTINGS_LAST_OPENED.lock() {
@@ -103,7 +140,7 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
 +                        "Skipping duplicate macOS privacy settings open for {}",
 +                        key
 +                    );
-+                    return;
++                    return false;
 +                }
 +            }
 +            last_opened.insert(key, Instant::now());
@@ -114,7 +151,14 @@ Index: screenpipe/apps/screenpipe-app-tauri/src-tauri/src/permissions.rs
 +                "Failed to open macOS privacy settings for {}: {}",
 +                key, error
 +            );
++            return false;
 +        }
++
++        if should_reveal_app(permission) {
++            reveal_current_app_in_finder();
++        }
++
++        true
 +    }
  }
  

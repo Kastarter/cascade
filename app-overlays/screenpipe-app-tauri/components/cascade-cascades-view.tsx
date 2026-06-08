@@ -422,7 +422,7 @@ export function CascadesView() {
             {runtimeBlockedMessage && <InfoBanner message={runtimeBlockedMessage} onClose={() => setNote(null)} />}
 
             <StageSection
-              title="3 · Running on this Mac"
+              title="Running on this Mac"
               sub={
                 runMode === "screen"
                   ? "Active helpers doing real work. Screen mode can operate any app, but only starts when Screen Recording, Accessibility, Input Monitoring, and UI recorder health are all healthy. STOP stays visible in the control dock."

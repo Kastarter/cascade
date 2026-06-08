@@ -4,10 +4,11 @@
 //! Cascade Layer 2 agents.
 //!
 //! Five agents, in the order trust must be earned (see `docs/agents.md`):
-//!   #5 Privacy Aggregator  — on-device, deterministic. Turns the raw day into
-//!                            an allowlist-only metric set. The ONLY thing the
-//!                            LLM agents below are allowed to read.
-//!   #2 Waste Detector      — Opus over the aggregator output (never raw OCR).
+//!   #5 Privacy Aggregator  — on-device, deterministic. Turns raw activity into
+//!                            allowlisted metrics for dashboards and guardrails.
+//!   #2 Waste Detector      — Opus over filtered Rewind context: sensitive apps
+//!                            excluded, typed text skipped, and only bounded
+//!                            OCR/window/click/app-switch summaries included.
 //!   #3 Agent Generator     — Opus turns an approved pattern into a typed,
 //!                            reviewable agent spec (not executable yet).
 //!   #4 Deployment Monitor  — Sonnet sandbox dry-run + lifecycle + anomaly
@@ -1832,14 +1833,14 @@ pub async fn cascade_generate_manager_suggestions(
     // Read the Rewind: what the employee ACTUALLY did on screen (window titles +
     // OCR), sensitive apps dropped. This is the detector's real input now.
     let (mut digest, frames, excluded) = fetch_rewind_digest(&app, hours, 400).await?;
-    // Add the employee's ACTUAL recorded steps (clicks/typing/app switches) so the
+    // Add the employee's ACTUAL recorded steps (clicks/app switches) so the
     // detector grounds its proposal in the real workflow and the generated spec
     // carries that step sequence for the agent to later follow. General: whatever
-    // `ui_events` recorded, no per-app handling.
+    // non-sensitive `ui_events` recorded, with typed text intentionally skipped.
     if let Ok(steps) = fetch_rewind_steps(&app, hours, 400, false).await {
         if !steps.trim().is_empty() {
             digest.push_str(&format!(
-                "\n\nRECORDED STEPS THE EMPLOYEE TOOK (clicks/typing/app switches, in order):\n{steps}"
+                "\n\nRECORDED STEPS THE EMPLOYEE TOOK (clicks/app switches, in order; typed text omitted):\n{steps}"
             ));
         }
     }

@@ -56,7 +56,7 @@ Index: screenpipe/apps/screenpipe-app-tauri/scripts/cascade_codesign_macos_app.s
 +MAIN_PATH="$APP_PATH/Contents/MacOS/$MAIN_EXECUTABLE"
 +
 +echo "==> signing Cascade.app with: $IDENTITY"
-+xattr -cr "$APP_PATH"
++find "$APP_PATH" -exec xattr -c {} + 2>/dev/null || true
 +
 +while IFS= read -r -d '' helper; do
 +  [[ "$helper" == "$MAIN_PATH" ]] && continue
