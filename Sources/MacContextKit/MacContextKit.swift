@@ -185,11 +185,13 @@ public final class ContextRecorder: ObservableObject {
     private let store: CascadeStore
     private let observer: AppWindowObserver
     private var rewind: RewindRecorder?
+    private let input: InputRecorder
     private var retentionTask: Task<Void, Never>?
 
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver()) {
         self.store = store
         self.observer = observer
+        self.input = InputRecorder(store: store)
         let permissions = PermissionProbe.currentStatus()
         status = ContextRecorderStatus(
             running: false,
@@ -239,6 +241,10 @@ public final class ContextRecorder: ObservableObject {
                 self.status.running = false
             }
         }
+        // Best-effort: records real clicks/keys for workflow learning. Self-gates
+        // (fail-closed) on Input Monitoring + Accessibility, independent of screen
+        // recording.
+        input.start()
         startRetention()
     }
 
@@ -251,6 +257,7 @@ public final class ContextRecorder: ObservableObject {
     private func stopEngine() {
         retentionTask?.cancel()
         retentionTask = nil
+        input.stop()
         guard let recorder = rewind else { return }
         rewind = nil
         Task { @MainActor in await recorder.stop() }

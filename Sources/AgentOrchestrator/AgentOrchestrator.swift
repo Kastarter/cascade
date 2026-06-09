@@ -34,6 +34,34 @@ public extension AgentAction {
         case .done, .unsupported: return nil
         }
     }
+
+    /// Maps one step of a recorded agent recipe to an executable action.
+    /// `activateApp` returns nil — the run loop handles app activation itself.
+    init?(recipeStep step: RecipeStep) {
+        switch step.kind {
+        case .activateApp:
+            return nil
+        case .click:
+            guard let x = step.x, let y = step.y else { return nil }
+            self = .computerUse(.click(x: x, y: y))
+        case .doubleClick:
+            guard let x = step.x, let y = step.y else { return nil }
+            self = .computerUse(.doubleClick(x: x, y: y))
+        case .rightClick:
+            guard let x = step.x, let y = step.y else { return nil }
+            self = .computerUse(.rightClick(x: x, y: y))
+        case .type:
+            guard let text = step.text else { return nil }
+            self = .computerUse(.typeText(text))
+        case .key:
+            guard let key = step.key else { return nil }
+            self = .computerUse(.key(key, modifiers: step.modifiers))
+        case .scroll:
+            let deltaY = Double(step.modifiers.first ?? "0") ?? 0
+            let deltaX = Double(step.modifiers.dropFirst().first ?? "0") ?? 0
+            self = .computerUse(.scroll(deltaX: deltaX, deltaY: deltaY))
+        }
+    }
 }
 
 public struct AgentVerification: Sendable, Equatable {
@@ -109,6 +137,7 @@ public actor CascadeOrchestrator {
     private let claudeAnswerer: ContextQuestionAnswering
     private let planner: SingleStepPlanner
     private let suggestionEngine: SuggestionEngine
+    private let wasteDetector = WasteDetector()
     private let keyStore: AnthropicKeyStore
 
     public init(
@@ -147,5 +176,31 @@ public actor CascadeOrchestrator {
 
     public func suggestions() async throws -> [AgentSuggestion] {
         suggestionEngine.suggest(from: try await store.recentContexts(limit: 120))
+    }
+
+    /// What Cascade detected the user repeating, from recorded input anchored to
+    /// the Rewind. Each is a candidate to turn into an agent built from real actions.
+    public func detectedWaste(maxResults: Int = 5) async throws -> [DetectedWaste] {
+        let contexts = try await store.recentContexts(limit: 400)
+        let events = try await store.recentInputEvents(limit: 3000)
+        return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults)
+    }
+
+    /// Persists (or refreshes) an agent built from a detected workflow.
+    @discardableResult
+    public func createAgent(from waste: DetectedWaste) async throws -> CascadeAgent {
+        try await store.upsertAgent(CascadeAgent(
+            name: waste.title,
+            source: .detected,
+            signature: waste.signature,
+            recipe: waste.recipe,
+            apps: waste.apps,
+            estimatedSeconds: waste.estimatedTotalSeconds,
+            evidenceCount: waste.occurrences
+        ))
+    }
+
+    public func agents() async throws -> [CascadeAgent] {
+        try await store.agents()
     }
 }

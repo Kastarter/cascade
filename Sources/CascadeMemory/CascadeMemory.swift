@@ -64,6 +64,167 @@ public struct AuditEvent: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - Input events (the user's actual clicks/keys, recorded for workflow learning)
+
+public enum InputEventKind: String, Codable, Sendable {
+    case click
+    case doubleClick
+    case rightClick
+    case type
+    case key
+    case scroll
+}
+
+/// One recorded user action. Local-only; written only when the privacy gate
+/// passes (see `InputRecorder`). Coordinates are global screen points.
+public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
+    public let id: Int64
+    public let capturedAt: Date
+    public let kind: InputEventKind
+    public let x: Double?
+    public let y: Double?
+    public let text: String?
+    public let key: String?
+    public let modifiers: [String]
+    public let appName: String
+    public let bundleIdentifier: String?
+    public let windowTitle: String?
+
+    public init(
+        id: Int64 = 0,
+        capturedAt: Date = Date(),
+        kind: InputEventKind,
+        x: Double? = nil,
+        y: Double? = nil,
+        text: String? = nil,
+        key: String? = nil,
+        modifiers: [String] = [],
+        appName: String,
+        bundleIdentifier: String? = nil,
+        windowTitle: String? = nil
+    ) {
+        self.id = id
+        self.capturedAt = capturedAt
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.text = text
+        self.key = key
+        self.modifiers = modifiers
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.windowTitle = windowTitle
+    }
+}
+
+// MARK: - Agents (a Cascade built from a recorded, repeated workflow)
+
+public enum RecipeStepKind: String, Codable, Sendable {
+    case activateApp
+    case click
+    case doubleClick
+    case rightClick
+    case type
+    case key
+    case scroll
+}
+
+/// One step of an agent recipe, derived from the user's recorded actions. The
+/// `ocrAnchor` is text seen near a click so the deploy loop can re-locate the
+/// target instead of trusting a stale coordinate.
+public struct RecipeStep: Codable, Equatable, Sendable {
+    public let order: Int
+    public let kind: RecipeStepKind
+    public let x: Double?
+    public let y: Double?
+    public let text: String?
+    public let key: String?
+    public let modifiers: [String]
+    public let appName: String
+    public let bundleIdentifier: String?
+    public let windowTitleHint: String?
+    public let ocrAnchor: String?
+
+    public init(
+        order: Int,
+        kind: RecipeStepKind,
+        x: Double? = nil,
+        y: Double? = nil,
+        text: String? = nil,
+        key: String? = nil,
+        modifiers: [String] = [],
+        appName: String,
+        bundleIdentifier: String? = nil,
+        windowTitleHint: String? = nil,
+        ocrAnchor: String? = nil
+    ) {
+        self.order = order
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.text = text
+        self.key = key
+        self.modifiers = modifiers
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.windowTitleHint = windowTitleHint
+        self.ocrAnchor = ocrAnchor
+    }
+}
+
+public struct AgentRecipe: Codable, Equatable, Sendable {
+    public var steps: [RecipeStep]
+    public init(steps: [RecipeStep]) { self.steps = steps }
+}
+
+public enum AgentSource: String, Codable, Sendable {
+    case detected
+    case manager
+    case manual
+}
+
+/// A saved Cascade: a named, re-runnable agent built from a recorded workflow.
+public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
+    public let id: Int64
+    public let name: String
+    public let source: AgentSource
+    /// Stable key (e.g. the app sequence) used to dedupe re-detected workflows.
+    public let signature: String
+    public let recipe: AgentRecipe
+    public let apps: [String]
+    public let estimatedSeconds: Int
+    public let evidenceCount: Int
+    public let createdAt: Date
+    public let lastRunAt: Date?
+    public let enabled: Bool
+
+    public init(
+        id: Int64 = 0,
+        name: String,
+        source: AgentSource,
+        signature: String,
+        recipe: AgentRecipe,
+        apps: [String] = [],
+        estimatedSeconds: Int = 0,
+        evidenceCount: Int = 0,
+        createdAt: Date = Date(),
+        lastRunAt: Date? = nil,
+        enabled: Bool = true
+    ) {
+        self.id = id
+        self.name = name
+        self.source = source
+        self.signature = signature
+        self.recipe = recipe
+        self.apps = apps
+        self.estimatedSeconds = estimatedSeconds
+        self.evidenceCount = evidenceCount
+        self.createdAt = createdAt
+        self.lastRunAt = lastRunAt
+        self.enabled = enabled
+    }
+}
+
 public enum CascadeStoreError: Error, LocalizedError {
     case openFailed(String)
     case sqlite(String)
@@ -242,7 +403,158 @@ public actor CascadeStore {
             }
             if let path = row.path { removed.append(path) }
         }
+
+        // Recorded input ages out on the same age budget (no backing files).
+        try withStatement("DELETE FROM input_event WHERE captured_at < ?;") { statement in
+            bind(cutoff, at: 1, in: statement)
+            try stepDone(statement)
+        }
         return removed
+    }
+
+    // MARK: - Input events
+
+    /// Batch-inserts recorded input events in one transaction.
+    public func insertInputEvents(_ events: [InputEvent]) throws {
+        guard !events.isEmpty else { return }
+        try execute("BEGIN TRANSACTION;")
+        do {
+            let sql = """
+            INSERT INTO input_event
+                (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+            for event in events {
+                try withStatement(sql) { statement in
+                    bind(DateCodec.string(from: event.capturedAt), at: 1, in: statement)
+                    bind(event.kind.rawValue, at: 2, in: statement)
+                    bind(event.x, at: 3, in: statement)
+                    bind(event.y, at: 4, in: statement)
+                    bind(event.text, at: 5, in: statement)
+                    bind(event.key, at: 6, in: statement)
+                    bind(event.modifiers.isEmpty ? nil : event.modifiers.joined(separator: ","), at: 7, in: statement)
+                    bind(event.appName, at: 8, in: statement)
+                    bind(event.bundleIdentifier, at: 9, in: statement)
+                    bind(event.windowTitle, at: 10, in: statement)
+                    try stepDone(statement)
+                }
+            }
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Most recent input events (newest first).
+    public func recentInputEvents(limit: Int = 1000) throws -> [InputEvent] {
+        let sql = """
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title
+        FROM input_event
+        ORDER BY captured_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(limit))
+            var rows: [InputEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeInputEvent(statement))
+            }
+            return rows
+        }
+    }
+
+    // MARK: - Agents
+
+    /// Inserts a new agent, or updates the existing one with the same `signature`
+    /// (so re-detecting a workflow refreshes it rather than duplicating). Returns
+    /// the stored agent with its id.
+    @discardableResult
+    public func upsertAgent(_ agent: CascadeAgent) throws -> CascadeAgent {
+        let recipeJSON = Self.encodeRecipe(agent.recipe)
+        let appsCSV = agent.apps.joined(separator: "\u{1F}") // unit separator — app names may contain commas
+
+        let existingID = try withStatement("SELECT id FROM agents WHERE signature = ? LIMIT 1;") { statement in
+            bind(agent.signature, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : nil
+        }
+
+        if let existingID {
+            try withStatement("""
+            UPDATE agents SET name = ?, source = ?, recipe_json = ?, apps = ?, estimated_seconds = ?, evidence_count = ?
+            WHERE id = ?;
+            """) { statement in
+                bind(agent.name, at: 1, in: statement)
+                bind(agent.source.rawValue, at: 2, in: statement)
+                bind(recipeJSON, at: 3, in: statement)
+                bind(appsCSV, at: 4, in: statement)
+                sqlite3_bind_int64(statement, 5, Int64(agent.estimatedSeconds))
+                sqlite3_bind_int64(statement, 6, Int64(agent.evidenceCount))
+                sqlite3_bind_int64(statement, 7, existingID)
+                try stepDone(statement)
+            }
+            return try self.agent(id: existingID) ?? agent
+        }
+
+        try withStatement("""
+        INSERT INTO agents
+            (name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """) { statement in
+            bind(agent.name, at: 1, in: statement)
+            bind(agent.source.rawValue, at: 2, in: statement)
+            bind(agent.signature, at: 3, in: statement)
+            bind(recipeJSON, at: 4, in: statement)
+            bind(appsCSV, at: 5, in: statement)
+            sqlite3_bind_int64(statement, 6, Int64(agent.estimatedSeconds))
+            sqlite3_bind_int64(statement, 7, Int64(agent.evidenceCount))
+            bind(DateCodec.string(from: agent.createdAt), at: 8, in: statement)
+            bind(agent.lastRunAt.map(DateCodec.string(from:)), at: 9, in: statement)
+            sqlite3_bind_int(statement, 10, agent.enabled ? 1 : 0)
+            try stepDone(statement)
+        }
+        let newID = sqlite3_last_insert_rowid(connection.db)
+        return try self.agent(id: newID) ?? agent
+    }
+
+    public func agents() throws -> [CascadeAgent] {
+        try withStatement("\(Self.agentColumns) FROM agents ORDER BY created_at DESC, id DESC;") { statement in
+            var rows: [CascadeAgent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeAgent(statement))
+            }
+            return rows
+        }
+    }
+
+    public func agent(id: Int64) throws -> CascadeAgent? {
+        try withStatement("\(Self.agentColumns) FROM agents WHERE id = ? LIMIT 1;") { statement in
+            sqlite3_bind_int64(statement, 1, id)
+            return sqlite3_step(statement) == SQLITE_ROW ? decodeAgent(statement) : nil
+        }
+    }
+
+    public func markAgentRun(id: Int64, at date: Date = Date()) throws {
+        try withStatement("UPDATE agents SET last_run_at = ? WHERE id = ?;") { statement in
+            bind(DateCodec.string(from: date), at: 1, in: statement)
+            sqlite3_bind_int64(statement, 2, id)
+            try stepDone(statement)
+        }
+    }
+
+    public func setAgentEnabled(id: Int64, enabled: Bool) throws {
+        try withStatement("UPDATE agents SET enabled = ? WHERE id = ?;") { statement in
+            sqlite3_bind_int(statement, 1, enabled ? 1 : 0)
+            sqlite3_bind_int64(statement, 2, id)
+            try stepDone(statement)
+        }
+    }
+
+    public func deleteAgent(id: Int64) throws {
+        try withStatement("DELETE FROM agents WHERE id = ?;") { statement in
+            sqlite3_bind_int64(statement, 1, id)
+            try stepDone(statement)
+        }
     }
 
     public func appendAudit(_ event: AuditEvent) throws -> AuditEvent {
@@ -344,6 +656,40 @@ public actor CascadeStore {
         END;
         """, db: db)
 
+        // Recorded user input (clicks/keys) and saved agents built from repeated
+        // workflows. Input is local-only and privacy-gated at the recorder.
+        try execute("""
+        CREATE TABLE IF NOT EXISTS input_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            x REAL,
+            y REAL,
+            text TEXT,
+            key TEXT,
+            modifiers TEXT,
+            app_name TEXT NOT NULL,
+            bundle_identifier TEXT,
+            window_title TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_input_event_captured_at
+            ON input_event(captured_at DESC);
+
+        CREATE TABLE IF NOT EXISTS agents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            signature TEXT NOT NULL UNIQUE,
+            recipe_json TEXT NOT NULL,
+            apps TEXT,
+            estimated_seconds INTEGER NOT NULL DEFAULT 0,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_run_at TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
+        """, db: db)
+
         // Backfill the index for rows inserted before FTS existed (triggers only
         // fire on new writes). Counts match in steady state, so this rebuild runs
         // at most once after upgrading.
@@ -419,6 +765,72 @@ public actor CascadeStore {
     private func int64(_ statement: OpaquePointer, _ index: Int32) -> Int64? {
         guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
         return sqlite3_column_int64(statement, index)
+    }
+
+    private func bind(_ value: Double?, at index: Int32, in statement: OpaquePointer) {
+        guard let value else {
+            sqlite3_bind_null(statement, index)
+            return
+        }
+        sqlite3_bind_double(statement, index, value)
+    }
+
+    private func double(_ statement: OpaquePointer, _ index: Int32) -> Double? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return sqlite3_column_double(statement, index)
+    }
+
+    private func decodeInputEvent(_ statement: OpaquePointer) -> InputEvent {
+        InputEvent(
+            id: sqlite3_column_int64(statement, 0),
+            capturedAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
+            kind: InputEventKind(rawValue: text(statement, 2) ?? "") ?? .click,
+            x: double(statement, 3),
+            y: double(statement, 4),
+            text: text(statement, 5),
+            key: text(statement, 6),
+            modifiers: text(statement, 7).map { $0.split(separator: ",").map(String.init) } ?? [],
+            appName: text(statement, 8) ?? "Unknown",
+            bundleIdentifier: text(statement, 9),
+            windowTitle: text(statement, 10)
+        )
+    }
+
+    private static let agentColumns =
+        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled"
+
+    private func decodeAgent(_ statement: OpaquePointer) -> CascadeAgent {
+        let appsRaw = text(statement, 5) ?? ""
+        let apps = appsRaw.isEmpty ? [] : appsRaw.components(separatedBy: "\u{1F}")
+        return CascadeAgent(
+            id: sqlite3_column_int64(statement, 0),
+            name: text(statement, 1) ?? "Agent",
+            source: AgentSource(rawValue: text(statement, 2) ?? "") ?? .detected,
+            signature: text(statement, 3) ?? "",
+            recipe: Self.decodeRecipe(text(statement, 4)),
+            apps: apps,
+            estimatedSeconds: Int(sqlite3_column_int64(statement, 6)),
+            evidenceCount: Int(sqlite3_column_int64(statement, 7)),
+            createdAt: DateCodec.date(from: text(statement, 8)) ?? Date(),
+            lastRunAt: DateCodec.date(from: text(statement, 9)),
+            enabled: sqlite3_column_int(statement, 10) != 0
+        )
+    }
+
+    private static func encodeRecipe(_ recipe: AgentRecipe) -> String {
+        guard let data = try? JSONEncoder().encode(recipe),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{\"steps\":[]}"
+        }
+        return json
+    }
+
+    private static func decodeRecipe(_ json: String?) -> AgentRecipe {
+        guard let json, let data = json.data(using: .utf8),
+              let recipe = try? JSONDecoder().decode(AgentRecipe.self, from: data) else {
+            return AgentRecipe(steps: [])
+        }
+        return recipe
     }
 
     /// Decodes a `recorded_context` row in the `contextColumns(...)` order.

@@ -858,23 +858,16 @@ private struct CascadesScreen: View {
         model.audit.filter { $0.action.hasPrefix("step.") || $0.action.hasPrefix("agent.") || $0.action == "computer.act" || $0.action == "cascade.declined" }
     }
 
-    private var employeeChips: [String] {
-        var result = model.visibleSuggestions.prefix(2).map(\.title)
-        if let app = model.contexts.first?.appName { result.append("Summarize my work in \(app)") }
-        if result.isEmpty { result = ["Summarize what I did today"] }
-        return Array(result)
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
-                ComposeBox(
-                    eyebrow: "Compose · Talk to Cascade",
-                    placeholder: "Tell Cascade what to automate. Plain English.",
-                    hint: "return to run — watch the cursor work",
-                    chips: employeeChips,
-                    submit: { model.runAgent(goal: $0) }
-                )
+                VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                    CascadeTag("Agents", tone: .cascadeAgent)
+                    Text("Approved by your manager").font(.cascadeSerif(30))
+                    Text("Cascade detects the tasks you repeat and sends them to your manager. The ones they approve land here — built from your real actions, ready to deploy.")
+                        .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
+                }
+                agentsSection
                 cascadeSection(
                     title: "CASCADES FROM YOUR MANAGER",
                     trailing: "\(model.visibleManagerCascades.count) pending",
@@ -882,16 +875,27 @@ private struct CascadesScreen: View {
                     fromManager: true,
                     empty: "When your manager cascades an agent from the Manager dashboard, it lands here to review and deploy."
                 )
-                cascadeSection(
-                    title: "DETECTED FROM YOUR CONTEXT",
-                    trailing: "\(model.visibleSuggestions.count) evidence-backed",
-                    suggestions: model.visibleSuggestions,
-                    fromManager: false,
-                    empty: "Cascade surfaces a helper once it sees enough repeated local context. Keep recording."
-                )
                 activitySection
             }
             .padding(CascadeMetrics.s8)
+        }
+    }
+
+    private var agentsSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "YOUR AGENTS", trailing: "\(model.agents.count) approved")
+            if model.agents.isEmpty {
+                CascadePanel { EmptyState(title: "No agents yet", detail: "When your manager approves a workflow Cascade detected, the agent shows up here, ready to deploy.") }
+            } else {
+                ForEach(model.agents) { agent in
+                    AgentCard(
+                        agent: agent,
+                        onDeploy: { model.deployAgent(agent) },
+                        onToggle: { model.setAgentEnabled(agent, enabled: $0) },
+                        onDelete: { model.deleteAgent(agent) }
+                    )
+                }
+            }
         }
     }
 
@@ -927,6 +931,109 @@ private struct CascadesScreen: View {
     }
 }
 
+/// One-line summary of a recipe's steps, for the cards.
+private func recipeSummary(_ recipe: AgentRecipe) -> String {
+    let parts = recipe.steps.sorted { $0.order < $1.order }.prefix(10).map { step -> String in
+        switch step.kind {
+        case .activateApp: return step.appName
+        case .click: return "click"
+        case .doubleClick: return "2×click"
+        case .rightClick: return "right-click"
+        case .type: return "type"
+        case .key: return (step.modifiers + [step.key ?? ""]).joined(separator: "+")
+        case .scroll: return "scroll"
+        }
+    }
+    return parts.joined(separator: " · ")
+}
+
+private struct AppChips: View {
+    let apps: [String]
+    var body: some View {
+        HStack(spacing: CascadeMetrics.s2) {
+            ForEach(apps, id: \.self) { app in
+                HStack(spacing: 4) {
+                    Circle().fill(AppVisuals.color(for: app)).frame(width: 7, height: 7)
+                    Text(app).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2)
+                }
+            }
+        }
+    }
+}
+
+/// Manager-facing review card for a detected workflow. Shows the privacy-safe
+/// summary (task, apps, frequency, time saved, step *shape*) — never the raw typed
+/// text or coordinates — with approve/decline.
+private struct WasteCard: View {
+    let waste: DetectedWaste
+    let onApprove: () -> Void
+    let onDecline: () -> Void
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    Text(waste.title).font(.cascadeSans(15, .semibold))
+                    Spacer()
+                    Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m saved")
+                        .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                }
+                AppChips(apps: waste.apps)
+                Text(recipeSummary(waste.recipe))
+                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2).lineLimit(2)
+                HStack(spacing: CascadeMetrics.s2) {
+                    Spacer()
+                    Button(action: onDecline) { Text("Decline") }
+                        .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                    Button(action: onApprove) { Text("Approve & send") }
+                        .buttonStyle(CascadeAccentButtonStyle())
+                }
+            }
+        }
+    }
+}
+
+private struct AgentCard: View {
+    let agent: CascadeAgent
+    let onDeploy: () -> Void
+    let onToggle: (Bool) -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack {
+                    Circle().fill(AppVisuals.color(for: agent.apps.first ?? agent.name)).frame(width: 8, height: 8)
+                    Text(agent.name).font(.cascadeSans(15, .semibold))
+                    Spacer()
+                    Toggle("", isOn: Binding(get: { agent.enabled }, set: onToggle))
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                if !agent.apps.isEmpty { AppChips(apps: agent.apps) }
+                Text(recipeSummary(agent.recipe))
+                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2).lineLimit(2)
+                HStack {
+                    Text(meta).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                    Spacer()
+                    Button("Delete", action: onDelete)
+                        .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                    Button("Deploy", action: onDeploy)
+                        .buttonStyle(CascadeAccentButtonStyle())
+                        .disabled(!agent.enabled)
+                }
+            }
+        }
+    }
+
+    private var meta: String {
+        var summary = "\(agent.recipe.steps.count) steps"
+        if let last = agent.lastRunAt {
+            summary += " · last run \(last.formatted(date: .omitted, time: .shortened))"
+        }
+        return summary
+    }
+}
+
 // MARK: - Manager screen (aggregate-only dashboard; cascades agents to the employee)
 
 private struct ManagerScreen: View {
@@ -947,15 +1054,29 @@ private struct ManagerScreen: View {
                 VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
                     CascadeTag("Manager", tone: .cascadeAgent)
                     Text("Suggestions from privacy-safe signals").font(.cascadeSerif(30))
-                    Text("Aggregate-only. The manager never sees raw OCR or screenshots — only allowlisted counts.")
+                    Text("Aggregate-only. You review the tasks Cascade detects the employee repeating — task, apps, frequency, time saved — and approve the agents worth running. Never raw OCR, screenshots, or keystrokes.")
                         .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                 }
                 HStack(spacing: CascadeMetrics.s3) {
                     MetricCard(value: "\(model.contexts.count)", label: "Local samples")
                     MetricCard(value: "\(appsObserved)", label: "Apps observed")
-                    MetricCard(value: "\(model.visibleSuggestions.count)", label: "Patterns")
-                    MetricCard(value: "\(model.managerCascades.count)", label: "Cascades sent")
+                    MetricCard(value: "\(model.pendingDetectedWaste.count)", label: "To review")
+                    MetricCard(value: "\(model.agents.count)", label: "Approved")
                     MetricCard(value: "0", label: "Raw screenshots")
+                }
+                VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                    SectionLabel(title: "DETECTED WORKFLOWS — REVIEW & APPROVE", trailing: "\(model.pendingDetectedWaste.count) pending")
+                    if model.pendingDetectedWaste.isEmpty {
+                        CascadePanel { EmptyState(title: "Nothing to review", detail: "When the employee repeats a task, Cascade surfaces it here — task, apps, frequency, time saved — for you to approve or decline. Approved agents are sent to their Cascades tab.") }
+                    } else {
+                        ForEach(model.pendingDetectedWaste) { waste in
+                            WasteCard(
+                                waste: waste,
+                                onApprove: { model.approveWaste(waste) },
+                                onDecline: { model.declineWaste(waste) }
+                            )
+                        }
+                    }
                 }
                 ComposeBox(
                     eyebrow: "Cascade an agent to this employee",

@@ -57,6 +57,25 @@ public final class GuidanceOverlayController {
         }
     }
 
+    /// Flies the companion to a global point for an *action* and keeps it parked
+    /// there (no auto-return) so it can press. Call `hide()` when the task ends to
+    /// resume following the user's cursor.
+    public func navigate(toGlobalPoint point: CGPoint) {
+        startFollowing()
+        returnTask?.cancel()
+        returnTask = nil
+        state.label = ""
+        state.pointing = true
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.68)) {
+            state.cursorPoint = toLocalTopLeft(point)
+        }
+    }
+
+    /// Plays a quick press/tap animation at the companion's current position.
+    public func press() {
+        state.pressTrigger &+= 1
+    }
+
     /// Returns the companion to following the cursor (clears any pointing/label) but
     /// keeps it visible. Used when a question matched no element.
     public func hide() {
@@ -114,6 +133,8 @@ final class GuidanceState: ObservableObject {
     @Published var label: String = ""
     @Published var pointing = false
     @Published var visible = false
+    /// Bumped on every press so the overlay can fire a one-shot tap ripple.
+    @Published var pressTrigger = 0
 }
 
 final class GuidanceOverlayWindow: NSWindow {
@@ -136,12 +157,15 @@ final class GuidanceOverlayWindow: NSWindow {
 
 struct GuidanceOverlayView: View {
     @ObservedObject var state: GuidanceState
+    private let blue = Color(red: 0.20, green: 0.55, blue: 1.0)
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             Color.clear
             if state.visible {
-                GuideCursor(label: state.pointing ? state.label : "")
+                PressRipple(trigger: state.pressTrigger, color: blue)
+                    .offset(x: state.cursorPoint.x - 17, y: state.cursorPoint.y - 17)
+                GuideCursor(label: state.pointing ? state.label : "", pressTrigger: state.pressTrigger)
                     .offset(x: state.cursorPoint.x, y: state.cursorPoint.y)
             }
         }
@@ -150,10 +174,36 @@ struct GuidanceOverlayView: View {
     }
 }
 
+/// One-shot expanding ring centred on the cursor tip — the visible "click".
+private struct PressRipple: View {
+    let trigger: Int
+    let color: Color
+    @State private var scale: CGFloat = 0.2
+    @State private var opacity: Double = 0
+
+    var body: some View {
+        Circle()
+            .stroke(color, lineWidth: 2.5)
+            .frame(width: 34, height: 34)
+            .scaleEffect(scale)
+            .opacity(opacity)
+            .onChange(of: trigger) { _, _ in
+                scale = 0.25
+                opacity = 0.85
+                withAnimation(.easeOut(duration: 0.42)) {
+                    scale = 1.3
+                    opacity = 0
+                }
+            }
+    }
+}
+
 /// Blue arrow cursor sized to match the system cursor (tip at the top-left origin),
 /// with an optional label callout when pointing.
 struct GuideCursor: View {
     let label: String
+    var pressTrigger: Int = 0
+    @State private var pressed = false
     private let blue = Color(red: 0.20, green: 0.55, blue: 1.0)
 
     var body: some View {
@@ -162,8 +212,13 @@ struct GuideCursor: View {
                 .fill(blue)
                 .overlay(ArrowShape().stroke(.white, lineWidth: 1.0))
                 .frame(width: 12, height: 16)
+                .scaleEffect(pressed ? 0.74 : 1.0, anchor: .topLeading)
                 .shadow(color: blue.opacity(0.6), radius: 5)
                 .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+                .onChange(of: pressTrigger) { _, _ in
+                    pressed = true
+                    withAnimation(.spring(response: 0.22, dampingFraction: 0.55)) { pressed = false }
+                }
 
             if !label.isEmpty {
                 Text(label)
