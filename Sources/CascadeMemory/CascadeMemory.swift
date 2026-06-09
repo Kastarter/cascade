@@ -17,7 +17,11 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
     public let bundleIdentifier: String?
     public let windowTitle: String?
     public let ocrText: String?
+    public let imagePath: String?
     public let metadataJSON: String?
+    /// Perceptual fingerprint of the captured frame, used to dedupe near-identical
+    /// moments across restarts. `nil` for rows without a frame (e.g. app-only ticks).
+    public let frameHash: Int64?
 
     public init(
         id: Int64 = 0,
@@ -27,7 +31,9 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
         bundleIdentifier: String? = nil,
         windowTitle: String? = nil,
         ocrText: String? = nil,
-        metadataJSON: String? = nil
+        imagePath: String? = nil,
+        metadataJSON: String? = nil,
+        frameHash: Int64? = nil
     ) {
         self.id = id
         self.capturedAt = capturedAt
@@ -36,7 +42,9 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
         self.bundleIdentifier = bundleIdentifier
         self.windowTitle = windowTitle
         self.ocrText = ocrText
+        self.imagePath = imagePath
         self.metadataJSON = metadataJSON
+        self.frameHash = frameHash
     }
 }
 
@@ -103,8 +111,8 @@ public actor CascadeStore {
     public func insert(_ context: RecordedContext) throws -> RecordedContext {
         let sql = """
         INSERT INTO recorded_context
-            (captured_at, source, app_name, bundle_identifier, window_title, ocr_text, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
+            (captured_at, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         try withStatement(sql) { statement in
             bind(DateCodec.string(from: context.capturedAt), at: 1, in: statement)
@@ -113,7 +121,9 @@ public actor CascadeStore {
             bind(context.bundleIdentifier, at: 4, in: statement)
             bind(context.windowTitle, at: 5, in: statement)
             bind(context.ocrText, at: 6, in: statement)
-            bind(context.metadataJSON, at: 7, in: statement)
+            bind(context.imagePath, at: 7, in: statement)
+            bind(context.metadataJSON, at: 8, in: statement)
+            bind(context.frameHash, at: 9, in: statement)
             try stepDone(statement)
         }
         return RecordedContext(
@@ -124,13 +134,24 @@ public actor CascadeStore {
             bundleIdentifier: context.bundleIdentifier,
             windowTitle: context.windowTitle,
             ocrText: context.ocrText,
-            metadataJSON: context.metadataJSON
+            imagePath: context.imagePath,
+            metadataJSON: context.metadataJSON,
+            frameHash: context.frameHash
         )
+    }
+
+    /// Column list shared by `recentContexts` / `searchContexts`, in the order
+    /// `decodeContext(_:)` expects. `prefix` qualifies each column with a table
+    /// alias so the FTS join (where `ocr_text`/`window_title`/`app_name` exist in
+    /// both tables) is unambiguous.
+    private static func contextColumns(prefix: String = "") -> String {
+        let p = prefix.isEmpty ? "" : "\(prefix)."
+        return "\(p)id, \(p)captured_at, \(p)source, \(p)app_name, \(p)bundle_identifier, \(p)window_title, \(p)ocr_text, \(p)image_path, \(p)metadata_json, \(p)frame_hash"
     }
 
     public func recentContexts(limit: Int = 40) throws -> [RecordedContext] {
         let sql = """
-        SELECT id, captured_at, source, app_name, bundle_identifier, window_title, ocr_text, metadata_json
+        SELECT \(Self.contextColumns())
         FROM recorded_context
         ORDER BY captured_at DESC, id DESC
         LIMIT ?;
@@ -139,19 +160,89 @@ public actor CascadeStore {
             sqlite3_bind_int(statement, 1, Int32(limit))
             var rows: [RecordedContext] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                rows.append(RecordedContext(
-                    id: sqlite3_column_int64(statement, 0),
-                    capturedAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
-                    source: ContextSource(rawValue: text(statement, 2) ?? "") ?? .system,
-                    appName: text(statement, 3) ?? "Unknown",
-                    bundleIdentifier: text(statement, 4),
-                    windowTitle: text(statement, 5),
-                    ocrText: text(statement, 6),
-                    metadataJSON: text(statement, 7)
-                ))
+                rows.append(decodeContext(statement))
             }
             return rows
         }
+    }
+
+    /// Full-text search over the OCR text, window title, and app name of stored
+    /// moments via the `rewind_fts` FTS5 index. Returns matches newest-first.
+    public func searchContexts(query: String, limit: Int = 80) throws -> [RecordedContext] {
+        let match = Self.ftsQuery(from: query)
+        guard !match.isEmpty else { return [] }
+        // MATCH must name the FTS table itself (an alias is read as a column), so
+        // `rewind_fts` is left unaliased; `recorded_context` is aliased `c` to
+        // disambiguate the text columns it shares with the index.
+        let sql = """
+        SELECT \(Self.contextColumns(prefix: "c"))
+        FROM rewind_fts
+        JOIN recorded_context c ON c.id = rewind_fts.rowid
+        WHERE rewind_fts MATCH ?
+        ORDER BY c.captured_at DESC, c.id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(match, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
+    /// Enforces local retention: drops moments older than `maxAge`, then trims the
+    /// oldest remaining moments whose frames push total frame-file size over
+    /// `maxTotalBytes`. Deleting the rows fires the FTS `_ad` trigger so the search
+    /// index stays in sync; returns the `image_path`s of pruned moments so the
+    /// caller can delete the backing JPEG files.
+    @discardableResult
+    public func prune(
+        maxAge: TimeInterval = 7 * 24 * 60 * 60,
+        maxTotalBytes: Int64 = 5 * 1024 * 1024 * 1024
+    ) throws -> [String] {
+        var removed: [String] = []
+
+        // Age-based prune.
+        let cutoff = DateCodec.string(from: Date().addingTimeInterval(-maxAge))
+        removed += try withStatement("SELECT image_path FROM recorded_context WHERE captured_at < ?;") { statement in
+            bind(cutoff, at: 1, in: statement)
+            var paths: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let path = text(statement, 0) { paths.append(path) }
+            }
+            return paths
+        }
+        try withStatement("DELETE FROM recorded_context WHERE captured_at < ?;") { statement in
+            bind(cutoff, at: 1, in: statement)
+            try stepDone(statement)
+        }
+
+        // Size-based prune: keep newest moments until the frame-file budget is hit,
+        // delete the older overflow.
+        let survivors = try withStatement("SELECT id, image_path FROM recorded_context ORDER BY captured_at DESC, id DESC;") { statement in
+            var rows: [(id: Int64, path: String?)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append((sqlite3_column_int64(statement, 0), text(statement, 1)))
+            }
+            return rows
+        }
+        var running: Int64 = 0
+        var overflow: [(id: Int64, path: String?)] = []
+        for row in survivors {
+            running += row.path.flatMap { Self.fileSize(at: $0) } ?? 0
+            if running > maxTotalBytes { overflow.append(row) }
+        }
+        for row in overflow {
+            try withStatement("DELETE FROM recorded_context WHERE id = ?;") { statement in
+                sqlite3_bind_int64(statement, 1, row.id)
+                try stepDone(statement)
+            }
+            if let path = row.path { removed.append(path) }
+        }
+        return removed
     }
 
     public func appendAudit(_ event: AuditEvent) throws -> AuditEvent {
@@ -206,6 +297,7 @@ public actor CascadeStore {
             bundle_identifier TEXT,
             window_title TEXT,
             ocr_text TEXT,
+            image_path TEXT,
             metadata_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_at
@@ -221,6 +313,52 @@ public actor CascadeStore {
         CREATE INDEX IF NOT EXISTS idx_audit_event_created_at
             ON audit_event(created_at DESC);
         """, db: db)
+
+        // Best-effort migrations for databases created before these columns existed.
+        try? execute("ALTER TABLE recorded_context ADD COLUMN image_path TEXT;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN frame_hash INTEGER;", db: db)
+
+        // Full-text search over recorded moments. External-content FTS5 indexes the
+        // text columns of `recorded_context` (no duplicated content); triggers keep
+        // it in sync — `_ad`/`_au` issue the special 'delete' command echoing the
+        // old row so deletes (including retention pruning) stay consistent.
+        try execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS rewind_fts USING fts5(
+            ocr_text, window_title, app_name,
+            content='recorded_context', content_rowid='id'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS recorded_context_ai AFTER INSERT ON recorded_context BEGIN
+            INSERT INTO rewind_fts(rowid, ocr_text, window_title, app_name)
+            VALUES (new.id, new.ocr_text, new.window_title, new.app_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS recorded_context_ad AFTER DELETE ON recorded_context BEGIN
+            INSERT INTO rewind_fts(rewind_fts, rowid, ocr_text, window_title, app_name)
+            VALUES ('delete', old.id, old.ocr_text, old.window_title, old.app_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS recorded_context_au AFTER UPDATE ON recorded_context BEGIN
+            INSERT INTO rewind_fts(rewind_fts, rowid, ocr_text, window_title, app_name)
+            VALUES ('delete', old.id, old.ocr_text, old.window_title, old.app_name);
+            INSERT INTO rewind_fts(rowid, ocr_text, window_title, app_name)
+            VALUES (new.id, new.ocr_text, new.window_title, new.app_name);
+        END;
+        """, db: db)
+
+        // Backfill the index for rows inserted before FTS existed (triggers only
+        // fire on new writes). Counts match in steady state, so this rebuild runs
+        // at most once after upgrading.
+        if scalarValue(db, "SELECT count(*) FROM recorded_context;") != scalarValue(db, "SELECT count(*) FROM rewind_fts;") {
+            try? execute("INSERT INTO rewind_fts(rewind_fts) VALUES('rebuild');", db: db)
+        }
+    }
+
+    /// Runs a single-column scalar query and returns the first integer result
+    /// (0 if the query yields no row). Used only during migration.
+    private static func scalarValue(_ db: OpaquePointer?, _ sql: String) -> Int64 {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : 0
     }
 
     private func execute(_ sql: String) throws {
@@ -265,9 +403,59 @@ public actor CascadeStore {
         sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
     }
 
+    private func bind(_ value: Int64?, at index: Int32, in statement: OpaquePointer) {
+        guard let value else {
+            sqlite3_bind_null(statement, index)
+            return
+        }
+        sqlite3_bind_int64(statement, index, value)
+    }
+
     private func text(_ statement: OpaquePointer, _ index: Int32) -> String? {
         guard let cString = sqlite3_column_text(statement, index) else { return nil }
         return String(cString: cString)
+    }
+
+    private func int64(_ statement: OpaquePointer, _ index: Int32) -> Int64? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return sqlite3_column_int64(statement, index)
+    }
+
+    /// Decodes a `recorded_context` row in the `contextColumns(...)` order.
+    private func decodeContext(_ statement: OpaquePointer) -> RecordedContext {
+        RecordedContext(
+            id: sqlite3_column_int64(statement, 0),
+            capturedAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
+            source: ContextSource(rawValue: text(statement, 2) ?? "") ?? .system,
+            appName: text(statement, 3) ?? "Unknown",
+            bundleIdentifier: text(statement, 4),
+            windowTitle: text(statement, 5),
+            ocrText: text(statement, 6),
+            imagePath: text(statement, 7),
+            metadataJSON: text(statement, 8),
+            frameHash: int64(statement, 9)
+        )
+    }
+
+    /// Turns free-form user input into a safe FTS5 MATCH expression: each
+    /// alphanumeric token is double-quoted (so punctuation can't trigger
+    /// `fts5: syntax error`) and AND-ed together with a trailing `*` for prefix
+    /// matching. Returns `""` when the query has no usable tokens.
+    private static func ftsQuery(from query: String) -> String {
+        let tokens = query
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return "" }
+        return tokens.map { "\"\($0)\"*" }.joined(separator: " ")
+    }
+
+    private static func fileSize(at path: String) -> Int64? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber else {
+            return nil
+        }
+        return size.int64Value
     }
 
     private static func ensureParentDirectory(for path: String) throws {

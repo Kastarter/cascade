@@ -184,7 +184,8 @@ public final class ContextRecorder: ObservableObject {
 
     private let store: CascadeStore
     private let observer: AppWindowObserver
-    private var timer: Timer?
+    private var rewind: RewindRecorder?
+    private var retentionTask: Task<Void, Never>?
 
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver()) {
         self.store = store
@@ -202,61 +203,126 @@ public final class ContextRecorder: ObservableObject {
         let permissions = PermissionProbe.currentStatus()
         status.permissions = permissions
         if !permissions.canRecordContext {
+            stopEngine()
             status.running = false
             status.message = "Screen Recording is required before context recording starts."
-            timer?.invalidate()
-            timer = nil
         }
     }
 
-    public func start(interval: TimeInterval = 4.0) {
+    /// Starts continuous, always-on recording: an SCStream (~1fps) that dedupes,
+    /// OCRs, and stores only changed frames, plus a background retention prune.
+    /// `interval` is ignored (kept for source compatibility with the old timer API).
+    public func start(interval: TimeInterval = 1.0) {
         refreshPermissions()
         guard status.permissions.canRecordContext else {
             status.message = "Open Settings to grant Screen Recording before recording."
             return
         }
-        guard timer == nil else { return }
+        guard rewind == nil else { return }
         status.running = true
         status.message = "Recording local context."
-        captureOnce()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.captureOnce() }
+
+        let recorder = RewindRecorder(store: store) { [weak self] context in
+            Task { @MainActor in
+                guard let self else { return }
+                self.status.latestContext = context
+                if self.status.running { self.status.message = "Recording local context." }
+            }
         }
+        rewind = recorder
+        Task { @MainActor in
+            do {
+                try await recorder.start()
+            } catch {
+                self.status.message = "Could not start recording: \(error.localizedDescription)"
+                self.stopEngine()
+                self.status.running = false
+            }
+        }
+        startRetention()
     }
 
     public func pause() {
-        timer?.invalidate()
-        timer = nil
+        stopEngine()
         status.running = false
         status.message = "Recording paused."
     }
 
+    private func stopEngine() {
+        retentionTask?.cancel()
+        retentionTask = nil
+        guard let recorder = rewind else { return }
+        rewind = nil
+        Task { @MainActor in await recorder.stop() }
+    }
+
+    /// Background loop enforcing local retention (7 days / ≤5GB by default): prune
+    /// the DB and delete the frame files it reports, on launch and then hourly.
+    private func startRetention() {
+        retentionTask?.cancel()
+        let store = self.store
+        retentionTask = Task.detached(priority: .background) {
+            while !Task.isCancelled {
+                if let removed = try? await store.prune() {
+                    for path in removed { FrameStore.delete(path) }
+                }
+                try? await Task.sleep(for: .seconds(3600))
+            }
+        }
+    }
+
     public func captureOnce() {
+        Task { _ = await captureNow() }
+    }
+
+    /// Awaitable single capture — used by the autonomous agent loop so it can
+    /// observe the current screen (and its OCR) before planning the next step.
+    @discardableResult
+    public func captureNow() async -> RecordedContext? {
         let snapshot = observer.refresh()
+        let canCaptureScreen = status.permissions.canRecordContext
+        var ocrText: String?
+        var imagePath: String?
+        var source: ContextSource = .app
+        var isCursorScreen = false
+        if canCaptureScreen,
+           let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true) {
+            source = .screen
+            isCursorScreen = sample.isCursorScreen
+            if sample.hasText { ocrText = sample.ocrText }
+            if let png = sample.imagePNG { imagePath = Self.saveFrame(png) }
+        }
+
         let metadata = """
-        {"processIdentifier":\(snapshot.processIdentifier.map(String.init) ?? "null")}
+        {"processIdentifier":\(snapshot.processIdentifier.map(String.init) ?? "null"),"cursorScreen":\(isCursorScreen)}
         """
         let context = RecordedContext(
-            source: .app,
+            source: source,
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier,
             windowTitle: snapshot.windowTitle,
-            ocrText: nil,
+            ocrText: ocrText,
+            imagePath: imagePath,
             metadataJSON: metadata
         )
-        Task {
-            do {
-                let inserted = try await store.insert(context)
-                _ = try await store.appendAudit(AuditEvent(actor: "system", action: "context.capture", detail: inserted.appName))
-                await MainActor.run {
-                    status.latestContext = inserted
-                    status.message = status.running ? "Recording local context." : "Captured one context sample."
-                }
-            } catch {
-                await MainActor.run {
-                    status.message = "Could not write context: \(error.localizedDescription)"
-                }
-            }
+        do {
+            let inserted = try await store.insert(context)
+            let detail = ocrText.map { "\(inserted.appName) · ocr \($0.count) chars" } ?? inserted.appName
+            _ = try await store.appendAudit(AuditEvent(actor: "system", action: "context.capture", detail: detail))
+            status.latestContext = inserted
+            status.message = status.running ? "Recording local context." : "Captured one context sample."
+            return inserted
+        } catch {
+            status.message = "Could not write context: \(error.localizedDescription)"
+            return nil
         }
+    }
+
+    /// Persists a captured frame (from the single-shot path, which produces PNG
+    /// bytes) so the Rewind can show the real screenshot per moment. Re-encodes to
+    /// JPEG via `FrameStore` to match the continuous recorder's on-disk format and
+    /// cut disk use. Returns the file path, or nil on failure.
+    private nonisolated static func saveFrame(_ png: Data) -> String? {
+        FrameStore.save(imageData: png)
     }
 }

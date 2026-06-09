@@ -81,18 +81,3 @@ public struct SuggestionEngine: Sendable {
         }
     }
 }
-
-public enum PrivacyRules {
-    public static func isSensitive(_ context: RecordedContext) -> Bool {
-        let haystack = [
-            context.appName,
-            context.bundleIdentifier ?? "",
-            context.windowTitle ?? "",
-            context.ocrText ?? ""
-        ].joined(separator: " ").lowercased()
-        return [
-            "bank", "health", "medical", "legal", "dating", "incognito", "private browsing",
-            "password", "1password", "keychain", "wallet"
-        ].contains { haystack.contains($0) }
-    }
-}

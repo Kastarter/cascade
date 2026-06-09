@@ -41,9 +41,19 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <string>Cascade records local work context so you can rewind, audit, and approve helper agents.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Cascade can use the microphone only when you enable voice teaching.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Cascade transcribes your spoken questions so it can point at what you ask about on screen.</string>
 </dict>
 </plist>
 PLIST
 
-codesign --force --deep --sign - --identifier "com.humain.cascade" "$APP"
+# Prefer a stable self-signed identity so macOS TCC grants (Accessibility, Input
+# Monitoring, Screen Recording) persist across rebuilds. Falls back to ad-hoc if
+# the "Cascade Local Signing" cert isn't installed.
+if security find-identity -v 2>/dev/null | grep -q "Cascade Local Signing" \
+   || codesign --force --sign "Cascade Local Signing" --identifier "com.humain.cascade" "$APP" 2>/dev/null; then
+  codesign --force --deep --sign "Cascade Local Signing" --identifier "com.humain.cascade" "$APP"
+else
+  codesign --force --deep --sign - --identifier "com.humain.cascade" "$APP"
+fi
 echo "$APP"

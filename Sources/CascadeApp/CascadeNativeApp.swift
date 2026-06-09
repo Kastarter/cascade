@@ -19,6 +19,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit Cascade", action: #selector(quitCascade), keyEquivalent: "q"))
         statusItem?.menu = menu
+
+        enterFullScreen(attempt: 0)
+    }
+
+    /// Launches Cascade in macOS fullscreen. SwiftUI's WindowGroup creates the
+    /// window slightly after launch, so we retry until it exists, then toggle
+    /// fullscreen once.
+    private func enterFullScreen(attempt: Int) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .milliseconds(attempt == 0 ? 200 : 120))
+            guard let window = NSApp.windows.first(where: { $0.canBecomeMain }) else {
+                if attempt < 50 { self.enterFullScreen(attempt: attempt + 1) }
+                return
+            }
+            window.collectionBehavior.insert(.fullScreenPrimary)
+            if !window.styleMask.contains(.fullScreen) {
+                window.toggleFullScreen(nil)
+            }
+        }
     }
 
     @objc private func openCascade() {
@@ -39,10 +59,13 @@ struct CascadeNativeApp: App {
     var body: some Scene {
         WindowGroup("Cascade") {
             CascadeRootView(model: model.value)
-                .preferredColorScheme(.dark)
-                .task { await model.value.refreshAll() }
+                .task {
+                    model.value.guidanceOverlay.startFollowing()
+                    await model.value.refreshAll()
+                }
         }
         .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1320, height: 880)
         .commands {
             CommandMenu("Cascade") {
                 Button("Use Device") { model.value.beginUseDeviceIntent(source: "menu") }

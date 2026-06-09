@@ -7,10 +7,38 @@ import Foundation
 import MacContextKit
 
 public enum ComputerUseAction: Equatable, Sendable {
+    case move(x: Double, y: Double)
     case click(x: Double, y: Double)
+    case doubleClick(x: Double, y: Double)
+    case rightClick(x: Double, y: Double)
     case key(String, modifiers: [String])
     case typeText(String)
     case scroll(deltaX: Double, deltaY: Double)
+    case openURL(String)
+}
+
+/// Shared, thread-safe stop signal for a supervised computer-use run. The visible
+/// STOP control flips this; the actuator checks it before every action so STOP
+/// actually halts the agent rather than only hiding the dock.
+public final class AgentRunState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _stopRequested = false
+
+    public init() {}
+
+    public var isStopRequested: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _stopRequested
+    }
+
+    public func requestStop() {
+        lock.lock(); _stopRequested = true; lock.unlock()
+    }
+
+    /// Clears the stop flag at the start of a new approved intent.
+    public func reset() {
+        lock.lock(); _stopRequested = false; lock.unlock()
+    }
 }
 
 public struct ComputerUseHealth: Equatable, Sendable {
@@ -141,17 +169,23 @@ public protocol ComputerUseActuator: Sendable {
 public enum ComputerUseError: Error, LocalizedError {
     case notReady(String)
     case unsupported(String)
+    case stopped
 
     public var errorDescription: String? {
         switch self {
         case .notReady(let message): message
         case .unsupported(let message): message
+        case .stopped: "Stopped by the user before the action ran."
         }
     }
 }
 
 public struct NativeComputerUseActuator: ComputerUseActuator {
-    public init() {}
+    private let runState: AgentRunState?
+
+    public init(runState: AgentRunState? = nil) {
+        self.runState = runState
+    }
 
     public func health() async -> ComputerUseHealth {
         let status = await MainActor.run { PermissionProbe.currentStatus() }
@@ -166,19 +200,40 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     }
 
     public func perform(_ action: ComputerUseAction) async throws {
+        // STOP is checked before health and before the event posts, so the
+        // visible STOP control halts the run even mid-sequence.
+        if runState?.isStopRequested == true { throw ComputerUseError.stopped }
+
         let current = await health()
         guard current.ready else { throw ComputerUseError.notReady(current.message) }
 
+        if runState?.isStopRequested == true { throw ComputerUseError.stopped }
+
         switch action {
+        case .move(let x, let y):
+            try move(to: CGPoint(x: x, y: y))
         case .click(let x, let y):
             try click(at: CGPoint(x: x, y: y))
+        case .doubleClick(let x, let y):
+            try doubleClick(at: CGPoint(x: x, y: y))
+        case .rightClick(let x, let y):
+            try rightClick(at: CGPoint(x: x, y: y))
         case .key(let key, let modifiers):
             try pressKey(key, modifiers: modifiers)
         case .typeText(let text):
             try typeText(text)
-        case .scroll:
-            throw ComputerUseError.unsupported("Scroll routing is not enabled in the first slice.")
+        case .scroll(let deltaX, let deltaY):
+            try scroll(deltaX: deltaX, deltaY: deltaY)
+        case .openURL(let raw):
+            try await openURL(raw)
         }
+    }
+
+    private func move(to point: CGPoint) throws {
+        guard let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
+            throw ComputerUseError.unsupported("Could not create move event.")
+        }
+        moved.post(tap: .cghidEventTap)
     }
 
     private func click(at point: CGPoint) throws {
@@ -188,6 +243,50 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         }
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+    }
+
+    private func doubleClick(at point: CGPoint) throws {
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+            throw ComputerUseError.unsupported("Could not create double-click event.")
+        }
+        for event in [down, up] {
+            event.setIntegerValueField(.mouseEventClickState, value: 2)
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    private func rightClick(at point: CGPoint) throws {
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right),
+              let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right) else {
+            throw ComputerUseError.unsupported("Could not create right-click event.")
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    private func scroll(deltaX: Double, deltaY: Double) throws {
+        guard let event = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 2,
+            wheel1: Int32(deltaY),
+            wheel2: Int32(deltaX),
+            wheel3: 0
+        ) else {
+            throw ComputerUseError.unsupported("Could not create scroll event.")
+        }
+        event.post(tap: .cghidEventTap)
+    }
+
+    private func openURL(_ raw: String) async throws {
+        guard let url = URL(string: raw), url.scheme == "http" || url.scheme == "https" else {
+            throw ComputerUseError.unsupported("Refusing to open a non-web URL: \(raw)")
+        }
+        await MainActor.run { _ = NSWorkspace.shared.open(url) }
     }
 
     private func pressKey(_ key: String, modifiers: [String]) throws {
@@ -274,6 +373,10 @@ public final class ControlDockModel: ObservableObject {
     @Published public private(set) var title = "Cascade is ready"
     @Published public private(set) var detail = "No agent is using the computer."
 
+    /// Invoked when the user presses STOP, so the owner can halt an in-flight
+    /// agent run (flip the `AgentRunState`, cancel tasks) — not just hide the dock.
+    public var onStop: (@MainActor () -> Void)?
+
     public init() {}
 
     public func show(title: String, detail: String) {
@@ -283,6 +386,7 @@ public final class ControlDockModel: ObservableObject {
     }
 
     public func stop() {
+        onStop?()
         title = "Stopped"
         detail = "Cascade returned control to you."
         visible = false
