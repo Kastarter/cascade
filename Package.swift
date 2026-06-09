@@ -19,6 +19,7 @@ let package = Package(
         .target(name: "MacContextKit", dependencies: ["CascadeMemory"]),
         .target(name: "ComputerUseKit", dependencies: ["CascadeMemory", "MacContextKit"]),
         .target(name: "ProviderKit", dependencies: ["CascadeMemory"]),
+        .target(name: "SandboxKit", dependencies: ["ProviderKit", "CascadeMemory"]),
         .target(name: "SuggestionEngine", dependencies: ["CascadeMemory"]),
         .target(
             name: "AgentOrchestrator",
@@ -33,6 +34,7 @@ let package = Package(
                 "ComputerUseKit",
                 "MacContextKit",
                 "ProviderKit",
+                "SandboxKit",
                 "SuggestionEngine"
             ]
         ),

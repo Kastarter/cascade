@@ -39,9 +39,41 @@ public final class ComputerUseAgent {
     private var displayW = 0
     private var displayH = 0
 
-    public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
+    private let effort: String
+    /// Extra environment context appended to the system prompt (e.g. "you're in a web
+    /// sandbox with no tabs or address bar").
+    private let environmentNote: String?
+
+    /// Keeps the model terse and decisive: no narration (fewer output tokens → faster
+    /// turns and short text-to-speech), one action at a time, brief confirmation only
+    /// at the end.
+    private static let systemPrompt = """
+    You are Cascade, operating this Mac to carry out the user's request. Use the computer \
+    tool to act, one step at a time. Be silent and extremely brief: do NOT narrate, \
+    explain, or describe what you see or plan — just take the next action. Only when the \
+    whole task is finished, reply with a confirmation of five words or fewer.
+    """
+
+    /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
+    /// a tab bar. Not used by the single-view web sandbox.
+    public static let foregroundBrowserNote = """
+    If the task involves opening a website, use the browser the user already has open and \
+    focused — never launch or switch to a different browser. Open exactly ONE new tab for \
+    the whole task by CLICKING the "+" (new tab) button in the browser's tab bar — do NOT \
+    use the cmd+t shortcut. Click "+" only once; then type the address and press Return, \
+    and keep using that same tab. Never click "+" again or open more tabs.
+    """
+
+    public init(
+        keyStore: AnthropicKeyStore = AnthropicKeyStore(),
+        model: String = AnthropicModel.sonnet,
+        effort: String = "medium",
+        environmentNote: String? = nil
+    ) {
         self.keyStore = keyStore
         self.model = model
+        self.effort = effort
+        self.environmentNote = environmentNote
     }
 
     public func begin(goal: String, screenshotPNG: Data, displayWidthPoints: Int, displayHeightPoints: Int) async -> CUStep {
@@ -59,13 +91,7 @@ public final class ComputerUseAgent {
             "role": "user",
             "content": [
                 imageBlock(jpeg),
-                ["type": "text", "text": """
-                Task: \(goal)
-
-                Carry this out on the current screen using the computer tool, one action \
-                at a time. After each action you'll get a new screenshot. When the task is \
-                fully complete, stop using the tool and briefly say it's done.
-                """],
+                ["type": "text", "text": "Task: \(goal)"],
             ],
         ])
         return await step()
@@ -84,6 +110,7 @@ public final class ComputerUseAgent {
             }
         }
         messages.append(["role": "user", "content": results])
+        pruneScreenshots()
         return await step()
     }
 
@@ -99,11 +126,21 @@ public final class ComputerUseAgent {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue("computer-use-2025-11-24", forHTTPHeaderField: "anthropic-beta")
 
+        // Cache the static prefix (system + tool defs) and the most recent turn, so the
+        // growing screenshot history is re-read from cache instead of reprocessed.
+        let tools: [[String: Any]] = [[
+            "type": "computer_20251124", "name": "computer",
+            "display_width_px": resW, "display_height_px": resH,
+            "cache_control": ["type": "ephemeral"],
+        ]]
+        let system = environmentNote.map { "\(Self.systemPrompt)\n\n\($0)" } ?? Self.systemPrompt
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
-            "tools": [["type": "computer_20251124", "name": "computer", "display_width_px": resW, "display_height_px": resH]],
-            "messages": messages,
+            "max_tokens": 512,
+            "system": system,
+            "output_config": ["effort": effort],
+            "tools": tools,
+            "messages": Self.withMovingCacheBreakpoint(messages),
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             return CUStep(actions: [], text: "", done: true)
@@ -200,6 +237,52 @@ public final class ComputerUseAgent {
         ctx?.imageInterpolation = .high
         image.draw(in: NSRect(x: 0, y: 0, width: width, height: height), from: NSRect(origin: .zero, size: image.size), operation: .copy, fraction: 1.0)
         NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8])
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+    }
+
+    /// Adds an ephemeral cache breakpoint to the last block of the final turn so the
+    /// prefix is re-read from cache next turn. Operates on a copy — stored `messages`
+    /// stay clean (value semantics make this a cheap deep copy).
+    private static func withMovingCacheBreakpoint(_ messages: [[String: Any]]) -> [[String: Any]] {
+        var out = messages
+        guard var last = out.last,
+              var content = last["content"] as? [[String: Any]], !content.isEmpty else { return out }
+        content[content.count - 1]["cache_control"] = ["type": "ephemeral"]
+        last["content"] = content
+        out[out.count - 1] = last
+        return out
+    }
+
+    /// Rolling buffer (Anthropic's guidance): once screenshots exceed `threshold`,
+    /// replace all but the most recent `keep` with short text placeholders, bounding
+    /// the upload payload on long tasks while leaving short tasks untouched.
+    private func pruneScreenshots(keep: Int = 3, threshold: Int = 8) {
+        var imageTurns: [Int] = []
+        for (index, message) in messages.enumerated() {
+            guard let content = message["content"] as? [[String: Any]] else { continue }
+            let hasImage = content.contains { block in
+                if block["type"] as? String == "image" { return true }
+                if block["type"] as? String == "tool_result", let inner = block["content"] as? [[String: Any]] {
+                    return inner.contains { $0["type"] as? String == "image" }
+                }
+                return false
+            }
+            if hasImage { imageTurns.append(index) }
+        }
+        guard imageTurns.count > threshold else { return }
+        for index in imageTurns.dropLast(keep) {
+            guard var content = messages[index]["content"] as? [[String: Any]] else { continue }
+            for block in content.indices {
+                switch content[block]["type"] as? String {
+                case "image":
+                    content[block] = ["type": "text", "text": "[earlier screenshot omitted]"]
+                case "tool_result":
+                    content[block]["content"] = "[earlier screenshot omitted]"
+                default:
+                    break
+                }
+            }
+            messages[index]["content"] = content
+        }
     }
 }

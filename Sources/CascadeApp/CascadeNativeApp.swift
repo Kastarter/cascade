@@ -55,12 +55,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct CascadeNativeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = AppModelBox.make()
+    @StateObject private var notch = NotchController()
 
     var body: some Scene {
         WindowGroup("Cascade") {
             CascadeRootView(model: model.value)
                 .task {
                     model.value.guidanceOverlay.startFollowing()
+                    notch.attach(model: model.value)
                     await model.value.refreshAll()
                 }
         }

@@ -7,6 +7,7 @@ import ComputerUseKit
 import Foundation
 import MacContextKit
 import ProviderKit
+import SandboxKit
 import SuggestionEngine
 
 /// One real Q&A turn over local context — drives the Reel "Ask about this moment" thread.
@@ -14,6 +15,16 @@ public struct QATurn: Identifiable, Sendable {
     public let id = UUID()
     public let question: String
     public let answer: String
+}
+
+/// A background agent running in the isolated web sandbox.
+public struct BackgroundAgentRun: Identifiable, Sendable {
+    public let id: UUID
+    public let task: String
+    public var status: String
+    public var snapshot: Data?
+    public var done: Bool
+    public var result: String?
 }
 
 @MainActor
@@ -45,6 +56,8 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var statusLine: String = "Starting Cascade."
     @Published public private(set) var hasAnthropicKey = false
     @Published public private(set) var keyMessage = "Claude key is not connected."
+    @Published public private(set) var hasOpenAIKey = false
+    @Published public private(set) var openAIKeyMessage = "OpenAI key is not connected (for GPT-Realtime voice)."
     @Published public private(set) var permissionDiagnostics = PermissionProbe.diagnostics()
     @Published public private(set) var screenAgentReady = false
     @Published public private(set) var screenAgentMessage = "Checking real-screen driver health."
@@ -59,9 +72,14 @@ public final class CascadeAppModel: ObservableObject {
     public let hotkey: UseDeviceHotkeyMonitor
     private let orchestrator: CascadeOrchestrator
     private let keyStore = AnthropicKeyStore()
+    private let openAIKeyStore = OpenAIKeyStore()
     public let guidanceOverlay = GuidanceOverlayController()
-    public let voice = VoiceListener()
+    public let voice = RealtimeVoice()
     public let pushToTalk = PushToTalkMonitor()
+    /// Background agents running in the isolated web sandbox.
+    @Published public private(set) var backgroundAgents: [BackgroundAgentRun] = []
+    private var sandboxRuntimes: [UUID: BackgroundWebAgent] = [:]
+    private let sandboxBox = SandboxBoxController()
     private let elementLocator = ElementLocator()
     private var cancellables: Set<AnyCancellable> = []
     private var lastSettingsOpen = Date.distantPast
@@ -170,15 +188,24 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
+    /// The Reel chat. Replies briefly. Questions that refer to the current screen
+    /// ("where is the send button", "show me X") point the companion cursor at the
+    /// element AND reply; everything else is a brief grounded answer about the record.
     public func ask(_ question: String) {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        answer = "Thinking from local context…"
+
+        if Self.refersToScreen(trimmed) {
+            showOnScreen(trimmed)
+            return
+        }
+
+        answer = "Thinking…"
         thinking = true
         Task {
             let result: String
             do {
-                result = try await orchestrator.ask(trimmed)
+                result = Self.brief(try await orchestrator.ask(trimmed))
             } catch {
                 result = error.localizedDescription
             }
@@ -186,6 +213,69 @@ public final class CascadeAppModel: ObservableObject {
             conversation.append(QATurn(question: trimmed, answer: result))
             thinking = false
         }
+    }
+
+    /// Captures the current screen, points the blue companion cursor at the element
+    /// the user asked about, and adds a brief reply to the chat. Falls back to a text
+    /// answer when there's no key or no screen access.
+    private func showOnScreen(_ q: String) {
+        thinking = true
+        answer = "Looking at your screen…"
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main
+        Task {
+            defer { thinking = false }
+            guard hasAnthropicKey else {
+                await answerAsText(q)
+                return
+            }
+            guard let screen,
+                  let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true),
+                  let png = sample.imagePNG else {
+                conversation.append(QATurn(question: q, answer: "Grant Screen Recording so I can see your screen."))
+                return
+            }
+            let guidance = await elementLocator.guide(
+                screenshotPNG: png,
+                question: q,
+                displayWidthPoints: Int(screen.frame.width),
+                displayHeightPoints: Int(screen.frame.height)
+            )
+            if let local = guidance.point {
+                let global = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
+                guidanceOverlay.present(atGlobalPoint: global, label: "this one")
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "reel.point", detail: q))
+            } else {
+                guidanceOverlay.hide()
+            }
+            conversation.append(QATurn(question: q, answer: Self.brief(guidance.speech)))
+        }
+    }
+
+    private func answerAsText(_ q: String) async {
+        let result = (try? await orchestrator.ask(q)) ?? "I couldn't answer that from the local record."
+        conversation.append(QATurn(question: q, answer: Self.brief(result)))
+    }
+
+    /// Whether a chat question is about the *current screen* (point the cursor) vs.
+    /// the *recorded past* (answer as text). Retrospective phrasing wins so that
+    /// "what did I do today" is never mistaken for a screen command.
+    private static func refersToScreen(_ text: String) -> Bool {
+        let t = text.lowercased()
+        let retrospective = ["what did", "what was", "what have", "did i ", "summar", "recap",
+                             "today", "yesterday", "earlier", "this week", "last week", "history", "happened"]
+        if retrospective.contains(where: { t.contains($0) }) { return false }
+        let screenReferring = ["where", "show me", "show the", "find ", "which ", "point", "take me to",
+                              "locate", "highlight", "how do i", "how can i", "open ", "click", "button",
+                              "menu", "icon", " tab", "field", "on screen", "on my screen", "this screen"]
+        return screenReferring.contains { t.contains($0) }
+    }
+
+    /// Caps a reply so the chat stays brief even if a provider rambles.
+    private static func brief(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 280 else { return trimmed }
+        return String(trimmed.prefix(280)).trimmingCharacters(in: .whitespaces) + "…"
     }
 
     public func beginUseDeviceIntent(source: String = "manual") {
@@ -221,7 +311,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func runLoop(goal: String) async {
-        let maxSteps = 10
+        let maxSteps = 20
         defer { agentRunning = false }
         for step in 1...maxSteps {
             if driver.runState.isStopRequested {
@@ -268,12 +358,131 @@ public final class CascadeAppModel: ObservableObject {
     /// to it. If the request was a command ("open / click / do X"), it also
     /// **performs the click** (gated on Accessibility + Input Monitoring); otherwise
     /// it just points and explains ("where / how / show me X").
+    /// Spawns a background agent that carries out `task` inside the isolated web
+    /// sandbox (its own hidden browser), streaming progress to a small watch box —
+    /// the user keeps using their Mac while it works.
+    public func createSandboxAgent(task: String) {
+        let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Too vague to act on — ask rather than letting the agent wander (e.g. off
+        // googling "how to create an agent").
+        if trimmed.count < 5 || trimmed.split(separator: " ").count < 2 {
+            teachMessage = "What should the background agent actually do? e.g. \"in the background, find the cheapest flight to Tokyo next month.\""
+            voice.speak("What should the background agent do?")
+            return
+        }
+        guard hasAnthropicKey else {
+            teachMessage = "Connect your Claude key in Settings first."
+            showSettings = true
+            return
+        }
+        let id = UUID()
+        let runtime = BackgroundWebAgent()
+        sandboxRuntimes[id] = runtime
+        backgroundAgents.insert(
+            BackgroundAgentRun(id: id, task: trimmed, status: "Starting…", snapshot: nil, done: false, result: nil),
+            at: 0
+        )
+        teachMessage = "Running in the background: \(trimmed)"
+        voice.speak("On it. I'll handle that in the background.")
+        sandboxBox.show(webView: runtime.sandbox.webView, task: trimmed) { [weak self] in
+            self?.stopSandboxAgent(id)
+        }
+        Task {
+            await runtime.run(task: trimmed) { [weak self] update in
+                self?.applySandboxUpdate(id, update)
+            }
+        }
+    }
+
+    public func stopSandboxAgent(_ id: UUID) {
+        sandboxRuntimes[id]?.stop()
+        sandboxRuntimes[id] = nil
+        if let index = backgroundAgents.firstIndex(where: { $0.id == id }) {
+            backgroundAgents[index].done = true
+            backgroundAgents[index].status = "Stopped."
+        }
+    }
+
+    private func applySandboxUpdate(_ id: UUID, _ update: BackgroundWebAgent.Update) {
+        if let index = backgroundAgents.firstIndex(where: { $0.id == id }) {
+            backgroundAgents[index].status = update.status
+            if let snapshot = update.snapshotPNG { backgroundAgents[index].snapshot = snapshot }
+            backgroundAgents[index].done = update.done
+            backgroundAgents[index].result = update.result
+        }
+        sandboxBox.updateStatus(update.status)
+        guard update.done else { return }
+        sandboxRuntimes[id] = nil
+        let task = backgroundAgents.first(where: { $0.id == id })?.task ?? "the task"
+        let said = update.result ?? "Finished in the background."
+
+        // Sign-in wall: keep the box open so the user can log in once (it persists),
+        // then Continue resumes the task — now authenticated.
+        if update.needsLogin {
+            teachMessage = said
+            voice.speak(said)
+            sandboxBox.requestLogin(message: said) { [weak self] in
+                self?.createSandboxAgent(task: task)
+            }
+            return
+        }
+
+        teachMessage = "Background agent done — \(said)"
+        voice.speak(said)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)")) }
+        // Leave the box up briefly so the user can glance at the result, then close it.
+        Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide() }
+    }
+
+    /// Did the user ask for a background agent ("create an agent…", "in the background",
+    /// "in the sandbox")?
+    private static func isBackgroundRequest(_ text: String) -> Bool {
+        let t = text.lowercased()
+        if t.range(of: #"\b(create|make|build|spin\s*up|run|start|set\s*up)\b.{0,16}\bagent\b"#,
+                   options: .regularExpression) != nil { return true }
+        return t.contains("in the background") || t.contains("background agent")
+            || t.contains("in the sandbox") || t.contains("in a sandbox") || t.contains("local sandbox")
+    }
+
+    /// Recovers the actual task from a "create an agent that …" style request, robust
+    /// to phrasing ("create me a background agent to …", "build an agent that …"). The
+    /// trigger words must NOT leak into the task, or the agent ends up *researching*
+    /// "how to create an agent" instead of doing the work.
+    private static func backgroundTask(from text: String) -> String {
+        var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip the leading "(please) create/make/build (me) a(n) (background)(computer-use)
+        // agent (that/to/which/for/and)" preamble, keeping everything after it.
+        let preamble = #"^(?:hey\s+)?(?:cascade[,\s]+)?(?:can you\s+|could you\s+|please\s+|i(?:'?d like| want)(?:\syou)?\sto\s+|go ahead and\s+)?(?:create|make|build|spin\s*up|run|start|set\s*up)\s+(?:me\s+)?(?:a|an)?\s*(?:new\s+)?(?:background\s+)?(?:computer[-\s]?use\s+)?agent\b\s*(?:that\s+(?:can\s+|will\s+)?|to\s+|which\s+(?:can\s+|will\s+)?|for\s+|and\s+|:\s*)?"#
+        if let range = t.range(of: preamble, options: [.regularExpression, .caseInsensitive]) {
+            t = String(t[range.upperBound...])
+        }
+        // Remove sandbox/background qualifiers wherever they appear.
+        let qualifiers = [
+            "and let it work in the background", "let it work in the background",
+            "run in the background", "in the background", "as a background agent", "background agent",
+            "in the local sandbox", "in a local sandbox", "in the sandbox", "in a sandbox", "local sandbox",
+        ]
+        for phrase in qualifiers {
+            t = t.replacingOccurrences(of: phrase, with: " ", options: .caseInsensitive)
+        }
+        let cleaned = t
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,")))
+        return cleaned
+    }
+
     public func teach(question: String) {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { teachMessage = "Ask where something is, or what to do."; return }
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
             showSettings = true
+            return
+        }
+        // "create an agent that … in the background" → run it in the isolated web
+        // sandbox instead of taking over the screen.
+        if Self.isBackgroundRequest(q) {
+            createSandboxAgent(task: Self.backgroundTask(from: q))
             return
         }
         let wantsAction = Self.isActionRequest(q)
@@ -297,25 +506,31 @@ public final class CascadeAppModel: ObservableObject {
                 return
             }
 
-            let guidance = await elementLocator.guide(
+            // "Where do I find/do X" → frame the region with the dashed marquee.
+            let region = await elementLocator.locateRegion(
                 screenshotPNG: png,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
                 displayHeightPoints: Int(screen.frame.height)
             )
-            guard let local = guidance.point else {
+            guard let local = region.rect else {
+                guidanceOverlay.clearHighlight()
                 guidanceOverlay.hide()
-                teachMessage = guidance.speech
-                voice.speak(guidance.speech)
+                teachMessage = region.speech
+                voice.speak(region.speech)
                 voice.done()
                 return
             }
 
-            let global = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
-            guidanceOverlay.present(atGlobalPoint: global, label: "this one")
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.point", detail: q))
-            teachMessage = guidance.speech
-            voice.speak(guidance.speech)
+            let globalRect = CGRect(
+                x: screen.frame.minX + local.minX, y: screen.frame.minY + local.minY,
+                width: local.width, height: local.height
+            )
+            guidanceOverlay.highlight(globalRect: globalRect)
+            guidanceOverlay.present(atGlobalPoint: CGPoint(x: globalRect.midX, y: globalRect.midY), label: "here")
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.region", detail: q))
+            teachMessage = region.speech
+            voice.speak(region.speech)
             voice.done()
             await refreshAll()
         }
@@ -327,10 +542,11 @@ public final class CascadeAppModel: ObservableObject {
     /// companion cursor flies to each target so you can watch; STOP (and the cap)
     /// keep control with you, and every run is audited.
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data) async {
-        let agent = ComputerUseAgent()
+        let agent = ComputerUseAgent(environmentNote: ComputerUseAgent.foregroundBrowserNote)
         driver.runState.reset()
+        ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
-        let maxSteps = 14
+        let maxSteps = 28
         var step = await agent.begin(
             goal: goal,
             screenshotPNG: firstScreenshotPNG,
@@ -355,11 +571,11 @@ public final class CascadeAppModel: ObservableObject {
             var failed = false
             for action in step.actions {
                 if !(await executeCU(action, on: screen)) { failed = true; break }
-                try? await Task.sleep(for: .milliseconds(280))
+                try? await Task.sleep(for: .milliseconds(120))
             }
             if failed { break }
             // Let the UI settle, then re-observe and ask for the next step.
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: .milliseconds(260))
             guard let nextShot = await Self.captureScreenPNG() else {
                 teachMessage = "I lost sight of the screen — try again."
                 break
@@ -394,22 +610,25 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
             case .click(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(150))  // let the cursor reach the target
                 guidanceOverlay.press()
-                try? await Task.sleep(for: .milliseconds(110))
+                try? await Task.sleep(for: .milliseconds(55))   // show the press dip
                 let p = cg(x, y)
                 if !Self.axActivate(atCG: p) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
                 }
             case .doubleClick(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(150))
                 guidanceOverlay.press()
-                try? await Task.sleep(for: .milliseconds(110))
+                try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
                 try await clickRestoringCursor { try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y))) }
             case .rightClick(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(150))
                 guidanceOverlay.press()
-                try? await Task.sleep(for: .milliseconds(110))
+                try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
                 if !Self.axActivate(atCG: p, showMenu: true) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
@@ -768,6 +987,10 @@ public final class CascadeAppModel: ObservableObject {
         keyMessage = hasAnthropicKey
             ? "Claude key connected in macOS Keychain."
             : "Paste your Anthropic API key to enable Claude-backed Q&A and agent generation."
+        hasOpenAIKey = openAIKeyStore.hasKey()
+        openAIKeyMessage = hasOpenAIKey
+            ? "OpenAI key connected — GPT-Realtime voice enabled."
+            : "Paste your OpenAI API key to enable the GPT-Realtime voice (talk + spoken replies)."
     }
 
     public func saveAnthropicKey(_ key: String) {
@@ -785,6 +1008,24 @@ public final class CascadeAppModel: ObservableObject {
             refreshKeyStatus()
         } catch {
             keyMessage = error.localizedDescription
+        }
+    }
+
+    public func saveOpenAIKey(_ key: String) {
+        do {
+            try openAIKeyStore.save(key)
+            refreshKeyStatus()
+        } catch {
+            openAIKeyMessage = error.localizedDescription
+        }
+    }
+
+    public func clearOpenAIKey() {
+        do {
+            try openAIKeyStore.delete()
+            refreshKeyStatus()
+        } catch {
+            openAIKeyMessage = error.localizedDescription
         }
     }
 

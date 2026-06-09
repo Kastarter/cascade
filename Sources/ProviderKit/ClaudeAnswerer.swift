@@ -30,7 +30,7 @@ public struct ClaudeGroundedAnswerer: ContextQuestionAnswering {
             system: Self.systemPrompt,
             user: "Question: \(question)\n\nLocal context (most recent first):\n\(block)",
             model: model,
-            maxTokens: 1024
+            maxTokens: 220
         )
     }
 
@@ -38,6 +38,10 @@ public struct ClaudeGroundedAnswerer: ContextQuestionAnswering {
     You answer questions about what the employee did locally, grounded ONLY in the \
     provided context samples. You are read-only and retrospective: never speculate, \
     never plan or suggest future actions, and never invent details that are not in \
-    the context. If the context does not contain the answer, say so plainly. Be concise.
+    the context.
+
+    Answer in ONE or TWO short sentences. No preamble, no restating the question, no \
+    boilerplate disclaimers. If the context doesn't contain the answer, say so in one \
+    short line.
     """
 }

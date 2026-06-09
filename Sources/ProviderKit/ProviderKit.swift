@@ -98,3 +98,47 @@ public struct AnthropicKeyStore: Sendable {
         ]
     }
 }
+
+/// Keychain-backed store for the user's OpenAI API key (used by the GPT-Realtime voice).
+public struct OpenAIKeyStore: Sendable {
+    private let service = "com.humain.cascade"
+    private let account = "openai-api-key"
+
+    public init() {}
+
+    public func hasKey() -> Bool { readKey() != nil }
+
+    public func readKey() -> String? {
+        var query = baseQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    public func save(_ key: String) throws {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw ProviderKeyStoreError.emptyKey }
+        try? delete()
+        var item = baseQuery()
+        item[kSecValueData as String] = Data(trimmed.utf8)
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else { throw ProviderKeyStoreError.unexpectedStatus(status) }
+    }
+
+    public func delete() throws {
+        let status = SecItemDelete(baseQuery() as CFDictionary)
+        if status == errSecItemNotFound { return }
+        guard status == errSecSuccess else { throw ProviderKeyStoreError.unexpectedStatus(status) }
+    }
+
+    private func baseQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+}

@@ -174,6 +174,10 @@ private struct CascadeTopBar: View {
     @ObservedObject var model: CascadeAppModel
 
     var body: some View {
+        // Status + quick controls (REC · LOCAL, Listening, settings, theme) now live
+        // in the floating notch HUD at the top-center of the screen, so the in-app bar
+        // keeps just the brand + tabs, left-aligned to leave the center clear for the
+        // notch.
         HStack(spacing: CascadeMetrics.s4) {
             HStack(spacing: CascadeMetrics.s2) {
                 Image(nsImage: NSImage(named: "cascadeTemplate") ?? NSImage())
@@ -182,8 +186,6 @@ private struct CascadeTopBar: View {
                     .foregroundStyle(Color.cascadeAgent)
                 Text("Cascade").font(.cascadeSerif(20))
             }
-
-            Spacer()
 
             HStack(spacing: 2) {
                 ForEach(CascadeAppModel.Tab.allCases) { tab in
@@ -204,51 +206,6 @@ private struct CascadeTopBar: View {
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
 
             Spacer()
-
-            Text(Date.now, format: .dateTime.weekday(.abbreviated).month(.abbreviated).day())
-                .font(.cascadeMono(12, .medium))
-                .foregroundStyle(Color.cascadeText3)
-
-            Button { model.showSettings = true } label: {
-                Image(systemName: "gearshape").font(.system(size: 13, weight: .semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.cascadeText2)
-            .help("Settings — access & Claude key")
-
-            Button {
-                model.recorder.status.running ? model.pauseRecording() : model.startRecording()
-            } label: {
-                CascadeRecordingPill(
-                    label: model.recorder.status.running ? "REC · LOCAL" : "PAUSED · LOCAL",
-                    active: model.recorder.status.running
-                )
-            }
-            .buttonStyle(.plain)
-            .help("Everything stays on this Mac")
-
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(model.voice.state == .listening ? Color.cascadeAgent
-                          : (model.voice.state == .working ? Color.cascadeWarn : Color.cascadeText4))
-                    .frame(width: 7, height: 7)
-                Text(model.voice.state == .listening ? "Listening"
-                     : (model.voice.state == .working ? "Thinking" : "Hold ⌘"))
-                    .font(.cascadeMono(11, .medium))
-                    .foregroundStyle(model.voice.state == .idle ? Color.cascadeText3 : Color.cascadeText)
-            }
-            .padding(.horizontal, CascadeMetrics.s2 + 2)
-            .padding(.vertical, CascadeMetrics.s1 + 1)
-            .background(Color.cascadePanel2, in: Capsule())
-            .overlay(Capsule().stroke(Color.cascadeBorder, lineWidth: 1))
-            .help("Hold the right Command (⌘) key to talk to Cascade")
-
-            Button { model.toggleTheme() } label: {
-                Image(systemName: model.prefersDark ? "sun.max" : "moon").font(.system(size: 13, weight: .semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.cascadeText2)
-            .help("Toggle light / dark")
         }
         .padding(.horizontal, CascadeMetrics.s5)
         .padding(.vertical, CascadeMetrics.s3)
@@ -779,7 +736,7 @@ private struct AskPanel: View {
                         ChatBubble(text: turn.answer, mine: false)
                     }
                     if model.thinking {
-                        ChatBubble(text: "Thinking from local context…", mine: false)
+                        ChatBubble(text: model.answer, mine: false)
                     }
                 }
                 .padding(CascadeMetrics.s5)
@@ -1293,6 +1250,7 @@ private struct SettingsSheet: View {
                     }
                     DiagnosticsCard(diagnostics: model.permissionDiagnostics)
                     ClaudeKeyCard(model: model)
+                    OpenAIKeyCard(model: model)
                 }
             }
         }
@@ -1420,6 +1378,39 @@ private struct ClaudeKeyCard: View {
                     Button("Clear") { model.clearAnthropicKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
                 Text("Stored in macOS Keychain. Used only for Claude-backed Q&A, suggestions, and reviewed agents.")
+                    .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+            }
+        }
+    }
+}
+
+private struct OpenAIKeyCard: View {
+    @ObservedObject var model: CascadeAppModel
+    @State private var key = ""
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("OpenAI key · GPT-Realtime voice").font(.cascadeSans(16, .semibold))
+                        Text(model.openAIKeyMessage).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    CascadeTag(model.hasOpenAIKey ? "Connected" : "Voice off", tone: model.hasOpenAIKey ? .cascadeGood : .cascadeWarn)
+                }
+                SecureField("sk-…", text: $key)
+                    .textFieldStyle(.plain)
+                    .font(.cascadeMono(12))
+                    .padding(.horizontal, CascadeMetrics.s3)
+                    .padding(.vertical, CascadeMetrics.s2 + 1)
+                    .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                HStack {
+                    Button("Save key") { model.saveOpenAIKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
+                    Button("Clear") { model.clearOpenAIKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
+                }
+                Text("Stored in macOS Keychain. Powers talk-to-Cascade and spoken replies via OpenAI GPT-Realtime-2. Claude still does the thinking.")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
         }

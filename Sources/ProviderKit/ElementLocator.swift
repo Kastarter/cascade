@@ -23,6 +23,18 @@ public struct ElementGuidance: Sendable {
     }
 }
 
+/// A region to frame on screen (for "where do I find/do X" answers).
+public struct ElementRegion: Sendable {
+    /// Display-local AppKit rect (bottom-left origin); nil when nothing matched.
+    public let rect: CGRect?
+    public let speech: String
+
+    public init(rect: CGRect?, speech: String) {
+        self.rect = rect
+        self.speech = speech
+    }
+}
+
 public struct ElementLocator: Sendable {
     private let keyStore: AnthropicKeyStore
     private let model: String
@@ -75,6 +87,98 @@ public struct ElementLocator: Sendable {
         // Computer Use uses top-left origin; convert to AppKit bottom-left.
         let scaledYFromBottom = CGFloat(displayHeightPoints) - scaledYFromTop
         return ElementGuidance(point: CGPoint(x: scaledX, y: scaledYFromBottom), speech: speech)
+    }
+
+    /// Finds the bounding box of the on-screen region where the user would do/find what
+    /// they asked, to frame with the dashed marquee. Returns a display-local AppKit rect
+    /// (bottom-left origin) + one short spoken sentence.
+    public func locateRegion(
+        screenshotPNG: Data,
+        question: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> ElementRegion {
+        guard let key = keyStore.readKey(), !key.isEmpty else {
+            return ElementRegion(rect: nil, speech: "Connect your Claude key first.")
+        }
+        let res = bestResolution(forWidth: displayWidthPoints, height: displayHeightPoints)
+        guard let jpeg = resize(png: screenshotPNG, toWidth: res.w, toHeight: res.h) else {
+            return ElementRegion(rect: nil, speech: "I couldn't read the screen image.")
+        }
+        guard let result = await callRegion(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key) else {
+            return ElementRegion(rect: nil, speech: "I couldn't reach Claude just now.")
+        }
+        let speech = result.say.isEmpty
+            ? (result.box != nil ? "Here — it's in this area." : "I couldn't find that on the current screen.")
+            : result.say
+        guard let box = result.box else { return ElementRegion(rect: nil, speech: speech) }
+
+        // box = [x, y, w, h] top-left, in resized pixels → display-local AppKit bottom-left.
+        let sx = CGFloat(displayWidthPoints) / CGFloat(res.w)
+        let sy = CGFloat(displayHeightPoints) / CGFloat(res.h)
+        let x = max(0, box[0] * sx)
+        let w = max(8, box[2] * sx)
+        let yTop = max(0, box[1] * sy)
+        let h = max(8, box[3] * sy)
+        let yBottom = CGFloat(displayHeightPoints) - (yTop + h)
+        let rect = CGRect(x: x, y: yBottom, width: w, height: h)
+        return ElementRegion(rect: rect, speech: speech)
+    }
+
+    private func callRegion(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String) async -> (box: [CGFloat]?, say: String)? {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue(key, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+
+        let prompt = """
+        A screenshot of the user's screen is attached; it is \(declaredW) by \(declaredH) pixels. \
+        The user asked: "\(question)"
+
+        Find the single on-screen region where they would do or find that — the area to \
+        frame for them (a button, menu, panel, list, sidebar, field, or section). Reply with \
+        ONLY compact JSON, no other text:
+        {"box": [x, y, w, h], "say": "<one short friendly sentence telling them where/how>"}
+        where x,y is the TOP-LEFT corner and w,h the width and height of the region, in the \
+        screenshot's pixels. If it is not visible on screen, use {"box": null, "say": "..."}.
+        """
+
+        let body: [String: Any] = [
+            "model": model,
+            "max_tokens": 400,
+            "messages": [[
+                "role": "user",
+                "content": [
+                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+                    ["type": "text", "text": prompt],
+                ],
+            ]],
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        request.httpBody = bodyData
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]],
+              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String else {
+            return nil
+        }
+        return parseRegion(text)
+    }
+
+    private func parseRegion(_ text: String) -> (box: [CGFloat]?, say: String) {
+        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"),
+              let data = String(text[start...end]).data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (nil, text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let say = (json["say"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if let nums = json["box"] as? [NSNumber], nums.count == 4 {
+            return (nums.map { CGFloat(truncating: $0) }, say)
+        }
+        return (nil, say)
     }
 
     private func bestResolution(forWidth width: Int, height: Int) -> (w: Int, h: Int) {
