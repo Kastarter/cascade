@@ -146,7 +146,9 @@ public struct ElementLocator: Sendable {
         """
 
         let body: [String: Any] = [
-            "model": model,
+            // Region detection is a simple bounding-box vision task — Haiku is ~2× faster
+            // and plenty accurate for framing, so the find loop isn't bottlenecked on it.
+            "model": AnthropicModel.haiku,
             "max_tokens": 400,
             "messages": [[
                 "role": "user",

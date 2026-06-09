@@ -514,11 +514,9 @@ public final class CascadeAppModel: ObservableObject {
                 displayHeightPoints: Int(screen.frame.height)
             )
             guard let local = region.rect else {
-                guidanceOverlay.clearHighlight()
-                guidanceOverlay.hide()
-                teachMessage = region.speech
-                voice.speak(region.speech)
-                voice.done()
+                // Not on the current screen — don't give up. Navigate (open the app/menu/
+                // tab, scroll) to surface it, then frame it.
+                await findAndReveal(question: q, screen: screen, firstScreenshotPNG: png)
                 return
             }
 
@@ -711,6 +709,76 @@ public final class CascadeAppModel: ObservableObject {
     /// Captures the current screen (own windows excluded) as PNG for the next loop turn.
     private static func captureScreenPNG() async -> Data? {
         await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true)?.imagePNG
+    }
+
+    /// "Where can I find/do X" when X isn't on the current screen: navigate (open the
+    /// right app/menu/tab, scroll) to bring it into view, then frame it with the marquee.
+    /// It reveals — it does NOT click the target itself. STOP-able and capped.
+    private func findAndReveal(question: String, screen: NSScreen, firstScreenshotPNG: Data) async {
+        driver.runState.reset()
+        teachMessage = "Let me find that for you…"
+        voice.speak("One moment — let me find that.")
+        let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
+
+        let navigator = ComputerUseAgent(effort: "low", environmentNote: """
+        The user is trying to FIND or REACH "\(question)" but it is not on the screen yet. \
+        Navigate this Mac to bring it into view — open the relevant app, menu, or tab, or \
+        scroll. Take the most DIRECT path and use as few steps as possible. One action at a \
+        time. Do NOT click or activate the target itself; just surface it so it becomes \
+        visible. Once it is visible on screen, stop.
+        """)
+        var step = await navigator.begin(
+            goal: "Surface on screen where the user can find or do: \(question)",
+            screenshotPNG: firstScreenshotPNG,
+            displayWidthPoints: dw, displayHeightPoints: dh
+        )
+
+        let maxSteps = 6
+        var count = 0
+        while count < maxSteps {
+            if driver.runState.isStopRequested { teachMessage = "Stopped."; return }
+            var failed = false
+            for action in step.actions {
+                if !(await executeCU(action, on: screen)) { failed = true; break }
+                try? await Task.sleep(for: .milliseconds(80))
+            }
+            if failed { return }  // executeCU surfaced the permission/STOP reason
+            try? await Task.sleep(for: .milliseconds(220))
+
+            guard let shot = await Self.captureScreenPNG() else { break }
+            // Detection (is it visible now?) and the next nav step fire concurrently, so
+            // each loop turn costs ONE round-trip of wall-clock instead of two. If found,
+            // the speculative nav step is just discarded.
+            async let regionTask = elementLocator.locateRegion(
+                screenshotPNG: shot, question: question, displayWidthPoints: dw, displayHeightPoints: dh
+            )
+            async let nextStepTask = navigator.proceed(screenshotPNG: shot)
+
+            let region = await regionTask
+            if let local = region.rect {
+                let g = CGRect(
+                    x: screen.frame.minX + local.minX, y: screen.frame.minY + local.minY,
+                    width: local.width, height: local.height
+                )
+                guidanceOverlay.highlight(globalRect: g)
+                guidanceOverlay.present(atGlobalPoint: CGPoint(x: g.midX, y: g.midY), label: "here")
+                teachMessage = region.speech
+                voice.speak(region.speech)
+                voice.done()
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.reveal", detail: question))
+                await refreshAll()
+                return
+            }
+            let next = await nextStepTask
+            if next.done { break }
+            step = next
+            count += 1
+        }
+
+        guidanceOverlay.hide()
+        teachMessage = "I opened a few things but couldn't surface that — it may not be here."
+        voice.speak("I couldn't bring that on screen.")
+        voice.done()
     }
 
     /// Splits a Computer Use key string ("Return", "cmd+space", "ctrl+c") into a
