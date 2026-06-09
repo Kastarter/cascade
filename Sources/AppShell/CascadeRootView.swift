@@ -64,7 +64,7 @@ enum AppVisuals {
         if let brand = brandColors.first(where: { lower.contains($0.match) }) {
             return brand.color
         }
-        if let dominant = dominantIconColor(bundleIdentifier: bundleIdentifier) {
+        if let dominant = dominantIconColor(app: app, bundleIdentifier: bundleIdentifier) {
             return dominant
         }
         return hashColor(app)
@@ -79,8 +79,8 @@ enum AppVisuals {
     /// Pulls a representative color from the app's real icon: average the saturated,
     /// non-transparent, non-gray pixels (so white/black backgrounds don't wash it
     /// out), then lift saturation/brightness so it reads on the dark timeline.
-    private static func dominantIconColor(bundleIdentifier: String?) -> Color? {
-        guard let icon = icon(forBundle: bundleIdentifier),
+    private static func dominantIconColor(app: String, bundleIdentifier: String?) -> Color? {
+        guard let icon = icon(forBundle: bundleIdentifier) ?? icon(forAppNamed: app),
               let cgImage = icon.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
         }
@@ -130,6 +130,15 @@ enum AppVisuals {
 
     static func icon(forBundle id: String?) -> NSImage? {
         guard let id, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return nil }
+        return NSWorkspace.shared.icon(forFile: url.path)
+    }
+
+    /// Best-effort icon for an app we only know by name — matches a running app by
+    /// its localized name. Lets the timeline tint by the app's *real* icon even when
+    /// a recorded moment didn't capture a bundle id, so one app keeps one color.
+    static func icon(forAppNamed name: String) -> NSImage? {
+        guard let url = NSWorkspace.shared.runningApplications
+            .first(where: { $0.localizedName == name })?.bundleURL else { return nil }
         return NSWorkspace.shared.icon(forFile: url.path)
     }
 }
@@ -309,7 +318,14 @@ private struct ReelScreen: View {
                     isPlaying = false
                 }
             )
-            ActivityTimeline(contexts: moments)
+            ActivityTimeline(
+                contexts: moments,
+                currentIndex: index,
+                onScrub: { newIndex in
+                    index = newIndex
+                    isPlaying = false
+                }
+            )
         }
     }
 
@@ -600,6 +616,10 @@ private struct TransportBar: View {
 
 private struct ActivityTimeline: View {
     let contexts: [RecordedContext]
+    /// Current scrubber position as an index into `contexts` (0 = newest / live).
+    let currentIndex: Int
+    /// Called when the user clicks or drags the bar to a different moment.
+    let onScrub: (Int) -> Void
 
     private struct Run: Identifiable { let id = UUID(); let app: String; let bundle: String?; let count: Int }
     private struct LegendItem: Identifiable { let id: String; let app: String; let bundle: String? }
@@ -662,17 +682,57 @@ private struct ActivityTimeline: View {
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
         } else {
             GeometryReader { geo in
-                HStack(spacing: 2) {
-                    ForEach(runs) { run in
-                        AppVisuals.color(for: run.app, bundleIdentifier: run.bundle)
-                            .frame(width: max(6, geo.size.width * CGFloat(run.count) / CGFloat(max(contexts.count, 1)) - 2))
+                ZStack(alignment: .leading) {
+                    HStack(spacing: 2) {
+                        ForEach(runs) { run in
+                            AppVisuals.color(for: run.app, bundleIdentifier: run.bundle)
+                                .frame(width: max(6, geo.size.width * CGFloat(run.count) / CGFloat(max(contexts.count, 1)) - 2))
+                        }
                     }
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    playhead(width: geo.size.width, height: geo.size.height)
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .contentShape(Rectangle())
+                // minimumDistance 0 so a single click jumps to that moment, and a
+                // drag scrubs continuously.
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { scrub(toX: $0.location.x, width: geo.size.width) }
+                )
             }
             .frame(height: 30)
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+            .help("Click or drag to scrub through your timeline")
         }
+    }
+
+    /// White handle marking the current moment. The bar runs oldest → newest
+    /// (left → right), so the newest moment (index 0) sits at the right edge.
+    private func playhead(width: CGFloat, height: CGFloat) -> some View {
+        Capsule()
+            .fill(Color.cascadeText)
+            .frame(width: 3, height: height + 8)
+            .shadow(color: .black.opacity(0.55), radius: 2)
+            .position(x: playheadX(width), y: height / 2)
+            .allowsHitTesting(false)
+    }
+
+    private func playheadX(_ width: CGFloat) -> CGFloat {
+        let count = max(contexts.count, 1)
+        let ordinal = count - 1 - min(max(currentIndex, 0), count - 1)  // 0 = oldest (left)
+        let fraction = (Double(ordinal) + 0.5) / Double(count)
+        return CGFloat(fraction) * width
+    }
+
+    /// Maps a tap/drag X into the matching moment index and reports it (only when it
+    /// actually changes, so dragging within one moment doesn't thrash state).
+    private func scrub(toX x: CGFloat, width: CGFloat) {
+        guard !contexts.isEmpty, width > 0 else { return }
+        let count = contexts.count
+        let fraction = min(max(Double(x / width), 0), 1)
+        let ordinal = min(Int(fraction * Double(count)), count - 1)  // 0 = oldest
+        let newIndex = count - 1 - ordinal
+        if newIndex != currentIndex { onScrub(newIndex) }
     }
 
     private var axis: some View {
