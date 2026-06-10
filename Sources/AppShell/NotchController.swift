@@ -165,20 +165,32 @@ struct NotchView: View {
     let baseNotch: CGSize
     @State private var expanded = false
 
-    /// Two sizes: the tab at the hardware-notch footprint (never resizes, even
-    /// while a voice request is in flight) and the full hover panel.
-    private enum Mode { case idle, expanded }
+    /// Three sizes: the tab at the hardware-notch footprint, the LIVE pill that
+    /// grows symmetrically left+right the moment the talk hotkey goes down (the
+    /// "it's listening now" signal), and the full hover panel.
+    private enum Mode { case idle, live, expanded }
 
-    private var mode: Mode { expanded ? .expanded : .idle }
+    private var mode: Mode {
+        if expanded { return .expanded }
+        return voiceState == .idle ? .idle : .live
+    }
 
     private var size: CGSize {
         switch mode {
         // Tall enough that the control row sits fully below the housing line.
         case .expanded: CGSize(width: panelWidth - 8, height: baseNotch.height + 46)
+        // Wider on both sides + a touch deeper — unmistakably "live".
+        case .live: CGSize(width: baseNotch.width + 150, height: baseNotch.height + 8)
         case .idle: baseNotch
         }
     }
-    private var radius: CGFloat { expanded ? 20 : 10 }
+    private var radius: CGFloat {
+        switch mode {
+        case .expanded: 20
+        case .live: 15
+        case .idle: 10
+        }
+    }
 
     /// One spring for every notch state change (frame, radius, shadow, content),
     /// so the tab morphs as a single piece instead of layering competing animations.
@@ -200,16 +212,50 @@ struct NotchView: View {
         ZStack {
             switch mode {
             case .expanded: expandedContent
+            case .live: liveContent
             case .idle: collapsedContent
             }
         }
         .frame(width: size.width, height: size.height)
         .background(NotchShape(bottomRadius: radius).fill(Color.black))
-        .overlay(NotchShape(bottomRadius: radius).stroke(Color.cascadeBorderHi.opacity(0.45), lineWidth: 1))
+        .overlay(NotchShape(bottomRadius: radius).stroke(liveStrokeColor, lineWidth: 1))
         .contentShape(NotchShape(bottomRadius: radius))
-        .shadow(color: .black.opacity(0.55), radius: expanded ? 22 : 7, y: expanded ? 11 : 4)
+        .shadow(color: shadowColor, radius: expanded ? 22 : (mode == .live ? 14 : 7), y: expanded ? 11 : 4)
         .onHover { hovering in expanded = hovering }
         .animation(Self.morph, value: mode)
+    }
+
+    private var liveStrokeColor: Color {
+        switch mode {
+        case .live: (voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent).opacity(0.55)
+        default: Color.cascadeBorderHi.opacity(0.45)
+        }
+    }
+
+    private var shadowColor: Color {
+        mode == .live && voiceState == .listening
+            ? Color.cascadeRecDot.opacity(0.35)
+            : .black.opacity(0.55)
+    }
+
+    // Live: the talk hotkey is down (or the reply is in flight) — the notch
+    // swells out both sides so there's zero doubt the mic is hot.
+    private var liveContent: some View {
+        HStack(spacing: 10) {
+            Image(systemName: voiceState == .listening ? "mic.fill" : "waveform")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent)
+            Text(voiceState == .listening ? "Listening…" : "Thinking…")
+                .font(.cascadeMono(11))
+                .foregroundStyle(Color.cascadeText2)
+            NotchStatusDot(
+                color: voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent,
+                pulsing: true
+            )
+        }
+        .padding(.horizontal, 16)
+        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
+        .onTapGesture { expandFromTap() }
     }
 
     // Idle: just the live indicator dots, hugging the top edge.
