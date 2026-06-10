@@ -409,8 +409,8 @@ public final class CascadeAppModel: ObservableObject {
     public func beginUseDeviceIntent(source: String = "manual") {
         selectedTab = .reel
         dock.show(
-            title: "Cascade is ready",
-            detail: "Teach or approve the next step before Cascade uses this Mac."
+            title: "Cascade is listening",
+            detail: "Say or type what you want done — Esc stops it at any time."
         )
         Task {
             _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "device.intent", detail: source))
