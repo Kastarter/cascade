@@ -903,6 +903,12 @@ public final class CascadeAppModel: ObservableObject {
         )
         var acted = false
         var count = 0
+        // Stall guard: a turn with no actions and no done is the model talking
+        // instead of working. One is tolerated (thinking out loud), the second
+        // gets a firm nudge, the third ends the episode — never a spam loop to
+        // the step cap repeating the same line.
+        var idleTurns = 0
+        var nudge: String?
         let episodeStart = ContinuousClock.now
         var modelTime = Duration.zero
         var actionTime = Duration.zero
@@ -931,12 +937,26 @@ public final class CascadeAppModel: ObservableObject {
                 return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
 
-            if !step.actions.isEmpty { acted = true }
+            if step.actions.isEmpty {
+                idleTurns += 1
+                if idleTurns >= 3 {
+                    auditTiming(outcome: "stalled")
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: String(step.text.prefix(120))))
+                    return .finished(step.text.isEmpty ? "I couldn't make progress on this." : step.text, acted: acted)
+                }
+                if idleTurns == 2 {
+                    nudge = "You have now replied twice without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
+                }
+            } else {
+                idleTurns = 0
+                nudge = nil
+                acted = true
+            }
             // Zoom is answered with the cropped frame, not a regular screenshot —
             // pull it out and run everything else first.
             var zoomRegion: CGRect?
             var actedThisTurn = false
-            for action in step.actions {
+            for (actionIndex, action) in step.actions.enumerated() {
                 // Re-check between every action — a barge-in or newer turn must
                 // halt mid-batch, not after the batch finishes.
                 if assistGeneration != gen || driver.runState.isStopRequested { return .stopped }
@@ -948,7 +968,11 @@ public final class CascadeAppModel: ObservableObject {
                 let actionStart = ContinuousClock.now
                 if !(await executeCU(action, on: screen)) { return .failed }
                 actionTime += actionStart.duration(to: .now)
-                try? await Task.sleep(for: .milliseconds(120))
+                // The pace gap matters BETWEEN actions; after the last one the
+                // settle sleep below covers it — no double wait.
+                if actionIndex < step.actions.count - 1 {
+                    try? await Task.sleep(for: .milliseconds(120))
+                }
             }
 
             if let zoomRegion {
@@ -956,7 +980,7 @@ public final class CascadeAppModel: ObservableObject {
                 if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
                     let modelStart = ContinuousClock.now
-                    step = await agent.proceed(screenshot: crop, note: groundingNote(), zoomResult: true)
+                    step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
                     modelTime += modelStart.duration(to: .now)
                     count += 1
                     continue
@@ -965,14 +989,15 @@ public final class CascadeAppModel: ObservableObject {
             }
             // Let the UI settle, then re-observe and ask for the next step. Capturing
             // at the agent's resolution as JPEG skips the PNG round-trip and OCR.
-            try? await Task.sleep(for: .milliseconds(260))
+            // A turn that did nothing changed nothing — skip the settle entirely.
+            if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
             let size = agent.captureSize
             guard let nextShot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) else {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
             let modelStart = ContinuousClock.now
-            step = await agent.proceed(screenshot: nextShot, note: groundingNote())
+            step = await agent.proceed(screenshot: nextShot, note: episodeNote(nudge))
             modelTime += modelStart.duration(to: .now)
             count += 1
         }
@@ -1011,6 +1036,13 @@ public final class CascadeAppModel: ObservableObject {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms — \(summary)"))
         }
         return result
+    }
+
+    /// The per-turn grounding note plus, when the stall guard fired, the firm
+    /// "act now or stop" nudge appended so the model can't keep idling.
+    private func episodeNote(_ nudge: String?) -> String? {
+        guard let nudge else { return groundingNote() }
+        return [groundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
     }
 
     /// One line of text grounding sent with every frame: which app and window are
