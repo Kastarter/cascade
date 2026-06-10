@@ -69,6 +69,14 @@ public final class InputRecorder: @unchecked Sendable {
     private let queueLock = NSLock()
     private var queue: [Raw] = []
 
+    // AX labels of clicked elements, resolved asynchronously at click time (the
+    // hit-test runs ms after the click, before the UI changes) and matched to
+    // their click events at drain time. The label is what lets a recipe replay
+    // re-find its target by identity instead of trusting a stale pixel (the
+    // tiptour-macos pattern — see docs/THIRD_PARTY_NOTICES.md).
+    private let labelLock = NSLock()
+    private var clickLabels: [(at: Date, x: Double, y: Double, label: String)] = []
+
     private var tap: CFMachPort?
     private var thread: Thread?
     private let runLoopLock = NSLock()
@@ -184,9 +192,11 @@ public final class InputRecorder: @unchecked Sendable {
             let clickState = event.getIntegerValueField(.mouseEventClickState)
             let point = event.location
             enqueue(.click(x: Double(point.x), y: Double(point.y), double: clickState >= 2, at: now, in: location))
+            resolveClickLabel(at: point, when: now)
         case .rightMouseDown:
             let point = event.location
             enqueue(.rightClick(x: Double(point.x), y: Double(point.y), at: now, in: location))
+            resolveClickLabel(at: point, when: now)
         case .scrollWheel:
             let dy = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
             let dx = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
@@ -230,6 +240,74 @@ public final class InputRecorder: @unchecked Sendable {
         queueLock.unlock()
     }
 
+    /// Hit-tests the AX element under a click off the tap thread (the tap callback
+    /// must stay fast). Runs only for events that already passed the app/window
+    /// privacy gate; the label TEXT gets its own check — an element title can
+    /// smuggle a sensitive phrase out of an otherwise unflagged window.
+    private func resolveClickLabel(at point: CGPoint, when: Date) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, let label = Self.axClickLabel(atCG: point),
+                  !PrivacyRules.isSensitiveText(label) else { return }
+            self.labelLock.lock()
+            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: label))
+            if self.clickLabels.count > 64 { self.clickLabels.removeFirst(self.clickLabels.count - 64) }
+            self.labelLock.unlock()
+        }
+    }
+
+    /// Whether a click's label has resolved yet (non-consuming — used to decide
+    /// whether to defer the click to the next drain).
+    private func hasClickLabel(at: Date, x: Double, y: Double) -> Bool {
+        labelLock.lock(); defer { labelLock.unlock() }
+        return clickLabels.contains {
+            abs($0.at.timeIntervalSince(at)) < 0.5 && abs($0.x - x) < 2 && abs($0.y - y) < 2
+        }
+    }
+
+    /// The resolved label for a click at (time, point), consuming it on match.
+    private func takeClickLabel(at: Date, x: Double, y: Double) -> String? {
+        labelLock.lock(); defer { labelLock.unlock() }
+        guard let index = clickLabels.firstIndex(where: {
+            abs($0.at.timeIntervalSince(at)) < 0.5 && abs($0.x - x) < 2 && abs($0.y - y) < 2
+        }) else { return nil }
+        return clickLabels.remove(at: index).label
+    }
+
+    /// Compact title of the clicked element (climbing to the nearest labeled,
+    /// actionable ancestor — hit-tests often land on an unlabeled leaf).
+    private static func axClickLabel(atCG point: CGPoint) -> String? {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.3)
+        var ref: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
+              var element = ref else { return nil }
+        let actionable: Set<String> = [
+            "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
+            "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton",
+            "AXCheckBox", "AXRadioButton", "AXTab", "AXOutlineRow", "AXStaticText",
+        ]
+        for _ in 0..<4 {
+            var roleRef: CFTypeRef?
+            let role = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success
+                ? (roleRef as? String ?? "") : ""
+            if actionable.contains(role) {
+                for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+                    var textRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(element, attribute as CFString, &textRef) == .success,
+                       let text = textRef as? String,
+                       !text.trimmingCharacters(in: .whitespaces).isEmpty {
+                        return String(text.prefix(80))
+                    }
+                }
+            }
+            var parentRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
+                  let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+            element = (parent as! AXUIElement)
+        }
+        return nil
+    }
+
     private func snapshotContext() -> AppContext {
         contextLock.lock(); defer { contextLock.unlock() }
         return currentContext
@@ -256,9 +334,35 @@ public final class InputRecorder: @unchecked Sendable {
         return items
     }
 
+    /// Puts deferred items back at the FRONT of the queue, ahead of anything that
+    /// arrived while draining, so event order is preserved.
+    private func requeue(_ items: [Raw]) {
+        queueLock.lock()
+        defer { queueLock.unlock() }
+        queue.insert(contentsOf: items, at: 0)
+    }
+
     private func drain() async {
-        let items = takePending()
+        var items = takePending()
         guard !items.isEmpty else { return }
+
+        // A click's AX label resolves asynchronously; a click captured right before
+        // this drain may not have its label yet. Defer that click AND everything
+        // after it to the next drain (order must be preserved — a recipe with
+        // reordered steps replays wrong). `stopped` flushes everything as-is.
+        if !stopped, let deferIndex = items.firstIndex(where: { item in
+            switch item {
+            case .click(let x, let y, _, let at, _), .rightClick(let x, let y, let at, _):
+                return Date().timeIntervalSince(at) < 0.35 && !hasClickLabel(at: at, x: x, y: y)
+            default:
+                return false
+            }
+        }) {
+            let deferred = Array(items[deferIndex...])
+            items.removeSubrange(deferIndex...)
+            requeue(deferred)
+            guard !items.isEmpty else { return }
+        }
 
         var events: [InputEvent] = []
         var typed = ""
@@ -282,10 +386,16 @@ public final class InputRecorder: @unchecked Sendable {
                 events.append(InputEvent(capturedAt: at, kind: .key, key: key, modifiers: modifiers, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
             case .click(let x, let y, let double, let at, let location):
                 flushTyped()
-                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                // For clicks, `text` carries the clicked element's AX label so the
+                // replay can re-find the target by identity.
+                let label = takeClickLabel(at: at, x: x, y: y)
+                if label == nil { logger.debug("click stored without AX label in \(location.app, privacy: .public)") }
+                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
             case .rightClick(let x, let y, let at, let location):
                 flushTyped()
-                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                let label = takeClickLabel(at: at, x: x, y: y)
+                if label == nil { logger.debug("right-click stored without AX label in \(location.app, privacy: .public)") }
+                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
             case .scroll(let x, let y, let dx, let dy, let at, let location):
                 flushTyped()
                 let modifiers = ["\(Int(dx))", "\(Int(dy))"]

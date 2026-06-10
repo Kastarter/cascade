@@ -45,11 +45,6 @@ public struct ElementLocator: Sendable {
         self.model = model
     }
 
-    private static let resolutions: [(w: Int, h: Int, ar: Double)] = [
-        (1024, 768, 1024.0 / 768.0),   // 4:3
-        (1280, 800, 1280.0 / 800.0),   // 16:10 (most Macs)
-        (1366, 768, 1366.0 / 768.0),   // ~16:9
-    ]
 
     /// Locates the element the user asked about. Returns its position in
     /// **display-local AppKit coordinates** (bottom-left origin), or nil when no
@@ -57,11 +52,14 @@ public struct ElementLocator: Sendable {
     /// Locates the element the user asked about **and** a one-sentence spoken
     /// instruction, in a single Computer Use call. `point` is display-local AppKit
     /// coords (bottom-left), nil when no confident element was found.
+    /// `conversation` carries the session's recent exchanges as plain text turns so
+    /// referential questions ("the second one") resolve against what just happened.
     public func guide(
         screenshot: Data,
         question: String,
         displayWidthPoints: Int,
-        displayHeightPoints: Int
+        displayHeightPoints: Int,
+        conversation: [(user: String, assistant: String)] = []
     ) async -> ElementGuidance {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return ElementGuidance(point: nil, speech: "Connect your Claude key first.")
@@ -70,7 +68,7 @@ public struct ElementLocator: Sendable {
         guard let jpeg = resize(image: screenshot, toWidth: res.w, toHeight: res.h) else {
             return ElementGuidance(point: nil, speech: "I couldn't read the screen image.")
         }
-        guard let result = await callComputerUse(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key) else {
+        guard let result = await callComputerUse(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key, conversation: conversation) else {
             return ElementGuidance(point: nil, speech: "I couldn't reach Claude just now.")
         }
 
@@ -96,7 +94,8 @@ public struct ElementLocator: Sendable {
         screenshot: Data,
         question: String,
         displayWidthPoints: Int,
-        displayHeightPoints: Int
+        displayHeightPoints: Int,
+        conversation: [(user: String, assistant: String)] = []
     ) async -> ElementRegion {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return ElementRegion(rect: nil, speech: "Connect your Claude key first.")
@@ -105,7 +104,7 @@ public struct ElementLocator: Sendable {
         guard let jpeg = resize(image: screenshot, toWidth: res.w, toHeight: res.h) else {
             return ElementRegion(rect: nil, speech: "I couldn't read the screen image.")
         }
-        guard let result = await callRegion(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key) else {
+        guard let result = await callRegion(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key, conversation: conversation) else {
             return ElementRegion(rect: nil, speech: "I couldn't reach Claude just now.")
         }
         let speech = result.say.isEmpty
@@ -125,7 +124,16 @@ public struct ElementLocator: Sendable {
         return ElementRegion(rect: rect, speech: speech)
     }
 
-    private func callRegion(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String) async -> (box: [CGFloat]?, say: String)? {
+    /// Prior session exchanges as plain text user/assistant messages, replayed
+    /// ahead of the current screenshot turn (old screenshots are never resent).
+    private static func historyMessages(_ conversation: [(user: String, assistant: String)]) -> [[String: Any]] {
+        conversation.flatMap { turn -> [[String: Any]] in
+            [["role": "user", "content": turn.user],
+             ["role": "assistant", "content": turn.assistant]]
+        }
+    }
+
+    private func callRegion(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String, conversation: [(user: String, assistant: String)] = []) async -> (box: [CGFloat]?, say: String)? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 20
@@ -150,7 +158,7 @@ public struct ElementLocator: Sendable {
             // and plenty accurate for framing, so the find loop isn't bottlenecked on it.
             "model": AnthropicModel.haiku,
             "max_tokens": 400,
-            "messages": [[
+            "messages": Self.historyMessages(conversation) + [[
                 "role": "user",
                 "content": [
                     ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
@@ -184,17 +192,10 @@ public struct ElementLocator: Sendable {
     }
 
     private func bestResolution(forWidth width: Int, height: Int) -> (w: Int, h: Int) {
-        let aspect = Double(width) / Double(max(1, height))
-        var best = (w: 1280, h: 800)
-        var bestDiff = Double.greatestFiniteMagnitude
-        for r in Self.resolutions {
-            let diff = abs(aspect - r.ar)
-            if diff < bestDiff { bestDiff = diff; best = (r.w, r.h) }
-        }
-        return best
+        AgentResolution.best(forWidth: width, height: height)
     }
 
-    private func callComputerUse(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String) async -> (point: CGPoint?, text: String)? {
+    private func callComputerUse(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String, conversation: [(user: String, assistant: String)] = []) async -> (point: CGPoint?, text: String)? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 20
@@ -222,7 +223,7 @@ public struct ElementLocator: Sendable {
                 "display_height_px": declaredH,
             ]],
             "tool_choice": ["type": "tool", "name": "computer"],
-            "messages": [[
+            "messages": Self.historyMessages(conversation) + [[
                 "role": "user",
                 "content": [
                     ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],

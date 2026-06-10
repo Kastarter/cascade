@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import ProviderKit
 
 /// One part of a job, sized so a single Computer Use episode can finish it within
@@ -54,21 +55,35 @@ public struct AgentTaskPlanner: Sendable {
 
     /// Plans `task`. Never fails: if the call or the parse falls over, the whole
     /// task becomes a single subtask — exactly the pre-planner behavior.
-    public func plan(for task: String, in environment: Environment) async -> [AgentSubtask] {
+    /// `conversationContext` is the session's recent exchanges as plain text, so a
+    /// follow-up job ("now reply to the first one") is split against what the user
+    /// and the agent just did instead of in a vacuum.
+    public func plan(
+        for task: String, in environment: Environment, conversationContext: String = ""
+    ) async -> [AgentSubtask] {
+        let memo = conversationContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = memo.isEmpty
+            ? "Job: \(task)"
+            : "Recent conversation (resolve references like \"it\" or \"the first one\" from here; the job below is what to plan):\n\(memo)\n\nJob: \(task)"
         let raw = try? await client.complete(
             system: Self.systemPrompt(for: environment),
-            user: "Job: \(task)",
+            user: user,
             model: model,
             maxTokens: 700
         )
         if let raw, let parsed = Self.parse(raw) {
             return Array(parsed.prefix(Self.maxSubtasks))
         }
+        // Degrading to one subtask is safe but should never be invisible — a key,
+        // network, or schema problem would otherwise just look like "worse plans".
+        Self.logger.error("planner fell back to a single subtask — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
         switch environment {
         case .webSandbox: return [AgentSubtask(task: task, startURL: Self.searchURL(for: task))]
         case .onScreen: return [AgentSubtask(task: task)]
         }
     }
+
+    private static let logger = Logger(subsystem: "com.humain.cascade", category: "planner")
 
     static let maxSubtasks = 5
 

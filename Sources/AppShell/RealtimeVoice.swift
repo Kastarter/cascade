@@ -40,6 +40,10 @@ final class RealtimeSocket: @unchecked Sendable {
     }
 }
 
+private final class ConverterInputState: @unchecked Sendable {
+    var hasFedBuffer = false
+}
+
 /// Replaces the Apple Speech / AVSpeechSynthesizer voice with OpenAI **GPT-Realtime-2**:
 /// push-to-talk audio streams up as PCM16, the user's transcript comes back and is handed
 /// to Claude (`onUtterance`), and Claude's reply is spoken by the realtime voice. Same
@@ -264,14 +268,13 @@ public final class RealtimeVoice: ObservableObject {
             let ratio = 24_000.0 / inFormat.sampleRate
             let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
             guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else { return }
-            // Heap flag (UnsafeMutablePointer is Sendable) so the @Sendable converter
-            // input block can mark the single buffer as consumed without capturing a var.
-            let fed = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
-            fed.initialize(to: false)
-            defer { fed.deallocate() }
+            let inputState = ConverterInputState()
             let inputBlock: AVAudioConverterInputBlock = { _, status in
-                if fed.pointee { status.pointee = .noDataNow; return nil }
-                fed.pointee = true
+                if inputState.hasFedBuffer {
+                    status.pointee = .noDataNow
+                    return nil
+                }
+                inputState.hasFedBuffer = true
                 status.pointee = .haveData
                 return buffer
             }

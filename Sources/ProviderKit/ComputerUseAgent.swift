@@ -63,7 +63,9 @@ public final class ComputerUseAgent {
     ONE turn instead of re-observing between them; take uncertain steps one at a time. \
     Be silent and extremely brief: do NOT narrate, explain, or describe what you see or \
     plan — just act. Only when the whole task is finished, reply with a confirmation of \
-    five words or fewer.
+    five words or fewer. Earlier exchanges from this session may precede the task; use \
+    them to resolve references like "it", "that one", or "the first one" — they are \
+    context, not new work.
     """
 
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
@@ -92,7 +94,15 @@ public final class ComputerUseAgent {
     /// `ScreenCaptureUtility.captureCursorScreenJPEG`) so `proceed` skips resizing.
     public var captureSize: (width: Int, height: Int) { (resW, resH) }
 
-    public func begin(goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int) async -> CUStep {
+    /// `conversation` is the session's recent (user, assistant) exchanges, replayed
+    /// as plain text turns ahead of the screenshot so the model resolves references
+    /// like "the first one" or "reply to it" against what just happened. Old
+    /// screenshots are never resent — only the words (the clicky/openclicky
+    /// pattern; see docs/THIRD_PARTY_NOTICES.md).
+    public func begin(
+        goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int,
+        conversation: [(user: String, assistant: String)] = []
+    ) async -> CUStep {
         messages = []
         pendingToolIDs = []
         displayW = displayWidthPoints
@@ -102,6 +112,10 @@ public final class ComputerUseAgent {
         resH = res.h
         guard let jpeg = resize(screenshot, resW, resH) else {
             return CUStep(actions: [], text: "I couldn't read the screen.", done: true)
+        }
+        for turn in conversation {
+            messages.append(["role": "user", "content": turn.user])
+            messages.append(["role": "assistant", "content": turn.assistant])
         }
         messages.append([
             "role": "user",
@@ -296,15 +310,7 @@ public final class ComputerUseAgent {
     }
 
     private func bestResolution(_ width: Int, _ height: Int) -> (w: Int, h: Int) {
-        let aspect = Double(width) / Double(max(1, height))
-        let options: [(w: Int, h: Int, ar: Double)] = [(1024, 768, 1.333), (1280, 800, 1.6), (1366, 768, 1.779)]
-        var best = (w: 1280, h: 800)
-        var bestDiff = Double.greatestFiniteMagnitude
-        for option in options where abs(aspect - option.ar) < bestDiff {
-            bestDiff = abs(aspect - option.ar)
-            best = (option.w, option.h)
-        }
-        return best
+        AgentResolution.best(forWidth: width, height: height)
     }
 
     private func resize(_ imageData: Data, _ width: Int, _ height: Int) -> Data? {
