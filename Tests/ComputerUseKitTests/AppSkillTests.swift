@@ -100,10 +100,45 @@ struct AppSkillTests {
         #expect(skill?.axUnreliable == false)
     }
 
-    @Test func rejectsMissingFenceAndMalformedJSON() {
-        #expect(parsed("# No fence here\n\nJust prose.") == nil)
+    @Test func missingFenceYieldsTaskSkillWithDefaultHints() {
+        // Pure task skills carry no hints fence — they parse, join the index,
+        // but never app-match and carry no policies.
+        let skill = parsed("# Research\n\nJust prose.", path: "/tmp/skills/web-research/SKILL.md")
+        #expect(skill?.name == "web-research")
+        #expect(skill?.axUnreliable == false)
+        #expect(skill?.matches(appName: "Safari", bundleIdentifier: "com.apple.Safari") == false)
+    }
+
+    @Test func rejectsMalformedHintsJSON() {
         let broken = blenderFixture.replacingOccurrences(of: "\"axUnreliable\": true", with: "\"axUnreliable\": ")
         #expect(parsed(broken) == nil)
+    }
+
+    @Test func useWhenParsesAndFallsBackToDescription() {
+        let withUseWhen = blenderFixture.replacingOccurrences(
+            of: "---\nname: blender\n",
+            with: "---\nname: blender\nuseWhen: any 3D work\n"
+        )
+        #expect(parsed(withUseWhen)?.useWhen == "any 3D work")
+        #expect(parsed(blenderFixture)?.useWhen == "Drives Blender's modal keyboard workflows.")
+    }
+
+    @Test func indexRendersOneLinePerSkill() throws {
+        let a = try #require(parsed(blenderFixture))
+        let b = try #require(parsed("# Notes\n\nProse.", path: "/tmp/skills/web-research/SKILL.md"))
+        let index = try #require(AppSkillRegistry(skills: [a, b]).indexText)
+        #expect(index.contains("- blender: Drives Blender's modal keyboard workflows."))
+        #expect(index.contains("- web-research: web-research"))
+        #expect(index.contains("use_skill"))
+        #expect(!index.contains("Work from screenshots"))  // index never carries content
+        #expect(AppSkillRegistry(skills: []).indexText == nil)
+    }
+
+    @Test func namedLookupIsCaseInsensitive() throws {
+        let registry = AppSkillRegistry(skills: [try #require(parsed(blenderFixture))])
+        #expect(registry.skill(named: "Blender")?.name == "blender")
+        #expect(registry.skill(named: " blender ")?.name == "blender")
+        #expect(registry.skill(named: "nope") == nil)
     }
 
     @Test func axUnreliableDefaultsFalseAndParsesTrue() {
@@ -206,5 +241,21 @@ struct AppSkillTests {
         #expect(blender?.keysFollowPointer == true)
         #expect(blender?.shouldTypePhysicalKeys("3") == true)
         #expect(blender?.instructions.contains("one") == true)
+    }
+
+    @Test func bundledStarterPackLoads() {
+        let registry = AppSkillRegistry.load()
+        #expect(registry.skills.count >= 13)
+        let names = registry.skills.map { $0.name.lowercased() }
+        #expect(Set(names).count == names.count)  // unique
+        for expected in ["blender", "email", "spreadsheets", "web-research", "terminal", "messaging", "finder"] {
+            #expect(registry.skill(named: expected) != nil, "missing bundled skill: \(expected)")
+        }
+        // Every bundled skill has a usable index line and pullable content.
+        for skill in registry.skills {
+            #expect(!skill.useWhen.isEmpty)
+            #expect(!skill.instructions.isEmpty)
+        }
+        #expect(registry.indexText?.contains("- figma:") == true)
     }
 }

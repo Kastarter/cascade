@@ -98,13 +98,16 @@ public struct AppSkillRuntimeHints: Decodable, Sendable {
 public struct AppSkill: Sendable {
     public let name: String
     public let description: String
+    /// One line for the agent's skill index: when this skill should be pulled.
+    /// From `useWhen:` frontmatter, falling back to the description.
+    public let useWhen: String
     /// "user" (App Support/Cascade/Skills) or "bundled" (app resources).
     public let source: String
     public let path: String
     public let markdown: String
     public let hints: AppSkillRuntimeHints
     /// The markdown body with frontmatter and the hints fence stripped — what
-    /// gets injected into the agent's prompt.
+    /// the agent receives when it pulls the skill.
     public let instructions: String
 
     public var axUnreliable: Bool { hints.axUnreliable }
@@ -179,6 +182,26 @@ public struct AppSkillRegistry: Sendable {
         skills.first { $0.matches(appName: appName, bundleIdentifier: bundleIdentifier) }
     }
 
+    /// Lookup for the agent's use_skill tool — exact name, case-insensitive.
+    public func skill(named name: String) -> AppSkill? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return skills.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
+    }
+
+    /// The one-line-per-skill index sent in the agent's first turn. Content is
+    /// pulled via the use_skill tool, never pushed — this is all the prompt
+    /// carries no matter how large the library grows.
+    public var indexText: String? {
+        guard !skills.isEmpty else { return nil }
+        let lines = skills.map { "- \($0.name): \($0.useWhen)" }
+        return """
+        Skills available through your use_skill tool — proven playbooks for specific \
+        apps and tasks. When one matches what you're about to do, call use_skill with \
+        its name BEFORE acting and follow its instructions:
+        \(lines.joined(separator: "\n"))
+        """
+    }
+
     /// Maps modal numeric text to the key names the actuator's keymap accepts,
     /// one key per character. Returns nil if ANY character is unmappable so a
     /// partially typed value never reaches the app.
@@ -213,16 +236,28 @@ public struct AppSkillRegistry: Sendable {
     }
 
     static func parseSkill(markdown: String, path: String, source: String) -> AppSkill? {
-        guard let hintsJSON = fencedRuntimeHints(in: markdown),
-              let hintsData = hintsJSON.data(using: .utf8),
-              let hints = try? JSONDecoder().decode(AppSkillRuntimeHints.self, from: hintsData) else {
-            return nil
+        // A hints fence is optional (pure task skills carry none), but a fence
+        // that exists and fails to decode means a typo — reject loudly rather
+        // than silently dropping its policies.
+        let hints: AppSkillRuntimeHints
+        if let hintsJSON = fencedRuntimeHints(in: markdown) {
+            guard let hintsData = hintsJSON.data(using: .utf8),
+                  let decoded = try? JSONDecoder().decode(AppSkillRuntimeHints.self, from: hintsData) else {
+                return nil
+            }
+            hints = decoded
+        } else {
+            hints = AppSkillRuntimeHints()
         }
         let metadata = frontMatter(in: markdown)
         let fallbackName = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
+        let description = metadata["description"] ?? ""
+        let name = metadata["name"] ?? fallbackName
+        let useWhen = metadata["useWhen"] ?? (description.isEmpty ? name : description)
         return AppSkill(
-            name: metadata["name"] ?? fallbackName,
-            description: metadata["description"] ?? "",
+            name: name,
+            description: description,
+            useWhen: useWhen,
             source: source,
             path: path,
             markdown: markdown,

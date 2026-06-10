@@ -791,21 +791,25 @@ public final class CascadeAppModel: ObservableObject {
     private func runAssistEpisode(
         goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
-        let agent = ComputerUseAgent(environmentNote: ComputerUseAgent.foregroundBrowserNote)
+        // Pull-based skills: the agent gets a one-line index and fetches a
+        // skill's full instructions itself via the use_skill tool. Content
+        // never rides the prompt (token cost stays flat as the library grows).
+        let agent = ComputerUseAgent(
+            environmentNote: ComputerUseAgent.foregroundBrowserNote,
+            skillProvider: { [appSkills] name in appSkills.skill(named: name)?.promptBlock }
+        )
         // Runaway backstop, not a budget. The episode's real terminators are the
         // model finishing, STOP / barge-in, stall detection, or a newer turn
         // superseding this one — a low cap here just killed long honest tasks.
         let maxSteps = 80
-        // App-skill instructions already injected this episode (each episode is
-        // a fresh API conversation, so re-injection tracking lives here).
-        var injectedSkills: Set<String> = []
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height),
             conversation: assistMemory.historyForAPI(),
-            note: groundingNote(injectedSkills: &injectedSkills)
+            note: groundingNote(),
+            skillIndex: appSkills.indexText
         )
         var acted = false
         var count = 0
@@ -840,7 +844,7 @@ public final class CascadeAppModel: ObservableObject {
                 // Native-resolution crop so the model can actually read small text.
                 if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
-                    step = await agent.proceed(screenshot: crop, note: groundingNote(injectedSkills: &injectedSkills), zoomResult: true)
+                    step = await agent.proceed(screenshot: crop, note: groundingNote(), zoomResult: true)
                     count += 1
                     continue
                 }
@@ -854,18 +858,17 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
-            step = await agent.proceed(screenshot: nextShot, note: groundingNote(injectedSkills: &injectedSkills))
+            step = await agent.proceed(screenshot: nextShot, note: groundingNote())
             count += 1
         }
         return .stepLimit
     }
 
     /// One line of text grounding sent with every frame: which app and window are
-    /// frontmost. ~15 tokens that prevent which-app-am-I-in mistakes. When the
-    /// frontmost app has an app skill, the full cheat sheet rides along the first
-    /// time it's seen this episode; later turns carry a one-line reminder so long
-    /// runs stay anchored to instructions many turns back.
-    private func groundingNote(injectedSkills: inout Set<String>) -> String? {
+    /// frontmost. ~15 tokens that prevent which-app-am-I-in mistakes. When a skill
+    /// covers the frontmost app, a one-line nudge points at it — the content itself
+    /// is pulled by the agent through use_skill, never pushed.
+    private func groundingNote() -> String? {
         let snapshot = AppWindowObserver.snapshot()
         guard snapshot.appName != "Unknown app" else { return nil }
         var note: String
@@ -875,11 +878,7 @@ public final class CascadeAppModel: ObservableObject {
             note = "Frontmost app: \(snapshot.appName)"
         }
         if let skill = appSkills.skill(appName: snapshot.appName, bundleIdentifier: snapshot.bundleIdentifier) {
-            if injectedSkills.insert(skill.name).inserted {
-                note += "\n\n" + skill.promptBlock
-            } else {
-                note += "\nActive app skill: \(skill.name) — its instructions above apply."
-            }
+            note += "\nSkill “\(skill.name)” covers this app — pull it with use_skill before acting here, if you haven't already."
         }
         return note
     }

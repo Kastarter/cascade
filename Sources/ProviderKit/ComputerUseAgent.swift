@@ -53,6 +53,9 @@ public final class ComputerUseAgent {
 
     private var messages: [[String: Any]] = []
     private var pendingToolIDs: [String] = []
+    /// Text answers for tool_use ids resolved in-process (use_skill pulls) —
+    /// consumed by the next tool_result turn instead of the generic "done".
+    private var toolResultOverrides: [String: String] = [:]
     private var resW = 1280
     private var resH = 800
     private var displayW = 0
@@ -62,6 +65,10 @@ public final class ComputerUseAgent {
     /// Extra environment context appended to the system prompt (e.g. "you're in a web
     /// sandbox with no tabs or address bar").
     private let environmentNote: String?
+    /// Resolves a use_skill tool call to that skill's full instructions. When set,
+    /// the use_skill tool is offered and the skill index (from `begin`) tells the
+    /// model what it can pull. Pull-based: skill content never rides the prompt.
+    private let skillProvider: ((String) -> String?)?
 
     /// Keeps the model terse and decisive: no narration (fewer output tokens → faster
     /// turns and short text-to-speech), confident action chains batched into one turn
@@ -102,12 +109,14 @@ public final class ComputerUseAgent {
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         model: String = AnthropicModel.sonnet,
         effort: String = "medium",
-        environmentNote: String? = nil
+        environmentNote: String? = nil,
+        skillProvider: ((String) -> String?)? = nil
     ) {
         self.keyStore = keyStore
         self.model = model
         self.effort = effort
         self.environmentNote = environmentNote
+        self.skillProvider = skillProvider
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -124,12 +133,16 @@ public final class ComputerUseAgent {
     /// frame — ~15 tokens that remove a whole class of which-app-am-I-in mistakes.
     /// Instruction text goes BEFORE the image (per Anthropic's computer-use
     /// guidance, it measurably improves click accuracy).
+    /// `skillIndex` is the one-line-per-skill catalogue for the use_skill tool —
+    /// names + when-to-pull only; the content itself is fetched on demand.
     public func begin(
         goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int,
-        conversation: [(user: String, assistant: String)] = [], note: String? = nil
+        conversation: [(user: String, assistant: String)] = [], note: String? = nil,
+        skillIndex: String? = nil
     ) async -> CUStep {
         messages = []
         pendingToolIDs = []
+        toolResultOverrides = [:]
         displayW = displayWidthPoints
         displayH = displayHeightPoints
         let res = bestResolution(displayWidthPoints, displayHeightPoints)
@@ -143,6 +156,7 @@ public final class ComputerUseAgent {
             messages.append(["role": "assistant", "content": turn.assistant])
         }
         var content: [[String: Any]] = [["type": "text", "text": "Task: \(goal)"]]
+        if skillProvider != nil, let skillIndex { content.append(["type": "text", "text": skillIndex]) }
         if let note { content.append(["type": "text", "text": note]) }
         content.append(imageBlock(jpeg))
         messages.append(["role": "user", "content": content])
@@ -157,22 +171,29 @@ public final class ComputerUseAgent {
             return CUStep(actions: [], text: "", done: true)
         }
         var results: [[String: Any]] = []
-        for (index, id) in pendingToolIDs.enumerated() {
-            if index == pendingToolIDs.count - 1 {
+        // The screenshot answers the last tool call that wasn't already resolved
+        // in-process (use_skill); resolved ids get their text instead of "done".
+        let imageID = pendingToolIDs.last { toolResultOverrides[$0] == nil } ?? pendingToolIDs.last
+        for id in pendingToolIDs {
+            if id == imageID {
                 var content: [[String: Any]] = []
+                if let text = toolResultOverrides[id] { content.append(["type": "text", "text": text]) }
                 if let note { content.append(["type": "text", "text": note]) }
                 content.append(imageBlock(jpeg))
                 results.append(["type": "tool_result", "tool_use_id": id, "content": content])
+            } else if let text = toolResultOverrides[id] {
+                results.append(["type": "tool_result", "tool_use_id": id, "content": text])
             } else {
                 results.append(["type": "tool_result", "tool_use_id": id, "content": "done"])
             }
         }
+        toolResultOverrides = [:]
         messages.append(["role": "user", "content": results])
         pruneScreenshots()
         return await step()
     }
 
-    private func step(retryOnTruncation: Bool = true) async -> CUStep {
+    private func step(retryOnTruncation: Bool = true, inlineHops: Int = 0) async -> CUStep {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return CUStep(actions: [], text: "Connect your Claude key first.", done: true)
         }
@@ -187,8 +208,8 @@ public final class ComputerUseAgent {
         // Cache the static prefix (system + tool defs) and the most recent turn, so the
         // growing screenshot history is re-read from cache instead of reprocessed.
         // The instant tools come first; the breakpoint on the last (computer) tool
-        // caches all three together.
-        let tools: [[String: Any]] = [
+        // caches all of them together.
+        var tools: [[String: Any]] = [
             [
                 "name": "open_app",
                 "description": "Instantly launch or switch to a macOS app by its exact name (e.g. \"Safari\", \"Notes\"). Call this whenever an app needs to be opened or focused — it is far faster than finding the app on screen.",
@@ -229,6 +250,17 @@ public final class ComputerUseAgent {
                 "cache_control": ["type": "ephemeral"],
             ],
         ]
+        if skillProvider != nil {
+            tools.insert([
+                "name": "use_skill",
+                "description": "Fetch the full instructions of one skill from the skill list in the first message. Skills are proven playbooks for specific apps and tasks. Whenever a listed skill matches what you are about to do, call this FIRST and follow the returned instructions — it is instant.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": ["name": ["type": "string", "description": "The skill's exact name from the list"]],
+                    "required": ["name"],
+                ],
+            ], at: 2)
+        }
         let system = environmentNote.map { "\(Self.systemPrompt)\n\n\($0)" } ?? Self.systemPrompt
         // Adaptive thinking is Anthropic's benchmarked setup for computer use on
         // Sonnet 4.6: the model plans before acting, and fewer wrong clicks means
@@ -275,6 +307,19 @@ public final class ComputerUseAgent {
                     if let app = input["name"] as? String { actions.append(.openApp(app)) }
                 case "open_url":
                     if let url = input["url"] as? String { actions.append(.openURL(url)) }
+                case "use_skill":
+                    // Resolved right here — no screen action needed. The text is
+                    // delivered as this id's tool_result (inline below, or via
+                    // proceed when batched with screen actions).
+                    let requested = input["name"] as? String ?? ""
+                    if let id = block["id"] as? String {
+                        if let text = skillProvider?(requested) {
+                            Self.logger.info("use_skill pulled: \(requested, privacy: .public)")
+                            toolResultOverrides[id] = text
+                        } else {
+                            toolResultOverrides[id] = "No skill named “\(requested)”. Use one of the exact names from the skill list in the first message."
+                        }
+                    }
                 case "highlight":
                     if let action = parseHighlight(input) { actions.append(action) }
                 default:
@@ -283,6 +328,24 @@ public final class ComputerUseAgent {
             default:
                 break
             }
+        }
+        // A turn that ONLY pulled skills needs no screen work — answer the tool
+        // calls with the skill text right away and let the model continue, without
+        // bouncing through the caller's screenshot loop. Hop-capped so a model
+        // stuck pulling skills forever falls back to the normal loop.
+        if !pendingToolIDs.isEmpty, actions.isEmpty,
+           pendingToolIDs.allSatisfy({ toolResultOverrides[$0] != nil }),
+           inlineHops < 3 {
+            var results: [[String: Any]] = []
+            for id in pendingToolIDs {
+                results.append([
+                    "type": "tool_result", "tool_use_id": id,
+                    "content": toolResultOverrides.removeValue(forKey: id) ?? "done",
+                ])
+            }
+            messages.append(["role": "user", "content": results])
+            pendingToolIDs = []
+            return await step(retryOnTruncation: retryOnTruncation, inlineHops: inlineHops + 1)
         }
         // A max_tokens truncation is NOT completion — with thinking enabled the
         // budget can run out before any tool call. If nothing actionable came back,
@@ -293,7 +356,7 @@ public final class ComputerUseAgent {
                 "role": "user",
                 "content": "Your reply was cut off before any tool call. Continue the task now — act with tool calls.",
             ])
-            return await step(retryOnTruncation: false)
+            return await step(retryOnTruncation: false, inlineHops: inlineHops)
         }
         let done = !(stopReason == "tool_use" || (stopReason == "max_tokens" && !pendingToolIDs.isEmpty))
         return CUStep(actions: actions, text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), done: done)

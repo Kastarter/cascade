@@ -1,6 +1,7 @@
 ---
 name: blender
 description: Use when controlling Blender — menus, modal transforms, object creation, movement, scaling, rotation, and keyboard workflows.
+useWhen: any work in Blender — 3D modeling, transforms, adding/deleting objects, importing models
 attribution: Adapted from milind-soni/tiptour-macos TipTour/Skills/blender/SKILL.md (MIT)
 ---
 
