@@ -239,15 +239,20 @@ struct NotchView: View {
     }
 
     // Live: the talk hotkey is down (or the reply is in flight) — the notch
-    // swells out both sides so there's zero doubt the mic is hot.
+    // swells out both sides, and while listening the waveform bars track the
+    // user's ACTUAL voice so they can see themselves being heard.
     private var liveContent: some View {
         HStack(spacing: 10) {
             Image(systemName: voiceState == .listening ? "mic.fill" : "waveform")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent)
-            Text(voiceState == .listening ? "Listening…" : "Thinking…")
-                .font(.cascadeMono(11))
-                .foregroundStyle(Color.cascadeText2)
+            if voiceState == .listening {
+                SpeechWaveform(level: model.voice.inputLevel, color: Color.cascadeRecDot)
+            } else {
+                Text("Thinking…")
+                    .font(.cascadeMono(11))
+                    .foregroundStyle(Color.cascadeText2)
+            }
             NotchStatusDot(
                 color: voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent,
                 pulsing: true
@@ -397,6 +402,33 @@ private struct CursorThemeSwatch: View {
         }
         .buttonStyle(.plain)
         .help("\(theme.displayName) — \(theme.blurb)")
+    }
+}
+
+/// Speech-reactive bars: each bar follows the live mic level with its own
+/// weight and a tiny phase wobble, so talking makes the notch visibly dance
+/// and silence settles it to a quiet baseline.
+private struct SpeechWaveform: View {
+    let level: Float
+    let color: Color
+    /// Per-bar sensitivity — center bars swing hardest, like a real meter.
+    private static let weights: [CGFloat] = [0.45, 0.75, 1.0, 0.85, 0.6, 0.9, 0.5]
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 2.5) {
+                ForEach(Self.weights.indices, id: \.self) { i in
+                    let wobble = 0.5 + 0.5 * sin(t * 9 + Double(i) * 1.7)
+                    let height = 3 + CGFloat(level) * Self.weights[i] * (10 + CGFloat(wobble) * 4)
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(color.opacity(0.55 + Double(level) * 0.45))
+                        .frame(width: 2.5, height: min(height, 16))
+                }
+            }
+            .frame(height: 16)
+            .animation(.linear(duration: 0.08), value: level)
+        }
     }
 }
 

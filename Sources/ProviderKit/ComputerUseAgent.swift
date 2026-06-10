@@ -95,10 +95,12 @@ public final class ComputerUseAgent {
     tell the user to do it themselves or merely describe the steps. When you are \
     confident in a short sequence — like clicking a field, typing into it, and \
     pressing Return — chain those tool calls in ONE turn instead of re-observing between \
-    them; take uncertain steps one at a time. Narrate your progress in ONE short clause \
-    (eight words max) when you start a distinct phase of the task — "opening the reply", \
-    "writing the poem now" — the user hears these, so keep them human; never describe \
-    coordinates, tools, or screenshots. After launching an app, the first frame may still \
+    them; take uncertain steps one at a time. Narrate in ONE short clause (eight words \
+    max) when you start a distinct phase — "opening the reply", "writing the poem now". \
+    The clause must announce what you are ABOUT to do in that same turn, placed BEFORE \
+    those tool calls — never describe work you already finished, and never repeat a \
+    clause you already said. The user hears these, so keep them human; no coordinates, \
+    tools, or screenshots. After launching an app, the first frame may still \
     show its splash or template screen — wait for it to settle, and NEVER repeat a \
     new-document action (cmd+n or a New button) until the current frame proves the \
     previous one didn't work: extra presses create extra documents. When the whole task \

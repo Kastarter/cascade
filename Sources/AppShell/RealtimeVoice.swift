@@ -54,6 +54,9 @@ public final class RealtimeVoice: ObservableObject {
 
     @Published public private(set) var state: VoiceState = .idle
     @Published public private(set) var transcript = ""
+    /// Live mic loudness (0…1, smoothed) while listening — drives the notch's
+    /// speech-reactive waveform so the user SEES their voice being heard.
+    @Published public private(set) var inputLevel: Float = 0
 
     /// Spoken phrase handed off to Claude when the user releases the talk key.
     public var onUtterance: ((String) -> Void)?
@@ -238,7 +241,13 @@ public final class RealtimeVoice: ObservableObject {
         transcript = ""
         socket?.sendEvent(["type": "input_audio_buffer.clear"])
         do {
-            try Self.installCaptureTap(engine: captureEngine, sender: socket!)
+            try Self.installCaptureTap(engine: captureEngine, sender: socket!) { [weak self] level in
+                Task { @MainActor in
+                    guard let self, self.state == .listening else { return }
+                    // Light smoothing so the bars breathe instead of flickering.
+                    self.inputLevel = self.inputLevel * 0.6 + level * 0.4
+                }
+            }
             state = .listening
         } catch {
             permissionMessage = "No microphone input is available."
@@ -249,11 +258,16 @@ public final class RealtimeVoice: ObservableObject {
     private func stopCapture() {
         captureEngine.inputNode.removeTap(onBus: 0)
         captureEngine.stop()
+        inputLevel = 0
     }
 
     /// Installs the mic tap from a `nonisolated` context (the audio render thread must
     /// not touch main-actor state) and streams converted PCM16/24k frames to the socket.
-    nonisolated private static func installCaptureTap(engine: AVAudioEngine, sender: RealtimeSocket) throws {
+    nonisolated private static func installCaptureTap(
+        engine: AVAudioEngine,
+        sender: RealtimeSocket,
+        onLevel: @escaping @Sendable (Float) -> Void
+    ) throws {
         let input = engine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
         guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
@@ -265,6 +279,25 @@ public final class RealtimeVoice: ObservableObject {
         }
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, _ in
+            // Cheap RMS on the raw float buffer (sampled, not every frame) so the
+            // notch waveform tracks the user's actual speech.
+            if let floats = buffer.floatChannelData?[0] {
+                let frames = Int(buffer.frameLength)
+                if frames > 0 {
+                    var sum: Float = 0
+                    let stride = max(1, frames / 256)
+                    var count = 0
+                    var i = 0
+                    while i < frames {
+                        sum += floats[i] * floats[i]
+                        count += 1
+                        i += stride
+                    }
+                    let rms = (sum / Float(max(count, 1))).squareRoot()
+                    // Map speech RMS (~0.01–0.3) into 0…1 with a soft knee.
+                    onLevel(min(1, rms * 6))
+                }
+            }
             let ratio = 24_000.0 / inFormat.sampleRate
             let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
             guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else { return }
