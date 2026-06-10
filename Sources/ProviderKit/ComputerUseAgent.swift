@@ -8,7 +8,11 @@ public enum CUAction: Sendable, Equatable {
     case move(x: Double, y: Double)
     case click(x: Double, y: Double)
     case doubleClick(x: Double, y: Double)
+    case tripleClick(x: Double, y: Double)
     case rightClick(x: Double, y: Double)
+    /// Press, drag, release — drawing on canvases, moving objects, selecting
+    /// ranges. Both points are display-local AppKit (bottom-left origin).
+    case drag(fromX: Double, fromY: Double, toX: Double, toY: Double)
     case type(String)
     case key(String)
     case scroll(x: Double, y: Double, direction: String, amount: Int)
@@ -71,8 +75,12 @@ public final class ComputerUseAgent {
     highlight, mark, point out, or show them something, USE it (this is YOUR capability; \
     it works in every app — never say an app doesn't support highlighting). If on-screen \
     text is too small to read confidently — message contents, sidebar items, small labels \
-    — use the computer tool's zoom action on that region instead of guessing. When you \
-    are confident in a short sequence — like clicking a field, typing into it, and \
+    — use the computer tool's zoom action on that region instead of guessing. Creative \
+    and hands-on work is YOURS to do: when asked to design, draw, write, build, or edit \
+    something in an app, carry it out yourself with clicks, drags (left_click_drag for \
+    drawing shapes, moving objects, selecting ranges), typing, and shortcuts — NEVER \
+    tell the user to do it themselves or merely describe the steps. When you are \
+    confident in a short sequence — like clicking a field, typing into it, and \
     pressing Return — chain those tool calls in ONE turn instead of re-observing between \
     them; take uncertain steps one at a time. Be silent and extremely brief: do NOT \
     narrate, explain, or describe what you see or plan — just act. Only when the whole \
@@ -335,8 +343,15 @@ public final class ComputerUseAgent {
         switch action {
         case "left_click", "left_mouse_down": return coordinate.map { .click(x: $0.x, y: $0.y) }
         case "double_click": return coordinate.map { .doubleClick(x: $0.x, y: $0.y) }
+        case "triple_click": return coordinate.map { .tripleClick(x: $0.x, y: $0.y) }
+        case "middle_click": return coordinate.map { .click(x: $0.x, y: $0.y) }
         case "right_click": return coordinate.map { .rightClick(x: $0.x, y: $0.y) }
         case "mouse_move": return coordinate.map { .move(x: $0.x, y: $0.y) }
+        case "left_click_drag":
+            guard let start = (input["start_coordinate"] as? [NSNumber]).flatMap({
+                $0.count == 2 ? scale(CGPoint(x: $0[0].doubleValue, y: $0[1].doubleValue)) : nil
+            }), let end = coordinate else { return nil }
+            return .drag(fromX: start.x, fromY: start.y, toX: end.x, toY: end.y)
         case "type": return (input["text"] as? String).map { .type($0) }
         case "key": return (input["text"] as? String).map { .key($0) }
         case "scroll":

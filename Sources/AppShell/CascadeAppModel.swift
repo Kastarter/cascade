@@ -530,6 +530,19 @@ public final class CascadeAppModel: ObservableObject {
             clickRememberedElement(pointed, utterance: q, gen: gen)
             return
         }
+        // "What did I do today?" → answer from the local record; no screen driving.
+        if Self.isRetrospective(q) {
+            teachMessage = "Checking your record…"
+            Task {
+                let answer = Self.brief((try? await orchestrator.ask(q)) ?? "I couldn't answer that from the local record.")
+                guard assistGeneration == gen else { return }
+                assistMemory.remember(user: q, assistant: answer)
+                teachMessage = answer
+                voice.speak(answer)
+                voice.done()
+            }
+            return
+        }
         // A referential follow-up inside a live conversation keeps the previous
         // turn's route: "now do the second one" after an action stays an action even
         // though the words alone wouldn't classify as one.
@@ -862,6 +875,24 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
                 try await clickRestoringCursor { try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y))) }
+            case .tripleClick(let x, let y):
+                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(150))
+                guidanceOverlay.press()
+                try? await Task.sleep(for: .milliseconds(55))
+                let p = cg(x, y)
+                try await clickRestoringCursor { try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y))) }
+            case .drag(let fromX, let fromY, let toX, let toY):
+                // The companion cursor traces the drag so the user sees the motion.
+                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(fromX, fromY))
+                try? await Task.sleep(for: .milliseconds(150))
+                guidanceOverlay.press()
+                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(toX, toY))
+                let from = cg(fromX, fromY)
+                let to = cg(toX, toY)
+                try await clickRestoringCursor {
+                    try await driver.act(.computerUse(.drag(fromX: from.x, fromY: from.y, toX: to.x, toY: to.y)))
+                }
             case .rightClick(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
                 try? await Task.sleep(for: .milliseconds(150))
@@ -872,7 +903,19 @@ public final class CascadeAppModel: ObservableObject {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
                 }
             case .type(let text):
-                try await driver.act(.computerUse(.typeText(text)))
+                // Tiered text entry (tiptour-macos ActionExecutor pattern): AX
+                // selected-text insertion (instant, never dropped) → clipboard
+                // paste with restore → paced synthetic keystrokes. Catalyst and
+                // Electron apps (WhatsApp, Slack) drop fast synthetic typing, so
+                // keystrokes are the LAST resort, not the default.
+                if driver.runState.isStopRequested { throw ComputerUseError.stopped }
+                if Self.axInsertText(text) {
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.ax", detail: String(text.prefix(60))))
+                } else if await pasteText(text) {
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.paste", detail: String(text.prefix(60))))
+                } else {
+                    try await driver.act(.computerUse(.typeText(text)))
+                }
             case .key(let combo):
                 let (key, modifiers) = Self.parseKey(combo)
                 try await driver.act(.computerUse(.key(key, modifiers: modifiers)))
@@ -965,6 +1008,53 @@ public final class CascadeAppModel: ObservableObject {
             if AXUIElementPerformAction(element, action as CFString) == .success { return true }
         }
         return false
+    }
+
+    /// Pastes text via the clipboard (cmd+V), restoring the user's previous
+    /// clipboard afterwards — tiptour-macos's fallback for apps whose fields
+    /// don't take AX insertion. Returns false if the paste keystroke fails.
+    private func pasteText(_ text: String) async -> Bool {
+        let pasteboard = NSPasteboard.general
+        // Snapshot what the user had so the agent never eats their clipboard.
+        let previous = pasteboard.pasteboardItems?.map { item -> NSPasteboardItem in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+            }
+            return copy
+        } ?? []
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        defer {
+            pasteboard.clearContents()
+            if !previous.isEmpty { pasteboard.writeObjects(previous) }
+        }
+        do {
+            try await driver.act(.computerUse(.key("v", modifiers: ["command"])))
+            // Let the app consume the pasteboard before we restore it.
+            try? await Task.sleep(for: .milliseconds(180))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Inserts text at the caret of the frontmost app's focused element by setting
+    /// `AXSelectedText` (the tiptour-macos `ActionExecutor` pattern — see
+    /// docs/THIRD_PARTY_NOTICES.md). Returns false when there's no focused,
+    /// settable text element — the caller falls back to synthetic keystrokes.
+    private static func axInsertText(_ text: String) -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        let appRef = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(appRef, 0.3)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appRef, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focused = focusedRef, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+        let element = focused as! AXUIElement
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
+              settable.boolValue else { return false }
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
     }
 
     private static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
@@ -1099,7 +1189,9 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// Heuristic: did the user ask Cascade to *do* something (act) vs *find/show*
-    /// something (point only)?
+    /// something (point only)? Imperatives ACT by default — a whitelist of verbs
+    /// kept failing open-ended requests ("design me a landing page" was coached
+    /// instead of done). Only clearly question-shaped asks stay point-only.
     private static func isActionRequest(_ text: String) -> Bool {
         let t = text.lowercased()
         // Highlight/mark requests go to the acting agent — it owns the highlight
@@ -1108,12 +1200,19 @@ public final class CascadeAppModel: ObservableObject {
         if t.contains("highlight") || t.contains("point out") || t.contains(" mark ") || t.hasPrefix("mark ") {
             return true
         }
-        let teachy = ["where", "how do i", "how can i", "show me", "find ", "what is", "which "]
+        let teachy = ["where", "how do i", "how can i", "show me", "find ", "what is", "what's",
+                      "which ", "who ", "is there", "are there", "can i ", "does "]
         if teachy.contains(where: { t.contains($0) }) { return false }
-        let verbs = ["open", "click", "press", "tap", "hit", "launch", "go to", "select",
-                     "choose", "turn on", "turn off", "enable", "disable", "close",
-                     "switch to", "play", "send", "submit", "run ", "do "]
-        return verbs.contains { t.contains($0) }
+        return true
+    }
+
+    /// Questions about the recorded past ("what did I do today?") — answered from
+    /// the local record, never by driving the screen.
+    private static func isRetrospective(_ text: String) -> Bool {
+        let t = text.lowercased()
+        let markers = ["what did", "what was", "what have", "did i ", "summar", "recap",
+                       "yesterday", "this morning", "this week", "last week", "earlier today"]
+        return markers.contains { t.contains($0) }
     }
 
     /// Global AppKit (bottom-left, primary-display origin) → CGEvent global

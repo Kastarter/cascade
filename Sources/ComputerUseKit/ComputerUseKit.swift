@@ -10,7 +10,11 @@ public enum ComputerUseAction: Equatable, Sendable {
     case move(x: Double, y: Double)
     case click(x: Double, y: Double)
     case doubleClick(x: Double, y: Double)
+    case tripleClick(x: Double, y: Double)
     case rightClick(x: Double, y: Double)
+    /// Press at (fromX, fromY), drag to (toX, toY), release — drawing, moving
+    /// objects, selecting ranges. Coordinates are CG global (top-left origin).
+    case drag(fromX: Double, fromY: Double, toX: Double, toY: Double)
     case key(String, modifiers: [String])
     case typeText(String)
     case scroll(deltaX: Double, deltaY: Double)
@@ -216,12 +220,16 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
             try click(at: CGPoint(x: x, y: y))
         case .doubleClick(let x, let y):
             try doubleClick(at: CGPoint(x: x, y: y))
+        case .tripleClick(let x, let y):
+            try tripleClick(at: CGPoint(x: x, y: y))
         case .rightClick(let x, let y):
             try rightClick(at: CGPoint(x: x, y: y))
+        case .drag(let fromX, let fromY, let toX, let toY):
+            try await drag(from: CGPoint(x: fromX, y: fromY), to: CGPoint(x: toX, y: toY))
         case .key(let key, let modifiers):
             try pressKey(key, modifiers: modifiers)
         case .typeText(let text):
-            try typeText(text)
+            try await typeText(text)
         case .scroll(let deltaX, let deltaY):
             try scroll(deltaX: deltaX, deltaY: deltaY)
         case .openURL(let raw):
@@ -256,6 +264,48 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
         down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    private func tripleClick(at point: CGPoint) throws {
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+            throw ComputerUseError.unsupported("Could not create triple-click event.")
+        }
+        for event in [down, up] {
+            event.setIntegerValueField(.mouseEventClickState, value: 3)
+        }
+        for _ in 0..<3 {
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// A real press-drag-release: down at the start, interpolated drag events so
+    /// apps that track the pointer (canvases, sliders, text selection) see a human-
+    /// like motion, then up at the destination.
+    private func drag(from start: CGPoint, to end: CGPoint) async throws {
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left) else {
+            throw ComputerUseError.unsupported("Could not create drag event.")
+        }
+        down.post(tap: .cghidEventTap)
+        let steps = 14
+        for index in 1...steps {
+            if runState?.isStopRequested == true {
+                // Always release the button — a stuck drag is worse than a stop.
+                CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)?
+                    .post(tap: .cghidEventTap)
+                throw ComputerUseError.stopped
+            }
+            let t = Double(index) / Double(steps)
+            let point = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
+            guard let dragged = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: point, mouseButton: .left) else { continue }
+            dragged.post(tap: .cghidEventTap)
+            try? await Task.sleep(for: .milliseconds(12))
+        }
+        guard let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left) else {
+            throw ComputerUseError.unsupported("Could not create drag-release event.")
+        }
         up.post(tap: .cghidEventTap)
     }
 
@@ -304,22 +354,34 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         up.post(tap: .cghidEventTap)
     }
 
-    private func typeText(_ text: String) throws {
-        for scalar in text.unicodeScalars {
+    /// Types in chunks with a small pace between events. Per-character bursts with
+    /// zero delay get DROPPED by Catalyst/Electron apps (WhatsApp, Slack…) — the
+    /// keys "press" but nothing lands in the field.
+    private func typeText(_ text: String) async throws {
+        let units = Array(text.utf16)
+        var index = 0
+        while index < units.count {
+            if runState?.isStopRequested == true { throw ComputerUseError.stopped }
+            let chunk = Array(units[index..<min(index + 16, units.count)])
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
                 throw ComputerUseError.unsupported("Could not create text event.")
             }
-            var value = UniChar(scalar.value)
-            down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &value)
-            up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &value)
+            chunk.withUnsafeBufferPointer { buffer in
+                down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: buffer.baseAddress)
+                up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: buffer.baseAddress)
+            }
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
+            try? await Task.sleep(for: .milliseconds(12))
+            index += 16
         }
     }
 }
 
 private enum KeyCodes {
+    /// Full ANSI layout — a shortcut with ANY letter/digit/symbol must work; an
+    /// "Unknown key" here used to abort entire agent runs (e.g. cmd+n in Figma).
     static func code(for key: String) -> CGKeyCode? {
         switch key.lowercased() {
         case "return", "enter": 36
@@ -327,10 +389,27 @@ private enum KeyCodes {
         case "tab": 48
         case "space": 49
         case "delete", "backspace": 51
+        case "forwarddelete": 117
+        case "home": 115
+        case "end": 119
+        case "pageup": 116
+        case "pagedown": 121
         case "left": 123
         case "right": 124
         case "down": 125
         case "up": 126
+        case "f1": 122
+        case "f2": 120
+        case "f3": 99
+        case "f4": 118
+        case "f5": 96
+        case "f6": 97
+        case "f7": 98
+        case "f8": 100
+        case "f9": 101
+        case "f10": 109
+        case "f11": 103
+        case "f12": 111
         case "a": 0
         case "s": 1
         case "d": 2
@@ -348,6 +427,36 @@ private enum KeyCodes {
         case "r": 15
         case "y": 16
         case "t": 17
+        case "o": 31
+        case "u": 32
+        case "i": 34
+        case "p": 35
+        case "l": 37
+        case "j": 38
+        case "k": 40
+        case "n": 45
+        case "m": 46
+        case "1": 18
+        case "2": 19
+        case "3": 20
+        case "4": 21
+        case "5": 23
+        case "6": 22
+        case "7": 26
+        case "8": 28
+        case "9": 25
+        case "0": 29
+        case "-", "minus": 27
+        case "=", "equal", "equals", "plus": 24
+        case "[": 33
+        case "]": 30
+        case "\\": 42
+        case ";": 41
+        case "'": 39
+        case ",", "comma": 43
+        case ".", "period": 47
+        case "/", "slash": 44
+        case "`", "grave": 50
         default: nil
         }
     }

@@ -210,8 +210,12 @@ public final class BackgroundWebAgent {
     private func apply(_ action: CUAction) async {
         func topLeftY(_ y: Double) -> CGFloat { WebSandbox.height - CGFloat(y) }
         switch action {
-        case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y):
+        case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y), .tripleClick(let x, let y):
             await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: topLeftY(y))
+        case .drag(_, _, let toX, let toY):
+            // No real drag in the JS bridge — landing on the destination is the
+            // closest meaningful approximation.
+            await sandbox.click(xTopLeft: CGFloat(toX), yTopLeft: topLeftY(toY))
         case .move:
             break  // no pointer in the sandbox
         case .type(let text):
