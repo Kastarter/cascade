@@ -905,7 +905,10 @@ public final class CascadeAppModel: ObservableObject {
                 dock.show(title: "Stopped", detail: teachMessage)
                 return .stopped
             }
-            if !step.text.isEmpty { teachMessage = prefix + step.text }
+            if !step.text.isEmpty {
+                teachMessage = prefix + step.text
+                if !step.done { narrateProgress(step.text) }
+            }
             if step.done {
                 return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
@@ -965,7 +968,13 @@ public final class CascadeAppModel: ObservableObject {
             return "Unknown harness tool “\(name)”."
         }
         let summary = call.auditSummary
-        dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · press STOP to take control.")
+        if name == "run_applescript" {
+            // First AppleScript touch of an app blocks on a macOS Automation
+            // consent dialog — without this hint the agent just looks frozen.
+            dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · approve the permission prompt if macOS shows one.")
+        } else {
+            dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · press STOP to take control.")
+        }
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: summary))
         return await AgentHarness.perform(call, powerEnabled: powerHarnessEnabled)
     }
@@ -1022,8 +1031,8 @@ public final class CascadeAppModel: ObservableObject {
                     try await driver.act(.computerUse(.move(x: p.x, y: p.y)))
                 }
             case .click(let x, let y):
-                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(150))  // let the cursor reach the target
+                let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))  // press only after the cursor ARRIVES
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))   // show the press dip
                 let p = cg(x, y)
@@ -1033,8 +1042,8 @@ public final class CascadeAppModel: ObservableObject {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
                 }
             case .doubleClick(let x, let y):
-                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(150))
+                let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
@@ -1044,8 +1053,8 @@ public final class CascadeAppModel: ObservableObject {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y))) }
                 }
             case .tripleClick(let x, let y):
-                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(150))
+                let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
@@ -1066,8 +1075,8 @@ public final class CascadeAppModel: ObservableObject {
                     try await driver.act(.computerUse(.drag(fromX: from.x, fromY: from.y, toX: to.x, toY: to.y)))
                 }
             case .rightClick(let x, let y):
-                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(150))
+                let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
@@ -1138,15 +1147,22 @@ public final class CascadeAppModel: ObservableObject {
                 agentDidHighlight = true
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.highlight", detail: label))
             case .openApp(let name):
-                // Instant programmatic launch — no Dock hunting, no cursor. Wait (up to
-                // ~2.5s) for the app to actually come frontmost so the next screenshot
-                // shows it rather than the launch animation.
+                // Instant programmatic launch — no Dock hunting, no cursor. Heavy apps
+                // (Word, Photoshop) take seconds to boot AND keep painting after they're
+                // technically frontmost — a too-early screenshot made the model repeat
+                // new-document actions ("4 untitled documents"). Wait until frontmost
+                // (up to ~8s), then give a cold launch a beat to finish drawing.
                 dock.show(title: "Opening \(name)", detail: "")
+                let wasAlreadyRunning = NSWorkspace.shared.runningApplications
+                    .contains { $0.localizedName?.caseInsensitiveCompare(name) == .orderedSame }
                 if await Self.openApp(named: name) {
-                    for _ in 0..<10 {
+                    for _ in 0..<32 {
                         if NSWorkspace.shared.frontmostApplication?.localizedName?
                             .caseInsensitiveCompare(name) == .orderedSame { break }
                         try? await Task.sleep(for: .milliseconds(250))
+                    }
+                    if !wasAlreadyRunning {
+                        try? await Task.sleep(for: .milliseconds(1200))
                     }
                 }
                 // On failure the next screenshot shows nothing changed and Claude
@@ -1167,6 +1183,21 @@ public final class CascadeAppModel: ObservableObject {
             teachMessage = "I need Accessibility + Input Monitoring to control the Mac."
             voice.speak("I need Accessibility and Input Monitoring permission to do that.")
             return false
+        }
+    }
+
+    private var lastNarrationAt = Date.distantPast
+
+    /// Keeps the agent talky while it works: the model's short progress lines
+    /// ("writing the poem now") go to the dock and — on voice — are spoken.
+    /// Throttled so chatty turns don't stack speech on speech.
+    private func narrateProgress(_ text: String) {
+        let line = String(text.split(separator: "\n").first ?? "").trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty else { return }
+        dock.show(title: "Cascade is working", detail: String(line.prefix(120)))
+        if line.count <= 120, Date().timeIntervalSince(lastNarrationAt) >= 4 {
+            lastNarrationAt = Date()
+            voice.speak(line)
         }
     }
 

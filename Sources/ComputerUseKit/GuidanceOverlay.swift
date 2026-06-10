@@ -172,15 +172,30 @@ public final class GuidanceOverlayController {
     /// Flies the companion to a global point for an *action* and keeps it parked
     /// there (no auto-return) so it can press. Call `hide()` when the task ends to
     /// resume following the user's cursor.
-    public func navigate(toGlobalPoint point: CGPoint) {
+    ///
+    /// Returns the estimated flight time so the caller can wait for the cursor
+    /// to actually ARRIVE before pressing — a fixed delay made long flights
+    /// visibly "click" while the cursor was still mid-air.
+    @discardableResult
+    public func navigate(toGlobalPoint point: CGPoint) -> TimeInterval {
         startFollowing()
         orderFront()
         returnTask?.cancel()
         returnTask = nil
         state.label = ""
         state.pointing = true
-        // Quick, snappy flight — the guide cursor should arrive fast, not amble.
-        moveCursor(to: point, response: 0.18)
+        // Distance-scaled: short hops stay snappy, cross-screen flights sweep
+        // smoothly instead of teleporting.
+        let distance = hypot(point.x - state.globalPoint.x, point.y - state.globalPoint.y)
+        let response = min(0.5, 0.16 + distance / 3200)
+        moveCursor(to: point, response: response)
+        switch state.theme.motion {
+        case .dart: return max(0.14, response * 0.55) + 0.05
+        case .swoop:
+            let leg = max(0.10, response * 0.45)
+            return distance > 90 ? leg * 1.7 + response * 0.8 : response + 0.05
+        case .glide, .trace: return response + 0.05
+        }
     }
 
     /// Plays a quick press/tap animation at the companion's current position.
