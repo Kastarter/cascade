@@ -909,10 +909,12 @@ public final class CascadeAppModel: ObservableObject {
                 // Electron apps (WhatsApp, Slack) drop fast synthetic typing, so
                 // keystrokes are the LAST resort, not the default.
                 if driver.runState.isStopRequested { throw ComputerUseError.stopped }
+                // Audit the mechanism and size only — never the text itself (the
+                // agent may type sensitive content the user dictated).
                 if Self.axInsertText(text) {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.ax", detail: String(text.prefix(60))))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.ax", detail: "chars=\(text.count)"))
                 } else if await pasteText(text) {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.paste", detail: String(text.prefix(60))))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.paste", detail: "chars=\(text.count)"))
                 } else {
                     try await driver.act(.computerUse(.typeText(text)))
                 }
