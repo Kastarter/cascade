@@ -455,6 +455,10 @@ public final class ComputerUseAgent {
     /// 12→3 batch sizing means a prune (and its one-off cache rewrite) happens at
     /// most every ~9 turns, keeping the prefix byte-identical in between.
     private func pruneScreenshots(keep: Int = 3, threshold: Int = 12) {
+        messages = Self.pruned(messages, keep: keep, threshold: threshold)
+    }
+
+    nonisolated static func pruned(_ messages: [[String: Any]], keep: Int = 3, threshold: Int = 12) -> [[String: Any]] {
         var imageTurns: [Int] = []
         for (index, message) in messages.enumerated() {
             guard let content = message["content"] as? [[String: Any]] else { continue }
@@ -467,20 +471,31 @@ public final class ComputerUseAgent {
             }
             if hasImage { imageTurns.append(index) }
         }
-        guard imageTurns.count > threshold else { return }
+        guard imageTurns.count > threshold else { return messages }
+        var out = messages
         for index in imageTurns.dropLast(keep) {
-            guard var content = messages[index]["content"] as? [[String: Any]] else { continue }
+            guard var content = out[index]["content"] as? [[String: Any]] else { continue }
             for block in content.indices {
                 switch content[block]["type"] as? String {
                 case "image":
                     content[block] = ["type": "text", "text": "[earlier screenshot omitted]"]
                 case "tool_result":
-                    content[block]["content"] = "[earlier screenshot omitted]"
+                    // Replace only the inner image; keep text blocks (grounding
+                    // notes, injected app-skill instructions) in history.
+                    if var inner = content[block]["content"] as? [[String: Any]] {
+                        for innerIndex in inner.indices where inner[innerIndex]["type"] as? String == "image" {
+                            inner[innerIndex] = ["type": "text", "text": "[earlier screenshot omitted]"]
+                        }
+                        content[block]["content"] = inner
+                    } else {
+                        content[block]["content"] = "[earlier screenshot omitted]"
+                    }
                 default:
                     break
                 }
             }
-            messages[index]["content"] = content
+            out[index]["content"] = content
         }
+        return out
     }
 }

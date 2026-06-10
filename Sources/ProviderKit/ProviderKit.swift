@@ -12,21 +12,71 @@ public struct ProviderMessage: Equatable, Sendable {
     }
 }
 
+/// Everything the chat knows when it answers: the whole recorded window plus
+/// question-targeted recall, layered so any kind of question about the user's
+/// day has grounding — shape ("what did I do?") via `timeline`, content ("what
+/// did that page say?") via `samples` and `relevant`, and "what just happened?"
+/// via `recent`.
+public struct ChatGrounding: Sendable {
+    /// The whole window, lightweight rows (no OCR) — drives the session digest.
+    public let timeline: [RecordedContext]
+    /// Representative on-screen text excerpts sampled across the window.
+    public let samples: [RecordedContext]
+    /// Moments whose recorded text matches the question's terms, best first.
+    public let relevant: [RecordedContext]
+    /// The freshest fully-decoded moments, OCR included.
+    public let recent: [RecordedContext]
+
+    public init(
+        timeline: [RecordedContext] = [],
+        samples: [RecordedContext] = [],
+        relevant: [RecordedContext] = [],
+        recent: [RecordedContext] = []
+    ) {
+        self.timeline = timeline
+        self.samples = samples
+        self.relevant = relevant
+        self.recent = recent
+    }
+
+    /// All moments deduped by id, preferring the OCR-rich copy of a row that
+    /// appears in several layers. Rows with id 0 (unsaved) are kept as-is.
+    public var allMoments: [RecordedContext] {
+        var seen = Set<Int64>()
+        var result: [RecordedContext] = []
+        for context in recent + relevant + samples + timeline {
+            if context.id != 0 {
+                guard seen.insert(context.id).inserted else { continue }
+            }
+            result.append(context)
+        }
+        return result
+    }
+}
+
 public protocol ContextQuestionAnswering: Sendable {
-    func answer(question: String, contexts: [RecordedContext]) async throws -> String
+    func answer(question: String, grounding: ChatGrounding) async throws -> String
 }
 
 public struct LocalGroundedAnswerer: ContextQuestionAnswering {
     public init() {}
 
-    public func answer(question: String, contexts: [RecordedContext]) async throws -> String {
-        let latest = contexts.sorted { $0.capturedAt > $1.capturedAt }.prefix(6)
-        guard let first = latest.first else {
+    public func answer(question: String, grounding: ChatGrounding) async throws -> String {
+        let sorted = grounding.allMoments.sorted { $0.capturedAt > $1.capturedAt }
+        guard let newest = sorted.first else {
             return "I do not have enough recorded context yet."
         }
 
-        let apps = Array(Set(latest.map(\.appName))).sorted().joined(separator: ", ")
-        let window = first.windowTitle.map { " The latest window was “\($0)”." } ?? ""
+        var counts: [String: Int] = [:]
+        for context in sorted {
+            counts[context.appName, default: 0] += 1
+        }
+        let apps = counts
+            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .prefix(4)
+            .map(\.key)
+            .joined(separator: ", ")
+        let window = newest.windowTitle.map { " The latest window was “\($0)”." } ?? ""
         return "From the local record, you were mostly in \(apps).\(window) This answer is grounded only in the stored context samples."
     }
 }

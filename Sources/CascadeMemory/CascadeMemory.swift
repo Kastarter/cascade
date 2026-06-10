@@ -327,6 +327,85 @@ public actor CascadeStore {
         }
     }
 
+    /// Moments captured at or after `since`, newest-first, decoded WITHOUT the
+    /// heavy OCR/metadata payloads so a whole day's worth stays cheap to load.
+    /// Grounds day-scale chat questions; use `recentContexts` when OCR is needed.
+    public func contextTimeline(since: Date, limit: Int = 8000) throws -> [RecordedContext] {
+        let sql = """
+        SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
+               NULL, image_path, NULL, frame_hash
+        FROM recorded_context
+        WHERE captured_at >= ?
+        ORDER BY captured_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(DateCodec.string(from: since), at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
+    /// One representative moment per app per clock hour — the one with the most
+    /// on-screen text — with the OCR trimmed to `excerptLength`. Spreads content
+    /// coverage across the whole window so the chat can answer about things seen
+    /// at any point in the day, not just recently. Newest-first.
+    public func contentSamples(since: Date, limit: Int = 48, excerptLength: Int = 400) throws -> [RecordedContext] {
+        let sql = """
+        SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
+               substr(ocr_text, 1, ?), image_path, NULL, frame_hash,
+               MAX(length(ocr_text))
+        FROM recorded_context
+        WHERE captured_at >= ? AND ocr_text IS NOT NULL AND length(ocr_text) > 0
+        GROUP BY substr(captured_at, 1, 13), app_name
+        ORDER BY captured_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(excerptLength))
+            bind(DateCodec.string(from: since), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
+    /// Moments whose recorded text matches ANY meaningful token of a natural-
+    /// language question, best match first (FTS5 bm25). Unlike `searchContexts`
+    /// — which ANDs every token, so a stopword-heavy question matches nothing —
+    /// this is the recall path for chat questions like "when was the assignment
+    /// due?". OCR is trimmed to `excerptLength`.
+    public func relevantContexts(to question: String, limit: Int = 12, excerptLength: Int = 400) throws -> [RecordedContext] {
+        let match = Self.ftsAnyQuery(from: question)
+        guard !match.isEmpty else { return [] }
+        let sql = """
+        SELECT c.id, c.captured_at, c.source, c.app_name, c.bundle_identifier, c.window_title,
+               substr(c.ocr_text, 1, ?), c.image_path, NULL, c.frame_hash
+        FROM rewind_fts
+        JOIN recorded_context c ON c.id = rewind_fts.rowid
+        WHERE rewind_fts MATCH ?
+        ORDER BY bm25(rewind_fts), c.captured_at DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(excerptLength))
+            bind(match, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
     /// Full-text search over the OCR text, window title, and app name of stored
     /// moments via the `rewind_fts` FTS5 index. Returns matches newest-first.
     public func searchContexts(query: String, limit: Int = 80) throws -> [RecordedContext] {
@@ -847,6 +926,30 @@ public actor CascadeStore {
             metadataJSON: text(statement, 8),
             frameHash: int64(statement, 9)
         )
+    }
+
+    /// Question words that carry no recall signal — dropped before building the
+    /// OR query in `ftsAnyQuery(from:)`.
+    private static let questionStopwords: Set<String> = [
+        "the", "and", "was", "were", "what", "when", "where", "which", "who", "whom",
+        "why", "how", "did", "does", "doing", "done", "have", "has", "had", "you",
+        "your", "yours", "about", "with", "from", "that", "this", "these", "those",
+        "for", "are", "show", "tell", "give", "find", "get", "see", "look", "today",
+        "yesterday", "earlier", "morning", "afternoon", "evening", "tonight", "day",
+        "week", "time", "thing", "things", "summary", "summarize", "recap"
+    ]
+
+    /// Turns a natural-language question into an FTS5 MATCH expression that ORs
+    /// its meaningful tokens (quoted, prefix-matched), so a question like "when
+    /// was the assignment due?" still recalls moments mentioning "assignment".
+    /// Returns `""` when nothing meaningful remains.
+    private static func ftsAnyQuery(from question: String) -> String {
+        let tokens = question
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 3 && !questionStopwords.contains($0) }
+        guard !tokens.isEmpty else { return "" }
+        return Array(Set(tokens)).sorted().map { "\"\($0)\"*" }.joined(separator: " OR ")
     }
 
     /// Turns free-form user input into a safe FTS5 MATCH expression: each

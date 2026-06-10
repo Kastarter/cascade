@@ -39,4 +39,15 @@ When source is copied or substantially adapted, add the original repository, fil
   green mint-glow cursor styling (white core, green edge, seafoam halo) is
   adapted from the TipTour companion's look.
 
+- `milind-soni/tiptour-macos` (MIT) — `TipTour/Skills/MarkdownAppSkill.swift`
+  → `Sources/ComputerUseKit/AppSkill.swift`. Adapted the markdown skill model,
+  frontmatter/fenced-hints parsing, app matching, physical-keys input policy,
+  and registry precedence. Cascade adds the `axUnreliable` hint and drops
+  commandAliases/targetPolicies/plannerInstructions.
+
+- `milind-soni/tiptour-macos` (MIT) — `TipTour/Skills/blender/SKILL.md`
+  → `Sources/ComputerUseKit/Skills/blender/SKILL.md`. Blender workflow
+  knowledge (modal transform sequencing, house recipe, import workflow)
+  rewritten for Cascade's computer-use agent.
+
 Do not copy TipTour Neko sprite assets unless their separate BSD 2-Clause license is included and the product actually needs them.

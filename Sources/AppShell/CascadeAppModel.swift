@@ -91,6 +91,10 @@ public final class CascadeAppModel: ObservableObject {
     private var sandboxRuntimes: [UUID: BackgroundWebAgent] = [:]
     private let sandboxBox = SandboxBoxController()
     private let elementLocator = ElementLocator()
+    /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
+    /// instructions plus runtime policies, matched against the frontmost app.
+    /// User files at App Support/Cascade/Skills override the bundled ones.
+    private let appSkills = AppSkillRegistry.load()
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -349,7 +353,9 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func runLoop(goal: String) async {
-        let maxSteps = 20
+        // Runaway backstop, not a budget — the loop's real terminators are the
+        // model finishing, STOP, or an error. Honest tasks shouldn't hit this.
+        let maxSteps = 60
         defer { agentRunning = false }
         for step in 1...maxSteps {
             if driver.runState.isStopRequested {
@@ -786,14 +792,20 @@ public final class CascadeAppModel: ObservableObject {
         goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
         let agent = ComputerUseAgent(environmentNote: ComputerUseAgent.foregroundBrowserNote)
-        let maxSteps = 28
+        // Runaway backstop, not a budget. The episode's real terminators are the
+        // model finishing, STOP / barge-in, stall detection, or a newer turn
+        // superseding this one — a low cap here just killed long honest tasks.
+        let maxSteps = 80
+        // App-skill instructions already injected this episode (each episode is
+        // a fresh API conversation, so re-injection tracking lives here).
+        var injectedSkills: Set<String> = []
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height),
             conversation: assistMemory.historyForAPI(),
-            note: Self.groundingNote()
+            note: groundingNote(injectedSkills: &injectedSkills)
         )
         var acted = false
         var count = 0
@@ -828,7 +840,7 @@ public final class CascadeAppModel: ObservableObject {
                 // Native-resolution crop so the model can actually read small text.
                 if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
-                    step = await agent.proceed(screenshot: crop, note: Self.groundingNote(), zoomResult: true)
+                    step = await agent.proceed(screenshot: crop, note: groundingNote(injectedSkills: &injectedSkills), zoomResult: true)
                     count += 1
                     continue
                 }
@@ -842,21 +854,34 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
-            step = await agent.proceed(screenshot: nextShot, note: Self.groundingNote())
+            step = await agent.proceed(screenshot: nextShot, note: groundingNote(injectedSkills: &injectedSkills))
             count += 1
         }
         return .stepLimit
     }
 
     /// One line of text grounding sent with every frame: which app and window are
-    /// frontmost. ~15 tokens that prevent which-app-am-I-in mistakes.
-    private static func groundingNote() -> String? {
+    /// frontmost. ~15 tokens that prevent which-app-am-I-in mistakes. When the
+    /// frontmost app has an app skill, the full cheat sheet rides along the first
+    /// time it's seen this episode; later turns carry a one-line reminder so long
+    /// runs stay anchored to instructions many turns back.
+    private func groundingNote(injectedSkills: inout Set<String>) -> String? {
         let snapshot = AppWindowObserver.snapshot()
         guard snapshot.appName != "Unknown app" else { return nil }
+        var note: String
         if let title = snapshot.windowTitle, !title.isEmpty {
-            return "Frontmost app: \(snapshot.appName) — “\(title)”"
+            note = "Frontmost app: \(snapshot.appName) — “\(title)”"
+        } else {
+            note = "Frontmost app: \(snapshot.appName)"
         }
-        return "Frontmost app: \(snapshot.appName)"
+        if let skill = appSkills.skill(appName: snapshot.appName, bundleIdentifier: snapshot.bundleIdentifier) {
+            if injectedSkills.insert(skill.name).inserted {
+                note += "\n\n" + skill.promptBlock
+            } else {
+                note += "\nActive app skill: \(skill.name) — its instructions above apply."
+            }
+        }
+        return note
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer
@@ -868,18 +893,27 @@ public final class CascadeAppModel: ObservableObject {
             CGPoint(x: screen.frame.minX + x, y: screen.frame.minY + y)
         }
         func cg(_ x: Double, _ y: Double) -> CGPoint { Self.toCGGlobal(globalAppKit(x, y)) }
+        // Pointer-routed apps (Blender): hotkeys act on the editor under the
+        // physical pointer, so the pointer must STAY where the agent clicks
+        // instead of being restored to the user's parked position.
+        let skill = frontmostSkill()
+        let keepPointer = skill?.keysFollowPointer == true
         do {
             switch action {
             case .move(let x, let y):
-                // Blue companion only — the user's real pointer never moves.
+                // Blue companion only — the user's real pointer never moves
+                // (except in pointer-routed apps, where hovering IS the action).
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
+                if keepPointer { CGWarpMouseCursorPosition(cg(x, y)) }
             case .click(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
                 try? await Task.sleep(for: .milliseconds(150))  // let the cursor reach the target
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))   // show the press dip
                 let p = cg(x, y)
-                if !Self.axActivate(atCG: p) {
+                if keepPointer {
+                    try await driver.act(.computerUse(.click(x: p.x, y: p.y)))
+                } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
                 }
             case .doubleClick(let x, let y):
@@ -888,14 +922,22 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
-                try await clickRestoringCursor { try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y))) }
+                if keepPointer {
+                    try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y)))
+                } else {
+                    try await clickRestoringCursor { try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y))) }
+                }
             case .tripleClick(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
                 try? await Task.sleep(for: .milliseconds(150))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
-                try await clickRestoringCursor { try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y))) }
+                if keepPointer {
+                    try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y)))
+                } else {
+                    try await clickRestoringCursor { try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y))) }
+                }
             case .drag(let fromX, let fromY, let toX, let toY):
                 // The companion cursor traces the drag so the user sees the motion.
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(fromX, fromY))
@@ -913,7 +955,9 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
-                if !Self.axActivate(atCG: p, showMenu: true) {
+                if keepPointer {
+                    try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y)))
+                } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p, showMenu: true) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
                 }
             case .type(let text):
@@ -925,7 +969,18 @@ public final class CascadeAppModel: ObservableObject {
                 if driver.runState.isStopRequested { throw ComputerUseError.stopped }
                 // Audit the mechanism and size only — never the text itself (the
                 // agent may type sensitive content the user dictated).
-                if Self.axInsertText(text) {
+                if let skill, skill.shouldTypePhysicalKeys(text),
+                   let keys = AppSkillRegistry.physicalKeySequence(for: text) {
+                    // Modal numeric input (Blender): the app ignores AX insertion,
+                    // paste, and unicode-string events — only real per-key events
+                    // register. Paced so the modal operator sees each key.
+                    if keepPointer { Self.ensurePointerInFrontmostWindow() }
+                    for key in keys {
+                        try await driver.act(.computerUse(.key(key, modifiers: [])))
+                        try? await Task.sleep(for: .milliseconds(30))
+                    }
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.keys", detail: "chars=\(text.count) skill=\(skill.name)"))
+                } else if Self.axInsertText(text) {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.ax", detail: "chars=\(text.count)"))
                 } else if await pasteText(text) {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.paste", detail: "chars=\(text.count)"))
@@ -933,6 +988,9 @@ public final class CascadeAppModel: ObservableObject {
                     try await driver.act(.computerUse(.typeText(text)))
                 }
             case .key(let combo):
+                // Pointer-routed apps drop hotkeys when the pointer is outside
+                // their window — make sure it's inside before posting.
+                if keepPointer { Self.ensurePointerInFrontmostWindow() }
                 let (key, modifiers) = Self.parseKey(combo)
                 try await driver.act(.computerUse(.key(key, modifiers: modifiers)))
             case .scroll(let x, let y, let direction, let amount):
@@ -988,6 +1046,34 @@ public final class CascadeAppModel: ObservableObject {
             teachMessage = "I need Accessibility + Input Monitoring to control the Mac."
             voice.speak("I need Accessibility and Input Monitoring permission to do that.")
             return false
+        }
+    }
+
+    /// The app skill matching whatever app is frontmost right now, if any.
+    private func frontmostSkill() -> AppSkill? {
+        let front = NSWorkspace.shared.frontmostApplication
+        return appSkills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+    }
+
+    /// Pointer-routed apps (Blender) send hotkeys to the editor under the
+    /// physical pointer; a pointer parked outside the app's window means every
+    /// shortcut lands nowhere. If it's outside the frontmost app's main window,
+    /// warp it to the window's centre. Uses CGWindowList, not AX — these apps
+    /// are the ones whose AX trees can't be trusted.
+    private static func ensurePointerInFrontmostWindow() {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                  as? [[String: Any]] else { return }
+        let pointer = cursorCG()
+        for info in infos {
+            guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier,
+                  (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict) else { continue }
+            if !bounds.contains(pointer) {
+                CGWarpMouseCursorPosition(CGPoint(x: bounds.midX, y: bounds.midY))
+            }
+            return
         }
     }
 
@@ -1107,7 +1193,9 @@ public final class CascadeAppModel: ObservableObject {
             conversation: assistMemory.historyForAPI()
         )
 
-        let maxSteps = 6
+        // Backstop only — surfacing an element is a bounded task, but 6 nav steps
+        // wasn't enough to open an app, switch a tab, and scroll to the target.
+        let maxSteps = 14
         var count = 0
         while count < maxSteps {
             if assistGeneration != gen { return }  // superseded by a newer turn
@@ -1317,6 +1405,7 @@ public final class CascadeAppModel: ObservableObject {
         // on blind (the tiptour-macos pattern).
         var unverifiedStreak = 0
         var verifyUnavailableLogged = false
+        var skillVerifySkipLogged = false
         for (index, step) in steps.enumerated() {
             if driver.runState.isStopRequested {
                 agentMessage = "Stopped. Control returned to you."
@@ -1333,13 +1422,18 @@ public final class CascadeAppModel: ObservableObject {
                 if let x = step.x, let y = step.y,
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
                     let recorded = CGPoint(x: x, y: y)
+                    // Canvas apps (Blender) have an AX tree that never reflects
+                    // their visible UI — the skill flags them so replay skips the
+                    // AX tier and fingerprint verification instead of false-pausing.
+                    let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
+                    let axUnreliable = stepSkill?.axUnreliable == true
                     // Tier 1: re-find the element by its recorded AX label in the
                     // live tree. Tier 2: Claude vision via the OCR anchor. Tier 3:
                     // the recorded pixel. The tier lands in the step's audit row so
                     // a drifting recipe is diagnosable from the log.
                     let target: CGPoint
                     let tier: String
-                    if let axTarget = await Self.resolveByAX(step: step, recorded: recorded) {
+                    if !axUnreliable, let axTarget = await Self.resolveByAX(step: step, recorded: recorded) {
                         target = axTarget
                         tier = "ax"
                     } else {
@@ -1351,33 +1445,54 @@ public final class CascadeAppModel: ObservableObject {
                     try await driver.act(.computerUse(.move(x: target.x, y: target.y)))
                     try? await Task.sleep(for: .milliseconds(320))
 
-                    let before = await Self.uiFingerprint()
-                    if before == 0, !verifyUnavailableLogged {
-                        verifyUnavailableLogged = true
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
-                    }
-                    try await clickAction(step, at: target)
-                    if await Self.uiChanged(after: before) {
-                        unverifiedStreak = 0
-                    } else {
-                        // One corrective retry at the recorded coordinate (if the
-                        // resolved target differed), then count the step unverified.
-                        if target != recorded {
-                            try await clickAction(step, at: recorded)
+                    if axUnreliable {
+                        // Leave unverifiedStreak untouched — a streak from normal
+                        // apps should still pause; these steps just don't count.
+                        if !skillVerifySkipLogged {
+                            skillVerifySkipLogged = true
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.skipped-skill", detail: stepSkill?.name ?? step.appName))
                         }
+                        try await clickAction(step, at: target)
+                    } else {
+                        let before = await Self.uiFingerprint()
+                        if before == 0, !verifyUnavailableLogged {
+                            verifyUnavailableLogged = true
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
+                        }
+                        try await clickAction(step, at: target)
                         if await Self.uiChanged(after: before) {
                             unverifiedStreak = 0
                         } else {
-                            unverifiedStreak += 1
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeLabel(step)))
-                            if unverifiedStreak >= 2 {
-                                agentMessage = "Paused “\(agent.name)” — the screen no longer matches the recorded steps. Take over, or re-record the workflow."
-                                dock.show(title: "Paused", detail: agentMessage)
-                                stoppedEarly = true
-                                break
+                            // One corrective retry at the recorded coordinate (if the
+                            // resolved target differed), then count the step unverified.
+                            if target != recorded {
+                                try await clickAction(step, at: recorded)
+                            }
+                            if await Self.uiChanged(after: before) {
+                                unverifiedStreak = 0
+                            } else {
+                                unverifiedStreak += 1
+                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeLabel(step)))
+                                if unverifiedStreak >= 2 {
+                                    agentMessage = "Paused “\(agent.name)” — the screen no longer matches the recorded steps. Take over, or re-record the workflow."
+                                    dock.show(title: "Paused", detail: agentMessage)
+                                    stoppedEarly = true
+                                    break
+                                }
                             }
                         }
                     }
+                } else if step.kind == .type, let text = step.text,
+                          appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)?
+                              .shouldTypePhysicalKeys(text) == true,
+                          let keys = AppSkillRegistry.physicalKeySequence(for: text) {
+                    // Recorded modal numeric input (Blender) — the unicode-string
+                    // typeText path is silently dropped there; replay as real keys.
+                    for key in keys {
+                        try await driver.act(.computerUse(.key(key, modifiers: [])))
+                        try? await Task.sleep(for: .milliseconds(30))
+                    }
+                    unverifiedStreak = 0
                 } else if let action = AgentAction(recipeStep: step) {
                     try await driver.act(action)
                     unverifiedStreak = 0

@@ -154,6 +154,30 @@ Teaching flow references:
 
 Provider-specific code must sit behind `ProviderKit` protocols.
 
+## Markdown App Skills
+
+Primary source: `milind-soni/tiptour-macos`
+
+- `TipTour/Skills/MarkdownAppSkill.swift`
+  → `Sources/ComputerUseKit/AppSkill.swift`. Frontmatter parser, fenced
+  runtime-hints extraction, app matcher (bundle-id exact / name substring),
+  `shouldTypeUsingPhysicalKeys`, registry precedence (user dir overrides
+  bundled, first-name-wins).
+- `TipTour/Skills/blender/SKILL.md`
+  → `Sources/ComputerUseKit/Skills/blender/SKILL.md` (rewritten for Cascade's
+  agent vocabulary, not copied — TipTour's harness endpoints don't exist here).
+
+Cascade divergences:
+
+- `axUnreliable` hint (Cascade extension): replay skips AX target resolution
+  and AX-fingerprint verification for canvas apps instead of false-pausing.
+- Fence name is `cascade-runtime-hints`; the `tiptour-runtime-hints` fence
+  still parses so TipTour skill files drop in unmodified.
+- `commandAliases`, `targetPolicies`, and `plannerInstructions` are not
+  ported (no voice-alias fast path or local OCR target list in Cascade; the
+  markdown body carries all prompt instructions).
+- Only files named `SKILL.md` load (TipTour also accepts other `.md` names).
+
 ## Known Architecture Risks To Avoid
 
 - Do not copy `CompanionManager.swift` wholesale from any repo.

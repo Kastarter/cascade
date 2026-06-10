@@ -735,12 +735,26 @@ private struct ActivityTimeline: View {
                 .frame(height: 30)
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
         } else {
+            // Canvas paints each run at its exact fractional position, so the bar
+            // always fits its frame. (An HStack of min-6pt segments overflowed the
+            // track in narrow windows once many short runs were squeezed together —
+            // the bar bled past the playhead and the rounded border.)
+            let total = CGFloat(max(contexts.count, 1))
+            let segments = runs.map {
+                (color: AppVisuals.color(for: $0.app, bundleIdentifier: $0.bundle), count: CGFloat($0.count))
+            }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    HStack(spacing: 2) {
-                        ForEach(runs) { run in
-                            AppVisuals.color(for: run.app, bundleIdentifier: run.bundle)
-                                .frame(width: max(6, geo.size.width * CGFloat(run.count) / CGFloat(max(contexts.count, 1)) - 2))
+                    Canvas { context, size in
+                        var x: CGFloat = 0
+                        for segment in segments {
+                            let w = size.width * segment.count / total
+                            // Hairline gaps separate runs, but only when a run is
+                            // wide enough to survive one.
+                            let gap: CGFloat = w > 5 ? 1.5 : 0
+                            let rect = CGRect(x: x + gap / 2, y: 0, width: max(w - gap, 0.5), height: size.height)
+                            context.fill(Path(rect), with: .color(segment.color))
+                            x += w
                         }
                     }
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))

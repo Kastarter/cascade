@@ -7,6 +7,12 @@ import WebKit
 /// keeps WebKit painting so `takeSnapshot` returns live frames instead of blank
 /// ones. One panel per agent is essential: a shared panel would evict the previous
 /// agent's webView from its window and blind it mid-run.
+///
+/// Docked at the screen's middle-right as a small chip holding the Cascade logo
+/// (the webView stays mounted underneath, faintly visible, so WebKit keeps
+/// painting). Hovering blooms it into the full box — status, Stop, and the live
+/// sandbox. It pins itself expanded while a sign-in is pending or while the user
+/// is interacting (key window), so it never collapses mid-login.
 @MainActor
 final class SandboxBoxController: NSObject {
     private final class Box {
@@ -14,15 +20,30 @@ final class SandboxBoxController: NSObject {
         let scaler: NSView
         let statusLabel: NSTextField
         let continueButton: NSButton
+        let stopButton: NSButton
+        let cover: NSView
+        let logo: NSImageView
+        /// Current scaleUnitSquare factor applied to `scaler` (1 = full size).
+        var scale: CGFloat = 1
+        var isExpanded = true
         var onStop: (() -> Void)?
         var onContinue: (() -> Void)?
 
-        init(panel: NSPanel, scaler: NSView, statusLabel: NSTextField, continueButton: NSButton) {
+        init(panel: NSPanel, scaler: NSView, statusLabel: NSTextField, continueButton: NSButton, stopButton: NSButton, cover: NSView, logo: NSImageView) {
             self.panel = panel
             self.scaler = scaler
             self.statusLabel = statusLabel
             self.continueButton = continueButton
+            self.stopButton = stopButton
+            self.cover = cover
+            self.logo = logo
         }
+    }
+
+    /// Borderless panel that can still become key, so the user can click and type
+    /// inside the sandbox to sign in.
+    private final class SandboxPanel: NSPanel {
+        override var canBecomeKey: Bool { true }
     }
 
     private var boxes: [UUID: Box] = [:]
@@ -30,18 +51,25 @@ final class SandboxBoxController: NSObject {
     private let viewW: CGFloat = WebSandbox.width
     private let viewH: CGFloat = WebSandbox.height
     private let headerH: CGFloat = 40
+    /// Side of the collapsed logo chip.
+    private let chipSide: CGFloat = 60
 
     func show(_ id: UUID, webView: WKWebView, task: String, onStop: @escaping () -> Void) {
+        let isNew = boxes[id] == nil
         let box = boxes[id] ?? makeBox(for: id)
         box.onStop = onStop
+        box.onContinue = nil
         if webView.superview !== box.scaler {
             webView.removeFromSuperview()
-            webView.frame = box.scaler.bounds
-            webView.autoresizingMask = [.width, .height]
+            // Fixed logical size; the scaler's scaled coordinate space miniaturizes
+            // it visually without changing the page viewport the agent sees.
+            webView.frame = NSRect(x: 0, y: 0, width: viewW, height: viewH)
+            webView.autoresizingMask = []
             box.scaler.addSubview(webView)
         }
         box.statusLabel.stringValue = "● \(task)"
-        box.continueButton.isHidden = true
+        if isNew { layout(box, expanded: false, animate: false) }
+        ensureHoverTimer()
         box.panel.orderFrontRegardless()
         box.panel.displayIfNeeded()
     }
@@ -50,13 +78,13 @@ final class SandboxBoxController: NSObject {
         boxes[id]?.statusLabel.stringValue = text
     }
 
-    /// The agent hit a sign-in wall: keep the box up, let the user log in inside it,
-    /// and show a Continue button that resumes the task once they're signed in.
+    /// The agent hit a sign-in wall: expand and pin the box, let the user log in
+    /// inside it, and show a Continue button that resumes the task once they're in.
     func requestLogin(_ id: UUID, message: String, onContinue: @escaping () -> Void) {
         guard let box = boxes[id] else { return }
         box.onContinue = onContinue
         box.statusLabel.stringValue = message
-        box.continueButton.isHidden = false
+        layout(box, expanded: true, animate: true)
         box.panel.orderFrontRegardless()
         box.panel.makeKeyAndOrderFront(nil)
     }
@@ -65,6 +93,10 @@ final class SandboxBoxController: NSObject {
         guard let box = boxes.removeValue(forKey: id) else { return }
         box.scaler.subviews.forEach { $0.removeFromSuperview() }
         box.panel.orderOut(nil)
+        if boxes.isEmpty {
+            hoverTimer?.invalidate()
+            hoverTimer = nil
+        }
     }
 
     @objc private func stopTapped(_ sender: NSButton) {
@@ -81,14 +113,89 @@ final class SandboxBoxController: NSObject {
         resume?()
     }
 
+    // MARK: - Hover expand / collapse
+
+    /// Hover is driven by polling the global mouse position (same pattern as the
+    /// guide cursor's follow loop) — tracking areas on borderless floating panels
+    /// are unreliable across app activation states, and the rule is simple:
+    /// cursor on the box → expanded; cursor off it → chip. No clicking involved.
+    private var hoverTimer: Timer?
+
+    private func ensureHoverTimer() {
+        guard hoverTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickHover() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hoverTimer = timer
+    }
+
+    private func tickHover() {
+        guard !boxes.isEmpty else { return }
+        let mouse = NSEvent.mouseLocation
+        for box in boxes.values {
+            let inside = box.panel.frame.insetBy(dx: -2, dy: -2).contains(mouse)
+            if inside, !box.isExpanded {
+                layout(box, expanded: true, animate: true)
+            } else if !inside, box.isExpanded {
+                // Only a pending sign-in pins the box open.
+                guard box.onContinue == nil else { continue }
+                layout(box, expanded: false, animate: true)
+            }
+        }
+    }
+
+    /// Sizes the panel and its content for the given state, keeping the panel's
+    /// right edge and vertical centre pinned so it blooms leftward from its
+    /// middle-right dock.
+    private func layout(_ box: Box, expanded: Bool, animate: Bool) {
+        box.isExpanded = expanded
+        let width: CGFloat = expanded ? viewW + 20 : chipSide
+        let height: CGFloat = expanded ? viewH + headerH + 16 : chipSide
+
+        // The webview scales to sit (faint, covered by the logo chip) inside the
+        // collapsed box, which keeps WebKit painting between hovers.
+        let s: CGFloat = expanded ? 1 : (chipSide - 8) / viewW
+        let factor = s / box.scale
+        if factor != 1 {
+            box.scaler.scaleUnitSquare(to: NSSize(width: factor, height: factor))
+            box.scale = s
+        }
+
+        let current = box.panel.frame
+        let origin = NSPoint(x: current.maxX - width, y: current.midY - height / 2)
+        box.panel.setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true, animate: animate)
+
+        if expanded {
+            box.scaler.frame = NSRect(x: 10, y: 10, width: viewW, height: viewH)
+        } else {
+            let pw = round(viewW * s), ph = round(viewH * s)
+            box.scaler.frame = NSRect(x: (chipSide - pw) / 2, y: (chipSide - ph) / 2, width: pw, height: ph)
+        }
+
+        box.statusLabel.isHidden = !expanded
+        box.stopButton.isHidden = !expanded
+        box.continueButton.isHidden = !expanded || box.onContinue == nil
+        if expanded {
+            box.statusLabel.frame = NSRect(x: 12, y: viewH + 18, width: width - 172, height: 20)
+            box.stopButton.frame = NSRect(x: width - 72, y: viewH + 14, width: 60, height: 26)
+            box.continueButton.frame = NSRect(x: width - 156, y: viewH + 14, width: 80, height: 26)
+        }
+
+        box.cover.isHidden = expanded
+        box.cover.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        box.logo.frame = NSRect(x: (width - 26) / 2, y: (height - 26) / 2, width: 26, height: 26)
+        (box.panel.contentView)?.layer?.cornerRadius = expanded ? 14 : 16
+    }
+
     private func makeBox(for id: UUID) -> Box {
         let width = viewW + 20
         let height = viewH + headerH + 16
         // Activatable (not .nonactivatingPanel) so the user can click + type to sign in
         // inside the box when a task needs a login.
-        let panel = NSPanel(
+        let panel = SandboxPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
-            styleMask: [.titled, .closable, .resizable],
+            styleMask: [.borderless],
             backing: .buffered, defer: false
         )
         panel.isFloatingPanel = true
@@ -97,17 +204,27 @@ final class SandboxBoxController: NSObject {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
-        panel.title = "Cascade · background"
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.appearance = NSAppearance(named: .darkAqua)
         if let screen = NSScreen.main {
-            // Cascade additional boxes up-and-left so concurrent agents don't overlap.
+            // Middle-right dock; additional concurrent agents stack downward.
             let slot = CGFloat(boxes.count)
             panel.setFrameOrigin(NSPoint(
-                x: screen.visibleFrame.maxX - width - 24 - slot * 36,
-                y: screen.visibleFrame.minY + 24 + slot * 36
+                x: screen.visibleFrame.maxX - width - 20,
+                y: screen.visibleFrame.midY - height / 2 - slot * (chipSide + 14)
             ))
         }
 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.07, alpha: 0.97).cgColor
+        content.layer?.cornerRadius = 14
+        content.layer?.masksToBounds = true
+        content.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.14).cgColor
+        content.layer?.borderWidth = 1
+        content.autoresizingMask = [.width, .height]
 
         let scaler = NSView(frame: NSRect(x: 10, y: 10, width: viewW, height: viewH))
         scaler.wantsLayer = true
@@ -120,23 +237,41 @@ final class SandboxBoxController: NSObject {
         let status = NSTextField(labelWithString: "Starting…")
         status.frame = NSRect(x: 12, y: viewH + 18, width: width - 172, height: 20)
         status.font = .systemFont(ofSize: 12, weight: .medium)
+        status.textColor = .labelColor
         status.lineBreakMode = .byTruncatingTail
         content.addSubview(status)
 
         let stop = NSButton(title: "Stop", target: self, action: #selector(stopTapped(_:)))
         stop.frame = NSRect(x: width - 72, y: viewH + 14, width: 60, height: 26)
         stop.bezelStyle = .rounded
+        stop.controlSize = .small
         content.addSubview(stop)
 
         let cont = NSButton(title: "Continue", target: self, action: #selector(continueTapped(_:)))
         cont.frame = NSRect(x: width - 156, y: viewH + 14, width: 80, height: 26)
         cont.bezelStyle = .rounded
+        cont.controlSize = .small
         cont.keyEquivalent = "\r"
         cont.isHidden = true
         content.addSubview(cont)
 
+        // Collapsed-state face: a dim cover with the Cascade logo, sitting above
+        // the (tiny, still-painting) webview.
+        let cover = NSView(frame: content.bounds)
+        cover.wantsLayer = true
+        cover.layer?.backgroundColor = NSColor(calibratedWhite: 0.05, alpha: 0.72).cgColor
+        content.addSubview(cover)
+
+        let logoImage = NSImage(named: "cascadeTemplate")
+            ?? NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Cascade")
+        let logo = NSImageView(image: logoImage ?? NSImage())
+        logo.image?.isTemplate = true
+        logo.contentTintColor = NSColor(calibratedWhite: 0.95, alpha: 1)
+        logo.imageScaling = .scaleProportionallyUpOrDown
+        content.addSubview(logo)
+
         panel.contentView = content
-        let box = Box(panel: panel, scaler: scaler, statusLabel: status, continueButton: cont)
+        let box = Box(panel: panel, scaler: scaler, statusLabel: status, continueButton: cont, stopButton: stop, cover: cover, logo: logo)
         boxes[id] = box
         return box
     }

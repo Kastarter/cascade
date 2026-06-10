@@ -160,11 +160,30 @@ public actor CascadeOrchestrator {
     /// only) and falls back to the local heuristic answerer otherwise, or on any
     /// provider error.
     public func ask(_ question: String) async throws -> String {
-        let contexts = try await store.recentContexts(limit: 24).filter { !PrivacyRules.isSensitive($0) }
-        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: question, contexts: contexts) {
+        let grounding = try await chatGrounding(for: question)
+        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: question, grounding: grounding) {
             return answer
         }
-        return try await localAnswerer.answer(question: question, contexts: contexts)
+        return try await localAnswerer.answer(question: question, grounding: grounding)
+    }
+
+    /// Chat grounding, layered so any question about the user's day is answerable:
+    /// the whole last-24h timeline (shape of the day), hourly on-screen content
+    /// samples plus question-matched moments from the entire record (specifics
+    /// seen at any time), and the freshest fully-decoded moments (what just
+    /// happened). Privacy-filtered before anything reaches a provider.
+    private func chatGrounding(for question: String) async throws -> ChatGrounding {
+        let since = Date(timeIntervalSinceNow: -24 * 60 * 60)
+        let recent = try await store.recentContexts(limit: 24)
+        let timeline = (try? await store.contextTimeline(since: since)) ?? []
+        let samples = (try? await store.contentSamples(since: since)) ?? []
+        let relevant = (try? await store.relevantContexts(to: question)) ?? []
+        return ChatGrounding(
+            timeline: timeline.filter { !PrivacyRules.isSensitive($0) },
+            samples: samples.filter { !PrivacyRules.isSensitive($0) },
+            relevant: relevant.filter { !PrivacyRules.isSensitive($0) },
+            recent: recent.filter { !PrivacyRules.isSensitive($0) }
+        )
     }
 
     /// Proposes exactly one reviewed next step toward `goal`, grounded in recent

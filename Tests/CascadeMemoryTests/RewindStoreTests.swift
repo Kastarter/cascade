@@ -87,3 +87,77 @@ func pruneDropsOldMomentsAndSyncsSearchIndex() async throws {
     #expect(try await store.searchContexts(query: "ancient").isEmpty)
     #expect(try await store.searchContexts(query: "recent").count == 1)
 }
+
+@Test
+func contextTimelineReturnsRowsSinceCutoffWithoutHeavyPayloads() async throws {
+    let store = try makeStore()
+    _ = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSinceNow: -48 * 3600),
+        source: .screen,
+        appName: "OldApp",
+        ocrText: "stale text"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSinceNow: -3600),
+        source: .screen,
+        appName: "RecentApp",
+        windowTitle: "Today's window",
+        ocrText: "fresh text",
+        metadataJSON: "{\"k\":1}"
+    ))
+
+    let rows = try await store.contextTimeline(since: Date(timeIntervalSinceNow: -24 * 3600))
+
+    #expect(rows.map(\.appName) == ["RecentApp"])
+    // Identity and title survive; the heavy payloads are not decoded.
+    #expect(rows.first?.windowTitle == "Today's window")
+    #expect(rows.first?.ocrText == nil)
+    #expect(rows.first?.metadataJSON == nil)
+}
+
+@Test
+func contentSamplesPickTheRichestMomentPerAppPerHour() async throws {
+    let store = try makeStore()
+    let base = Date(timeIntervalSince1970: 1_700_000_000)  // 22:13:20 UTC
+    _ = try await store.insert(RecordedContext(
+        capturedAt: base, source: .screen, appName: "Chrome", ocrText: "tiny"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: base.addingTimeInterval(60), source: .screen, appName: "Chrome",
+        ocrText: "the long assignment page with the deadline details"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: base.addingTimeInterval(120), source: .screen, appName: "Xcode", ocrText: "build output"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: base.addingTimeInterval(4000), source: .screen, appName: "Chrome", ocrText: "later hour content"
+    ))
+
+    let samples = try await store.contentSamples(since: base.addingTimeInterval(-60), excerptLength: 20)
+
+    // One row per app per hour: Chrome 22h (the richest of its two), Xcode 22h, Chrome 23h.
+    #expect(samples.count == 3)
+    let chromeEarly = samples.first { $0.appName == "Chrome" && $0.capturedAt < base.addingTimeInterval(3000) }
+    #expect(chromeEarly?.capturedAt == base.addingTimeInterval(60))
+    // The excerpt is trimmed to the requested length.
+    #expect(chromeEarly?.ocrText == "the long assignment ")
+}
+
+@Test
+func relevantContextsMatchNaturalLanguageQuestions() async throws {
+    let store = try makeStore()
+    _ = try await store.insert(RecordedContext(
+        source: .screen, appName: "Chrome",
+        ocrText: "Final Project Mental Health Action Plan due Jul 30"
+    ))
+    _ = try await store.insert(RecordedContext(
+        source: .screen, appName: "Xcode", ocrText: "compiling swift sources"
+    ))
+
+    // A stopword-heavy question still recalls the moment via its content words.
+    let hits = try await store.relevantContexts(to: "when is the final project due?")
+    #expect(hits.map(\.appName) == ["Chrome"])
+
+    // Nothing meaningful to match on → no recall, not an FTS error.
+    #expect(try await store.relevantContexts(to: "what was the…?").isEmpty)
+}

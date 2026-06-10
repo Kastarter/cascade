@@ -16,6 +16,12 @@ cp "$ROOT/Sources/CascadeApp/Resources/AppIcon.icns" "$APP/Contents/Resources/Ap
 cp "$ROOT/Sources/CascadeApp/Resources/Images"/cascadeTemplate*.png "$APP/Contents/Resources/"
 cp "$ROOT/Sources/CascadeApp/Resources/Images/cascade-white-32.png" "$APP/Contents/Resources/"
 
+# SwiftPM resource bundles (Bundle.module) — e.g. ComputerUseKit's bundled
+# app skills. Without these the resource accessor fatalErrors at launch.
+for bundle in "$DERIVED"/CascadeNative_*.bundle; do
+  [ -e "$bundle" ] && cp -R "$bundle" "$APP/Contents/Resources/"
+done
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

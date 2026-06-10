@@ -14,24 +14,46 @@ public struct ClaudeGroundedAnswerer: ContextQuestionAnswering {
         self.model = model
     }
 
-    public func answer(question: String, contexts: [RecordedContext]) async throws -> String {
-        let recent = contexts.sorted { $0.capturedAt > $1.capturedAt }.prefix(12)
-        let block: String
-        if recent.isEmpty {
-            block = "(no recorded local context)"
-        } else {
-            block = recent.map { context in
-                let title = context.windowTitle.map { " — \($0)" } ?? ""
-                let ocr = context.ocrText.map { " | on-screen: \($0.prefix(300))" } ?? ""
-                return "• \(context.appName)\(title)\(ocr)"
-            }.joined(separator: "\n")
+    public func answer(question: String, grounding: ChatGrounding) async throws -> String {
+        var sections = ["Question: \(question)"]
+
+        let timelineRows = grounding.timeline.isEmpty ? grounding.allMoments : grounding.timeline
+        let timeline = ActivityTimeline.digest(from: timelineRows)
+        if !timeline.isEmpty {
+            sections.append("Activity timeline (whole recorded window, oldest first, collapsed into app sessions):\n\(timeline)")
         }
+        if !grounding.samples.isEmpty {
+            let samples = grounding.samples.sorted { $0.capturedAt < $1.capturedAt }
+            sections.append("On-screen content sampled across the window (oldest first):\n\(Self.block(samples))")
+        }
+        if !grounding.relevant.isEmpty {
+            sections.append("Moments matching the question (best match first):\n\(Self.block(grounding.relevant))")
+        }
+        let recent = Array(grounding.recent.sorted { $0.capturedAt > $1.capturedAt }.prefix(12))
+        sections.append(
+            "Most recent moments in detail (most recent first):\n"
+                + (recent.isEmpty ? "(no recorded local context)" : Self.block(recent))
+        )
+
         return try await client.complete(
             system: Self.systemPrompt,
-            user: "Question: \(question)\n\nLocal context (most recent first):\n\(block)",
+            user: sections.joined(separator: "\n\n"),
             model: model,
-            maxTokens: 220
+            maxTokens: 300
         )
+    }
+
+    /// One moment per line, timestamped so the model can anchor answers in time.
+    private static func block(_ contexts: [RecordedContext], timeZone: TimeZone = .current) -> String {
+        let time = DateFormatter()
+        time.locale = Locale(identifier: "en_US_POSIX")
+        time.timeZone = timeZone
+        time.dateFormat = "HH:mm"
+        return contexts.map { context in
+            let title = context.windowTitle.map { " — \($0)" } ?? ""
+            let ocr = context.ocrText.map { " | on-screen: \($0.prefix(300))" } ?? ""
+            return "• \(time.string(from: context.capturedAt)) \(context.appName)\(title)\(ocr)"
+        }.joined(separator: "\n")
     }
 
     static let systemPrompt = """
@@ -40,8 +62,13 @@ public struct ClaudeGroundedAnswerer: ContextQuestionAnswering {
     never plan or suggest future actions, and never invent details that are not in \
     the context.
 
-    Answer in ONE or TWO short sentences. No preamble, no restating the question, no \
-    boilerplate disclaimers. If the context doesn't contain the answer, say so in one \
-    short line.
+    Use the activity timeline for questions about a longer stretch (a day, an \
+    evening) — cover the whole timeline, not just the latest entries. Use the \
+    sampled content and question-matching moments for specifics seen earlier (names, \
+    numbers, deadlines, messages). Use the detailed moments for what just happened.
+
+    Answer in one to three short sentences. No preamble, no restating the question, \
+    no boilerplate disclaimers. If the context doesn't contain the answer, say so in \
+    one short line.
     """
 }

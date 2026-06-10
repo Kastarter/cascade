@@ -158,7 +158,10 @@ public final class BackgroundWebAgent {
         )
 
         var acted = false
-        let maxSteps = 25
+        // Runaway backstop, not a budget — research/multi-page tasks routinely
+        // need 30+ steps; the real terminators are the model finishing, the user
+        // stopping the box, or a sign-in wall.
+        let maxSteps = 80
         var count = 0
         while count < maxSteps, !stopped {
             if step.done {
