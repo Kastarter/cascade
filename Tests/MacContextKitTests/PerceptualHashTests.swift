@@ -31,6 +31,51 @@ func veryDifferentFramesHashFarApart() {
     #expect(!PerceptualHash.isDuplicate(base, of: reversed))
 }
 
+// MARK: - Region grid (change-aware dedup)
+
+@Test
+func gridCatchesTheSmallChangeTheGlobalHashMisses() {
+    let base = horizontalGradient()
+    let patched = horizontalGradient(darkPatch: true)
+
+    // The whole-frame hash calls these "the same screen" — that's exactly the
+    // hole that loses a new message in a static layout...
+    #expect(PerceptualHash.isDuplicate(PerceptualHash.dHash(patched), of: PerceptualHash.dHash(base)))
+
+    // ...and the per-region grid catches it: the patched region differs.
+    let baseGrid = PerceptualHash.gridHashes(base)
+    let patchedGrid = PerceptualHash.gridHashes(patched)
+    #expect(baseGrid.count == PerceptualHash.gridDimension * PerceptualHash.gridDimension)
+    #expect(!PerceptualHash.isDuplicateGrid(patchedGrid, of: baseGrid))
+}
+
+@Test
+func gridStillDedupesIdenticalFrames() {
+    let a = PerceptualHash.gridHashes(horizontalGradient())
+    let b = PerceptualHash.gridHashes(horizontalGradient())
+    #expect(PerceptualHash.isDuplicateGrid(a, of: b))
+}
+
+// MARK: - AX/OCR text merge
+
+@Test
+func mergePrefersAXAndAppendsNovelOCRLines() {
+    let ax = "Inbox\nReply All\nQuarterly numbers are ready"
+    let ocr = "Inbox\nReply All\nLogo Banner Text"
+    let merged = AXTextHarvester.merge(ax: ax, ocr: ocr)
+    #expect(merged.hasPrefix(ax))                  // exact text leads
+    #expect(merged.contains("Logo Banner Text"))   // OCR-only content kept
+    let occurrences = merged.components(separatedBy: "Reply All").count - 1
+    #expect(occurrences == 1)                      // overlap not duplicated
+}
+
+@Test
+func mergeFallsBackToWhicheverChannelHasText() {
+    #expect(AXTextHarvester.merge(ax: "", ocr: "only ocr") == "only ocr")
+    #expect(AXTextHarvester.merge(ax: "only ax", ocr: "") == "only ax")
+    #expect(AXTextHarvester.merge(ax: "", ocr: "") == "")
+}
+
 /// Renders a deterministic horizontal grayscale gradient so the dHash has real
 /// horizontal structure (every pixel brighter than its left neighbor). Reversing
 /// it flips every comparison bit; a small dark patch perturbs only a couple.

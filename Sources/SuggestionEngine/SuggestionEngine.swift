@@ -46,48 +46,24 @@ public struct AgentSuggestion: Identifiable, Codable, Equatable, Sendable {
 public struct SuggestionEngine: Sendable {
     public init() {}
 
+    /// Deliverable-shaped quick actions over the record. Repeated-WORKFLOW
+    /// detection lives in WasteDetector (real recorded actions, real recipes) —
+    /// this engine must never emit a watered-down copy of those cards, so
+    /// "you keep coming back to X" grouping is gone.
     public func suggest(from contexts: [RecordedContext]) -> [AgentSuggestion] {
         let nonSensitive = contexts.filter { !PrivacyRules.isSensitive($0) }
-        guard !nonSensitive.isEmpty else { return [] }
+        guard nonSensitive.count >= 2 else { return [] }
 
-        var suggestions: [AgentSuggestion] = []
-        let grouped = Dictionary(grouping: nonSensitive) { context in
-            [context.bundleIdentifier ?? context.appName, context.windowTitle ?? ""].joined(separator: "::")
-        }
-        for (_, items) in grouped where items.count >= 3 {
-            let latest = items.sorted { $0.capturedAt > $1.capturedAt }.first!
-            suggestions.append(AgentSuggestion(
-                title: "You keep coming back to \(latest.appName)" + (latest.windowTitle.map { " — “\(String($0.prefix(40)))”" } ?? ""),
-                summary: "Seen \(items.count) times in the record. Run this to get a breakdown of what you keep doing there and what an agent could take over.",
-                kind: .repeatedWorkflow,
-                confidence: min(0.95, 0.55 + Double(items.count) * 0.08),
-                evidence: [
-                    "\(items.count) matching moments",
-                    latest.windowTitle.map { "Latest window: \($0)" } ?? "Latest app: \(latest.appName)"
-                ],
-                doable: true,
-                appName: latest.appName,
-                windowTitle: latest.windowTitle
-            ))
-        }
-
-        if nonSensitive.count >= 2 {
-            suggestions.append(AgentSuggestion(
-                title: "Draft today’s recap from the record",
-                summary: "Cascade writes a short recap of what you actually worked on today — grounded only in the local record, shown in the Reel chat.",
-                kind: .dailyRecap,
-                confidence: 0.72,
-                evidence: [
-                    "\(nonSensitive.count) local context samples",
-                    "\(Set(nonSensitive.map(\.appName)).count) apps observed"
-                ],
-                doable: true
-            ))
-        }
-
-        return suggestions.sorted { lhs, rhs in
-            if lhs.confidence == rhs.confidence { return lhs.title < rhs.title }
-            return lhs.confidence > rhs.confidence
-        }
+        return [AgentSuggestion(
+            title: "Draft today’s recap from the record",
+            summary: "Cascade writes a short recap of what you actually worked on today — grounded only in the local record, shown in the Reel chat.",
+            kind: .dailyRecap,
+            confidence: 0.72,
+            evidence: [
+                "\(nonSensitive.count) local context samples",
+                "\(Set(nonSensitive.map(\.appName)).count) apps observed"
+            ],
+            doable: true
+        )]
     }
 }

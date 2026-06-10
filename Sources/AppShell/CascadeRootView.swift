@@ -1320,13 +1320,13 @@ private struct CascadesScreen: View {
     /// click to run through the agent.
     private var suggestionsSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "SUGGESTED BY CASCADE", trailing: "\(model.visibleSuggestions.count) from your record")
+            SectionLabel(title: "QUICK ACTIONS — FROM YOUR RECORD", trailing: "\(model.visibleSuggestions.count) available")
             if model.visibleSuggestions.isEmpty {
-                CascadePanel { EmptyState(title: "No suggestions yet", detail: "As Cascade records your work, repeated patterns surface here as ready-to-run suggestions.") }
+                CascadePanel { EmptyState(title: "Nothing yet", detail: "Once Cascade has recorded some work, one-click deliverables appear here — like a daily recap drafted from your actual day.") }
             } else {
                 ForEach(model.visibleSuggestions) { suggestion in
                     ManagerCascadeCard(
-                        eyebrow: "DETECTED · \(suggestion.kind.rawValue.uppercased()) · \(Int(suggestion.confidence * 100))% CONFIDENCE",
+                        eyebrow: "QUICK ACTION · GROUNDED IN THE LOCAL RECORD",
                         title: suggestion.title,
                         summary: suggestion.summary,
                         evidence: suggestion.evidence.first,

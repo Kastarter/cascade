@@ -14,7 +14,11 @@ func suggestionsRequireNonSensitiveEvidence() {
 
     let suggestions = engine.suggest(from: contexts)
 
-    #expect(suggestions.contains { $0.kind == .repeatedWorkflow })
+    // Workflow detection belongs to WasteDetector (real recorded actions) —
+    // the engine only offers deliverables like the recap, never a watered-down
+    // duplicate of the detected-workflow cards.
+    #expect(!suggestions.contains { $0.kind == .repeatedWorkflow })
+    #expect(suggestions.contains { $0.kind == .dailyRecap })
     #expect(suggestions.allSatisfy { $0.doable })
     #expect(!suggestions.flatMap(\.evidence).contains { $0.localizedCaseInsensitiveContains("password") })
 }
