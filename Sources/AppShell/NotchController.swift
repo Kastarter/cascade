@@ -165,23 +165,16 @@ struct NotchView: View {
     let baseNotch: CGSize
     @State private var expanded = false
 
-    /// Three sizes: a tiny idle tab, a wider "live activity" tab that surfaces the
-    /// voice state (Listening / Thinking) without a hover, and the full hover panel.
-    private enum Mode { case idle, activity, expanded }
+    /// Two sizes: the tab at the hardware-notch footprint (never resizes, even
+    /// while a voice request is in flight) and the full hover panel.
+    private enum Mode { case idle, expanded }
 
-    /// A voice request is in flight, so show its state on the outside even collapsed.
-    private var voiceActive: Bool { voiceState != .idle }
-    private var mode: Mode { expanded ? .expanded : (voiceActive ? .activity : .idle) }
+    private var mode: Mode { expanded ? .expanded : .idle }
 
     private var size: CGSize {
         switch mode {
         // Tall enough that the control row sits fully below the housing line.
         case .expanded: CGSize(width: panelWidth - 8, height: baseNotch.height + 46)
-        // Activity grows sideways for the "Listening / Thinking" text but keeps
-        // the hardware height, so the housing only ever widens, never thickens.
-        // The wings (±130) are where the text and dot live — the centre is the
-        // physical camera housing, which has no pixels.
-        case .activity: CGSize(width: baseNotch.width + 260, height: baseNotch.height)
         case .idle: baseNotch
         }
     }
@@ -207,7 +200,6 @@ struct NotchView: View {
         ZStack {
             switch mode {
             case .expanded: expandedContent
-            case .activity: activityContent
             case .idle: collapsedContent
             }
         }
@@ -228,27 +220,7 @@ struct NotchView: View {
                 .frame(width: 13, height: 13)
                 .foregroundStyle(Color.cascadeAgent)
             NotchStatusDot(color: recording ? Color.cascadeRecDot : Color.cascadeText4, pulsing: recording)
-            NotchStatusDot(color: voiceDotColor, pulsing: false)
-        }
-        .padding(.horizontal, 14)
-        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
-        .onTapGesture { expandFromTap() }
-    }
-
-    // Live activity: surfaces "Listening" / "Thinking" on the outside while a voice
-    // request is in flight — the whole point of the notch when a request comes in.
-    private var activityContent: some View {
-        HStack(spacing: 8) {
-            Image(systemName: voiceState == .listening ? "waveform" : "sparkles")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(voiceDotColor)
-                .symbolEffect(.variableColor.iterative, isActive: voiceState == .listening)
-            Text(voiceLabel)
-                .font(.cascadeMono(11, .semibold))
-                .foregroundStyle(Color.cascadeText)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            NotchStatusDot(color: recording ? Color.cascadeRecDot : Color.cascadeText4, pulsing: recording)
+            NotchStatusDot(color: voiceDotColor, pulsing: voiceState != .idle)
         }
         .padding(.horizontal, 14)
         .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
@@ -394,6 +366,7 @@ private struct NotchStatusDot: View {
             .frame(width: 8, height: 8)
             .opacity(pulsing && pulse ? 0.35 : 1)
             .animation(pulsing ? .easeInOut(duration: 1).repeatForever(autoreverses: true) : .default, value: pulse)
-            .onAppear { pulse = true }
+            .onAppear { pulse = pulsing }
+            .onChange(of: pulsing) { _, now in pulse = now }
     }
 }
