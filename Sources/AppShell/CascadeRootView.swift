@@ -495,27 +495,24 @@ private struct SceneCard: View {
         }
     }
 
-    /// Full-width card, flush with the transport bar below. The frame fits inside
-    /// uncropped while a blurred, dimmed copy of itself fills the letterbox — every
-    /// pixel of the card is used, with no dead black zones.
+    /// Full-width card, flush with the transport bar below, and the capture fills
+    /// it edge-to-edge like fullscreen video — cropping a sliver of the frame when
+    /// the aspect ratios differ rather than ever showing a letterbox.
     private func screenshotCard(_ image: NSImage) -> some View {
         ZStack(alignment: .topTrailing) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Color.clear sized by the card + overlay/clipped keeps scaledToFill's
+            // natural-size overflow from inflating the layout.
+            Color.clear
+                .overlay {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                }
+                .clipped()
             capturedBadge
                 .padding(CascadeMetrics.s4)
         }
         .frame(maxWidth: .infinity, minHeight: 220, maxHeight: .infinity)
-        .background {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-                .blur(radius: 42)
-                .opacity(0.55)
-                .overlay(Color.black.opacity(0.45))
-        }
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous))
         .overlay(
