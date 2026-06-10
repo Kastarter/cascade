@@ -606,6 +606,8 @@ public actor CascadeStore {
             bind(cutoff, at: 1, in: statement)
             try stepDone(statement)
         }
+        // Embeddings follow their moments out.
+        try? execute("DELETE FROM context_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         return removed
     }
 
@@ -944,6 +946,11 @@ public actor CascadeStore {
             summary TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending'
         );
+
+        CREATE TABLE IF NOT EXISTS context_embedding (
+            context_id INTEGER PRIMARY KEY,
+            vector BLOB NOT NULL
+        );
         """, db: db)
 
         // Backfill the index for rows inserted before FTS existed (triggers only
@@ -978,7 +985,7 @@ public actor CascadeStore {
         }
     }
 
-    private func withStatement<T>(_ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
+    internal func withStatement<T>(_ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(connection.db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw CascadeStoreError.prepareFailed(lastError())
@@ -987,7 +994,7 @@ public actor CascadeStore {
         return try body(statement)
     }
 
-    private func stepDone(_ statement: OpaquePointer) throws {
+    internal func stepDone(_ statement: OpaquePointer) throws {
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw CascadeStoreError.sqlite(lastError())
         }

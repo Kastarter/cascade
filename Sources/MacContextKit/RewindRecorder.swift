@@ -239,6 +239,10 @@ actor RewindEngine {
 
         do {
             let inserted = try await store.insert(context)
+            // Semantic recall: index the moment's text locally (best-effort).
+            if !mergedText.isEmpty {
+                try? await store.indexEmbedding(contextID: inserted.id, text: mergedText)
+            }
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "system",
                 action: "rewind.capture",

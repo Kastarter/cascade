@@ -99,11 +99,17 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         case "search_record":
             let query = (input["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !query.isEmpty else { return "search_record needs a query." }
-            // AND-search first (precise), then any-token (recall) — the model
-            // shouldn't have to know our FTS quirks.
+            // AND-search first (precise), then any-token (recall), then the
+            // semantic index (no keyword overlap needed) — the model shouldn't
+            // have to know our retrieval quirks.
             var hits = (try? await store.searchContexts(query: query, limit: 12)) ?? []
             if hits.isEmpty {
                 hits = (try? await store.relevantContexts(to: query, limit: 12)) ?? []
+            }
+            if hits.count < 4 {
+                let semantic = (try? await store.semanticContexts(matching: query, limit: 12 - hits.count)) ?? []
+                let known = Set(hits.map(\.id))
+                hits += semantic.filter { !known.contains($0.id) }
             }
             let visible = hits.filter { !PrivacyRules.isSensitive($0) }
             guard !visible.isEmpty else { return "No recorded moments match “\(query)”. Try different words or a timeframe." }
