@@ -48,6 +48,45 @@ func nonRepeatingActivityDetectsNothing() {
 }
 
 @Test
+func scrollSpamIsNeverAWorkflow() {
+    // Hours of reading in iTerm2 — hundreds of wheel ticks, no real actions.
+    // This was surfacing as "Repeated steps in iTerm2 · scroll · scroll · …".
+    let events = (0..<60).map { event($0, .scroll, app: "iTerm2") }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func scrollThenOneActionIsStillNotAWorkflow() {
+    // Scroll, type a command, repeat — that's just using a terminal.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<4 {
+        for _ in 0..<6 { events.append(event(i, .scroll, app: "iTerm2")); i += 1 }
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "ls", appName: "iTerm2")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func scrollBurstsCollapseToOneGesture() {
+    var events: [InputEvent] = []
+    var i = 0
+    // 8-tick wheel burst, then a click, a key — twice.
+    for _ in 0..<2 {
+        for _ in 0..<8 { events.append(event(i, .scroll, app: "Mail")); i += 1 }
+        events.append(event(i, .click, app: "Mail")); i += 1
+        events.append(event(i, .key, app: "Mail", key: "r", modifiers: ["command"])); i += 1
+    }
+    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    #expect(results.count == 1)
+    let waste = results[0]
+    // The burst is one step, not eight — recipes and time-saved stay honest.
+    let scrollSteps = waste.recipe.steps.filter { $0.kind == .scroll }.count
+    #expect(scrollSteps <= 1)
+    #expect(waste.estimatedSecondsPerRun <= 12)
+}
+
+@Test
 func recipeStepsCarryRealCoordinatesAndText() {
     var events: [InputEvent] = []
     var i = 0

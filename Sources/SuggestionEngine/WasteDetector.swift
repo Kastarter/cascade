@@ -60,10 +60,15 @@ public struct WasteDetector: Sendable {
         inputEvents: [InputEvent],
         maxResults: Int = 5
     ) -> [DetectedWaste] {
-        // Oldest → newest; ignore anything in a sensitive app defensively.
-        let events = inputEvents
-            .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
-            .sorted { $0.capturedAt < $1.capturedAt }
+        // Oldest → newest; ignore anything in a sensitive app defensively. Scroll
+        // BURSTS collapse to one gesture first — eight wheel ticks while reading
+        // are one movement, not eight automatable steps (they were inflating both
+        // the detected "workflows" and the minutes-saved math).
+        let events = Self.collapsingScrollBursts(
+            inputEvents
+                .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+                .sorted { $0.capturedAt < $1.capturedAt }
+        )
         guard events.count >= minRunLength * 2 else { return [] }
 
         let tokens = events.map(Self.token)
@@ -89,6 +94,10 @@ public struct WasteDetector: Sendable {
                 guard nonOverlapping.count >= 2 else { continue }
                 let representativeStart = nonOverlapping.max()!
                 let instance = Array(events[representativeStart..<representativeStart + length])
+                // A workflow is something an agent can DO for you. Scrolling and
+                // reading isn't it — demand at least two real actions (clicks,
+                // keys, typing) before proposing automation.
+                guard instance.filter({ $0.kind != .scroll }).count >= 2 else { continue }
                 results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
@@ -180,6 +189,26 @@ public struct WasteDetector: Sendable {
         case .key: .key
         case .scroll: .scroll
         }
+    }
+
+    /// Consecutive scrolls in the same app merge into the first one of the burst —
+    /// a wheel gesture emits many events, but it is ONE user action. The chain is
+    /// judged between NEIGHBORING scrolls, so a long continuous burst stays one
+    /// action no matter how many seconds it lasts.
+    static func collapsingScrollBursts(_ events: [InputEvent]) -> [InputEvent] {
+        var out: [InputEvent] = []
+        var previous: InputEvent?
+        for event in events {
+            defer { previous = event }
+            if event.kind == .scroll,
+               let previous, previous.kind == .scroll,
+               previous.appName == event.appName,
+               event.capturedAt.timeIntervalSince(previous.capturedAt) < 3 {
+                continue
+            }
+            out.append(event)
+        }
+        return out
     }
 
     /// Greedily selects non-overlapping occurrences (each at least `length` apart).
