@@ -54,6 +54,7 @@ let package = Package(
         ),
         .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit"]),
         .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit"]),
-        .testTarget(name: "ProviderKitTests", dependencies: ["ProviderKit", "CascadeMemory"])
+        .testTarget(name: "ProviderKitTests", dependencies: ["ProviderKit", "CascadeMemory"]),
+        .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit"])
     ]
 )

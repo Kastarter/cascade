@@ -19,8 +19,8 @@ public final class NotchController: ObservableObject {
 
     /// Bounding panel size — fits the expanded drop-down; the collapsed tab is
     /// centered inside, leaving transparent (non-interactive) margins.
-    private let panelWidth: CGFloat = 480
-    private let panelHeight: CGFloat = 116
+    private let panelWidth: CGFloat = 740
+    private let panelHeight: CGFloat = 104
 
     public init() {}
 
@@ -151,12 +151,16 @@ struct NotchView: View {
 
     private var size: CGSize {
         switch mode {
-        case .expanded: CGSize(width: panelWidth - 8, height: 92)
-        case .activity: CGSize(width: 236, height: 32)
-        case .idle: CGSize(width: 188, height: 30)
+        case .expanded: CGSize(width: panelWidth - 8, height: 68)
+        case .activity: CGSize(width: 360, height: 26)
+        case .idle: CGSize(width: 300, height: 24)
         }
     }
-    private var radius: CGFloat { expanded ? 24 : 15 }
+    private var radius: CGFloat { expanded ? 20 : 12 }
+
+    /// One spring for every notch state change (frame, radius, shadow, content),
+    /// so the tab morphs as a single piece instead of layering competing animations.
+    private static let morph = Animation.spring(response: 0.36, dampingFraction: 0.86)
 
     private var recording: Bool { model.recorder.status.running }
     private var voiceState: RealtimeVoice.VoiceState { model.voice.state }
@@ -183,11 +187,8 @@ struct NotchView: View {
         .overlay(NotchShape(bottomRadius: radius).stroke(Color.cascadeBorderHi.opacity(0.45), lineWidth: 1))
         .contentShape(NotchShape(bottomRadius: radius))
         .shadow(color: .black.opacity(0.55), radius: expanded ? 22 : 7, y: expanded ? 11 : 4)
-        .onHover { hovering in
-            withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) { expanded = hovering }
-        }
-        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: expanded)
-        .animation(.spring(response: 0.40, dampingFraction: 0.82), value: voiceActive)
+        .onHover { hovering in expanded = hovering }
+        .animation(Self.morph, value: mode)
     }
 
     // Idle: just the live indicator dots, hugging the top edge.
@@ -201,7 +202,7 @@ struct NotchView: View {
             NotchStatusDot(color: voiceDotColor, pulsing: false)
         }
         .padding(.horizontal, 14)
-        .transition(.opacity)
+        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
         .onTapGesture { expandFromTap() }
     }
 
@@ -221,14 +222,14 @@ struct NotchView: View {
             NotchStatusDot(color: recording ? Color.cascadeRecDot : Color.cascadeText4, pulsing: recording)
         }
         .padding(.horizontal, 14)
-        .transition(.opacity)
+        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
         .onTapGesture { expandFromTap() }
     }
 
     /// Fallback for environments where hover doesn't fire (e.g. another app is
     /// frontmost): tapping the tab opens the full controls.
     private func expandFromTap() {
-        withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) { expanded = true }
+        expanded = true
     }
 
     // Expanded: the full status + controls cluster that used to live in the app bar.
@@ -284,7 +285,7 @@ struct NotchView: View {
         }
         .padding(.horizontal, CascadeMetrics.s5)
         .frame(maxWidth: .infinity)
-        .transition(.opacity)
+        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
     }
 
     private var voiceDotColor: Color {

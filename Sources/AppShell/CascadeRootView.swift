@@ -183,10 +183,10 @@ private struct CascadeTopBar: View {
     @ObservedObject var model: CascadeAppModel
 
     var body: some View {
-        // Status + quick controls (REC · LOCAL, Listening, settings, theme) now live
-        // in the floating notch HUD at the top-center of the screen, so the in-app bar
-        // keeps just the brand + tabs, left-aligned to leave the center clear for the
-        // notch.
+        // Status pills (REC · LOCAL, Listening) live in the floating notch HUD at the
+        // top-center of the screen; the in-app bar keeps the brand + tabs on the left
+        // and the settings/theme quick controls on the right, leaving the center clear
+        // for the notch.
         HStack(spacing: CascadeMetrics.s4) {
             HStack(spacing: CascadeMetrics.s2) {
                 Image(nsImage: NSImage(named: "cascadeTemplate") ?? NSImage())
@@ -215,10 +215,34 @@ private struct CascadeTopBar: View {
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
 
             Spacer()
+
+            HStack(spacing: CascadeMetrics.s2) {
+                quickControl(
+                    icon: model.prefersDark ? "sun.max" : "moon",
+                    help: "Toggle light / dark"
+                ) { model.toggleTheme() }
+                quickControl(
+                    icon: "gearshape",
+                    help: "Settings — access & Claude key"
+                ) { model.showSettings = true }
+            }
         }
         .padding(.horizontal, CascadeMetrics.s5)
         .padding(.vertical, CascadeMetrics.s3)
         .overlay(Rectangle().fill(Color.cascadeBorder).frame(height: 1), alignment: .bottom)
+    }
+
+    private func quickControl(icon: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.cascadeText2)
+                .frame(width: 30, height: 30)
+                .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 

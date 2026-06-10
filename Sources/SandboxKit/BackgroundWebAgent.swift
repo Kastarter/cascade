@@ -1,10 +1,17 @@
 import Foundation
 import ProviderKit
 
-/// Runs a task entirely inside a `WebSandbox` — the isolated, background browser —
+/// Runs a job entirely inside a `WebSandbox` — the isolated, background browser —
 /// using Claude's Computer Use vision loop, but routing every action to the sandbox
 /// (JavaScript) instead of the user's real screen. The user can keep working; the
 /// agent's progress streams out as snapshots + status.
+///
+/// Multi-part jobs ("find X on site A, then use it on site B") are first split by
+/// `AgentTaskPlanner` into ordered subtasks. Each part runs as its own Computer
+/// Use episode with its own step budget, and every finished part hands a one-line
+/// finding to the next — so facts survive screenshot pruning, one slow part can't
+/// starve the rest of the job, and a login pause resumes at the pending part instead
+/// of redoing everything.
 @MainActor
 public final class BackgroundWebAgent {
     public struct Update: Sendable {
@@ -18,87 +25,185 @@ public final class BackgroundWebAgent {
 
     private let keyStore: AnthropicKeyStore
     private let model: String
+    private let planner: AgentTaskPlanner
     private var stopped = false
+
+    // The current plan. Survives a login pause so `resume()` re-enters at
+    // `nextIndex` with the earlier parts' findings intact.
+    private var originalTask = ""
+    private var plan: [AgentSubtask] = []
+    private var nextIndex = 0
+    private var findings: [(task: String, result: String)] = []
+    private var skipped: [AgentSubtask] = []
 
     public let sandbox = WebSandbox()
 
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
         self.model = model
+        self.planner = AgentTaskPlanner(client: AnthropicClient(keyStore: keyStore), model: model)
     }
 
     public func stop() { stopped = true }
 
-    /// Carries out `task` in the sandbox, calling `onUpdate` after each step.
+    /// Plans `task` into parts, then carries them out in the sandbox, calling
+    /// `onUpdate` after each step.
     public func run(task: String, onUpdate: @escaping @MainActor (Update) -> Void) async {
-        onUpdate(Update(status: "Opening a private browser…", snapshotPNG: nil, url: "", done: false, result: nil))
+        stopped = false
+        originalTask = task
+        nextIndex = 0
+        findings = []
+        skipped = []
+        onUpdate(Update(status: "Planning…", snapshotPNG: nil, url: "", done: false, result: nil))
+        plan = await planner.plan(for: task, in: .webSandbox)
+        await execute(onUpdate: onUpdate)
+    }
 
-        let startURL = await suggestStartURL(for: task)
-        await sandbox.navigate(to: startURL)
+    /// Continues a paused job (e.g. after the user signed in inside the box):
+    /// re-runs the pending part — now authenticated — keeping earlier findings.
+    public func resume(onUpdate: @escaping @MainActor (Update) -> Void) async {
+        guard !plan.isEmpty else { return }
+        stopped = false
+        await execute(onUpdate: onUpdate)
+    }
 
-        guard var shot = await sandbox.snapshotPNG() else {
-            onUpdate(Update(status: "Couldn't open the sandbox browser.", snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
+    private func execute(onUpdate: @escaping @MainActor (Update) -> Void) async {
+        episodes: while nextIndex < plan.count, !stopped {
+            let sub = plan[nextIndex]
+            // Feasibility triage: parts that genuinely need the Mac itself are
+            // reported in the summary, never attempted blind in a browser.
+            guard sub.web else {
+                skipped.append(sub)
+                nextIndex += 1
+                continue
+            }
+            switch await runEpisode(sub, index: nextIndex, total: plan.count, onUpdate: onUpdate) {
+            case .finished(let finding):
+                findings.append((task: sub.task, result: finding))
+                nextIndex += 1
+            case .needsLogin(let site):
+                let message = "I need you to sign in to \(site). I've opened it in the box — sign in, then press Continue."
+                onUpdate(Update(status: message, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: message, needsLogin: true))
+                return  // nextIndex unchanged — resume() retries this part signed in
+            case .stepLimit:
+                let summary = AgentTaskPlanner.summary(findings: findings, skipped: skipped, ranLongOn: sub.task)
+                onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary))
+                return
+            case .failed(let reason):
+                onUpdate(Update(status: reason, snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
+                return
+            case .stopped:
+                break episodes
+            }
+        }
+        if stopped {
+            onUpdate(Update(status: "Stopped.", snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
             return
         }
-        onUpdate(Update(status: "Working: \(task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
+        let summary = AgentTaskPlanner.summary(findings: findings, skipped: skipped, ranLongOn: nil)
+        onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary))
+    }
 
-        let agent = ComputerUseAgent(
-            keyStore: keyStore,
-            model: model,
-            environmentNote: """
-            You are inside a single web view in a sandboxed browser — there are NO tabs, \
-            NO "+" button and NO address bar, and there are no other apps (the open_app \
-            tool does nothing here). Do not look for them and never try to open a new \
-            tab. There is only this one view. To go to a different site or known URL, \
-            use the open_url tool — it loads instantly in this same view. Links that \
-            would normally open in a new tab automatically open right here, so just \
-            click them and continue working in place.
+    private enum EpisodeOutcome {
+        case finished(String)
+        case needsLogin(String)
+        case stepLimit
+        case stopped
+        case failed(String)
+    }
 
-            Actually CARRY OUT the task on the real website(s) for it. Do NOT search for \
-            tutorials, articles, or "how to" guides about the task, and do NOT go to \
-            ChatGPT/OpenAI to ask how — just do the task itself directly.
+    /// Runs one part as its own Computer Use episode. If the model stops without
+    /// taking a single action — narrating or asking instead of working — it gets
+    /// one firmer retry; the second answer stands either way.
+    private func runEpisode(
+        _ sub: AgentSubtask, index: Int, total: Int,
+        onUpdate: @escaping @MainActor (Update) -> Void
+    ) async -> EpisodeOutcome {
+        var attempt = await episodeOnce(sub, index: index, total: total, firmer: false, onUpdate: onUpdate)
+        if case .finished = attempt.outcome, !attempt.acted, !stopped {
+            attempt = await episodeOnce(sub, index: index, total: total, firmer: true, onUpdate: onUpdate)
+        }
+        return attempt.outcome
+    }
 
-            If the page is a sign-in / login / "log in to continue" wall and you do not \
-            have credentials, do NOT guess or type anything. Stop immediately and reply \
-            with exactly: NEEDS_LOGIN <site name>.
-            """
-        )
+    private func episodeOnce(
+        _ sub: AgentSubtask, index: Int, total: Int, firmer: Bool,
+        onUpdate: @escaping @MainActor (Update) -> Void
+    ) async -> (outcome: EpisodeOutcome, acted: Bool) {
+        let prefix = total > 1 ? "Part \(index + 1)/\(total) — " : ""
+
+        // Every part needs somewhere to start; "" means continue on the current
+        // page, which only works once an earlier part has loaded one.
+        var startURL = sub.startURL
+        if startURL.isEmpty, sandbox.webView.url == nil {
+            startURL = AgentTaskPlanner.searchURL(for: sub.task)
+        }
+        if !startURL.isEmpty {
+            let host = URL(string: startURL)?.host() ?? startURL
+            onUpdate(Update(status: "\(prefix)Opening \(host)…", snapshotPNG: nil, url: startURL, done: false, result: nil))
+            await sandbox.navigate(to: startURL)
+        }
+
+        guard var shot = await sandbox.snapshotPNG() else {
+            return (.failed("Couldn't open the sandbox browser."), false)
+        }
+        onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
+
+        let agent = ComputerUseAgent(keyStore: keyStore, model: model, environmentNote: Self.sandboxNote)
         var step = await agent.begin(
-            goal: task,
+            goal: AgentTaskPlanner.goal(for: sub, index: index, total: total, job: originalTask, findings: findings, firmer: firmer),
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height)
         )
 
-        let maxSteps = 40
+        var acted = false
+        let maxSteps = 25
         var count = 0
         while count < maxSteps, !stopped {
             if step.done {
                 let raw = step.text.isEmpty ? "Done." : step.text
-                if let site = Self.loginSite(in: raw) {
-                    let message = "I need you to sign in to \(site). I've opened it in the box — sign in, then press Continue."
-                    onUpdate(Update(status: message, snapshotPNG: shot, url: sandbox.currentURL, done: true, result: message, needsLogin: true))
-                } else {
-                    onUpdate(Update(status: raw, snapshotPNG: shot, url: sandbox.currentURL, done: true, result: raw))
-                }
-                return
+                if let site = Self.loginSite(in: raw) { return (.needsLogin(site), acted) }
+                return (.finished(raw), acted)
             }
             if !step.text.isEmpty {
-                onUpdate(Update(status: step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
+                onUpdate(Update(status: prefix + step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
             }
+            if !step.actions.isEmpty { acted = true }
             for action in step.actions {
                 await apply(action)
             }
             try? await Task.sleep(for: .milliseconds(350))
             shot = await sandbox.snapshotPNG() ?? shot
-            onUpdate(Update(status: step.text.isEmpty ? "Working…" : step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
+            onUpdate(Update(status: step.text.isEmpty ? "\(prefix)Working…" : prefix + step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
             step = await agent.proceed(screenshot: shot)
             count += 1
         }
-
-        let closing = stopped ? "Stopped." : "Reached the step limit — ask again to continue."
-        onUpdate(Update(status: closing, snapshotPNG: shot, url: sandbox.currentURL, done: true, result: stopped ? nil : closing))
+        return (stopped ? .stopped : .stepLimit, acted)
     }
+
+    static let sandboxNote = """
+    You are inside a single web view in a sandboxed browser — there are NO tabs, \
+    NO "+" button and NO address bar, and there are no other apps (the open_app \
+    tool does nothing here). Do not look for them and never try to open a new \
+    tab. There is only this one view. To go to a different site or known URL, \
+    use the open_url tool — it loads instantly in this same view. Links that \
+    would normally open in a new tab automatically open right here, so just \
+    click them and continue working in place.
+
+    Actually CARRY OUT the task on the real website(s) for it. Do NOT search for \
+    tutorials, articles, or "how to" guides about the task, and do NOT go to \
+    ChatGPT/OpenAI to ask how — just do the task itself directly.
+
+    If the page is a sign-in / login / "log in to continue" wall and you do not \
+    have credentials, do NOT guess or type anything. Stop immediately and reply \
+    with exactly: NEEDS_LOGIN <site name>.
+
+    When the task is finished, instead of the usual five-word confirmation reply \
+    with ONE short line stating the concrete outcome and the key facts you found \
+    or produced — names, prices, dates, links, confirmation numbers — because \
+    later parts of the job rely on that line.
+    """
 
     /// Maps a Computer Use action onto the web sandbox. The agent works in bottom-left
     /// AppKit coordinates; the page wants top-left, so y is flipped.
@@ -137,41 +242,5 @@ public final class BackgroundWebAgent {
             if !rest.isEmpty { return rest }
         }
         return "this site"
-    }
-
-    /// Asks Claude for the single best starting URL; falls back to a web search.
-    private func suggestStartURL(for task: String) async -> String {
-        let fallback = "https://www.google.com/search?q=" +
-            (task.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
-        guard let key = keyStore.readKey(), !key.isEmpty else { return fallback }
-
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 60,
-            "messages": [[
-                "role": "user",
-                "content": "I need to ACTUALLY DO this task on the web (not research how to do it). What single website should I open first to do it? Task: \(task)\n\nPick the real service/site for doing the task (a booking site, the tool's own website, etc.) — NOT a how-to article and NOT ChatGPT/OpenAI. Reply with ONLY the full https:// URL, nothing else.",
-            ]],
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return fallback }
-        request.httpBody = data
-        guard let (respData, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String else {
-            return fallback
-        }
-        // Pull the first URL-looking token out of the reply.
-        if let match = text.range(of: #"https?://[^\s"'<>]+"#, options: .regularExpression) {
-            return String(text[match])
-        }
-        return fallback
     }
 }

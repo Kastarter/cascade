@@ -384,7 +384,7 @@ public final class CascadeAppModel: ObservableObject {
         )
         teachMessage = "Running in the background: \(trimmed)"
         voice.speak("On it. I'll handle that in the background.")
-        sandboxBox.show(webView: runtime.sandbox.webView, task: trimmed) { [weak self] in
+        sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed) { [weak self] in
             self?.stopSandboxAgent(id)
         }
         Task {
@@ -401,6 +401,7 @@ public final class CascadeAppModel: ObservableObject {
             backgroundAgents[index].done = true
             backgroundAgents[index].status = "Stopped."
         }
+        sandboxBox.hide(id)
     }
 
     private func applySandboxUpdate(_ id: UUID, _ update: BackgroundWebAgent.Update) {
@@ -410,28 +411,34 @@ public final class CascadeAppModel: ObservableObject {
             backgroundAgents[index].done = update.done
             backgroundAgents[index].result = update.result
         }
-        sandboxBox.updateStatus(update.status)
+        sandboxBox.updateStatus(id, update.status)
         guard update.done else { return }
-        sandboxRuntimes[id] = nil
         let task = backgroundAgents.first(where: { $0.id == id })?.task ?? "the task"
         let said = update.result ?? "Finished in the background."
 
-        // Sign-in wall: keep the box open so the user can log in once (it persists),
-        // then Continue resumes the task — now authenticated.
+        // Sign-in wall: keep the box AND the runtime so Continue resumes at the
+        // pending part of the plan — earlier parts' findings intact — instead of
+        // redoing the whole job from scratch.
         if update.needsLogin {
             teachMessage = said
             voice.speak(said)
-            sandboxBox.requestLogin(message: said) { [weak self] in
-                self?.createSandboxAgent(task: task)
+            sandboxBox.requestLogin(id, message: said) { [weak self] in
+                guard let self, let runtime = self.sandboxRuntimes[id] else { return }
+                if let index = self.backgroundAgents.firstIndex(where: { $0.id == id }) {
+                    self.backgroundAgents[index].done = false
+                    self.backgroundAgents[index].status = "Continuing…"
+                }
+                Task { await runtime.resume { [weak self] update in self?.applySandboxUpdate(id, update) } }
             }
             return
         }
 
+        sandboxRuntimes[id] = nil
         teachMessage = "Background agent done — \(said)"
         voice.speak(said)
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)")) }
         // Leave the box up briefly so the user can glance at the result, then close it.
-        Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide() }
+        Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide(id) }
     }
 
     /// Did the user ask for a background agent ("create an agent…", "in the background",
@@ -536,14 +543,101 @@ public final class CascadeAppModel: ObservableObject {
 
     /// Carries out a spoken command across as many steps as it takes — open the app
     /// *and* do the thing — by driving Claude's Computer Use tool with a fresh
-    /// screenshot after every action (observe → act → re-observe). The blue
-    /// companion cursor flies to each target so you can watch; STOP (and the cap)
-    /// keep control with you, and every run is audited.
+    /// screenshot after every action (observe → act → re-observe). Multi-part
+    /// commands ("do X, then Y in another app") are split up front; each part runs
+    /// as its own episode with its own step budget, and every finished part hands
+    /// its one-line result to the next, so the orchestrator — not the model's stop
+    /// reason — decides when the whole job is done. The blue companion cursor flies
+    /// to each target so you can watch; STOP (and the caps) keep control with you,
+    /// and every run is audited.
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data) async {
-        let agent = ComputerUseAgent(environmentNote: ComputerUseAgent.foregroundBrowserNote)
         driver.runState.reset()
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
+
+        // Haiku keeps the up-front planning round-trip short; a one-part plan runs
+        // exactly like the old single loop, so simple commands lose almost nothing.
+        let plan = await AgentTaskPlanner(model: AnthropicModel.haiku).plan(for: goal, in: .onScreen)
+        var findings: [(task: String, result: String)] = []
+        var ranLongOn: String?
+        var interrupted = false
+        var shot: Data? = firstScreenshotPNG
+
+        parts: for (index, sub) in plan.enumerated() {
+            if driver.runState.isStopRequested { interrupted = true; break }
+            let prefix = plan.count > 1 ? "Part \(index + 1)/\(plan.count) — " : ""
+
+            // Jump straight to the part's app or site — instant, no vision round-trip.
+            if !sub.app.isEmpty {
+                await executeCU(.openApp(sub.app), on: screen)
+                shot = nil
+            } else if !sub.startURL.isEmpty {
+                await executeCU(.openURL(sub.startURL), on: screen)
+                shot = nil
+            }
+            if shot == nil {
+                try? await Task.sleep(for: .milliseconds(260))
+                shot = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false)?.imagePNG
+            }
+            guard let episodeShot = shot else {
+                teachMessage = "I lost sight of the screen — try again."
+                interrupted = true
+                break
+            }
+
+            var attempt = await runAssistEpisode(
+                goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: false),
+                prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot
+            )
+            // The model replied without doing anything — usually narration or a
+            // question. One firmer retry on a fresh frame; its answer stands.
+            if case .finished(_, let acted) = attempt, !acted, !driver.runState.isStopRequested,
+               let retryShot = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false)?.imagePNG {
+                attempt = await runAssistEpisode(
+                    goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: true),
+                    prefix: prefix, screen: screen, firstScreenshotPNG: retryShot
+                )
+            }
+
+            switch attempt {
+            case .finished(let text, _):
+                findings.append((task: sub.task, result: text))
+            case .stopped, .failed:
+                interrupted = true  // the episode already surfaced why
+                break parts
+            case .stepLimit:
+                ranLongOn = sub.task
+                break parts
+            }
+            shot = nil  // every later part observes a fresh frame
+        }
+
+        if !interrupted {
+            let summary = AgentTaskPlanner.summary(findings: findings, skipped: [], ranLongOn: ranLongOn)
+            teachMessage = summary
+            voice.speak(summary)
+            dock.show(title: ranLongOn == nil ? "Done" : "Paused", detail: summary)
+        }
+        guidanceOverlay.hide()
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: goal))
+        voice.done()
+        await refreshAll()
+    }
+
+    private enum AssistEpisodeOutcome {
+        case finished(String, acted: Bool)
+        case stopped
+        case stepLimit
+        case failed
+    }
+
+    /// Steps one Computer Use episode through a single part: observe → act →
+    /// re-observe until the model finishes, the user stops it, or the step budget
+    /// runs out. Returns the model's closing line plus whether it acted at all.
+    private func runAssistEpisode(
+        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data
+    ) async -> AssistEpisodeOutcome {
+        let agent = ComputerUseAgent(environmentNote: ComputerUseAgent.foregroundBrowserNote)
         let maxSteps = 28
         var step = await agent.begin(
             goal: goal,
@@ -551,47 +645,36 @@ public final class CascadeAppModel: ObservableObject {
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height)
         )
+        var acted = false
         var count = 0
         while count < maxSteps {
             if driver.runState.isStopRequested {
                 teachMessage = "Stopped. Control returned to you."
                 dock.show(title: "Stopped", detail: teachMessage)
-                break
+                return .stopped
             }
-            if !step.text.isEmpty { teachMessage = step.text }
+            if !step.text.isEmpty { teachMessage = prefix + step.text }
             if step.done {
-                let closing = step.text.isEmpty ? "Done." : step.text
-                voice.speak(closing)
-                dock.show(title: "Done", detail: closing)
-                break
+                return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
 
-            var failed = false
+            if !step.actions.isEmpty { acted = true }
             for action in step.actions {
-                if !(await executeCU(action, on: screen)) { failed = true; break }
+                if !(await executeCU(action, on: screen)) { return .failed }
                 try? await Task.sleep(for: .milliseconds(120))
             }
-            if failed { break }
             // Let the UI settle, then re-observe and ask for the next step. Capturing
             // at the agent's resolution as JPEG skips the PNG round-trip and OCR.
             try? await Task.sleep(for: .milliseconds(260))
             let size = agent.captureSize
             guard let nextShot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) else {
                 teachMessage = "I lost sight of the screen — try again."
-                break
+                return .failed
             }
             step = await agent.proceed(screenshot: nextShot)
             count += 1
         }
-
-        if count >= maxSteps {
-            teachMessage = "That ran long — say it again if you want me to keep going."
-            voice.speak("I did several steps. Say it again to keep going.")
-        }
-        guidanceOverlay.hide()
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: goal))
-        voice.done()
-        await refreshAll()
+        return .stepLimit
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer
