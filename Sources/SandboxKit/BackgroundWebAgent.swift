@@ -47,10 +47,12 @@ public final class BackgroundWebAgent {
             model: model,
             environmentNote: """
             You are inside a single web view in a sandboxed browser — there are NO tabs, \
-            NO "+" button and NO address bar. Do not look for them and never try to open a \
-            new tab. There is only this one view. Links that would normally open in a new \
-            tab automatically open right here in this same view, so just click them and \
-            continue working in place. Navigate by clicking links and buttons on the page.
+            NO "+" button and NO address bar, and there are no other apps (the open_app \
+            tool does nothing here). Do not look for them and never try to open a new \
+            tab. There is only this one view. To go to a different site or known URL, \
+            use the open_url tool — it loads instantly in this same view. Links that \
+            would normally open in a new tab automatically open right here, so just \
+            click them and continue working in place.
 
             Actually CARRY OUT the task on the real website(s) for it. Do NOT search for \
             tutorials, articles, or "how to" guides about the task, and do NOT go to \
@@ -63,7 +65,7 @@ public final class BackgroundWebAgent {
         )
         var step = await agent.begin(
             goal: task,
-            screenshotPNG: shot,
+            screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height)
         )
@@ -90,7 +92,7 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(350))
             shot = await sandbox.snapshotPNG() ?? shot
             onUpdate(Update(status: step.text.isEmpty ? "Working…" : step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
-            step = await agent.proceed(screenshotPNG: shot)
+            step = await agent.proceed(screenshot: shot)
             count += 1
         }
 
@@ -118,6 +120,11 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(600))
         case .screenshot:
             break
+        case .openApp:
+            break  // no apps inside the web sandbox
+        case .openURL(let urlString):
+            await sandbox.navigate(to: urlString)
+            try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
         }
     }
 

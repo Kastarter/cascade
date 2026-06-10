@@ -236,7 +236,7 @@ public final class CascadeAppModel: ObservableObject {
                 return
             }
             let guidance = await elementLocator.guide(
-                screenshotPNG: png,
+                screenshot: png,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
                 displayHeightPoints: Int(screen.frame.height)
@@ -508,7 +508,7 @@ public final class CascadeAppModel: ObservableObject {
 
             // "Where do I find/do X" → frame the region with the dashed marquee.
             let region = await elementLocator.locateRegion(
-                screenshotPNG: png,
+                screenshot: png,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
                 displayHeightPoints: Int(screen.frame.height)
@@ -547,7 +547,7 @@ public final class CascadeAppModel: ObservableObject {
         let maxSteps = 28
         var step = await agent.begin(
             goal: goal,
-            screenshotPNG: firstScreenshotPNG,
+            screenshot: firstScreenshotPNG,
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height)
         )
@@ -572,13 +572,15 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(120))
             }
             if failed { break }
-            // Let the UI settle, then re-observe and ask for the next step.
+            // Let the UI settle, then re-observe and ask for the next step. Capturing
+            // at the agent's resolution as JPEG skips the PNG round-trip and OCR.
             try? await Task.sleep(for: .milliseconds(260))
-            guard let nextShot = await Self.captureScreenPNG() else {
+            let size = agent.captureSize
+            guard let nextShot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) else {
                 teachMessage = "I lost sight of the screen — try again."
                 break
             }
-            step = await agent.proceed(screenshotPNG: nextShot)
+            step = await agent.proceed(screenshot: nextShot)
             count += 1
         }
 
@@ -649,6 +651,28 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(700))
             case .screenshot:
                 break
+            case .openApp(let name):
+                // Instant programmatic launch — no Dock hunting, no cursor. Wait (up to
+                // ~2.5s) for the app to actually come frontmost so the next screenshot
+                // shows it rather than the launch animation.
+                dock.show(title: "Opening \(name)", detail: "")
+                if await Self.openApp(named: name) {
+                    for _ in 0..<10 {
+                        if NSWorkspace.shared.frontmostApplication?.localizedName?
+                            .caseInsensitiveCompare(name) == .orderedSame { break }
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                }
+                // On failure the next screenshot shows nothing changed and Claude
+                // falls back to the visual path.
+            case .openURL(let urlString):
+                // http(s) only — the agent must not trigger arbitrary URL schemes.
+                if let url = URL(string: urlString), url.scheme == "https" || url.scheme == "http" {
+                    dock.show(title: "Opening \(url.host() ?? "page")", detail: "")
+                    NSWorkspace.shared.open(url)
+                    // Give the browser a beat to come forward and start loading.
+                    try? await Task.sleep(for: .milliseconds(900))
+                }
             }
             return true
         } catch ComputerUseError.stopped {
@@ -706,9 +730,10 @@ public final class CascadeAppModel: ObservableObject {
     /// Current cursor position in CGEvent global (top-left) coordinates.
     private static func cursorCG() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
 
-    /// Captures the current screen (own windows excluded) as PNG for the next loop turn.
+    /// Captures the current screen (own windows excluded) as PNG for grounding calls.
+    /// OCR is skipped — the consumers read pixels, not the recognized text.
     private static func captureScreenPNG() async -> Data? {
-        await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true)?.imagePNG
+        await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false)?.imagePNG
     }
 
     /// "Where can I find/do X" when X isn't on the current screen: navigate (open the
@@ -729,7 +754,7 @@ public final class CascadeAppModel: ObservableObject {
         """)
         var step = await navigator.begin(
             goal: "Surface on screen where the user can find or do: \(question)",
-            screenshotPNG: firstScreenshotPNG,
+            screenshot: firstScreenshotPNG,
             displayWidthPoints: dw, displayHeightPoints: dh
         )
 
@@ -745,14 +770,17 @@ public final class CascadeAppModel: ObservableObject {
             if failed { return }  // executeCU surfaced the permission/STOP reason
             try? await Task.sleep(for: .milliseconds(220))
 
-            guard let shot = await Self.captureScreenPNG() else { break }
+            // Capture once at the agent's resolution as JPEG — both consumers below
+            // accept it as-is, skipping the PNG round-trip, OCR, and re-encodes.
+            let size = navigator.captureSize
+            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) else { break }
             // Detection (is it visible now?) and the next nav step fire concurrently, so
             // each loop turn costs ONE round-trip of wall-clock instead of two. If found,
             // the speculative nav step is just discarded.
             async let regionTask = elementLocator.locateRegion(
-                screenshotPNG: shot, question: question, displayWidthPoints: dw, displayHeightPoints: dh
+                screenshot: shot, question: question, displayWidthPoints: dw, displayHeightPoints: dh
             )
-            async let nextStepTask = navigator.proceed(screenshotPNG: shot)
+            async let nextStepTask = navigator.proceed(screenshot: shot)
 
             let region = await regionTask
             if let local = region.rect {
@@ -971,7 +999,7 @@ public final class CascadeAppModel: ObservableObject {
             return recorded
         }
         let guidance = await elementLocator.guide(
-            screenshotPNG: png,
+            screenshot: png,
             question: "Where is \(anchor)?",
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height)
@@ -1002,6 +1030,25 @@ public final class CascadeAppModel: ObservableObject {
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         } else if let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == name }) {
             app.activate()
+        }
+    }
+
+    /// Launches (or activates) an app by name via `/usr/bin/open -a`, which resolves
+    /// the name through LaunchServices — handles apps that aren't running yet and
+    /// localized names, unlike a runningApplications scan. Returns whether `open`
+    /// accepted the name.
+    private static func openApp(named name: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            process.arguments = ["-a", name]
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus == 0) }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(returning: false)
+            }
         }
     }
 

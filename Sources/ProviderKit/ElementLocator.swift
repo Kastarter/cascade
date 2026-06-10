@@ -58,7 +58,7 @@ public struct ElementLocator: Sendable {
     /// instruction, in a single Computer Use call. `point` is display-local AppKit
     /// coords (bottom-left), nil when no confident element was found.
     public func guide(
-        screenshotPNG: Data,
+        screenshot: Data,
         question: String,
         displayWidthPoints: Int,
         displayHeightPoints: Int
@@ -67,7 +67,7 @@ public struct ElementLocator: Sendable {
             return ElementGuidance(point: nil, speech: "Connect your Claude key first.")
         }
         let res = bestResolution(forWidth: displayWidthPoints, height: displayHeightPoints)
-        guard let jpeg = resize(png: screenshotPNG, toWidth: res.w, toHeight: res.h) else {
+        guard let jpeg = resize(image: screenshot, toWidth: res.w, toHeight: res.h) else {
             return ElementGuidance(point: nil, speech: "I couldn't read the screen image.")
         }
         guard let result = await callComputerUse(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key) else {
@@ -93,7 +93,7 @@ public struct ElementLocator: Sendable {
     /// they asked, to frame with the dashed marquee. Returns a display-local AppKit rect
     /// (bottom-left origin) + one short spoken sentence.
     public func locateRegion(
-        screenshotPNG: Data,
+        screenshot: Data,
         question: String,
         displayWidthPoints: Int,
         displayHeightPoints: Int
@@ -102,7 +102,7 @@ public struct ElementLocator: Sendable {
             return ElementRegion(rect: nil, speech: "Connect your Claude key first.")
         }
         let res = bestResolution(forWidth: displayWidthPoints, height: displayHeightPoints)
-        guard let jpeg = resize(png: screenshotPNG, toWidth: res.w, toHeight: res.h) else {
+        guard let jpeg = resize(image: screenshot, toWidth: res.w, toHeight: res.h) else {
             return ElementRegion(rect: nil, speech: "I couldn't read the screen image.")
         }
         guard let result = await callRegion(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key) else {
@@ -265,8 +265,11 @@ public struct ElementLocator: Sendable {
 
     /// Resizes to an exact pixel size (bypassing NSImage's Retina 2× backing) so the
     /// JPEG sent matches the resolution declared to the Computer Use tool.
-    private func resize(png: Data, toWidth width: Int, toHeight height: Int) -> Data? {
-        guard let image = NSImage(data: png),
+    private func resize(image imageData: Data, toWidth width: Int, toHeight height: Int) -> Data? {
+        // Frames already captured as JPEG at the target size (the agent loops capture
+        // at the declared resolution) pass through without a re-encode.
+        if ImageConformance.isJPEG(imageData, width: width, height: height) { return imageData }
+        guard let image = NSImage(data: imageData),
               let rep = NSBitmapImageRep(
                 bitmapDataPlanes: nil,
                 pixelsWide: width,

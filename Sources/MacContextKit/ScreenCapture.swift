@@ -63,17 +63,52 @@ public enum ScreenCaptureUtility {
     private static let cacheLifetime: TimeInterval = 3.0
 
     /// Captures the display containing the cursor and returns its OCR text.
+    /// Pass `includeOCR: false` when only the frame is needed (e.g. vision-model
+    /// grounding) — recognition costs hundreds of milliseconds per frame.
     ///
     /// FAIL-CLOSED: if Screen Recording is not already granted this returns `nil`
     /// without ever calling a capture path or triggering a prompt, per the
     /// architecture's permission rules.
-    public static func captureCursorScreenContext(includeImage: Bool = false) async -> ScreenContextSample? {
+    public static func captureCursorScreenContext(includeImage: Bool = false, includeOCR: Bool = true) async -> ScreenContextSample? {
         guard CGPreflightScreenCaptureAccess() else {
             logger.info("Capture skipped — Screen Recording not granted (fail-closed).")
             return nil
         }
         do {
-            return try await capture(includeImage: includeImage)
+            return try await capture(includeImage: includeImage, includeOCR: includeOCR)
+        } catch {
+            logger.error("Screen capture failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    /// Captures the cursor display directly at `width`×`height` pixels and encodes
+    /// JPEG once — no full-resolution PNG round-trip and no OCR. The hot path for
+    /// agent loop turns, which already know the model-facing resolution and only
+    /// need the image.
+    ///
+    /// FAIL-CLOSED: returns `nil` without capturing if Screen Recording isn't granted.
+    public static func captureCursorScreenJPEG(width: Int, height: Int, compression: Double = 0.7) async -> Data? {
+        guard CGPreflightScreenCaptureAccess() else {
+            logger.info("Capture skipped — Screen Recording not granted (fail-closed).")
+            return nil
+        }
+        do {
+            let content = try await shareableContent()
+            guard let display = cursorDisplay(in: content) else {
+                logger.info("Capture skipped — no display available.")
+                return nil
+            }
+            let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows(in: content))
+            let configuration = SCStreamConfiguration()
+            configuration.width = max(1, width)
+            configuration.height = max(1, height)
+            configuration.showsCursor = false
+            let cgImage = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            return jpegData(from: cgImage, compression: compression)
         } catch {
             logger.error("Screen capture failed: \(error.localizedDescription, privacy: .public)")
             return nil
@@ -126,7 +161,7 @@ public enum ScreenCaptureUtility {
         return stream
     }
 
-    private static func capture(includeImage: Bool) async throws -> ScreenContextSample? {
+    private static func capture(includeImage: Bool, includeOCR: Bool = true) async throws -> ScreenContextSample? {
         let content = try await shareableContent()
         guard let display = cursorDisplay(in: content) else {
             logger.info("Capture skipped — no display available.")
@@ -153,7 +188,7 @@ public enum ScreenCaptureUtility {
 
         let front = NSWorkspace.shared.frontmostApplication
         let isCursorScreen = appKitFrame(for: display).contains(NSEvent.mouseLocation)
-        let text = await ScreenTextRecognizer.recognize(inPNG: png)
+        let text = includeOCR ? await ScreenTextRecognizer.recognize(inPNG: png) : ""
 
         return ScreenContextSample(
             ocrText: text,
@@ -221,6 +256,10 @@ public enum ScreenCaptureUtility {
 
     private static func pngData(from cgImage: CGImage) -> Data? {
         NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+    }
+
+    private static func jpegData(from cgImage: CGImage, compression: Double) -> Data? {
+        NSBitmapImageRep(cgImage: cgImage).representation(using: .jpeg, properties: [.compressionFactor: compression])
     }
 
     /// Maps each `SCDisplay` to its `NSScreen` so we can reason about cursor
