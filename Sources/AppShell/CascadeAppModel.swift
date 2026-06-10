@@ -65,6 +65,16 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var agentMessage = "Connect a Claude key and a goal, then watch Cascade use this Mac."
     @Published public private(set) var teachMessage = "Ask “where do I find X” and Cascade points at it on your screen."
 
+    /// The companion-cursor colorway (cursor, trail, ripple, and highlight marquee
+    /// all follow it). Picked from the notch; persists across launches.
+    @Published public var cursorTheme: CursorTheme {
+        didSet {
+            guidanceOverlay.setTheme(cursorTheme)
+            UserDefaults.standard.set(cursorTheme.rawValue, forKey: Self.cursorThemeKey)
+        }
+    }
+    private static let cursorThemeKey = "cascade.cursorTheme"
+
     public let store: CascadeStore
     public let driver: LocalMacDriver
     public let recorder: ContextRecorder
@@ -89,6 +99,8 @@ public final class CascadeAppModel: ObservableObject {
     public init() throws {
         let store = try CascadeStore()
         self.store = store
+        cursorTheme = UserDefaults.standard.string(forKey: Self.cursorThemeKey)
+            .flatMap(CursorTheme.init(rawValue:)) ?? .green
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
@@ -116,6 +128,8 @@ public final class CascadeAppModel: ObservableObject {
             }
             .store(in: &cancellables)
         hotkey.start()
+        // didSet doesn't fire during init — hand the restored theme to the overlay.
+        guidanceOverlay.setTheme(cursorTheme)
         voice.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)

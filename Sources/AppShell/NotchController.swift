@@ -1,5 +1,6 @@
 import AppKit
 import CascadeDesignSystem
+import ComputerUseKit
 import SwiftUI
 
 /// A Dynamic-Island-style HUD that hangs from the top-center of the screen and
@@ -29,7 +30,12 @@ public final class NotchController: ObservableObject {
         guard panel == nil else { reposition(); panel?.orderFrontRegardless(); return }
         let panel = NotchPanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
         let host = NSHostingView(
-            rootView: NotchView(model: model, panelWidth: panelWidth, panelHeight: panelHeight)
+            rootView: NotchView(
+                model: model,
+                panelWidth: panelWidth,
+                panelHeight: panelHeight,
+                baseNotch: Self.hardwareNotchSize()
+            )
         )
         host.frame = NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
         // The notch is always a dark HUD, so resolve the adaptive design tokens to
@@ -46,6 +52,21 @@ public final class NotchController: ObservableObject {
     public func detach() {
         panel?.orderOut(nil)
         panel = nil
+    }
+
+    /// The real hardware notch (camera housing) size, so the collapsed tab reads
+    /// as an extension of it: height from the safe-area inset, width from what the
+    /// auxiliary top areas leave uncovered. Falls back to a believable tab on
+    /// displays without a notch.
+    static func hardwareNotchSize() -> CGSize {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }),
+              let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea else {
+            return CGSize(width: 200, height: 32)
+        }
+        return CGSize(
+            width: screen.frame.width - left.width - right.width,
+            height: screen.safeAreaInsets.top
+        )
     }
 
     /// Centers the panel against the top edge of the menu-bar (notched) screen.
@@ -139,6 +160,9 @@ struct NotchView: View {
     @ObservedObject var model: CascadeAppModel
     let panelWidth: CGFloat
     let panelHeight: CGFloat
+    /// Size of the real hardware notch — the collapsed tab matches it exactly so
+    /// it reads as part of the housing rather than a floating pill.
+    let baseNotch: CGSize
     @State private var expanded = false
 
     /// Three sizes: a tiny idle tab, a wider "live activity" tab that surfaces the
@@ -151,12 +175,17 @@ struct NotchView: View {
 
     private var size: CGSize {
         switch mode {
-        case .expanded: CGSize(width: panelWidth - 8, height: 68)
-        case .activity: CGSize(width: 360, height: 26)
-        case .idle: CGSize(width: 300, height: 24)
+        // Tall enough that the control row sits fully below the housing line.
+        case .expanded: CGSize(width: panelWidth - 8, height: baseNotch.height + 46)
+        // Activity grows sideways for the "Listening / Thinking" text but keeps
+        // the hardware height, so the housing only ever widens, never thickens.
+        // The wings (±130) are where the text and dot live — the centre is the
+        // physical camera housing, which has no pixels.
+        case .activity: CGSize(width: baseNotch.width + 260, height: baseNotch.height)
+        case .idle: baseNotch
         }
     }
-    private var radius: CGFloat { expanded ? 20 : 12 }
+    private var radius: CGFloat { expanded ? 20 : 10 }
 
     /// One spring for every notch state change (frame, radius, shadow, content),
     /// so the tab morphs as a single piece instead of layering competing animations.
@@ -276,6 +305,8 @@ struct NotchView: View {
             .overlay(Capsule().stroke(Color.cascadeBorder, lineWidth: 1))
             .help("Hold the right Command (⌘) key to talk to Cascade")
 
+            cursorThemePicker
+
             Button { model.toggleTheme() } label: {
                 Image(systemName: model.prefersDark ? "sun.max" : "moon").font(.system(size: 13, weight: .semibold))
             }
@@ -284,8 +315,27 @@ struct NotchView: View {
             .help("Toggle light / dark")
         }
         .padding(.horizontal, CascadeMetrics.s5)
-        .frame(maxWidth: .infinity)
+        // Keep the controls below the housing line — the hardware notch has no
+        // pixels, so anything level with it would be physically invisible.
+        .padding(.top, baseNotch.height)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
+    }
+
+    /// The four companion cursors. Each swatch is a tiny version of the cursor
+    /// (arrow on its colored halo); the chosen one wears a ring.
+    private var cursorThemePicker: some View {
+        HStack(spacing: 7) {
+            ForEach(CursorTheme.allCases) { theme in
+                CursorThemeSwatch(theme: theme, selected: model.cursorTheme == theme) {
+                    model.cursorTheme = theme
+                }
+            }
+        }
+        .padding(.horizontal, CascadeMetrics.s2 + 2)
+        .padding(.vertical, CascadeMetrics.s1 + 1)
+        .background(Color.cascadePanel2, in: Capsule())
+        .overlay(Capsule().stroke(Color.cascadeBorder, lineWidth: 1))
     }
 
     private var voiceDotColor: Color {
@@ -302,6 +352,33 @@ struct NotchView: View {
         case .working: "Thinking"
         case .idle: "Hold ⌘"
         }
+    }
+}
+
+/// One cursor-theme swatch in the notch picker.
+private struct CursorThemeSwatch: View {
+    let theme: CursorTheme
+    let selected: Bool
+    let choose: () -> Void
+
+    var body: some View {
+        Button(action: choose) {
+            ZStack {
+                Circle().fill(theme.core.opacity(0.30))
+                Image(systemName: "cursorarrow")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(theme.core)
+            }
+            .frame(width: 18, height: 18)
+            .overlay(
+                Circle().stroke(
+                    selected ? theme.core : Color.cascadeBorder,
+                    lineWidth: selected ? 1.6 : 1
+                )
+            )
+        }
+        .buttonStyle(.plain)
+        .help("\(theme.displayName) — \(theme.blurb)")
     }
 }
 

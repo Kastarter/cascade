@@ -305,13 +305,17 @@ private struct ReelScreen: View {
     private var isLive: Bool { index == 0 }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            main
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(.horizontal, CascadeMetrics.s5)
-                .padding(.vertical, CascadeMetrics.s4)
-            AskPanel(model: model, selected: selected, draft: $draft)
-                .frame(width: 360)
+        GeometryReader { geo in
+            HStack(alignment: .top, spacing: 0) {
+                main
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.horizontal, CascadeMetrics.s5)
+                    .padding(.vertical, CascadeMetrics.s4)
+                // The chat panel earns more room as the window grows (~27% of the
+                // width in fullscreen) instead of staying a fixed sliver.
+                AskPanel(model: model, selected: selected, draft: $draft)
+                    .frame(width: max(340, min(440, geo.size.width * 0.27)))
+            }
         }
         .background(alignment: .top) { reelGlow }
         .onReceive(ticker) { _ in advancePlaybackIfNeeded() }
@@ -444,11 +448,19 @@ private struct ReelScreen: View {
 
     private var headline: String {
         guard let selected else { return "Idle — no capture at this time." }
-        if let title = selected.windowTitle, !title.isEmpty { return title }
+        if let title = selected.windowTitle, !title.isEmpty { return Self.cleanTitle(title) }
         if let ocr = selected.ocrText, let first = ocr.split(separator: "\n").first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
             return String(first.prefix(90))
         }
         return "A local moment in \(selected.appName)"
+    }
+
+    /// Window titles often lead with decorative bullets ("· Redesign…", "✳ Build…")
+    /// that look like typos in the big serif headline — drop them, nothing else.
+    private static func cleanTitle(_ title: String) -> String {
+        var t = Substring(title)
+        while let first = t.first, "·•✳✱✻*∙⁂ ".contains(first) { t = t.dropFirst() }
+        return t.isEmpty ? title : String(t)
     }
 
     private var timeRange: String {
@@ -475,7 +487,46 @@ private struct ReelScreen: View {
 private struct SceneCard: View {
     let context: RecordedContext?
 
-    var body: some View {
+    @ViewBuilder var body: some View {
+        if let context, let path = context.imagePath, let image = NSImage(contentsOfFile: path) {
+            screenshotCard(image)
+        } else {
+            panelCard
+        }
+    }
+
+    /// Full-width card, flush with the transport bar below. The frame fits inside
+    /// uncropped while a blurred, dimmed copy of itself fills the letterbox — every
+    /// pixel of the card is used, with no dead black zones.
+    private func screenshotCard(_ image: NSImage) -> some View {
+        ZStack(alignment: .topTrailing) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            capturedBadge
+                .padding(CascadeMetrics.s4)
+        }
+        .frame(maxWidth: .infinity, minHeight: 220, maxHeight: .infinity)
+        .background {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .blur(radius: 42)
+                .opacity(0.55)
+                .overlay(Color.black.opacity(0.45))
+        }
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous)
+                .stroke(Color.cascadeBorderHi.opacity(0.55), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.4), radius: 22, y: 10)
+    }
+
+    /// Fallback card (OCR text or idle) — full-width cinematic panel.
+    private var panelCard: some View {
         ZStack {
             // Warm cinematic backdrop fading to black, like the target reel.
             LinearGradient(
@@ -503,12 +554,7 @@ private struct SceneCard: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let context, let path = context.imagePath, let image = NSImage(contentsOfFile: path) {
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let context {
+        if let context {
             VStack(spacing: CascadeMetrics.s3) {
                 if let icon = AppVisuals.icon(forBundle: context.bundleIdentifier) {
                     Image(nsImage: icon).resizable().frame(width: 54, height: 54)
@@ -784,11 +830,14 @@ private struct ActivityTimeline: View {
             .allowsHitTesting(false)
     }
 
+    /// The playhead sits at the *trailing edge* of the current moment's slot — a
+    /// moment spans from its capture until the next one — so at the live edge the
+    /// handle is flush with the end of the bar instead of half a slot short of it.
     private func playheadX(_ width: CGFloat) -> CGFloat {
         let count = max(contexts.count, 1)
-        let ordinal = count - 1 - min(max(currentIndex, 0), count - 1)  // 0 = oldest (left)
-        let fraction = (Double(ordinal) + 0.5) / Double(count)
-        return CGFloat(fraction) * width
+        let ordinal = count - min(max(currentIndex, 0), count - 1)  // count = newest (right edge)
+        let fraction = Double(ordinal) / Double(count)
+        return min(CGFloat(fraction) * width, width - 2)
     }
 
     /// Maps a tap/drag X into the matching moment index and reports it (only when it
@@ -1508,7 +1557,7 @@ private struct FlowChips: View {
     let action: (String) -> Void
 
     var body: some View {
-        HStack(spacing: CascadeMetrics.s2) {
+        ChipFlowLayout(spacing: CascadeMetrics.s2) {
             ForEach(items, id: \.self) { item in
                 Button { action(item) } label: {
                     Text(item)
@@ -1522,6 +1571,44 @@ private struct FlowChips: View {
                 }
                 .buttonStyle(.plain)
             }
+        }
+    }
+}
+
+/// Left-aligned wrapping row: chips keep their natural size and flow onto new
+/// lines instead of truncating into "What was I doi…" when the column is narrow.
+private struct ChipFlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, widest: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            widest = max(widest, x - spacing)
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: maxWidth.isFinite ? maxWidth : widest, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX, x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
         }
     }
 }

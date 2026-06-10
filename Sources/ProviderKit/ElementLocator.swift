@@ -111,18 +111,40 @@ public struct ElementLocator: Sendable {
         let speech = result.say.isEmpty
             ? (result.box != nil ? "Here — it's in this area." : "I couldn't find that on the current screen.")
             : result.say
-        guard let box = result.box else { return ElementRegion(rect: nil, speech: speech) }
+        guard let raw = result.box else { return ElementRegion(rect: nil, speech: speech) }
 
         // box = [x, y, w, h] top-left, in resized pixels → display-local AppKit bottom-left.
+        let box = Self.normalize(box: raw, width: CGFloat(res.w), height: CGFloat(res.h))
         let sx = CGFloat(displayWidthPoints) / CGFloat(res.w)
         let sy = CGFloat(displayHeightPoints) / CGFloat(res.h)
-        let x = max(0, box[0] * sx)
+        let x = box[0] * sx
         let w = max(8, box[2] * sx)
-        let yTop = max(0, box[1] * sy)
+        let yTop = box[1] * sy
         let h = max(8, box[3] * sy)
         let yBottom = CGFloat(displayHeightPoints) - (yTop + h)
         let rect = CGRect(x: x, y: yBottom, width: w, height: h)
         return ElementRegion(rect: rect, speech: speech)
+    }
+
+    /// The model sometimes answers with corners ([x1, y1, x2, y2]) instead of the
+    /// requested [x, y, w, h], which doubles the marquee's size, and sometimes lets
+    /// the box spill past the screenshot's edge. Detect the corner format (the
+    /// "width/height" would run off the image while reading them as corners
+    /// wouldn't) and clamp the result into bounds, so the frame on screen always
+    /// matches a region that actually exists.
+    static func normalize(box: [CGFloat], width: CGFloat, height: CGFloat) -> [CGFloat] {
+        var x = box[0], y = box[1], w = box[2], h = box[3]
+        let overflowsAsSize = x + w > width * 1.02 || y + h > height * 1.02
+        let validAsCorners = w > x && h > y && w <= width * 1.02 && h <= height * 1.02
+        if overflowsAsSize && validAsCorners {
+            w -= x
+            h -= y
+        }
+        x = min(max(0, x), width - 1)
+        y = min(max(0, y), height - 1)
+        w = min(max(1, w), width - x)
+        h = min(max(1, h), height - y)
+        return [x, y, w, h]
     }
 
     private func callRegion(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String) async -> (box: [CGFloat]?, say: String)? {
@@ -141,8 +163,10 @@ public struct ElementLocator: Sendable {
         frame for them (a button, menu, panel, list, sidebar, field, or section). Reply with \
         ONLY compact JSON, no other text:
         {"box": [x, y, w, h], "say": "<one short friendly sentence telling them where/how>"}
-        where x,y is the TOP-LEFT corner and w,h the width and height of the region, in the \
-        screenshot's pixels. If it is not visible on screen, use {"box": null, "say": "..."}.
+        where x,y is the TOP-LEFT corner and w,h are the WIDTH and HEIGHT of the region \
+        (not the bottom-right corner), in the screenshot's pixels. The box must fit inside \
+        the \(declaredW)×\(declaredH) image and hug the region tightly — no bigger than the \
+        element itself. If it is not visible on screen, use {"box": null, "say": "..."}.
         """
 
         let body: [String: Any] = [

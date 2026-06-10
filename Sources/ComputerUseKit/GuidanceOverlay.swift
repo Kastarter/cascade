@@ -9,6 +9,106 @@ import SwiftUI
 // Cascade-owned companion that sits next to the user's cursor and flies to the
 // element they ask about. See docs/THIRD_PARTY_NOTICES.md.
 
+// MARK: - Cursor themes
+
+/// The four companion cursors the user can pick from the notch, matching the
+/// TipTour reference art. Each one is a full character — its own color AND its
+/// own motion: green glides inside a soft halo, pink swoops in an S-curve
+/// leaving a glowing ribbon, peach darts dead-straight with a comet streak, and
+/// purple traces a dashed guide path that ends in a target ring. Every piece of
+/// guidance chrome (cursor, trail, ripple, label pill, highlight marquee)
+/// derives from the same theme so the overlay always reads as one system.
+public enum CursorTheme: String, CaseIterable, Codable, Sendable, Identifiable {
+    case green, pink, peach, purple
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .green: "Green"
+        case .pink: "Pink"
+        case .peach: "Peach"
+        case .purple: "Purple"
+        }
+    }
+
+    /// How the companion flies and what it leaves behind.
+    public enum Motion: Sendable {
+        /// Direct spring flight, big soft halo, no trail.
+        case glide
+        /// Curved S-flight through two offset waypoints, thick ribbon trail.
+        case swoop
+        /// Fast straight dart, narrow comet streak.
+        case dart
+        /// Calm steady flight, dashed breadcrumb path + target ring at rest.
+        case trace
+    }
+
+    public var motion: Motion {
+        switch self {
+        case .green: .glide
+        case .pink: .swoop
+        case .peach: .dart
+        case .purple: .trace
+        }
+    }
+
+    /// One-line personality, for pickers and help text.
+    public var blurb: String {
+        switch self {
+        case .green: "glides with a soft halo"
+        case .pink: "swoops in, leaving a ribbon"
+        case .peach: "darts straight with a comet streak"
+        case .purple: "traces a dashed path to a target"
+        }
+    }
+
+    /// Main color: the cursor's edge/glow, the trail, the ripple, the marquee.
+    public var core: Color {
+        switch self {
+        case .green: Color(red: 0.31, green: 0.85, blue: 0.63)
+        case .pink: Color(red: 0.94, green: 0.55, blue: 0.67)
+        case .peach: Color(red: 1.0, green: 0.72, blue: 0.50)
+        case .purple: Color(red: 0.62, green: 0.63, blue: 0.95)
+        }
+    }
+
+    /// Lighter companion tint: the halo spotlight and the label-pill text.
+    public var soft: Color {
+        switch self {
+        case .green: Color(red: 0.62, green: 0.93, blue: 0.80)
+        case .pink: Color(red: 0.99, green: 0.76, blue: 0.84)
+        case .peach: Color(red: 1.0, green: 0.86, blue: 0.70)
+        case .purple: Color(red: 0.78, green: 0.79, blue: 0.99)
+        }
+    }
+}
+
+/// Per-theme trail recipe (rendering details stay internal to the overlay).
+enum TrailKind { case none, comet, ribbon, dashed }
+
+extension CursorTheme {
+    var trailKind: TrailKind {
+        switch motion {
+        case .glide: .none
+        case .swoop: .ribbon
+        case .dart: .comet
+        case .trace: .dashed
+        }
+    }
+
+    /// How long a trail sample stays visible — the ribbon lingers, the comet is
+    /// brief, the dashed guide path hangs around long enough to be followed.
+    var trailMaxAge: TimeInterval {
+        switch motion {
+        case .glide: 0.32
+        case .swoop: 0.6
+        case .dart: 0.38
+        case .trace: 1.3
+        }
+    }
+}
+
 @MainActor
 public final class GuidanceOverlayController {
     // One window PER SCREEN, each sized to its screen. A single window spanning the
@@ -20,6 +120,9 @@ public final class GuidanceOverlayController {
     private var followTimer: Timer?
     private var returnTask: Task<Void, Never>?
     private var highlightTask: Task<Void, Never>?
+    /// Drives multi-stage flights (the pink swoop); cancelled whenever a new
+    /// destination arrives so stale waypoints never fight a fresh flight.
+    private var flightTask: Task<Void, Never>?
     private var spaceObserver: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
     private var reorderTick = 0
@@ -90,6 +193,8 @@ public final class GuidanceOverlayController {
     public func hide() {
         returnTask?.cancel()
         returnTask = nil
+        flightTask?.cancel()
+        flightTask = nil
         state.pointing = false
         state.label = ""
     }
@@ -118,12 +223,19 @@ public final class GuidanceOverlayController {
         state.highlightVisible = false
     }
 
+    /// Recolors the whole guidance overlay (cursor, trail, ripple, marquee).
+    public func setTheme(_ theme: CursorTheme) {
+        state.theme = theme
+    }
+
     /// Fully removes the companion (used if the assistant is turned off).
     public func stop() {
         followTimer?.invalidate()
         followTimer = nil
         returnTask?.cancel()
         returnTask = nil
+        flightTask?.cancel()
+        flightTask = nil
         highlightTask?.cancel()
         highlightTask = nil
         state.highlightVisible = false
@@ -131,11 +243,62 @@ public final class GuidanceOverlayController {
         windows.forEach { $0.orderOut(nil) }
     }
 
-    /// Animates the companion to a global AppKit point, tracking which screen it's on.
+    /// Animates the companion to a global AppKit point, tracking which screen it's
+    /// on. The flight itself is the theme's signature: green springs straight in,
+    /// peach darts hard and fast, purple eases in calmly (its dashed breadcrumbs do
+    /// the talking), and pink swoops through two offset waypoints so its ribbon
+    /// trail draws an S-curve.
     private func moveCursor(to global: CGPoint, response: Double) {
         state.activeScreen = screenFrame(containing: global)
-        withAnimation(.spring(response: response, dampingFraction: 0.74)) {
-            state.globalPoint = global
+        flightTask?.cancel()
+        flightTask = nil
+        switch state.theme.motion {
+        case .glide:
+            withAnimation(.spring(response: response, dampingFraction: 0.74)) {
+                state.globalPoint = global
+            }
+        case .dart:
+            withAnimation(.easeOut(duration: max(0.14, response * 0.55))) {
+                state.globalPoint = global
+            }
+        case .trace:
+            withAnimation(.spring(response: response * 1.2, dampingFraction: 0.9)) {
+                state.globalPoint = global
+            }
+        case .swoop:
+            swoop(to: global, response: response)
+        }
+    }
+
+    /// Pink's S-curve: two waypoints offset perpendicular to the straight line
+    /// (one each side), each leg retargeting slightly before the previous lands so
+    /// the motion reads as one continuous swoop. Short hops skip the theatrics.
+    private func swoop(to global: CGPoint, response: Double) {
+        let start = state.globalPoint
+        let dx = global.x - start.x, dy = global.y - start.y
+        let dist = hypot(dx, dy)
+        guard dist > 90 else {
+            withAnimation(.spring(response: response, dampingFraction: 0.74)) {
+                state.globalPoint = global
+            }
+            return
+        }
+        let ux = -dy / dist, uy = dx / dist  // unit perpendicular
+        let amp = min(110, dist * 0.22)
+        let w1 = CGPoint(x: start.x + dx / 3 + ux * amp, y: start.y + dy / 3 + uy * amp)
+        let w2 = CGPoint(x: start.x + dx * 2 / 3 - ux * amp, y: start.y + dy * 2 / 3 - uy * amp)
+        let leg = max(0.10, response * 0.45)
+        flightTask = Task { [weak self] in
+            guard let self else { return }
+            withAnimation(.easeIn(duration: leg)) { self.state.globalPoint = w1 }
+            try? await Task.sleep(for: .seconds(leg * 0.85))
+            guard !Task.isCancelled else { return }
+            withAnimation(.linear(duration: leg)) { self.state.globalPoint = w2 }
+            try? await Task.sleep(for: .seconds(leg * 0.85))
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: response * 0.8, dampingFraction: 0.7)) {
+                self.state.globalPoint = global
+            }
         }
     }
 
@@ -232,6 +395,8 @@ final class GuidanceState: ObservableObject {
     @Published var highlightRect: CGRect = .zero    // global AppKit (bottom-left)
     @Published var highlightScreen: CGRect = .zero
     @Published var highlightVisible = false
+    /// Colorway for every piece of guidance chrome.
+    @Published var theme: CursorTheme = .green
 }
 
 /// A non-activating floating panel — unlike a plain NSWindow, this reliably draws
@@ -262,7 +427,6 @@ struct GuidanceOverlayView: View {
     @ObservedObject var state: GuidanceState
     let screenFrame: CGRect
     @State private var trail = CursorTrailStore()
-    private let green = Color(red: 0.31, green: 0.85, blue: 0.63)
 
     /// Global companion point mapped into this window's local (top-left) space, or
     /// nil when the companion is on a different screen.
@@ -292,15 +456,26 @@ struct GuidanceOverlayView: View {
         ZStack(alignment: .topLeading) {
             Color.clear
             if let box = highlightLocalRect {
-                MarchingAntsBox(rect: box)
+                MarchingAntsBox(rect: box, color: state.theme.core)
             }
-            // Glowing comet-streak behind the companion during a flight. Sits below
-            // the cursor and fades on its own once the cursor stops moving.
-            CursorTrailView(store: trail, color: green)
+            // The theme's motion trail behind the companion during a flight — pink's
+            // ribbon, peach's comet streak, purple's dashed guide path. Green leaves
+            // none; its halo is the identity.
+            if state.theme.trailKind != .none {
+                CursorTrailView(store: trail, theme: state.theme)
+            }
             if let point = localPoint {
-                PressRipple(trigger: state.pressTrigger, color: green)
+                // Purple plants a target ring at the destination the moment the
+                // flight starts (the model point IS the target; only the rendered
+                // offset animates) — the dashed path then leads the eye to it.
+                if state.pointing, state.theme.motion == .trace {
+                    TargetRing(core: state.theme.core, soft: state.theme.soft)
+                        .offset(x: point.x - 28, y: point.y - 28)
+                        .transaction { $0.animation = nil }
+                }
+                PressRipple(trigger: state.pressTrigger, color: state.theme.core)
                     .offset(x: point.x - 17, y: point.y - 17)
-                GuideCursor(label: state.pointing ? state.label : "", pointing: state.pointing, pressTrigger: state.pressTrigger)
+                GuideCursor(theme: state.theme, label: state.pointing ? state.label : "", pointing: state.pointing, pressTrigger: state.pressTrigger)
                     .offset(x: point.x, y: point.y)
                     // Rides the same spring the offset uses, sampling each interpolated
                     // position into the trail buffer. Only records while pointing/flying.
@@ -312,23 +487,24 @@ struct GuidanceOverlayView: View {
     }
 }
 
-/// Animated golden "marching ants" rectangle that frames a region of the screen.
+/// Animated "marching ants" rectangle that frames a region of the screen, drawn
+/// in the cursor theme's color so the marquee always matches the companion.
 struct MarchingAntsBox: View {
     let rect: CGRect
+    let color: Color
     @State private var phase: CGFloat = 0
-    private let gold = Color(red: 1.0, green: 0.86, blue: 0.25)
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(gold.opacity(0.10))
+                .fill(color.opacity(0.10))
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(gold.opacity(0.30), lineWidth: 5)
+                .strokeBorder(color.opacity(0.30), lineWidth: 5)
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(gold, style: StrokeStyle(lineWidth: 1.8, dash: [7, 4], dashPhase: phase))
+                .strokeBorder(color, style: StrokeStyle(lineWidth: 1.8, dash: [7, 4], dashPhase: phase))
         }
         .frame(width: rect.width, height: rect.height)
-        .shadow(color: gold.opacity(0.35), radius: 10)
+        .shadow(color: color.opacity(0.35), radius: 10)
         .position(x: rect.midX, y: rect.midY)
         .transition(.scale(scale: 1.04).combined(with: .opacity))
         .onAppear {
@@ -343,19 +519,19 @@ struct MarchingAntsBox: View {
 /// other — the renderer's TimelineView clock drives drawing instead.
 final class CursorTrailStore {
     private var samples: [(point: CGPoint, t: TimeInterval)] = []
-    /// How long a sample stays visible. Short enough to read as a wisp hugging the
-    /// cursor, long enough to trace the arc of a quick flight.
-    let maxAge: TimeInterval = 0.32
-    private let maxCount = 24
+    /// Hard ceiling on sample retention; each theme reads a shorter window via
+    /// `visibleSamples(now:maxAge:)` (the dashed guide path lives longest).
+    private let hardMaxAge: TimeInterval = 1.5
+    private let maxCount = 64
 
     /// Records a position if it has moved enough to matter, then drops anything
-    /// older than `maxAge` so a parked cursor's trail empties itself.
+    /// older than `hardMaxAge` so a parked cursor's trail empties itself.
     func record(_ point: CGPoint, at now: TimeInterval) {
         if let last = samples.last, hypot(point.x - last.point.x, point.y - last.point.y) < 1.2 {
             return
         }
         samples.append((point, now))
-        samples.removeAll { now - $0.t > maxAge }
+        samples.removeAll { now - $0.t > hardMaxAge }
         if samples.count > maxCount {
             samples.removeFirst(samples.count - maxCount)
         }
@@ -363,11 +539,12 @@ final class CursorTrailStore {
 
     /// Currently-visible samples (oldest → newest) with a freshness weight in 0…1,
     /// where 1 is right behind the cursor and 0 is the dissolving tail.
-    func visibleSamples(now: TimeInterval) -> [(point: CGPoint, freshness: Double)] {
-        samples.compactMap { sample in
+    func visibleSamples(now: TimeInterval, maxAge: TimeInterval) -> [(point: CGPoint, freshness: Double)] {
+        let window = min(maxAge, hardMaxAge)
+        return samples.compactMap { sample in
             let age = now - sample.t
-            guard age >= 0, age <= maxAge else { return nil }
-            return (sample.point, 1 - age / maxAge)
+            guard age >= 0, age <= window else { return nil }
+            return (sample.point, 1 - age / window)
         }
     }
 }
@@ -394,30 +571,60 @@ private struct FlightSampler: ViewModifier, @MainActor Animatable {
     func body(content: Content) -> some View { content }
 }
 
-/// Renders the trail as three stacked, blurred passes — a wide soft halo, a tighter
-/// glow, and a crisp core — each segment tapering and fading toward the tail so the
-/// streak reads like a highlighter dissolving into nothing behind the cursor.
+/// Renders the theme's motion trail. Comet (peach) and ribbon (pink) are stacked,
+/// blurred passes — a wide soft halo, a tighter glow, and a crisp core — each
+/// segment tapering and fading toward the tail; the ribbon is simply a much fatter,
+/// longer-lived comet, like the reference art's pink swoosh. Dashed (purple) is a
+/// single dotted breadcrumb stroke with a faint glow, left for the eye to follow.
 private struct CursorTrailView: View {
     let store: CursorTrailStore
-    let color: Color
+    let theme: CursorTheme
 
     /// Number of bands the trail is sliced into for its fade. More bands = a
     /// smoother gradient; any residual stepping is hidden by the layers' blur.
     private let bandCount = 24
 
+    private var color: Color { theme.core }
+
     var body: some View {
         TimelineView(.animation) { timeline in
             let now = timeline.date.timeIntervalSinceReferenceDate
-            let points = store.visibleSamples(now: now).map(\.point)
+            let points = store.visibleSamples(now: now, maxAge: theme.trailMaxAge).map(\.point)
             let path = Self.smoothPath(through: points)
             ZStack {
-                layer(path, lineWidth: 11, maxOpacity: 0.10, blur: 12)
-                layer(path, lineWidth: 6, maxOpacity: 0.22, blur: 5)
-                layer(path, lineWidth: 3, maxOpacity: 0.60, blur: 0)
+                switch theme.trailKind {
+                case .none:
+                    EmptyView()
+                case .comet:
+                    layer(path, lineWidth: 11, maxOpacity: 0.10, blur: 12)
+                    layer(path, lineWidth: 6, maxOpacity: 0.22, blur: 5)
+                    layer(path, lineWidth: 3, maxOpacity: 0.60, blur: 0)
+                case .ribbon:
+                    layer(path, lineWidth: 26, maxOpacity: 0.18, blur: 16)
+                    layer(path, lineWidth: 15, maxOpacity: 0.38, blur: 6)
+                    layer(path, lineWidth: 9, maxOpacity: 0.85, blur: 0)
+                case .dashed:
+                    dashedLayer(path, lineWidth: 7, opacity: 0.25, blur: 5)
+                    dashedLayer(path, lineWidth: 3, opacity: 0.9, blur: 0)
+                }
             }
             .allowsHitTesting(false)
         }
         .ignoresSafeArea()
+    }
+
+    /// Dotted breadcrumb stroke — round dots with even gaps, no taper, so the
+    /// path reads as a guide to follow rather than exhaust behind the cursor.
+    private func dashedLayer(_ path: Path, lineWidth: CGFloat, opacity: Double, blur: CGFloat) -> some View {
+        Canvas { context, _ in
+            guard !path.isEmpty else { return }
+            context.stroke(
+                path,
+                with: .color(color.opacity(opacity)),
+                style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, dash: [0.1, 11])
+            )
+        }
+        .blur(radius: blur)
     }
 
     /// Strokes the single smoothed path in `bandCount` slices. Each slice tapers
@@ -468,6 +675,29 @@ private struct CursorTrailView: View {
     }
 }
 
+/// Purple's destination marker: a soft-filled double ring pinned at the flight
+/// target (like the reference art's "Guide me" bullseye), gently pulsing while
+/// the companion is parked on it.
+private struct TargetRing: View {
+    let core: Color
+    let soft: Color
+    @State private var pulse = false
+
+    var body: some View {
+        ZStack {
+            Circle().fill(soft.opacity(0.16))
+            Circle().stroke(soft.opacity(0.6), lineWidth: 1.5).padding(4)
+            Circle().stroke(core, lineWidth: 2).padding(14)
+        }
+        .frame(width: 56, height: 56)
+        .scaleEffect(pulse ? 1.06 : 0.96)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) { pulse = true }
+        }
+        .transition(.scale(scale: 0.6).combined(with: .opacity))
+    }
+}
+
 /// One-shot click bloom centred on the cursor tip — a soft glow flash plus a
 /// crisp expanding ring, so a press reads as a little burst of light.
 private struct PressRipple: View {
@@ -514,20 +744,22 @@ private struct PressRipple: View {
     }
 }
 
-/// Green guide cursor in TipTour's style: the Lucide "mouse-pointer-2" glyph drawn
-/// as a white arrow with a green edge, sitting inside a soft seafoam halo. Built
-/// from stacked layers — wide halo → soft glow → white core → green stroke — so it
-/// reads as a luminous glyph rather than a flat fill. It breathes gently while
-/// parked pointing at something and pulses on press.
+/// Guide cursor in TipTour's style: the Lucide "mouse-pointer-2" glyph drawn as a
+/// white arrow with a colored edge, sitting inside a soft matching halo. Built
+/// from stacked layers — wide halo → soft glow → white core → colored stroke — so
+/// it reads as a luminous glyph rather than a flat fill. It breathes gently while
+/// parked pointing at something and pulses on press. Colors come from the user's
+/// chosen `CursorTheme`.
 struct GuideCursor: View {
+    var theme: CursorTheme = .green
     let label: String
     var pointing: Bool = false
     var pressTrigger: Int = 0
     @State private var pressed = false
     @State private var breathing = false
 
-    private let green = Color(red: 0.31, green: 0.85, blue: 0.63)
-    private let mint = Color(red: 0.62, green: 0.93, blue: 0.80)
+    private var green: Color { theme.core }
+    private var mint: Color { theme.soft }
     private let glyphSize: CGFloat = 24
     /// The glyph's tip sits ~4.2/24 into its viewbox; pull it back so the tip lands
     /// on the companion's anchor point (this view's top-leading corner), matching
@@ -550,12 +782,16 @@ struct GuideCursor: View {
             )
         }
         .frame(width: glyphSize, height: glyphSize)
-        .background(halo)
+        .background {
+            // The big spotlight is green's signature; the other cursors get their
+            // identity from their trails (ribbon / comet / dashed path) instead.
+            if theme.motion == .glide { halo }
+        }
         .offset(x: -tipInset, y: -tipInset)
         .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
     }
 
-    /// The big soft seafoam spotlight behind the arrow — the README-glow look.
+    /// The big soft spotlight behind the arrow — the README-glow look.
     /// A background, so it never affects layout or the tip's anchor.
     private var halo: some View {
         Circle()
