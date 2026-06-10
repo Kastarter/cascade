@@ -1259,10 +1259,29 @@ public final class CascadeAppModel: ObservableObject {
         return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
     }
 
-    private static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
+    private nonisolated static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
         var ref: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success else { return nil }
         return ref as? String
+    }
+
+    /// The title of a sheet or modal dialog currently focused in the frontmost
+    /// app, or nil when the UI is in its normal state. Off-main — AX calls block.
+    private static func unexpectedModal() async -> String? {
+        await Task.detached { () -> String? in
+            guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
+            let appRef = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(appRef, 0.3)
+            var focusedRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+                  let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else { return nil }
+            let window = focusedRef as! AXUIElement
+            let role = axString(window, kAXRoleAttribute) ?? ""
+            let subrole = axString(window, kAXSubroleAttribute) ?? ""
+            guard role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" else { return nil }
+            let title = axString(window, kAXTitleAttribute) ?? ""
+            return title.isEmpty ? (role == "AXSheet" ? "sheet" : "dialog") : title
+        }.value
     }
 
     private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
@@ -1569,6 +1588,17 @@ public final class CascadeAppModel: ObservableObject {
                 continue
             }
             do {
+                // A sheet/dialog the recording never saw is up — recorded
+                // coordinates would click straight into it (tiptour's modal
+                // pause). Hand control back instead of plowing on.
+                if step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick,
+                   let modalTitle = await Self.unexpectedModal() {
+                    agentMessage = "Paused “\(agent.name)” — a dialog (“\(modalTitle)”) is open that the recording never saw. Handle it, then deploy again."
+                    dock.show(title: "Paused — dialog open", detail: agentMessage)
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
+                    stoppedEarly = true
+                    break
+                }
                 if let x = step.x, let y = step.y,
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
                     let recorded = CGPoint(x: x, y: y)

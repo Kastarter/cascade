@@ -184,6 +184,46 @@ public enum ComputerUseError: Error, LocalizedError {
     }
 }
 
+/// Snaps a model-chosen click point to the center of the interactive element
+/// under it — vision coordinates are routinely a few pixels off, and a click on
+/// a button's edge that lands on the gap beside it is the classic misclick.
+/// Conservative on purpose: only small, genuinely clickable elements snap, so
+/// canvas apps (whose AX hit-test returns the giant canvas) never misfire.
+enum AXClickSnap {
+    private static let interactiveRoles: Set<String> = [
+        "AXButton", "AXMenuItem", "AXMenuButton", "AXCheckBox", "AXRadioButton",
+        "AXPopUpButton", "AXLink", "AXTextField", "AXTextArea", "AXSearchField",
+        "AXComboBox", "AXDisclosureTriangle", "AXTabButton", "AXSegmentedControl",
+    ]
+    private static let maxSnapDistance: CGFloat = 28
+    private static let maxElementSize = CGSize(width: 360, height: 130)
+
+    static func snapped(_ point: CGPoint) -> CGPoint? {
+        let system = AXUIElementCreateSystemWide()
+        var ref: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
+              let element = ref else { return nil }
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+              let role = roleRef as? String, interactiveRoles.contains(role) else { return nil }
+        var positionRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let positionRef, let sizeRef else { return nil }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size),
+              size.width > 1, size.height > 1,
+              size.width <= maxElementSize.width, size.height <= maxElementSize.height else { return nil }
+        let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+        let distance = hypot(center.x - point.x, center.y - point.y)
+        guard distance > 0.5, distance <= maxSnapDistance else { return nil }
+        return center
+    }
+}
+
 public struct NativeComputerUseActuator: ComputerUseActuator {
     private let runState: AgentRunState?
 
@@ -217,24 +257,39 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         case .move(let x, let y):
             try move(to: CGPoint(x: x, y: y))
         case .click(let x, let y):
-            try click(at: CGPoint(x: x, y: y))
+            try click(at: snapping(CGPoint(x: x, y: y)))
         case .doubleClick(let x, let y):
-            try doubleClick(at: CGPoint(x: x, y: y))
+            try doubleClick(at: snapping(CGPoint(x: x, y: y)))
         case .tripleClick(let x, let y):
             try tripleClick(at: CGPoint(x: x, y: y))
         case .rightClick(let x, let y):
-            try rightClick(at: CGPoint(x: x, y: y))
+            try rightClick(at: snapping(CGPoint(x: x, y: y)))
         case .drag(let fromX, let fromY, let toX, let toY):
             try await drag(from: CGPoint(x: fromX, y: fromY), to: CGPoint(x: toX, y: toY))
         case .key(let key, let modifiers):
-            try pressKey(key, modifiers: modifiers)
+            try pressKey(key, modifiers: modifiers, pid: await frontmostPID())
         case .typeText(let text):
-            try await typeText(text)
+            try await typeText(text, pid: await frontmostPID())
         case .scroll(let deltaX, let deltaY):
             try scroll(deltaX: deltaX, deltaY: deltaY)
         case .openURL(let raw):
             try await openURL(raw)
         }
+    }
+
+    /// AX+vision fused grounding for live clicks: vision picked the point, the
+    /// accessibility hit-test corrects it to the element's center when it's a
+    /// near-miss on a real control.
+    private func snapping(_ point: CGPoint) -> CGPoint {
+        AXClickSnap.snapped(point) ?? point
+    }
+
+    /// Keys post to the frontmost app's process (tiptour-macos pattern): they
+    /// land in the app the agent is working even if another window steals
+    /// focus mid-run, and the user's own typing never interleaves at the HID
+    /// level. Falls back to the global tap when there's no frontmost app.
+    private func frontmostPID() async -> pid_t? {
+        await MainActor.run { NSWorkspace.shared.frontmostApplication?.processIdentifier }
     }
 
     private func move(to point: CGPoint) throws {
@@ -339,7 +394,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         await MainActor.run { _ = NSWorkspace.shared.open(url) }
     }
 
-    private func pressKey(_ key: String, modifiers: [String]) throws {
+    private func pressKey(_ key: String, modifiers: [String], pid: pid_t?) throws {
         guard let code = KeyCodes.code(for: key) else {
             throw ComputerUseError.unsupported("Unknown key: \(key)")
         }
@@ -350,14 +405,14 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         }
         down.flags = flags
         up.flags = flags
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        post(down, pid: pid)
+        post(up, pid: pid)
     }
 
     /// Types in chunks with a small pace between events. Per-character bursts with
     /// zero delay get DROPPED by Catalyst/Electron apps (WhatsApp, Slack…) — the
     /// keys "press" but nothing lands in the field.
-    private func typeText(_ text: String) async throws {
+    private func typeText(_ text: String, pid: pid_t?) async throws {
         let units = Array(text.utf16)
         var index = 0
         while index < units.count {
@@ -371,10 +426,20 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
                 down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: buffer.baseAddress)
                 up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: buffer.baseAddress)
             }
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
+            post(down, pid: pid)
+            post(up, pid: pid)
             try? await Task.sleep(for: .milliseconds(12))
             index += 16
+        }
+    }
+
+    /// Per-PID delivery for keyboard events, with the global HID tap as the
+    /// fallback. Targeted posting can't be stolen by a focus change mid-run.
+    private func post(_ event: CGEvent, pid: pid_t?) {
+        if let pid {
+            event.postToPid(pid)
+        } else {
+            event.post(tap: .cghidEventTap)
         }
     }
 }
