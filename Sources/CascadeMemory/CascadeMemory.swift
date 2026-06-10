@@ -464,6 +464,37 @@ public actor CascadeStore {
         }
     }
 
+    /// One moment by id — the agentic answerer's `inspect_moment` tool.
+    public func context(id: Int64) throws -> RecordedContext? {
+        let sql = "SELECT \(Self.contextColumns()) FROM recorded_context WHERE id = ? LIMIT 1;"
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, id)
+            return sqlite3_step(statement) == SQLITE_ROW ? decodeContext(statement) : nil
+        }
+    }
+
+    /// Moments inside a time window, oldest-first — the agentic answerer's
+    /// `get_timeframe` tool ("what was I doing between 2 and 3pm").
+    public func contexts(between start: Date, and end: Date, limit: Int = 60) throws -> [RecordedContext] {
+        let sql = """
+        SELECT \(Self.contextColumns())
+        FROM recorded_context
+        WHERE captured_at >= ? AND captured_at <= ?
+        ORDER BY captured_at ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(DateCodec.string(from: start), at: 1, in: statement)
+            bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
     /// Moments whose recorded text matches ANY meaningful token of a natural-
     /// language question, best match first (FTS5 bm25). Unlike `searchContexts`
     /// — which ANDs every token, so a stopword-heavy question matches nothing —

@@ -11,10 +11,27 @@ import SandboxKit
 import SuggestionEngine
 
 /// One real Q&A turn over local context — drives the Reel "Ask about this moment" thread.
+/// A moment an answer was grounded in — rendered as a proof chip under the
+/// reply; clicking it jumps the Reel to that exact point in time.
+public struct CitedMoment: Identifiable, Sendable, Equatable {
+    public let id: Int64
+    public let appName: String
+    public let capturedAt: Date
+    public let imagePath: String?
+
+    public init(id: Int64, appName: String, capturedAt: Date, imagePath: String?) {
+        self.id = id
+        self.appName = appName
+        self.capturedAt = capturedAt
+        self.imagePath = imagePath
+    }
+}
+
 public struct QATurn: Identifiable, Sendable {
     public let id = UUID()
     public let question: String
     public let answer: String
+    public var citations: [CitedMoment] = []
 }
 
 /// A background agent running in the isolated web sandbox.
@@ -278,24 +295,44 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
 
-        answer = "Thinking…"
+        answer = "Searching your record…"
         thinking = true
+        // Recent turns let "and after that?" follow-ups inherit context.
+        let history = conversation.suffix(4).map { (user: $0.question, assistant: $0.answer) }
         Task {
-            let result: String
+            var result: String
+            var citations: [CitedMoment] = []
             var answered = true
             do {
-                result = Self.brief(try await orchestrator.ask(trimmed))
+                let recordAnswer = try await orchestrator.askRecord(trimmed, conversation: Array(history))
+                result = Self.brief(recordAnswer.text)
+                citations = await orchestrator.citedMoments(recordAnswer.citedMomentIDs).map {
+                    CitedMoment(id: $0.id, appName: $0.appName, capturedAt: $0.capturedAt, imagePath: $0.imagePath)
+                }
             } catch {
                 result = error.localizedDescription
                 answered = false
             }
             answer = result
-            conversation.append(QATurn(question: trimmed, answer: result))
+            conversation.append(QATurn(question: trimmed, answer: result, citations: citations))
             // One brain: the voice agent sees what was said in chat, and vice
             // versa. Errors stay short-lived context, never archived.
             assistMemory.remember(user: trimmed, assistant: result, ok: answered)
             thinking = false
         }
+    }
+
+    // MARK: - Citation → Reel jump
+
+    /// When set, the Reel scrubs to the moment nearest this time (then clears).
+    @Published public var reelJumpTarget: Date?
+
+    /// Click a proof chip → see the actual recorded moment in the Reel.
+    public func jumpToMoment(_ citation: CitedMoment) {
+        searchQuery = ""
+        selectedTab = .reel
+        reelJumpTarget = citation.capturedAt
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: "citation #\(citation.id)")) }
     }
 
     /// Captures the current screen, points the blue companion cursor at the element

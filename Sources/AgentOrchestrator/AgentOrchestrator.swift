@@ -166,6 +166,7 @@ public actor CascadeOrchestrator {
     private let store: CascadeStore
     private let localAnswerer: ContextQuestionAnswering
     private let claudeAnswerer: ContextQuestionAnswering
+    private let recordAnswerer: RecordAnswering
     private let planner: SingleStepPlanner
     private let suggestionEngine: SuggestionEngine
     private let wasteDetector = WasteDetector()
@@ -175,6 +176,7 @@ public actor CascadeOrchestrator {
         store: CascadeStore,
         localAnswerer: ContextQuestionAnswering = LocalGroundedAnswerer(),
         claudeAnswerer: ContextQuestionAnswering = ClaudeGroundedAnswerer(),
+        recordAnswerer: RecordAnswering? = nil,
         planner: SingleStepPlanner = ClaudeSingleStepPlanner(),
         suggestionEngine: SuggestionEngine = SuggestionEngine(),
         keyStore: AnthropicKeyStore = AnthropicKeyStore()
@@ -182,6 +184,7 @@ public actor CascadeOrchestrator {
         self.store = store
         self.localAnswerer = localAnswerer
         self.claudeAnswerer = claudeAnswerer
+        self.recordAnswerer = recordAnswerer ?? RecordSearchAnswerer(store: store, keyStore: keyStore)
         self.planner = planner
         self.suggestionEngine = suggestionEngine
         self.keyStore = keyStore
@@ -191,11 +194,37 @@ public actor CascadeOrchestrator {
     /// only) and falls back to the local heuristic answerer otherwise, or on any
     /// provider error.
     public func ask(_ question: String) async throws -> String {
-        let grounding = try await chatGrounding(for: question)
-        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: question, grounding: grounding) {
+        try await askRecord(question).text
+    }
+
+    /// Agentic Q&A: the model hunts through the record (FTS, timeframes,
+    /// per-moment inspection) and returns the answer WITH the moments it used.
+    /// Falls back to single-shot grounding, then to the local heuristic, so a
+    /// missing key or a flaky network never breaks asking.
+    public func askRecord(_ question: String, conversation: [(user: String, assistant: String)] = []) async throws -> RecordAnswer {
+        if keyStore.hasKey(),
+           let answer = try? await recordAnswerer.answer(question: question, conversation: conversation) {
             return answer
         }
-        return try await localAnswerer.answer(question: question, grounding: grounding)
+        let grounding = try await chatGrounding(for: question)
+        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: question, grounding: grounding) {
+            return RecordAnswer(text: answer, citedMomentIDs: [])
+        }
+        return RecordAnswer(
+            text: try await localAnswerer.answer(question: question, grounding: grounding),
+            citedMomentIDs: []
+        )
+    }
+
+    /// Resolves cited moment ids to renderable chips (privacy-filtered).
+    public func citedMoments(_ ids: [Int64]) async -> [RecordedContext] {
+        var moments: [RecordedContext] = []
+        for id in ids {
+            if let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) {
+                moments.append(moment)
+            }
+        }
+        return moments
     }
 
     /// Chat grounding, layered so any question about the user's day is answerable:

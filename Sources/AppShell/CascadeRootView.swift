@@ -439,6 +439,15 @@ private struct ReelScreen: View {
         .onChange(of: moments.count) { _, newCount in
             index = min(index, max(newCount - 1, 0))
         }
+        .onChange(of: model.reelJumpTarget) { _, target in
+            // A citation chip was clicked — scrub to the moment it cites.
+            guard let target, !moments.isEmpty else { return }
+            isPlaying = false
+            index = moments.indices.min(by: {
+                abs(moments[$0].capturedAt.timeIntervalSince(target)) < abs(moments[$1].capturedAt.timeIntervalSince(target))
+            }) ?? 0
+            model.reelJumpTarget = nil
+        }
     }
 
     /// Soft warm vignette at the top of the reel, echoing the captured-moment glow.
@@ -984,6 +993,9 @@ private struct AskPanel: View {
                         ForEach(model.conversation) { turn in
                             ChatBubble(text: turn.question, mine: true)
                             ChatBubble(text: turn.answer, mine: false)
+                            if !turn.citations.isEmpty {
+                                CitationChips(citations: turn.citations) { model.jumpToMoment($0) }
+                            }
                         }
                         if model.thinking {
                             if model.answer.isEmpty {
@@ -1716,6 +1728,51 @@ private struct PipelineStat: View {
         .padding(.vertical, CascadeMetrics.s2 + 2)
         .background(Color.cascadePanel, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
+}
+
+/// Proof chips under an answer: the recorded moments it was grounded in.
+/// Click one and the Reel jumps to that exact moment — the answer is checkable,
+/// not just plausible.
+private struct CitationChips: View {
+    let citations: [CitedMoment]
+    let onTap: (CitedMoment) -> Void
+
+    var body: some View {
+        HStack(spacing: CascadeMetrics.s2) {
+            ForEach(citations) { citation in
+                Button { onTap(citation) } label: {
+                    HStack(spacing: 5) {
+                        thumbnail(citation)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(citation.appName).font(.cascadeSans(10, .semibold)).lineLimit(1)
+                            Text(citation.capturedAt.formatted(date: .omitted, time: .shortened))
+                                .font(.cascadeMono(9)).foregroundStyle(Color.cascadeText3)
+                        }
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("Jump the Reel to this moment")
+            }
+        }
+    }
+
+    @ViewBuilder private func thumbnail(_ citation: CitedMoment) -> some View {
+        if let path = citation.imagePath, let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable().scaledToFill()
+                .frame(width: 30, height: 20)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        } else {
+            Image(systemName: "clock")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.cascadeText3)
+                .frame(width: 18, height: 18)
+        }
     }
 }
 
