@@ -93,6 +93,10 @@ public final class CascadeAppModel: ObservableObject {
     /// `runState.reset()` could revive a loop the barge-in just stopped, leaving
     /// two loops fighting over the same cursor.
     private var assistGeneration = 0
+    /// Set when the agent used its highlight tool during the current run, so the
+    /// end-of-task cleanup doesn't erase the box the user asked to see (it fades
+    /// on the overlay's own timer instead).
+    private var agentDidHighlight = false
     private var cancellables: Set<AnyCancellable> = []
     private var lastSettingsOpen = Date.distantPast
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
@@ -647,6 +651,7 @@ public final class CascadeAppModel: ObservableObject {
     /// and every run is audited.
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
+        agentDidHighlight = false
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
 
@@ -732,7 +737,9 @@ public final class CascadeAppModel: ObservableObject {
         } else {
             assistMemory.remember(user: goal, assistant: teachMessage, ok: false)
         }
-        guidanceOverlay.hide()
+        // Keep the agent's highlight up — erasing it at "Done" would defeat the
+        // point of asking for it. The overlay fades it on its own timer.
+        if !agentDidHighlight { guidanceOverlay.hide() }
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: goal))
         voice.done()
         await refreshAll()
@@ -758,7 +765,8 @@ public final class CascadeAppModel: ObservableObject {
             screenshot: firstScreenshotPNG,
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height),
-            conversation: assistMemory.historyForAPI()
+            conversation: assistMemory.historyForAPI(),
+            note: Self.groundingNote()
         )
         var acted = false
         var count = 0
@@ -775,9 +783,29 @@ public final class CascadeAppModel: ObservableObject {
             }
 
             if !step.actions.isEmpty { acted = true }
+            // Zoom is answered with the cropped frame, not a regular screenshot —
+            // pull it out and run everything else first.
+            var zoomRegion: CGRect?
+            var actedThisTurn = false
             for action in step.actions {
+                if case .zoom(let nx, let ny, let nw, let nh) = action {
+                    zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
+                    continue
+                }
+                actedThisTurn = true
                 if !(await executeCU(action, on: screen)) { return .failed }
                 try? await Task.sleep(for: .milliseconds(120))
+            }
+
+            if let zoomRegion {
+                // Native-resolution crop so the model can actually read small text.
+                if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
+                if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
+                    step = await agent.proceed(screenshot: crop, note: Self.groundingNote(), zoomResult: true)
+                    count += 1
+                    continue
+                }
+                // Crop failed — fall through to the regular re-observe.
             }
             // Let the UI settle, then re-observe and ask for the next step. Capturing
             // at the agent's resolution as JPEG skips the PNG round-trip and OCR.
@@ -787,10 +815,21 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
-            step = await agent.proceed(screenshot: nextShot)
+            step = await agent.proceed(screenshot: nextShot, note: Self.groundingNote())
             count += 1
         }
         return .stepLimit
+    }
+
+    /// One line of text grounding sent with every frame: which app and window are
+    /// frontmost. ~15 tokens that prevent which-app-am-I-in mistakes.
+    private static func groundingNote() -> String? {
+        let snapshot = AppWindowObserver.snapshot()
+        guard snapshot.appName != "Unknown app" else { return nil }
+        if let title = snapshot.windowTitle, !title.isEmpty {
+            return "Frontmost app: \(snapshot.appName) — “\(title)”"
+        }
+        return "Frontmost app: \(snapshot.appName)"
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer
@@ -850,6 +889,16 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(700))
             case .screenshot:
                 break
+            case .zoom:
+                break  // handled inside the episode loop (needs the cropped frame back)
+            case .highlight(let x, let y, let width, let height, let label):
+                // The agent showing the user something — Cascade's own overlay.
+                let g = CGRect(x: screen.frame.minX + x, y: screen.frame.minY + y, width: width, height: height)
+                guidanceOverlay.highlight(globalRect: g)
+                guidanceOverlay.present(atGlobalPoint: CGPoint(x: g.midX, y: g.midY), label: label)
+                assistMemory.rememberPointed(label: label, globalPoint: CGPoint(x: g.midX, y: g.midY))
+                agentDidHighlight = true
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.highlight", detail: label))
             case .openApp(let name):
                 // Instant programmatic launch — no Dock hunting, no cursor. Wait (up to
                 // ~2.5s) for the app to actually come frontmost so the next screenshot
@@ -1053,6 +1102,12 @@ public final class CascadeAppModel: ObservableObject {
     /// something (point only)?
     private static func isActionRequest(_ text: String) -> Bool {
         let t = text.lowercased()
+        // Highlight/mark requests go to the acting agent — it owns the highlight
+        // tool and can navigate/scroll to surface the target first. This wins even
+        // over question-y phrasing ("show me X and highlight them").
+        if t.contains("highlight") || t.contains("point out") || t.contains(" mark ") || t.hasPrefix("mark ") {
+            return true
+        }
         let teachy = ["where", "how do i", "how can i", "show me", "find ", "what is", "which "]
         if teachy.contains(where: { t.contains($0) }) { return false }
         let verbs = ["open", "click", "press", "tap", "hit", "launch", "go to", "select",

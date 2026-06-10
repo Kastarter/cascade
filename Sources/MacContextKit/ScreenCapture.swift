@@ -115,6 +115,66 @@ public enum ScreenCaptureUtility {
         }
     }
 
+    /// Captures the cursor display at NATIVE resolution and returns just the given
+    /// normalized region (top-left origin, [0,1]) as JPEG — the agent's zoom: full
+    /// pixel detail for small text that is illegible at the loop resolution. The
+    /// crop is capped at `maxDimension` on its long side.
+    ///
+    /// FAIL-CLOSED: returns `nil` without capturing if Screen Recording isn't granted.
+    public static func captureCursorScreenZoomJPEG(
+        normalizedRect: CGRect, maxDimension: Int = 1024, compression: Double = 0.8
+    ) async -> Data? {
+        guard CGPreflightScreenCaptureAccess() else {
+            logger.info("Capture skipped — Screen Recording not granted (fail-closed).")
+            return nil
+        }
+        do {
+            let content = try await shareableContent()
+            guard let display = cursorDisplay(in: content) else { return nil }
+            let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows(in: content))
+            let configuration = SCStreamConfiguration()
+            let scale = nsScreensByDisplayID()[display.displayID]?.backingScaleFactor ?? 2.0
+            configuration.width = max(1, Int((CGFloat(display.width) * scale).rounded()))
+            configuration.height = max(1, Int((CGFloat(display.height) * scale).rounded()))
+            configuration.showsCursor = false
+            let frame = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            let cropRect = CGRect(
+                x: (normalizedRect.minX * CGFloat(frame.width)).rounded(.down),
+                y: (normalizedRect.minY * CGFloat(frame.height)).rounded(.down),
+                width: max(1, (normalizedRect.width * CGFloat(frame.width)).rounded()),
+                height: max(1, (normalizedRect.height * CGFloat(frame.height)).rounded())
+            ).intersection(CGRect(x: 0, y: 0, width: frame.width, height: frame.height))
+            guard !cropRect.isEmpty, let crop = frame.cropping(to: cropRect) else { return nil }
+
+            let longSide = max(crop.width, crop.height)
+            guard longSide > maxDimension else { return jpegData(from: crop, compression: compression) }
+            let factor = CGFloat(maxDimension) / CGFloat(longSide)
+            let width = max(1, Int((CGFloat(crop.width) * factor).rounded()))
+            let height = max(1, Int((CGFloat(crop.height) * factor).rounded()))
+            guard let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+            ) else { return nil }
+            NSGraphicsContext.saveGraphicsState()
+            let context = NSGraphicsContext(bitmapImageRep: rep)
+            NSGraphicsContext.current = context
+            context?.imageInterpolation = .high
+            NSImage(cgImage: crop, size: .zero).draw(
+                in: NSRect(x: 0, y: 0, width: width, height: height),
+                from: .zero, operation: .copy, fraction: 1.0
+            )
+            NSGraphicsContext.restoreGraphicsState()
+            return rep.representation(using: .jpeg, properties: [.compressionFactor: compression])
+        } catch {
+            logger.error("Zoom capture failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
     /// Pre-fetches shareable content so the first capture after a permission grant
     /// skips the cold enumeration. Safe to call repeatedly.
     public static func prewarm() {

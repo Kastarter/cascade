@@ -223,8 +223,10 @@ public final class BackgroundWebAgent {
             await sandbox.scroll(dy: direction.lowercased() == "up" ? -magnitude : magnitude)
         case .wait:
             try? await Task.sleep(for: .milliseconds(600))
-        case .screenshot:
-            break
+        case .screenshot, .zoom:
+            break  // the loop re-snapshots; the sandbox view is small enough to read
+        case .highlight:
+            break  // the marching-ants overlay is a real-screen affordance
         case .openApp:
             break  // no apps inside the web sandbox
         case .openURL(let urlString):

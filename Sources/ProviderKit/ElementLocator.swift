@@ -142,11 +142,13 @@ public struct ElementLocator: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
         let prompt = """
-        A screenshot of the user's screen is attached; it is \(declaredW) by \(declaredH) pixels. \
-        The user asked: "\(question)"
+        The user asked: "\(question)". Their screen is in the attached screenshot \
+        (\(declaredW) by \(declaredH) pixels).
 
         Find the single on-screen region where they would do or find that — the area to \
-        frame for them (a button, menu, panel, list, sidebar, field, or section). Reply with \
+        frame for them (a button, menu, panel, list, sidebar, field, or section). Cascade \
+        will draw a glowing highlight box around whatever region you return — highlighting \
+        works over EVERY app, so never reply that something can't be highlighted. Reply with \
         ONLY compact JSON, no other text:
         {"box": [x, y, w, h], "say": "<one short friendly sentence telling them where/how>"}
         where x,y is the TOP-LEFT corner and w,h the width and height of the region, in the \
@@ -158,11 +160,12 @@ public struct ElementLocator: Sendable {
             // and plenty accurate for framing, so the find loop isn't bottlenecked on it.
             "model": AnthropicModel.haiku,
             "max_tokens": 400,
+            // Instruction BEFORE the image — measurably better localization.
             "messages": Self.historyMessages(conversation) + [[
                 "role": "user",
                 "content": [
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
                     ["type": "text", "text": prompt],
+                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
                 ],
             ]],
         ]
@@ -205,7 +208,7 @@ public struct ElementLocator: Sendable {
         request.setValue("computer-use-2025-11-24", forHTTPHeaderField: "anthropic-beta")
 
         let prompt = """
-        A screenshot of the user's current screen is attached. The user said: "\(question)"
+        The user said: "\(question)". Their current screen is in the attached screenshot.
 
         Click the single UI element they want — the exact button, link, menu item, \
         field, or icon — using ONE left_click action at its center. The screenshot is \
@@ -223,11 +226,12 @@ public struct ElementLocator: Sendable {
                 "display_height_px": declaredH,
             ]],
             "tool_choice": ["type": "tool", "name": "computer"],
+            // Instruction BEFORE the image — measurably better click accuracy.
             "messages": Self.historyMessages(conversation) + [[
                 "role": "user",
                 "content": [
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
                     ["type": "text", "text": prompt],
+                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
                 ],
             ]],
         ]
