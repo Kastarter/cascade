@@ -409,8 +409,8 @@ public final class CascadeAppModel: ObservableObject {
     public func beginUseDeviceIntent(source: String = "manual") {
         selectedTab = .reel
         dock.show(
-            title: "Cascade is ready",
-            detail: "Teach or approve the next step before Cascade uses this Mac."
+            title: "Cascade is listening",
+            detail: "Say or type what you want done — Esc stops it at any time."
         )
         Task {
             _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "device.intent", detail: source))
@@ -833,7 +833,12 @@ public final class CascadeAppModel: ObservableObject {
         if !interrupted {
             let summary = AgentTaskPlanner.summary(findings: findings, skipped: [], ranLongOn: ranLongOn)
             teachMessage = summary
-            voice.speak(summary)
+            // Don't say the same sentence twice — if the last progress line IS
+            // the summary, the user already heard it.
+            if summary.caseInsensitiveCompare(lastNarratedLine) != .orderedSame {
+                voice.speak(summary)
+            }
+            lastNarratedLine = ""
             dock.show(title: ranLongOn == nil ? "Done" : "Paused", detail: summary)
             assistMemory.remember(user: goal, assistant: summary)
             // A clean run in an app with no skill yet is exactly the material
@@ -898,6 +903,20 @@ public final class CascadeAppModel: ObservableObject {
         )
         var acted = false
         var count = 0
+        // Stall guard: a turn with no actions and no done is the model talking
+        // instead of working. One is tolerated (thinking out loud), the second
+        // gets a firm nudge, the third ends the episode — never a spam loop to
+        // the step cap repeating the same line.
+        var idleTurns = 0
+        var nudge: String?
+        let episodeStart = ContinuousClock.now
+        var modelTime = Duration.zero
+        var actionTime = Duration.zero
+        func auditTiming(outcome: String) {
+            let total = episodeStart.duration(to: .now)
+            let detail = "\(outcome) · \(count + 1) turns · total \(Int(total / .milliseconds(1)))ms · model \(Int(modelTime / .milliseconds(1)))ms · actions \(Int(actionTime / .milliseconds(1)))ms"
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: detail)) }
+        }
         while count < maxSteps {
             if assistGeneration != gen { return .stopped }  // superseded by a newer turn
             if driver.runState.isStopRequested {
@@ -907,18 +926,37 @@ public final class CascadeAppModel: ObservableObject {
             }
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
-                if !step.done { narrateProgress(step.text) }
+                if !step.done, narrateProgress(step.text), !step.actions.isEmpty {
+                    // Give the spoken line a head start so the user hears
+                    // "writing the poem now" BEFORE the typing starts, not after.
+                    try? await Task.sleep(for: .milliseconds(450))
+                }
             }
             if step.done {
+                auditTiming(outcome: "finished")
                 return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
 
-            if !step.actions.isEmpty { acted = true }
+            if step.actions.isEmpty {
+                idleTurns += 1
+                if idleTurns >= 3 {
+                    auditTiming(outcome: "stalled")
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: String(step.text.prefix(120))))
+                    return .finished(step.text.isEmpty ? "I couldn't make progress on this." : step.text, acted: acted)
+                }
+                if idleTurns == 2 {
+                    nudge = "You have now replied twice without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
+                }
+            } else {
+                idleTurns = 0
+                nudge = nil
+                acted = true
+            }
             // Zoom is answered with the cropped frame, not a regular screenshot —
             // pull it out and run everything else first.
             var zoomRegion: CGRect?
             var actedThisTurn = false
-            for action in step.actions {
+            for (actionIndex, action) in step.actions.enumerated() {
                 // Re-check between every action — a barge-in or newer turn must
                 // halt mid-batch, not after the batch finishes.
                 if assistGeneration != gen || driver.runState.isStopRequested { return .stopped }
@@ -927,15 +965,23 @@ public final class CascadeAppModel: ObservableObject {
                     continue
                 }
                 actedThisTurn = true
+                let actionStart = ContinuousClock.now
                 if !(await executeCU(action, on: screen)) { return .failed }
-                try? await Task.sleep(for: .milliseconds(120))
+                actionTime += actionStart.duration(to: .now)
+                // The pace gap matters BETWEEN actions; after the last one the
+                // settle sleep below covers it — no double wait.
+                if actionIndex < step.actions.count - 1 {
+                    try? await Task.sleep(for: .milliseconds(120))
+                }
             }
 
             if let zoomRegion {
                 // Native-resolution crop so the model can actually read small text.
                 if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
-                    step = await agent.proceed(screenshot: crop, note: groundingNote(), zoomResult: true)
+                    let modelStart = ContinuousClock.now
+                    step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
+                    modelTime += modelStart.duration(to: .now)
                     count += 1
                     continue
                 }
@@ -943,15 +989,19 @@ public final class CascadeAppModel: ObservableObject {
             }
             // Let the UI settle, then re-observe and ask for the next step. Capturing
             // at the agent's resolution as JPEG skips the PNG round-trip and OCR.
-            try? await Task.sleep(for: .milliseconds(260))
+            // A turn that did nothing changed nothing — skip the settle entirely.
+            if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
             let size = agent.captureSize
             guard let nextShot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) else {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
-            step = await agent.proceed(screenshot: nextShot, note: groundingNote())
+            let modelStart = ContinuousClock.now
+            step = await agent.proceed(screenshot: nextShot, note: episodeNote(nudge))
+            modelTime += modelStart.duration(to: .now)
             count += 1
         }
+        auditTiming(outcome: "step-limit")
         return .stepLimit
     }
 
@@ -975,8 +1025,24 @@ public final class CascadeAppModel: ObservableObject {
         } else {
             dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · press STOP to take control.")
         }
+        // Audit BEFORE executing (the audit-first invariant), then flag slow
+        // calls in a second row — that's how a consent-dialog stall or a
+        // crawling script shows up in the log instead of being invisible.
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: summary))
-        return await AgentHarness.perform(call, powerEnabled: powerHarnessEnabled)
+        let started = ContinuousClock.now
+        let result = await AgentHarness.perform(call, powerEnabled: powerHarnessEnabled)
+        let ms = Int(started.duration(to: .now) / .milliseconds(1))
+        if ms >= 800 {
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms — \(summary)"))
+        }
+        return result
+    }
+
+    /// The per-turn grounding note plus, when the stall guard fired, the firm
+    /// "act now or stop" nudge appended so the model can't keep idling.
+    private func episodeNote(_ nudge: String?) -> String? {
+        guard let nudge else { return groundingNote() }
+        return [groundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
     }
 
     /// One line of text grounding sent with every frame: which app and window are
@@ -1187,18 +1253,25 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private var lastNarrationAt = Date.distantPast
+    private var lastNarratedLine = ""
 
     /// Keeps the agent talky while it works: the model's short progress lines
     /// ("writing the poem now") go to the dock and — on voice — are spoken.
-    /// Throttled so chatty turns don't stack speech on speech.
-    private func narrateProgress(_ text: String) {
+    /// Throttled, and consecutive repeats are never spoken twice ("he repeats
+    /// what he says"). Returns true when a line was actually spoken so the
+    /// caller can give the speech a head start before the actions land.
+    @discardableResult
+    private func narrateProgress(_ text: String) -> Bool {
         let line = String(text.split(separator: "\n").first ?? "").trimmingCharacters(in: .whitespaces)
-        guard !line.isEmpty else { return }
+        guard !line.isEmpty else { return false }
         dock.show(title: "Cascade is working", detail: String(line.prefix(120)))
-        if line.count <= 120, Date().timeIntervalSince(lastNarrationAt) >= 4 {
-            lastNarrationAt = Date()
-            voice.speak(line)
-        }
+        guard line.count <= 120,
+              line.caseInsensitiveCompare(lastNarratedLine) != .orderedSame,
+              Date().timeIntervalSince(lastNarrationAt) >= 4 else { return false }
+        lastNarrationAt = Date()
+        lastNarratedLine = line
+        voice.speak(line)
+        return true
     }
 
     /// The app skill matching whatever app is frontmost right now, if any.
