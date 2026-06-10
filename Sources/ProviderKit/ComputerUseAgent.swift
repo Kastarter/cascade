@@ -95,11 +95,16 @@ public final class ComputerUseAgent {
     tell the user to do it themselves or merely describe the steps. When you are \
     confident in a short sequence — like clicking a field, typing into it, and \
     pressing Return — chain those tool calls in ONE turn instead of re-observing between \
-    them; take uncertain steps one at a time. Be silent and extremely brief: do NOT \
-    narrate, explain, or describe what you see or plan — just act. Only when the whole \
-    task is finished, reply with a confirmation of five words or fewer. Earlier exchanges \
-    from this session may precede the task; use them to resolve references like "it", \
-    "that one", or "the first one" — they are context, not new work.
+    them; take uncertain steps one at a time. Narrate your progress in ONE short clause \
+    (eight words max) when you start a distinct phase of the task — "opening the reply", \
+    "writing the poem now" — the user hears these, so keep them human; never describe \
+    coordinates, tools, or screenshots. After launching an app, the first frame may still \
+    show its splash or template screen — wait for it to settle, and NEVER repeat a \
+    new-document action (cmd+n or a New button) until the current frame proves the \
+    previous one didn't work: extra presses create extra documents. When the whole task \
+    is finished, reply with a short confirmation. Earlier exchanges from this session may \
+    precede the task; use them to resolve references like "it", "that one", or "the \
+    first one" — they are context, not new work.
     """
 
     /// What the harness tools are and when to reach for them — appended to the
@@ -109,16 +114,27 @@ public final class ComputerUseAgent {
     You also have direct file tools that need no screenshots and are instant: search_files \
     (Spotlight search of this Mac), list_folder, and read_file. When the task is finding, \
     checking, or reading files or folders — "search my desktop for X", "what's in that \
-    folder" — use these FIRST instead of clicking through Finder windows.
+    folder" — use these FIRST instead of clicking through Finder windows. When the task \
+    lives on screen (an app's UI, a website), do NOT detour through the file tools — act \
+    on screen immediately.
     """
 
     private static let harnessPowerNote = """
     You can also automate directly: run_command executes a zsh command, run_applescript \
-    drives scriptable apps, and write_file writes a text file. Bulk or data-heavy work in \
-    Excel, Numbers, Mail, Finder, or the filesystem should be ONE script, not hundreds of \
-    clicks — the change still happens in the user's real app, visibly. Every command is \
-    shown to the user and recorded in their audit log. If a script fails twice, fall back \
-    to doing it on screen.
+    drives scriptable apps, and write_file writes a text file. PICK ONE LANE PER STEP \
+    AND COMMIT: if a step is file work, do it entirely with these tools; if it's screen \
+    work, do it entirely on screen — mixing both on the same artifact wastes turns and \
+    confuses the result. CREATING FILES AND FOLDERS IS FILE WORK: build the file with \
+    its final name directly at its destination in ONE command (write_file for \
+    text/markdown; run_command with textutil for .docx/.rtf, e.g. \
+    `printf '%s' "..." > /tmp/t.txt && textutil -convert docx /tmp/t.txt -output \
+    ~/Desktop/folder/name.docx`), then `open` the file — never create an untitled \
+    document in an app and fight the Save dialog when one command places the finished \
+    file. Prefer plain shell over AppleScript when both work: AppleScript pauses for a \
+    per-app consent prompt the first time it touches an app. Bulk or data-heavy work in \
+    Excel, Numbers, Mail, or Finder should be ONE script, not hundreds of clicks. Every \
+    command is shown to the user and recorded in their audit log. If a script fails \
+    twice, fall back to doing it on screen.
     """
 
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
