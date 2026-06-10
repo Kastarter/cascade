@@ -8,7 +8,11 @@ public enum CUAction: Sendable, Equatable {
     case move(x: Double, y: Double)
     case click(x: Double, y: Double)
     case doubleClick(x: Double, y: Double)
+    case tripleClick(x: Double, y: Double)
     case rightClick(x: Double, y: Double)
+    /// Press, drag, release — drawing on canvases, moving objects, selecting
+    /// ranges. Both points are display-local AppKit (bottom-left origin).
+    case drag(fromX: Double, fromY: Double, toX: Double, toY: Double)
     case type(String)
     case key(String)
     case scroll(x: Double, y: Double, direction: String, amount: Int)
@@ -18,6 +22,14 @@ public enum CUAction: Sendable, Equatable {
     /// by name, or open a URL. These skip the observe→locate→click loop entirely.
     case openApp(String)
     case openURL(String)
+    /// Inspect a region at full native resolution (the model can't read small text
+    /// at the loop resolution). Region is NORMALIZED [0,1] with top-left origin —
+    /// the executor crops it from a fresh native-resolution capture.
+    case zoom(nx: Double, ny: Double, nw: Double, nh: Double)
+    /// Draw Cascade's marching-ants highlight + companion cursor over a region to
+    /// SHOW the user something. Rect is display-local AppKit points (bottom-left
+    /// origin), like the click coordinates.
+    case highlight(x: Double, y: Double, width: Double, height: Double, label: String)
 }
 
 public struct CUStep: Sendable {
@@ -58,14 +70,23 @@ public final class ComputerUseAgent {
     You are Cascade, operating this Mac to carry out the user's request. Use the computer \
     tool to act. Open apps with the open_app tool and websites with the open_url tool — \
     both are instant; never hunt for an icon in the Dock, Spotlight, or Launchpad, and \
-    never type an address by hand. When you are confident in a short sequence — like \
-    clicking a field, typing into it, and pressing Return — chain those tool calls in \
-    ONE turn instead of re-observing between them; take uncertain steps one at a time. \
-    Be silent and extremely brief: do NOT narrate, explain, or describe what you see or \
-    plan — just act. Only when the whole task is finished, reply with a confirmation of \
-    five words or fewer. Earlier exchanges from this session may precede the task; use \
-    them to resolve references like "it", "that one", or "the first one" — they are \
-    context, not new work.
+    never type an address by hand. You CAN visually point things out: the highlight tool \
+    draws a glowing box on the user's screen over any region — when the user asks you to \
+    highlight, mark, point out, or show them something, USE it (this is YOUR capability; \
+    it works in every app — never say an app doesn't support highlighting). If on-screen \
+    text is too small to read confidently — message contents, sidebar items, small labels \
+    — use the computer tool's zoom action on that region instead of guessing. Creative \
+    and hands-on work is YOURS to do: when asked to design, draw, write, build, or edit \
+    something in an app, carry it out yourself with clicks, drags (left_click_drag for \
+    drawing shapes, moving objects, selecting ranges), typing, and shortcuts — NEVER \
+    tell the user to do it themselves or merely describe the steps. When you are \
+    confident in a short sequence — like clicking a field, typing into it, and \
+    pressing Return — chain those tool calls in ONE turn instead of re-observing between \
+    them; take uncertain steps one at a time. Be silent and extremely brief: do NOT \
+    narrate, explain, or describe what you see or plan — just act. Only when the whole \
+    task is finished, reply with a confirmation of five words or fewer. Earlier exchanges \
+    from this session may precede the task; use them to resolve references like "it", \
+    "that one", or "the first one" — they are context, not new work.
     """
 
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
@@ -99,9 +120,13 @@ public final class ComputerUseAgent {
     /// like "the first one" or "reply to it" against what just happened. Old
     /// screenshots are never resent — only the words (the clicky/openclicky
     /// pattern; see docs/THIRD_PARTY_NOTICES.md).
+    /// `note` is one line of text grounding (frontmost app + window) sent with the
+    /// frame — ~15 tokens that remove a whole class of which-app-am-I-in mistakes.
+    /// Instruction text goes BEFORE the image (per Anthropic's computer-use
+    /// guidance, it measurably improves click accuracy).
     public func begin(
         goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int,
-        conversation: [(user: String, assistant: String)] = []
+        conversation: [(user: String, assistant: String)] = [], note: String? = nil
     ) async -> CUStep {
         messages = []
         pendingToolIDs = []
@@ -117,24 +142,27 @@ public final class ComputerUseAgent {
             messages.append(["role": "user", "content": turn.user])
             messages.append(["role": "assistant", "content": turn.assistant])
         }
-        messages.append([
-            "role": "user",
-            "content": [
-                imageBlock(jpeg),
-                ["type": "text", "text": "Task: \(goal)"],
-            ],
-        ])
+        var content: [[String: Any]] = [["type": "text", "text": "Task: \(goal)"]]
+        if let note { content.append(["type": "text", "text": note]) }
+        content.append(imageBlock(jpeg))
+        messages.append(["role": "user", "content": content])
         return await step()
     }
 
-    public func proceed(screenshot: Data) async -> CUStep {
-        guard !pendingToolIDs.isEmpty, let jpeg = resize(screenshot, resW, resH) else {
+    /// `zoomResult` marks the image as the model-requested zoom crop — it passes
+    /// through at its own size instead of being stretched to the loop resolution.
+    public func proceed(screenshot: Data, note: String? = nil, zoomResult: Bool = false) async -> CUStep {
+        let jpeg = zoomResult ? screenshot : resize(screenshot, resW, resH)
+        guard !pendingToolIDs.isEmpty, let jpeg else {
             return CUStep(actions: [], text: "", done: true)
         }
         var results: [[String: Any]] = []
         for (index, id) in pendingToolIDs.enumerated() {
             if index == pendingToolIDs.count - 1 {
-                results.append(["type": "tool_result", "tool_use_id": id, "content": [imageBlock(jpeg)]])
+                var content: [[String: Any]] = []
+                if let note { content.append(["type": "text", "text": note]) }
+                content.append(imageBlock(jpeg))
+                results.append(["type": "tool_result", "tool_use_id": id, "content": content])
             } else {
                 results.append(["type": "tool_result", "tool_use_id": id, "content": "done"])
             }
@@ -144,7 +172,7 @@ public final class ComputerUseAgent {
         return await step()
     }
 
-    private func step() async -> CUStep {
+    private func step(retryOnTruncation: Bool = true) async -> CUStep {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return CUStep(actions: [], text: "Connect your Claude key first.", done: true)
         }
@@ -180,19 +208,40 @@ public final class ComputerUseAgent {
                 ],
             ],
             [
+                "name": "highlight",
+                "description": "Draw a glowing highlight box on the user's screen over one region, to visually SHOW them something they asked about. Works over any app — this is YOUR overlay, not an app feature. Call it whenever the user asks to highlight, mark, point out, or show where something is. Coordinates are in screenshot pixels. Call again for a different region; the latest box stays visible.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": [
+                        "region": [
+                            "type": "array", "items": ["type": "number"],
+                            "description": "[x1, y1, x2, y2] — top-left and bottom-right corners of the region, in screenshot pixels",
+                        ],
+                        "label": ["type": "string", "description": "2-4 word label for what's highlighted"],
+                    ],
+                    "required": ["region"],
+                ],
+            ],
+            [
                 "type": "computer_20251124", "name": "computer",
                 "display_width_px": resW, "display_height_px": resH,
+                "enable_zoom": true,
                 "cache_control": ["type": "ephemeral"],
             ],
         ]
         let system = environmentNote.map { "\(Self.systemPrompt)\n\n\($0)" } ?? Self.systemPrompt
+        // Adaptive thinking is Anthropic's benchmarked setup for computer use on
+        // Sonnet 4.6: the model plans before acting, and fewer wrong clicks means
+        // fewer retries — it uses fewer total tokens than no-thinking. max_tokens
+        // leaves room for thinking ahead of the tool calls.
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 512,
+            "max_tokens": 2048,
             "system": system,
+            "thinking": ["type": "adaptive"],
             "output_config": ["effort": effort],
             "tools": tools,
-            "messages": Self.withMovingCacheBreakpoint(messages),
+            "messages": Self.withMovingCacheBreakpoints(messages),
         ]
         // .sortedKeys keeps the rendered body byte-stable across turns — prompt
         // caching is a prefix match, and unordered keys would silently invalidate it.
@@ -226,6 +275,8 @@ public final class ComputerUseAgent {
                     if let app = input["name"] as? String { actions.append(.openApp(app)) }
                 case "open_url":
                     if let url = input["url"] as? String { actions.append(.openURL(url)) }
+                case "highlight":
+                    if let action = parseHighlight(input) { actions.append(action) }
                 default:
                     if let action = parseAction(input) { actions.append(action) }
                 }
@@ -233,7 +284,19 @@ public final class ComputerUseAgent {
                 break
             }
         }
-        return CUStep(actions: actions, text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), done: stopReason != "tool_use")
+        // A max_tokens truncation is NOT completion — with thinking enabled the
+        // budget can run out before any tool call. If nothing actionable came back,
+        // nudge once; otherwise let the loop execute what did come through and the
+        // next tool_result turn continues the task.
+        if stopReason == "max_tokens", pendingToolIDs.isEmpty, retryOnTruncation {
+            messages.append([
+                "role": "user",
+                "content": "Your reply was cut off before any tool call. Continue the task now — act with tool calls.",
+            ])
+            return await step(retryOnTruncation: false)
+        }
+        let done = !(stopReason == "tool_use" || (stopReason == "max_tokens" && !pendingToolIDs.isEmpty))
+        return CUStep(actions: actions, text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), done: done)
     }
 
     /// Posts the request, retrying once on transport errors, 429, and 5xx (honoring
@@ -280,8 +343,15 @@ public final class ComputerUseAgent {
         switch action {
         case "left_click", "left_mouse_down": return coordinate.map { .click(x: $0.x, y: $0.y) }
         case "double_click": return coordinate.map { .doubleClick(x: $0.x, y: $0.y) }
+        case "triple_click": return coordinate.map { .tripleClick(x: $0.x, y: $0.y) }
+        case "middle_click": return coordinate.map { .click(x: $0.x, y: $0.y) }
         case "right_click": return coordinate.map { .rightClick(x: $0.x, y: $0.y) }
         case "mouse_move": return coordinate.map { .move(x: $0.x, y: $0.y) }
+        case "left_click_drag":
+            guard let start = (input["start_coordinate"] as? [NSNumber]).flatMap({
+                $0.count == 2 ? scale(CGPoint(x: $0[0].doubleValue, y: $0[1].doubleValue)) : nil
+            }), let end = coordinate else { return nil }
+            return .drag(fromX: start.x, fromY: start.y, toX: end.x, toY: end.y)
         case "type": return (input["text"] as? String).map { .type($0) }
         case "key": return (input["text"] as? String).map { .key($0) }
         case "scroll":
@@ -293,8 +363,36 @@ public final class ComputerUseAgent {
             )
         case "wait": return .wait
         case "screenshot", "cursor_position": return .screenshot
+        case "zoom":
+            guard let region = input["region"] as? [NSNumber], region.count == 4 else { return .screenshot }
+            let x1 = max(0, min(region[0].doubleValue, Double(resW)))
+            let y1 = max(0, min(region[1].doubleValue, Double(resH)))
+            let x2 = max(x1 + 1, min(region[2].doubleValue, Double(resW)))
+            let y2 = max(y1 + 1, min(region[3].doubleValue, Double(resH)))
+            return .zoom(
+                nx: x1 / Double(resW), ny: y1 / Double(resH),
+                nw: (x2 - x1) / Double(resW), nh: (y2 - y1) / Double(resH)
+            )
         default: return nil
         }
+    }
+
+    /// Highlight tool input → display-local AppKit rect (bottom-left origin).
+    private func parseHighlight(_ input: [String: Any]) -> CUAction? {
+        guard let region = input["region"] as? [NSNumber], region.count == 4 else { return nil }
+        let x1 = max(0, min(region[0].doubleValue, Double(resW)))
+        let y1 = max(0, min(region[1].doubleValue, Double(resH)))
+        let x2 = max(x1 + 1, min(region[2].doubleValue, Double(resW)))
+        let y2 = max(y1 + 1, min(region[3].doubleValue, Double(resH)))
+        let sx = Double(displayW) / Double(resW)
+        let sy = Double(displayH) / Double(resH)
+        let width = (x2 - x1) * sx
+        let height = (y2 - y1) * sy
+        // Top-left model pixels → bottom-left AppKit: the rect's bottom edge.
+        let x = x1 * sx
+        let y = Double(displayH) - (y2 * sy)
+        let label = (input["label"] as? String ?? "here").trimmingCharacters(in: .whitespacesAndNewlines)
+        return .highlight(x: x, y: y, width: width, height: height, label: label.isEmpty ? "here" : label)
     }
 
     private func scale(_ point: CGPoint) -> CGPoint {
@@ -331,23 +429,32 @@ public final class ComputerUseAgent {
         return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
     }
 
-    /// Adds an ephemeral cache breakpoint to the last block of the final turn so the
-    /// prefix is re-read from cache next turn. Operates on a copy — stored `messages`
-    /// stay clean (value semantics make this a cheap deep copy).
-    private static func withMovingCacheBreakpoint(_ messages: [[String: Any]]) -> [[String: Any]] {
+    /// Adds ephemeral cache breakpoints to the last block of up to the 3 most
+    /// recent USER turns (tool results), per Anthropic's computer-use caching
+    /// guidance — multiple advancing breakpoints survive big batched-action turns
+    /// that a single breakpoint's 20-block lookback could miss. Plus the tools
+    /// breakpoint, that's the 4-breakpoint maximum. Operates on a copy — stored
+    /// `messages` stay clean (value semantics make this a cheap deep copy).
+    private static func withMovingCacheBreakpoints(_ messages: [[String: Any]]) -> [[String: Any]] {
         var out = messages
-        guard var last = out.last,
-              var content = last["content"] as? [[String: Any]], !content.isEmpty else { return out }
-        content[content.count - 1]["cache_control"] = ["type": "ephemeral"]
-        last["content"] = content
-        out[out.count - 1] = last
+        var marked = 0
+        for index in stride(from: out.count - 1, through: 0, by: -1) {
+            guard marked < 3 else { break }
+            guard out[index]["role"] as? String == "user",
+                  var content = out[index]["content"] as? [[String: Any]], !content.isEmpty else { continue }
+            content[content.count - 1]["cache_control"] = ["type": "ephemeral"]
+            out[index]["content"] = content
+            marked += 1
+        }
         return out
     }
 
     /// Rolling buffer (Anthropic's guidance): once screenshots exceed `threshold`,
     /// replace all but the most recent `keep` with short text placeholders, bounding
-    /// the upload payload on long tasks while leaving short tasks untouched.
-    private func pruneScreenshots(keep: Int = 3, threshold: Int = 8) {
+    /// the upload payload on long tasks while leaving short tasks untouched. The
+    /// 12→3 batch sizing means a prune (and its one-off cache rewrite) happens at
+    /// most every ~9 turns, keeping the prefix byte-identical in between.
+    private func pruneScreenshots(keep: Int = 3, threshold: Int = 12) {
         var imageTurns: [Int] = []
         for (index, message) in messages.enumerated() {
             guard let content = message["content"] as? [[String: Any]] else { continue }
