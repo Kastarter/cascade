@@ -95,9 +95,15 @@ public struct WasteDetector: Sendable {
                 let representativeStart = nonOverlapping.max()!
                 let instance = Array(events[representativeStart..<representativeStart + length])
                 // A workflow is something an agent can DO for you. Scrolling and
-                // reading isn't it — demand at least two real actions (clicks,
-                // keys, typing) before proposing automation.
-                guard instance.filter({ $0.kind != .scroll }).count >= 2 else { continue }
+                // reading isn't it, and neither is plain typing (people type in
+                // the same app all day) — demand at least two real actions AND
+                // one discrete step (a click or shortcut) that gives the
+                // repetition automatable structure.
+                let meaningful = instance.filter { $0.kind != .scroll }
+                let hasDiscreteAction = meaningful.contains {
+                    $0.kind == .click || $0.kind == .doubleClick || $0.kind == .rightClick || $0.kind == .key
+                }
+                guard meaningful.count >= 2, hasDiscreteAction else { continue }
                 results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
