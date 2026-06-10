@@ -75,6 +75,15 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let cursorThemeKey = "cascade.cursorTheme"
 
+    /// Power harness: lets the assist agent run shell commands, AppleScript, and
+    /// file writes directly (read-only file tools are always on). Explicit
+    /// Settings opt-in, default OFF; every call is audited verbatim and the
+    /// destructive-command deny-list applies regardless.
+    @Published public var powerHarnessEnabled: Bool {
+        didSet { UserDefaults.standard.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
+    }
+    private static let powerHarnessKey = "cascade.powerHarness"
+
     public let store: CascadeStore
     public let driver: LocalMacDriver
     public let recorder: ContextRecorder
@@ -121,6 +130,7 @@ public final class CascadeAppModel: ObservableObject {
         self.store = store
         cursorTheme = UserDefaults.standard.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
+        powerHarnessEnabled = UserDefaults.standard.bool(forKey: Self.powerHarnessKey)
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
@@ -784,6 +794,13 @@ public final class CascadeAppModel: ObservableObject {
                 // same as every action it takes.
                 Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
                 return skill.promptBlock
+            },
+            // Direct-Mac tools beside the computer tool: find/read is always on;
+            // run/script/write only with the user's Power harness opt-in.
+            harnessTier: powerHarnessEnabled ? .full : .readOnly,
+            harnessProvider: { [weak self] name, input in
+                guard let self else { return "Cascade is shutting down — stop." }
+                return await self.performHarness(name: name, input: input, gen: gen)
             }
         )
         // Runaway backstop, not a budget. The episode's real terminators are the
@@ -853,6 +870,24 @@ public final class CascadeAppModel: ObservableObject {
             count += 1
         }
         return .stepLimit
+    }
+
+    /// Runs one harness tool call for the assist agent: STOP/supersession gate
+    /// first, then an audit row with the verbatim query/path/command, then the
+    /// actual execution (which applies the power-tier gate and the destructive
+    /// deny-list). The dock shows each call as it runs, so the user supervises
+    /// scripts the same way they supervise clicks.
+    private func performHarness(name: String, input: [String: Any], gen: Int) async -> String {
+        guard assistGeneration == gen, !driver.runState.isStopRequested else {
+            return "The user stopped this task. Do not continue — end now."
+        }
+        guard let call = HarnessCall(name: name, input: input) else {
+            return "Unknown harness tool “\(name)”."
+        }
+        let summary = call.auditSummary
+        dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · press STOP to take control.")
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: summary))
+        return await AgentHarness.perform(call, powerEnabled: powerHarnessEnabled)
     }
 
     /// One line of text grounding sent with every frame: which app and window are
@@ -1328,21 +1363,21 @@ public final class CascadeAppModel: ObservableObject {
 
     // MARK: - Agents built from recorded workflows
 
-    /// Detected workflows still awaiting the manager's review — excludes ones
-    /// already approved (an agent exists) or declined.
+    /// Detected workflows still awaiting review in the Cascades tab — excludes
+    /// ones already approved (an agent exists) or declined.
     public var pendingDetectedWaste: [DetectedWaste] {
         let approved = Set(agents.map(\.signature))
         return detectedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
     }
 
-    /// Manager approves a detected workflow: builds the agent (from the user's real
-    /// actions) and sends it to the employee's Cascades tab.
+    /// Approving a detected workflow builds the agent from the user's real
+    /// recorded actions and lands it under "Your agents".
     public func approveWaste(_ waste: DetectedWaste) {
         Task {
             do {
                 _ = try await orchestrator.createAgent(from: waste)
-                _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.approved", detail: waste.title))
-                agentMessage = "Approved “\(waste.title)” — sent to the employee's Cascades."
+                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.approved", detail: waste.title))
+                agentMessage = "Approved “\(waste.title)” — it's in Your agents, ready to deploy."
             } catch {
                 agentMessage = "Could not approve: \(error.localizedDescription)"
             }
@@ -1350,10 +1385,10 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Manager declines a detected workflow: it won't be surfaced again.
+    /// Declining a detected workflow means it won't be surfaced again.
     public func declineWaste(_ waste: DetectedWaste) {
         dismissedWasteSignatures.insert(waste.signature)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: waste.title)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.declined", detail: waste.title)) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {

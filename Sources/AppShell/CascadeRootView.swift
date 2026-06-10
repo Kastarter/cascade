@@ -1074,11 +1074,12 @@ private struct CascadesScreen: View {
         ScrollView {
             VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
                 VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
-                    CascadeTag("Agents", tone: .cascadeAgent)
-                    Text("Approved by your manager").font(.cascadeSerif(30))
-                    Text("Cascade detects the tasks you repeat and sends them to your manager. The ones they approve land here — built from your real actions, ready to deploy.")
+                    CascadeTag("Cascades", tone: .cascadeAgent)
+                    Text("Everything you can run").font(.cascadeSerif(30))
+                    Text("Workflows Cascade detected in your real work, agents already approved, and cascades from your manager — review, deploy, and watch them run. The Manager tab shows the numbers.")
                         .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                 }
+                detectedSection
                 agentsSection
                 managerInboxSection
                 suggestionsSection
@@ -1091,11 +1092,30 @@ private struct CascadesScreen: View {
         }
     }
 
+    /// Repeated work Cascade detected, awaiting review — approve to build an
+    /// agent from the recorded actions, decline to never see it again.
+    private var detectedSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "DETECTED WORKFLOWS — REVIEW & APPROVE", trailing: "\(model.pendingDetectedWaste.count) pending")
+            if model.pendingDetectedWaste.isEmpty {
+                CascadePanel { EmptyState(title: "Nothing to review", detail: "When you repeat a task, Cascade surfaces it here — apps, frequency, time saved — and one approve turns it into an agent built from your real actions.") }
+            } else {
+                ForEach(model.pendingDetectedWaste) { waste in
+                    WasteCard(
+                        waste: waste,
+                        onApprove: { model.approveWaste(waste) },
+                        onDecline: { model.declineWaste(waste) }
+                    )
+                }
+            }
+        }
+    }
+
     private var agentsSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
             SectionLabel(title: "YOUR AGENTS", trailing: "\(model.agents.count) approved")
             if model.agents.isEmpty {
-                CascadePanel { EmptyState(title: "No agents yet", detail: "When your manager approves a workflow Cascade detected, the agent shows up here, ready to deploy.") }
+                CascadePanel { EmptyState(title: "No agents yet", detail: "Approve a detected workflow above and the agent shows up here — built from your real actions, ready to deploy.") }
             } else {
                 ForEach(model.agents) { agent in
                     AgentCard(
@@ -1198,7 +1218,7 @@ private struct AppChips: View {
     }
 }
 
-/// Manager-facing review card for a detected workflow. Shows the privacy-safe
+/// Review card for a detected workflow (Cascades tab). Shows the privacy-safe
 /// summary (task, apps, frequency, time saved, step *shape*) — never the raw typed
 /// text or coordinates — with approve/decline.
 private struct WasteCard: View {
@@ -1222,7 +1242,7 @@ private struct WasteCard: View {
                     Spacer()
                     Button(action: onDecline) { Text("Decline") }
                         .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
-                    Button(action: onApprove) { Text("Approve & send") }
+                    Button(action: onApprove) { Text("Approve agent") }
                         .buttonStyle(CascadeAccentButtonStyle())
                 }
             }
@@ -1274,12 +1294,38 @@ private struct AgentCard: View {
     }
 }
 
-// MARK: - Manager screen (aggregate-only dashboard; cascades agents to the employee)
+// MARK: - Manager screen (aggregate-only ANALYTICS; review/deploy live in Cascades)
 
 private struct ManagerScreen: View {
     @ObservedObject var model: CascadeAppModel
 
     private var appsObserved: Int { Set(model.contexts.map(\.appName)).count }
+
+    /// Minutes the approved agents stand to give back — straight from the
+    /// detection math (seconds per run × observed occurrences), no padding.
+    private var minutesReclaimed: Int {
+        model.agents.map(\.estimatedSeconds).reduce(0, +) / 60
+    }
+
+    /// Minutes still sitting in unreviewed detected workflows.
+    private var minutesOnTheTable: Int {
+        model.pendingDetectedWaste.map(\.estimatedTotalSeconds).reduce(0, +) / 60
+    }
+
+    /// Sample counts per app, biggest first — where the recorded time actually went.
+    private var appUsage: [(app: String, bundle: String?, count: Int)] {
+        var counts: [String: (bundle: String?, count: Int)] = [:]
+        for context in model.contexts {
+            counts[context.appName, default: (context.bundleIdentifier, 0)].count += 1
+        }
+        return counts.map { (app: $0.key, bundle: $0.value.bundle, count: $0.value.count) }
+            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.app < $1.app }
+    }
+
+    /// Detected workflows worth the most time, approved or not — insight, not actions.
+    private var topWorkflows: [DetectedWaste] {
+        Array(model.detectedWaste.prefix(5))
+    }
 
     private var managerChips: [String] {
         var result = Array(Set(model.contexts.map(\.appName))).prefix(2).map { "Auto-summarize \($0) sessions" }
@@ -1293,31 +1339,19 @@ private struct ManagerScreen: View {
             VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
                 VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
                     CascadeTag("Manager", tone: .cascadeAgent)
-                    Text("Suggestions from privacy-safe signals").font(.cascadeSerif(30))
-                    Text("Aggregate-only. You review the tasks Cascade detects the employee repeating — task, apps, frequency, time saved — and approve the agents worth running. Never raw OCR, screenshots, or keystrokes.")
+                    Text("Analytics from privacy-safe signals").font(.cascadeSerif(30))
+                    Text("Aggregate-only: time reclaimed, where the hours go, and the workflows worth automating. Reviewing and deploying happens in Cascades — never raw OCR, screenshots, or keystrokes here.")
                         .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                 }
                 HStack(spacing: CascadeMetrics.s3) {
-                    MetricCard(value: "\(model.contexts.count)", label: "Local samples")
+                    MetricCard(value: "~\(minutesReclaimed)m", label: "Reclaimed by agents")
+                    MetricCard(value: "~\(minutesOnTheTable)m", label: "On the table")
                     MetricCard(value: "\(appsObserved)", label: "Apps observed")
-                    MetricCard(value: "\(model.pendingDetectedWaste.count)", label: "To review")
-                    MetricCard(value: "\(model.agents.count)", label: "Approved")
+                    MetricCard(value: "\(model.agents.count)", label: "Agents approved")
                     MetricCard(value: "0", label: "Raw screenshots")
                 }
-                VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-                    SectionLabel(title: "DETECTED WORKFLOWS — REVIEW & APPROVE", trailing: "\(model.pendingDetectedWaste.count) pending")
-                    if model.pendingDetectedWaste.isEmpty {
-                        CascadePanel { EmptyState(title: "Nothing to review", detail: "When the employee repeats a task, Cascade surfaces it here — task, apps, frequency, time saved — for you to approve or decline. Approved agents are sent to their Cascades tab.") }
-                    } else {
-                        ForEach(model.pendingDetectedWaste) { waste in
-                            WasteCard(
-                                waste: waste,
-                                onApprove: { model.approveWaste(waste) },
-                                onDecline: { model.declineWaste(waste) }
-                            )
-                        }
-                    }
-                }
+                workflowsSection
+                whereTimeGoesSection
                 ComposeBox(
                     eyebrow: "Cascade an agent to this employee",
                     placeholder: "Describe an automation to cascade. Plain English.",
@@ -1346,6 +1380,74 @@ private struct ManagerScreen: View {
             .padding(.vertical, CascadeMetrics.s6)
             .frame(maxWidth: 960, alignment: .leading)
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Read-only insight rows — the deploy buttons live in Cascades, and the
+    /// jump link takes you there.
+    private var workflowsSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            HStack {
+                SectionLabel(title: "TOP REPEATED WORKFLOWS", trailing: "")
+                Button {
+                    model.selectedTab = .cascades
+                } label: {
+                    Text("Review in Cascades →").font(.cascadeMono(11)).foregroundStyle(Color.cascadeAgent)
+                }
+                .buttonStyle(.plain)
+            }
+            if topWorkflows.isEmpty {
+                CascadePanel { EmptyState(title: "No repeated workflows yet", detail: "As Cascade records work, the most-repeated (and most automatable) tasks surface here with honest time-saved math.") }
+            } else {
+                CascadePanel {
+                    VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                        ForEach(topWorkflows) { waste in
+                            HStack(spacing: CascadeMetrics.s3) {
+                                Circle().fill(AppVisuals.color(for: waste.apps.first ?? waste.title)).frame(width: 7, height: 7)
+                                Text(waste.title).font(.cascadeSans(13, .medium)).lineLimit(1)
+                                AppChips(apps: waste.apps)
+                                Spacer()
+                                Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m")
+                                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sample share per app — a quiet bar per row, computed from the real record.
+    private var whereTimeGoesSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "WHERE THE TIME GOES", trailing: "\(model.contexts.count) recent samples")
+            if appUsage.isEmpty {
+                CascadePanel { EmptyState(title: "Nothing recorded yet", detail: "Once recording is on, the apps where work actually happens show up here, ranked by observed time.") }
+            } else {
+                CascadePanel {
+                    VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                        let top = Array(appUsage.prefix(6))
+                        let maxCount = max(top.first?.count ?? 1, 1)
+                        ForEach(top, id: \.app) { usage in
+                            HStack(spacing: CascadeMetrics.s3) {
+                                Circle().fill(AppVisuals.color(for: usage.app, bundleIdentifier: usage.bundle)).frame(width: 7, height: 7)
+                                Text(usage.app).font(.cascadeSans(13, .medium))
+                                    .frame(width: 170, alignment: .leading).lineLimit(1)
+                                GeometryReader { geo in
+                                    Capsule()
+                                        .fill(AppVisuals.color(for: usage.app, bundleIdentifier: usage.bundle).opacity(0.65))
+                                        .frame(width: max(6, geo.size.width * CGFloat(usage.count) / CGFloat(maxCount)), height: 8)
+                                        .frame(maxHeight: .infinity, alignment: .center)
+                                }
+                                .frame(height: 16)
+                                Text("\(usage.count)")
+                                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                                    .frame(width: 36, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1518,6 +1620,9 @@ private struct SettingsScreen: View {
                 section("PERMISSIONS", trailing: "local capture & control") {
                     permissionsCard
                 }
+                section("AGENT HARNESS", trailing: "direct-Mac tools, fully audited") {
+                    HarnessCard(model: model)
+                }
                 section("APP IDENTITY", trailing: "for granting permissions") {
                     DiagnosticsCard(diagnostics: model.permissionDiagnostics)
                 }
@@ -1575,6 +1680,39 @@ private struct SettingsScreen: View {
                     Button("Request AX") { model.requestAccessibility() }.buttonStyle(CascadeQuietButtonStyle())
                     Button("Request Input") { model.requestInputMonitoring() }.buttonStyle(CascadeQuietButtonStyle())
                     Button("Open Settings") { model.openSystemSettings() }.buttonStyle(CascadeAccentButtonStyle())
+                }
+            }
+        }
+    }
+}
+
+/// The assist agent's direct-Mac tools: the always-on read-only tier, and the
+/// opt-in Power harness that lets it run commands, scripts, and file writes.
+private struct HarnessCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Find & read files").font(.cascadeSans(15, .semibold))
+                        Text("search_files · list_folder · read_file — Spotlight search and bounded text reads. Read-only, privacy-gated by your exclusion list.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    CascadeTag("Always on", tone: .cascadeGood)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Power harness").font(.cascadeSans(15, .semibold))
+                        Text("run_command · run_applescript · write_file — the agent can run shell commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Every call lands verbatim in the audit log, destructive commands (sudo, rm -rf /, …) are refused, and Esc stops it mid-run.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $model.powerHarnessEnabled)
+                        .labelsHidden().toggleStyle(.switch)
                 }
             }
         }
