@@ -126,6 +126,23 @@ func runCountIsRealRunsNotApprovals() async throws {
 }
 
 @Test
+func scheduleRoundTripsAndSurvivesRedetect() async throws {
+    let store = try makeAgentStore()
+    let agent = try await store.upsertAgent(CascadeAgent(name: "A", source: .detected, signature: "s", recipe: AgentRecipe(steps: [])))
+    #expect(agent.schedule == nil)
+
+    try await store.setAgentSchedule(id: agent.id, schedule: "daily@09:05")
+    #expect(try await store.agent(id: agent.id)?.schedule == "daily@09:05")
+
+    // A re-detect refresh must not clear the user's schedule.
+    _ = try await store.upsertAgent(CascadeAgent(name: "A v2", source: .detected, signature: "s", recipe: AgentRecipe(steps: [])))
+    #expect(try await store.agent(id: agent.id)?.schedule == "daily@09:05")
+
+    try await store.setAgentSchedule(id: agent.id, schedule: nil)
+    #expect(try await store.agent(id: agent.id)?.schedule == nil)
+}
+
+@Test
 func humanStepsReadLikeTheWorkflow() {
     let recipe = AgentRecipe(steps: [
         RecipeStep(order: 0, kind: .activateApp, appName: "Mail"),

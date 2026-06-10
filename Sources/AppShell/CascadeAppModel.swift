@@ -145,7 +145,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
     /// instructions plus runtime policies, matched against the frontmost app.
     /// User files at App Support/Cascade/Skills override the bundled ones.
-    private let appSkills = AppSkillRegistry.load()
+    private var appSkills = AppSkillRegistry.load()
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -224,6 +224,7 @@ public final class CascadeAppModel: ObservableObject {
         }
         pushToTalk.onRelease = { [weak self] in self?.voice.endTalking() }
         pushToTalk.start()
+        startScheduler()
         dock.onStop = { [weak self] in
             guard let self else { return }
             self.driver.runState.requestStop()
@@ -752,6 +753,7 @@ public final class CascadeAppModel: ObservableObject {
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
         agentDidHighlight = false
+        episodeAppActions = [:]
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
 
@@ -834,6 +836,9 @@ public final class CascadeAppModel: ObservableObject {
             voice.speak(summary)
             dock.show(title: ranLongOn == nil ? "Done" : "Paused", detail: summary)
             assistMemory.remember(user: goal, assistant: summary)
+            // A clean run in an app with no skill yet is exactly the material
+            // skills are made of — draft one for the user to review.
+            if ranLongOn == nil { maybeDistillSkill(goal: goal, findings: findings) }
         } else {
             assistMemory.remember(user: goal, assistant: teachMessage, ok: false)
         }
@@ -993,6 +998,11 @@ public final class CascadeAppModel: ObservableObject {
             CGPoint(x: screen.frame.minX + x, y: screen.frame.minY + y)
         }
         func cg(_ x: Double, _ y: Double) -> CGPoint { Self.toCGGlobal(globalAppKit(x, y)) }
+        // Skill auto-learning: tally which app this run actually worked in.
+        if let app = NSWorkspace.shared.frontmostApplication?.localizedName,
+           app.caseInsensitiveCompare("Cascade") != .orderedSame {
+            episodeAppActions[app, default: 0] += 1
+        }
         // Pointer-routed apps (Blender): hotkeys act on the editor under the
         // physical pointer, so the pointer must STAY where the agent clicks
         // instead of being restored to the user's parked position.
@@ -1824,6 +1834,153 @@ public final class CascadeAppModel: ObservableObject {
     public func declineSuggestion(_ suggestion: AgentSuggestion) {
         dismissedSuggestionTitles.insert(suggestion.title)
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: suggestion.title)) }
+    }
+
+    // MARK: - Skill auto-learning (the library compounds with usage)
+
+    /// A skill draft distilled from a successful assist run, awaiting the
+    /// user's review in Cascades. Approving moves it into the live library.
+    public struct LearnedSkill: Identifiable, Sendable, Equatable {
+        public let id = UUID()
+        public let appName: String
+        public let slug: String
+        public let markdown: String
+        public let sourceTask: String
+    }
+
+    @Published public private(set) var pendingLearnedSkills: [LearnedSkill] = []
+    /// Per-app action tally for the current assist run (reset per task).
+    private var episodeAppActions: [String: Int] = [:]
+
+    /// After a successful run: if the work concentrated in one app that has no
+    /// skill yet, distill what worked into a draft SKILL.md for review.
+    private func maybeDistillSkill(goal: String, findings: [(task: String, result: String)]) {
+        let totalActions = episodeAppActions.values.reduce(0, +)
+        guard totalActions >= 6, hasAnthropicKey,
+              let (app, count) = episodeAppActions.max(by: { $0.value < $1.value }),
+              Double(count) / Double(totalActions) >= 0.7,
+              appSkills.skill(appName: app, bundleIdentifier: nil) == nil,
+              !pendingLearnedSkills.contains(where: { $0.appName == app })
+        else { return }
+        let memo = findings.map { "\($0.task) → \($0.result)" }.joined(separator: "\n")
+        Task { await distillSkill(app: app, goal: goal, findingsMemo: memo, actionCount: count) }
+    }
+
+    private func distillSkill(app: String, goal: String, findingsMemo: String, actionCount: Int) async {
+        let user = """
+        App: \(app)
+        Task the agent just completed there (\(actionCount) on-screen actions): \(goal)
+        What each part accomplished:
+        \(findingsMemo)
+        """
+        guard let markdown = try? await AnthropicClient().complete(
+            system: Self.skillAuthorPrompt, user: user, model: AnthropicModel.sonnet, maxTokens: 900
+        ), markdown.hasPrefix("---"), markdown.contains("appMatchers") else { return }
+        let slug = "learned-" + app.lowercased().replacingOccurrences(of: " ", with: "-")
+            .filter { $0.isLetter || $0.isNumber || $0 == "-" }
+        let learned = LearnedSkill(appName: app, slug: slug, markdown: markdown, sourceTask: goal)
+        pendingLearnedSkills.append(learned)
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "skill.learned.draft", detail: "\(app) — from “\(String(goal.prefix(80)))”"))
+    }
+
+    private static let skillAuthorPrompt = """
+    You distill a completed computer-use run into a Cascade app skill: a SKILL.md \
+    the agent will pull next time it works in this app. Output ONLY the file content.
+
+    Format, exactly:
+    ---
+    name: <short-kebab-name>
+    description: <one line>
+    useWhen: <one line — when the agent should pull this skill>
+    ---
+
+    # <Title>
+
+    - 5–9 short, imperative bullets with what actually works in this app: the \
+    reliable entry points, shortcuts, gotchas, and the order that worked. Only \
+    include things evidenced by the run — no generic advice.
+
+    ```cascade-runtime-hints
+    {"appMatchers": {"names": ["<App Name>"]}}
+    ```
+    """
+
+    /// Moves a reviewed draft into the live skill library (user skills dir).
+    public func approveLearnedSkill(_ skill: LearnedSkill) {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let dir = appSupport.appendingPathComponent("Cascade/Skills/\(skill.slug)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try skill.markdown.write(to: dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+        } catch {
+            teachMessage = "Couldn't save the skill: \(error.localizedDescription)"
+            return
+        }
+        pendingLearnedSkills.removeAll { $0.id == skill.id }
+        appSkills = AppSkillRegistry.load()
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.approved", detail: skill.appName)) }
+    }
+
+    public func discardLearnedSkill(_ skill: LearnedSkill) {
+        pendingLearnedSkills.removeAll { $0.id == skill.id }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.discarded", detail: skill.appName)) }
+    }
+
+    // MARK: - Agent scheduling
+
+    private var schedulerTask: Task<Void, Never>?
+    private var firedScheduleKeys: Set<String> = []
+
+    /// "daily@HH:mm" check every 30s. Background (sandbox) agents fire for
+    /// real; on-screen agents only get a reminder — Cascade never takes the
+    /// user's screen unprompted.
+    func startScheduler() {
+        guard schedulerTask == nil else { return }
+        schedulerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.fireDueSchedules()
+                try? await Task.sleep(for: .seconds(30))
+            }
+        }
+    }
+
+    private func fireDueSchedules() async {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm"
+        let nowSlot = formatter.string(from: Date())
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        let today = dayFormatter.string(from: Date())
+
+        for agent in agents where agent.enabled {
+            guard agent.schedule == "daily@\(nowSlot)" else { continue }
+            let key = "\(agent.id)@\(today)@\(nowSlot)"
+            guard !firedScheduleKeys.contains(key) else { continue }
+            firedScheduleKeys.insert(key)
+            if Self.runsInBackground(apps: agent.apps) {
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.fired", detail: agent.name))
+                agentMessage = "Scheduled: running “\(agent.name)” in the background."
+                createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id)
+            } else {
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.due", detail: agent.name))
+                dock.show(title: "Scheduled agent is due", detail: "“\(agent.name)” is ready — deploy it from Cascades whenever you want.")
+                Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(8))
+                    if self?.agentRunning != true { self?.dock.dismiss() }
+                }
+            }
+        }
+        if firedScheduleKeys.count > 500 { firedScheduleKeys.removeAll() }
+    }
+
+    public func setAgentSchedule(_ agent: CascadeAgent, schedule: String?) {
+        Task {
+            try? await store.setAgentSchedule(id: agent.id, schedule: schedule)
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.schedule.set", detail: "\(agent.name) → \(schedule ?? "off")"))
+            await refreshAll()
+        }
     }
 
     private static let onboardedKey = "cascade.onboarded"

@@ -565,4 +565,10 @@ public final class ControlDockModel: ObservableObject {
         detail = "Cascade returned control to you."
         visible = false
     }
+
+    /// Hides the dock without halting anything — for transient notices
+    /// (scheduled-agent reminders) that aren't a running agent.
+    public func dismiss() {
+        visible = false
+    }
 }

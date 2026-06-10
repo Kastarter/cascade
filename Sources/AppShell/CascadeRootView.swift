@@ -1214,6 +1214,7 @@ private struct CascadesScreen: View {
                     pipelineStrip
                     detectedSection
                     agentsSection.id(Self.agentsAnchor)
+                    learnedSkillsSection
                     managerInboxSection
                     suggestionsSection
                     activitySection
@@ -1299,8 +1300,47 @@ private struct CascadesScreen: View {
                         flash: agent.id == flashAgentID,
                         onDeploy: { model.deployAgent(agent) },
                         onToggle: { model.setAgentEnabled(agent, enabled: $0) },
-                        onDelete: { model.deleteAgent(agent) }
+                        onDelete: { model.deleteAgent(agent) },
+                        onSchedule: { model.setAgentSchedule(agent, schedule: $0) }
                     )
+                }
+            }
+        }
+    }
+
+    /// Skills the agent drafted from its own successful runs — the library
+    /// compounds with usage instead of with hand-written files. Hidden until
+    /// there's something to review.
+    @ViewBuilder private var learnedSkillsSection: some View {
+        if !model.pendingLearnedSkills.isEmpty {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                SectionLabel(title: "LEARNED SKILLS — REVIEW", trailing: "\(model.pendingLearnedSkills.count) drafted")
+                ForEach(model.pendingLearnedSkills) { skill in
+                    CascadePanel {
+                        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                            HStack(spacing: CascadeMetrics.s2) {
+                                Image(systemName: "graduationcap.fill")
+                                    .font(.system(size: 12)).foregroundStyle(Color.cascadeAgent)
+                                Text("New skill for \(skill.appName)").font(.cascadeSans(15, .semibold))
+                                Spacer()
+                            }
+                            Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
+                                .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+                            Text(skill.markdown)
+                                .font(.cascadeMono(10)).foregroundStyle(Color.cascadeText2)
+                                .lineLimit(10)
+                                .padding(CascadeMetrics.s3)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.cascadePanel2.opacity(0.5), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            HStack {
+                                Spacer()
+                                Button("Discard") { model.discardLearnedSkill(skill) }
+                                    .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                                Button("Add to skill library") { model.approveLearnedSkill(skill) }
+                                    .buttonStyle(CascadeAccentButtonStyle())
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1467,8 +1507,12 @@ private struct AgentCard: View {
     let onDeploy: () -> Void
     let onToggle: (Bool) -> Void
     let onDelete: () -> Void
+    var onSchedule: ((String?) -> Void)?
 
     private static let previewSteps = 4
+    /// Daily slots offered in the schedule menu. Background agents run for
+    /// real on schedule; on-screen agents get a reminder (never auto-run).
+    private static let scheduleSlots = ["09:05", "13:05", "17:05"]
 
     private var runsInBackground: Bool {
         CascadeAppModel.runsInBackground(apps: agent.apps)
@@ -1493,6 +1537,7 @@ private struct AgentCard: View {
                 HStack {
                     Text(meta).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
                     Spacer()
+                    scheduleMenu
                     Button("Delete", action: onDelete)
                         .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
                     Button(runsInBackground ? "Deploy in background  →" : "Deploy  →", action: onDeploy)
@@ -1509,6 +1554,33 @@ private struct AgentCard: View {
                 .shadow(color: Color.cascadeAgent.opacity(flash ? 0.45 : 0), radius: 10)
         )
         .animation(.easeOut(duration: 0.5), value: flash)
+    }
+
+    /// Daily schedule picker. Background agents fire for real at the slot;
+    /// on-screen agents get a "ready to deploy" reminder instead.
+    @ViewBuilder private var scheduleMenu: some View {
+        if let onSchedule {
+            Menu {
+                Button("Manual only") { onSchedule(nil) }
+                ForEach(Self.scheduleSlots, id: \.self) { slot in
+                    Button(runsInBackground ? "Run daily at \(slot)" : "Remind daily at \(slot)") {
+                        onSchedule("daily@\(slot)")
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: agent.schedule == nil ? "clock" : "clock.badge.checkmark")
+                        .font(.system(size: 11))
+                    if let schedule = agent.schedule?.split(separator: "@").last {
+                        Text(String(schedule)).font(.cascadeMono(11))
+                    }
+                }
+                .foregroundStyle(agent.schedule == nil ? Color.cascadeText3 : Color.cascadeAgent)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help(agent.schedule == nil ? "Schedule this agent" : "Scheduled \(agent.schedule ?? "")")
+        }
     }
 
     /// The same "what will happen" language as the review card — the numbered

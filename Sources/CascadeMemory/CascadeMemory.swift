@@ -280,6 +280,8 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
     public let createdAt: Date
     public let lastRunAt: Date?
     public let enabled: Bool
+    /// "daily@HH:mm" for a scheduled agent, nil for manual-only.
+    public let schedule: String?
 
     public init(
         id: Int64 = 0,
@@ -294,7 +296,8 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         runCount: Int = 0,
         createdAt: Date = Date(),
         lastRunAt: Date? = nil,
-        enabled: Bool = true
+        enabled: Bool = true,
+        schedule: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -309,6 +312,7 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.lastRunAt = lastRunAt
         self.enabled = enabled
+        self.schedule = schedule
     }
 }
 
@@ -756,6 +760,15 @@ public actor CascadeStore {
         }
     }
 
+    /// Sets or clears an agent's recurring schedule ("daily@HH:mm" / nil).
+    public func setAgentSchedule(id: Int64, schedule: String?) throws {
+        try withStatement("UPDATE agents SET schedule = ? WHERE id = ?;") { statement in
+            bind(schedule, at: 1, in: statement)
+            sqlite3_bind_int64(statement, 2, id)
+            try stepDone(statement)
+        }
+    }
+
     public func deleteAgent(id: Int64) throws {
         try withStatement("DELETE FROM agents WHERE id = ?;") { statement in
             sqlite3_bind_int64(statement, 1, id)
@@ -877,6 +890,7 @@ public actor CascadeStore {
         try? execute("ALTER TABLE recorded_context ADD COLUMN frame_hash INTEGER;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN seconds_per_run INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
+        try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
@@ -936,7 +950,8 @@ public actor CascadeStore {
             run_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             last_run_at TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1
+            enabled INTEGER NOT NULL DEFAULT 1,
+            schedule TEXT
         );
 
         CREATE TABLE IF NOT EXISTS manager_cascade (
@@ -1060,7 +1075,7 @@ public actor CascadeStore {
     }
 
     private static let agentColumns =
-        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count"
+        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count, schedule"
 
     private func decodeAgent(_ statement: OpaquePointer) -> CascadeAgent {
         let appsRaw = text(statement, 5) ?? ""
@@ -1078,7 +1093,8 @@ public actor CascadeStore {
             runCount: Int(sqlite3_column_int64(statement, 12)),
             createdAt: DateCodec.date(from: text(statement, 8)) ?? Date(),
             lastRunAt: DateCodec.date(from: text(statement, 9)),
-            enabled: sqlite3_column_int(statement, 10) != 0
+            enabled: sqlite3_column_int(statement, 10) != 0,
+            schedule: text(statement, 13)
         )
     }
 
