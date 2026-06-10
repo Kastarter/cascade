@@ -78,7 +78,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     private let threshold: Int
     private let onStop: @Sendable (Error?) -> Void
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    private var lastHash: UInt64?
+    private var lastGrid: [UInt64]?
 
     init(engine: RewindEngine, threshold: Int, onStop: @escaping @Sendable (Error?) -> Void) {
         self.engine = engine
@@ -97,11 +97,15 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
 
-        let hash = PerceptualHash.dHash(cgImage)
-        if let last = lastHash, PerceptualHash.isDuplicate(hash, of: last, threshold: threshold) {
-            return // Near-identical to the last stored frame — drop.
+        // Change-aware dedup: per-region hashes, so a small but real change (a
+        // new message in an otherwise static window) defeats the skip instead
+        // of being averaged away by a whole-frame hash.
+        let grid = PerceptualHash.gridHashes(cgImage)
+        if let last = lastGrid, PerceptualHash.isDuplicateGrid(grid, of: last) {
+            return // Every region near-identical to the last stored frame — drop.
         }
-        lastHash = hash
+        lastGrid = grid
+        let hash = PerceptualHash.dHash(cgImage)
 
         guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
             .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
@@ -137,7 +141,16 @@ actor RewindEngine {
     private let onMoment: @Sendable (RecordedContext) -> Void
     private var pending: ChangedFrame?
     private var processing = false
+    private var lastNativeOCRAt = Date.distantPast
     private let logger = Logger(subsystem: "com.humain.cascade", category: "rewind")
+
+    /// When the AX channel gave us less text than this, the window is probably
+    /// a canvas/web surface and OCR is carrying the frame — worth paying for a
+    /// native-resolution pass so small text isn't lost to the 1920px cap.
+    static let sparseAXThreshold = 200
+    /// Native-resolution OCR is an extra SCScreenshotManager capture; rate-limit
+    /// it so a busy canvas app doesn't double the capture cost every second.
+    static let nativeOCRInterval: TimeInterval = 3.0
 
     init(store: CascadeStore, onMoment: @escaping @Sendable (RecordedContext) -> Void) {
         self.store = store
@@ -181,17 +194,39 @@ actor RewindEngine {
 
         guard let imagePath = FrameStore.save(jpeg: frame.jpeg) else { return }
 
+        // The exact-text channel: the focused window's accessibility tree.
+        // Character-perfect for native apps, immune to the resolution cap.
+        // (Thread-safe C API; this actor serializes the walks.)
+        let axText = snapshot.processIdentifier.map { AXTextHarvester.text(forWindowOfPID: $0) } ?? ""
+
         // `recognize(inPNG:)` decodes via ImageIO, which handles JPEG bytes too.
-        let ocrText = await ScreenTextRecognizer.recognize(inPNG: frame.jpeg)
+        var ocrText = await ScreenTextRecognizer.recognize(inPNG: frame.jpeg)
+
+        // Canvas/web window with little AX text → OCR is the only channel, so
+        // do one native-resolution pass (rate-limited) for the focused window
+        // instead of trusting the 1920px-capped stream frame with small text.
+        if axText.count < Self.sparseAXThreshold,
+           Date().timeIntervalSince(lastNativeOCRAt) >= Self.nativeOCRInterval,
+           let pid = snapshot.processIdentifier,
+           let windowRect = await MainActor.run(body: { ScreenCaptureUtility.focusedWindowNormalizedRect(pid: pid) }),
+           let nativeCrop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(
+               normalizedRect: windowRect, maxDimension: 2400
+           ) {
+            lastNativeOCRAt = Date()
+            let nativeText = await ScreenTextRecognizer.recognize(inPNG: nativeCrop)
+            if nativeText.count > ocrText.count { ocrText = nativeText }
+        }
+
+        let mergedText = AXTextHarvester.merge(ax: axText, ocr: ocrText)
 
         let context = RecordedContext(
             source: .screen,
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier,
             windowTitle: snapshot.windowTitle,
-            ocrText: ocrText.isEmpty ? nil : ocrText,
+            ocrText: mergedText.isEmpty ? nil : mergedText,
             imagePath: imagePath,
-            metadataJSON: "{\"rewind\":true,\"w\":\(frame.width),\"h\":\(frame.height)}",
+            metadataJSON: "{\"rewind\":true,\"w\":\(frame.width),\"h\":\(frame.height),\"ax\":\(axText.count)}",
             frameHash: Int64(bitPattern: frame.hash)
         )
 
@@ -204,10 +239,16 @@ actor RewindEngine {
 
         do {
             let inserted = try await store.insert(context)
+            // Semantic recall: index the moment's text locally (best-effort).
+            if !mergedText.isEmpty {
+                try? await store.indexEmbedding(contextID: inserted.id, text: mergedText)
+            }
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "system",
                 action: "rewind.capture",
-                detail: ocrText.isEmpty ? inserted.appName : "\(inserted.appName) · ocr \(ocrText.count) chars"
+                detail: mergedText.isEmpty
+                    ? inserted.appName
+                    : "\(inserted.appName) · ax \(axText.count) + ocr \(ocrText.count) chars"
             ))
             onMoment(inserted)
         } catch {
@@ -230,6 +271,7 @@ final class RewindRecorder {
     private let sampleQueue = DispatchQueue(label: "com.humain.cascade.rewind.frames")
     private var stream: SCStream?
     private var output: RewindStreamOutput?
+    private var streamedDisplayID: CGDirectDisplayID?
     private var stopping = false
     private let logger = Logger(subsystem: "com.humain.cascade", category: "rewind")
 
@@ -254,7 +296,7 @@ final class RewindRecorder {
             guard let self else { return }
             Task { await self.handleStreamStopped(error) }
         }
-        guard let stream = try await ScreenCaptureUtility.makeRewindStream(
+        guard let made = try await ScreenCaptureUtility.makeRewindStream(
             output: output,
             sampleHandlerQueue: sampleQueue,
             fps: fps
@@ -263,13 +305,14 @@ final class RewindRecorder {
         }
         // A pause could have arrived while we awaited stream creation.
         guard !stopping else {
-            try? await stream.stopCapture()
+            try? await made.stream.stopCapture()
             return
         }
-        try await stream.startCapture()
-        self.stream = stream
+        try await made.stream.startCapture()
+        self.stream = made.stream
         self.output = output
-        logger.info("Rewind stream started.")
+        self.streamedDisplayID = made.displayID
+        logger.info("Rewind stream started on display \(made.displayID).")
     }
 
     func stop() async {
@@ -277,8 +320,26 @@ final class RewindRecorder {
         guard let stream else { return }
         self.stream = nil
         self.output = nil
+        self.streamedDisplayID = nil
         try? await stream.stopCapture()
         logger.info("Rewind stream stopped.")
+    }
+
+    /// Follow the user across monitors: when the cursor lives on a different
+    /// display than the one being streamed, restart the stream there. Called on
+    /// app-activation events — cheap when nothing changed.
+    func followCursorDisplay() async {
+        guard stream != nil, !stopping else { return }
+        guard let current = await ScreenCaptureUtility.currentCursorDisplayID(),
+              let streamed = streamedDisplayID, current != streamed else { return }
+        logger.info("Cursor moved to display \(current) — restarting rewind stream there.")
+        let liveStream = stream
+        stream = nil
+        output = nil
+        streamedDisplayID = nil
+        if let liveStream { try? await liveStream.stopCapture() }
+        stopping = false
+        try? await start()
     }
 
     private func handleStreamStopped(_ error: Error?) async {

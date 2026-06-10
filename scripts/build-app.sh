@@ -49,6 +49,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <string>Cascade can use the microphone only when you enable voice teaching.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Cascade transcribes your spoken questions so it can point at what you ask about on screen.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>With the Power harness enabled, Cascade can drive scriptable apps (Numbers, Mail, Finder) to do bulk work for you — every script is shown and audited.</string>
 </dict>
 </plist>
 PLIST

@@ -17,6 +17,9 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
     /// Stable key (the action-token sequence) used to dedupe an agent built from
     /// this workflow.
     public let signature: String
+    /// When the workflow was last observed — lets the UI date the card and pick
+    /// a nearby rewind frame as visual evidence.
+    public let lastSeenAt: Date
 
     public init(
         id: UUID = UUID(),
@@ -28,7 +31,8 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
         recipe: AgentRecipe,
         evidence: [Int64],
         confidence: Double,
-        signature: String
+        signature: String,
+        lastSeenAt: Date = Date()
     ) {
         self.id = id
         self.title = title
@@ -40,6 +44,7 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
         self.evidence = evidence
         self.confidence = confidence
         self.signature = signature
+        self.lastSeenAt = lastSeenAt
     }
 }
 
@@ -60,10 +65,15 @@ public struct WasteDetector: Sendable {
         inputEvents: [InputEvent],
         maxResults: Int = 5
     ) -> [DetectedWaste] {
-        // Oldest → newest; ignore anything in a sensitive app defensively.
-        let events = inputEvents
-            .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
-            .sorted { $0.capturedAt < $1.capturedAt }
+        // Oldest → newest; ignore anything in a sensitive app defensively. Scroll
+        // BURSTS collapse to one gesture first — eight wheel ticks while reading
+        // are one movement, not eight automatable steps (they were inflating both
+        // the detected "workflows" and the minutes-saved math).
+        let events = Self.collapsingScrollBursts(
+            inputEvents
+                .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+                .sorted { $0.capturedAt < $1.capturedAt }
+        )
         guard events.count >= minRunLength * 2 else { return [] }
 
         let tokens = events.map(Self.token)
@@ -89,6 +99,19 @@ public struct WasteDetector: Sendable {
                 guard nonOverlapping.count >= 2 else { continue }
                 let representativeStart = nonOverlapping.max()!
                 let instance = Array(events[representativeStart..<representativeStart + length])
+                // A workflow is something an agent can DO for you, and that
+                // means STRUCTURE: clicks on UI elements and command shortcuts.
+                // Plain typing, bare editing keys (Delete, Return, arrows), and
+                // scrolling are content editing — "Delete · Delete · type" is
+                // someone fixing a sentence, and nobody wants an agent that
+                // re-presses Delete for them. Demand two structural actions
+                // plus one intent marker: a click on a *named* element, a real
+                // shortcut, or a cross-app flow. Two anonymous clicks in a
+                // browser are reading, not a workflow.
+                let structuralCount = instance.count(where: Self.isStructural)
+                let hasIntentMarker = instance.contains(where: Self.isIntentMarker)
+                    || Set(instance.map(\.appName)).count >= 2
+                guard structuralCount >= 2, hasIntentMarker else { continue }
                 results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
@@ -138,11 +161,8 @@ public struct WasteDetector: Sendable {
         let apps = Self.orderedDistinct(instance.map(\.appName))
         let span = instance.last!.capturedAt.timeIntervalSince(instance.first!.capturedAt)
         let perRun = max(instance.count, Int(span.rounded()))
-        let title = apps.count <= 1
-            ? "Repeated steps in \(apps.first ?? "an app")"
-            : "Workflow: " + apps.joined(separator: " → ")
         return DetectedWaste(
-            title: title,
+            title: Self.title(apps: apps, steps: steps),
             apps: apps,
             occurrences: occurrences,
             estimatedSecondsPerRun: perRun,
@@ -150,8 +170,31 @@ public struct WasteDetector: Sendable {
             recipe: AgentRecipe(steps: steps),
             evidence: instance.map(\.id),
             confidence: min(0.95, 0.5 + Double(occurrences) * 0.12),
-            signature: instance.map(Self.token).joined(separator: "|")
+            signature: instance.map(Self.token).joined(separator: "|"),
+            lastSeenAt: instance.last!.capturedAt
         )
+    }
+
+    /// A title that says what the workflow IS, not just where it happened: the
+    /// recorded anchors and shortcuts become the story ("Mail: click “Send
+    /// Message” → ⌘C"), and the classic copy-into-another-app shape is named
+    /// outright. Falls back to the app flow only when the steps carry no story.
+    static func title(apps: [String], steps: [RecipeStep]) -> String {
+        // ⌘C in one app followed by ⌘V in another is the single most common
+        // detected workflow — name it like a person would.
+        if let copy = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "c" && $0.modifiers.contains("command") }),
+           let paste = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "v" && $0.modifiers.contains("command") }),
+           copy.order < paste.order, copy.appName != paste.appName {
+            return "Copy from \(copy.appName) into \(paste.appName)"
+        }
+        // Lead with the most telling steps: anchored clicks and shortcuts.
+        let meaningful = steps.filter { $0.kind != .activateApp && $0.kind != .scroll }
+        let story = meaningful.prefix(3).map(\.humanLabel).joined(separator: " → ")
+        if apps.count <= 1 {
+            let app = apps.first ?? "an app"
+            return story.isEmpty ? "Repeated steps in \(app)" : "\(app): \(String(story.prefix(64)))"
+        }
+        return "\(apps.joined(separator: " → ")): \(String(story.prefix(48)))"
     }
 
     // MARK: - Helpers
@@ -180,6 +223,54 @@ public struct WasteDetector: Sendable {
         case .key: .key
         case .scroll: .scroll
         }
+    }
+
+    /// Clicks and modifier shortcuts give a repetition automatable structure.
+    /// Bare keys (Delete, Return, arrows, characters) and typing are content
+    /// editing — they ride along in a recipe but never justify one.
+    private static func isStructural(_ event: InputEvent) -> Bool {
+        switch event.kind {
+        case .click, .doubleClick, .rightClick:
+            return true
+        case .key:
+            return event.modifiers.contains("command") || event.modifiers.contains("control")
+        case .type, .scroll:
+            return false
+        }
+    }
+
+    /// Evidence the repetition is deliberate: a click on an element the recorder
+    /// could NAME (its AX label), or a command shortcut. Anonymous same-app
+    /// clicking is how people read.
+    private static func isIntentMarker(_ event: InputEvent) -> Bool {
+        switch event.kind {
+        case .click, .doubleClick, .rightClick:
+            return !(event.text ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        case .key:
+            return event.modifiers.contains("command") || event.modifiers.contains("control")
+        case .type, .scroll:
+            return false
+        }
+    }
+
+    /// Consecutive scrolls in the same app merge into the first one of the burst —
+    /// a wheel gesture emits many events, but it is ONE user action. The chain is
+    /// judged between NEIGHBORING scrolls, so a long continuous burst stays one
+    /// action no matter how many seconds it lasts.
+    static func collapsingScrollBursts(_ events: [InputEvent]) -> [InputEvent] {
+        var out: [InputEvent] = []
+        var previous: InputEvent?
+        for event in events {
+            defer { previous = event }
+            if event.kind == .scroll,
+               let previous, previous.kind == .scroll,
+               previous.appName == event.appName,
+               event.capturedAt.timeIntervalSince(previous.capturedAt) < 3 {
+                continue
+            }
+            out.append(event)
+        }
+        return out
     }
 
     /// Greedily selects non-overlapping occurrences (each at least `length` apart).

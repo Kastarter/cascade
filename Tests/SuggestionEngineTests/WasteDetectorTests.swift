@@ -48,16 +48,92 @@ func nonRepeatingActivityDetectsNothing() {
 }
 
 @Test
+func scrollSpamIsNeverAWorkflow() {
+    // Hours of reading in iTerm2 — hundreds of wheel ticks, no real actions.
+    // This was surfacing as "Repeated steps in iTerm2 · scroll · scroll · …".
+    let events = (0..<60).map { event($0, .scroll, app: "iTerm2") }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func scrollThenOneActionIsStillNotAWorkflow() {
+    // Scroll, type a command, repeat — that's just using a terminal.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<4 {
+        for _ in 0..<6 { events.append(event(i, .scroll, app: "iTerm2")); i += 1 }
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "ls", appName: "iTerm2")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func scrollBurstsCollapseToOneGesture() {
+    var events: [InputEvent] = []
+    var i = 0
+    // 8-tick wheel burst, then a click, a key — twice.
+    for _ in 0..<2 {
+        for _ in 0..<8 { events.append(event(i, .scroll, app: "Mail")); i += 1 }
+        events.append(event(i, .click, app: "Mail")); i += 1
+        events.append(event(i, .key, app: "Mail", key: "r", modifiers: ["command"])); i += 1
+    }
+    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    #expect(results.count == 1)
+    let waste = results[0]
+    // The burst is one step, not eight — recipes and time-saved stay honest.
+    let scrollSteps = waste.recipe.steps.filter { $0.kind == .scroll }.count
+    #expect(scrollSteps <= 1)
+    #expect(waste.estimatedSecondsPerRun <= 12)
+}
+
+@Test
 func recipeStepsCarryRealCoordinatesAndText() {
     var events: [InputEvent] = []
     var i = 0
     for _ in 0..<2 {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 42, y: 99, appName: "Safari")); i += 1
+        events.append(event(i, .key, app: "Safari", key: "l", modifiers: ["command"])); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "hello", appName: "Safari")); i += 1
     }
     let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
     #expect(waste.recipe.steps.contains { $0.kind == .click && $0.x == 42 && $0.y == 99 })
     #expect(waste.recipe.steps.contains { $0.kind == .type && $0.text == "hello" })
+}
+
+@Test
+func editingKeysAreNeverAWorkflow() {
+    // The real-world garbage this gate exists for: "Delete → Delete → type"
+    // in Chrome is someone fixing a sentence, not an automatable task.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<3 {
+        events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
+        events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "fix", appName: "Google Chrome")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func anonymousSameAppClickingIsNotAWorkflow() {
+    // Click, click, click around a browser — that's reading. No named element,
+    // no shortcut, one app: no agent.
+    let events = (0..<12).map { event($0, .click, app: "Google Chrome") }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func clickPlusTypingAloneIsNotAWorkflow() {
+    // Click a field and type — that's just using a text box (the "type →
+    // Delete → type" cards). One structural action isn't a workflow.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<3 {
+        events.append(event(i, .click, app: "Google Chrome")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "words", appName: "Google Chrome")); i += 1
+        events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
 }
 
 @Test
@@ -96,6 +172,38 @@ func contextAnchorMustComeFromTheSameApp() {
     let waste = WasteDetector().detect(contexts: [foreign], inputEvents: events).first!
     let click = waste.recipe.steps.first { $0.kind == .click }!
     #expect(click.ocrAnchor == "Safari window")
+}
+
+@Test
+func copyPasteAcrossAppsGetsNamedOutright() {
+    // ⌘C in Mail then ⌘V in Numbers — the title should say what it IS.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 {
+        events.append(event(i, .key, app: "Mail", key: "c", modifiers: ["command"])); i += 1
+        events.append(event(i, .key, app: "Numbers", key: "v", modifiers: ["command"])); i += 1
+    }
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    #expect(waste.title == "Copy from Mail into Numbers")
+}
+
+@Test
+func titleTellsTheStoryFromAnchorsNotJustTheApp() {
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 {
+        events.append(InputEvent(
+            id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)),
+            kind: .click, x: 10, y: 10, text: "Reply All", appName: "Mail"
+        )); i += 1
+        events.append(event(i, .key, app: "Mail", key: "r", modifiers: ["command"])); i += 1
+    }
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    #expect(waste.title.contains("Mail"))
+    #expect(waste.title.contains("Reply All"))
+    #expect(!waste.title.contains("Repeated steps"))
+    // And the card can date the evidence.
+    #expect(waste.lastSeenAt > base)
 }
 
 @Test

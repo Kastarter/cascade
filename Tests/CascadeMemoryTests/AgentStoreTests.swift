@@ -99,3 +99,63 @@ func markRunEnableAndDelete() async throws {
     try await store.deleteAgent(id: agent.id)
     #expect(try await store.agents().isEmpty)
 }
+
+@Test
+func runCountIsRealRunsNotApprovals() async throws {
+    let store = try makeAgentStore()
+    let agent = try await store.upsertAgent(CascadeAgent(
+        name: "A", source: .detected, signature: "s",
+        recipe: AgentRecipe(steps: []), estimatedSecondsPerRun: 45
+    ))
+    #expect(agent.runCount == 0)
+    #expect(agent.estimatedSecondsPerRun == 45)
+
+    try await store.markAgentRun(id: agent.id)
+    try await store.markAgentRun(id: agent.id)
+    let after = try await store.agent(id: agent.id)
+    #expect(after?.runCount == 2)
+
+    // A re-detect refreshing the recipe must not erase the run history.
+    _ = try await store.upsertAgent(CascadeAgent(
+        name: "A v2", source: .detected, signature: "s",
+        recipe: AgentRecipe(steps: []), estimatedSecondsPerRun: 50
+    ))
+    let refreshed = try await store.agent(id: agent.id)
+    #expect(refreshed?.runCount == 2)
+    #expect(refreshed?.estimatedSecondsPerRun == 50)
+}
+
+@Test
+func scheduleRoundTripsAndSurvivesRedetect() async throws {
+    let store = try makeAgentStore()
+    let agent = try await store.upsertAgent(CascadeAgent(name: "A", source: .detected, signature: "s", recipe: AgentRecipe(steps: [])))
+    #expect(agent.schedule == nil)
+
+    try await store.setAgentSchedule(id: agent.id, schedule: "daily@09:05")
+    #expect(try await store.agent(id: agent.id)?.schedule == "daily@09:05")
+
+    // A re-detect refresh must not clear the user's schedule.
+    _ = try await store.upsertAgent(CascadeAgent(name: "A v2", source: .detected, signature: "s", recipe: AgentRecipe(steps: [])))
+    #expect(try await store.agent(id: agent.id)?.schedule == "daily@09:05")
+
+    try await store.setAgentSchedule(id: agent.id, schedule: nil)
+    #expect(try await store.agent(id: agent.id)?.schedule == nil)
+}
+
+@Test
+func humanStepsReadLikeTheWorkflow() {
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(order: 0, kind: .activateApp, appName: "Mail"),
+        RecipeStep(order: 1, kind: .click, x: 1, y: 1, appName: "Mail", ocrAnchor: "Send Message"),
+        RecipeStep(order: 2, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        RecipeStep(order: 3, kind: .key, key: "v", modifiers: ["shift", "command"], appName: "Numbers"),
+        RecipeStep(order: 4, kind: .type, text: "secret draft text", appName: "Numbers"),
+    ])
+    #expect(recipe.humanSteps == [
+        "switch to Mail",
+        "click “Send Message”",
+        "⌘C",
+        "⇧⌘V",
+        "type",  // never the recorded text itself
+    ])
+}

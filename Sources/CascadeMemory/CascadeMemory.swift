@@ -172,9 +172,59 @@ public struct RecipeStep: Codable, Equatable, Sendable {
     }
 }
 
+public extension RecipeStep {
+    /// The step as a person would say it — "click “Send Message”", "⌘C",
+    /// "switch to Numbers" — built from the recorded AX anchor and shortcut.
+    /// Typed content is summarized, never quoted (cards promise step *shape*,
+    /// not keystrokes).
+    var humanLabel: String {
+        switch kind {
+        case .activateApp:
+            return "switch to \(appName)"
+        case .click:
+            return anchored("click")
+        case .doubleClick:
+            return anchored("double-click")
+        case .rightClick:
+            return anchored("right-click")
+        case .type:
+            return "type"
+        case .key:
+            let symbols = modifiers.map(Self.symbol).joined()
+            let keyName = (key ?? "").count == 1 ? (key ?? "").uppercased() : (key ?? "").capitalized
+            return symbols.isEmpty ? keyName : symbols + keyName
+        case .scroll:
+            return "scroll"
+        }
+    }
+
+    private func anchored(_ verb: String) -> String {
+        guard let anchor = ocrAnchor?.trimmingCharacters(in: .whitespacesAndNewlines), !anchor.isEmpty else {
+            return verb
+        }
+        return "\(verb) “\(String(anchor.prefix(28)))”"
+    }
+
+    private static func symbol(_ modifier: String) -> String {
+        switch modifier.lowercased() {
+        case "command", "cmd": "⌘"
+        case "shift": "⇧"
+        case "option", "alt": "⌥"
+        case "control", "ctrl": "⌃"
+        case "fn", "function": "fn"
+        default: modifier
+        }
+    }
+}
+
 public struct AgentRecipe: Codable, Equatable, Sendable {
     public var steps: [RecipeStep]
     public init(steps: [RecipeStep]) { self.steps = steps }
+
+    /// Ordered human-readable step labels — what will actually happen on deploy.
+    public var humanSteps: [String] {
+        steps.sorted { $0.order < $1.order }.map(\.humanLabel)
+    }
 }
 
 public enum AgentSource: String, Codable, Sendable {
@@ -220,10 +270,18 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
     public let recipe: AgentRecipe
     public let apps: [String]
     public let estimatedSeconds: Int
+    /// Seconds ONE deploy gives back (from the detection math) — multiplied by
+    /// `runCount` this is the honest "time actually reclaimed", as opposed to
+    /// `estimatedSeconds`, which is the potential observed at detection time.
+    public let estimatedSecondsPerRun: Int
     public let evidenceCount: Int
+    /// How many times this agent has actually been deployed to completion.
+    public let runCount: Int
     public let createdAt: Date
     public let lastRunAt: Date?
     public let enabled: Bool
+    /// "daily@HH:mm" for a scheduled agent, nil for manual-only.
+    public let schedule: String?
 
     public init(
         id: Int64 = 0,
@@ -233,10 +291,13 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         recipe: AgentRecipe,
         apps: [String] = [],
         estimatedSeconds: Int = 0,
+        estimatedSecondsPerRun: Int = 0,
         evidenceCount: Int = 0,
+        runCount: Int = 0,
         createdAt: Date = Date(),
         lastRunAt: Date? = nil,
-        enabled: Bool = true
+        enabled: Bool = true,
+        schedule: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -245,10 +306,13 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         self.recipe = recipe
         self.apps = apps
         self.estimatedSeconds = estimatedSeconds
+        self.estimatedSecondsPerRun = estimatedSecondsPerRun
         self.evidenceCount = evidenceCount
+        self.runCount = runCount
         self.createdAt = createdAt
         self.lastRunAt = lastRunAt
         self.enabled = enabled
+        self.schedule = schedule
     }
 }
 
@@ -404,6 +468,37 @@ public actor CascadeStore {
         }
     }
 
+    /// One moment by id — the agentic answerer's `inspect_moment` tool.
+    public func context(id: Int64) throws -> RecordedContext? {
+        let sql = "SELECT \(Self.contextColumns()) FROM recorded_context WHERE id = ? LIMIT 1;"
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, id)
+            return sqlite3_step(statement) == SQLITE_ROW ? decodeContext(statement) : nil
+        }
+    }
+
+    /// Moments inside a time window, oldest-first — the agentic answerer's
+    /// `get_timeframe` tool ("what was I doing between 2 and 3pm").
+    public func contexts(between start: Date, and end: Date, limit: Int = 60) throws -> [RecordedContext] {
+        let sql = """
+        SELECT \(Self.contextColumns())
+        FROM recorded_context
+        WHERE captured_at >= ? AND captured_at <= ?
+        ORDER BY captured_at ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(DateCodec.string(from: start), at: 1, in: statement)
+            bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
     /// Moments whose recorded text matches ANY meaningful token of a natural-
     /// language question, best match first (FTS5 bm25). Unlike `searchContexts`
     /// — which ANDs every token, so a stopword-heavy question matches nothing —
@@ -515,6 +610,8 @@ public actor CascadeStore {
             bind(cutoff, at: 1, in: statement)
             try stepDone(statement)
         }
+        // Embeddings follow their moments out.
+        try? execute("DELETE FROM context_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         return removed
     }
 
@@ -586,8 +683,10 @@ public actor CascadeStore {
         }
 
         if let existingID {
+            // run_count and last_run_at are never overwritten by a re-detect —
+            // the run history belongs to the agent, not the detection.
             try withStatement("""
-            UPDATE agents SET name = ?, source = ?, recipe_json = ?, apps = ?, estimated_seconds = ?, evidence_count = ?
+            UPDATE agents SET name = ?, source = ?, recipe_json = ?, apps = ?, estimated_seconds = ?, seconds_per_run = ?, evidence_count = ?
             WHERE id = ?;
             """) { statement in
                 bind(agent.name, at: 1, in: statement)
@@ -595,8 +694,9 @@ public actor CascadeStore {
                 bind(recipeJSON, at: 3, in: statement)
                 bind(appsCSV, at: 4, in: statement)
                 sqlite3_bind_int64(statement, 5, Int64(agent.estimatedSeconds))
-                sqlite3_bind_int64(statement, 6, Int64(agent.evidenceCount))
-                sqlite3_bind_int64(statement, 7, existingID)
+                sqlite3_bind_int64(statement, 6, Int64(agent.estimatedSecondsPerRun))
+                sqlite3_bind_int64(statement, 7, Int64(agent.evidenceCount))
+                sqlite3_bind_int64(statement, 8, existingID)
                 try stepDone(statement)
             }
             return try self.agent(id: existingID) ?? agent
@@ -604,8 +704,8 @@ public actor CascadeStore {
 
         try withStatement("""
         INSERT INTO agents
-            (name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (name, source, signature, recipe_json, apps, estimated_seconds, seconds_per_run, evidence_count, run_count, created_at, last_run_at, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """) { statement in
             bind(agent.name, at: 1, in: statement)
             bind(agent.source.rawValue, at: 2, in: statement)
@@ -613,10 +713,12 @@ public actor CascadeStore {
             bind(recipeJSON, at: 4, in: statement)
             bind(appsCSV, at: 5, in: statement)
             sqlite3_bind_int64(statement, 6, Int64(agent.estimatedSeconds))
-            sqlite3_bind_int64(statement, 7, Int64(agent.evidenceCount))
-            bind(DateCodec.string(from: agent.createdAt), at: 8, in: statement)
-            bind(agent.lastRunAt.map(DateCodec.string(from:)), at: 9, in: statement)
-            sqlite3_bind_int(statement, 10, agent.enabled ? 1 : 0)
+            sqlite3_bind_int64(statement, 7, Int64(agent.estimatedSecondsPerRun))
+            sqlite3_bind_int64(statement, 8, Int64(agent.evidenceCount))
+            sqlite3_bind_int64(statement, 9, Int64(agent.runCount))
+            bind(DateCodec.string(from: agent.createdAt), at: 10, in: statement)
+            bind(agent.lastRunAt.map(DateCodec.string(from:)), at: 11, in: statement)
+            sqlite3_bind_int(statement, 12, agent.enabled ? 1 : 0)
             try stepDone(statement)
         }
         let newID = sqlite3_last_insert_rowid(connection.db)
@@ -640,8 +742,10 @@ public actor CascadeStore {
         }
     }
 
+    /// One completed deploy: stamps the time AND increments the run counter —
+    /// the "time reclaimed" math multiplies seconds-per-run by real runs.
     public func markAgentRun(id: Int64, at date: Date = Date()) throws {
-        try withStatement("UPDATE agents SET last_run_at = ? WHERE id = ?;") { statement in
+        try withStatement("UPDATE agents SET last_run_at = ?, run_count = run_count + 1 WHERE id = ?;") { statement in
             bind(DateCodec.string(from: date), at: 1, in: statement)
             sqlite3_bind_int64(statement, 2, id)
             try stepDone(statement)
@@ -651,6 +755,15 @@ public actor CascadeStore {
     public func setAgentEnabled(id: Int64, enabled: Bool) throws {
         try withStatement("UPDATE agents SET enabled = ? WHERE id = ?;") { statement in
             sqlite3_bind_int(statement, 1, enabled ? 1 : 0)
+            sqlite3_bind_int64(statement, 2, id)
+            try stepDone(statement)
+        }
+    }
+
+    /// Sets or clears an agent's recurring schedule ("daily@HH:mm" / nil).
+    public func setAgentSchedule(id: Int64, schedule: String?) throws {
+        try withStatement("UPDATE agents SET schedule = ? WHERE id = ?;") { statement in
+            bind(schedule, at: 1, in: statement)
             sqlite3_bind_int64(statement, 2, id)
             try stepDone(statement)
         }
@@ -775,6 +888,9 @@ public actor CascadeStore {
         // Best-effort migrations for databases created before these columns existed.
         try? execute("ALTER TABLE recorded_context ADD COLUMN image_path TEXT;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN frame_hash INTEGER;", db: db)
+        try? execute("ALTER TABLE agents ADD COLUMN seconds_per_run INTEGER NOT NULL DEFAULT 0;", db: db)
+        try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
+        try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
@@ -829,10 +945,13 @@ public actor CascadeStore {
             recipe_json TEXT NOT NULL,
             apps TEXT,
             estimated_seconds INTEGER NOT NULL DEFAULT 0,
+            seconds_per_run INTEGER NOT NULL DEFAULT 0,
             evidence_count INTEGER NOT NULL DEFAULT 0,
+            run_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             last_run_at TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1
+            enabled INTEGER NOT NULL DEFAULT 1,
+            schedule TEXT
         );
 
         CREATE TABLE IF NOT EXISTS manager_cascade (
@@ -841,6 +960,11 @@ public actor CascadeStore {
             title TEXT NOT NULL,
             summary TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending'
+        );
+
+        CREATE TABLE IF NOT EXISTS context_embedding (
+            context_id INTEGER PRIMARY KEY,
+            vector BLOB NOT NULL
         );
         """, db: db)
 
@@ -876,7 +1000,7 @@ public actor CascadeStore {
         }
     }
 
-    private func withStatement<T>(_ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
+    internal func withStatement<T>(_ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(connection.db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw CascadeStoreError.prepareFailed(lastError())
@@ -885,7 +1009,7 @@ public actor CascadeStore {
         return try body(statement)
     }
 
-    private func stepDone(_ statement: OpaquePointer) throws {
+    internal func stepDone(_ statement: OpaquePointer) throws {
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw CascadeStoreError.sqlite(lastError())
         }
@@ -951,7 +1075,7 @@ public actor CascadeStore {
     }
 
     private static let agentColumns =
-        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled"
+        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count, schedule"
 
     private func decodeAgent(_ statement: OpaquePointer) -> CascadeAgent {
         let appsRaw = text(statement, 5) ?? ""
@@ -964,10 +1088,13 @@ public actor CascadeStore {
             recipe: Self.decodeRecipe(text(statement, 4)),
             apps: apps,
             estimatedSeconds: Int(sqlite3_column_int64(statement, 6)),
+            estimatedSecondsPerRun: Int(sqlite3_column_int64(statement, 11)),
             evidenceCount: Int(sqlite3_column_int64(statement, 7)),
+            runCount: Int(sqlite3_column_int64(statement, 12)),
             createdAt: DateCodec.date(from: text(statement, 8)) ?? Date(),
             lastRunAt: DateCodec.date(from: text(statement, 9)),
-            enabled: sqlite3_column_int(statement, 10) != 0
+            enabled: sqlite3_column_int(statement, 10) != 0,
+            schedule: text(statement, 13)
         )
     }
 

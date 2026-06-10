@@ -69,6 +69,12 @@ public final class ComputerUseAgent {
     /// the use_skill tool is offered and the skill index (from `begin`) tells the
     /// model what it can pull. Pull-based: skill content never rides the prompt.
     private let skillProvider: ((String) -> String?)?
+    /// Direct-Mac harness: which tier of file/shell tools to offer, and the
+    /// executor that runs one call (the caller owns auditing, gating, and STOP).
+    /// Harness calls resolve in-process like use_skill — a search→read→answer
+    /// chain costs zero screenshots.
+    private let harnessTier: HarnessTier
+    private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
 
     /// Keeps the model terse and decisive: no narration (fewer output tokens → faster
     /// turns and short text-to-speech), confident action chains batched into one turn
@@ -99,6 +105,25 @@ public final class ComputerUseAgent {
     "that one", or "the first one" — they are context, not new work.
     """
 
+    /// What the harness tools are and when to reach for them — appended to the
+    /// system prompt only when the matching tier is active, so the model is
+    /// never told about tools it doesn't have.
+    private static let harnessReadOnlyNote = """
+    You also have direct file tools that need no screenshots and are instant: search_files \
+    (Spotlight search of this Mac), list_folder, and read_file. When the task is finding, \
+    checking, or reading files or folders — "search my desktop for X", "what's in that \
+    folder" — use these FIRST instead of clicking through Finder windows.
+    """
+
+    private static let harnessPowerNote = """
+    You can also automate directly: run_command executes a zsh command, run_applescript \
+    drives scriptable apps, and write_file writes a text file. Bulk or data-heavy work in \
+    Excel, Numbers, Mail, Finder, or the filesystem should be ONE script, not hundreds of \
+    clicks — the change still happens in the user's real app, visibly. Every command is \
+    shown to the user and recorded in their audit log. If a script fails twice, fall back \
+    to doing it on screen.
+    """
+
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
     /// a tab bar. Not used by the single-view web sandbox.
     public static let foregroundBrowserNote = """
@@ -113,13 +138,17 @@ public final class ComputerUseAgent {
         model: String = AnthropicModel.sonnet,
         effort: String = "medium",
         environmentNote: String? = nil,
-        skillProvider: ((String) -> String?)? = nil
+        skillProvider: ((String) -> String?)? = nil,
+        harnessTier: HarnessTier = .off,
+        harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil
     ) {
         self.keyStore = keyStore
         self.model = model
         self.effort = effort
         self.environmentNote = environmentNote
         self.skillProvider = skillProvider
+        self.harnessTier = harnessProvider == nil ? .off : harnessTier
+        self.harnessProvider = harnessProvider
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -253,6 +282,12 @@ public final class ComputerUseAgent {
                 "cache_control": ["type": "ephemeral"],
             ],
         ]
+        // Harness tools sit before the computer tool so its cache breakpoint
+        // covers them. Definitions are fixed per episode — zero ongoing token
+        // cost beyond the one-time cache write.
+        if harnessTier != .off {
+            tools.insert(contentsOf: Self.harnessToolDefinitions(tier: harnessTier), at: tools.count - 1)
+        }
         if skillProvider != nil {
             tools.insert([
                 "name": "use_skill",
@@ -264,7 +299,13 @@ public final class ComputerUseAgent {
                 ],
             ], at: 2)
         }
-        let system = environmentNote.map { "\(Self.systemPrompt)\n\n\($0)" } ?? Self.systemPrompt
+        var system = Self.systemPrompt
+        switch harnessTier {
+        case .off: break
+        case .readOnly: system += "\n\n" + Self.harnessReadOnlyNote
+        case .full: system += "\n\n" + Self.harnessReadOnlyNote + "\n\n" + Self.harnessPowerNote
+        }
+        if let environmentNote { system += "\n\n" + environmentNote }
         // Adaptive thinking is Anthropic's benchmarked setup for computer use on
         // Sonnet 4.6: the model plans before acting, and fewer wrong clicks means
         // fewer retries — it uses fewer total tokens than no-thinking. max_tokens
@@ -325,6 +366,14 @@ public final class ComputerUseAgent {
                     }
                 case "highlight":
                     if let action = parseHighlight(input) { actions.append(action) }
+                case let name? where AgentHarness.isHarnessTool(name):
+                    // Resolved in-process like use_skill — search/read/run chains
+                    // never touch the screenshot loop. The provider owns audit,
+                    // power gating, and STOP.
+                    if let id = block["id"] as? String {
+                        toolResultOverrides[id] = await harnessProvider?(name, input)
+                            ?? "The \(name) tool isn't available in this run."
+                    }
                 default:
                     if let action = parseAction(input) { actions.append(action) }
                 }
@@ -332,13 +381,14 @@ public final class ComputerUseAgent {
                 break
             }
         }
-        // A turn that ONLY pulled skills needs no screen work — answer the tool
-        // calls with the skill text right away and let the model continue, without
-        // bouncing through the caller's screenshot loop. Hop-capped so a model
-        // stuck pulling skills forever falls back to the normal loop.
+        // A turn that ONLY pulled skills or ran harness tools needs no screen
+        // work — answer the tool calls with their text right away and let the
+        // model continue, without bouncing through the caller's screenshot loop.
+        // Hop-capped (a search→read→read→script chain is legitimate; 8 hops of
+        // anything means it's stuck) so the loop falls back to the screen path.
         if !pendingToolIDs.isEmpty, actions.isEmpty,
            pendingToolIDs.allSatisfy({ toolResultOverrides[$0] != nil }),
-           inlineHops < 3 {
+           inlineHops < 8 {
             var results: [[String: Any]] = []
             for id in pendingToolIDs {
                 results.append([
@@ -363,6 +413,78 @@ public final class ComputerUseAgent {
         }
         let done = !(stopReason == "tool_use" || (stopReason == "max_tokens" && !pendingToolIDs.isEmpty))
         return CUStep(actions: actions, text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), done: done)
+    }
+
+    /// Tool definitions for the direct-Mac harness. Read-only tools ride every
+    /// run; the power trio appears only when the user's Settings toggle is on —
+    /// the model is never offered a tool that would be refused.
+    private static func harnessToolDefinitions(tier: HarnessTier) -> [[String: Any]] {
+        var defs: [[String: Any]] = [
+            [
+                "name": "search_files",
+                "description": "Spotlight-search this Mac for files by name or content. Instant — use it instead of clicking through Finder whenever the task is finding a file or folder. Returns matching paths.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string", "description": "Words to search for (matches file names and content)"],
+                        "folder": ["type": "string", "description": "Optional folder to search under, e.g. ~/Desktop. Defaults to the user's home folder."],
+                    ],
+                    "required": ["query"],
+                ],
+            ],
+            [
+                "name": "list_folder",
+                "description": "List the contents of one folder (directories end with /). Instant — use it instead of opening Finder to see what's in a folder.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": ["path": ["type": "string", "description": "Folder path, ~ allowed"]],
+                    "required": ["path"],
+                ],
+            ],
+            [
+                "name": "read_file",
+                "description": "Read a text file's content (bounded; binary files are refused). Instant — use it instead of opening the file on screen when you just need what's inside.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": ["path": ["type": "string", "description": "File path, ~ allowed"]],
+                    "required": ["path"],
+                ],
+            ],
+        ]
+        guard tier == .full else { return defs }
+        defs.append(contentsOf: [
+            [
+                "name": "run_command",
+                "description": "Run one zsh command on this Mac and get its output (25s limit; destructive commands like sudo or rm -rf / are refused; the user sees every command in their audit log). Use it for bulk file work, data processing, or anything a shell does better than clicking.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": ["command": ["type": "string", "description": "The zsh command"]],
+                    "required": ["command"],
+                ],
+            ],
+            [
+                "name": "run_applescript",
+                "description": "Run an AppleScript to drive scriptable apps — Excel, Numbers, Mail, Calendar, Finder, Safari. The change happens in the user's real app. ONE script beats hundreds of clicks for bulk edits (e.g. setting many spreadsheet cells); 30s limit; audited.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": ["script": ["type": "string", "description": "The complete AppleScript source"]],
+                    "required": ["script"],
+                ],
+            ],
+            [
+                "name": "write_file",
+                "description": "Write a text file inside the user's home folder (creates parent folders; overwrites). Use it to save results, drafts, scripts, or data the user asked for.",
+                "input_schema": [
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string", "description": "Destination path under ~, e.g. ~/Desktop/notes.md"],
+                        "content": ["type": "string", "description": "The full file content"],
+                    ],
+                    "required": ["path", "content"],
+                ],
+            ],
+        ])
+        return defs
     }
 
     /// Posts the request, retrying once on transport errors, 429, and 5xx (honoring

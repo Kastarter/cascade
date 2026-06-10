@@ -187,6 +187,8 @@ public final class ContextRecorder: ObservableObject {
     private var rewind: RewindRecorder?
     private let input: InputRecorder
     private var retentionTask: Task<Void, Never>?
+    private var activationObserver: NSObjectProtocol?
+    private var lastActivationCaptureAt = Date.distantPast
 
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver()) {
         self.store = store
@@ -246,6 +248,30 @@ public final class ContextRecorder: ObservableObject {
         // recording.
         input.start()
         startRetention()
+        startActivationCapture()
+    }
+
+    /// Event-driven capture: the moment the user switches apps is exactly the
+    /// moment worth recording — don't wait up to a second for the stream clock.
+    /// Also the hook that lets the rewind stream follow the cursor across
+    /// monitors. Debounced so ⌘-tabbing through five apps costs one capture.
+    private func startActivationCapture() {
+        guard activationObserver == nil else { return }
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleAppActivated() }
+        }
+    }
+
+    private func handleAppActivated() {
+        guard status.running else { return }
+        Task { await rewind?.followCursorDisplay() }
+        guard Date().timeIntervalSince(lastActivationCaptureAt) > 1.5 else { return }
+        lastActivationCaptureAt = Date()
+        captureOnce()
     }
 
     public func pause() {
@@ -257,6 +283,10 @@ public final class ContextRecorder: ObservableObject {
     private func stopEngine() {
         retentionTask?.cancel()
         retentionTask = nil
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+            self.activationObserver = nil
+        }
         input.stop()
         guard let recorder = rewind else { return }
         rewind = nil
@@ -308,6 +338,13 @@ public final class ContextRecorder: ObservableObject {
             isCursorScreen = sample.isCursorScreen
             if sample.hasText { ocrText = sample.ocrText }
             if let png = sample.imagePNG { imagePath = Self.saveFrame(png) }
+        }
+        // Same exact-text channel as the continuous recorder: AX text leads,
+        // OCR fills in what the tree can't see.
+        if let pid = snapshot.processIdentifier {
+            let axText = await Task.detached { AXTextHarvester.text(forWindowOfPID: pid) }.value
+            let merged = AXTextHarvester.merge(ax: axText, ocr: ocrText ?? "")
+            if !merged.isEmpty { ocrText = merged }
         }
 
         let metadata = """

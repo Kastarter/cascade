@@ -51,6 +51,14 @@ private struct ThrowingAnswerer: ContextQuestionAnswering {
     }
 }
 
+/// Keeps `ask` tests deterministic on machines that have a real key in the
+/// keychain — the agentic record path must never hit the network in tests.
+private struct ThrowingRecordAnswerer: RecordAnswering {
+    func answer(question: String, conversation: [(user: String, assistant: String)]) async throws -> RecordAnswer {
+        throw CocoaError(.featureUnsupported)
+    }
+}
+
 private func makeStore() throws -> CascadeStore {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("AgentOrchestratorTests-\(UUID().uuidString).sqlite")
@@ -74,7 +82,8 @@ func askGroundsInTheWholeDayNotJustTheFreshestMoments() async throws {
     let orchestrator = CascadeOrchestrator(
         store: store,
         localAnswerer: CountingAnswerer(),
-        claudeAnswerer: ThrowingAnswerer()
+        claudeAnswerer: ThrowingAnswerer(),
+        recordAnswerer: ThrowingRecordAnswerer()
     )
 
     let answer = try await orchestrator.ask("what did I do today?")
@@ -106,7 +115,8 @@ func askRecallsQuestionRelevantMomentsFromEarlierInTheDay() async throws {
     let orchestrator = CascadeOrchestrator(
         store: store,
         localAnswerer: RelevantEchoAnswerer(),
-        claudeAnswerer: ThrowingAnswerer()
+        claudeAnswerer: ThrowingAnswerer(),
+        recordAnswerer: ThrowingRecordAnswerer()
     )
 
     let answer = try await orchestrator.ask("when is the final project due?")

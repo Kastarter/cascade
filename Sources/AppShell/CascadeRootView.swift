@@ -172,11 +172,126 @@ public struct CascadeRootView: View {
                     .padding(.bottom, 18)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            if model.showOnboarding {
+                OnboardingScreen(model: model)
+                    .transition(.opacity)
+            }
         }
         .foregroundStyle(Color.cascadeText)
         .frame(minWidth: 1040, minHeight: 720)
         .preferredColorScheme(model.prefersDark ? .dark : .light)
         .animation(.easeOut(duration: 0.18), value: model.dock.visible)
+        .animation(.easeOut(duration: 0.22), value: model.showOnboarding)
+    }
+}
+
+// MARK: - First-run onboarding (permissions + keys, the first five minutes)
+
+private struct OnboardingScreen: View {
+    @ObservedObject var model: CascadeAppModel
+    @State private var claudeKey = ""
+
+    private var permissions: CapturePermissionStatus { model.recorder.status.permissions }
+    private var canRecord: Bool { permissions.screenRecording }
+    private var canAct: Bool { permissions.accessibility && permissions.inputMonitoring }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: CascadeMetrics.s5) {
+                    header
+                    step(number: 1, title: "Record", done: canRecord,
+                         detail: "Screen Recording lets Cascade keep your local, rewindable record. Frames never leave this Mac.") {
+                        HStack {
+                            PermissionRow(name: "Screen Recording", granted: permissions.screenRecording)
+                            Spacer()
+                            Button("Grant") { model.requestScreenRecording() }.buttonStyle(CascadeAccentButtonStyle())
+                        }
+                    }
+                    step(number: 2, title: "Act", done: canAct,
+                         detail: "Accessibility + Input Monitoring let agents click and type for you — with the visible companion cursor, Esc to stop, and a full audit trail.") {
+                        VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                            HStack {
+                                PermissionRow(name: "Accessibility", granted: permissions.accessibility)
+                                Spacer()
+                                Button("Grant") { model.requestAccessibility() }.buttonStyle(CascadeQuietButtonStyle())
+                            }
+                            HStack {
+                                PermissionRow(name: "Input Monitoring", granted: permissions.inputMonitoring)
+                                Spacer()
+                                Button("Grant") { model.requestInputMonitoring() }.buttonStyle(CascadeQuietButtonStyle())
+                            }
+                        }
+                    }
+                    step(number: 3, title: "Think", done: model.hasAnthropicKey,
+                         detail: "A Claude key powers grounded answers, where-is-X pointing, and the agents. Stored in the macOS Keychain.") {
+                        HStack(spacing: CascadeMetrics.s2) {
+                            SecureField("sk-ant-…", text: $claudeKey)
+                                .textFieldStyle(.plain)
+                                .font(.cascadeMono(12))
+                                .padding(.horizontal, CascadeMetrics.s3)
+                                .padding(.vertical, CascadeMetrics.s2)
+                                .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            Button("Save") {
+                                model.saveAnthropicKey(claudeKey)
+                                claudeKey = ""
+                            }
+                            .buttonStyle(CascadeAccentButtonStyle())
+                            .disabled(claudeKey.isEmpty)
+                        }
+                    }
+                    footer
+                }
+                .padding(CascadeMetrics.s6)
+                .frame(maxWidth: 620)
+                .background(Color.cascadePanel, in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous)
+                        .stroke(Color.cascadeBorderHi, lineWidth: 1)
+                )
+                .cascadeWindowShadow()
+                .padding(CascadeMetrics.s6)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .onAppear { model.refreshPermissionState() }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+            CascadeTag("Welcome to Cascade", tone: .cascadeAgent)
+            Text("Three steps and it just works").font(.cascadeSerif(28))
+            Text("Cascade records your work locally, answers from the record, and turns the tasks you repeat into agents you supervise. Everything below stays on this Mac.")
+                .font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
+        }
+    }
+
+    private func step(number: Int, title: String, done: Bool, detail: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            HStack(spacing: CascadeMetrics.s2) {
+                Image(systemName: done ? "checkmark.circle.fill" : "\(number).circle")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(done ? Color.cascadeGood : Color.cascadeAgent)
+                Text(title).font(.cascadeSans(15, .semibold))
+            }
+            Text(detail).font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+            content()
+        }
+        .padding(CascadeMetrics.s4)
+        .background(Color.cascadePanel2.opacity(0.5), in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
+
+    private var footer: some View {
+        HStack {
+            Button("Refresh status") { model.refreshPermissionState() }.buttonStyle(CascadeQuietButtonStyle())
+            Text("Voice (optional) and everything else live in Settings.")
+                .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText4)
+            Spacer()
+            Button(canRecord ? "Start using Cascade  →" : "Skip for now") { model.finishOnboarding() }
+                .buttonStyle(CascadeAccentButtonStyle())
+        }
     }
 }
 
@@ -323,6 +438,15 @@ private struct ReelScreen: View {
         .onReceive(ticker) { _ in advancePlaybackIfNeeded() }
         .onChange(of: moments.count) { _, newCount in
             index = min(index, max(newCount - 1, 0))
+        }
+        .onChange(of: model.reelJumpTarget) { _, target in
+            // A citation chip was clicked — scrub to the moment it cites.
+            guard let target, !moments.isEmpty else { return }
+            isPlaying = false
+            index = moments.indices.min(by: {
+                abs(moments[$0].capturedAt.timeIntervalSince(target)) < abs(moments[$1].capturedAt.timeIntervalSince(target))
+            }) ?? 0
+            model.reelJumpTarget = nil
         }
     }
 
@@ -869,6 +993,9 @@ private struct AskPanel: View {
                         ForEach(model.conversation) { turn in
                             ChatBubble(text: turn.question, mine: true)
                             ChatBubble(text: turn.answer, mine: false)
+                            if !turn.citations.isEmpty {
+                                CitationChips(citations: turn.citations) { model.jumpToMoment($0) }
+                            }
                         }
                         if model.thinking {
                             if model.answer.isEmpty {
@@ -1070,40 +1197,150 @@ private struct CascadesScreen: View {
         model.audit.filter { $0.action.hasPrefix("step.") || $0.action.hasPrefix("agent.") || $0.action == "computer.act" || $0.action == "cascade.declined" }
     }
 
+    /// Newly approved agent to flash + scroll to, so an approve never feels
+    /// like the card just vanished.
+    @State private var flashAgentID: Int64?
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
-                VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
-                    CascadeTag("Agents", tone: .cascadeAgent)
-                    Text("Approved by your manager").font(.cascadeSerif(30))
-                    Text("Cascade detects the tasks you repeat and sends them to your manager. The ones they approve land here — built from your real actions, ready to deploy.")
-                        .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
+                    VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                        CascadeTag("Cascades", tone: .cascadeAgent)
+                        Text("Everything you can run").font(.cascadeSerif(30))
+                        Text("Cascade catches what you repeat. You approve it once, and it becomes an agent that does it for you — on screen or in the background.")
+                            .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
+                    }
+                    pipelineStrip
+                    detectedSection
+                    agentsSection.id(Self.agentsAnchor)
+                    learnedSkillsSection
+                    managerInboxSection
+                    suggestionsSection
+                    activitySection
                 }
-                agentsSection
-                managerInboxSection
-                suggestionsSection
-                activitySection
+                .padding(.horizontal, CascadeMetrics.s6)
+                .padding(.vertical, CascadeMetrics.s6)
+                .frame(maxWidth: 960, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, CascadeMetrics.s6)
-            .padding(.vertical, CascadeMetrics.s6)
-            .frame(maxWidth: 960, alignment: .leading)
-            .frame(maxWidth: .infinity)
+            .onChange(of: model.agents.count) { previous, current in
+                // An approve just landed an agent — take the user to it.
+                guard current > previous, let newest = model.agents.first else { return }
+                flashAgentID = newest.id
+                withAnimation(.easeInOut(duration: 0.45)) {
+                    proxy.scrollTo(Self.agentsAnchor, anchor: .top)
+                }
+                Task {
+                    try? await Task.sleep(for: .seconds(3))
+                    withAnimation(.easeOut(duration: 0.6)) { flashAgentID = nil }
+                }
+            }
         }
+    }
+
+    private static let agentsAnchor = "your-agents"
+
+    /// The page's mental model in one strip: review → agents → runs.
+    private var pipelineStrip: some View {
+        HStack(spacing: CascadeMetrics.s2) {
+            PipelineStat(value: "\(model.pendingDetectedWaste.count)", label: "TO REVIEW", icon: "sparkles")
+            pipelineArrow
+            PipelineStat(value: "\(model.agents.count)", label: "AGENTS READY", icon: "bolt.badge.checkmark")
+            pipelineArrow
+            PipelineStat(value: "\(model.agents.map(\.runCount).reduce(0, +))", label: "RUNS DONE", icon: "checkmark.seal")
+            Spacer()
+        }
+    }
+
+    private var pipelineArrow: some View {
+        Image(systemName: "arrow.right")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(Color.cascadeText4)
+    }
+
+    /// Repeated work Cascade detected, awaiting review — approve to build an
+    /// agent from the recorded actions, decline to never see it again.
+    private var detectedSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "STEP 1 · REVIEW — WORKFLOWS CASCADE CAUGHT", trailing: "\(model.pendingDetectedWaste.count) pending")
+            if model.pendingDetectedWaste.isEmpty {
+                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When you repeat a task — same clicks, same shortcuts — it appears here with proof. One approve turns it into an agent.") }
+            } else {
+                ForEach(model.pendingDetectedWaste) { waste in
+                    WasteCard(
+                        waste: waste,
+                        evidenceImagePath: evidenceImagePath(for: waste),
+                        onApprove: { model.approveWaste(waste) },
+                        onDecline: { model.declineWaste(waste) }
+                    )
+                }
+            }
+        }
+    }
+
+    /// The rewind frame nearest to when the workflow was last observed, from the
+    /// same app — real visual evidence for the card.
+    private func evidenceImagePath(for waste: DetectedWaste) -> String? {
+        model.contexts
+            .filter { $0.imagePath != nil && (waste.apps.contains($0.appName) || waste.apps.isEmpty) }
+            .min { abs($0.capturedAt.timeIntervalSince(waste.lastSeenAt)) < abs($1.capturedAt.timeIntervalSince(waste.lastSeenAt)) }?
+            .imagePath
     }
 
     private var agentsSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "YOUR AGENTS", trailing: "\(model.agents.count) approved")
+            SectionLabel(title: "STEP 2 · YOUR AGENTS — APPROVED & READY", trailing: "\(model.agents.count) ready")
             if model.agents.isEmpty {
-                CascadePanel { EmptyState(title: "No agents yet", detail: "When your manager approves a workflow Cascade detected, the agent shows up here, ready to deploy.") }
+                CascadePanel { EmptyState(title: "No agents yet", detail: "Approve a workflow above and it lands right here as an agent, with its exact steps listed — built from your real actions.") }
             } else {
                 ForEach(model.agents) { agent in
                     AgentCard(
                         agent: agent,
+                        flash: agent.id == flashAgentID,
                         onDeploy: { model.deployAgent(agent) },
                         onToggle: { model.setAgentEnabled(agent, enabled: $0) },
-                        onDelete: { model.deleteAgent(agent) }
+                        onDelete: { model.deleteAgent(agent) },
+                        onSchedule: { model.setAgentSchedule(agent, schedule: $0) }
                     )
+                }
+            }
+        }
+    }
+
+    /// Skills the agent drafted from its own successful runs — the library
+    /// compounds with usage instead of with hand-written files. Hidden until
+    /// there's something to review.
+    @ViewBuilder private var learnedSkillsSection: some View {
+        if !model.pendingLearnedSkills.isEmpty {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                SectionLabel(title: "LEARNED SKILLS — REVIEW", trailing: "\(model.pendingLearnedSkills.count) drafted")
+                ForEach(model.pendingLearnedSkills) { skill in
+                    CascadePanel {
+                        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                            HStack(spacing: CascadeMetrics.s2) {
+                                Image(systemName: "graduationcap.fill")
+                                    .font(.system(size: 12)).foregroundStyle(Color.cascadeAgent)
+                                Text("New skill for \(skill.appName)").font(.cascadeSans(15, .semibold))
+                                Spacer()
+                            }
+                            Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
+                                .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+                            Text(skill.markdown)
+                                .font(.cascadeMono(10)).foregroundStyle(Color.cascadeText2)
+                                .lineLimit(10)
+                                .padding(CascadeMetrics.s3)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.cascadePanel2.opacity(0.5), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            HStack {
+                                Spacer()
+                                Button("Discard") { model.discardLearnedSkill(skill) }
+                                    .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                                Button("Add to skill library") { model.approveLearnedSkill(skill) }
+                                    .buttonStyle(CascadeAccentButtonStyle())
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1112,7 +1349,7 @@ private struct CascadesScreen: View {
     /// The persisted manager → employee inbox: pending cascades to review.
     private var managerInboxSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "CASCADES FROM YOUR MANAGER", trailing: "\(model.visibleManagerCascades.count) pending")
+            SectionLabel(title: "INBOX — FROM YOUR MANAGER", trailing: "\(model.visibleManagerCascades.count) pending")
             if model.visibleManagerCascades.isEmpty {
                 CascadePanel { EmptyState(title: "Nothing here yet", detail: "When your manager cascades an agent from the Manager dashboard, it lands here to review and deploy.") }
             } else {
@@ -1135,17 +1372,18 @@ private struct CascadesScreen: View {
     /// click to run through the agent.
     private var suggestionsSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "SUGGESTED BY CASCADE", trailing: "\(model.visibleSuggestions.count) from your record")
+            SectionLabel(title: "QUICK ACTIONS — FROM YOUR RECORD", trailing: "\(model.visibleSuggestions.count) available")
             if model.visibleSuggestions.isEmpty {
-                CascadePanel { EmptyState(title: "No suggestions yet", detail: "As Cascade records your work, repeated patterns surface here as ready-to-run suggestions.") }
+                CascadePanel { EmptyState(title: "Nothing yet", detail: "Once Cascade has recorded some work, one-click deliverables appear here — like a daily recap drafted from your actual day.") }
             } else {
                 ForEach(model.visibleSuggestions) { suggestion in
                     ManagerCascadeCard(
-                        eyebrow: "DETECTED · \(suggestion.kind.rawValue.uppercased()) · \(Int(suggestion.confidence * 100))% CONFIDENCE",
+                        eyebrow: "QUICK ACTION · GROUNDED IN THE LOCAL RECORD",
                         title: suggestion.title,
                         summary: suggestion.summary,
                         evidence: suggestion.evidence.first,
                         fromManager: false,
+                        deployLabel: "RUN  →",
                         onDeploy: { model.deploySuggestion(suggestion) },
                         onDecline: { model.declineSuggestion(suggestion) }
                     )
@@ -1168,21 +1406,6 @@ private struct CascadesScreen: View {
     }
 }
 
-/// One-line summary of a recipe's steps, for the cards.
-private func recipeSummary(_ recipe: AgentRecipe) -> String {
-    let parts = recipe.steps.sorted { $0.order < $1.order }.prefix(10).map { step -> String in
-        switch step.kind {
-        case .activateApp: return step.appName
-        case .click: return "click"
-        case .doubleClick: return "2×click"
-        case .rightClick: return "right-click"
-        case .type: return "type"
-        case .key: return (step.modifiers + [step.key ?? ""]).joined(separator: "+")
-        case .scroll: return "scroll"
-        }
-    }
-    return parts.joined(separator: " · ")
-}
 
 private struct AppChips: View {
     let apps: [String]
@@ -1198,33 +1421,81 @@ private struct AppChips: View {
     }
 }
 
-/// Manager-facing review card for a detected workflow. Shows the privacy-safe
-/// summary (task, apps, frequency, time saved, step *shape*) — never the raw typed
-/// text or coordinates — with approve/decline.
+/// Review card for a detected workflow (Cascades tab): a rewind frame as
+/// visual evidence, and the numbered "when deployed" steps built from the
+/// recorded AX anchors — informed consent, not a leap of faith. Privacy-safe:
+/// step *shape* and anchors only, never raw typed text or coordinates.
 private struct WasteCard: View {
     let waste: DetectedWaste
+    let evidenceImagePath: String?
     let onApprove: () -> Void
     let onDecline: () -> Void
 
+    private static let previewSteps = 5
+
     var body: some View {
         CascadePanel {
-            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-                HStack(alignment: .top) {
-                    Text(waste.title).font(.cascadeSans(15, .semibold))
-                    Spacer()
-                    Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m saved")
-                        .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+            HStack(alignment: .top, spacing: CascadeMetrics.s4) {
+                thumbnail
+                VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                    HStack(alignment: .top) {
+                        Text(waste.title).font(.cascadeSans(15, .semibold))
+                        Spacer()
+                        Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m saved")
+                            .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                            .fixedSize()
+                    }
+                    AppChips(apps: waste.apps)
+                    deployPreview
+                    HStack(spacing: CascadeMetrics.s2) {
+                        Text("last seen \(waste.lastSeenAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText4)
+                        Spacer()
+                        Button(action: onDecline) { Text("Decline") }
+                            .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                        Button(action: onApprove) { Text("Approve agent") }
+                            .buttonStyle(CascadeAccentButtonStyle())
+                    }
                 }
-                AppChips(apps: waste.apps)
-                Text(recipeSummary(waste.recipe))
-                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2).lineLimit(2)
-                HStack(spacing: CascadeMetrics.s2) {
-                    Spacer()
-                    Button(action: onDecline) { Text("Decline") }
-                        .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
-                    Button(action: onApprove) { Text("Approve & send") }
-                        .buttonStyle(CascadeAccentButtonStyle())
+            }
+        }
+    }
+
+    /// A real frame from the rewind, captured around the time the workflow last
+    /// ran — what this actually looked like on screen.
+    @ViewBuilder private var thumbnail: some View {
+        if let path = evidenceImagePath, let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 116, height: 74)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorderHi, lineWidth: 1))
+        }
+    }
+
+    /// Exactly what approving + deploying will do, step by step.
+    private var deployPreview: some View {
+        let steps = waste.recipe.humanSteps
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("WHEN DEPLOYED, CASCADE WILL")
+                .font(.cascadeMono(9, .semibold)).tracking(0.7).foregroundStyle(Color.cascadeText4)
+            ForEach(Array(steps.prefix(Self.previewSteps).enumerated()), id: \.offset) { index, step in
+                Text("\(index + 1).  \(step)")
+                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2).lineLimit(1)
+            }
+            if steps.count > Self.previewSteps {
+                Text("…and \(steps.count - Self.previewSteps) more steps")
+                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText4)
+            }
+            if CascadeAppModel.runsInBackground(apps: waste.apps) {
+                HStack(spacing: 5) {
+                    Image(systemName: "macwindow.on.rectangle")
+                        .font(.system(size: 10)).foregroundStyle(Color.cascadeAgent)
+                    Text("Runs in the background sandbox — your screen stays yours.")
+                        .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
                 }
+                .padding(.top, 2)
             }
         }
     }
@@ -1232,16 +1503,28 @@ private struct WasteCard: View {
 
 private struct AgentCard: View {
     let agent: CascadeAgent
+    var flash: Bool = false
     let onDeploy: () -> Void
     let onToggle: (Bool) -> Void
     let onDelete: () -> Void
+    var onSchedule: ((String?) -> Void)?
+
+    private static let previewSteps = 4
+    /// Daily slots offered in the schedule menu. Background agents run for
+    /// real on schedule; on-screen agents get a reminder (never auto-run).
+    private static let scheduleSlots = ["09:05", "13:05", "17:05"]
+
+    private var runsInBackground: Bool {
+        CascadeAppModel.runsInBackground(apps: agent.apps)
+    }
 
     var body: some View {
         CascadePanel {
             VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-                HStack {
+                HStack(spacing: CascadeMetrics.s2) {
                     Circle().fill(AppVisuals.color(for: agent.apps.first ?? agent.name)).frame(width: 8, height: 8)
-                    Text(agent.name).font(.cascadeSans(15, .semibold))
+                    Text(agent.name).font(.cascadeSans(15, .semibold)).lineLimit(1)
+                    CascadeTag(runsInBackground ? "BACKGROUND" : "ON SCREEN", tone: runsInBackground ? .cascadeAgent : .cascadeAccentWarm)
                     Spacer()
                     Toggle("", isOn: Binding(
                         get: { agent.enabled },
@@ -1250,36 +1533,129 @@ private struct AgentCard: View {
                         .labelsHidden().toggleStyle(.switch)
                 }
                 if !agent.apps.isEmpty { AppChips(apps: agent.apps) }
-                Text(recipeSummary(agent.recipe))
-                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2).lineLimit(2)
+                stepsPreview
                 HStack {
                     Text(meta).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
                     Spacer()
+                    scheduleMenu
                     Button("Delete", action: onDelete)
                         .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
-                    Button("Deploy", action: onDeploy)
+                    Button(runsInBackground ? "Deploy in background  →" : "Deploy  →", action: onDeploy)
                         .buttonStyle(CascadeAccentButtonStyle())
                         .disabled(!agent.enabled)
                 }
+            }
+        }
+        // The just-approved glow: when an approve lands the agent here, this
+        // ring + the auto-scroll make "where did it go" impossible to ask.
+        .overlay(
+            RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous)
+                .stroke(Color.cascadeAgent, lineWidth: flash ? 2 : 0)
+                .shadow(color: Color.cascadeAgent.opacity(flash ? 0.45 : 0), radius: 10)
+        )
+        .animation(.easeOut(duration: 0.5), value: flash)
+    }
+
+    /// Daily schedule picker. Background agents fire for real at the slot;
+    /// on-screen agents get a "ready to deploy" reminder instead.
+    @ViewBuilder private var scheduleMenu: some View {
+        if let onSchedule {
+            Menu {
+                Button("Manual only") { onSchedule(nil) }
+                ForEach(Self.scheduleSlots, id: \.self) { slot in
+                    Button(runsInBackground ? "Run daily at \(slot)" : "Remind daily at \(slot)") {
+                        onSchedule("daily@\(slot)")
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: agent.schedule == nil ? "clock" : "clock.badge.checkmark")
+                        .font(.system(size: 11))
+                    if let schedule = agent.schedule?.split(separator: "@").last {
+                        Text(String(schedule)).font(.cascadeMono(11))
+                    }
+                }
+                .foregroundStyle(agent.schedule == nil ? Color.cascadeText3 : Color.cascadeAgent)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help(agent.schedule == nil ? "Schedule this agent" : "Scheduled \(agent.schedule ?? "")")
+        }
+    }
+
+    /// The same "what will happen" language as the review card — the numbered
+    /// steps this agent performs, from the recorded actions.
+    private var stepsPreview: some View {
+        let steps = agent.recipe.humanSteps
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("WHAT IT DOES")
+                .font(.cascadeMono(9, .semibold)).tracking(0.7).foregroundStyle(Color.cascadeText4)
+            ForEach(Array(steps.prefix(Self.previewSteps).enumerated()), id: \.offset) { index, step in
+                Text("\(index + 1).  \(step)")
+                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText2).lineLimit(1)
+            }
+            if steps.count > Self.previewSteps {
+                Text("…and \(steps.count - Self.previewSteps) more steps")
+                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText4)
             }
         }
     }
 
     private var meta: String {
         var summary = "\(agent.recipe.steps.count) steps"
+        summary += agent.runCount == 1 ? " · 1 run" : " · \(agent.runCount) runs"
+        if agent.runCount > 0, agent.estimatedSecondsPerRun > 0 {
+            summary += " · ~\(max(1, agent.estimatedSecondsPerRun * agent.runCount / 60))m reclaimed"
+        }
         if let last = agent.lastRunAt {
-            summary += " · last run \(last.formatted(date: .omitted, time: .shortened))"
+            summary += " · last \(last.formatted(date: .omitted, time: .shortened))"
+        }
+        if CascadeAppModel.runsInBackground(apps: agent.apps) {
+            summary += " · runs in background"
         }
         return summary
     }
 }
 
-// MARK: - Manager screen (aggregate-only dashboard; cascades agents to the employee)
+// MARK: - Manager screen (aggregate-only ANALYTICS; review/deploy live in Cascades)
 
 private struct ManagerScreen: View {
     @ObservedObject var model: CascadeAppModel
 
     private var appsObserved: Int { Set(model.contexts.map(\.appName)).count }
+
+    /// Minutes ACTUALLY given back: seconds one run saves × completed runs.
+    /// Approval alone counts for nothing here — only deploys that finished.
+    private var minutesReclaimed: Int {
+        model.agents.map { $0.estimatedSecondsPerRun * $0.runCount }.reduce(0, +) / 60
+    }
+
+    /// Minutes still sitting on the table: unreviewed detected workflows plus
+    /// approved agents that have never actually been deployed.
+    private var minutesOnTheTable: Int {
+        let pending = model.pendingDetectedWaste.map(\.estimatedTotalSeconds).reduce(0, +)
+        let approvedNeverRun = model.agents.filter { $0.runCount == 0 }.map(\.estimatedSeconds).reduce(0, +)
+        return (pending + approvedNeverRun) / 60
+    }
+
+    private var totalRuns: Int {
+        model.agents.map(\.runCount).reduce(0, +)
+    }
+
+    /// Sample counts per app, biggest first — where the recorded time actually went.
+    private var appUsage: [(app: String, bundle: String?, count: Int)] {
+        var counts: [String: (bundle: String?, count: Int)] = [:]
+        for context in model.contexts {
+            counts[context.appName, default: (context.bundleIdentifier, 0)].count += 1
+        }
+        return counts.map { (app: $0.key, bundle: $0.value.bundle, count: $0.value.count) }
+            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.app < $1.app }
+    }
+
+    /// Detected workflows worth the most time, approved or not — insight, not actions.
+    private var topWorkflows: [DetectedWaste] {
+        Array(model.detectedWaste.prefix(5))
+    }
 
     private var managerChips: [String] {
         var result = Array(Set(model.contexts.map(\.appName))).prefix(2).map { "Auto-summarize \($0) sessions" }
@@ -1293,31 +1669,19 @@ private struct ManagerScreen: View {
             VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
                 VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
                     CascadeTag("Manager", tone: .cascadeAgent)
-                    Text("Suggestions from privacy-safe signals").font(.cascadeSerif(30))
-                    Text("Aggregate-only. You review the tasks Cascade detects the employee repeating — task, apps, frequency, time saved — and approve the agents worth running. Never raw OCR, screenshots, or keystrokes.")
+                    Text("Analytics from privacy-safe signals").font(.cascadeSerif(30))
+                    Text("Aggregate-only: time reclaimed, where the hours go, and the workflows worth automating. Reviewing and deploying happens in Cascades — never raw OCR, screenshots, or keystrokes here.")
                         .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                 }
                 HStack(spacing: CascadeMetrics.s3) {
-                    MetricCard(value: "\(model.contexts.count)", label: "Local samples")
+                    MetricCard(value: "~\(minutesReclaimed)m", label: "Reclaimed (\(totalRuns) runs)")
+                    MetricCard(value: "~\(minutesOnTheTable)m", label: "On the table")
                     MetricCard(value: "\(appsObserved)", label: "Apps observed")
-                    MetricCard(value: "\(model.pendingDetectedWaste.count)", label: "To review")
-                    MetricCard(value: "\(model.agents.count)", label: "Approved")
+                    MetricCard(value: "\(model.agents.count)", label: "Agents approved")
                     MetricCard(value: "0", label: "Raw screenshots")
                 }
-                VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-                    SectionLabel(title: "DETECTED WORKFLOWS — REVIEW & APPROVE", trailing: "\(model.pendingDetectedWaste.count) pending")
-                    if model.pendingDetectedWaste.isEmpty {
-                        CascadePanel { EmptyState(title: "Nothing to review", detail: "When the employee repeats a task, Cascade surfaces it here — task, apps, frequency, time saved — for you to approve or decline. Approved agents are sent to their Cascades tab.") }
-                    } else {
-                        ForEach(model.pendingDetectedWaste) { waste in
-                            WasteCard(
-                                waste: waste,
-                                onApprove: { model.approveWaste(waste) },
-                                onDecline: { model.declineWaste(waste) }
-                            )
-                        }
-                    }
-                }
+                workflowsSection
+                whereTimeGoesSection
                 ComposeBox(
                     eyebrow: "Cascade an agent to this employee",
                     placeholder: "Describe an automation to cascade. Plain English.",
@@ -1346,6 +1710,140 @@ private struct ManagerScreen: View {
             .padding(.vertical, CascadeMetrics.s6)
             .frame(maxWidth: 960, alignment: .leading)
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Read-only insight rows — the deploy buttons live in Cascades, and the
+    /// jump link takes you there.
+    private var workflowsSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            HStack {
+                SectionLabel(title: "TOP REPEATED WORKFLOWS", trailing: "")
+                Button {
+                    model.selectedTab = .cascades
+                } label: {
+                    Text("Review in Cascades →").font(.cascadeMono(11)).foregroundStyle(Color.cascadeAgent)
+                }
+                .buttonStyle(.plain)
+            }
+            if topWorkflows.isEmpty {
+                CascadePanel { EmptyState(title: "No repeated workflows yet", detail: "As Cascade records work, the most-repeated (and most automatable) tasks surface here with honest time-saved math.") }
+            } else {
+                CascadePanel {
+                    VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                        ForEach(topWorkflows) { waste in
+                            HStack(spacing: CascadeMetrics.s3) {
+                                Circle().fill(AppVisuals.color(for: waste.apps.first ?? waste.title)).frame(width: 7, height: 7)
+                                Text(waste.title).font(.cascadeSans(13, .medium)).lineLimit(1)
+                                AppChips(apps: waste.apps)
+                                Spacer()
+                                Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m")
+                                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sample share per app — a quiet bar per row, computed from the real record.
+    private var whereTimeGoesSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "WHERE THE TIME GOES", trailing: "\(model.contexts.count) recent samples")
+            if appUsage.isEmpty {
+                CascadePanel { EmptyState(title: "Nothing recorded yet", detail: "Once recording is on, the apps where work actually happens show up here, ranked by observed time.") }
+            } else {
+                CascadePanel {
+                    VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                        let top = Array(appUsage.prefix(6))
+                        let maxCount = max(top.first?.count ?? 1, 1)
+                        ForEach(top, id: \.app) { usage in
+                            HStack(spacing: CascadeMetrics.s3) {
+                                Circle().fill(AppVisuals.color(for: usage.app, bundleIdentifier: usage.bundle)).frame(width: 7, height: 7)
+                                Text(usage.app).font(.cascadeSans(13, .medium))
+                                    .frame(width: 170, alignment: .leading).lineLimit(1)
+                                GeometryReader { geo in
+                                    Capsule()
+                                        .fill(AppVisuals.color(for: usage.app, bundleIdentifier: usage.bundle).opacity(0.65))
+                                        .frame(width: max(6, geo.size.width * CGFloat(usage.count) / CGFloat(maxCount)), height: 8)
+                                        .frame(maxHeight: .infinity, alignment: .center)
+                                }
+                                .frame(height: 16)
+                                Text("\(usage.count)")
+                                    .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                                    .frame(width: 36, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One number in the Cascades pipeline strip: review → agents → runs.
+private struct PipelineStat: View {
+    let value: String
+    let label: String
+    let icon: String
+
+    var body: some View {
+        HStack(spacing: CascadeMetrics.s2) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.cascadeAgent)
+            Text(value).font(.cascadeSerif(22))
+            Text(label).font(.cascadeMono(10, .semibold)).tracking(0.6).foregroundStyle(Color.cascadeText3)
+        }
+        .padding(.horizontal, CascadeMetrics.s4)
+        .padding(.vertical, CascadeMetrics.s2 + 2)
+        .background(Color.cascadePanel, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
+}
+
+/// Proof chips under an answer: the recorded moments it was grounded in.
+/// Click one and the Reel jumps to that exact moment — the answer is checkable,
+/// not just plausible.
+private struct CitationChips: View {
+    let citations: [CitedMoment]
+    let onTap: (CitedMoment) -> Void
+
+    var body: some View {
+        HStack(spacing: CascadeMetrics.s2) {
+            ForEach(citations) { citation in
+                Button { onTap(citation) } label: {
+                    HStack(spacing: 5) {
+                        thumbnail(citation)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(citation.appName).font(.cascadeSans(10, .semibold)).lineLimit(1)
+                            Text(citation.capturedAt.formatted(date: .omitted, time: .shortened))
+                                .font(.cascadeMono(9)).foregroundStyle(Color.cascadeText3)
+                        }
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("Jump the Reel to this moment")
+            }
+        }
+    }
+
+    @ViewBuilder private func thumbnail(_ citation: CitedMoment) -> some View {
+        if let path = citation.imagePath, let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable().scaledToFill()
+                .frame(width: 30, height: 20)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        } else {
+            Image(systemName: "clock")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.cascadeText3)
+                .frame(width: 18, height: 18)
         }
     }
 }
@@ -1429,6 +1927,7 @@ private struct ManagerCascadeCard: View {
     let summary: String
     let evidence: String?
     var fromManager: Bool = false
+    var deployLabel: String = "DEPLOY  →"
     let onDeploy: () -> Void
     let onDecline: () -> Void
 
@@ -1448,7 +1947,7 @@ private struct ManagerCascadeCard: View {
             }
             Spacer()
             VStack(spacing: CascadeMetrics.s2) {
-                Button("DEPLOY  →") { onDeploy() }.buttonStyle(AgentButtonStyle())
+                Button(deployLabel) { onDeploy() }.buttonStyle(AgentButtonStyle())
                 Button("DECLINE") { onDecline() }.buttonStyle(CascadeQuietButtonStyle())
             }
         }
@@ -1518,6 +2017,9 @@ private struct SettingsScreen: View {
                 section("PERMISSIONS", trailing: "local capture & control") {
                     permissionsCard
                 }
+                section("AGENT HARNESS", trailing: "direct-Mac tools, fully audited") {
+                    HarnessCard(model: model)
+                }
                 section("APP IDENTITY", trailing: "for granting permissions") {
                     DiagnosticsCard(diagnostics: model.permissionDiagnostics)
                 }
@@ -1542,6 +2044,8 @@ private struct SettingsScreen: View {
                     .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
             }
             Spacer()
+            Button("Setup guide") { model.showOnboarding = true }
+                .buttonStyle(CascadeQuietButtonStyle())
             Button {
                 model.showSettings = false
             } label: {
@@ -1575,6 +2079,47 @@ private struct SettingsScreen: View {
                     Button("Request AX") { model.requestAccessibility() }.buttonStyle(CascadeQuietButtonStyle())
                     Button("Request Input") { model.requestInputMonitoring() }.buttonStyle(CascadeQuietButtonStyle())
                     Button("Open Settings") { model.openSystemSettings() }.buttonStyle(CascadeAccentButtonStyle())
+                }
+            }
+        }
+    }
+}
+
+/// The assist agent's direct-Mac tools: the always-on read-only tier, and the
+/// opt-in Power harness that lets it run commands, scripts, and file writes.
+private struct HarnessCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Find & read files").font(.cascadeSans(15, .semibold))
+                        Text("search_files · list_folder · read_file — Spotlight search and bounded text reads. Read-only, privacy-gated by your exclusion list.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    CascadeTag("Always on", tone: .cascadeGood)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Power harness").font(.cascadeSans(15, .semibold))
+                        Text("run_command · run_applescript · write_file — the agent can run shell commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Every call lands verbatim in the audit log, destructive commands (sudo, rm -rf /, …) are refused, and Esc stops it mid-run.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $model.powerHarnessEnabled)
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                if model.powerHarnessEnabled {
+                    HStack(spacing: CascadeMetrics.s2) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 11)).foregroundStyle(Color.cascadeText3)
+                        Text("AppleScript drives other apps via Automation: macOS asks once per app the first time a script touches it (System Settings → Privacy & Security → Automation).")
+                            .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
+                    }
                 }
             }
         }

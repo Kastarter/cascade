@@ -182,6 +182,51 @@ public enum ScreenCaptureUtility {
         Task { @MainActor in _ = try? await shareableContent() }
     }
 
+    /// The focused window of `pid` as a normalized (top-left origin, [0,1]) rect
+    /// on the cursor display — the crop the native-resolution OCR pass needs.
+    /// Returns nil when the window is unavailable or not on the cursor display.
+    public static func focusedWindowNormalizedRect(pid: pid_t) -> CGRect? {
+        guard AXIsProcessTrusted() else { return nil }
+        let appRef = AXUIElementCreateApplication(pid)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+              let focusedRef else { return nil }
+        let window = focusedRef as! AXUIElement
+
+        var positionRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let positionRef, let sizeRef else { return nil }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size),
+              size.width > 1, size.height > 1 else { return nil }
+
+        // AX coordinates are global top-left; CGDisplayBounds matches that space.
+        let mouse = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main,
+              let displayID = screen.displayID else { return nil }
+        let displayBounds = CGDisplayBounds(displayID)
+        let windowRect = CGRect(origin: origin, size: size).intersection(displayBounds)
+        guard !windowRect.isEmpty else { return nil }
+        return CGRect(
+            x: (windowRect.minX - displayBounds.minX) / displayBounds.width,
+            y: (windowRect.minY - displayBounds.minY) / displayBounds.height,
+            width: windowRect.width / displayBounds.width,
+            height: windowRect.height / displayBounds.height
+        )
+    }
+
+    /// The display the cursor is on right now — lets the rewind recorder notice
+    /// the user moved to another monitor and follow them there.
+    public static func currentCursorDisplayID() async -> CGDirectDisplayID? {
+        guard CGPreflightScreenCaptureAccess() else { return nil }
+        guard let content = try? await shareableContent() else { return nil }
+        return cursorDisplay(in: content)?.displayID
+    }
+
     /// Builds a continuous `SCStream` over the cursor display for the always-on
     /// recorder, reusing the same cursor-display selection, own-window exclusion,
     /// and 1920 long-side cap as the single-frame path. Frames arrive on
@@ -194,7 +239,7 @@ public enum ScreenCaptureUtility {
         output: SCStreamOutput & SCStreamDelegate,
         sampleHandlerQueue: DispatchQueue,
         fps: Int32 = 1
-    ) async throws -> SCStream? {
+    ) async throws -> (stream: SCStream, displayID: CGDirectDisplayID)? {
         guard CGPreflightScreenCaptureAccess() else {
             logger.info("Rewind stream skipped — Screen Recording not granted (fail-closed).")
             return nil
@@ -218,7 +263,7 @@ public enum ScreenCaptureUtility {
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
         try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleHandlerQueue)
-        return stream
+        return (stream, display.displayID)
     }
 
     private static func capture(includeImage: Bool, includeOCR: Bool = true) async throws -> ScreenContextSample? {
