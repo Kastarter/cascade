@@ -25,6 +25,10 @@ func denyListBlocksDestructiveShapes() {
         "shutdown -h now",
         "security find-generic-password -s com.humain.cascade",
         ":(){ :|:& };:",
+        "cat ~/.ssh/id_rsa",
+        "cat .aws/credentials",
+        "plutil -p ~/Library/Keychains/login.keychain-db",
+        "grep password ~/Documents/notes.txt",
     ]
     for command in blocked {
         #expect(AgentHarness.denialReason(for: command) != nil, "should refuse: \(command)")
@@ -111,6 +115,27 @@ func readFileRefusesSensitiveContent() async throws {
     let result = await AgentHarness.perform(.readFile(path: dir + "/secrets.txt"), powerEnabled: false)
     #expect(result.contains("privacy"))
     #expect(!result.contains("hunter2"))
+}
+
+@Test
+func directToolsRefuseProtectedCredentialPaths() async throws {
+    let dir = try tempDir()
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    try FileManager.default.createDirectory(atPath: dir + "/.ssh", withIntermediateDirectories: true)
+    try "PRIVATE KEY".write(toFile: dir + "/.ssh/id_rsa", atomically: true, encoding: .utf8)
+    try "normal".write(toFile: dir + "/readme.txt", atomically: true, encoding: .utf8)
+
+    let listing = await AgentHarness.perform(.listFolder(path: dir), powerEnabled: false)
+    #expect(listing.contains("readme.txt"))
+    #expect(!listing.contains(".ssh"))
+
+    let refusedRead = await AgentHarness.perform(.readFile(path: dir + "/.ssh/id_rsa"), powerEnabled: false)
+    #expect(refusedRead.contains("protected local credential"))
+
+    let refusedWrite = await AgentHarness.perform(
+        .writeFile(path: dir + "/.ssh/config", content: "Host *"), powerEnabled: true
+    )
+    #expect(refusedWrite.contains("protected local credential"))
 }
 
 @Test

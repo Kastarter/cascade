@@ -109,7 +109,11 @@ public enum AgentHarness {
     private static func searchFiles(query: String, folder: String?) async -> String {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "search_files needs a query." }
+        guard !PrivacyRules.isSensitiveText(trimmed) else {
+            return privacyRefusal("search query")
+        }
         let scope = expand(folder?.isEmpty == false ? folder! : NSHomeDirectory())
+        if let reason = sensitivePathReason(scope) { return reason }
         // Plain mdfind matches content + metadata; if nothing hits, retry as a
         // filename-only search — "find my resume" usually means the file name.
         var result = await run("/usr/bin/mdfind", ["-onlyin", scope, trimmed], timeout: 10)
@@ -117,15 +121,20 @@ public enum AgentHarness {
             result = await run("/usr/bin/mdfind", ["-onlyin", scope, "-name", trimmed], timeout: 10)
         }
         let paths = result.output.split(separator: "\n").map(String.init)
+        let visible = paths.filter { sensitivePathReason($0) == nil }
         guard !paths.isEmpty else { return "No files matched “\(trimmed)” under \(scope)." }
-        let shown = paths.prefix(40)
+        guard !visible.isEmpty else {
+            return "Matches were only in privacy-protected locations, so their paths stay local."
+        }
+        let shown = visible.prefix(40)
         var text = shown.joined(separator: "\n")
-        if paths.count > shown.count { text += "\n…and \(paths.count - shown.count) more." }
+        if visible.count > shown.count { text += "\n…and \(visible.count - shown.count) more." }
         return text
     }
 
     private static func listFolder(path: String) -> String {
         let expanded = expand(path)
+        if let reason = sensitivePathReason(expanded) { return reason }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory) else {
             return "No such folder: \(expanded)"
@@ -135,6 +144,10 @@ public enum AgentHarness {
             return "Couldn't list \(expanded) (no permission?)."
         }
         let entries = names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .filter { name in
+                let full = (expanded as NSString).appendingPathComponent(name)
+                return sensitivePathReason(full) == nil
+            }
             .map { name -> String in
                 var isDir: ObjCBool = false
                 let full = (expanded as NSString).appendingPathComponent(name)
@@ -155,6 +168,7 @@ public enum AgentHarness {
 
     private static func readFile(path: String) -> String {
         let expanded = expand(path)
+        if let reason = sensitivePathReason(expanded) { return reason }
         guard FileManager.default.fileExists(atPath: expanded) else { return "No such file: \(expanded)" }
         guard let data = FileManager.default.contents(atPath: expanded) else {
             return "Couldn't read \(expanded) (no permission?)."
@@ -163,8 +177,7 @@ public enum AgentHarness {
             return "\(expanded) is binary (\(data.count) bytes) — read_file only reads text."
         }
         if PrivacyRules.isSensitiveText(expanded) || PrivacyRules.isSensitiveText(text) {
-            return "That file matches the user's privacy exclusions — its content stays local. "
-                + "Tell the user why if they asked for it directly."
+            return privacyRefusal("file")
         }
         if text.count > readCap {
             return String(text.prefix(readCap)) + "\n…[truncated — \(data.count) bytes total]"
@@ -196,6 +209,12 @@ public enum AgentHarness {
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+        if PrivacyRules.isSensitiveText(normalized) {
+            return privacyRefusal("command")
+        }
+        if commandMentionsProtectedPath(normalized) {
+            return "That command references a protected local credential or Cascade data path, so it will not run."
+        }
         for pattern in denyPatterns where normalized.range(of: pattern, options: .regularExpression) != nil {
             return "That command matches Cascade's destructive-command deny-list and will not run. "
                 + "Pick a narrower, non-destructive command, or do it on screen where the user can watch."
@@ -233,6 +252,7 @@ public enum AgentHarness {
     /// into system paths.
     private static func writeFile(path: String, content: String) -> String {
         let expanded = expand(path)
+        if let reason = sensitivePathReason(expanded) { return reason }
         let allowedRoots = [NSHomeDirectory(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"]
         guard allowedRoots.contains(where: { expanded.hasPrefix($0 + "/") }) else {
             return "write_file only writes inside the user's home folder or temp dirs — not \(expanded)."
@@ -250,7 +270,57 @@ public enum AgentHarness {
     // MARK: - Plumbing
 
     private static func expand(_ path: String) -> String {
-        (path as NSString).expandingTildeInPath
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+    }
+
+    private static let protectedPathComponents: Set<String> = [
+        ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker"
+    ]
+
+    private static let protectedSubpaths = [
+        "/library/keychains/",
+        "/library/application support/cascade/",
+        "/library/application support/com.humain.cascade/",
+    ]
+
+    private static let protectedCommandFragments = [
+        "~/.ssh", "$home/.ssh", ".ssh/",
+        "~/.gnupg", "$home/.gnupg", ".gnupg/",
+        "~/.aws", "$home/.aws", ".aws/",
+        "~/.azure", "$home/.azure", ".azure/",
+        "~/.gcloud", "$home/.gcloud", ".gcloud/",
+        "~/.kube", "$home/.kube", ".kube/",
+        "~/.docker", "$home/.docker", ".docker/",
+        "library/keychains",
+        "application support/cascade",
+        "application support/com.humain.cascade",
+    ]
+
+    private static func sensitivePathReason(_ path: String) -> String? {
+        let expanded = expand(path)
+        if PrivacyRules.isSensitiveText(expanded) {
+            return privacyRefusal("path")
+        }
+        let components = URL(fileURLWithPath: expanded).standardizedFileURL.pathComponents
+            .map { $0.lowercased() }
+        if components.contains(where: { protectedPathComponents.contains($0) }) {
+            return "That path is in a protected local credential directory, so it stays local."
+        }
+        let lower = expanded.lowercased()
+        let slashTerminated = lower.hasSuffix("/") ? lower : lower + "/"
+        if protectedSubpaths.contains(where: { slashTerminated.contains($0) }) {
+            return "That path is in protected local application data, so it stays local."
+        }
+        return nil
+    }
+
+    private static func commandMentionsProtectedPath(_ command: String) -> Bool {
+        protectedCommandFragments.contains { command.contains($0) }
+    }
+
+    private static func privacyRefusal(_ noun: String) -> String {
+        "That \(noun) matches the user's privacy exclusions — its content stays local. "
+            + "Tell the user why if they asked for it directly."
     }
 
     private static func capped(_ text: String) -> String {
