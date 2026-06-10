@@ -2,8 +2,10 @@ import AppKit
 import SwiftUI
 
 // Transparent, click-through, always-on-top companion cursor. The follow-the-user-
-// cursor behaviour + blue-cursor idea are adapted from `jasonkneen/openclicky`
-// (`OverlayWindow.swift` / `BlueCursorView`, MIT) — re-implemented as a small
+// cursor behaviour + guide-cursor idea are adapted from `jasonkneen/openclicky`
+// (`OverlayWindow.swift` / `BlueCursorView`, MIT); the pointer silhouette and the
+// green mint-glow styling are adapted from `milind-soni/tiptour-macos`
+// (`OverlayWindow.swift` / `CursorArrowShape`, MIT) — re-implemented as a small
 // Cascade-owned companion that sits next to the user's cursor and flies to the
 // element they ask about. See docs/THIRD_PARTY_NOTICES.md.
 
@@ -74,7 +76,7 @@ public final class GuidanceOverlayController {
         returnTask = nil
         state.label = ""
         state.pointing = true
-        // Quick, snappy flight — the blue cursor should arrive fast, not amble.
+        // Quick, snappy flight — the guide cursor should arrive fast, not amble.
         moveCursor(to: point, response: 0.18)
     }
 
@@ -233,7 +235,7 @@ final class GuidanceState: ObservableObject {
 }
 
 /// A non-activating floating panel — unlike a plain NSWindow, this reliably draws
-/// over *another* app's native full-screen Space (where the blue cursor was
+/// over *another* app's native full-screen Space (where the guide cursor was
 /// vanishing) without ever stealing focus.
 final class GuidanceOverlayWindow: NSPanel {
     init(frame: CGRect) {
@@ -260,7 +262,7 @@ struct GuidanceOverlayView: View {
     @ObservedObject var state: GuidanceState
     let screenFrame: CGRect
     @State private var trail = CursorTrailStore()
-    private let blue = Color(red: 0.20, green: 0.55, blue: 1.0)
+    private let green = Color(red: 0.31, green: 0.85, blue: 0.63)
 
     /// Global companion point mapped into this window's local (top-left) space, or
     /// nil when the companion is on a different screen.
@@ -294,9 +296,9 @@ struct GuidanceOverlayView: View {
             }
             // Glowing comet-streak behind the companion during a flight. Sits below
             // the cursor and fades on its own once the cursor stops moving.
-            CursorTrailView(store: trail, color: blue)
+            CursorTrailView(store: trail, color: green)
             if let point = localPoint {
-                PressRipple(trigger: state.pressTrigger, color: blue)
+                PressRipple(trigger: state.pressTrigger, color: green)
                     .offset(x: point.x - 17, y: point.y - 17)
                 GuideCursor(label: state.pointing ? state.label : "", pointing: state.pointing, pressTrigger: state.pressTrigger)
                     .offset(x: point.x, y: point.y)
@@ -512,10 +514,11 @@ private struct PressRipple: View {
     }
 }
 
-/// Blue arrow cursor sized to match the system cursor (tip at the top-left origin).
-/// Built from stacked layers — a soft halo, a tighter inner glow, a gradient core,
-/// and a crisp white edge — so it reads as a luminous glyph rather than a flat
-/// fill. It breathes gently while parked pointing at something and pulses on press.
+/// Green guide cursor in TipTour's style: the Lucide "mouse-pointer-2" glyph drawn
+/// as a white arrow with a green edge, sitting inside a soft seafoam halo. Built
+/// from stacked layers — wide halo → soft glow → white core → green stroke — so it
+/// reads as a luminous glyph rather than a flat fill. It breathes gently while
+/// parked pointing at something and pulses on press.
 struct GuideCursor: View {
     let label: String
     var pointing: Bool = false
@@ -523,26 +526,46 @@ struct GuideCursor: View {
     @State private var pressed = false
     @State private var breathing = false
 
-    private let core = Color(red: 0.20, green: 0.55, blue: 1.0)
-    private let coreLight = Color(red: 0.58, green: 0.80, blue: 1.0)
-    private let glow = Color(red: 0.26, green: 0.62, blue: 1.0)
+    private let green = Color(red: 0.31, green: 0.85, blue: 0.63)
+    private let mint = Color(red: 0.62, green: 0.93, blue: 0.80)
+    private let glyphSize: CGFloat = 24
+    /// The glyph's tip sits ~4.2/24 into its viewbox; pull it back so the tip lands
+    /// on the companion's anchor point (this view's top-leading corner), matching
+    /// where the press ripple centres and where flights aim.
+    private var tipInset: CGFloat { glyphSize * 4.2 / 24 }
 
-    /// The layered glyph: halo → inner glow → gradient core → white edge.
+    /// The layered glyph: seafoam halo → soft green glow → white core → green edge.
     private var arrow: some View {
         ZStack {
-            ArrowShape().fill(glow)
-                .blur(radius: 10)
-                .opacity(breathing ? 0.66 : 0.46)
-            ArrowShape().fill(glow)
+            PointerShape().fill(green)
+                .blur(radius: 9)
+                .opacity(breathing ? 0.72 : 0.50)
+            PointerShape().fill(green)
                 .blur(radius: 3)
-                .opacity(0.55)
-            ArrowShape().fill(
-                LinearGradient(colors: [coreLight, core], startPoint: .topLeading, endPoint: .bottomTrailing)
+                .opacity(0.45)
+            PointerShape().fill(.white)
+            PointerShape().stroke(
+                green,
+                style: StrokeStyle(lineWidth: 2.0, lineCap: .round, lineJoin: .round)
             )
-            ArrowShape().stroke(.white, lineWidth: 1.1)
         }
-        .frame(width: 12, height: 16)
-        .shadow(color: .black.opacity(0.28), radius: 2, y: 1)
+        .frame(width: glyphSize, height: glyphSize)
+        .background(halo)
+        .offset(x: -tipInset, y: -tipInset)
+        .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+    }
+
+    /// The big soft seafoam spotlight behind the arrow — the README-glow look.
+    /// A background, so it never affects layout or the tip's anchor.
+    private var halo: some View {
+        Circle()
+            .fill(
+                RadialGradient(
+                    colors: [mint.opacity(breathing ? 0.40 : 0.28), mint.opacity(0)],
+                    center: .center, startRadius: 0, endRadius: 46
+                )
+            )
+            .frame(width: 92, height: 92)
     }
 
     var body: some View {
@@ -567,16 +590,12 @@ struct GuideCursor: View {
             if !label.isEmpty {
                 Text(label)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10)
+                    .foregroundStyle(mint)
+                    .padding(.horizontal, 12)
                     .padding(.vertical, 6)
-                    .background(
-                        LinearGradient(colors: [Color(red: 0.30, green: 0.61, blue: 1.0), core],
-                                       startPoint: .top, endPoint: .bottom),
-                        in: Capsule()
-                    )
-                    .overlay(Capsule().stroke(.white.opacity(0.4), lineWidth: 1))
-                    .shadow(color: glow.opacity(0.5), radius: 9)
+                    .background(.black.opacity(0.55), in: Capsule())
+                    .overlay(Capsule().stroke(green.opacity(0.8), lineWidth: 1.2))
+                    .shadow(color: green.opacity(0.4), radius: 9)
                     .shadow(color: .black.opacity(0.28), radius: 5, y: 2)
                     .fixedSize()
                     .transition(.scale(scale: 0.7).combined(with: .opacity))
@@ -586,18 +605,29 @@ struct GuideCursor: View {
     }
 }
 
-/// Arrowhead with its tip at the top-left origin (0,0), like the macOS cursor.
-private struct ArrowShape: Shape {
+/// Lucide "mouse-pointer-2" silhouette, ported from `milind-soni/tiptour-macos`
+/// (`OverlayWindow.swift` / `CursorArrowShape`, MIT). Tip points up-left, at
+/// roughly (4.2, 4.2) of its 24-point viewbox.
+private struct PointerShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        let w = rect.width, h = rect.height
-        path.move(to: CGPoint(x: 0, y: 0))
-        path.addLine(to: CGPoint(x: 0, y: h))
-        path.addLine(to: CGPoint(x: w * 0.30, y: h * 0.74))
-        path.addLine(to: CGPoint(x: w * 0.50, y: h * 1.04))
-        path.addLine(to: CGPoint(x: w * 0.70, y: h * 0.94))
-        path.addLine(to: CGPoint(x: w * 0.48, y: h * 0.64))
-        path.addLine(to: CGPoint(x: w, y: h * 0.5))
+        let viewBoxSize: CGFloat = 24
+        let scale = min(rect.width, rect.height) / viewBoxSize
+        let originX = rect.midX - (viewBoxSize * scale / 2)
+        let originY = rect.midY - (viewBoxSize * scale / 2)
+
+        func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: originX + x * scale, y: originY + y * scale)
+        }
+
+        path.move(to: point(4.037, 4.688))
+        path.addQuadCurve(to: point(4.688, 4.037), control: point(3.90, 3.90))
+        path.addLine(to: point(20.688, 10.537))
+        path.addQuadCurve(to: point(20.625, 11.484), control: point(21.42, 10.84))
+        path.addLine(to: point(14.501, 13.064))
+        path.addQuadCurve(to: point(13.063, 14.499), control: point(13.43, 13.34))
+        path.addLine(to: point(11.484, 20.625))
+        path.addQuadCurve(to: point(10.537, 20.688), control: point(11.17, 21.42))
         path.closeSubpath()
         return path
     }

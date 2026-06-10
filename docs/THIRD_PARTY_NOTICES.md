@@ -33,4 +33,10 @@ When source is copied or substantially adapted, add the original repository, fil
   patterns informed Cascade's agent/teaching runtime in `Sources/AppShell` and
   `Sources/AgentOrchestrator`.
 
+- `milind-soni/tiptour-macos` (MIT) — `TipTour/UI/OverlayWindow.swift`
+  (`CursorArrowShape`, the Lucide mouse-pointer-2 port) → `PointerShape` in
+  `Sources/ComputerUseKit/GuidanceOverlay.swift`. Path geometry copied; the
+  green mint-glow cursor styling (white core, green edge, seafoam halo) is
+  adapted from the TipTour companion's look.
+
 Do not copy TipTour Neko sprite assets unless their separate BSD 2-Clause license is included and the product actually needs them.

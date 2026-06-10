@@ -78,6 +78,11 @@ struct CascadeNativeApp: App {
                     model.value.recorder.status.running ? model.value.pauseRecording() : model.value.startRecording()
                 }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+                Divider()
+                Button("Toggle Full Screen") {
+                    NSApp.windows.first(where: { $0.canBecomeMain })?.toggleFullScreen(nil)
+                }
+                .keyboardShortcut("f", modifiers: [.control, .command])
             }
         }
     }

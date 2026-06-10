@@ -157,10 +157,14 @@ public struct CascadeRootView: View {
             Color.cascadeBG.ignoresSafeArea()
             VStack(spacing: 0) {
                 CascadeTopBar(model: model)
-                switch model.selectedTab {
-                case .reel: ReelScreen(model: model)
-                case .cascades: CascadesScreen(model: model)
-                case .manager: ManagerScreen(model: model)
+                if model.showSettings {
+                    SettingsScreen(model: model)
+                } else {
+                    switch model.selectedTab {
+                    case .reel: ReelScreen(model: model)
+                    case .cascades: CascadesScreen(model: model)
+                    case .manager: ManagerScreen(model: model)
+                    }
                 }
             }
             if model.dock.visible {
@@ -173,7 +177,6 @@ public struct CascadeRootView: View {
         .frame(minWidth: 1040, minHeight: 720)
         .preferredColorScheme(model.prefersDark ? .dark : .light)
         .animation(.easeOut(duration: 0.18), value: model.dock.visible)
-        .sheet(isPresented: $model.showSettings) { SettingsSheet(model: model) }
     }
 }
 
@@ -181,12 +184,12 @@ public struct CascadeRootView: View {
 
 private struct CascadeTopBar: View {
     @ObservedObject var model: CascadeAppModel
+    @State private var isFullScreen = false
 
     var body: some View {
         // Status pills (REC · LOCAL, Listening) live in the floating notch HUD at the
-        // top-center of the screen; the in-app bar keeps the brand + tabs on the left
-        // and the settings/theme quick controls on the right, leaving the center clear
-        // for the notch.
+        // top-center of the screen; the in-app bar keeps the brand on the left, the
+        // tab switcher dead-center, and the quick controls on the right.
         HStack(spacing: CascadeMetrics.s4) {
             HStack(spacing: CascadeMetrics.s2) {
                 Image(nsImage: NSImage(named: "cascadeTemplate") ?? NSImage())
@@ -196,50 +199,79 @@ private struct CascadeTopBar: View {
                 Text("Cascade").font(.cascadeSerif(20))
             }
 
-            HStack(spacing: 2) {
-                ForEach(CascadeAppModel.Tab.allCases) { tab in
-                    let active = model.selectedTab == tab
-                    Button { model.selectedTab = tab } label: {
-                        Text(tab.rawValue)
-                            .font(.cascadeSans(13, active ? .semibold : .medium))
-                            .foregroundStyle(active ? Color.cascadeText : Color.cascadeText2)
-                            .padding(.horizontal, CascadeMetrics.s3 + 2)
-                            .padding(.vertical, CascadeMetrics.s2 - 1)
-                            .background(active ? Color.cascadePanel3 : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(3)
-            .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
-
             Spacer()
 
             HStack(spacing: CascadeMetrics.s2) {
+                quickControl(
+                    icon: "arrow.up.left.and.arrow.down.right",
+                    help: "Toggle fullscreen (⌃⌘F)"
+                ) { toggleFullScreen() }
                 quickControl(
                     icon: model.prefersDark ? "sun.max" : "moon",
                     help: "Toggle light / dark"
                 ) { model.toggleTheme() }
                 quickControl(
                     icon: "gearshape",
-                    help: "Settings — access & Claude key"
-                ) { model.showSettings = true }
+                    help: "Settings — hotkeys, access & model keys",
+                    active: model.showSettings
+                ) { model.showSettings.toggle() }
             }
         }
+        .overlay(tabSwitcher)
         .padding(.horizontal, CascadeMetrics.s5)
         .padding(.vertical, CascadeMetrics.s3)
+        // In fullscreen the menu bar hides and the notch HUD hangs over the top
+        // edge of the window — right where the centered tabs sit. Drop the bar
+        // below it so the HUD gets its own strip instead of covering the tabs.
+        .padding(.top, isFullScreen ? 30 : 0)
         .overlay(Rectangle().fill(Color.cascadeBorder).frame(height: 1), alignment: .bottom)
+        .onAppear {
+            isFullScreen = NSApp.windows.contains { $0.styleMask.contains(.fullScreen) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            isFullScreen = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            isFullScreen = false
+        }
     }
 
-    private func quickControl(icon: String, help: String, action: @escaping () -> Void) -> some View {
+    /// Centered between the brand and the quick controls, independent of either side's width.
+    private var tabSwitcher: some View {
+        HStack(spacing: 2) {
+            ForEach(CascadeAppModel.Tab.allCases) { tab in
+                let active = model.selectedTab == tab && !model.showSettings
+                Button {
+                    model.selectedTab = tab
+                    model.showSettings = false
+                } label: {
+                    Text(tab.rawValue)
+                        .font(.cascadeSans(13, active ? .semibold : .medium))
+                        .foregroundStyle(active ? Color.cascadeText : Color.cascadeText2)
+                        .padding(.horizontal, CascadeMetrics.s3 + 2)
+                        .padding(.vertical, CascadeMetrics.s2 - 1)
+                        .background(active ? Color.cascadePanel3 : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
+
+    private func toggleFullScreen() {
+        NSApp.windows.first(where: { $0.canBecomeMain })?.toggleFullScreen(nil)
+    }
+
+    private func quickControl(icon: String, help: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.cascadeText2)
+                .foregroundStyle(active ? Color.cascadeText : Color.cascadeText2)
                 .frame(width: 30, height: 30)
-                .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                .background(active ? Color.cascadePanel3 : Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(active ? Color.cascadeBorderHi : Color.cascadeBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .help(help)
@@ -276,7 +308,8 @@ private struct ReelScreen: View {
         HStack(alignment: .top, spacing: 0) {
             main
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(CascadeMetrics.s8)
+                .padding(.horizontal, CascadeMetrics.s5)
+                .padding(.vertical, CascadeMetrics.s4)
             AskPanel(model: model, selected: selected, draft: $draft)
                 .frame(width: 360)
         }
@@ -316,7 +349,7 @@ private struct ReelScreen: View {
     }
 
     private var main: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s5) {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
             searchField
             metaRow
             Text(headline)
@@ -324,7 +357,7 @@ private struct ReelScreen: View {
                 .italic()
                 .frame(maxWidth: .infinity, alignment: .center)
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, CascadeMetrics.s6)
+                .padding(.horizontal, CascadeMetrics.s4)
             SceneCard(context: selected)
             TransportBar(
                 isPlaying: $isPlaying,
@@ -475,7 +508,6 @@ private struct SceneCard: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(CascadeMetrics.s2)
         } else if let context {
             VStack(spacing: CascadeMetrics.s3) {
                 if let icon = AppVisuals.icon(forBundle: context.bundleIdentifier) {
@@ -552,18 +584,25 @@ private struct TransportBar: View {
                 ghostButton("chevron.right", action: onNewer, enabled: hasMoments)
             }
             Rectangle().fill(Color.cascadeBorder).frame(width: 1, height: 26)
+            // Live: one clock + the LIVE pill (current == latest, no point showing
+            // both). Scrubbed: "current / latest". Everything here is fixed-size so
+            // a narrow window can never squeeze the text into a vertical wrap.
             HStack(alignment: .firstTextBaseline, spacing: CascadeMetrics.s2) {
                 Text(current.map(ReelScreen.clock) ?? "—")
                     .font(.cascadeMono(20, .medium))
                     .lineLimit(1)
                     .fixedSize()
-                Text("/ \(latest.map(ReelScreen.clock) ?? "—")")
-                    .font(.cascadeMono(12))
-                    .foregroundStyle(Color.cascadeText3)
-                    .lineLimit(1)
-                    .fixedSize()
-                if isLive { livePill }
+                if isLive {
+                    livePill
+                } else {
+                    Text("/ \(latest.map(ReelScreen.clock) ?? "—")")
+                        .font(.cascadeMono(12))
+                        .foregroundStyle(Color.cascadeText3)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
             }
+            .layoutPriority(1)
             Spacer(minLength: CascadeMetrics.s2)
             speedControls
         }
@@ -603,7 +642,9 @@ private struct TransportBar: View {
                 .font(.cascadeMono(10, .semibold))
                 .tracking(0.6)
                 .foregroundStyle(Color.cascadeAccent)
+                .lineLimit(1)
         }
+        .fixedSize()
         .padding(.horizontal, CascadeMetrics.s2)
         .padding(.vertical, 4)
         .background(Color.cascadeAccent.opacity(0.12), in: Capsule())
@@ -617,6 +658,8 @@ private struct TransportBar: View {
                     Text(speedLabel(value))
                         .font(.cascadeMono(12, speed == value ? .semibold : .regular))
                         .foregroundStyle(speed == value ? Color.cascadeText : Color.cascadeText3)
+                        .lineLimit(1)
+                        .fixedSize()
                         .padding(.horizontal, CascadeMetrics.s2)
                         .padding(.vertical, 5)
                         .background(
@@ -918,7 +961,10 @@ private struct CascadesScreen: View {
                 )
                 activitySection
             }
-            .padding(CascadeMetrics.s8)
+            .padding(.horizontal, CascadeMetrics.s6)
+            .padding(.vertical, CascadeMetrics.s6)
+            .frame(maxWidth: 960, alignment: .leading)
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -1138,7 +1184,10 @@ private struct ManagerScreen: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(CascadeMetrics.s8)
+            .padding(.horizontal, CascadeMetrics.s6)
+            .padding(.vertical, CascadeMetrics.s6)
+            .frame(maxWidth: 960, alignment: .leading)
+            .frame(maxWidth: .infinity)
         }
     }
 }
@@ -1299,49 +1348,143 @@ private struct ControlDockView: View {
     }
 }
 
-// MARK: - Settings sheet
+// MARK: - Settings page
 
-private struct SettingsSheet: View {
+private struct SettingsScreen: View {
     @ObservedObject var model: CascadeAppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s5) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    CascadeTag("Settings", tone: .cascadeAccentWarm)
-                    Text("Local trust controls").font(.cascadeSerif(26))
+        ScrollView {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
+                header
+                section("KEYBOARD SHORTCUTS", trailing: "work app-wide") {
+                    HotkeysCard()
                 }
-                Spacer()
-                Button("Done") { model.showSettings = false }.buttonStyle(CascadeAccentButtonStyle())
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
-                    CascadePanel {
-                        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-                            PermissionRow(name: "Screen Recording", granted: model.recorder.status.permissions.screenRecording)
-                            PermissionRow(name: "Accessibility", granted: model.recorder.status.permissions.accessibility)
-                            PermissionRow(name: "Input Monitoring", granted: model.recorder.status.permissions.inputMonitoring)
-                            PermissionRow(name: "Use-device hotkey", granted: model.hotkey.running, detail: model.hotkey.label)
-                            Divider().overlay(Color.cascadeBorder)
-                            HStack {
-                                Button("Refresh") { model.refreshPermissionState() }.buttonStyle(CascadeQuietButtonStyle())
-                                Button("Request Screen") { model.requestScreenRecording() }.buttonStyle(CascadeQuietButtonStyle())
-                                Button("Request AX") { model.requestAccessibility() }.buttonStyle(CascadeQuietButtonStyle())
-                                Button("Request Input") { model.requestInputMonitoring() }.buttonStyle(CascadeQuietButtonStyle())
-                                Button("Open Settings") { model.openSystemSettings() }.buttonStyle(CascadeAccentButtonStyle())
-                            }
-                        }
-                    }
+                section("PERMISSIONS", trailing: "local capture & control") {
+                    permissionsCard
+                }
+                section("APP IDENTITY", trailing: "for granting permissions") {
                     DiagnosticsCard(diagnostics: model.permissionDiagnostics)
+                }
+                section("MODEL KEYS", trailing: "stored in macOS Keychain") {
                     ClaudeKeyCard(model: model)
                     OpenAIKeyCard(model: model)
                 }
             }
+            .padding(.horizontal, CascadeMetrics.s6)
+            .padding(.vertical, CascadeMetrics.s6)
+            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: .infinity)
         }
-        .padding(CascadeMetrics.s6)
-        .frame(width: 640, height: 620)
-        .background(Color.cascadeBG)
-        .preferredColorScheme(model.prefersDark ? .dark : .light)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s1) {
+                CascadeTag("Settings", tone: .cascadeAccentWarm)
+                Text("Local trust controls").font(.cascadeSerif(30))
+                Text("Hotkeys, permissions, and the keys Cascade uses. Everything stays on this Mac.")
+                    .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
+            }
+            Spacer()
+            Button {
+                model.showSettings = false
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.left").font(.system(size: 11, weight: .bold))
+                    Text("Back")
+                }
+            }
+            .buttonStyle(CascadeQuietButtonStyle())
+        }
+    }
+
+    private func section(_ title: String, trailing: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: title, trailing: trailing)
+            content()
+        }
+    }
+
+    private var permissionsCard: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                PermissionRow(name: "Screen Recording", granted: model.recorder.status.permissions.screenRecording)
+                PermissionRow(name: "Accessibility", granted: model.recorder.status.permissions.accessibility)
+                PermissionRow(name: "Input Monitoring", granted: model.recorder.status.permissions.inputMonitoring)
+                PermissionRow(name: "Use-device hotkey", granted: model.hotkey.running, detail: model.hotkey.label)
+                Divider().overlay(Color.cascadeBorder)
+                HStack {
+                    Button("Refresh") { model.refreshPermissionState() }.buttonStyle(CascadeQuietButtonStyle())
+                    Button("Request Screen") { model.requestScreenRecording() }.buttonStyle(CascadeQuietButtonStyle())
+                    Button("Request AX") { model.requestAccessibility() }.buttonStyle(CascadeQuietButtonStyle())
+                    Button("Request Input") { model.requestInputMonitoring() }.buttonStyle(CascadeQuietButtonStyle())
+                    Button("Open Settings") { model.openSystemSettings() }.buttonStyle(CascadeAccentButtonStyle())
+                }
+            }
+        }
+    }
+}
+
+/// Every way to summon Cascade from the keyboard, in one place.
+private struct HotkeysCard: View {
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HotkeyRow(
+                    keys: ["hold right ⌘"],
+                    name: "Talk to Cascade",
+                    detail: "Push-to-talk: hold, speak, release. Ask the rewind or point Cascade at something on screen."
+                )
+                HotkeyRow(
+                    keys: ["⇧", "⌘", "R"],
+                    name: "Capture this moment",
+                    detail: "Snapshots the current screen straight into the Reel."
+                )
+                HotkeyRow(
+                    keys: ["⇧", "⌘", "L"],
+                    name: "Start / pause recording",
+                    detail: "Toggles the always-on local capture."
+                )
+                HotkeyRow(
+                    keys: ["⌃", "⌘", "F"],
+                    name: "Toggle fullscreen",
+                    detail: "Expands Cascade to take over the screen; same key brings it back."
+                )
+                HotkeyRow(
+                    keys: ["Esc"],
+                    name: "Stop the running agent",
+                    detail: "Immediately halts a deployed cascade mid-run."
+                )
+            }
+        }
+    }
+}
+
+private struct HotkeyRow: View {
+    let keys: [String]
+    let name: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: CascadeMetrics.s4) {
+            HStack(spacing: CascadeMetrics.s1) {
+                ForEach(keys, id: \.self) { key in
+                    Text(key)
+                        .font(.cascadeMono(12, .semibold))
+                        .padding(.horizontal, CascadeMetrics.s2)
+                        .padding(.vertical, CascadeMetrics.s1)
+                        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Color.cascadeBorderHi, lineWidth: 1))
+                }
+            }
+            .frame(width: 150, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(.cascadeSans(13, .semibold))
+                Text(detail).font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+            }
+            Spacer()
+        }
     }
 }
 
