@@ -2,7 +2,9 @@ import AppKit
 import WebKit
 
 /// An isolated, off-to-the-side web environment the background agent works inside —
-/// its own ephemeral cookie/storage jar, never touching the user's real screen.
+/// never touching the user's real screen. It deliberately uses the DEFAULT (persistent)
+/// website data store so the agent reuses the user's existing sign-in sessions —
+/// the NEEDS_LOGIN pause exists for the sites where that isn't enough.
 /// Vision comes from `WKWebView.takeSnapshot` (like the old Rust Local Sandbox); the
 /// agent acts by injecting JavaScript (click at a point, type, scroll, navigate).
 ///

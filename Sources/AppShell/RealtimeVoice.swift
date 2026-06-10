@@ -47,7 +47,7 @@ private final class ConverterInputState: @unchecked Sendable {
 /// Replaces the Apple Speech / AVSpeechSynthesizer voice with OpenAI **GPT-Realtime-2**:
 /// push-to-talk audio streams up as PCM16, the user's transcript comes back and is handed
 /// to Claude (`onUtterance`), and Claude's reply is spoken by the realtime voice. Same
-/// public surface as the old `VoiceListener`, so it drops straight into the app model.
+/// small idle/listening/working surface the app model expects.
 @MainActor
 public final class RealtimeVoice: ObservableObject {
     public enum VoiceState: Equatable { case idle, listening, working }

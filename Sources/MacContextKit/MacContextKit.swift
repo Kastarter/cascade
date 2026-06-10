@@ -287,6 +287,16 @@ public final class ContextRecorder: ObservableObject {
     @discardableResult
     public func captureNow() async -> RecordedContext? {
         let snapshot = observer.refresh()
+        // Same privacy boundary as the continuous recorder — the one-shot path
+        // must not store what the rewind would refuse. Pre-OCR gate on app/window…
+        guard !PrivacyRules.isSensitive(
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle
+        ) else {
+            status.message = "Skipped a sensitive moment."
+            return nil
+        }
         let canCaptureScreen = status.permissions.canRecordContext
         var ocrText: String?
         var imagePath: String?
@@ -312,6 +322,13 @@ public final class ContextRecorder: ObservableObject {
             imagePath: imagePath,
             metadataJSON: metadata
         )
+        // …and the full gate once OCR text exists: a sensitive frame is deleted,
+        // never stored.
+        if PrivacyRules.isSensitive(context) {
+            if let imagePath { try? FileManager.default.removeItem(atPath: imagePath) }
+            status.message = "Skipped a sensitive moment."
+            return nil
+        }
         do {
             let inserted = try await store.insert(context)
             let detail = ocrText.map { "\(inserted.appName) · ocr \($0.count) chars" } ?? inserted.appName

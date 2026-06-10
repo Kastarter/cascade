@@ -105,18 +105,49 @@ public actor LocalMacDriver: AgentDriver {
             try await actuator.perform(computerUseAction)
             _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "computer.act", detail: "\(computerUseAction)"))
         case .writeLocalArtifact(let title, let body):
-            _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "artifact.write.preview", detail: "\(title): \(body.prefix(120))"))
+            let url = try Self.writeArtifact(title: title, body: body)
+            _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "artifact.write", detail: "\(title) → \(url.path)"))
         }
     }
 
+    /// Writes an agent-produced artifact as Markdown under
+    /// `Application Support/Cascade/Artifacts/`, slugged + timestamped so runs
+    /// never overwrite each other.
+    private static func writeArtifact(title: String, body: String) throws -> URL {
+        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let dir = base.appendingPathComponent("Cascade/Artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let slug = title.lowercased()
+            .map { $0.isLetter || $0.isNumber ? $0 : "-" }
+            .reduce(into: "") { result, char in
+                if char != "-" || result.last != "-" { result.append(char) }
+            }
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        // Timestamp + short random suffix — same-titled artifacts in the same
+        // second must not overwrite each other.
+        let stamp = Int(Date().timeIntervalSince1970)
+        let nonce = UUID().uuidString.prefix(8)
+        let url = dir.appendingPathComponent("\(slug.isEmpty ? "artifact" : String(slug.prefix(60)))-\(stamp)-\(nonce).md")
+        try "# \(title)\n\n\(body)\n".write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    /// Did acting visibly land? Passes only when the record shows FRESH context —
+    /// something was observed since the run started — not merely that a record
+    /// exists at all.
     public func verify(goal: String) async throws -> AgentVerification {
         let contexts = try await store.recentContexts(limit: 12)
+        guard let latest = contexts.first else {
+            return AgentVerification(passed: false, detail: "No context recorded — nothing to verify against.")
+        }
+        let age = Date().timeIntervalSince(latest.capturedAt)
+        let fresh = age < 60
         let appNames = Set(contexts.map(\.appName))
         return AgentVerification(
-            passed: !contexts.isEmpty,
-            detail: contexts.isEmpty
-                ? "No context available for verification."
-                : "Verified against \(contexts.count) recent context samples across \(appNames.count) apps for goal: \(goal)"
+            passed: fresh,
+            detail: fresh
+                ? "Fresh context \(Int(age))s ago in \(latest.appName) (\(contexts.count) samples, \(appNames.count) apps) for goal: \(goal)"
+                : "Stale record — latest context is \(Int(age))s old; the screen was not observed after acting on: \(goal)"
         )
     }
 

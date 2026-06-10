@@ -42,7 +42,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public var prefersDark = true
     @Published public private(set) var dismissedSuggestions: Set<UUID> = []
     @Published private var dismissedWasteSignatures: Set<String> = []
-    @Published public private(set) var managerCascades: [AgentSuggestion] = []
+    @Published public private(set) var managerCascades: [ManagerCascade] = []
     @Published public private(set) var contexts: [RecordedContext] = []
     @Published public private(set) var searchResults: [RecordedContext] = []
     @Published public private(set) var searchQuery: String = ""
@@ -188,6 +188,7 @@ public final class CascadeAppModel: ObservableObject {
             suggestions = try await orchestrator.suggestions()
             agents = try await orchestrator.agents()
             detectedWaste = try await orchestrator.detectedWaste()
+            managerCascades = try await store.managerCascades()
             statusLine = recorder.status.message
         } catch {
             statusLine = error.localizedDescription
@@ -243,13 +244,18 @@ public final class CascadeAppModel: ObservableObject {
         thinking = true
         Task {
             let result: String
+            var answered = true
             do {
                 result = Self.brief(try await orchestrator.ask(trimmed))
             } catch {
                 result = error.localizedDescription
+                answered = false
             }
             answer = result
             conversation.append(QATurn(question: trimmed, answer: result))
+            // One brain: the voice agent sees what was said in chat, and vice
+            // versa. Errors stay short-lived context, never archived.
+            assistMemory.remember(user: trimmed, assistant: result, ok: answered)
             thinking = false
         }
     }
@@ -281,16 +287,20 @@ public final class CascadeAppModel: ObservableObject {
                 screenshot: shot,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
-                displayHeightPoints: Int(screen.frame.height)
+                displayHeightPoints: Int(screen.frame.height),
+                conversation: assistMemory.historyForAPI()
             )
             if let local = guidance.point {
                 let global = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
                 guidanceOverlay.present(atGlobalPoint: global, label: "this one")
+                assistMemory.rememberPointed(label: q, globalPoint: global)
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "reel.point", detail: q))
             } else {
                 guidanceOverlay.hide()
             }
             conversation.append(QATurn(question: q, answer: Self.brief(guidance.speech)))
+            // One brain: chat pointing lands in the same memory the voice agent uses.
+            assistMemory.remember(user: q, assistant: Self.brief(guidance.speech), ok: guidance.point != nil)
         }
     }
 
@@ -332,69 +342,41 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Autonomously works toward `goal`: observe the screen → plan one step with
-    /// Claude → act (visibly moving the cursor) → repeat, until done, STOP, or the
-    /// step cap. No per-step approval — STOP is the take-control valve, the run is
-    /// capped, and every action is audited.
-    public func runAgent(goal: String) {
+    /// Autonomously works toward `goal` through the SAME episode pipeline as the
+    /// voice/hotkey assistant — multi-part planning, batched actions, zoom,
+    /// skills, STOP — instead of the retired one-step-at-a-time planner loop.
+    /// Used by goal runs, deployed suggestions, and manager cascades. Returns
+    /// whether the run was accepted (validations passed and the agent started).
+    @discardableResult
+    public func runAgent(goal: String) -> Bool {
         let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { agentMessage = "Enter a goal to run."; return }
+        guard !trimmed.isEmpty else { agentMessage = "Enter a goal to run."; return false }
         guard hasAnthropicKey else {
             agentMessage = "Connect your Claude key in Settings first."
             showSettings = true
-            return
+            return false
         }
-        guard !agentRunning else { return }
-        driver.runState.reset()
+        guard !agentRunning else { return false }
+        let mouse = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else { return false }
+        // Bumped only once the run is definitely happening — a rejected start must
+        // not supersede an in-flight voice turn.
+        assistGeneration += 1
+        let gen = assistGeneration
         agentRunning = true
         agentMessage = "Cascade is using this Mac…"
-        dock.show(title: "Cascade is working", detail: "Goal: \(trimmed) · press STOP to take control.")
-        Task { await runLoop(goal: trimmed) }
-    }
-
-    private func runLoop(goal: String) async {
-        // Runaway backstop, not a budget — the loop's real terminators are the
-        // model finishing, STOP, or an error. Honest tasks shouldn't hit this.
-        let maxSteps = 60
-        defer { agentRunning = false }
-        for step in 1...maxSteps {
-            if driver.runState.isStopRequested {
-                agentMessage = "Stopped. Control returned to you."
-                dock.show(title: "Stopped", detail: agentMessage)
-                break
+        Task {
+            defer { agentRunning = false }
+            let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
+                agentMessage = "Grant Screen Recording so Cascade can see the screen."
+                return
             }
-            _ = await recorder.captureNow()
-            do {
-                let proposed = try await orchestrator.proposeStep(goal: goal)
-                dock.show(title: "Step \(step): \(proposed.action.shortLabel)", detail: proposed.rationale)
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "step.auto", detail: proposed.action.shortLabel))
-                guard let action = AgentAction(planned: proposed.action) else {
-                    switch proposed.action {
-                    case .done(let summary): agentMessage = "Done — \(summary)"
-                    default: agentMessage = "Stopped — unsupported step (\(proposed.action.shortLabel))."
-                    }
-                    dock.show(title: "Done", detail: agentMessage)
-                    break
-                }
-                // Visibly move the cursor to the target before clicking.
-                if let point = proposed.action.targetPoint {
-                    try await driver.act(.computerUse(.move(x: point.x, y: point.y)))
-                    try? await Task.sleep(for: .milliseconds(450))
-                }
-                try await driver.act(action)
-                agentMessage = "Step \(step): \(proposed.action.shortLabel)"
-                try? await Task.sleep(for: .milliseconds(700))
-            } catch {
-                agentMessage = "Stopped: \(error.localizedDescription)"
-                dock.show(title: "Stopped", detail: agentMessage)
-                break
-            }
-            if step == maxSteps {
-                agentMessage = "Reached the \(maxSteps)-step limit. Run again to continue."
-                dock.show(title: "Paused", detail: agentMessage)
-            }
+            guard assistGeneration == gen else { return }
+            await runAssistTask(goal: trimmed, screen: screen, firstScreenshotPNG: shot, gen: gen)
+            agentMessage = teachMessage
         }
-        await refreshAll()
+        return true
     }
 
     /// Captures the current screen (excluding Cascade's own windows), asks Claude's
@@ -796,7 +778,13 @@ public final class CascadeAppModel: ObservableObject {
         // never rides the prompt (token cost stays flat as the library grows).
         let agent = ComputerUseAgent(
             environmentNote: ComputerUseAgent.foregroundBrowserNote,
-            skillProvider: { [appSkills] name in appSkills.skill(named: name)?.promptBlock }
+            skillProvider: { [appSkills, store] name in
+                guard let skill = appSkills.skill(named: name) else { return nil }
+                // Skill text entering the agent's context is an auditable event,
+                // same as every action it takes.
+                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
+                return skill.promptBlock
+            }
         )
         // Runaway backstop, not a budget. The episode's real terminators are the
         // model finishing, STOP / barge-in, stall detection, or a newer turn
@@ -831,6 +819,9 @@ public final class CascadeAppModel: ObservableObject {
             var zoomRegion: CGRect?
             var actedThisTurn = false
             for action in step.actions {
+                // Re-check between every action — a barge-in or newer turn must
+                // halt mid-batch, not after the batch finishes.
+                if assistGeneration != gen || driver.runState.isStopRequested { return .stopped }
                 if case .zoom(let nx, let ny, let nw, let nh) = action {
                     zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
                     continue
@@ -1646,28 +1637,45 @@ public final class CascadeAppModel: ObservableObject {
         prefersDark.toggle()
     }
 
-    /// Manager-cascaded agents the employee hasn't dismissed.
-    public var visibleManagerCascades: [AgentSuggestion] {
-        managerCascades.filter { !dismissedSuggestions.contains($0.id) }
+    /// Cascades still awaiting the employee's decision.
+    public var visibleManagerCascades: [ManagerCascade] {
+        managerCascades.filter { $0.status == .pending }
     }
 
-    /// The manager cascades a plain-English automation to this employee. It lands
-    /// in the employee's Cascades inbox to review and deploy. (In this local
-    /// prototype the manager and employee share one device; a real deployment
-    /// would deliver this over the privacy-safe manager channel.)
+    /// The manager cascades a plain-English automation to this employee. It is
+    /// PERSISTED in the local store, so the inbox survives restarts — manager and
+    /// employee share this one app for now; a separate platform delivers these
+    /// across devices later.
     public func cascadeFromManager(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let cascade = AgentSuggestion(
-            title: trimmed,
-            summary: "Cascaded by your manager for you to review and deploy.",
-            kind: .reviewQueue,
-            confidence: 1.0,
-            evidence: ["Sent from the Manager dashboard"],
-            doable: true
-        )
-        managerCascades.insert(cascade, at: 0)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.sent", detail: trimmed)) }
+        Task {
+            _ = try? await store.insertManagerCascade(
+                title: trimmed,
+                summary: "Cascaded by your manager for you to review and deploy."
+            )
+            _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.sent", detail: trimmed))
+            await refreshAll()
+        }
+    }
+
+    /// Employee deploys a cascade: only marked deployed once the agent actually
+    /// accepted the run — a rejected start (no key, agent busy) keeps it pending.
+    public func deployCascade(_ cascade: ManagerCascade) {
+        guard runAgent(goal: cascade.title) else { return }
+        Task {
+            try? await store.setManagerCascadeStatus(id: cascade.id, status: .deployed)
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.deployed", detail: cascade.title))
+            await refreshAll()
+        }
+    }
+
+    public func declineCascade(_ cascade: ManagerCascade) {
+        Task {
+            try? await store.setManagerCascadeStatus(id: cascade.id, status: .declined)
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: cascade.title))
+            await refreshAll()
+        }
     }
 
     public func refreshKeyStatus() {
