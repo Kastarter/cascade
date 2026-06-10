@@ -39,9 +39,32 @@ public final class CascadeAppModel: ObservableObject {
 
     @Published public var selectedTab: Tab = .reel
     @Published public var showSettings = false
+    /// First-run setup: permissions + keys, shown once over everything until
+    /// dismissed (reopenable from Settings). Without it a new user lands on an
+    /// empty Reel with no idea why nothing records.
+    @Published public var showOnboarding: Bool
     @Published public var prefersDark = true
-    @Published public private(set) var dismissedSuggestions: Set<UUID> = []
-    @Published private var dismissedWasteSignatures: Set<String> = []
+    /// Declined suggestions, keyed by TITLE: suggestion ids are regenerated on
+    /// every refresh, so an id-keyed set forgot the decline within seconds. The
+    /// title is the stable identity of a heuristic suggestion. Persisted, like
+    /// declined workflow signatures — "no" must survive a relaunch.
+    @Published private var dismissedSuggestionTitles: Set<String> {
+        didSet { Self.persist(dismissedSuggestionTitles, key: Self.dismissedSuggestionsKey) }
+    }
+    @Published private var dismissedWasteSignatures: Set<String> {
+        didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey) }
+    }
+    private static let dismissedSuggestionsKey = "cascade.dismissedSuggestions"
+    private static let dismissedWasteKey = "cascade.dismissedWaste"
+
+    private static func persist(_ values: Set<String>, key: String) {
+        // Capped so years of declines can't grow the defaults plist unbounded.
+        UserDefaults.standard.set(Array(values.suffix(300)), forKey: key)
+    }
+
+    private static func restoreSet(key: String) -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
     @Published public private(set) var managerCascades: [ManagerCascade] = []
     @Published public private(set) var contexts: [RecordedContext] = []
     @Published public private(set) var searchResults: [RecordedContext] = []
@@ -131,6 +154,9 @@ public final class CascadeAppModel: ObservableObject {
         cursorTheme = UserDefaults.standard.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = UserDefaults.standard.bool(forKey: Self.powerHarnessKey)
+        dismissedSuggestionTitles = Self.restoreSet(key: Self.dismissedSuggestionsKey)
+        dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey)
+        showOnboarding = !UserDefaults.standard.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
@@ -1353,12 +1379,28 @@ public final class CascadeAppModel: ObservableObject {
 
     /// Manager-cascaded helpers the employee hasn't dismissed.
     public var visibleSuggestions: [AgentSuggestion] {
-        suggestions.filter { !dismissedSuggestions.contains($0.id) }
+        suggestions.filter { !dismissedSuggestionTitles.contains($0.title) }
     }
 
     /// "DEPLOY" a reviewed helper: plan its first step for approval.
+    /// Heuristic suggestions are observations, not recorded recipes — running
+    /// one produces a grounded deliverable in the Reel chat (the card title is
+    /// display copy, not an executable goal; handing it to the screen agent
+    /// just made it flail).
     public func deploySuggestion(_ suggestion: AgentSuggestion) {
-        runAgent(goal: suggestion.title)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "suggestion.run", detail: suggestion.title)) }
+        switch suggestion.kind {
+        case .dailyRecap:
+            selectedTab = .reel
+            ask("Write my daily recap from the local record: the main tasks I worked on, which apps, and anything that looks unfinished. Keep it under 150 words.")
+        case .repeatedWorkflow:
+            selectedTab = .reel
+            let place = [suggestion.appName, suggestion.windowTitle.map { "“\($0)”" }]
+                .compactMap(\.self).joined(separator: " — ")
+            ask("I keep spending time in \(place.isEmpty ? "the same window" : place). From the recorded history, what exactly did I do there each time, and which part could an agent take over?")
+        case .reviewQueue:
+            runAgent(goal: suggestion.title)
+        }
     }
 
     // MARK: - Agents built from recorded workflows
@@ -1535,8 +1577,11 @@ public final class CascadeAppModel: ObservableObject {
         if !stoppedEarly {
             agentMessage = "Done — ran “\(agent.name)”."
             dock.show(title: "Done", detail: agentMessage)
+            // Only COMPLETED runs count — the reclaimed-time math multiplies
+            // seconds-per-run by this counter, and a stopped run saved nothing.
+            try? await store.markAgentRun(id: agent.id)
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: agent.name))
         }
-        try? await store.markAgentRun(id: agent.id)
         await refreshAll()
     }
 
@@ -1664,8 +1709,18 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func declineSuggestion(_ suggestion: AgentSuggestion) {
-        dismissedSuggestions.insert(suggestion.id)
+        dismissedSuggestionTitles.insert(suggestion.title)
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: suggestion.title)) }
+    }
+
+    private static let onboardedKey = "cascade.onboarded"
+
+    /// Closes the first-run guide for good (Settings can reopen it).
+    public func finishOnboarding() {
+        showOnboarding = false
+        UserDefaults.standard.set(true, forKey: Self.onboardedKey)
+        refreshPermissionState()
+        startRecording()
     }
 
     public func toggleTheme() {

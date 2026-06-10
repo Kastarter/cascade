@@ -246,6 +246,7 @@ public actor CascadeOrchestrator {
             recipe: waste.recipe,
             apps: waste.apps,
             estimatedSeconds: waste.estimatedTotalSeconds,
+            estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
             evidenceCount: waste.occurrences
         ))
     }

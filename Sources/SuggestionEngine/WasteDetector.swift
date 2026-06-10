@@ -17,6 +17,9 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
     /// Stable key (the action-token sequence) used to dedupe an agent built from
     /// this workflow.
     public let signature: String
+    /// When the workflow was last observed — lets the UI date the card and pick
+    /// a nearby rewind frame as visual evidence.
+    public let lastSeenAt: Date
 
     public init(
         id: UUID = UUID(),
@@ -28,7 +31,8 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
         recipe: AgentRecipe,
         evidence: [Int64],
         confidence: Double,
-        signature: String
+        signature: String,
+        lastSeenAt: Date = Date()
     ) {
         self.id = id
         self.title = title
@@ -40,6 +44,7 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
         self.evidence = evidence
         self.confidence = confidence
         self.signature = signature
+        self.lastSeenAt = lastSeenAt
     }
 }
 
@@ -153,11 +158,8 @@ public struct WasteDetector: Sendable {
         let apps = Self.orderedDistinct(instance.map(\.appName))
         let span = instance.last!.capturedAt.timeIntervalSince(instance.first!.capturedAt)
         let perRun = max(instance.count, Int(span.rounded()))
-        let title = apps.count <= 1
-            ? "Repeated steps in \(apps.first ?? "an app")"
-            : "Workflow: " + apps.joined(separator: " → ")
         return DetectedWaste(
-            title: title,
+            title: Self.title(apps: apps, steps: steps),
             apps: apps,
             occurrences: occurrences,
             estimatedSecondsPerRun: perRun,
@@ -165,8 +167,31 @@ public struct WasteDetector: Sendable {
             recipe: AgentRecipe(steps: steps),
             evidence: instance.map(\.id),
             confidence: min(0.95, 0.5 + Double(occurrences) * 0.12),
-            signature: instance.map(Self.token).joined(separator: "|")
+            signature: instance.map(Self.token).joined(separator: "|"),
+            lastSeenAt: instance.last!.capturedAt
         )
+    }
+
+    /// A title that says what the workflow IS, not just where it happened: the
+    /// recorded anchors and shortcuts become the story ("Mail: click “Send
+    /// Message” → ⌘C"), and the classic copy-into-another-app shape is named
+    /// outright. Falls back to the app flow only when the steps carry no story.
+    static func title(apps: [String], steps: [RecipeStep]) -> String {
+        // ⌘C in one app followed by ⌘V in another is the single most common
+        // detected workflow — name it like a person would.
+        if let copy = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "c" && $0.modifiers.contains("command") }),
+           let paste = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "v" && $0.modifiers.contains("command") }),
+           copy.order < paste.order, copy.appName != paste.appName {
+            return "Copy from \(copy.appName) into \(paste.appName)"
+        }
+        // Lead with the most telling steps: anchored clicks and shortcuts.
+        let meaningful = steps.filter { $0.kind != .activateApp && $0.kind != .scroll }
+        let story = meaningful.prefix(3).map(\.humanLabel).joined(separator: " → ")
+        if apps.count <= 1 {
+            let app = apps.first ?? "an app"
+            return story.isEmpty ? "Repeated steps in \(app)" : "\(app): \(String(story.prefix(64)))"
+        }
+        return "\(apps.joined(separator: " → ")): \(String(story.prefix(48)))"
     }
 
     // MARK: - Helpers

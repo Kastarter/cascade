@@ -15,6 +15,10 @@ public struct AgentSuggestion: Identifiable, Codable, Equatable, Sendable {
     public let confidence: Double
     public let evidence: [String]
     public let doable: Bool
+    /// The observed context the suggestion came from — what a concrete deploy
+    /// action needs (the display title alone is not an executable goal).
+    public let appName: String?
+    public let windowTitle: String?
 
     public init(
         id: UUID = UUID(),
@@ -23,7 +27,9 @@ public struct AgentSuggestion: Identifiable, Codable, Equatable, Sendable {
         kind: SuggestionKind,
         confidence: Double,
         evidence: [String],
-        doable: Bool
+        doable: Bool,
+        appName: String? = nil,
+        windowTitle: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -32,6 +38,8 @@ public struct AgentSuggestion: Identifiable, Codable, Equatable, Sendable {
         self.confidence = confidence
         self.evidence = evidence
         self.doable = doable
+        self.appName = appName
+        self.windowTitle = windowTitle
     }
 }
 
@@ -49,22 +57,24 @@ public struct SuggestionEngine: Sendable {
         for (_, items) in grouped where items.count >= 3 {
             let latest = items.sorted { $0.capturedAt > $1.capturedAt }.first!
             suggestions.append(AgentSuggestion(
-                title: "Help with repeated work in \(latest.appName)",
-                summary: "Cascade saw this context \(items.count) times. Review it before turning it into an agent.",
+                title: "You keep coming back to \(latest.appName)" + (latest.windowTitle.map { " — “\(String($0.prefix(40)))”" } ?? ""),
+                summary: "Seen \(items.count) times in the record. Run this to get a breakdown of what you keep doing there and what an agent could take over.",
                 kind: .repeatedWorkflow,
                 confidence: min(0.95, 0.55 + Double(items.count) * 0.08),
                 evidence: [
                     "\(items.count) matching moments",
                     latest.windowTitle.map { "Latest window: \($0)" } ?? "Latest app: \(latest.appName)"
                 ],
-                doable: true
+                doable: true,
+                appName: latest.appName,
+                windowTitle: latest.windowTitle
             ))
         }
 
         if nonSensitive.count >= 2 {
             suggestions.append(AgentSuggestion(
-                title: "Daily recap in the notes app you already use",
-                summary: "Cascade can draft a local recap from today’s recorded context after you review the evidence.",
+                title: "Draft today’s recap from the record",
+                summary: "Cascade writes a short recap of what you actually worked on today — grounded only in the local record, shown in the Reel chat.",
                 kind: .dailyRecap,
                 confidence: 0.72,
                 evidence: [

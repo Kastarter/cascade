@@ -138,6 +138,38 @@ func contextAnchorMustComeFromTheSameApp() {
 }
 
 @Test
+func copyPasteAcrossAppsGetsNamedOutright() {
+    // ⌘C in Mail then ⌘V in Numbers — the title should say what it IS.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 {
+        events.append(event(i, .key, app: "Mail", key: "c", modifiers: ["command"])); i += 1
+        events.append(event(i, .key, app: "Numbers", key: "v", modifiers: ["command"])); i += 1
+    }
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    #expect(waste.title == "Copy from Mail into Numbers")
+}
+
+@Test
+func titleTellsTheStoryFromAnchorsNotJustTheApp() {
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 {
+        events.append(InputEvent(
+            id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)),
+            kind: .click, x: 10, y: 10, text: "Reply All", appName: "Mail"
+        )); i += 1
+        events.append(event(i, .key, app: "Mail", key: "r", modifiers: ["command"])); i += 1
+    }
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    #expect(waste.title.contains("Mail"))
+    #expect(waste.title.contains("Reply All"))
+    #expect(!waste.title.contains("Repeated steps"))
+    // And the card can date the evidence.
+    #expect(waste.lastSeenAt > base)
+}
+
+@Test
 func resultsSortByTotalTimeSavedDescending() {
     var events: [InputEvent] = []
     var i = 0
