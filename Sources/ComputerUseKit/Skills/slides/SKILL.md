@@ -1,13 +1,15 @@
 ---
 name: slides
-description: Building and editing presentations in Keynote or PowerPoint.
-useWhen: creating or editing slides, decks, presentations (Keynote, PowerPoint)
+description: Building and editing presentations in PowerPoint and other non-Keynote slide apps.
+useWhen: creating or editing slides in PowerPoint or Google Slides (Keynote has its own skill — pull keynote instead)
 ---
 
 # Slides
 
-- New slide: `cmd+shift+n` in Keynote; in PowerPoint use the visible "New
-  Slide" button (its shortcut varies).
+In Keynote, pull the `keynote` skill instead — it carries the full driving
+manual; this one covers PowerPoint and other slide apps.
+
+- New slide: use the visible "New Slide" button (its shortcut varies).
 - Text lives in placeholders: click once to select the box, double-click to
   enter text editing. Type, then click OUTSIDE the box (or press `Escape`) to
   commit — `Escape` while editing exits to box-selection, a second `Escape`
@@ -24,8 +26,8 @@ useWhen: creating or editing slides, decks, presentations (Keynote, PowerPoint)
 ```cascade-runtime-hints
 {
   "appMatchers": {
-    "bundleIdentifiers": ["com.apple.iWork.Keynote", "com.microsoft.Powerpoint"],
-    "names": ["Keynote", "Microsoft PowerPoint"]
+    "bundleIdentifiers": ["com.microsoft.Powerpoint"],
+    "names": ["Microsoft PowerPoint"]
   }
 }
 ```

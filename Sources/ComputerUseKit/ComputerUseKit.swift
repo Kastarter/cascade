@@ -217,13 +217,13 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         case .move(let x, let y):
             try move(to: CGPoint(x: x, y: y))
         case .click(let x, let y):
-            try click(at: CGPoint(x: x, y: y))
+            try await click(at: CGPoint(x: x, y: y))
         case .doubleClick(let x, let y):
-            try doubleClick(at: CGPoint(x: x, y: y))
+            try await doubleClick(at: CGPoint(x: x, y: y))
         case .tripleClick(let x, let y):
-            try tripleClick(at: CGPoint(x: x, y: y))
+            try await tripleClick(at: CGPoint(x: x, y: y))
         case .rightClick(let x, let y):
-            try rightClick(at: CGPoint(x: x, y: y))
+            try await rightClick(at: CGPoint(x: x, y: y))
         case .drag(let fromX, let fromY, let toX, let toY):
             try await drag(from: CGPoint(x: fromX, y: fromY), to: CGPoint(x: toX, y: toY))
         case .key(let key, let modifiers):
@@ -244,16 +244,30 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         moved.post(tap: .cghidEventTap)
     }
 
-    private func click(at point: CGPoint) throws {
+    /// Apps that track the pointer through move events (Blender/GHOST, games,
+    /// GL canvases) process button events at the LAST MOVED-TO position — the
+    /// coordinates embedded in down/up are ignored, and CGWarp generates no
+    /// move events. A real mouse always moves before it presses; so do we.
+    private func settleAt(_ point: CGPoint) async throws {
+        try move(to: point)
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+
+    private func click(at point: CGPoint) async throws {
+        try await settleAt(point)
         guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
               let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create mouse event.")
+        }
+        for event in [down, up] {
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
         }
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }
 
-    private func doubleClick(at point: CGPoint) throws {
+    private func doubleClick(at point: CGPoint) async throws {
+        try await settleAt(point)
         guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
               let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create double-click event.")
@@ -267,7 +281,8 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         up.post(tap: .cghidEventTap)
     }
 
-    private func tripleClick(at point: CGPoint) throws {
+    private func tripleClick(at point: CGPoint) async throws {
+        try await settleAt(point)
         guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
               let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create triple-click event.")
@@ -285,6 +300,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     /// apps that track the pointer (canvases, sliders, text selection) see a human-
     /// like motion, then up at the destination.
     private func drag(from start: CGPoint, to end: CGPoint) async throws {
+        try await settleAt(start)
         guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create drag event.")
         }
@@ -309,7 +325,8 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         up.post(tap: .cghidEventTap)
     }
 
-    private func rightClick(at point: CGPoint) throws {
+    private func rightClick(at point: CGPoint) async throws {
+        try await settleAt(point)
         guard let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right),
               let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right) else {
             throw ComputerUseError.unsupported("Could not create right-click event.")

@@ -893,8 +893,14 @@ public final class CascadeAppModel: ObservableObject {
             case .move(let x, let y):
                 // Blue companion only — the user's real pointer never moves
                 // (except in pointer-routed apps, where hovering IS the action).
+                // There it must be a real move EVENT, not a warp: these apps
+                // track the pointer from move events, and a warp is invisible
+                // to them (hover, menu placement, and clicks all go stale).
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                if keepPointer { CGWarpMouseCursorPosition(cg(x, y)) }
+                if keepPointer {
+                    let p = cg(x, y)
+                    try await driver.act(.computerUse(.move(x: p.x, y: p.y)))
+                }
             case .click(let x, let y):
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
                 try? await Task.sleep(for: .milliseconds(150))  // let the cursor reach the target
@@ -970,9 +976,11 @@ public final class CascadeAppModel: ObservableObject {
                         try? await Task.sleep(for: .milliseconds(30))
                     }
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.keys", detail: "chars=\(text.count) skill=\(skill.name)"))
-                } else if Self.axInsertText(text) {
+                } else if skill?.axUnreliable != true, Self.axInsertText(text) {
+                    // Skipped for axUnreliable apps: their AX tree can accept the
+                    // write and report success while nothing visible changes.
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.ax", detail: "chars=\(text.count)"))
-                } else if await pasteText(text) {
+                } else if await pasteText(text, pointerRouted: keepPointer) {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.paste", detail: "chars=\(text.count)"))
                 } else {
                     try await driver.act(.computerUse(.typeText(text)))
@@ -988,7 +996,10 @@ public final class CascadeAppModel: ObservableObject {
                 let p = cg(x, y)
                 let (dx, dy) = Self.scrollDelta(direction: direction, amount: amount)
                 let origin = Self.cursorCG()
-                CGWarpMouseCursorPosition(p)
+                // A real move event (not a warp) so pointer-tracking apps
+                // apply the scroll at the target; the restore stays a silent
+                // warp to avoid hover side-effects at the user's parked spot.
+                try await driver.act(.computerUse(.move(x: p.x, y: p.y)))
                 do { try await driver.act(.computerUse(.scroll(deltaX: dx, deltaY: dy))) }
                 catch { CGWarpMouseCursorPosition(origin); throw error }
                 CGWarpMouseCursorPosition(origin)
@@ -1061,7 +1072,15 @@ public final class CascadeAppModel: ObservableObject {
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: boundsDict) else { continue }
             if !bounds.contains(pointer) {
-                CGWarpMouseCursorPosition(CGPoint(x: bounds.midX, y: bounds.midY))
+                // A move EVENT, not CGWarp — pointer-routed apps only learn
+                // the new position from the event, and the next hotkey's menu
+                // or modal anchors there.
+                CGEvent(
+                    mouseEventSource: nil,
+                    mouseType: .mouseMoved,
+                    mouseCursorPosition: CGPoint(x: bounds.midX, y: bounds.midY),
+                    mouseButton: .left
+                )?.post(tap: .cghidEventTap)
             }
             return
         }
@@ -1105,7 +1124,13 @@ public final class CascadeAppModel: ObservableObject {
     /// Pastes text via the clipboard (cmd+V), restoring the user's previous
     /// clipboard afterwards — tiptour-macos's fallback for apps whose fields
     /// don't take AX insertion. Returns false if the paste keystroke fails.
-    private func pasteText(_ text: String) async -> Bool {
+    /// Pointer-routed apps (Blender) need three deviations: the pointer must be
+    /// inside the app's window (keys route to the editor under it), the chord is
+    /// ctrl+V (the literal keymap binding — cmd is only an alias layer), and the
+    /// clipboard must stay ours much longer: the app reads it when its main loop
+    /// runs the paste operator, easily later than the keystroke itself.
+    private func pasteText(_ text: String, pointerRouted: Bool = false) async -> Bool {
+        if pointerRouted { Self.ensurePointerInFrontmostWindow() }
         let pasteboard = NSPasteboard.general
         // Snapshot what the user had so the agent never eats their clipboard.
         let previous = pasteboard.pasteboardItems?.map { item -> NSPasteboardItem in
@@ -1122,9 +1147,9 @@ public final class CascadeAppModel: ObservableObject {
             if !previous.isEmpty { pasteboard.writeObjects(previous) }
         }
         do {
-            try await driver.act(.computerUse(.key("v", modifiers: ["command"])))
+            try await driver.act(.computerUse(.key("v", modifiers: [pointerRouted ? "control" : "command"])))
             // Let the app consume the pasteboard before we restore it.
-            try? await Task.sleep(for: .milliseconds(180))
+            try? await Task.sleep(for: .milliseconds(pointerRouted ? 900 : 180))
             return true
         } catch {
             return false

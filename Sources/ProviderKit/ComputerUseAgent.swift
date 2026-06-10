@@ -86,7 +86,10 @@ public final class ComputerUseAgent {
     and hands-on work is YOURS to do: when asked to design, draw, write, build, or edit \
     something in an app, carry it out yourself with clicks, drags (left_click_drag for \
     drawing shapes, moving objects, selecting ranges), typing, and shortcuts — NEVER \
-    tell the user to do it themselves or merely describe the steps. When you are \
+    tell the user to do it themselves or merely describe the steps. Do that work INSIDE \
+    the app the task names, through its own UI: never detour to Terminal, shell \
+    commands, or scripts unless the task itself is about them or the user explicitly \
+    asked for a script. When you are \
     confident in a short sequence — like clicking a field, typing into it, and \
     pressing Return — chain those tool calls in ONE turn instead of re-observing between \
     them; take uncertain steps one at a time. Be silent and extremely brief: do NOT \

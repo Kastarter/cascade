@@ -243,6 +243,28 @@ struct AppSkillTests {
         #expect(blender?.instructions.contains("one") == true)
     }
 
+    @Test func bundledKeynotePackLoads() {
+        let registry = AppSkillRegistry.load()
+        // Both builds resolve to the core skill: legacy Keynote 14.x and the
+        // 15.x app, whose name is "Keynote Creator Studio" and whose bundle
+        // id is com.apple.Keynote (not com.apple.iWork.Keynote).
+        let creatorStudio = registry.skill(appName: "Keynote Creator Studio", bundleIdentifier: "com.apple.Keynote")
+        let legacy = registry.skill(appName: "Keynote", bundleIdentifier: "com.apple.iWork.Keynote")
+        #expect(creatorStudio?.name == "keynote")
+        #expect(legacy?.name == "keynote")
+        #expect(creatorStudio?.axUnreliable == false)
+        #expect(creatorStudio?.keysFollowPointer == false)
+        // The task skills join the index but never app-match — matchers stay
+        // on the core skill (and keynote-* would path-sort ahead of it).
+        for name in ["keynote-consulting", "keynote-applescript"] {
+            let skill = registry.skill(named: name)
+            #expect(skill != nil, "missing bundled skill: \(name)")
+            #expect(skill?.matches(appName: "Keynote Creator Studio", bundleIdentifier: "com.apple.Keynote") == false)
+        }
+        // PowerPoint still routes to the generic slides skill.
+        #expect(registry.skill(appName: "Microsoft PowerPoint", bundleIdentifier: "com.microsoft.Powerpoint")?.name == "slides")
+    }
+
     @Test func bundledStarterPackLoads() {
         let registry = AppSkillRegistry.load()
         #expect(registry.skills.count >= 13)
