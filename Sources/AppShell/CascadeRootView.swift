@@ -284,7 +284,6 @@ private struct ReelScreen: View {
     @ObservedObject var model: CascadeAppModel
     @State private var index = 0
     @State private var draft = ""
-    @State private var searchText = ""
     @State private var isPlaying = false
     @State private var speed: Double = 1
     @State private var playbackAccumulator = 0.0
@@ -312,9 +311,12 @@ private struct ReelScreen: View {
                     .padding(.horizontal, CascadeMetrics.s5)
                     .padding(.vertical, CascadeMetrics.s4)
                 // The chat panel earns more room as the window grows (~27% of the
-                // width in fullscreen) instead of staying a fixed sliver.
+                // width in fullscreen) instead of staying a fixed sliver. It floats
+                // as a card in the same design language as the scene card.
                 AskPanel(model: model, selected: selected, draft: $draft)
                     .frame(width: max(340, min(440, geo.size.width * 0.27)))
+                    .padding(.trailing, CascadeMetrics.s5)
+                    .padding(.vertical, CascadeMetrics.s4)
             }
         }
         .background(alignment: .top) { reelGlow }
@@ -354,14 +356,23 @@ private struct ReelScreen: View {
 
     private var main: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
-            searchField
-            metaRow
-            Text(headline)
-                .font(.cascadeSerif(34))
-                .italic()
-                .frame(maxWidth: .infinity, alignment: .center)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, CascadeMetrics.s4)
+            // The headline leads — no search bar or moment/time rows above it; the
+            // transport readout already tells the time, and the chat panel names
+            // the app. A small tinted dot next to the title keeps the app cue.
+            HStack(spacing: CascadeMetrics.s3) {
+                if let selected {
+                    Circle()
+                        .fill(AppVisuals.color(for: selected.appName, bundleIdentifier: selected.bundleIdentifier))
+                        .frame(width: 9, height: 9)
+                }
+                Text(headline)
+                    .font(.cascadeSerif(34))
+                    .italic()
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, CascadeMetrics.s4)
+            .padding(.top, CascadeMetrics.s2)
             SceneCard(context: selected)
             TransportBar(
                 isPlaying: $isPlaying,
@@ -390,62 +401,6 @@ private struct ReelScreen: View {
         }
     }
 
-    /// Full-text search across everything captured (OCR text, window title, app).
-    /// Resets the scrubber to the top result whenever the query changes.
-    private var searchField: some View {
-        HStack(spacing: CascadeMetrics.s2) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(Color.cascadeText3)
-            TextField("Search everything you’ve seen…", text: $searchText)
-                .textFieldStyle(.plain)
-                .font(.cascadeSans(14))
-                .onSubmit { model.search(searchText) }
-                .onChange(of: searchText) { _, newValue in
-                    index = 0
-                    model.search(newValue)
-                }
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                    index = 0
-                    model.search("")
-                } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(Color.cascadeText3)
-                }
-                .buttonStyle(.plain)
-                .help("Clear search")
-            }
-        }
-        .padding(.horizontal, CascadeMetrics.s3)
-        .padding(.vertical, CascadeMetrics.s2)
-        .background(Color.cascadePanel2)
-        .clipShape(RoundedRectangle(cornerRadius: CascadeMetrics.s2))
-        .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.s2).stroke(Color.cascadeBorder, lineWidth: 1))
-    }
-
-    private var metaRow: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: CascadeMetrics.s1) {
-                CascadeTag("The Moment", tone: .cascadeText3)
-                Text(timeRange).font(.cascadeMono(15, .medium))
-            }
-            Spacer()
-            HStack(spacing: CascadeMetrics.s2) {
-                Text("· IN").font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
-                if let selected {
-                    HStack(spacing: CascadeMetrics.s1 + 2) {
-                        Circle()
-                            .fill(AppVisuals.color(for: selected.appName, bundleIdentifier: selected.bundleIdentifier))
-                            .frame(width: 7, height: 7)
-                        Text(selected.appName).font(.cascadeSans(13, .medium))
-                    }
-                } else {
-                    Text("—").font(.cascadeMono(13)).foregroundStyle(Color.cascadeText3)
-                }
-            }
-        }
-    }
-
     private var headline: String {
         guard let selected else { return "Idle — no capture at this time." }
         if let title = selected.windowTitle, !title.isEmpty { return Self.cleanTitle(title) }
@@ -461,17 +416,6 @@ private struct ReelScreen: View {
         var t = Substring(title)
         while let first = t.first, "·•✳✱✻*∙⁂ ".contains(first) { t = t.dropFirst() }
         return t.isEmpty ? title : String(t)
-    }
-
-    private var timeRange: String {
-        guard let selected else { return "— → now" }
-        let start = selected.capturedAt
-        let newer = index > 0 ? moments[index - 1].capturedAt : Date()
-        return "\(Self.time(start)) → \(Self.time(newer))"
-    }
-
-    static func time(_ date: Date) -> String {
-        date.formatted(date: .omitted, time: .shortened)
     }
 
     /// Clock with seconds for the transport readout, e.g. "11:58:53pm".
@@ -888,75 +832,176 @@ private struct AskPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 CascadeTag("Ask about this moment", tone: .cascadeAgent)
-                Text(selected.map { "\($0.appName)\($0.windowTitle.map { " · \($0)" } ?? "")" } ?? "Local record")
+                Text(headerLine)
                     .font(.cascadeSans(13, .medium))
                     .foregroundStyle(Color.cascadeText2)
                     .lineLimit(1)
             }
-            .padding(CascadeMetrics.s5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, CascadeMetrics.s5)
+            .padding(.vertical, CascadeMetrics.s4)
+            .background(Color.cascadePanel.opacity(0.7))
 
             Divider().overlay(Color.cascadeBorder)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
-                    if model.conversation.isEmpty && !model.thinking {
-                        Text("Ask anything about your recorded local context. Answers are grounded only in what was captured.")
-                            .font(.cascadeSans(13))
-                            .foregroundStyle(Color.cascadeText3)
+            // The conversation pins to its newest message: new turns and streamed
+            // answer chunks keep the bottom anchored in view.
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
+                        if model.conversation.isEmpty && !model.thinking {
+                            emptyState
+                        }
+                        ForEach(model.conversation) { turn in
+                            ChatBubble(text: turn.question, mine: true)
+                            ChatBubble(text: turn.answer, mine: false)
+                        }
+                        if model.thinking {
+                            if model.answer.isEmpty {
+                                TypingIndicator()
+                            } else {
+                                ChatBubble(text: model.answer, mine: false)
+                            }
+                        }
+                        Color.clear.frame(height: 1).id(Self.chatEnd)
                     }
-                    ForEach(model.conversation) { turn in
-                        ChatBubble(text: turn.question, mine: true)
-                        ChatBubble(text: turn.answer, mine: false)
-                    }
-                    if model.thinking {
-                        ChatBubble(text: model.answer, mine: false)
-                    }
+                    .padding(CascadeMetrics.s5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(CascadeMetrics.s5)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .onChange(of: model.conversation.count) { _, _ in scrollToEnd(proxy) }
+                .onChange(of: model.thinking) { _, _ in scrollToEnd(proxy) }
+                .onChange(of: model.answer) { _, _ in scrollToEnd(proxy) }
             }
 
-            VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
-                FlowChips(items: suggestedQuestions) { q in model.ask(q) }
+            VStack(alignment: .leading, spacing: CascadeMetrics.s2 + 2) {
+                if model.conversation.isEmpty && !model.thinking {
+                    FlowChips(items: suggestedQuestions) { q in model.ask(q) }
+                }
+                // Capsule composer with the send button living inside the field.
                 HStack(spacing: CascadeMetrics.s2) {
                     TextField("Ask the rewind, or “where do I find X”…", text: $draft)
                         .textFieldStyle(.plain)
                         .font(.cascadeSans(13))
-                        .padding(.horizontal, CascadeMetrics.s3)
-                        .padding(.vertical, CascadeMetrics.s2 + 1)
-                        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
                         .onSubmit { send() }
                     Button { send() } label: {
-                        Image(systemName: "arrow.right").font(.system(size: 13, weight: .bold)).foregroundStyle(Color.cascadeOnAccent)
-                            .frame(width: 34, height: 32)
-                            .background(Color.cascadeAgent, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(canSend ? Color.cascadeOnAccent : Color.cascadeText4)
+                            .frame(width: 28, height: 28)
+                            .background(canSend ? Color.cascadeAgent : Color.cascadePanel3, in: Circle())
                     }
                     .buttonStyle(.plain)
+                    .disabled(!canSend)
                 }
-                HStack(spacing: CascadeMetrics.s2) {
-                    Image(systemName: model.voice.state == .listening ? "waveform" : (model.voice.state == .working ? "ellipsis.circle" : "mic"))
-                        .font(.system(size: 11))
-                        .foregroundStyle(model.voice.state == .idle ? Color.cascadeText3 : Color.cascadeAgent)
-                    Text(model.voice.hint)
-                        .font(.cascadeSans(11))
-                        .foregroundStyle(Color.cascadeText3)
-                        .lineLimit(1)
-                }
-                Text(model.teachMessage)
-                    .font(.cascadeSans(11))
-                    .foregroundStyle(Color.cascadeText2)
+                .padding(.leading, CascadeMetrics.s4)
+                .padding(.trailing, 5)
+                .padding(.vertical, 5)
+                .background(Color.cascadePanel2, in: Capsule())
+                .overlay(Capsule().stroke(Color.cascadeBorder, lineWidth: 1))
+                statusLine
             }
-            .padding(CascadeMetrics.s5)
+            .padding(CascadeMetrics.s4)
         }
-        .background(Color.cascadePanel.opacity(0.5))
-        .overlay(Rectangle().fill(Color.cascadeBorder).frame(width: 1), alignment: .leading)
+        .background(Color.cascadePanel.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous)
+                .stroke(Color.cascadeBorder, lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
+    }
+
+    private static let chatEnd = "chat-end"
+
+    /// "WhatsApp · chat title", deduped when the window title is just the app name.
+    private var headerLine: String {
+        guard let selected else { return "Local record" }
+        if let title = selected.windowTitle, !title.isEmpty, title != selected.appName {
+            return "\(selected.appName) · \(title)"
+        }
+        return selected.appName
+    }
+
+    private var canSend: Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func scrollToEnd(_ proxy: ScrollViewProxy) {
+        withAnimation(.easeOut(duration: 0.2)) {
+            proxy.scrollTo(Self.chatEnd, anchor: .bottom)
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: CascadeMetrics.s3) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(Color.cascadeAgent)
+            Text("Ask anything about your recorded local context.")
+                .font(.cascadeSans(13, .medium))
+                .foregroundStyle(Color.cascadeText2)
+            Text("Answers are grounded only in what was captured. Hold right ⌘ to talk, or ask “where do I find X” and Cascade points at it on your screen.")
+                .font(.cascadeSans(12))
+                .foregroundStyle(Color.cascadeText3)
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(.top, CascadeMetrics.s8)
+        .padding(.horizontal, CascadeMetrics.s2)
+    }
+
+    /// One quiet line under the composer: the live voice state while a request is
+    /// in flight, else the latest pointer answer — never a stack of stale status.
+    @ViewBuilder private var statusLine: some View {
+        if model.voice.state != .idle {
+            HStack(spacing: CascadeMetrics.s2) {
+                Image(systemName: model.voice.state == .listening ? "waveform" : "ellipsis.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.cascadeAgent)
+                Text(model.voice.hint)
+                    .font(.cascadeSans(11))
+                    .foregroundStyle(Color.cascadeText3)
+                    .lineLimit(1)
+            }
+        } else if !model.teachMessage.isEmpty {
+            Text(model.teachMessage)
+                .font(.cascadeSans(11))
+                .foregroundStyle(Color.cascadeText3)
+                .lineLimit(2)
+        }
     }
 
     private func send() {
+        guard canSend else { return }
         let q = draft
         draft = ""
         model.ask(q)
+    }
+}
+
+/// Three softly pulsing dots while Claude is thinking — a live signal instead of
+/// an empty bubble.
+private struct TypingIndicator: View {
+    @State private var phase = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(0..<3, id: \.self) { dot in
+                Circle()
+                    .fill(Color.cascadeText3)
+                    .frame(width: 6, height: 6)
+                    .opacity(phase ? 0.25 : 1)
+                    .animation(
+                        .easeInOut(duration: 0.55).repeatForever().delay(Double(dot) * 0.18),
+                        value: phase
+                    )
+            }
+        }
+        .padding(.horizontal, CascadeMetrics.s3)
+        .padding(.vertical, CascadeMetrics.s2 + 3)
+        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+        .onAppear { phase = true }
     }
 }
 
@@ -964,17 +1009,40 @@ private struct ChatBubble: View {
     let text: String
     let mine: Bool
 
+    /// Message-app corner language: the corner nearest the sender is pinched.
+    private var corners: RectangleCornerRadii {
+        mine
+            ? RectangleCornerRadii(topLeading: 16, bottomLeading: 16, bottomTrailing: 5, topTrailing: 16)
+            : RectangleCornerRadii(topLeading: 16, bottomLeading: 5, bottomTrailing: 16, topTrailing: 16)
+    }
+
     var body: some View {
         HStack {
-            if mine { Spacer(minLength: 32) }
+            if mine { Spacer(minLength: 40) }
             Text(text)
                 .font(.cascadeSans(13))
+                .textSelection(.enabled)
                 .foregroundStyle(mine ? Color.cascadeOnAccent : Color.cascadeText)
-                .padding(.horizontal, CascadeMetrics.s3)
-                .padding(.vertical, CascadeMetrics.s2 + 1)
-                .background(mine ? Color.cascadeAccent : Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay(mine ? nil : RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
-            if !mine { Spacer(minLength: 32) }
+                .padding(.horizontal, CascadeMetrics.s3 + 1)
+                .padding(.vertical, CascadeMetrics.s2 + 2)
+                .background(
+                    mine
+                        ? AnyShapeStyle(
+                            LinearGradient(
+                                colors: [Color.cascadeAgent, Color.cascadeAgent.opacity(0.8)],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        )
+                        : AnyShapeStyle(Color.cascadePanel2),
+                    in: UnevenRoundedRectangle(cornerRadii: corners, style: .continuous)
+                )
+                .overlay(
+                    mine
+                        ? nil
+                        : UnevenRoundedRectangle(cornerRadii: corners, style: .continuous)
+                            .stroke(Color.cascadeBorder, lineWidth: 1)
+                )
+            if !mine { Spacer(minLength: 40) }
         }
     }
 }

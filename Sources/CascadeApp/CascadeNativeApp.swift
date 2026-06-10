@@ -20,24 +20,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit Cascade", action: #selector(quitCascade), keyEquivalent: "q"))
         statusItem?.menu = menu
 
-        enterFullScreen(attempt: 0)
+        // The app opens as a regular window — fullscreen stays one click away
+        // (the top-bar expand button, ⌃⌘F, or the green traffic light).
+        markFullScreenCapable(attempt: 0)
     }
 
-    /// Launches Cascade in macOS fullscreen. SwiftUI's WindowGroup creates the
-    /// window slightly after launch, so we retry until it exists, then toggle
-    /// fullscreen once.
-    private func enterFullScreen(attempt: Int) {
+    /// SwiftUI's WindowGroup creates the window slightly after launch; retry until
+    /// it exists, then mark it fullscreen-primary so the toggle works, WITHOUT
+    /// entering fullscreen automatically.
+    private func markFullScreenCapable(attempt: Int) {
         Task { @MainActor [weak self] in
             guard let self else { return }
             try? await Task.sleep(for: .milliseconds(attempt == 0 ? 200 : 120))
             guard let window = NSApp.windows.first(where: { $0.canBecomeMain }) else {
-                if attempt < 50 { self.enterFullScreen(attempt: attempt + 1) }
+                if attempt < 50 { self.markFullScreenCapable(attempt: attempt + 1) }
                 return
             }
             window.collectionBehavior.insert(.fullScreenPrimary)
-            if !window.styleMask.contains(.fullScreen) {
-                window.toggleFullScreen(nil)
-            }
         }
     }
 
