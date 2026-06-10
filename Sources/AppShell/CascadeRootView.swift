@@ -1401,6 +1401,15 @@ private struct WasteCard: View {
                 Text("…and \(steps.count - Self.previewSteps) more steps")
                     .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText4)
             }
+            if CascadeAppModel.runsInBackground(apps: waste.apps) {
+                HStack(spacing: 5) {
+                    Image(systemName: "macwindow.on.rectangle")
+                        .font(.system(size: 10)).foregroundStyle(Color.cascadeAgent)
+                    Text("Runs in the background sandbox — your screen stays yours.")
+                        .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
+                }
+                .padding(.top, 2)
+            }
         }
     }
 }
@@ -1448,6 +1457,9 @@ private struct AgentCard: View {
         }
         if let last = agent.lastRunAt {
             summary += " · last \(last.formatted(date: .omitted, time: .shortened))"
+        }
+        if CascadeAppModel.runsInBackground(apps: agent.apps) {
+            summary += " · runs in background"
         }
         return summary
     }

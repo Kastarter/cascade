@@ -99,16 +99,19 @@ public struct WasteDetector: Sendable {
                 guard nonOverlapping.count >= 2 else { continue }
                 let representativeStart = nonOverlapping.max()!
                 let instance = Array(events[representativeStart..<representativeStart + length])
-                // A workflow is something an agent can DO for you. Scrolling and
-                // reading isn't it, and neither is plain typing (people type in
-                // the same app all day) — demand at least two real actions AND
-                // one discrete step (a click or shortcut) that gives the
-                // repetition automatable structure.
-                let meaningful = instance.filter { $0.kind != .scroll }
-                let hasDiscreteAction = meaningful.contains {
-                    $0.kind == .click || $0.kind == .doubleClick || $0.kind == .rightClick || $0.kind == .key
-                }
-                guard meaningful.count >= 2, hasDiscreteAction else { continue }
+                // A workflow is something an agent can DO for you, and that
+                // means STRUCTURE: clicks on UI elements and command shortcuts.
+                // Plain typing, bare editing keys (Delete, Return, arrows), and
+                // scrolling are content editing — "Delete · Delete · type" is
+                // someone fixing a sentence, and nobody wants an agent that
+                // re-presses Delete for them. Demand two structural actions
+                // plus one intent marker: a click on a *named* element, a real
+                // shortcut, or a cross-app flow. Two anonymous clicks in a
+                // browser are reading, not a workflow.
+                let structuralCount = instance.count(where: Self.isStructural)
+                let hasIntentMarker = instance.contains(where: Self.isIntentMarker)
+                    || Set(instance.map(\.appName)).count >= 2
+                guard structuralCount >= 2, hasIntentMarker else { continue }
                 results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
@@ -219,6 +222,34 @@ public struct WasteDetector: Sendable {
         case .type: .type
         case .key: .key
         case .scroll: .scroll
+        }
+    }
+
+    /// Clicks and modifier shortcuts give a repetition automatable structure.
+    /// Bare keys (Delete, Return, arrows, characters) and typing are content
+    /// editing — they ride along in a recipe but never justify one.
+    private static func isStructural(_ event: InputEvent) -> Bool {
+        switch event.kind {
+        case .click, .doubleClick, .rightClick:
+            return true
+        case .key:
+            return event.modifiers.contains("command") || event.modifiers.contains("control")
+        case .type, .scroll:
+            return false
+        }
+    }
+
+    /// Evidence the repetition is deliberate: a click on an element the recorder
+    /// could NAME (its AX label), or a command shortcut. Anonymous same-app
+    /// clicking is how people read.
+    private static func isIntentMarker(_ event: InputEvent) -> Bool {
+        switch event.kind {
+        case .click, .doubleClick, .rightClick:
+            return !(event.text ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        case .key:
+            return event.modifiers.contains("command") || event.modifiers.contains("control")
+        case .type, .scroll:
+            return false
         }
     }
 

@@ -25,6 +25,8 @@ public struct BackgroundAgentRun: Identifiable, Sendable {
     public var snapshot: Data?
     public var done: Bool
     public var result: String?
+    /// Set when this run deploys a saved agent — completion feeds its run count.
+    public var agentID: Int64?
 }
 
 @MainActor
@@ -423,7 +425,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Spawns a background agent that carries out `task` inside the isolated web
     /// sandbox (its own hidden browser), streaming progress to a small watch box —
     /// the user keeps using their Mac while it works.
-    public func createSandboxAgent(task: String) {
+    public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) {
         let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
         // Too vague to act on — ask rather than letting the agent wander (e.g. off
         // googling "how to create an agent").
@@ -441,7 +443,7 @@ public final class CascadeAppModel: ObservableObject {
         let runtime = BackgroundWebAgent()
         sandboxRuntimes[id] = runtime
         backgroundAgents.insert(
-            BackgroundAgentRun(id: id, task: trimmed, status: "Starting…", snapshot: nil, done: false, result: nil),
+            BackgroundAgentRun(id: id, task: trimmed, status: "Starting…", snapshot: nil, done: false, result: nil, agentID: agentID),
             at: 0
         )
         teachMessage = "Running in the background: \(trimmed)"
@@ -500,7 +502,17 @@ public final class CascadeAppModel: ObservableObject {
         teachMessage = "Background agent done — \(said)"
         assistMemory.remember(user: "[background agent finished: \(task)]", assistant: said)
         voice.speak(said)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)")) }
+        // A deployed saved agent finishing in the sandbox is a real completed
+        // run — it feeds the same reclaimed-time math as foreground replays.
+        let deployedAgentID = backgroundAgents.first(where: { $0.id == id })?.agentID
+        Task {
+            if let deployedAgentID {
+                try? await store.markAgentRun(id: deployedAgentID)
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: task))
+                await refreshAll()
+            }
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)"))
+        }
         // Leave the box up briefly so the user can glance at the result, then close it.
         Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide(id) }
     }
@@ -1447,12 +1459,46 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Runs a saved agent by replaying its recorded recipe on the real Mac — visible
+    /// Apps whose workflows can run in the isolated web sandbox instead of on
+    /// the user's real screen.
+    private nonisolated static let browserApps: Set<String> = [
+        "safari", "google chrome", "chrome", "chromium", "arc", "firefox",
+        "microsoft edge", "brave browser", "opera", "vivaldi", "zen browser", "dia",
+    ]
+
+    /// Whether a workflow's apps are all browsers — those agents deploy in the
+    /// BACKGROUND sandbox (your screen stays yours, saved sign-ins reused).
+    public nonisolated static func runsInBackground(apps: [String]) -> Bool {
+        !apps.isEmpty && apps.allSatisfy { browserApps.contains($0.lowercased()) }
+    }
+
+    /// The natural-language task a recorded web workflow becomes in the sandbox:
+    /// the agent there acts from intent (it has its own browser), not from
+    /// recorded screen coordinates that mean nothing inside the box.
+    static func sandboxTask(for agent: CascadeAgent) -> String {
+        var task = "Do this recurring web task the user normally does by hand: \(agent.name)."
+        if let hint = agent.recipe.steps.compactMap(\.windowTitleHint).first(where: { !$0.isEmpty }) {
+            task += " It normally happens on the page “\(String(hint.prefix(80)))”."
+        }
+        let steps = agent.recipe.humanSteps.filter { $0 != "type" && $0 != "scroll" }.prefix(6).joined(separator: ", ")
+        if !steps.isEmpty { task += " The user's recorded steps look like: \(steps)." }
+        task += " Carry it out and report the result."
+        return task
+    }
+
+    /// Runs a saved agent. Web workflows deploy as a BACKGROUND sandbox agent —
+    /// the work happens in a floating box while the user keeps their screen.
+    /// Everything else replays the recorded recipe on the real Mac — visible
     /// cursor, STOP valve, step cap, every action audited.
     public func deployAgent(_ agent: CascadeAgent) {
         guard !agentRunning else { return }
         guard !agent.recipe.steps.isEmpty else {
             agentMessage = "“\(agent.name)” has no recorded steps yet."
+            return
+        }
+        if Self.runsInBackground(apps: agent.apps) {
+            agentMessage = "Running “\(agent.name)” in the background sandbox."
+            createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id)
             return
         }
         driver.runState.reset()

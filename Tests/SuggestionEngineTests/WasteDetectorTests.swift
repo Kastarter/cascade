@@ -92,11 +92,48 @@ func recipeStepsCarryRealCoordinatesAndText() {
     var i = 0
     for _ in 0..<2 {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 42, y: 99, appName: "Safari")); i += 1
+        events.append(event(i, .key, app: "Safari", key: "l", modifiers: ["command"])); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "hello", appName: "Safari")); i += 1
     }
     let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
     #expect(waste.recipe.steps.contains { $0.kind == .click && $0.x == 42 && $0.y == 99 })
     #expect(waste.recipe.steps.contains { $0.kind == .type && $0.text == "hello" })
+}
+
+@Test
+func editingKeysAreNeverAWorkflow() {
+    // The real-world garbage this gate exists for: "Delete → Delete → type"
+    // in Chrome is someone fixing a sentence, not an automatable task.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<3 {
+        events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
+        events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "fix", appName: "Google Chrome")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func anonymousSameAppClickingIsNotAWorkflow() {
+    // Click, click, click around a browser — that's reading. No named element,
+    // no shortcut, one app: no agent.
+    let events = (0..<12).map { event($0, .click, app: "Google Chrome") }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
+@Test
+func clickPlusTypingAloneIsNotAWorkflow() {
+    // Click a field and type — that's just using a text box (the "type →
+    // Delete → type" cards). One structural action isn't a workflow.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<3 {
+        events.append(event(i, .click, app: "Google Chrome")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "words", appName: "Google Chrome")); i += 1
+        events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
 }
 
 @Test
