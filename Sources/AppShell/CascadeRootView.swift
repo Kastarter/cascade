@@ -1093,7 +1093,10 @@ private struct AgentCard: View {
                     Circle().fill(AppVisuals.color(for: agent.apps.first ?? agent.name)).frame(width: 8, height: 8)
                     Text(agent.name).font(.cascadeSans(15, .semibold))
                     Spacer()
-                    Toggle("", isOn: Binding(get: { agent.enabled }, set: onToggle))
+                    Toggle("", isOn: Binding(
+                        get: { agent.enabled },
+                        set: { enabled in onToggle(enabled) }
+                    ))
                         .labelsHidden().toggleStyle(.switch)
                 }
                 if !agent.apps.isEmpty { AppChips(apps: agent.apps) }

@@ -97,7 +97,12 @@ public struct WasteDetector: Sendable {
         }
 
         return results
-            .sorted { ($0.estimatedTotalSeconds, $1.signature) > ($1.estimatedTotalSeconds, $0.signature) }
+            .sorted { lhs, rhs in
+                if lhs.estimatedTotalSeconds != rhs.estimatedTotalSeconds {
+                    return lhs.estimatedTotalSeconds > rhs.estimatedTotalSeconds
+                }
+                return lhs.signature < rhs.signature
+            }
             .prefix(maxResults)
             .map { $0 }
     }
@@ -188,9 +193,22 @@ public struct WasteDetector: Sendable {
         return chosen
     }
 
+    /// The clicked element's own AX label is the strongest anchor; the recorded
+    /// screen context is the fallback. Contexts must come from the SAME app as the
+    /// event and pass the privacy gate — an anchor from an unrelated (or sensitive)
+    /// frame would re-target the replayed click at the wrong thing.
     private static func ocrAnchor(for event: InputEvent, contexts: [RecordedContext]) -> String? {
+        if let label = event.text, !label.trimmingCharacters(in: .whitespaces).isEmpty,
+           !PrivacyRules.isSensitiveText(label),
+           event.kind == .click || event.kind == .doubleClick || event.kind == .rightClick {
+            return String(label.prefix(60))
+        }
         let nearest = contexts
-            .filter { $0.capturedAt <= event.capturedAt }
+            .filter {
+                $0.capturedAt <= event.capturedAt
+                    && !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle)
+                    && ($0.bundleIdentifier == event.bundleIdentifier || $0.appName == event.appName)
+            }
             .max(by: { $0.capturedAt < $1.capturedAt })
         if let title = nearest?.windowTitle, !title.isEmpty { return String(title.prefix(60)) }
         if let ocr = nearest?.ocrText,
