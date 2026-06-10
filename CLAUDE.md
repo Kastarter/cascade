@@ -43,4 +43,5 @@
 - `suggestions` fetched but not rendered as a full card section; `screenAgentReady/Message` mostly unsurfaced.
 - VoiceListener (Apple Speech) is dead code superseded by RealtimeVoice.
 - No fonts bundled (Inter Tight / Instrument Serif / JetBrains Mono intended, system fallback used).
+- Audit 2026-06-10 additions: legacy `runAgent`/`runLoop` (single-step `proposeStep` path, used only by `deploySuggestion`) bypasses the modern episode loop AND its `captureNow()` bypasses PrivacyRules; `use_skill` pulls log to OSLog only, no `audit_event` row; Reel chat (`ask`/`showOnScreen`) doesn't share `AssistMemory` with the voice agent (two separate brains); `writeLocalArtifact` still audit-only stub; `LocalMacDriver.verify()` still shallow; keys still post system-wide (no tiptour per-PID posting), no AXSheet/AXDialog modal-pause, no local YOLO/OCR perception.
 - Reference repos cloned at /tmp/cascade-refs (clicky, openclicky, tiptour-macos, glide) — re-clone if gone.

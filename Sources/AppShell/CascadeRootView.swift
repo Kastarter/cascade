@@ -1080,13 +1080,8 @@ private struct CascadesScreen: View {
                         .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                 }
                 agentsSection
-                cascadeSection(
-                    title: "CASCADES FROM YOUR MANAGER",
-                    trailing: "\(model.visibleManagerCascades.count) pending",
-                    suggestions: model.visibleManagerCascades,
-                    fromManager: true,
-                    empty: "When your manager cascades an agent from the Manager dashboard, it lands here to review and deploy."
-                )
+                managerInboxSection
+                suggestionsSection
                 activitySection
             }
             .padding(.horizontal, CascadeMetrics.s6)
@@ -1114,16 +1109,43 @@ private struct CascadesScreen: View {
         }
     }
 
-    private func cascadeSection(title: String, trailing: String, suggestions: [AgentSuggestion], fromManager: Bool, empty: String) -> some View {
+    /// The persisted manager → employee inbox: pending cascades to review.
+    private var managerInboxSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: title, trailing: trailing)
-            if suggestions.isEmpty {
-                CascadePanel { EmptyState(title: "Nothing here yet", detail: empty) }
+            SectionLabel(title: "CASCADES FROM YOUR MANAGER", trailing: "\(model.visibleManagerCascades.count) pending")
+            if model.visibleManagerCascades.isEmpty {
+                CascadePanel { EmptyState(title: "Nothing here yet", detail: "When your manager cascades an agent from the Manager dashboard, it lands here to review and deploy.") }
             } else {
-                ForEach(suggestions) { suggestion in
+                ForEach(model.visibleManagerCascades) { cascade in
                     ManagerCascadeCard(
-                        suggestion: suggestion,
-                        fromManager: fromManager,
+                        eyebrow: "CASCADED FROM YOUR MANAGER",
+                        title: cascade.title,
+                        summary: cascade.summary,
+                        evidence: nil,
+                        fromManager: true,
+                        onDeploy: { model.deployCascade(cascade) },
+                        onDecline: { model.declineCascade(cascade) }
+                    )
+                }
+            }
+        }
+    }
+
+    /// What Cascade itself noticed in the local record — evidence-backed, one
+    /// click to run through the agent.
+    private var suggestionsSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "SUGGESTED BY CASCADE", trailing: "\(model.visibleSuggestions.count) from your record")
+            if model.visibleSuggestions.isEmpty {
+                CascadePanel { EmptyState(title: "No suggestions yet", detail: "As Cascade records your work, repeated patterns surface here as ready-to-run suggestions.") }
+            } else {
+                ForEach(model.visibleSuggestions) { suggestion in
+                    ManagerCascadeCard(
+                        eyebrow: "DETECTED · \(suggestion.kind.rawValue.uppercased()) · \(Int(suggestion.confidence * 100))% CONFIDENCE",
+                        title: suggestion.title,
+                        summary: suggestion.summary,
+                        evidence: suggestion.evidence.first,
+                        fromManager: false,
                         onDeploy: { model.deploySuggestion(suggestion) },
                         onDecline: { model.declineSuggestion(suggestion) }
                     )
@@ -1309,7 +1331,12 @@ private struct ManagerScreen: View {
                         CascadePanel { EmptyState(title: "No cascades sent", detail: "Compose an automation above to cascade it to this employee's Cascades inbox.") }
                     } else {
                         ForEach(model.managerCascades) { cascade in
-                            AgentActivityRow(event: AuditEvent(actor: "manager", action: "cascade.sent", detail: cascade.title))
+                            AgentActivityRow(event: AuditEvent(
+                                createdAt: cascade.createdAt,
+                                actor: "manager",
+                                action: "cascade.\(cascade.status.rawValue)",
+                                detail: cascade.title
+                            ))
                         }
                     }
                 }
@@ -1397,16 +1424,13 @@ private struct ComposeBox: View {
 }
 
 private struct ManagerCascadeCard: View {
-    let suggestion: AgentSuggestion
+    let eyebrow: String
+    let title: String
+    let summary: String
+    let evidence: String?
     var fromManager: Bool = false
     let onDeploy: () -> Void
     let onDecline: () -> Void
-
-    private var eyebrow: String {
-        fromManager
-            ? "CASCADED FROM YOUR MANAGER"
-            : "DETECTED · \(suggestion.kind.rawValue.uppercased()) · \(Int(suggestion.confidence * 100))% CONFIDENCE"
-    }
 
     var body: some View {
         HStack(alignment: .top, spacing: CascadeMetrics.s4) {
@@ -1416,9 +1440,9 @@ private struct ManagerCascadeCard: View {
             VStack(alignment: .leading, spacing: CascadeMetrics.s1 + 2) {
                 Text(eyebrow)
                     .font(.cascadeMono(10, .semibold)).foregroundStyle(Color.cascadeAgent)
-                Text(suggestion.title).font(.cascadeSans(15, .semibold))
-                Text(suggestion.summary).font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2).lineLimit(2)
-                if let evidence = suggestion.evidence.first {
+                Text(title).font(.cascadeSans(15, .semibold))
+                Text(summary).font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2).lineLimit(2)
+                if let evidence {
                     Text("↳ \(evidence)").font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
                 }
             }
