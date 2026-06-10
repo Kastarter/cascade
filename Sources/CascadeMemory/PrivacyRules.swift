@@ -35,4 +35,12 @@ public enum PrivacyRules {
         ].joined(separator: " ").lowercased()
         return sensitiveKeywords.contains { haystack.contains($0) }
     }
+
+    /// Gate for a single piece of captured text (e.g. the AX label of a clicked
+    /// element) when the surrounding app/window already passed: the text itself
+    /// must not smuggle a sensitive phrase into the store.
+    public static func isSensitiveText(_ text: String) -> Bool {
+        let haystack = text.lowercased()
+        return sensitiveKeywords.contains { haystack.contains($0) }
+    }
 }

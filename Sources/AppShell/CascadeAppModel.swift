@@ -91,6 +91,18 @@ public final class CascadeAppModel: ObservableObject {
     private var sandboxRuntimes: [UUID: BackgroundWebAgent] = [:]
     private let sandboxBox = SandboxBoxController()
     private let elementLocator = ElementLocator()
+    /// Rolling conversation memory for the voice/hotkey assistant — follow-up
+    /// questions resolve against it ("now reply to the first one").
+    public let assistMemory = AssistMemory()
+    /// Where the previous teach turn went, so a referential follow-up ("the second
+    /// one too") inherits the route instead of being re-classified from scratch.
+    private enum TeachRoute { case action, locate }
+    private var lastTeachRoute: TeachRoute?
+    /// Bumped by every new teach turn. Running assist loops check it each
+    /// iteration and stand down when superseded — without this, the new turn's
+    /// `runState.reset()` could revive a loop the barge-in just stopped, leaving
+    /// two loops fighting over the same cursor.
+    private var assistGeneration = 0
     private var cancellables: Set<AnyCancellable> = []
     private var lastSettingsOpen = Date.distantPast
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
@@ -141,7 +153,12 @@ public final class CascadeAppModel: ObservableObject {
             self?.driver.runState.requestStop()
             self?.guidanceOverlay.hide()
         }
-        pushToTalk.onPress = { [weak self] in self?.voice.beginTalking() }
+        pushToTalk.onPress = { [weak self] in
+            self?.voice.beginTalking()
+            // The user is about to ask for something on screen — warm the capture
+            // pipeline now so the screenshot is cheap when they finish speaking.
+            ScreenCaptureUtility.prewarm()
+        }
         pushToTalk.onRelease = { [weak self] in self?.voice.endTalking() }
         pushToTalk.start()
         dock.onStop = { [weak self] in
@@ -243,14 +260,17 @@ public final class CascadeAppModel: ObservableObject {
                 await answerAsText(q)
                 return
             }
-            guard let screen,
-                  let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true),
-                  let png = sample.imagePNG else {
+            guard let screen else {
+                conversation.append(QATurn(question: q, answer: "Grant Screen Recording so I can see your screen."))
+                return
+            }
+            let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
                 conversation.append(QATurn(question: q, answer: "Grant Screen Recording so I can see your screen."))
                 return
             }
             let guidance = await elementLocator.guide(
-                screenshot: png,
+                screenshot: shot,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
                 displayHeightPoints: Int(screen.frame.height)
@@ -397,6 +417,7 @@ public final class CascadeAppModel: ObservableObject {
             at: 0
         )
         teachMessage = "Running in the background: \(trimmed)"
+        assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
         voice.speak("On it. I'll handle that in the background.")
         sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed) { [weak self] in
             self?.stopSandboxAgent(id)
@@ -449,6 +470,7 @@ public final class CascadeAppModel: ObservableObject {
 
         sandboxRuntimes[id] = nil
         teachMessage = "Background agent done — \(said)"
+        assistMemory.remember(user: "[background agent finished: \(task)]", assistant: said)
         voice.speak(said)
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)")) }
         // Leave the box up briefly so the user can glance at the result, then close it.
@@ -506,38 +528,62 @@ public final class CascadeAppModel: ObservableObject {
             createSandboxAgent(task: Self.backgroundTask(from: q))
             return
         }
-        let wantsAction = Self.isActionRequest(q)
+        // Every new turn supersedes whatever an earlier turn is still doing. The
+        // token is captured HERE, synchronously, so a stale task suspended in an
+        // await can never pick up the newer generation after resuming.
+        assistGeneration += 1
+        let gen = assistGeneration
+        // "Click that / open it" right after Cascade pointed at something: act on
+        // the remembered element instantly — no vision round-trip (openclicky's
+        // last-pointed-element pattern).
+        if Self.isBareReferentialClick(q), let pointed = assistMemory.freshPointed() {
+            clickRememberedElement(pointed, utterance: q, gen: gen)
+            return
+        }
+        // A referential follow-up inside a live conversation keeps the previous
+        // turn's route: "now do the second one" after an action stays an action even
+        // though the words alone wouldn't classify as one.
+        let referential = Self.isReferential(q) && assistMemory.isFollowUpWindowOpen()
+        let wantsAction = Self.isActionRequest(q) || (referential && lastTeachRoute == .action)
         let mouse = NSEvent.mouseLocation
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else { return }
         teachMessage = wantsAction ? "On it — looking at your screen…" : "Looking at your screen…"
         Task {
-            guard let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true),
-                  let png = sample.imagePNG else {
+            // Capture once, directly at the model resolution, as JPEG — no OCR, no
+            // full-resolution PNG. Every consumer (locator, agent episodes) declares
+            // this exact size, so the frame passes through to base64 untouched.
+            let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
                 teachMessage = "Grant Screen Recording so Cascade can see your screen."
                 voice.speak("I need Screen Recording permission to see your screen.")
                 voice.done()
                 return
             }
+            guard assistGeneration == gen else { return }  // superseded while capturing
 
             // Commands ("open X and do Y") run as a multi-step Computer Use loop so
             // Cascade finishes the whole task, not just the first click. Questions
             // ("where / how / show me X") stay single-shot: point and explain.
             if wantsAction {
-                await runAssistTask(goal: q, screen: screen, firstScreenshotPNG: png)
+                lastTeachRoute = .action
+                await runAssistTask(goal: q, screen: screen, firstScreenshotPNG: shot, gen: gen)
                 return
             }
+            lastTeachRoute = .locate
 
             // "Where do I find/do X" → frame the region with the dashed marquee.
             let region = await elementLocator.locateRegion(
-                screenshot: png,
+                screenshot: shot,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
-                displayHeightPoints: Int(screen.frame.height)
+                displayHeightPoints: Int(screen.frame.height),
+                conversation: assistMemory.historyForAPI()
             )
+            guard assistGeneration == gen else { return }  // superseded while locating
             guard let local = region.rect else {
                 // Not on the current screen — don't give up. Navigate (open the app/menu/
                 // tab, scroll) to surface it, then frame it.
-                await findAndReveal(question: q, screen: screen, firstScreenshotPNG: png)
+                await findAndReveal(question: q, screen: screen, firstScreenshotPNG: shot, gen: gen)
                 return
             }
 
@@ -547,12 +593,61 @@ public final class CascadeAppModel: ObservableObject {
             )
             guidanceOverlay.highlight(globalRect: globalRect)
             guidanceOverlay.present(atGlobalPoint: CGPoint(x: globalRect.midX, y: globalRect.midY), label: "here")
+            assistMemory.rememberPointed(label: q, globalPoint: CGPoint(x: globalRect.midX, y: globalRect.midY))
+            assistMemory.remember(user: q, assistant: region.speech)
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.region", detail: q))
             teachMessage = region.speech
             voice.speak(region.speech)
             voice.done()
             await refreshAll()
         }
+    }
+
+    /// Clicks the element Cascade just pointed at — the "click that" fast path.
+    private func clickRememberedElement(_ pointed: AssistMemory.PointedElement, utterance: String, gen: Int) {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointed.globalPoint) }) ?? NSScreen.main else { return }
+        let working = "Clicking what I pointed at…"
+        teachMessage = working
+        Task {
+            guard assistGeneration == gen else { return }  // superseded
+            driver.runState.reset()
+            let local = CGPoint(x: pointed.globalPoint.x - screen.frame.minX, y: pointed.globalPoint.y - screen.frame.minY)
+            let said: String
+            let clicked = await executeCU(.click(x: local.x, y: local.y), on: screen)
+            if clicked {
+                said = "Done — clicked it."
+            } else {
+                // executeCU surfaces permission failures into teachMessage; STOP
+                // leaves it untouched.
+                said = teachMessage == working ? "Stopped." : teachMessage
+            }
+            assistMemory.remember(user: utterance, assistant: said, ok: clicked)
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.clickPointed", detail: "\(utterance) → \(pointed.label)"))
+            teachMessage = said
+            voice.speak(said)
+            voice.done()
+        }
+    }
+
+    /// "Click that / open it / press that one" — referential commands that act on
+    /// the element Cascade last pointed at, with no new target named.
+    private static func isBareReferentialClick(_ text: String) -> Bool {
+        let t = text.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " .,!"))
+        let patterns = ["click that", "click it", "click there", "click this", "click that one",
+                        "press that", "press it", "press that one", "open that", "open it",
+                        "select that", "select it", "yes click", "tap that", "tap it"]
+        return patterns.contains { t == $0 || t.hasSuffix($0) } && t.count <= 28
+    }
+
+    /// Does the utterance lean on the conversation ("it", "that one", "the first
+    /// one", "now …") rather than naming its own target?
+    private static func isReferential(_ text: String) -> Bool {
+        let t = " " + text.lowercased() + " "
+        let markers = [" it ", " that ", " them ", " those ", " this one", " that one",
+                       " the first", " the second", " the third", " the last one",
+                       " same ", " again ", " too ", " also ", " what about", " and the "]
+        if markers.contains(where: { t.contains($0) }) { return true }
+        return t.hasPrefix(" now ") || t.hasPrefix(" then ")
     }
 
     /// Carries out a spoken command across as many steps as it takes — open the app
@@ -564,21 +659,37 @@ public final class CascadeAppModel: ObservableObject {
     /// reason — decides when the whole job is done. The blue companion cursor flies
     /// to each target so you can watch; STOP (and the caps) keep control with you,
     /// and every run is audited.
-    private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data) async {
+    private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
 
-        // Haiku keeps the up-front planning round-trip short; a one-part plan runs
-        // exactly like the old single loop, so simple commands lose almost nothing.
-        let plan = await AgentTaskPlanner(model: AnthropicModel.haiku).plan(for: goal, in: .onScreen)
+        // Haiku keeps the up-front planning round-trip short, and trivially simple
+        // commands skip the round-trip entirely — a one-part plan runs exactly like
+        // the old single loop. The conversation memo lets the planner split
+        // follow-ups ("now reply to the first one") against what just happened.
+        let plan: [AgentSubtask]
+        if Self.isSinglePartCommand(goal) {
+            plan = [AgentSubtask(task: goal)]
+        } else {
+            plan = await AgentTaskPlanner(model: AnthropicModel.haiku).plan(
+                for: goal, in: .onScreen, conversationContext: assistMemory.contextMemo()
+            )
+        }
         var findings: [(task: String, result: String)] = []
         var ranLongOn: String?
         var interrupted = false
         var shot: Data? = firstScreenshotPNG
 
+        // All frames in this run are captured at the model resolution as JPEG and
+        // pass through to base64 untouched.
+        let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+        func freshShot() async -> Data? {
+            await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h)
+        }
+
         parts: for (index, sub) in plan.enumerated() {
-            if driver.runState.isStopRequested { interrupted = true; break }
+            if driver.runState.isStopRequested || assistGeneration != gen { interrupted = true; break }
             let prefix = plan.count > 1 ? "Part \(index + 1)/\(plan.count) — " : ""
 
             // Jump straight to the part's app or site — instant, no vision round-trip.
@@ -591,7 +702,7 @@ public final class CascadeAppModel: ObservableObject {
             }
             if shot == nil {
                 try? await Task.sleep(for: .milliseconds(260))
-                shot = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false)?.imagePNG
+                shot = await freshShot()
             }
             guard let episodeShot = shot else {
                 teachMessage = "I lost sight of the screen — try again."
@@ -601,15 +712,15 @@ public final class CascadeAppModel: ObservableObject {
 
             var attempt = await runAssistEpisode(
                 goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: false),
-                prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot
+                prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot, gen: gen
             )
             // The model replied without doing anything — usually narration or a
             // question. One firmer retry on a fresh frame; its answer stands.
-            if case .finished(_, let acted) = attempt, !acted, !driver.runState.isStopRequested,
-               let retryShot = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false)?.imagePNG {
+            if case .finished(_, let acted) = attempt, !acted, !driver.runState.isStopRequested, assistGeneration == gen,
+               let retryShot = await freshShot() {
                 attempt = await runAssistEpisode(
                     goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: true),
-                    prefix: prefix, screen: screen, firstScreenshotPNG: retryShot
+                    prefix: prefix, screen: screen, firstScreenshotPNG: retryShot, gen: gen
                 )
             }
 
@@ -631,6 +742,9 @@ public final class CascadeAppModel: ObservableObject {
             teachMessage = summary
             voice.speak(summary)
             dock.show(title: ranLongOn == nil ? "Done" : "Paused", detail: summary)
+            assistMemory.remember(user: goal, assistant: summary)
+        } else {
+            assistMemory.remember(user: goal, assistant: teachMessage, ok: false)
         }
         guidanceOverlay.hide()
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: goal))
@@ -649,7 +763,7 @@ public final class CascadeAppModel: ObservableObject {
     /// re-observe until the model finishes, the user stops it, or the step budget
     /// runs out. Returns the model's closing line plus whether it acted at all.
     private func runAssistEpisode(
-        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data
+        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
         let agent = ComputerUseAgent(environmentNote: ComputerUseAgent.foregroundBrowserNote)
         let maxSteps = 28
@@ -657,11 +771,13 @@ public final class CascadeAppModel: ObservableObject {
             goal: goal,
             screenshot: firstScreenshotPNG,
             displayWidthPoints: Int(screen.frame.width),
-            displayHeightPoints: Int(screen.frame.height)
+            displayHeightPoints: Int(screen.frame.height),
+            conversation: assistMemory.historyForAPI()
         )
         var acted = false
         var count = 0
         while count < maxSteps {
+            if assistGeneration != gen { return .stopped }  // superseded by a newer turn
             if driver.runState.isStopRequested {
                 teachMessage = "Stopped. Control returned to you."
                 dock.show(title: "Stopped", detail: teachMessage)
@@ -827,16 +943,10 @@ public final class CascadeAppModel: ObservableObject {
     /// Current cursor position in CGEvent global (top-left) coordinates.
     private static func cursorCG() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
 
-    /// Captures the current screen (own windows excluded) as PNG for grounding calls.
-    /// OCR is skipped — the consumers read pixels, not the recognized text.
-    private static func captureScreenPNG() async -> Data? {
-        await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false)?.imagePNG
-    }
-
     /// "Where can I find/do X" when X isn't on the current screen: navigate (open the
     /// right app/menu/tab, scroll) to bring it into view, then frame it with the marquee.
     /// It reveals — it does NOT click the target itself. STOP-able and capped.
-    private func findAndReveal(question: String, screen: NSScreen, firstScreenshotPNG: Data) async {
+    private func findAndReveal(question: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
         teachMessage = "Let me find that for you…"
         voice.speak("One moment — let me find that.")
@@ -852,12 +962,14 @@ public final class CascadeAppModel: ObservableObject {
         var step = await navigator.begin(
             goal: "Surface on screen where the user can find or do: \(question)",
             screenshot: firstScreenshotPNG,
-            displayWidthPoints: dw, displayHeightPoints: dh
+            displayWidthPoints: dw, displayHeightPoints: dh,
+            conversation: assistMemory.historyForAPI()
         )
 
         let maxSteps = 6
         var count = 0
         while count < maxSteps {
+            if assistGeneration != gen { return }  // superseded by a newer turn
             if driver.runState.isStopRequested { teachMessage = "Stopped."; return }
             var failed = false
             for action in step.actions {
@@ -875,7 +987,8 @@ public final class CascadeAppModel: ObservableObject {
             // each loop turn costs ONE round-trip of wall-clock instead of two. If found,
             // the speculative nav step is just discarded.
             async let regionTask = elementLocator.locateRegion(
-                screenshot: shot, question: question, displayWidthPoints: dw, displayHeightPoints: dh
+                screenshot: shot, question: question, displayWidthPoints: dw, displayHeightPoints: dh,
+                conversation: assistMemory.historyForAPI()
             )
             async let nextStepTask = navigator.proceed(screenshot: shot)
 
@@ -887,6 +1000,8 @@ public final class CascadeAppModel: ObservableObject {
                 )
                 guidanceOverlay.highlight(globalRect: g)
                 guidanceOverlay.present(atGlobalPoint: CGPoint(x: g.midX, y: g.midY), label: "here")
+                assistMemory.rememberPointed(label: question, globalPoint: CGPoint(x: g.midX, y: g.midY))
+                assistMemory.remember(user: question, assistant: region.speech)
                 teachMessage = region.speech
                 voice.speak(region.speech)
                 voice.done()
@@ -902,6 +1017,7 @@ public final class CascadeAppModel: ObservableObject {
 
         guidanceOverlay.hide()
         teachMessage = "I opened a few things but couldn't surface that — it may not be here."
+        assistMemory.remember(user: question, assistant: teachMessage, ok: false)
         voice.speak("I couldn't bring that on screen.")
         voice.done()
     }
@@ -935,6 +1051,16 @@ public final class CascadeAppModel: ObservableObject {
         case "right": return (-step, 0)
         default: return (0, -step)
         }
+    }
+
+    /// Commands with no multi-part connectors skip the planner round-trip — a
+    /// single Computer Use episode handles them (exactly the pre-planner behavior),
+    /// saving ~a second of up-front latency on the most common short commands.
+    private static func isSinglePartCommand(_ text: String) -> Bool {
+        guard text.count < 60 else { return false }
+        let t = " " + text.lowercased() + " "
+        let connectors = [" then ", " after that ", " and then ", "; ", ", and ", " followed by "]
+        return !connectors.contains { t.contains($0) }
     }
 
     /// Heuristic: did the user ask Cascade to *do* something (act) vs *find/show*
@@ -1029,6 +1155,12 @@ public final class CascadeAppModel: ObservableObject {
         defer { agentRunning = false }
         let steps = agent.recipe.steps.sorted { $0.order < $1.order }
         var stoppedEarly = false
+        // Clicks whose effect could not be confirmed in a row. One is tolerated
+        // (some clicks legitimately change nothing the AX tree shows); two in a row
+        // means the recipe has drifted from the live UI — pause instead of plowing
+        // on blind (the tiptour-macos pattern).
+        var unverifiedStreak = 0
+        var verifyUnavailableLogged = false
         for (index, step) in steps.enumerated() {
             if driver.runState.isStopRequested {
                 agentMessage = "Stopped. Control returned to you."
@@ -1042,19 +1174,57 @@ public final class CascadeAppModel: ObservableObject {
                 continue
             }
             do {
-                // Grounded re-targeting: a click re-locates its target on the
-                // *current* screen via the recorded OCR anchor, so a moved window or
-                // shifted layout self-corrects instead of clicking a stale pixel.
                 if let x = step.x, let y = step.y,
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
-                    let target = await regroundedTarget(anchor: step.ocrAnchor, recorded: CGPoint(x: x, y: y))
+                    let recorded = CGPoint(x: x, y: y)
+                    // Tier 1: re-find the element by its recorded AX label in the
+                    // live tree. Tier 2: Claude vision via the OCR anchor. Tier 3:
+                    // the recorded pixel. The tier lands in the step's audit row so
+                    // a drifting recipe is diagnosable from the log.
+                    let target: CGPoint
+                    let tier: String
+                    if let axTarget = await Self.resolveByAX(step: step, recorded: recorded) {
+                        target = axTarget
+                        tier = "ax"
+                    } else {
+                        // Falls back to `recorded` itself when there's no anchor/key.
+                        target = await regroundedTarget(anchor: step.ocrAnchor, recorded: recorded)
+                        tier = target == recorded ? "recorded" : "vision"
+                    }
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.target", detail: "\(Self.recipeLabel(step)) via \(tier)"))
                     try await driver.act(.computerUse(.move(x: target.x, y: target.y)))
                     try? await Task.sleep(for: .milliseconds(320))
-                    if let action = AgentAction(recipeStep: Self.retargeted(step, to: target)) {
-                        try await driver.act(action)
+
+                    let before = await Self.uiFingerprint()
+                    if before == 0, !verifyUnavailableLogged {
+                        verifyUnavailableLogged = true
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
+                    }
+                    try await clickAction(step, at: target)
+                    if await Self.uiChanged(after: before) {
+                        unverifiedStreak = 0
+                    } else {
+                        // One corrective retry at the recorded coordinate (if the
+                        // resolved target differed), then count the step unverified.
+                        if target != recorded {
+                            try await clickAction(step, at: recorded)
+                        }
+                        if await Self.uiChanged(after: before) {
+                            unverifiedStreak = 0
+                        } else {
+                            unverifiedStreak += 1
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeLabel(step)))
+                            if unverifiedStreak >= 2 {
+                                agentMessage = "Paused “\(agent.name)” — the screen no longer matches the recorded steps. Take over, or re-record the workflow."
+                                dock.show(title: "Paused", detail: agentMessage)
+                                stoppedEarly = true
+                                break
+                            }
+                        }
                     }
                 } else if let action = AgentAction(recipeStep: step) {
                     try await driver.act(action)
+                    unverifiedStreak = 0
                 }
                 dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeLabel(step)))
@@ -1074,6 +1244,39 @@ public final class CascadeAppModel: ObservableObject {
         await refreshAll()
     }
 
+    /// Performs the step's click kind at a CG global point.
+    private func clickAction(_ step: RecipeStep, at point: CGPoint) async throws {
+        if let action = AgentAction(recipeStep: Self.retargeted(step, to: point)) {
+            try await driver.act(action)
+        }
+    }
+
+    /// Tier-1 target resolution: the element matching the step's recorded AX label
+    /// (stored in `text` for click steps), nearest to the recorded point. Runs off
+    /// the main actor — AX tree walks take tens of milliseconds.
+    private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> CGPoint? {
+        let label = step.text ?? step.ocrAnchor
+        guard let label, !label.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            AXElementResolver.find(label: label, near: recorded)?.center
+        }.value
+    }
+
+    private static func uiFingerprint() async -> Int {
+        await Task.detached(priority: .userInitiated) { AXElementResolver.frontmostFingerprint() }.value
+    }
+
+    /// Polls (5 × 80ms) for the frontmost AX tree to differ from `before`. A zero
+    /// `before` means AX was unavailable — verification is skipped, not failed.
+    private static func uiChanged(after before: Int) async -> Bool {
+        guard before != 0 else { return true }
+        for _ in 0..<5 {
+            try? await Task.sleep(for: .milliseconds(80))
+            if await uiFingerprint() != before { return true }
+        }
+        return false
+    }
+
     /// Activates an app and waits (up to ~2s) until it is actually frontmost, so the
     /// next step runs against the right window — a lightweight verify between steps.
     private func activateAndConfirm(name: String, bundle: String?) async {
@@ -1091,12 +1294,15 @@ public final class CascadeAppModel: ObservableObject {
     /// is no anchor, no key, or the locator can't find it.
     private func regroundedTarget(anchor: String?, recorded: CGPoint) async -> CGPoint {
         guard hasAnthropicKey, let anchor, !anchor.isEmpty,
-              let png = await Self.captureScreenPNG(),
               let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main else {
             return recorded
         }
+        let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
+            return recorded
+        }
         let guidance = await elementLocator.guide(
-            screenshot: png,
+            screenshot: shot,
             question: "Where is \(anchor)?",
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height)
