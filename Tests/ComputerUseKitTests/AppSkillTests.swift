@@ -329,6 +329,19 @@ struct AppSkillTests {
         }
     }
 
+    @Test func goalNamesAppForPreOpen() {
+        // Pre-opening the goal's named app before the first frame saves the
+        // ~8s the model spent opening it itself (2026-06-11m forensics).
+        let registry = AppSkillRegistry.load()
+        #expect(registry.appNamed(inGoal: "Open Keynote and create a title slide: Market Entry Readout") == "Keynote")
+        #expect(registry.appNamed(inGoal: "open the roadmap meeting notes on the screen in notes") == "Notes")
+        #expect(registry.appNamed(inGoal: "make a donut in blender") == "Blender")
+        // Longest match wins — never "Word" for "Microsoft Word".
+        #expect(registry.appNamed(inGoal: "Can you please open Microsoft Word for me?") == "Microsoft Word")
+        // No app named → no pre-open guesswork.
+        #expect(registry.appNamed(inGoal: "search my desktop for the falcon invoices") == nil)
+    }
+
     @Test func bundledKeynotePackIsBatchAligned() {
         // The 2026-06-11 readout run averaged ~0.5 actions/turn: the Keynote
         // skills predated turn batching, and their one-step-verify pacing

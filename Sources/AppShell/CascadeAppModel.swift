@@ -836,6 +836,16 @@ public final class CascadeAppModel: ObservableObject {
             await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h)
         }
 
+        // Beginning-latency fix (2026-06-11m forensics): single-part goals skip
+        // the planner and lose the parts loop's app pre-open below — the model
+        // then spent two turns (~8s) opening the app its own goal names. Open it
+        // before the first frame instead, so turn 1 already sees it frontmost.
+        if let first = plan.first, first.app.isEmpty,
+           let named = appSkills.appNamed(inGoal: goal) {
+            await executeCU(.openApp(named), on: screen)
+            if let fresh = await freshShot() { shot = fresh }
+        }
+
         parts: for (index, sub) in plan.enumerated() {
             if driver.runState.isStopRequested || assistGeneration != gen { interrupted = true; break }
             let prefix = plan.count > 1 ? "Part \(index + 1)/\(plan.count) — " : ""
@@ -1435,8 +1445,13 @@ public final class CascadeAppModel: ObservableObject {
                     .contains { $0.localizedName?.caseInsensitiveCompare(name) == .orderedSame }
                 if await Self.openApp(named: name) {
                     for _ in 0..<32 {
-                        if NSWorkspace.shared.frontmostApplication?.localizedName?
-                            .caseInsensitiveCompare(name) == .orderedSame { break }
+                        // Containment, not equality: the asked-for name and the
+                        // app's display name routinely differ ("Keynote" vs
+                        // "Keynote Creator Studio") — exact compare never matched
+                        // and silently burned the full 8s poll every open.
+                        if let front = NSWorkspace.shared.frontmostApplication?.localizedName,
+                           front.localizedCaseInsensitiveContains(name)
+                            || name.localizedCaseInsensitiveContains(front) { break }
                         try? await Task.sleep(for: .milliseconds(250))
                     }
                     if !wasAlreadyRunning {

@@ -399,7 +399,7 @@ public final class ComputerUseAgent {
         if skillProvider != nil {
             tools.insert([
                 "name": "use_skill",
-                "description": "Fetch the full instructions of one skill from the skill list in the first message. Skills are proven playbooks for specific apps and tasks. Whenever a listed skill matches what you are about to do, call this FIRST and follow the returned instructions — it is instant.",
+                "description": "Fetch the full instructions of one skill from the skill list in the first message. Skills are proven playbooks for specific apps and tasks. Whenever a listed skill matches what you are about to do, call this FIRST and follow the returned instructions — it is instant. Need several skills? Call use_skill for ALL of them in this SAME turn (multiple calls together) — they resolve in one instant hop; pulling them one turn at a time wastes a full round trip each.",
                 "input_schema": [
                     "type": "object",
                     "properties": ["name": ["type": "string", "description": "The skill's exact name from the list"]],

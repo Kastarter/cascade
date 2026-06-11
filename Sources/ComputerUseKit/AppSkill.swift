@@ -204,6 +204,37 @@ public struct AppSkillRegistry: Sendable {
         return skills.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
     }
 
+    /// The app a goal names, resolvable BEFORE the first model turn: matcher
+    /// names from every loaded skill plus stock apps that have no skill yet.
+    /// Longest name wins ("Microsoft Word" before "Word"); whole-word and
+    /// case-insensitive. Lets the orchestrator pre-open the app so the first
+    /// screenshot already shows it — the 2026-06-11 forensics measured two
+    /// model turns (~8s) spent opening the goal's own named app.
+    public func appNamed(inGoal goal: String) -> String? {
+        var candidates = Set(Self.stockApps)
+        for skill in skills {
+            for name in skill.hints.appMatchers?.names ?? [] where name.count >= 4 {
+                candidates.insert(name)
+            }
+        }
+        for name in candidates.sorted(by: { $0.count > $1.count }) {
+            let pattern = "(?i)\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b"
+            if goal.range(of: pattern, options: .regularExpression) != nil { return name }
+        }
+        return nil
+    }
+
+    /// Apps users name in goals that may not have a skill installed. Order is
+    /// irrelevant (matching sorts by length); names must be LaunchServices-
+    /// resolvable for `open -a`.
+    private static let stockApps = [
+        "Keynote", "Numbers", "Pages", "Safari", "Notes", "Mail", "Finder",
+        "Calendar", "Messages", "Reminders", "Preview", "TextEdit", "Music",
+        "Photos", "Microsoft Word", "Microsoft Excel", "Microsoft PowerPoint",
+        "Word", "Excel", "PowerPoint", "Google Chrome", "Chrome", "Blender",
+        "Figma", "Photoshop", "Xcode", "Terminal",
+    ]
+
     /// The one-line-per-skill index sent in the agent's first turn. Content is
     /// pulled via the use_skill tool, never pushed — this is all the prompt
     /// carries no matter how large the library grows.
