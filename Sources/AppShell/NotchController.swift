@@ -180,7 +180,7 @@ struct NotchView: View {
         // Tall enough that the control row sits fully below the housing line.
         case .expanded: CGSize(width: panelWidth - 8, height: baseNotch.height + 46)
         // Wider on both sides + a touch deeper — unmistakably "live".
-        case .live: CGSize(width: baseNotch.width + 190, height: baseNotch.height + 8)
+        case .live: CGSize(width: baseNotch.width + 230, height: baseNotch.height + 8)
         case .idle: baseNotch
         }
     }
@@ -241,27 +241,37 @@ struct NotchView: View {
     // Live: the talk hotkey is down (or the reply is in flight) — the notch
     // swells out both sides, and while listening the waveform bars track the
     // user's ACTUAL voice so they can see themselves being heard.
+    //
+    // CRITICAL LAYOUT RULE: the center of this pill is the physical camera
+    // housing — pixels there do not exist. Everything readable lives in the
+    // two WINGS, with a dead spacer exactly the hardware notch wide between.
     private var liveContent: some View {
-        HStack(spacing: 10) {
-            Image(systemName: voiceState == .listening ? "mic.fill" : "waveform")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent)
-            if voiceState == .listening {
-                SpeechWaveform(level: model.voice.inputLevel, color: Color.cascadeRecDot)
-                Text("Listening…")
-                    .font(.cascadeMono(11))
-                    .foregroundStyle(Color.cascadeText2)
-            } else {
-                Text("Thinking…")
-                    .font(.cascadeMono(11))
-                    .foregroundStyle(Color.cascadeText2)
+        let listening = voiceState == .listening
+        let tint = listening ? Color.cascadeRecDot : Color.cascadeAgent
+        return HStack(spacing: 0) {
+            // Left wing: mic + the speech-reactive bars.
+            HStack(spacing: 7) {
+                Image(systemName: listening ? "mic.fill" : "waveform")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(tint)
+                if listening {
+                    SpeechWaveform(level: model.voice.inputLevel, color: tint)
+                } else {
+                    NotchStatusDot(color: tint, pulsing: true)
+                }
             }
-            NotchStatusDot(
-                color: voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent,
-                pulsing: true
-            )
+            .frame(maxWidth: .infinity)
+            // The hardware notch — nothing rendered here is ever visible.
+            Color.clear.frame(width: baseNotch.width)
+            // Right wing: the state, in words.
+            Text(listening ? "Listening…" : "Thinking…")
+                .font(.cascadeMono(11))
+                .foregroundStyle(tint.opacity(0.92))
+                .lineLimit(1)
+                .fixedSize()
+                .frame(maxWidth: .infinity)
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 10)
         .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
         .onTapGesture { expandFromTap() }
     }
