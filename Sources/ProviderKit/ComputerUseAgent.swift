@@ -97,6 +97,7 @@ public final class ComputerUseAgent {
     /// chain costs zero screenshots.
     private let harnessTier: HarnessTier
     private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
+    private let elementsProvider: (@MainActor () async -> CUScreenElementsResult)?
 
     /// Mid-stream delivery: when set, each completed text block and screen action
     /// is handed over the moment it finishes generating, so the caller acts while
@@ -234,6 +235,25 @@ public final class ComputerUseAgent {
     and never type into the address bar — use open_url instead.
     """
 
+    /// The AX perception lane (idea ported from mediar-ai's MacosUseSDK, MIT —
+    /// see docs/PORT_MAP.md): exact labels + clickable coordinates without a
+    /// vision round trip. Resolves in-process like use_skill, so "where is the
+    /// checkbox" costs ~50ms instead of a zoom round trip.
+    static let screenElementsToolDefinition: [String: Any] = [
+        "name": "read_screen_elements",
+        "description": "Instantly list the frontmost window's real controls from the system accessibility tree: exact labels, current values, and clickable screenshot coordinates for every button, field, checkbox, link, and text. Use this FIRST to locate a control, read small text, or check a field/checkbox state — it is exact where pixels are ambiguous, and it replaces zooming and look-only turns. Then click the listed @(x,y) center directly. Canvas apps (3D viewports, drawing surfaces) may return little or nothing — the screenshot is the ground truth there.",
+        "input_schema": ["type": "object", "properties": [String: Any]()],
+    ]
+
+    static let axPerceptionNote = """
+    Screen elements: the read_screen_elements tool lists the frontmost window's \
+    controls with exact labels and screenshot coordinates, instantly. Prefer it \
+    over zooming, re-observing, or guessing whenever you need to FIND a control, \
+    READ small text, or CHECK a value — then act on the listed coordinates in the \
+    same turn. A thin or empty result means the app paints its own canvas: work \
+    from the screenshot. The screenshot stays the truth for layout and imagery.
+    """
+
     public init(
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         model: String = AnthropicModel.sonnet,
@@ -241,7 +261,8 @@ public final class ComputerUseAgent {
         environmentNote: String? = nil,
         skillProvider: ((String) -> String?)? = nil,
         harnessTier: HarnessTier = .off,
-        harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil
+        harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
+        elementsProvider: (@MainActor () async -> CUScreenElementsResult)? = nil
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -250,6 +271,7 @@ public final class ComputerUseAgent {
         self.skillProvider = skillProvider
         self.harnessTier = harnessProvider == nil ? .off : harnessTier
         self.harnessProvider = harnessProvider
+        self.elementsProvider = elementsProvider
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -396,6 +418,9 @@ public final class ComputerUseAgent {
         if harnessTier != .off {
             tools.insert(contentsOf: Self.harnessToolDefinitions(tier: harnessTier), at: tools.count - 1)
         }
+        if elementsProvider != nil {
+            tools.insert(Self.screenElementsToolDefinition, at: tools.count - 1)
+        }
         if skillProvider != nil {
             tools.insert([
                 "name": "use_skill",
@@ -413,6 +438,7 @@ public final class ComputerUseAgent {
         case .readOnly: system += "\n\n" + Self.harnessReadOnlyNote
         case .full: system += "\n\n" + Self.harnessReadOnlyNote + "\n\n" + Self.harnessPowerNote
         }
+        if elementsProvider != nil { system += "\n\n" + Self.axPerceptionNote }
         if let environmentNote { system += "\n\n" + environmentNote }
         // Adaptive thinking is Anthropic's benchmarked setup for computer use on
         // Sonnet 4.6: the model plans before acting, and fewer wrong clicks means
@@ -483,6 +509,19 @@ public final class ComputerUseAgent {
                     }
                 case "highlight":
                     if let action = parseHighlight(input) { actions.append(action) }
+                case "read_screen_elements":
+                    // The perception lane: resolved in-process like use_skill,
+                    // so find→click chains never burn a screenshot round trip.
+                    if let id = block["id"] as? String {
+                        if let elementsProvider {
+                            let result = await elementsProvider()
+                            toolResultOverrides[id] = CUScreenElementRenderer.render(
+                                result, resW: resW, resH: resH, displayW: displayW, displayH: displayH
+                            )
+                        } else {
+                            toolResultOverrides[id] = "Screen element reading isn't available in this run."
+                        }
+                    }
                 case let name? where AgentHarness.isHarnessTool(name):
                     // Resolved in-process like use_skill — search/read/run chains
                     // never touch the screenshot loop. The provider owns audit,

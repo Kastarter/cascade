@@ -974,6 +974,14 @@ public final class CascadeAppModel: ObservableObject {
             harnessProvider: { [weak self] name, input in
                 guard let self else { return "Cascade is shutting down — stop." }
                 return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
+            },
+            // The AX perception lane: exact labels + clickable coordinates for
+            // the window the agent is working in, resolved without a screenshot
+            // round trip. Gated like every other read (STOP, axUnreliable
+            // skills, privacy rules) and audited per call.
+            elementsProvider: { [weak self] in
+                guard let self else { return .unavailable("Cascade is shutting down — stop.") }
+                return await self.readScreenElements(screen: screen, gen: gen)
             }
         )
         // Runaway backstop, not a budget. The episode's real terminators are the
@@ -1505,6 +1513,56 @@ public final class CascadeAppModel: ObservableObject {
     private func frontmostSkill() -> AppSkill? {
         let front = NSWorkspace.shared.frontmostApplication
         return appSkills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+    }
+
+    /// The agent's read_screen_elements call: harvest the frontmost window's
+    /// controls and map them into the capture screen's point space (top-left
+    /// origin) — the renderer scales into screenshot pixels from there. The
+    /// harvest runs off the main actor because a busy app can sit on AX
+    /// requests; results are bounded by the harvester's own caps.
+    private func readScreenElements(screen: NSScreen, gen: Int) async -> CUScreenElementsResult {
+        if assistGeneration != gen || driver.runState.isStopRequested {
+            return .unavailable("Stopped.")
+        }
+        guard let front = NSWorkspace.shared.frontmostApplication else {
+            return .unavailable("No app is frontmost — work from the screenshot.")
+        }
+        let appName = front.localizedName ?? "this app"
+        // Canvas apps (Blender, Figma, Photoshop) report phantom AX state —
+        // the same flag that steers click tiers gates the perception lane.
+        if frontmostSkill()?.axUnreliable == true {
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ax.read", detail: "\(appName) · denied: axUnreliable"))
+            return .unavailable("\(appName)'s accessibility tree is unreliable — work from the screenshot instead.")
+        }
+        let pid = front.processIdentifier
+        let harvested = await Task.detached { AXElementHarvester.elements(forWindowOfPID: pid) }.value
+        // AX reports Quartz global coordinates (top-left of the primary
+        // display); the agent's space is the capture screen, top-left origin.
+        // Mirror of toCGGlobal + globalAppKit, inverted.
+        let primaryHeight = (NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main)?.frame.height ?? screen.frame.height
+        let screenQuartzTop = primaryHeight - screen.frame.maxY
+        let mapped: [CUScreenElement] = harvested.compactMap { element in
+            let local = CGRect(
+                x: element.frame.origin.x - screen.frame.minX,
+                y: element.frame.origin.y - screenQuartzTop,
+                width: element.frame.width,
+                height: element.frame.height
+            )
+            // The window can span displays; elements off the capture screen
+            // would render as out-of-range click targets.
+            guard local.maxX > 0, local.maxY > 0,
+                  local.minX < screen.frame.width, local.minY < screen.frame.height else { return nil }
+            return CUScreenElement(role: element.role, label: element.label, value: element.value, enabled: element.enabled, frame: local)
+        }
+        // Same fence as the recorder and the harness: content the user marked
+        // private never enters the model's context as text.
+        let joined = mapped.map { "\($0.label) \($0.value)" }.joined(separator: " ")
+        if PrivacyRules.isSensitiveText(joined) {
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ax.read", detail: "\(appName) · denied: privacy"))
+            return .unavailable("This screen matches the user's privacy rules — Cascade won't read it as text. Work from the screenshot.")
+        }
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ax.read", detail: "\(appName) · \(mapped.count) elements"))
+        return .elements(mapped)
     }
 
     /// Pointer-routed apps (Blender) send hotkeys to the editor at the position

@@ -178,6 +178,18 @@ Cascade divergences:
   markdown body carries all prompt instructions).
 - Only files named `SKILL.md` load (TipTour also accepts other `.md` names).
 
+## AX Perception Lane (read_screen_elements)
+
+| Source | What was taken | Where it landed |
+| --- | --- | --- |
+| `mediar-ai/MacosUseSDK` (MIT) — `AccessibilityTraversal.swift` | The *idea* and element shape (role/text/bounds per element, visible-only filter, flat list for the model) — no code copied; Cascade's walk reuses `AXTextHarvester`'s bounded iterative DFS | `Sources/MacContextKit/AXElementHarvester.swift` |
+| `m13v/fazm` (MIT) | The hybrid policy: AX tree first for finding/reading controls, screenshots stay the ground truth for layout/canvas apps | `ComputerUseAgent.axPerceptionNote` + `read_screen_elements` tool description |
+
+Deliberately NOT taken: `mediar-ai/mcp-server-macos-use` is BSL 1.1 (non-production
+license) — reference only, never port code from it. Fazm's action execution and
+MCP plumbing are also skipped: Cascade's actuator owns STOP/audit/paste gates and
+must stay the only thing that posts events.
+
 ## Known Architecture Risks To Avoid
 
 - Do not copy `CompanionManager.swift` wholesale from any repo.
