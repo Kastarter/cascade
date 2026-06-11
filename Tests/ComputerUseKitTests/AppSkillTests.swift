@@ -351,6 +351,22 @@ struct AppSkillTests {
         #expect(registry.appNamed(inGoal: "create a word document", installedNames: installed) == "Microsoft Word")
         // No app named → no pre-open guesswork.
         #expect(registry.appNamed(inGoal: "search my desktop for the falcon invoices", installedNames: installed) == nil)
+        // The host app never nominates itself: every demo goal says "for
+        // Cascade", and the tie against Keynote resolved to Cascade before
+        // this guard — pre-opening Cascade over the real target.
+        let withSelf = installed + ["Cascade"]
+        #expect(
+            registry.appNamed(
+                inGoal: "Open Keynote and make a market entry readout for Cascade",
+                installedNames: withSelf, excludingHost: "Cascade"
+            ) == "Keynote Creator Studio"
+        )
+        #expect(
+            registry.appNamed(
+                inGoal: "make a market entry readout for Cascade",
+                installedNames: withSelf, excludingHost: "Cascade"
+            ) == nil
+        )
         // The real installed enumeration returns something on any Mac.
         #expect(!AppSkillRegistry.installedAppNames().isEmpty)
     }

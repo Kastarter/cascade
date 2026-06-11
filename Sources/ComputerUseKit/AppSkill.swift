@@ -215,9 +215,17 @@ public struct AppSkillRegistry: Sendable {
     /// Lets the orchestrator pre-open the app before the first frame — the
     /// 2026-06-11 forensics measured two model turns (~8s) spent opening the
     /// goal's own named app.
-    public func appNamed(inGoal goal: String, installedNames: [String]? = nil) -> String? {
+    public func appNamed(
+        inGoal goal: String,
+        installedNames: [String]? = nil,
+        excludingHost host: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+    ) -> String? {
         var best: (name: String, score: (Int, Int))?
         for app in installedNames ?? Self.installedAppNames() {
+            // The host app never nominates itself: every Cascade goal mentions
+            // "Cascade" ("market entry readout for Cascade"), and a tie against
+            // the real target app would pre-open Cascade over Keynote.
+            if let host, app.caseInsensitiveCompare(host) == .orderedSame { continue }
             let words = app.split(separator: " ").map(String.init)
             let matched = words.filter { word in
                 word.count >= 4 && goal.range(
