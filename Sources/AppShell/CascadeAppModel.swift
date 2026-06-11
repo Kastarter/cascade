@@ -1158,6 +1158,7 @@ public final class CascadeAppModel: ObservableObject {
                     }
                 }
                 if let watched {
+                    dock.show(title: "Blocked a script", detail: "\(name) targeting \(watched) — the task stays on screen.")
                     _ = try? await store.appendAudit(AuditEvent(
                         actor: "agent", action: "harness.denied.watched-app", detail: "\(name) → \(watched)"
                     ))
