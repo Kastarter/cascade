@@ -892,6 +892,9 @@ public final class CascadeAppModel: ObservableObject {
         // model finishing, STOP / barge-in, stall detection, or a newer turn
         // superseding this one — a low cap here just killed long honest tasks.
         let maxSteps = 80
+        let episodeStart = ContinuousClock.now
+        var modelTime = Duration.zero
+        var actionTime = Duration.zero
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
@@ -901,6 +904,7 @@ public final class CascadeAppModel: ObservableObject {
             note: groundingNote(),
             skillIndex: appSkills.indexText
         )
+        modelTime += episodeStart.duration(to: .now)  // begin() IS the first model turn
         var acted = false
         var count = 0
         // Stall guard: a turn with no actions and no done is the model talking
@@ -909,9 +913,6 @@ public final class CascadeAppModel: ObservableObject {
         // the step cap repeating the same line.
         var idleTurns = 0
         var nudge: String?
-        let episodeStart = ContinuousClock.now
-        var modelTime = Duration.zero
-        var actionTime = Duration.zero
         func auditTiming(outcome: String) {
             let total = episodeStart.duration(to: .now)
             let detail = "\(outcome) · \(count + 1) turns · total \(Int(total / .milliseconds(1)))ms · model \(Int(modelTime / .milliseconds(1)))ms · actions \(Int(actionTime / .milliseconds(1)))ms"
@@ -1130,9 +1131,10 @@ public final class CascadeAppModel: ObservableObject {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y))) }
                 }
             case .drag(let fromX, let fromY, let toX, let toY):
-                // The companion cursor traces the drag so the user sees the motion.
-                guidanceOverlay.navigate(toGlobalPoint: globalAppKit(fromX, fromY))
-                try? await Task.sleep(for: .milliseconds(150))
+                // The companion cursor traces the drag so the user sees the motion —
+                // and like clicks, the press waits for it to actually ARRIVE.
+                let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(fromX, fromY))
+                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
                 guidanceOverlay.press()
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(toX, toY))
                 let from = cg(fromX, fromY)
