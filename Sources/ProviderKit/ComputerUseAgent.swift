@@ -324,7 +324,12 @@ public final class ComputerUseAgent {
         }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 40
+        // Idle (inter-byte) timer, not a total cap. SSE keeps it fed with deltas
+        // on healthy turns, but thinking-summary chunks can gap for tens of
+        // seconds — at 40s a false kill silently cost a salvage + full retry
+        // (≈45s of frozen cursor). 90s only ever matters on a genuinely dead
+        // connection; liveness on healthy turns comes from the stream itself.
+        request.timeoutInterval = 90
         request.setValue(key, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -658,7 +663,7 @@ public final class ComputerUseAgent {
             (bytes, response) = try await URLSession.shared.bytes(for: request)
         } catch {
             guard canRetry else { return .fatal }
-            Self.logger.info("step transport error — retrying once: \(error.localizedDescription, privacy: .public)")
+            Self.logger.notice("step transport error — retrying once: \(error.localizedDescription, privacy: .public)")
             return .retry(after: nil)
         }
         guard let http = response as? HTTPURLResponse else { return .fatal }
@@ -667,7 +672,7 @@ public final class ComputerUseAgent {
                 Self.logger.error("step failed — HTTP \(http.statusCode)")
                 return .fatal
             }
-            Self.logger.info("step got HTTP \(http.statusCode) — retrying once")
+            Self.logger.notice("step got HTTP \(http.statusCode) — retrying once")
             return .retry(after: http.value(forHTTPHeaderField: "retry-after").flatMap(Double.init))
         }
 
@@ -748,7 +753,7 @@ public final class ComputerUseAgent {
             return canRetry ? .retry(after: nil) : .fatal
         }
         if message.stopReason == nil, hasToolUse { message.stopReason = "tool_use" }
-        Self.logger.info("salvaged \(message.content.count) blocks from a broken stream")
+        Self.logger.notice("salvaged \(message.content.count) blocks from a broken stream")
         return .success(message)
     }
 
@@ -864,7 +869,7 @@ public final class ComputerUseAgent {
         let cacheRead = (usage["cache_read_input_tokens"] as? NSNumber)?.intValue ?? 0
         let cacheWrite = (usage["cache_creation_input_tokens"] as? NSNumber)?.intValue ?? 0
         let output = (usage["output_tokens"] as? NSNumber)?.intValue ?? 0
-        logger.info("step tokens — input: \(input), cache read: \(cacheRead), cache write: \(cacheWrite), output: \(output)")
+        logger.notice("step tokens — input: \(input), cache read: \(cacheRead), cache write: \(cacheWrite), output: \(output)")
     }
 
     private func parseAction(_ input: [String: Any]) -> CUAction? {

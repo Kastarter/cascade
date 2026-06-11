@@ -1032,13 +1032,20 @@ public final class CascadeAppModel: ObservableObject {
             Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: detail)) }
         }
         while count < maxSteps {
-            if assistGeneration != gen { return .stopped }  // superseded by a newer turn
+            if assistGeneration != gen {
+                auditTiming(outcome: "superseded")  // a newer voice turn took over
+                return .stopped
+            }
             if driver.runState.isStopRequested {
+                auditTiming(outcome: "stopped")
                 teachMessage = "Stopped. Control returned to you."
                 dock.show(title: "Stopped", detail: teachMessage)
                 return .stopped
             }
-            if streamFailed { return .failed }  // executeCU already surfaced why mid-stream
+            if streamFailed {
+                auditTiming(outcome: "failed-action")  // executeCU already surfaced why mid-stream
+                return .failed
+            }
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
                 // Turns that streamed actions already narrated their clause at
@@ -1077,14 +1084,24 @@ public final class CascadeAppModel: ObservableObject {
             for (actionIndex, action) in step.actions.enumerated() {
                 // Re-check between every action — a barge-in or newer turn must
                 // halt mid-batch, not after the batch finishes.
-                if assistGeneration != gen || driver.runState.isStopRequested { return .stopped }
+                if assistGeneration != gen || driver.runState.isStopRequested {
+                    auditTiming(outcome: "stopped")
+                    return .stopped
+                }
                 if case .zoom(let nx, let ny, let nw, let nh) = action {
                     zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
+                    // Zoom turns execute no screen action and change nothing visible —
+                    // without this row a zoom LOOP is indistinguishable from a hang
+                    // (the 2026-06-11 46s Keynote stall was unattributable).
+                    Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
                     continue
                 }
                 actedThisTurn = true
                 let actionStart = ContinuousClock.now
-                if !(await executeCU(action, on: screen)) { return .failed }
+                if !(await executeCU(action, on: screen)) {
+                    auditTiming(outcome: "failed-action")
+                    return .failed
+                }
                 actionTime += actionStart.duration(to: .now)
                 // The pace gap matters BETWEEN actions; after the last one the
                 // settle sleep below covers it — no double wait.
@@ -1114,6 +1131,7 @@ public final class CascadeAppModel: ObservableObject {
             if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
             let size = agent.captureSize
             guard let nextShot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) else {
+                auditTiming(outcome: "failed-capture")
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
