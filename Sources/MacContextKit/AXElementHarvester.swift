@@ -65,12 +65,19 @@ public enum AXElementHarvester {
         let window = focusedRef as! AXUIElement
         let windowFrame = frame(of: window)
 
+        AXUIElementSetMessagingTimeout(window, 1.0)
+
         var collected: [AXHarvestedElement] = []
         var seenText = Set<String>()
         var visited = 0
         var stack: [(AXUIElement, Int)] = [(window, 0)]
         while let (element, depth) = stack.popLast() {
             if visited >= maxVisited || collected.count >= maxElements { break }
+            // The per-element timeout doesn't propagate to children, so a
+            // pathological app can still drag each request out — the caller
+            // races this walk against a deadline and cancels; honor it here so
+            // the orphaned walk exits instead of grinding through the tree.
+            if Task.isCancelled { break }
             visited += 1
 
             let role = stringAttribute(element, kAXRoleAttribute) ?? ""

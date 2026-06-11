@@ -842,8 +842,9 @@ public final class ComputerUseAgent {
     /// Hands one completed block to the sink if it's immediately actionable.
     /// Narration text streams but is never marked delivered (step()'s post-pass
     /// still collects it for the step text). zoom/screenshot are observation
-    /// directives the caller answers with a capture, and use_skill/harness calls
-    /// carry audit + gating in the post-pass — none of those stream.
+    /// directives the caller answers with a capture, and use_skill/harness/
+    /// read_screen_elements calls carry audit + gating in the post-pass — none
+    /// of those stream.
     private func deliver(_ block: [String: Any]) async -> Delivery {
         guard let sink = streamSink else { return .skipped }
         switch block["type"] as? String {

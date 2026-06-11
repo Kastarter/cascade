@@ -1535,7 +1535,27 @@ public final class CascadeAppModel: ObservableObject {
             return .unavailable("\(appName)'s accessibility tree is unreliable — work from the screenshot instead.")
         }
         let pid = front.processIdentifier
-        let harvested = await Task.detached { AXElementHarvester.elements(forWindowOfPID: pid) }.value
+        // Race the harvest against a wall-clock deadline: AX requests to a hung
+        // app block ~6s EACH and don't respond to cancellation mid-call, so a
+        // sick tree could otherwise stall the turn indefinitely. On timeout the
+        // walk is cancelled (it exits at its next loop check) and the model is
+        // told to use the screenshot — same cost as one failed zoom.
+        let harvestTask = Task.detached { AXElementHarvester.elements(forWindowOfPID: pid) }
+        let harvested = await withTaskGroup(of: [AXHarvestedElement]?.self) { group -> [AXHarvestedElement]? in
+            group.addTask { await harvestTask.value }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(3))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            harvestTask.cancel()
+            group.cancelAll()
+            return first
+        }
+        guard let harvested else {
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ax.read", detail: "\(appName) · timeout"))
+            return .unavailable("\(appName) was too slow to report its controls — work from the screenshot.")
+        }
         // AX reports Quartz global coordinates (top-left of the primary
         // display); the agent's space is the capture screen, top-left origin.
         // Mirror of toCGGlobal + globalAppKit, inverted.
@@ -1553,6 +1573,13 @@ public final class CascadeAppModel: ObservableObject {
             guard local.maxX > 0, local.maxY > 0,
                   local.minX < screen.frame.width, local.minY < screen.frame.height else { return nil }
             return CUScreenElement(role: element.role, label: element.label, value: element.value, enabled: element.enabled, frame: local)
+        }
+        // Elements exist but none landed on the capture screen: the frontmost
+        // window is on another display. Saying "canvas app" here would teach
+        // the model the wrong lesson about a perfectly scriptable app.
+        if mapped.isEmpty, !harvested.isEmpty {
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ax.read", detail: "\(appName) · off-screen window"))
+            return .unavailable("\(appName)'s window is on a different display than the one you see — bring it to this screen (or work from the screenshot).")
         }
         // Same fence as the recorder and the harness: content the user marked
         // private never enters the model's context as text.

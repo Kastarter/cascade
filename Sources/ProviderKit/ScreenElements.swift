@@ -55,8 +55,10 @@ public enum CUScreenElementRenderer {
             var chars = lines[0].count
             var rendered = 0
             for element in elements {
-                let cx = Int(((element.frame.midX) * sx).rounded())
-                let cy = Int(((element.frame.midY) * sy).rounded())
+                // Partially off-screen elements would otherwise print centers
+                // the click path can't reach (negative or past the edge).
+                let cx = max(0, min(Int(((element.frame.midX) * sx).rounded()), resW))
+                let cy = max(0, min(Int(((element.frame.midY) * sy).rounded()), resH))
                 let w = Int((element.frame.width * sx).rounded())
                 let h = Int((element.frame.height * sy).rounded())
                 var line = element.role

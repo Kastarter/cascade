@@ -39,6 +39,15 @@ struct ScreenElementTests {
         #expect(output.contains("(disabled)"))
     }
 
+    @Test func halfOffscreenCentersClampIntoTheScreenshot() {
+        let element = CUScreenElement(
+            role: "AXButton", label: "Edge", value: "", enabled: true,
+            frame: CGRect(x: -40, y: -30, width: 20, height: 20)  // center off both edges
+        )
+        let output = render(.elements([element]))
+        #expect(output.contains("@(0,0)"))
+    }
+
     @Test func emptyTreeSaysCanvasNotSilence() {
         let output = render(.elements([]))
         #expect(output.contains("canvas"))
