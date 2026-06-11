@@ -328,4 +328,18 @@ struct AppSkillTests {
             #expect(skill?.useWhen.lowercased().contains("script") == false)
         }
     }
+
+    @Test func bundledKeynotePackIsBatchAligned() {
+        // The 2026-06-11 readout run averaged ~0.5 actions/turn: the Keynote
+        // skills predated turn batching, and their one-step-verify pacing
+        // overrode the system prompt (pulled skills win — the 11d lesson).
+        let registry = AppSkillRegistry.load()
+        let core = registry.skill(named: "keynote")
+        #expect(core?.instructions.contains("ONE chained turn") == true)
+        // The old routing line invited the script detour for bulk deck work.
+        #expect(core?.instructions.contains("script it instead of clicking") == false)
+        let consulting = registry.skill(named: "keynote-consulting")
+        #expect(consulting?.instructions.contains("ONE chained turn") == true)
+        #expect(consulting?.instructions.contains("look-only turns") == true)
+    }
 }

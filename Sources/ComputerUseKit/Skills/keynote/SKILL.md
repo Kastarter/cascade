@@ -14,9 +14,21 @@ a subscribe sheet is a paywall, not an error: back out and pick a non-badged
 option). Open Keynote (or Numbers/Pages) with your open_app tool, never via
 Spotlight.
 
-For business/consulting deck recipes pull `keynote-consulting` too. For bulk
-work — skeletons of many slides, batch presenter notes, exports — pull
-`keynote-applescript` and script it instead of clicking.
+For business/consulting deck recipes pull `keynote-consulting` too. Pull
+`keynote-applescript` ONLY when the user's own words ask for a script, or for
+file exports — deck building is screen work the user watches; scripting it
+abandons that work (and Cascade will refuse the script).
+
+## Pacing — make turns count
+
+Every round trip costs the user seconds of a motionless cursor. A sequence
+you can already predict from the current screenshot is ONE chained turn, and
+the NEXT turn's screenshot is the check — no look-only turns in between:
+double-click a placeholder → `cmd+a` → type is one turn; click a field →
+`cmd+a` → type → `Return` is one turn; `cmd+shift+n` → double-click the new
+slide's title → type is one turn. Go one-action-solo only when the next step
+depends on what appears: the theme chooser, a just-inserted table or chart,
+an unfamiliar dialog, Edit Chart Data.
 
 ## Documents and themes
 
@@ -53,7 +65,12 @@ where you intend to type, then confirm from the screenshot.
 ## When a click seems to do nothing
 
 Never re-click the same point again and again — "nothing happened" is a mode
-signal, not a missed click. Screenshot and classify:
+signal, not a missed click. You get ONE corrective re-aim per control (aim at
+the control itself — a checkbox is the small box LEFT of its label, not the
+word); if the next screenshot still shows no change, the route is wrong —
+switch to a menu, the toolbar, or a different control. A third click at the
+same point is never the answer (a real run burned six turns alternating
+clicks and zooms on one checkbox). Otherwise, screenshot and classify:
 
 - Object shows no handles when clicked → it is LOCKED (Arrange > Unlock) or
   belongs to the slide LAYOUT and can't be edited from a normal slide.
@@ -75,9 +92,10 @@ signal, not a missed click. Screenshot and classify:
 - Position and size: Format > `Arrange` tab → Position X/Y (the object's
   upper-LEFT corner) and Size W/H — same dance: click the field, `cmd+a`,
   type, `Return`. This is how you "move the title up": set Y once.
-- One key event per action; modifiers are only cmd/shift/option/ctrl. To
-  press a key N times send N separate actions — and if N would exceed ~3,
-  stop: there is a numeric field or menu item that does it in one step.
+- One key event per key ACTION (several key actions still chain in the same
+  turn); modifiers are only cmd/shift/option/ctrl. To press a key N times
+  send N separate actions — and if N would exceed ~3, stop: there is a
+  numeric field or menu item that does it in one step.
 - Arrow nudges (1 pt / 10 pt with shift) are for a final touch-up only.
 
 ## Text and placeholders
@@ -89,9 +107,15 @@ signal, not a missed click. Screenshot and classify:
   size you set, the box overflowed — enlarge the box or cut words; don't
   re-send the font size. A small `+` badge at a box's bottom edge means
   clipped overflow text, NOT failed typing.
-- "Add a title" on a slide without one: click empty canvas (deselect all) →
-  the Format sidebar shows `Title` / `Body` checkboxes → check Title. No
-  checkbox there → this layout has none; use the toolbar `Text` button.
+- Writing the title: the slide's layout almost always ALREADY has a title
+  placeholder ON THE CANVAS — double-click it, `cmd+a`, type, all one turn.
+  Go to the sidebar ONLY if the canvas truly shows no title box: click empty
+  canvas (deselect all) → Format sidebar `Slide` tab shows `Title` / `Body`
+  checkboxes → check `Title` ONCE; the next screenshot must show a title box
+  ON THE CANVAS — then work in that box, the checkbox's job is done. One
+  re-aim at the checkbox maximum; still nothing → toolbar `Text` button
+  instead. Never alternate clicks between canvas and checkbox hoping for a
+  reaction.
 - If rendered text differs from what you sent — curly quotes, capitalized
   words, a typed "1." turned into a list bullet — auto-correction fired on
   typed text. It is not a typing failure: NEVER blind-retype (it

@@ -6,10 +6,12 @@ useWhen: building a business, consulting, or executive deck in Keynote — reado
 
 # Keynote — consulting decks
 
-Pull `keynote` too — its focus model, field-not-keys rule, and table/chart
-mechanics apply to every recipe here. Build entirely in Keynote's UI —
-Outline view (below) enters a whole skeleton in one pass; never detour to
-Terminal or AppleScript unless the user asked for a script or an export.
+Pull `keynote` too — its focus model, field-not-keys rule, pacing (a
+predictable sequence is ONE chained turn; the next screenshot is the check),
+and table/chart mechanics apply to every recipe here. Build entirely in
+Keynote's UI — Outline view (below) enters a whole skeleton in one pass;
+never detour to Terminal or AppleScript unless the user asked for a script
+or an export.
 
 ## Style rules — apply to every slide
 
@@ -56,9 +58,11 @@ in the theme chooser. Existing deck: File → Change Theme → pick → Choose.
 
 ## Slide recipes
 
-- Title slide — layout `Title & Subtitle` (a new deck opens on it): title =
-  the engagement's one-line conclusion or the deck name; subtitle = client +
-  date.
+- Title slide — layout `Title & Subtitle` (a new deck opens on it; both
+  placeholders are already ON THE CANVAS): double-click the title
+  placeholder → `cmd+a` → type, then double-click the subtitle → `cmd+a` →
+  type — ONE chained turn, no sidebar needed. Title = the engagement's
+  one-line conclusion or the deck name; subtitle = client + date.
 - Agenda — layout `Title & Bullets`, title "Agenda", one bullet per section,
   no sub-bullets.
 - Executive summary — `Title & Bullets`: action title carrying the single
@@ -96,8 +100,10 @@ in the theme chooser. Existing deck: File → Change Theme → pick → Choose.
 1. Skeleton first: every slide with its layout and action title before any
    body content — Outline view does this in one pass, and wrong structure
    surfaces early in the navigator.
-2. Fill slide by slide, completing one before the next; screenshot after
-   each to confirm the text landed in the right placeholder.
+2. Fill slide by slide, completing one before the next — a slide's fills
+   chain into as few turns as its layout allows, and the NEXT turn's
+   screenshot confirms the text landed in the right placeholder (no
+   look-only turns between fills).
 3. Presenter notes (if asked) as a final pass: `cmd+shift+p` once, then
    navigator-click each slide and type into the notes pane.
 4. Deliverable pass: flip through the navigator to spot-check that titles
