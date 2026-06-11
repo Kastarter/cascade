@@ -82,6 +82,30 @@ public enum AgentHarness {
         readOnlyTools.contains(name) || powerTools.contains(name)
     }
 
+    /// App names an AppleScript source (or an osascript-bearing shell command)
+    /// drives via `tell application "X"` / `tell app "X"` / `tell application id
+    /// "com.vendor.X"`. Bundle-id targets yield their last dot component
+    /// ("com.apple.Keynote" → "Keynote"). Callers use this to enforce one lane
+    /// per artifact: scripting an app whose UI the task is already working on
+    /// screen abandons work the user is watching.
+    public static func scriptedAppTargets(in source: String) -> [String] {
+        let pattern = #"(?i)\btell\s+app(?:lication)?\s+(id\s+)?"([^"]+)""#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(source.startIndex..., in: source)
+        var targets: [String] = []
+        regex.enumerateMatches(in: source, range: range) { match, _, _ in
+            guard let match, let nameRange = Range(match.range(at: 2), in: source) else { return }
+            var name = String(source[nameRange])
+            if match.range(at: 1).location != NSNotFound, let tail = name.split(separator: ".").last {
+                name = String(tail)  // bundle id → app name component
+            }
+            if !targets.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+                targets.append(name)
+            }
+        }
+        return targets
+    }
+
     public static func perform(_ call: HarnessCall, powerEnabled: Bool) async -> String {
         if call.isPower, !powerEnabled {
             return "The Power harness is OFF in Cascade's Settings, so this tool is disabled. "

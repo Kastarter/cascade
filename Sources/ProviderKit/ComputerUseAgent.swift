@@ -107,6 +107,17 @@ public final class ComputerUseAgent {
     /// they keep their existing post-response handling (crops, audit, gating).
     public var streamSink: (@MainActor (CUStreamItem) async -> Bool)?
 
+    /// Called when the agent refuses one of the model's own actions (e.g. a bare
+    /// cmd+v with an unowned clipboard) — the caller audits it; the model learns
+    /// from the refusal text delivered as that call's tool_result.
+    public var onActionRefused: (@MainActor (String) -> Void)?
+
+    /// Paste-key gate state (see `pasteRefusal`): does the goal's own wording ask
+    /// for clipboard work, and has the agent itself copied something this episode
+    /// (cmd+c / cmd+x) — which makes the clipboard contents its own.
+    private var goalAsksForPaste = false
+    private var episodeCopied = false
+
     /// Keeps the model terse and decisive: no narration (fewer output tokens → faster
     /// turns and short text-to-speech), confident action chains batched into one turn
     /// (fewer round trips), brief confirmation only at the end.
@@ -255,6 +266,8 @@ public final class ComputerUseAgent {
         messages = []
         pendingToolIDs = []
         toolResultOverrides = [:]
+        goalAsksForPaste = Self.goalMentionsClipboard(goal)
+        episodeCopied = false
         displayW = displayWidthPoints
         displayH = displayHeightPoints
         let res = bestResolution(displayWidthPoints, displayHeightPoints)
@@ -464,7 +477,18 @@ public final class ComputerUseAgent {
                             ?? "The \(name) tool isn't available in this run."
                     }
                 default:
-                    if let action = parseAction(input) { actions.append(action) }
+                    guard let action = parseAction(input) else { break }
+                    noteCopy(action)
+                    // Structural paste gate (the Keynote title-page incident,
+                    // 2026-06-11): the prompt ban on bare cmd+v didn't hold —
+                    // refuse it here and teach via the tool_result instead.
+                    if let id = block["id"] as? String, let refusal = pasteRefusal(for: action) {
+                        toolResultOverrides[id] = refusal
+                        onActionRefused?("key blocked — clipboard not owned by agent")
+                        Self.logger.info("refused bare paste key action")
+                    } else {
+                        actions.append(action)
+                    }
                 }
             default:
                 break
@@ -776,10 +800,60 @@ public final class ComputerUseAgent {
             guard let action else { return .skipped }
             if case .zoom = action { return .skipped }
             if case .screenshot = action { return .skipped }
+            // Gated paste keys must not execute mid-stream — skipping hands them
+            // to step()'s post-pass, which answers with the teaching refusal.
+            if pasteRefusal(for: action) != nil { return .skipped }
+            noteCopy(action)
             return await sink(.action(action)) ? .delivered : .aborted
         default:
             return .skipped
         }
+    }
+
+    /// The teaching refusal for a bare clipboard-paste key the agent doesn't own.
+    /// A stray cmd+v pastes whatever the USER last copied — it corrupted the
+    /// Blender hex field (11g) and the Keynote title page (this gate's incident)
+    /// despite an explicit prompt ban. Allowed once the agent copied something
+    /// itself this episode, or when the goal's own words are clipboard work.
+    private func pasteRefusal(for action: CUAction) -> String? {
+        guard case .key(let combo) = action, Self.isPasteCombo(combo),
+              !episodeCopied, !goalAsksForPaste else { return nil }
+        return """
+        Blocked \(combo): you do not control the clipboard — it holds whatever the \
+        user last copied, and pasting it corrupts the field. The type action delivers \
+        text entirely by itself (it pastes internally when needed) — use type. \
+        Paste keys unlock after you copy something yourself with cmd+c.
+        """
+    }
+
+    /// Copying or cutting makes the clipboard the agent's own — paste unlocks.
+    private func noteCopy(_ action: CUAction) {
+        if case .key(let combo) = action, Self.isCopyCombo(combo) { episodeCopied = true }
+    }
+
+    /// A key combo that pastes the clipboard: V with cmd/ctrl held, regardless of
+    /// extra modifiers (shift+cmd+v is paste-and-match-style — same clipboard).
+    nonisolated static func isPasteCombo(_ combo: String) -> Bool {
+        let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.last == "v" else { return false }
+        return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])
+    }
+
+    /// A key combo that fills the clipboard: C or X with cmd/ctrl held.
+    nonisolated static func isCopyCombo(_ combo: String) -> Bool {
+        let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let key = parts.last, key == "c" || key == "x" else { return false }
+        return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])
+    }
+
+    /// The user's own words make this task clipboard work ("paste it", "what I
+    /// copied") — the one case a bare paste key is legitimate without the agent
+    /// copying first. Arabic terms included (voice goals arrive in both).
+    nonisolated static func goalMentionsClipboard(_ goal: String) -> Bool {
+        goal.range(
+            of: #"(?i)\b(paste|pasted|pasting|clipboard|copy|copied)\b|الصق|لصق|انسخ|نسخ"#,
+            options: .regularExpression
+        ) != nil
     }
 
     /// Cache telemetry: if `cache read` stays 0 across turns, prompt caching is

@@ -949,7 +949,7 @@ public final class CascadeAppModel: ObservableObject {
             harnessTier: powerHarnessEnabled ? .full : .readOnly,
             harnessProvider: { [weak self] name, input in
                 guard let self else { return "Cascade is shutting down — stop." }
-                return await self.performHarness(name: name, input: input, gen: gen)
+                return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
             }
         )
         // Runaway backstop, not a budget. The episode's real terminators are the
@@ -970,6 +970,10 @@ public final class CascadeAppModel: ObservableObject {
         var streamFailed = false              // executeCU refused — episode is over
         var streamActionTime = Duration.zero  // this turn's in-stream action time
         var pendingNarration: String?         // clause buffered until the turn proves it has actions
+        agent.onActionRefused = { [weak self] detail in
+            guard let self else { return }
+            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.action.refused", detail: detail)) }
+        }
         agent.streamSink = { [weak self] item in
             guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else { return false }
             switch item {
@@ -1130,12 +1134,42 @@ public final class CascadeAppModel: ObservableObject {
     /// actual execution (which applies the power-tier gate and the destructive
     /// deny-list). The dock shows each call as it runs, so the user supervises
     /// scripts the same way they supervise clicks.
-    private func performHarness(name: String, input: [String: Any], gen: Int) async -> String {
+    private func performHarness(name: String, input: [String: Any], goal: String, gen: Int) async -> String {
         guard assistGeneration == gen, !driver.runState.isStopRequested else {
             return "The user stopped this task. Do not continue — end now."
         }
         guard let call = HarnessCall(name: name, input: input) else {
             return "Unknown harness tool “\(name)”."
+        }
+        // ONE-LANE enforcement, structural: scripting an app whose UI this task
+        // has already been working on screen abandons work the user is watching
+        // (the Keynote title-page incident, 2026-06-11 — prompt rules alone
+        // didn't survive failure pressure). Script-FIRST bulk work in an app
+        // the agent never touched on screen stays allowed, and the user's own
+        // ask for a script overrides.
+        if name == "run_applescript" || name == "run_command" {
+            let source = (input["script"] as? String) ?? (input["command"] as? String) ?? ""
+            let isScripting = name == "run_applescript" || source.lowercased().contains("osascript")
+            if isScripting, !AppSkill.goalAsksForScript(goal) {
+                let watched = AgentHarness.scriptedAppTargets(in: source).first { target in
+                    episodeAppActions.contains { app, count in
+                        count >= 3 && (app.lowercased().contains(target.lowercased())
+                            || target.lowercased().contains(app.lowercased()))
+                    }
+                }
+                if let watched {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent", action: "harness.denied.watched-app", detail: "\(name) → \(watched)"
+                    ))
+                    return """
+                    Blocked: you have been doing this task in \(watched)'s own UI on screen, \
+                    and the user is watching that work — scripting the same app now abandons \
+                    it mid-flight (one lane per artifact). Finish on screen with clicks, \
+                    fields, and shortcuts; if an edit went wrong, fix it on screen too. A \
+                    script here is only allowed when the user's own words ask for one.
+                    """
+                }
+            }
         }
         let summary = call.auditSummary
         if name == "run_applescript" {
