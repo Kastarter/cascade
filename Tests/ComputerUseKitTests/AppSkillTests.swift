@@ -280,4 +280,52 @@ struct AppSkillTests {
         }
         #expect(registry.indexText?.contains("- figma:") == true)
     }
+
+    @Test func explicitAskOnlyParsesFromFrontmatter() {
+        let flagged = parsed("""
+        ---
+        name: scripted-thing
+        description: A scripting playbook.
+        explicitAskOnly: true
+        ---
+
+        # Body
+        """)
+        #expect(flagged?.explicitAskOnly == true)
+        // Absent flag defaults to an always-available skill.
+        #expect(parsed(blenderFixture)?.explicitAskOnly == false)
+    }
+
+    @Test func goalAsksForScriptOnlyOnExplicitWording() {
+        for asking in [
+            "Write me a Python script that builds a city",
+            "Use AppleScript to retitle the slides",
+            "can you script this in blender",
+            "generate the bpy code for a donut",
+            "اكتب سكربت بايثون في بلندر",
+        ] {
+            #expect(AppSkill.goalAsksForScript(asking), "should open the gate: \(asking)")
+        }
+        for building in [
+            "Open blender and create a small white chocolate sprinkled on it.",
+            "Scale the cube to a three and then create a small office.",
+            "Remove the cube and continue building this office.",
+            "describe the encoded subscription",  // substrings never count
+        ] {
+            #expect(!AppSkill.goalAsksForScript(building), "should stay closed: \(building)")
+        }
+    }
+
+    @Test func bundledBlenderPackIsCursorOnly() {
+        let registry = AppSkillRegistry.load()
+        // The scripting playbook is gone — Blender work is cursor-only, and
+        // nothing in the remaining pack points at a scripting lane.
+        #expect(registry.skill(named: "blender-python") == nil)
+        for name in ["blender", "blender-archviz", "blender-modeling"] {
+            let skill = registry.skill(named: name)
+            #expect(skill != nil, "missing bundled skill: \(name)")
+            #expect(skill?.instructions.contains("blender-python") == false)
+            #expect(skill?.useWhen.lowercased().contains("script") == false)
+        }
+    }
 }

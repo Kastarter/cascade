@@ -109,6 +109,11 @@ public struct AppSkill: Sendable {
     /// The markdown body with frontmatter and the hints fence stripped — what
     /// the agent receives when it pulls the skill.
     public let instructions: String
+    /// Frontmatter `explicitAskOnly: true` — a scripting playbook the skill
+    /// provider refuses unless the user's own words asked for a script. Index
+    /// qualifiers get read as policy ("repeated parts → script it"), so the
+    /// gate has to be structural, not another sentence in the prompt.
+    public let explicitAskOnly: Bool
 
     public var axUnreliable: Bool { hints.axUnreliable }
     public var keysFollowPointer: Bool { hints.keysFollowPointer }
@@ -147,6 +152,17 @@ public struct AppSkill: Sendable {
             }
             return trimmed.rangeOfCharacter(from: .decimalDigits) != nil
         }
+    }
+
+    /// Whether the user's own words ask for a script — the only key that opens
+    /// an `explicitAskOnly` skill. Whole-word match so "description" or
+    /// "encode" never count. Arabic tokens included: voice goals arrive in
+    /// Arabic too (سكربت/بايثون/كود = script/python/code).
+    public static func goalAsksForScript(_ goal: String) -> Bool {
+        goal.range(
+            of: #"(?i)\b(scripts?|scripting|scripted|applescript|osascript|python|bpy|code|coding|macros?|سكربت|سكريبت|بايثون|كود)\b"#,
+            options: .regularExpression
+        ) != nil
     }
 
     private static func normalized(_ text: String) -> String {
@@ -262,7 +278,8 @@ public struct AppSkillRegistry: Sendable {
             path: path,
             markdown: markdown,
             hints: hints,
-            instructions: strippedInstructions(from: markdown)
+            instructions: strippedInstructions(from: markdown),
+            explicitAskOnly: metadata["explicitAskOnly"]?.lowercased() == "true"
         )
     }
 

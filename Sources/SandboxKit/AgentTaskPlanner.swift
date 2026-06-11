@@ -197,16 +197,20 @@ public struct AgentTaskPlanner: Sendable {
     public static func summary(
         findings: [(task: String, result: String)],
         skipped: [AgentSubtask],
-        ranLongOn: String?
+        ranLongOn: String?,
+        stalledOn: String? = nil
     ) -> String {
-        if findings.count == 1, skipped.isEmpty, ranLongOn == nil { return findings[0].result }
+        if findings.count == 1, skipped.isEmpty, ranLongOn == nil, stalledOn == nil { return findings[0].result }
         var pieces: [String] = []
         if let ranLongOn {
             pieces.append("Ran out of steps on “\(ranLongOn)” — ask again and I'll continue.")
         }
+        if let stalledOn {
+            pieces.append("I got stuck on “\(stalledOn)” and paused there — tell me more, or ask again and I'll retry.")
+        }
         if !findings.isEmpty {
             let lines = findings.map { "• \($0.task) — \($0.result)" }.joined(separator: "\n")
-            pieces.append((ranLongOn == nil && skipped.isEmpty ? "Done.\n" : "Finished:\n") + lines)
+            pieces.append((ranLongOn == nil && stalledOn == nil && skipped.isEmpty ? "Done.\n" : "Finished:\n") + lines)
         }
         if !skipped.isEmpty {
             let parts = skipped

@@ -20,15 +20,22 @@ has no clickable label on the canvas — click it at its visual coordinates from
 a fresh screenshot. Never click lookalike text in the Outliner or Properties
 sidebar when you mean a viewport object or an open menu item.
 
-For buildings, offices, rooms, or furniture pull `blender-archviz` too; for
-anything with exact dimensions everywhere or many repeated parts pull
-`blender-python` and script it.
+To CREATE anything — an object, prop, food, vehicle, character, scene —
+pull `blender-modeling` for the decompose-and-blockout method; for
+buildings, offices, rooms, or furniture pull `blender-archviz` too.
+ALL modeling happens in the viewport with the cursor and keyboard: exact
+sizes are typed into N-panel fields, repeated parts are duplicates
+(`shift+D`, `alt+D` linked) or an Array modifier. There is no scripting lane
+in Blender work — never open the Scripting workspace, the Python console, or
+the Text Editor, no matter how big, precise, or repetitive the build looks.
 
 ## Pointer rules
 
-Blender routes keys to the editor under the pointer. Cascade keeps the real
-pointer where you last clicked and moves it into the Blender window before
-bare key presses — but you must keep the interaction inside the 3D viewport:
+Blender routes keys to the editor at the pointer position it last saw.
+Cascade handles the mechanics: it re-teaches Blender your last click/hover
+point before every key press, then returns the user's cursor — Blender keeps
+acting at YOUR last click or hover even though the visible cursor goes home.
+You must still keep the interaction inside the 3D viewport:
 
 - Hotkeys (`G`/`S`/`R`/`Tab`/`N`) need the pointer OVER the viewport. Hovering
   is enough — do not click to "focus": clicking empty viewport space DESELECTS
@@ -43,17 +50,26 @@ bare key presses — but you must keep the interaction inside the 3D viewport:
   re-enable collections in the Outliner). Numbers are safe only inside a
   modal transform or in Edit Mode.
 
-## Modal transforms — one key per action
+## Modal transforms — one chained sequence per turn
 
 Transforms are keyboard-modal sequences: `G` (move), `S` (scale), `R`
 (rotate), then an axis key `X`/`Y`/`Z`, then the numeric value, then `Return`
 to confirm (`Escape` cancels and fully reverts).
 
-- Send each token as its OWN action and observe the result between tokens.
-  Scaling by 3 is three separate actions: press `S`, type `3`, press `Return`.
-  Moving up 1.5 on Z is four: press `G`, press `Z`, type `1.5`, press
-  `Return`. This overrides the usual guidance to batch confident actions —
-  NEVER batch a transform key, its number, and Return in one turn.
+- Each token is its OWN action (press `S`, press `X`, type `3`, press
+  `Return` — never one combined keystroke string), but a transform whose
+  axis and value you already know is ONE TURN: click the object first (that
+  parks the pointer over the viewport AND proves selection), then chain the
+  whole sequence in the same turn — click, `S`, `X`, `3`, `Return` — and
+  verify the result in the next screenshot (N-panel numbers or the
+  viewport). Waiting for a screenshot between tokens you already know wastes
+  five seconds per keypress.
+- Batch ONE transform per turn, never two: a move and a scale chained
+  blindly compound a miss. If the result looks wrong, `cmd+z` once and redo
+  that transform with single stepped tokens, reading the header readout
+  between tokens.
+- Mouse-driven or stateful modals (loop cut, bevel, extrude-then-drag) stay
+  stepped one token at a time — their state is only readable between tokens.
 - ALWAYS send the axis key for moves — `G` plus a number with no axis moves
   along X silently.
 - READ the modal state from the screenshot: during a modal, the viewport
@@ -78,6 +94,15 @@ to confirm (`Escape` cancels and fully reverts).
   edges have hidden `<` `>` step arrows, and any click-drag scrubs the
   value), then type the number. `Tab` commits and jumps to the next field
   (X→Y→Z), `Return` commits, `Escape` reverts.
+- A full Dimensions entry is ONE TURN: click the X field, type the value,
+  `Tab`, type Y, `Tab`, type Z, `Return` — chain it all; `Tab` commits and
+  advances by itself, so nothing needs re-observing between fields. Verify
+  all three numbers in the next screenshot.
+- REPLACING a value: typing into a field that still holds its old text
+  APPENDS (garbage like `FFFFFFCFCBC3` means exactly that happened). Number
+  fields select their content when clicked; text and hex fields may not —
+  when replacing, chain click-field, `ctrl+a`, type, `Return` in one turn.
+  Fix a botched field with `ctrl+a` and retype — never with repeated Delete.
 - After any Add or tool operation, the Adjust Last Operation panel
   (bottom-left of the viewport, or press `F9`) re-runs it with exact values —
   e.g. after Add → Cube set its Size and Location numerically. It DIES on the
@@ -140,7 +165,8 @@ vertex/edge/face select (Edit Mode only), `A` select all, `Alt+A` deselect.
 
 Select all with `A` when needed, delete with `X`, confirm with `Return` if a
 confirmation popup appears. Press `Return` as a plain key action — do not hunt
-for a confirm button to click.
+for a confirm button to click. When the target is already selected in the
+current screenshot, chain click-object, `X`, `Return` in one turn.
 
 ## Importing a downloaded model
 

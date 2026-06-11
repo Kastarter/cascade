@@ -595,6 +595,27 @@ public final class CascadeAppModel: ObservableObject {
     public func teach(question: String) {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { teachMessage = "Ask where something is, or what to do."; return }
+        // Voice gives us everything the user says — including acknowledgments
+        // ("Sure!", "Ok.") and stop requests. Neither is a goal: an ack must not
+        // supersede (and kill) a running task, and "stop" means STOP, not a new
+        // run named "Stop". The audit log showed both arriving as tasks.
+        let bare = q.lowercased().trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        if Self.stopPhrases.contains(bare) {
+            if assistTaskRunning {
+                driver.runState.requestStop()
+                teachMessage = "Stopped. Control returned to you."
+                dock.show(title: "Stopped", detail: teachMessage)
+            } else {
+                teachMessage = "Nothing is running."
+            }
+            voice.done()
+            return
+        }
+        if Self.acknowledgmentPhrases.contains(bare) {
+            if !assistTaskRunning { teachMessage = q }
+            voice.done()
+            return
+        }
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
             showSettings = true
@@ -741,6 +762,23 @@ public final class CascadeAppModel: ObservableObject {
         return t.hasPrefix(" now ") || t.hasPrefix(" then ")
     }
 
+    /// True while a screen-driving assist run is in flight — used to keep
+    /// non-goals (acknowledgments) from superseding it and to route spoken
+    /// stop requests to STOP instead of a new task.
+    private var assistTaskRunning = false
+
+    /// Utterances that mean "halt the run", never a goal.
+    private static let stopPhrases: Set<String> = [
+        "stop", "stop it", "stop that", "cancel", "cancel that", "never mind", "nevermind",
+    ]
+
+    /// Bare acknowledgments — conversational filler, never a task. The audit
+    /// log showed "Sure!" and "Ok." arriving as goals and killing live runs.
+    private static let acknowledgmentPhrases: Set<String> = [
+        "ok", "okay", "k", "sure", "yes", "yep", "yeah", "thanks", "thank you",
+        "cool", "nice", "good", "great", "perfect", "awesome", "alright", "all right",
+    ]
+
     /// Carries out a spoken command across as many steps as it takes — open the app
     /// *and* do the thing — by driving Claude's Computer Use tool with a fresh
     /// screenshot after every action (observe → act → re-observe). Multi-part
@@ -752,6 +790,8 @@ public final class CascadeAppModel: ObservableObject {
     /// and every run is audited.
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
+        assistTaskRunning = true
+        defer { assistTaskRunning = false }
         agentDidHighlight = false
         episodeAppActions = [:]
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
@@ -771,6 +811,7 @@ public final class CascadeAppModel: ObservableObject {
         }
         var findings: [(task: String, result: String)] = []
         var ranLongOn: String?
+        var stalledOn: String?
         var interrupted = false
         var shot: Data? = firstScreenshotPNG
 
@@ -820,6 +861,12 @@ public final class CascadeAppModel: ObservableObject {
             switch attempt {
             case .finished(let text, _):
                 findings.append((task: sub.task, result: text))
+            case .stalled(let text):
+                // The part did NOT complete — moving on to the next part would
+                // build on a missing foundation. Stop here and say so honestly.
+                findings.append((task: sub.task, result: text))
+                stalledOn = sub.task
+                break parts
             case .stopped, .failed:
                 interrupted = true  // the episode already surfaced why
                 break parts
@@ -831,7 +878,7 @@ public final class CascadeAppModel: ObservableObject {
         }
 
         if !interrupted {
-            let summary = AgentTaskPlanner.summary(findings: findings, skipped: [], ranLongOn: ranLongOn)
+            let summary = AgentTaskPlanner.summary(findings: findings, skipped: [], ranLongOn: ranLongOn, stalledOn: stalledOn)
             teachMessage = summary
             // Don't say the same sentence twice — if the last progress line IS
             // the summary, the user already heard it.
@@ -839,11 +886,11 @@ public final class CascadeAppModel: ObservableObject {
                 voice.speak(summary)
             }
             lastNarratedLine = ""
-            dock.show(title: ranLongOn == nil ? "Done" : "Paused", detail: summary)
+            dock.show(title: ranLongOn == nil && stalledOn == nil ? "Done" : "Paused", detail: summary)
             assistMemory.remember(user: goal, assistant: summary)
             // A clean run in an app with no skill yet is exactly the material
             // skills are made of — draft one for the user to review.
-            if ranLongOn == nil { maybeDistillSkill(goal: goal, findings: findings) }
+            if ranLongOn == nil && stalledOn == nil { maybeDistillSkill(goal: goal, findings: findings) }
         } else {
             assistMemory.remember(user: goal, assistant: teachMessage, ok: false)
         }
@@ -857,6 +904,9 @@ public final class CascadeAppModel: ObservableObject {
 
     private enum AssistEpisodeOutcome {
         case finished(String, acted: Bool)
+        /// The model talked itself out (three idle turns) without declaring the
+        /// part done. NOT success: later parts must not run on top of it.
+        case stalled(String)
         case stopped
         case stepLimit
         case failed
@@ -875,6 +925,20 @@ public final class CascadeAppModel: ObservableObject {
             environmentNote: ComputerUseAgent.foregroundBrowserNote,
             skillProvider: { [appSkills, store] name in
                 guard let skill = appSkills.skill(named: name) else { return nil }
+                // Scripting playbooks open only on the user's explicit ask.
+                // Prompt-level qualifiers ("10+ repeated parts") get read as
+                // policy and every real build qualifies — so the gate is here,
+                // structural, keyed to the user's own words in the goal.
+                if skill.explicitAskOnly && !AppSkill.goalAsksForScript(goal) {
+                    Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: name)) }
+                    return """
+                    Skill \(skill.name) is unavailable for this task: it is a scripting \
+                    playbook and the user did not ask for a script. Do the work on \
+                    screen in the app's own UI — pull the app's other listed skills \
+                    instead. Do not write or run any script for this task: no script \
+                    editors, no shell, no writing files to open in the app.
+                    """
+                }
                 // Skill text entering the agent's context is an auditable event,
                 // same as every action it takes.
                 Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
@@ -943,7 +1007,7 @@ public final class CascadeAppModel: ObservableObject {
                 if idleTurns >= 3 {
                     auditTiming(outcome: "stalled")
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: String(step.text.prefix(120))))
-                    return .finished(step.text.isEmpty ? "I couldn't make progress on this." : step.text, acted: acted)
+                    return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
                 }
                 if idleTurns == 2 {
                     nudge = "You have now replied twice without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
@@ -1087,15 +1151,16 @@ public final class CascadeAppModel: ObservableObject {
         do {
             switch action {
             case .move(let x, let y):
-                // Blue companion only — the user's real pointer never moves
-                // (except in pointer-routed apps, where hovering IS the action).
-                // There it must be a real move EVENT, not a warp: these apps
-                // track the pointer from move events, and a warp is invisible
-                // to them (hover, menu placement, and clicks all go stale).
+                // Blue companion only — the user's real pointer never STAYS moved.
+                // Pointer-routed apps need a real move EVENT (they track the
+                // pointer from events; a warp is invisible to them), but the
+                // restore is a warp for exactly that reason: the app keeps acting
+                // at the hovered point while the user's cursor returns home.
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
                 if keepPointer {
                     let p = cg(x, y)
-                    try await driver.act(.computerUse(.move(x: p.x, y: p.y)))
+                    lastPointerRoutedPoint = p
+                    try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.move(x: p.x, y: p.y))) }
                 }
             case .click(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
@@ -1104,7 +1169,11 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(55))   // show the press dip
                 let p = cg(x, y)
                 if keepPointer {
-                    try await driver.act(.computerUse(.click(x: p.x, y: p.y)))
+                    // The press itself needs the real pointer (move event + click),
+                    // but afterwards the cursor goes back to the user — the app's
+                    // learned position stays at p because warps emit no events.
+                    lastPointerRoutedPoint = p
+                    try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
                 } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
                 }
@@ -1114,10 +1183,9 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
-                if keepPointer {
+                if keepPointer { lastPointerRoutedPoint = p }
+                try await clickRestoringCursor(settleMs: keepPointer ? 30 : 0) {
                     try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y)))
-                } else {
-                    try await clickRestoringCursor { try await driver.act(.computerUse(.doubleClick(x: p.x, y: p.y))) }
                 }
             case .tripleClick(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
@@ -1125,10 +1193,9 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
-                if keepPointer {
+                if keepPointer { lastPointerRoutedPoint = p }
+                try await clickRestoringCursor(settleMs: keepPointer ? 30 : 0) {
                     try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y)))
-                } else {
-                    try await clickRestoringCursor { try await driver.act(.computerUse(.tripleClick(x: p.x, y: p.y))) }
                 }
             case .drag(let fromX, let fromY, let toX, let toY):
                 // The companion cursor traces the drag so the user sees the motion —
@@ -1139,7 +1206,8 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(toX, toY))
                 let from = cg(fromX, fromY)
                 let to = cg(toX, toY)
-                try await clickRestoringCursor {
+                if keepPointer { lastPointerRoutedPoint = to }
+                try await clickRestoringCursor(settleMs: keepPointer ? 30 : 0) {
                     try await driver.act(.computerUse(.drag(fromX: from.x, fromY: from.y, toX: to.x, toY: to.y)))
                 }
             case .rightClick(let x, let y):
@@ -1149,7 +1217,8 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
                 if keepPointer {
-                    try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y)))
+                    lastPointerRoutedPoint = p
+                    try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
                 } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p, showMenu: true) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
                 }
@@ -1167,7 +1236,7 @@ public final class CascadeAppModel: ObservableObject {
                     // Modal numeric input (Blender): the app ignores AX insertion,
                     // paste, and unicode-string events — only real per-key events
                     // register. Paced so the modal operator sees each key.
-                    if keepPointer { Self.ensurePointerInFrontmostWindow() }
+                    if keepPointer { await establishPointerRoutedPosition() }
                     for key in keys {
                         try await driver.act(.computerUse(.key(key, modifiers: [])))
                         try? await Task.sleep(for: .milliseconds(30))
@@ -1183,9 +1252,9 @@ public final class CascadeAppModel: ObservableObject {
                     try await driver.act(.computerUse(.typeText(text)))
                 }
             case .key(let combo):
-                // Pointer-routed apps drop hotkeys when the pointer is outside
-                // their window — make sure it's inside before posting.
-                if keepPointer { Self.ensurePointerInFrontmostWindow() }
+                // Pointer-routed apps act where they last saw the pointer —
+                // re-teach them the agent's working point before the key.
+                if keepPointer { await establishPointerRoutedPosition() }
                 let (key, modifiers) = Self.parseKey(combo)
                 try await driver.act(.computerUse(.key(key, modifiers: modifiers)))
             case .scroll(let x, let y, let direction, let amount):
@@ -1196,6 +1265,7 @@ public final class CascadeAppModel: ObservableObject {
                 // A real move event (not a warp) so pointer-tracking apps
                 // apply the scroll at the target; the restore stays a silent
                 // warp to avoid hover side-effects at the user's parked spot.
+                if keepPointer { lastPointerRoutedPoint = p }
                 try await driver.act(.computerUse(.move(x: p.x, y: p.y)))
                 do { try await driver.act(.computerUse(.scroll(deltaX: dx, deltaY: dy))) }
                 catch { CGWarpMouseCursorPosition(origin); throw error }
@@ -1282,43 +1352,56 @@ public final class CascadeAppModel: ObservableObject {
         return appSkills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
     }
 
-    /// Pointer-routed apps (Blender) send hotkeys to the editor under the
-    /// physical pointer; a pointer parked outside the app's window means every
-    /// shortcut lands nowhere. If it's outside the frontmost app's main window,
-    /// warp it to the window's centre. Uses CGWindowList, not AX — these apps
-    /// are the ones whose AX trees can't be trusted.
-    private static func ensurePointerInFrontmostWindow() {
+    /// Pointer-routed apps (Blender) send hotkeys to the editor at the position
+    /// they last LEARNED from a mouse-move event — not at the visible cursor
+    /// (warps are invisible to them). Before bare keys/typing/paste, re-teach
+    /// the app the point the agent is working at (its last click/hover, else
+    /// the frontmost window's centre) with a real move event, give the queue a
+    /// beat to deliver it, then warp the user's cursor straight back: the app
+    /// keeps acting at the agent's point while the user's cursor never stays
+    /// hijacked. Always re-teach — the visible cursor says nothing about the
+    /// app's learned position once restores are in play. Uses CGWindowList,
+    /// not AX — these apps are the ones whose AX trees can't be trusted.
+    private func establishPointerRoutedPosition() async {
         guard let app = NSWorkspace.shared.frontmostApplication,
               let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                   as? [[String: Any]] else { return }
-        let pointer = cursorCG()
         for info in infos {
             guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier,
                   (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: boundsDict) else { continue }
-            if !bounds.contains(pointer) {
-                // A move EVENT, not CGWarp — pointer-routed apps only learn
-                // the new position from the event, and the next hotkey's menu
-                // or modal anchors there.
-                CGEvent(
-                    mouseEventSource: nil,
-                    mouseType: .mouseMoved,
-                    mouseCursorPosition: CGPoint(x: bounds.midX, y: bounds.midY),
-                    mouseButton: .left
-                )?.post(tap: .cghidEventTap)
+            let origin = Self.cursorCG()
+            let target: CGPoint
+            if let last = lastPointerRoutedPoint, bounds.contains(last) {
+                target = last
+            } else {
+                target = CGPoint(x: bounds.midX, y: bounds.midY)
             }
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: target, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+            // Let the queued event deliver before warping back — processed
+            // after the warp it would drag the visible cursor to the target.
+            try? await Task.sleep(for: .milliseconds(40))
+            CGWarpMouseCursorPosition(origin)
             return
         }
     }
 
+    /// Where the agent last clicked/hovered in a pointer-routed app — the point
+    /// its hotkeys should keep acting at after the cursor restore.
+    private var lastPointerRoutedPoint: CGPoint?
+
     /// Runs a CGEvent click body, then snaps the real cursor back to exactly where
     /// it was — the fallback for targets Accessibility can't press. The actuator
     /// checks health/STOP *before* posting, so on throw the cursor hasn't moved and
-    /// we just rethrow.
-    private func clickRestoringCursor(_ body: () async throws -> Void) async throws {
+    /// we just rethrow. `settleMs` waits before the restore so every queued event
+    /// is delivered first (a move processed after the warp would drag the visible
+    /// cursor back out to the click point).
+    private func clickRestoringCursor(settleMs: Int = 0, _ body: () async throws -> Void) async throws {
         let origin = Self.cursorCG()
         try await body()
+        if settleMs > 0 { try? await Task.sleep(for: .milliseconds(settleMs)) }
         CGWarpMouseCursorPosition(origin)
     }
 
@@ -1356,7 +1439,7 @@ public final class CascadeAppModel: ObservableObject {
     /// clipboard must stay ours much longer: the app reads it when its main loop
     /// runs the paste operator, easily later than the keystroke itself.
     private func pasteText(_ text: String, pointerRouted: Bool = false) async -> Bool {
-        if pointerRouted { Self.ensurePointerInFrontmostWindow() }
+        if pointerRouted { await establishPointerRoutedPosition() }
         let pasteboard = NSPasteboard.general
         // Snapshot what the user had so the agent never eats their clipboard.
         let previous = pasteboard.pasteboardItems?.map { item -> NSPasteboardItem in
