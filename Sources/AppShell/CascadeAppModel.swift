@@ -1536,21 +1536,22 @@ public final class CascadeAppModel: ObservableObject {
         }
         let pid = front.processIdentifier
         // Race the harvest against a wall-clock deadline: AX requests to a hung
-        // app block ~6s EACH and don't respond to cancellation mid-call, so a
-        // sick tree could otherwise stall the turn indefinitely. On timeout the
-        // walk is cancelled (it exits at its next loop check) and the model is
-        // told to use the screenshot — same cost as one failed zoom.
-        let harvestTask = Task.detached { AXElementHarvester.elements(forWindowOfPID: pid) }
-        let harvested = await withTaskGroup(of: [AXHarvestedElement]?.self) { group -> [AXHarvestedElement]? in
-            group.addTask { await harvestTask.value }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(3))
-                return nil
+        // app block ~6s EACH and an in-flight C call can't be interrupted, so a
+        // sick tree could otherwise stall the turn indefinitely. A task group
+        // would re-introduce the hang at scope exit (it awaits ALL children),
+        // so this is a first-wins continuation — the losing walk is cancelled
+        // and truly abandoned; it exits at its next loop-top check.
+        let harvested: [AXHarvestedElement]? = await withCheckedContinuation { continuation in
+            let resumed = ResumeOnce()
+            let work = Task.detached {
+                let result = AXElementHarvester.elements(forWindowOfPID: pid)
+                if resumed.claim() { continuation.resume(returning: result) }
             }
-            let first = await group.next() ?? nil
-            harvestTask.cancel()
-            group.cancelAll()
-            return first
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                work.cancel()
+                if resumed.claim() { continuation.resume(returning: nil) }
+            }
         }
         guard let harvested else {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ax.read", detail: "\(appName) · timeout"))
@@ -2621,5 +2622,20 @@ public final class CascadeAppModel: ObservableObject {
         if let bundleURL = Bundle.main.bundleURL as URL? {
             NSWorkspace.shared.activateFileViewerSelecting([bundleURL])
         }
+    }
+}
+
+/// First caller wins; everyone else gets false. Guards a continuation that two
+/// racing arms (a result and a deadline) could both try to resume.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }
