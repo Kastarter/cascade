@@ -604,6 +604,9 @@ public final class CascadeAppModel: ObservableObject {
         // sandbox instead of taking over the screen.
         if Self.isBackgroundRequest(q) {
             createSandboxAgent(task: Self.backgroundTask(from: q))
+            // This IS the end of the voice turn — without done() the notch
+            // stays stuck on "Thinking…" forever after a background ask.
+            voice.done()
             return
         }
         // Every new turn supersedes whatever an earlier turn is still doing. The
@@ -851,7 +854,8 @@ public final class CascadeAppModel: ObservableObject {
         // point of asking for it. The overlay fades it on its own timer.
         if !agentDidHighlight { guidanceOverlay.hide() }
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: goal))
-        voice.done()
+        // A superseded run must not end the NEWER turn's voice state.
+        if assistGeneration == gen { voice.done() }
         await refreshAll()
     }
 
@@ -938,7 +942,7 @@ public final class CascadeAppModel: ObservableObject {
                 return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
 
-            if step.actions.isEmpty {
+            if step.actions.isEmpty, !step.didInProcessWork {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     auditTiming(outcome: "stalled")
@@ -949,6 +953,9 @@ public final class CascadeAppModel: ObservableObject {
                     nudge = "You have now replied twice without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
                 }
             } else {
+                // Harness-only turns ARE work — a run_command that created the
+                // folder must count as acted, or the task-level retry re-runs
+                // it and duplicates the result.
                 idleTurns = 0
                 nudge = nil
                 acted = true
@@ -1410,6 +1417,9 @@ public final class CascadeAppModel: ObservableObject {
     /// It reveals — it does NOT click the target itself. STOP-able and capped.
     private func findAndReveal(question: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
+        // Every exit path (found, stopped, failed, superseded-not) ends this
+        // voice turn — early returns used to leave the notch on "Thinking…".
+        defer { if assistGeneration == gen { voice.done() } }
         teachMessage = "Let me find that for you…"
         voice.speak("One moment — let me find that.")
         let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
@@ -1468,7 +1478,6 @@ public final class CascadeAppModel: ObservableObject {
                 assistMemory.remember(user: question, assistant: region.speech)
                 teachMessage = region.speech
                 voice.speak(region.speech)
-                voice.done()
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.reveal", detail: question))
                 await refreshAll()
                 return
@@ -1483,7 +1492,6 @@ public final class CascadeAppModel: ObservableObject {
         teachMessage = "I opened a few things but couldn't surface that — it may not be here."
         assistMemory.remember(user: question, assistant: teachMessage, ok: false)
         voice.speak("I couldn't bring that on screen.")
-        voice.done()
     }
 
     /// Splits a Computer Use key string ("Return", "cmd+space", "ctrl+c") into a

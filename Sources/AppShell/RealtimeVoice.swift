@@ -129,6 +129,11 @@ public final class RealtimeVoice: ObservableObject {
         guard !trimmed.isEmpty else { return }
         Task { @MainActor in
             guard await ensureConnected() else { return }
+            // Latest line wins: the Realtime API rejects response.create while
+            // a response is active, so a narration line landing mid-speech
+            // would silently never be voiced. Cancel first (harmless when
+            // nothing is speaking), then speak the new line.
+            socket?.sendEvent(["type": "response.cancel"])
             socket?.sendEvent([
                 "type": "response.create",
                 "response": [
@@ -171,7 +176,15 @@ public final class RealtimeVoice: ObservableObject {
         let waiters = connectWaiters
         connectWaiters.removeAll()
         waiters.forEach { $0.resume(returning: false) }
-        if state != .idle { permissionMessage = "Voice disconnected — try again."; state = .idle }
+        if state != .idle {
+            // A close mid-listen must also release the mic and settle the
+            // waveform — forcing idle alone left the tap running.
+            stopCapture()
+            stopPlayback()
+            transcript = ""
+            permissionMessage = "Voice disconnected — try again."
+            state = .idle
+        }
     }
 
     private func sessionUpdate() -> [String: Any] {

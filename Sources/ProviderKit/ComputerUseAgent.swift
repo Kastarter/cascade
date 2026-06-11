@@ -36,6 +36,11 @@ public struct CUStep: Sendable {
     public let actions: [CUAction]
     public let text: String
     public let done: Bool
+    /// True when this step did real work through in-process tools (harness
+    /// calls, skill pulls) even though it posted no screen actions. The caller
+    /// MUST treat such turns as progress — counting them as idle made the
+    /// stall guard kill (and the retry duplicate) successful file work.
+    public var didInProcessWork: Bool = false
 }
 
 /// Drives Claude's Computer Use tool as a real agentic loop: send the goal + a
@@ -104,9 +109,12 @@ public final class ComputerUseAgent {
     show its splash or template screen — wait for it to settle, and NEVER repeat a \
     new-document action (cmd+n or a New button) until the current frame proves the \
     previous one didn't work: extra presses create extra documents. When the whole task \
-    is finished, reply with a short confirmation. Earlier exchanges from this session may \
-    precede the task; use them to resolve references like "it", "that one", or "the \
-    first one" — they are context, not new work.
+    is finished, reply with a short confirmation — EXCEPT when the user asked you to \
+    read, tell, report, or summarize something: then your final reply must contain the \
+    actual content (read the text off the screen, zooming if needed), because it is \
+    spoken to them — "Done" alone is a failure there. Earlier exchanges from this \
+    session may precede the task; use them to resolve references like "it", "that one", \
+    or "the first one" — they are context, not new work.
     """
 
     /// What the harness tools are and when to reach for them — appended to the
@@ -427,7 +435,13 @@ public final class ComputerUseAgent {
             return await step(retryOnTruncation: false, inlineHops: inlineHops)
         }
         let done = !(stopReason == "tool_use" || (stopReason == "max_tokens" && !pendingToolIDs.isEmpty))
-        return CUStep(actions: actions, text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), done: done)
+        return CUStep(
+            actions: actions,
+            text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines),
+            done: done,
+            // Any inline hop on the way here was a harness/skill call that ran.
+            didInProcessWork: inlineHops > 0
+        )
     }
 
     /// Tool definitions for the direct-Mac harness. Read-only tools ride every

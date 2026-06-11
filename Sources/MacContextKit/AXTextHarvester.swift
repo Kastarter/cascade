@@ -28,20 +28,28 @@ public enum AXTextHarvester {
     public static func text(forWindowOfPID pid: pid_t) -> String {
         guard AXIsProcessTrusted() else { return "" }
         let appRef = AXUIElementCreateApplication(pid)
+        // Node caps bound the WORK; this bounds the WAIT — a hung app answers
+        // each AX call slowly, and 600 slow calls would stall the recorder.
+        AXUIElementSetMessagingTimeout(appRef, 0.2)
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
               let focusedRef else { return "" }
         let window = focusedRef as! AXUIElement
+        AXUIElementSetMessagingTimeout(window, 0.2)
 
         var lines: [String] = []
         var seen = Set<String>()
         var totalChars = 0
         var visited = 0
+        let deadline = Date().addingTimeInterval(0.6)
 
         // Iterative DFS with explicit depth so the caps are exact.
         var stack: [(AXUIElement, Int)] = [(window, 0)]
         while let (element, depth) = stack.popLast() {
             if visited >= maxNodes || totalChars >= maxChars { break }
+            // Wall-clock deadline: better a partial AX harvest than a recorder
+            // that falls behind the screen (OCR still covers the frame).
+            if visited % 24 == 0, Date() > deadline { break }
             visited += 1
 
             let role = stringAttribute(element, kAXRoleAttribute) ?? ""

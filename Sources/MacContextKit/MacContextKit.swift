@@ -158,6 +158,9 @@ public final class AppWindowObserver: ObservableObject {
     private static func frontmostWindowTitle(for pid: pid_t?) -> String? {
         guard let pid else { return nil }
         let appRef = AXUIElementCreateApplication(pid)
+        // This runs on the main thread once per recorded frame — a hung app
+        // must cost 250ms, not a beachball.
+        AXUIElementSetMessagingTimeout(appRef, 0.25)
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focused) == .success,
               let focused else {
@@ -266,12 +269,21 @@ public final class ContextRecorder: ObservableObject {
         }
     }
 
+    private var activationCaptureInFlight = false
+
     private func handleAppActivated() {
         guard status.running else { return }
         Task { await rewind?.followCursorDisplay() }
-        guard Date().timeIntervalSince(lastActivationCaptureAt) > 1.5 else { return }
+        // Debounce by time AND by in-flight work — cmd-tabbing through five
+        // apps must not stack five screenshot+OCR passes on top of the stream.
+        guard !activationCaptureInFlight,
+              Date().timeIntervalSince(lastActivationCaptureAt) > 1.5 else { return }
         lastActivationCaptureAt = Date()
-        captureOnce()
+        activationCaptureInFlight = true
+        Task {
+            _ = await captureNow()
+            activationCaptureInFlight = false
+        }
     }
 
     public func pause() {

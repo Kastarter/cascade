@@ -338,7 +338,9 @@ final class RewindRecorder {
         output = nil
         streamedDisplayID = nil
         if let liveStream { try? await liveStream.stopCapture() }
-        stopping = false
+        // A pause() can land while we awaited the stop — restarting then would
+        // undo the user's pause. Only restart if nobody asked us to stop.
+        guard !stopping else { return }
         try? await start()
     }
 
