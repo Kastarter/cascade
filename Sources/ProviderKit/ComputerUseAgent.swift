@@ -36,6 +36,27 @@ public struct CUStep: Sendable {
     public let actions: [CUAction]
     public let text: String
     public let done: Bool
+    /// Screen actions already executed mid-stream through `streamSink` — they are
+    /// NOT in `actions`. Lets callers count activity without re-running them.
+    public let streamedActions: Int
+
+    init(actions: [CUAction], text: String, done: Bool, streamedActions: Int = 0) {
+        self.actions = actions
+        self.text = text
+        self.done = done
+        self.streamedActions = streamedActions
+    }
+}
+
+/// One piece of a streamed model reply, delivered in response order the moment
+/// its block finishes generating — actions execute while the rest of the reply
+/// is still being written, instead of after the full round trip.
+public enum CUStreamItem: Sendable {
+    /// A completed narration clause (speak it now — the next action block is
+    /// still generating, which is the natural head start).
+    case text(String)
+    /// A completed screen action, ready to execute immediately.
+    case action(CUAction)
 }
 
 /// Drives Claude's Computer Use tool as a real agentic loop: send the goal + a
@@ -76,6 +97,15 @@ public final class ComputerUseAgent {
     private let harnessTier: HarnessTier
     private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
 
+    /// Mid-stream delivery: when set, each completed text block and screen action
+    /// is handed over the moment it finishes generating, so the caller acts while
+    /// the rest of the reply streams in (the round-trip wait stops being idle
+    /// time). Return false to abort the turn — STOP pressed, episode superseded,
+    /// or an action failed; the agent drops the half-turn and returns immediately.
+    /// zoom/screenshot directives and use_skill/harness calls are never streamed —
+    /// they keep their existing post-response handling (crops, audit, gating).
+    public var streamSink: (@MainActor (CUStreamItem) async -> Bool)?
+
     /// Keeps the model terse and decisive: no narration (fewer output tokens → faster
     /// turns and short text-to-speech), confident action chains batched into one turn
     /// (fewer round trips), brief confirmation only at the end.
@@ -104,7 +134,12 @@ public final class ComputerUseAgent {
     chain them ALL as tool calls in ONE turn. Three to six actions is a normal turn; a \
     single-action turn is the exception, reserved for steps whose outcome you genuinely \
     cannot predict (a menu about to open, a dialog that may appear). Re-observe only \
-    when the next action depends on something the screen has not shown yet. To REPLACE \
+    when the next action depends on something the screen has not shown yet. Always take \
+    the MOST DIRECT route you know and commit to it before acting: a keyboard shortcut \
+    beats a menu, a menu beats clicking through panels, and a skill's recipe beats \
+    improvising. Never open an app, window, or menu just to verify something the \
+    screenshot already shows, and never redo a step the screen proves succeeded — every \
+    detour is seconds the user spends watching a motionless cursor. To REPLACE \
     what a field already contains (a value, a name, a hex color), click the field, \
     select all with cmd+a, then use the type action with the new value — chained in one \
     turn. Typing into a field that still holds its old text APPENDS to it, and clearing \
@@ -357,6 +392,7 @@ public final class ComputerUseAgent {
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 2048,
+            "stream": true,
             "system": system,
             "thinking": ["type": "adaptive"],
             "output_config": ["effort": effort],
@@ -370,25 +406,33 @@ public final class ComputerUseAgent {
         }
         request.httpBody = bodyData
 
-        guard let data = await Self.send(request),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]] else {
+        guard let streamed = await streamMessage(request) else {
             return CUStep(actions: [], text: "I couldn't reach Claude just now.", done: true)
         }
-        Self.logUsage(json)
+        if streamed.aborted {
+            // The sink stopped the turn mid-stream (STOP, supersession, or a
+            // failed action). The episode is over — the caller's own flags say
+            // why; don't extend history with the half turn.
+            return CUStep(actions: [], text: "", done: true)
+        }
+        Self.logUsage(["usage": streamed.usage])
 
+        let content = streamed.content
         messages.append(["role": "assistant", "content": content])
-        let stopReason = json["stop_reason"] as? String
+        let stopReason = streamed.stopReason
 
         var texts: [String] = []
         var actions: [CUAction] = []
         pendingToolIDs = []
-        for block in content {
+        for (index, block) in content.enumerated() {
             switch block["type"] as? String {
             case "text":
                 if let text = block["text"] as? String { texts.append(text) }
             case "tool_use":
                 if let id = block["id"] as? String { pendingToolIDs.append(id) }
+                // Already executed mid-stream — its tool_result is the next
+                // screenshot like any other action's; just never run it twice.
+                if streamed.deliveredIndices.contains(index) { continue }
                 let input = block["input"] as? [String: Any] ?? [:]
                 switch block["name"] as? String {
                 case "open_app":
@@ -456,7 +500,12 @@ public final class ComputerUseAgent {
             return await step(retryOnTruncation: false, inlineHops: inlineHops)
         }
         let done = !(stopReason == "tool_use" || (stopReason == "max_tokens" && !pendingToolIDs.isEmpty))
-        return CUStep(actions: actions, text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), done: done)
+        return CUStep(
+            actions: actions,
+            text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines),
+            done: done,
+            streamedActions: streamed.deliveredActions
+        )
     }
 
     /// Tool definitions for the direct-Mac harness. Read-only tools ride every
@@ -531,29 +580,205 @@ public final class ComputerUseAgent {
         return defs
     }
 
-    /// Posts the request, retrying once on transport errors, 429, and 5xx (honoring
-    /// Retry-After, capped). A transient blip otherwise aborts the entire multi-step
-    /// task — far costlier than a short pause.
-    private static func send(_ request: URLRequest) async -> Data? {
+    /// Everything one streamed reply yields: content blocks reassembled exactly as
+    /// the non-streaming API would have returned them (history stays byte-compatible),
+    /// plus which blocks the sink already executed.
+    private struct StreamedMessage {
+        var content: [[String: Any]] = []
+        var stopReason: String?
+        var usage: [String: Any] = [:]
+        /// Indices into `content` whose ACTIONS the sink already executed —
+        /// step()'s post-pass must not run them a second time.
+        var deliveredIndices: Set<Int> = []
+        var deliveredActions = 0
+        /// The sink said stop — drop the turn; the caller owns the outcome.
+        var aborted = false
+    }
+
+    /// One in-flight content block being assembled from deltas.
+    struct OpenBlock {
+        var header: [String: Any]
+        var text = ""       // text_delta / thinking_delta
+        var json = ""       // input_json_delta (partial JSON string)
+        var signature = ""  // signature_delta (thinking)
+    }
+
+    private enum StreamOutcome {
+        case success(StreamedMessage)
+        case retry(after: Double?)
+        case fatal
+    }
+
+    /// Sends the request as SSE, retrying once on transport errors, 429, and 5xx
+    /// (honoring Retry-After, capped) — a transient blip otherwise aborts the whole
+    /// multi-step task. A retry NEVER happens after an action already executed
+    /// mid-stream: it would generate a fresh plan against a screen the half-finished
+    /// turn already changed.
+    private func streamMessage(_ request: URLRequest) async -> StreamedMessage? {
         for attempt in 0..<2 {
-            do {
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard let http = response as? HTTPURLResponse else { return nil }
-                if (200..<300).contains(http.statusCode) { return data }
-                guard attempt == 0, http.statusCode == 429 || http.statusCode >= 500 else {
-                    logger.error("step failed — HTTP \(http.statusCode)")
-                    return nil
-                }
-                let retryAfter = http.value(forHTTPHeaderField: "retry-after").flatMap(Double.init)
-                logger.info("step got HTTP \(http.statusCode) — retrying once")
-                try? await Task.sleep(for: .seconds(min(retryAfter ?? 1.0, 5)))
-            } catch {
-                guard attempt == 0 else { return nil }
-                logger.info("step transport error — retrying once: \(error.localizedDescription, privacy: .public)")
-                try? await Task.sleep(for: .seconds(1))
+            switch await attemptStream(request, canRetry: attempt == 0) {
+            case .success(let message): return message
+            case .fatal: return nil
+            case .retry(let after):
+                try? await Task.sleep(for: .seconds(min(after ?? 1.0, 5)))
             }
         }
         return nil
+    }
+
+    private func attemptStream(_ request: URLRequest, canRetry: Bool) async -> StreamOutcome {
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await URLSession.shared.bytes(for: request)
+        } catch {
+            guard canRetry else { return .fatal }
+            Self.logger.info("step transport error — retrying once: \(error.localizedDescription, privacy: .public)")
+            return .retry(after: nil)
+        }
+        guard let http = response as? HTTPURLResponse else { return .fatal }
+        guard (200..<300).contains(http.statusCode) else {
+            guard canRetry, http.statusCode == 429 || http.statusCode >= 500 else {
+                Self.logger.error("step failed — HTTP \(http.statusCode)")
+                return .fatal
+            }
+            Self.logger.info("step got HTTP \(http.statusCode) — retrying once")
+            return .retry(after: http.value(forHTTPHeaderField: "retry-after").flatMap(Double.init))
+        }
+
+        var message = StreamedMessage()
+        var open: [Int: OpenBlock] = [:]
+        do {
+            for try await line in bytes.lines {
+                guard line.hasPrefix("data:") else { continue }
+                let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                guard let data = payload.data(using: .utf8),
+                      let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let kind = event["type"] as? String else { continue }
+                switch kind {
+                case "message_start":
+                    if let start = event["message"] as? [String: Any],
+                       let usage = start["usage"] as? [String: Any] { message.usage = usage }
+                case "content_block_start":
+                    guard let index = event["index"] as? Int,
+                          let header = event["content_block"] as? [String: Any] else { break }
+                    open[index] = OpenBlock(header: header)
+                case "content_block_delta":
+                    guard let index = event["index"] as? Int, var block = open[index],
+                          let delta = event["delta"] as? [String: Any] else { break }
+                    switch delta["type"] as? String {
+                    case "text_delta": block.text += delta["text"] as? String ?? ""
+                    case "thinking_delta": block.text += delta["thinking"] as? String ?? ""
+                    case "input_json_delta": block.json += delta["partial_json"] as? String ?? ""
+                    case "signature_delta": block.signature = delta["signature"] as? String ?? block.signature
+                    default: break
+                    }
+                    open[index] = block
+                case "content_block_stop":
+                    guard let index = event["index"] as? Int,
+                          let block = open.removeValue(forKey: index) else { break }
+                    let finished = Self.finishedBlock(block)
+                    message.content.append(finished)
+                    switch await deliver(finished) {
+                    case .skipped:
+                        break
+                    case .delivered:
+                        message.deliveredIndices.insert(message.content.count - 1)
+                        message.deliveredActions += 1
+                    case .aborted:
+                        message.aborted = true
+                        return .success(message)
+                    }
+                case "message_delta":
+                    if let delta = event["delta"] as? [String: Any],
+                       let stop = delta["stop_reason"] as? String { message.stopReason = stop }
+                    if let usage = event["usage"] as? [String: Any] {
+                        message.usage.merge(usage) { _, new in new }
+                    }
+                case "message_stop":
+                    return .success(message)
+                case "error":
+                    Self.logger.error("stream error event: \(payload, privacy: .public)")
+                    return salvage(message, canRetry: canRetry)
+                default:
+                    break  // ping and future event types
+                }
+            }
+            // Stream ended without message_stop.
+            return salvage(message, canRetry: canRetry)
+        } catch {
+            Self.logger.error("stream broke mid-message: \(error.localizedDescription, privacy: .public)")
+            return salvage(message, canRetry: canRetry)
+        }
+    }
+
+    /// A stream died early. Retrying is only safe while nothing acted on the
+    /// screen and no tool call completed — otherwise keep the finished blocks
+    /// (blocks finish strictly in order, so everything before the one in flight
+    /// is whole) and let the loop continue from the next screenshot.
+    private func salvage(_ message: StreamedMessage, canRetry: Bool) -> StreamOutcome {
+        var message = message
+        let hasToolUse = message.content.contains { ($0["type"] as? String) == "tool_use" }
+        if message.deliveredActions == 0, !hasToolUse {
+            return canRetry ? .retry(after: nil) : .fatal
+        }
+        if message.stopReason == nil, hasToolUse { message.stopReason = "tool_use" }
+        Self.logger.info("salvaged \(message.content.count) blocks from a broken stream")
+        return .success(message)
+    }
+
+    /// Closes one block: text/thinking/tool_use are reassembled into the exact
+    /// dictionaries the non-streaming API returns (thinking keeps its signature —
+    /// history must replay byte-faithful); anything else passes through as-is.
+    nonisolated static func finishedBlock(_ block: OpenBlock) -> [String: Any] {
+        switch block.header["type"] as? String {
+        case "text":
+            return ["type": "text", "text": block.text]
+        case "thinking":
+            var out: [String: Any] = ["type": "thinking", "thinking": block.text]
+            if !block.signature.isEmpty { out["signature"] = block.signature }
+            return out
+        case "tool_use":
+            var out = block.header
+            let json = block.json.isEmpty ? "{}" : block.json
+            out["input"] = ((try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]) ?? [:]
+            return out
+        default:
+            return block.header  // redacted_thinking and friends
+        }
+    }
+
+    private enum Delivery { case skipped, delivered, aborted }
+
+    /// Hands one completed block to the sink if it's immediately actionable.
+    /// Narration text streams but is never marked delivered (step()'s post-pass
+    /// still collects it for the step text). zoom/screenshot are observation
+    /// directives the caller answers with a capture, and use_skill/harness calls
+    /// carry audit + gating in the post-pass — none of those stream.
+    private func deliver(_ block: [String: Any]) async -> Delivery {
+        guard let sink = streamSink else { return .skipped }
+        switch block["type"] as? String {
+        case "text":
+            guard let text = block["text"] as? String,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .skipped }
+            return await sink(.text(text)) ? .skipped : .aborted
+        case "tool_use":
+            let input = block["input"] as? [String: Any] ?? [:]
+            let action: CUAction?
+            switch block["name"] as? String {
+            case "open_app": action = (input["name"] as? String).map { CUAction.openApp($0) }
+            case "open_url": action = (input["url"] as? String).map { CUAction.openURL($0) }
+            case "highlight": action = parseHighlight(input)
+            case "computer": action = parseAction(input)
+            default: return .skipped
+            }
+            guard let action else { return .skipped }
+            if case .zoom = action { return .skipped }
+            if case .screenshot = action { return .skipped }
+            return await sink(.action(action)) ? .delivered : .aborted
+        default:
+            return .skipped
+        }
     }
 
     /// Cache telemetry: if `cache read` stays 0 across turns, prompt caching is

@@ -959,6 +959,38 @@ public final class CascadeAppModel: ObservableObject {
         let episodeStart = ContinuousClock.now
         var modelTime = Duration.zero
         var actionTime = Duration.zero
+        // Streamed execution: the reply arrives as SSE and each completed tool
+        // call runs HERE while the rest is still generating — the cursor starts
+        // moving seconds into the round trip instead of after it, and narration
+        // speaks the moment its clause lands. Same gates as the batch path
+        // below: generation + STOP before every action, pace gap between
+        // actions, executeCU failures end the episode.
+        var streamActed = false               // an action ran mid-stream this turn
+        var streamFailed = false              // executeCU refused — episode is over
+        var streamActionTime = Duration.zero  // this turn's in-stream action time
+        agent.streamSink = { [weak self] item in
+            guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else { return false }
+            switch item {
+            case .text(let line):
+                self.teachMessage = prefix + line
+                // Speak now — the next action block is still generating, which
+                // IS the head start the batch path had to sleep for.
+                _ = self.narrateProgress(line)
+                return true
+            case .action(let action):
+                if streamActed { try? await Task.sleep(for: .milliseconds(120)) }  // pace gap between actions
+                let start = ContinuousClock.now
+                guard await self.executeCU(action, on: screen) else {
+                    streamFailed = true
+                    return false
+                }
+                let spent = start.duration(to: .now)
+                streamActionTime += spent
+                actionTime += spent
+                streamActed = true
+                return true
+            }
+        }
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
@@ -968,7 +1000,8 @@ public final class CascadeAppModel: ObservableObject {
             note: groundingNote(),
             skillIndex: appSkills.indexText
         )
-        modelTime += episodeStart.duration(to: .now)  // begin() IS the first model turn
+        // begin() IS the first model turn; in-stream action time isn't model time.
+        modelTime += episodeStart.duration(to: .now) - streamActionTime
         var acted = false
         var count = 0
         // Stall guard: a turn with no actions and no done is the model talking
@@ -989,6 +1022,7 @@ public final class CascadeAppModel: ObservableObject {
                 dock.show(title: "Stopped", detail: teachMessage)
                 return .stopped
             }
+            if streamFailed { return .failed }  // executeCU already surfaced why mid-stream
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
                 if !step.done, narrateProgress(step.text), !step.actions.isEmpty {
@@ -1002,7 +1036,7 @@ public final class CascadeAppModel: ObservableObject {
                 return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
 
-            if step.actions.isEmpty {
+            if step.actions.isEmpty && step.streamedActions == 0 {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     auditTiming(outcome: "stalled")
@@ -1020,7 +1054,7 @@ public final class CascadeAppModel: ObservableObject {
             // Zoom is answered with the cropped frame, not a regular screenshot —
             // pull it out and run everything else first.
             var zoomRegion: CGRect?
-            var actedThisTurn = false
+            var actedThisTurn = streamActed
             for (actionIndex, action) in step.actions.enumerated() {
                 // Re-check between every action — a barge-in or newer turn must
                 // halt mid-batch, not after the batch finishes.
@@ -1044,9 +1078,11 @@ public final class CascadeAppModel: ObservableObject {
                 // Native-resolution crop so the model can actually read small text.
                 if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
+                    streamActed = false
+                    streamActionTime = .zero
                     let modelStart = ContinuousClock.now
                     step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
-                    modelTime += modelStart.duration(to: .now)
+                    modelTime += modelStart.duration(to: .now) - streamActionTime
                     count += 1
                     continue
                 }
@@ -1061,9 +1097,11 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
+            streamActed = false
+            streamActionTime = .zero
             let modelStart = ContinuousClock.now
             step = await agent.proceed(screenshot: nextShot, note: episodeNote(nudge))
-            modelTime += modelStart.duration(to: .now)
+            modelTime += modelStart.duration(to: .now) - streamActionTime
             count += 1
         }
         auditTiming(outcome: "step-limit")
