@@ -968,16 +968,27 @@ public final class CascadeAppModel: ObservableObject {
         var streamActed = false               // an action ran mid-stream this turn
         var streamFailed = false              // executeCU refused — episode is over
         var streamActionTime = Duration.zero  // this turn's in-stream action time
+        var pendingNarration: String?         // clause buffered until the turn proves it has actions
         agent.streamSink = { [weak self] item in
             guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else { return false }
             switch item {
             case .text(let line):
                 self.teachMessage = prefix + line
-                // Speak now — the next action block is still generating, which
-                // IS the head start the batch path had to sleep for.
-                _ = self.narrateProgress(line)
+                // Buffer instead of speaking: a turn that ends with no actions
+                // is the model's closing or idle line, and those are narrated by
+                // the episode's own paths (final summary, stall handling) —
+                // voicing them here too would say everything twice at task end.
+                pendingNarration = line
                 return true
             case .action(let action):
+                if let line = pendingNarration {
+                    pendingNarration = nil
+                    // Same head start the batch path gave: the user hears
+                    // "writing the poem now" BEFORE the typing starts.
+                    if self.narrateProgress(line) {
+                        try? await Task.sleep(for: .milliseconds(450))
+                    }
+                }
                 if streamActed { try? await Task.sleep(for: .milliseconds(120)) }  // pace gap between actions
                 let start = ContinuousClock.now
                 guard await self.executeCU(action, on: screen) else {
@@ -1025,7 +1036,10 @@ public final class CascadeAppModel: ObservableObject {
             if streamFailed { return .failed }  // executeCU already surfaced why mid-stream
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
-                if !step.done, narrateProgress(step.text), !step.actions.isEmpty {
+                // Turns that streamed actions already narrated their clause at
+                // the first action — re-narrating the joined text here would
+                // double-speak once the 4s throttle expires on long turns.
+                if !step.done, step.streamedActions == 0, narrateProgress(step.text), !step.actions.isEmpty {
                     // Give the spoken line a head start so the user hears
                     // "writing the poem now" BEFORE the typing starts, not after.
                     try? await Task.sleep(for: .milliseconds(450))
@@ -1080,6 +1094,7 @@ public final class CascadeAppModel: ObservableObject {
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
                     streamActed = false
                     streamActionTime = .zero
+                    pendingNarration = nil
                     let modelStart = ContinuousClock.now
                     step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
                     modelTime += modelStart.duration(to: .now) - streamActionTime
@@ -1099,6 +1114,7 @@ public final class CascadeAppModel: ObservableObject {
             }
             streamActed = false
             streamActionTime = .zero
+            pendingNarration = nil
             let modelStart = ContinuousClock.now
             step = await agent.proceed(screenshot: nextShot, note: episodeNote(nudge))
             modelTime += modelStart.duration(to: .now) - streamActionTime

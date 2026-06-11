@@ -52,8 +52,9 @@ public struct CUStep: Sendable {
 /// its block finishes generating — actions execute while the rest of the reply
 /// is still being written, instead of after the full round trip.
 public enum CUStreamItem: Sendable {
-    /// A completed narration clause (speak it now — the next action block is
-    /// still generating, which is the natural head start).
+    /// A completed narration clause. The caller decides when to voice it — a
+    /// turn can end with no actions at all (closing and idle lines), and those
+    /// are narrated by episode-level paths instead.
     case text(String)
     /// A completed screen action, ready to execute immediately.
     case action(CUAction)
