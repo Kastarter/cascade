@@ -204,36 +204,54 @@ public struct AppSkillRegistry: Sendable {
         return skills.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
     }
 
-    /// The app a goal names, resolvable BEFORE the first model turn: matcher
-    /// names from every loaded skill plus stock apps that have no skill yet.
-    /// Longest name wins ("Microsoft Word" before "Word"); whole-word and
-    /// case-insensitive. Lets the orchestrator pre-open the app so the first
-    /// screenshot already shows it — the 2026-06-11 forensics measured two
-    /// model turns (~8s) spent opening the goal's own named app.
-    public func appNamed(inGoal goal: String) -> String? {
-        var candidates = Set(Self.stockApps)
-        for skill in skills {
-            for name in skill.hints.appMatchers?.names ?? [] where name.count >= 4 {
-                candidates.insert(name)
+    /// The app a goal names, resolved against what is ACTUALLY INSTALLED on
+    /// this Mac — no hardcoded app list, so it works for any app the user can
+    /// open. A goal word matching any distinctive word of an installed app's
+    /// name (whole-word, case-insensitive, ≥4 chars) nominates that app, and
+    /// the INSTALLED name is returned — so "open a Word document" resolves to
+    /// "Microsoft Word", the exact name `open -a` and the frontmost poll need.
+    /// More matched words win ("Microsoft Word" with both words beats it with
+    /// one); ties break lexicographically so resolution is deterministic.
+    /// Lets the orchestrator pre-open the app before the first frame — the
+    /// 2026-06-11 forensics measured two model turns (~8s) spent opening the
+    /// goal's own named app.
+    public func appNamed(inGoal goal: String, installedNames: [String]? = nil) -> String? {
+        var best: (name: String, score: (Int, Int))?
+        for app in installedNames ?? Self.installedAppNames() {
+            let words = app.split(separator: " ").map(String.init)
+            let matched = words.filter { word in
+                word.count >= 4 && goal.range(
+                    of: "(?i)\\b" + NSRegularExpression.escapedPattern(for: word) + "\\b",
+                    options: .regularExpression
+                ) != nil
+            }
+            guard !matched.isEmpty else { continue }
+            let score = (matched.count, matched.reduce(0) { $0 + $1.count })
+            if best == nil || score > best!.score || (score == best!.score && app < best!.name) {
+                best = (app, score)
             }
         }
-        for name in candidates.sorted(by: { $0.count > $1.count }) {
-            let pattern = "(?i)\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b"
-            if goal.range(of: pattern, options: .regularExpression) != nil { return name }
-        }
-        return nil
+        return best?.name
     }
 
-    /// Apps users name in goals that may not have a skill installed. Order is
-    /// irrelevant (matching sorts by length); names must be LaunchServices-
-    /// resolvable for `open -a`.
-    private static let stockApps = [
-        "Keynote", "Numbers", "Pages", "Safari", "Notes", "Mail", "Finder",
-        "Calendar", "Messages", "Reminders", "Preview", "TextEdit", "Music",
-        "Photos", "Microsoft Word", "Microsoft Excel", "Microsoft PowerPoint",
-        "Word", "Excel", "PowerPoint", "Google Chrome", "Chrome", "Blender",
-        "Figma", "Photoshop", "Xcode", "Terminal",
-    ]
+    /// Display names of every .app in the standard install locations — the
+    /// candidate pool for `appNamed(inGoal:)`. Enumerated fresh per call
+    /// (a few directory listings, well under the cost of one model turn).
+    public static func installedAppNames() -> [String] {
+        var names: Set<String> = []
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        for dir in [
+            "/Applications", "/Applications/Utilities",
+            "/System/Applications", "/System/Applications/Utilities",
+            home + "/Applications",
+        ] {
+            for entry in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            where entry.hasSuffix(".app") {
+                names.insert(String(entry.dropLast(4)))
+            }
+        }
+        return Array(names)
+    }
 
     /// The one-line-per-skill index sent in the agent's first turn. Content is
     /// pulled via the use_skill tool, never pushed — this is all the prompt

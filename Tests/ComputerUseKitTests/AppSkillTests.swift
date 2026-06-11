@@ -332,14 +332,27 @@ struct AppSkillTests {
     @Test func goalNamesAppForPreOpen() {
         // Pre-opening the goal's named app before the first frame saves the
         // ~8s the model spent opening it itself (2026-06-11m forensics).
-        let registry = AppSkillRegistry.load()
-        #expect(registry.appNamed(inGoal: "Open Keynote and create a title slide: Market Entry Readout") == "Keynote")
-        #expect(registry.appNamed(inGoal: "open the roadmap meeting notes on the screen in notes") == "Notes")
-        #expect(registry.appNamed(inGoal: "make a donut in blender") == "Blender")
-        // Longest match wins — never "Word" for "Microsoft Word".
-        #expect(registry.appNamed(inGoal: "Can you please open Microsoft Word for me?") == "Microsoft Word")
+        // Resolution is against INSTALLED apps (injected here so the test is
+        // hermetic) — never a hardcoded list, so any app a user owns works.
+        let registry = AppSkillRegistry(skills: [])
+        let installed = [
+            "Keynote Creator Studio", "Microsoft Word", "Microsoft Excel",
+            "Notes", "Safari", "Blender", "Obsidian", "WordPress Studio",
+        ]
+        // A spoken partial name resolves to the INSTALLED name — what
+        // `open -a` and the frontmost poll actually need.
+        #expect(registry.appNamed(inGoal: "Open Keynote and create a title slide", installedNames: installed) == "Keynote Creator Studio")
+        #expect(registry.appNamed(inGoal: "open the roadmap meeting notes on the screen in notes", installedNames: installed) == "Notes")
+        #expect(registry.appNamed(inGoal: "make a donut in blender", installedNames: installed) == "Blender")
+        // More matched words beat fewer: the full spoken name picks Microsoft
+        // Word over WordPress Studio's single shared token... and a bare
+        // "word document" still resolves via the distinctive word.
+        #expect(registry.appNamed(inGoal: "open Microsoft Word please", installedNames: installed) == "Microsoft Word")
+        #expect(registry.appNamed(inGoal: "create a word document", installedNames: installed) == "Microsoft Word")
         // No app named → no pre-open guesswork.
-        #expect(registry.appNamed(inGoal: "search my desktop for the falcon invoices") == nil)
+        #expect(registry.appNamed(inGoal: "search my desktop for the falcon invoices", installedNames: installed) == nil)
+        // The real installed enumeration returns something on any Mac.
+        #expect(!AppSkillRegistry.installedAppNames().isEmpty)
     }
 
     @Test func bundledKeynotePackIsBatchAligned() {
