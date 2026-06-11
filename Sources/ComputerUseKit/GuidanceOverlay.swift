@@ -194,7 +194,10 @@ public final class GuidanceOverlayController {
         case .swoop:
             let leg = max(0.10, response * 0.45)
             return distance > 90 ? leg * 1.7 + response * 0.8 : response + 0.05
-        case .glide, .trace: return response + 0.05
+        case .glide: return response + 0.05
+        // Trace animates at response * 1.2 (see moveCursor) — the ETA must match
+        // or purple-theme clicks fire before the cursor lands.
+        case .trace: return response * 1.2 + 0.05
         }
     }
 

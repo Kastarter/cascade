@@ -122,7 +122,9 @@ public final class RealtimeVoice: ObservableObject {
 
     public func speak(_ text: String) {
         guard state != .listening else { return }
-        if state == .working { state = .idle }
+        // NOTE: speak() must not touch `state` — mid-run narration would flip
+        // .working → .idle and collapse the notch while the agent still works;
+        // done() owns the return to idle.
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         Task { @MainActor in
