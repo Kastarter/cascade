@@ -593,7 +593,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func teach(question: String) {
-        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        var q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { teachMessage = "Ask where something is, or what to do."; return }
         // Voice gives us everything the user says — including acknowledgments
         // ("Sure!", "Ok.") and stop requests. Neither is a goal: an ack must not
@@ -615,6 +615,20 @@ public final class CascadeAppModel: ObservableObject {
             if !assistTaskRunning { teachMessage = q }
             voice.done()
             return
+        }
+        // Transcription noise gate, structural: the mic hands teach() everything
+        // it hears, and one-word interjections / filler sentences kept spawning
+        // full runs — each superseding (killing) the real task ("Iii!" murdered
+        // the 13:28Z Keynote run). Fragments are ignored; dangling lead-in
+        // filler ("And create…") is stripped so the command underneath survives.
+        switch VoiceFragmentGate.classify(q) {
+        case .noise:
+            if !assistTaskRunning { teachMessage = "I heard “\(q.prefix(60))” — tell me the full task." }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "voice.fragment.ignored", detail: String(q.prefix(80)))) }
+            voice.done()
+            return
+        case .goal(let cleaned):
+            q = cleaned
         }
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
