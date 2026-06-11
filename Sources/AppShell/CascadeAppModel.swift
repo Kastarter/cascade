@@ -719,7 +719,7 @@ public final class CascadeAppModel: ObservableObject {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.clickPointed", detail: "\(utterance) → \(pointed.label)"))
             teachMessage = said
             voice.speak(said)
-            voice.done()
+            if assistGeneration == gen { voice.done() }
         }
     }
 

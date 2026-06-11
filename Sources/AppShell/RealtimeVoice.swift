@@ -242,7 +242,12 @@ public final class RealtimeVoice: ObservableObject {
 
         case "error":
             if let error = json["error"] as? [String: Any], let message = error["message"] as? String {
-                permissionMessage = message
+                // speak() cancels defensively before each line; "nothing to
+                // cancel" is our own no-op, not a problem to report.
+                let code = (error["code"] as? String ?? "").lowercased()
+                if !code.contains("cancel"), !message.localizedCaseInsensitiveContains("no active response") {
+                    permissionMessage = message
+                }
             }
 
         default:
