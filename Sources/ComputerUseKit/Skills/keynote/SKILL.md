@@ -19,12 +19,6 @@ For business/consulting deck recipes pull `keynote-consulting` too. Pull
 file exports — deck building is screen work the user watches; scripting it
 abandons that work (and Cascade will refuse the script).
 
-To find an inspector control, check a checkbox state, or verify text you
-just set, call `read_screen_elements` FIRST — it returns exact labels,
-values (`value="0"/"1"` for checkboxes), and clickable coordinates
-instantly, with no screenshot turn. It replaces zooming and look-only
-verification.
-
 ## Pacing — make turns count
 
 Every round trip costs the user seconds of a motionless cursor. A sequence
@@ -32,9 +26,7 @@ you can already predict from the current screenshot is ONE chained turn, and
 the NEXT turn's screenshot is the check — no look-only turns in between:
 double-click a placeholder → `cmd+a` → type is one turn; click a field →
 `cmd+a` → type → `Return` is one turn; `cmd+shift+n` → double-click the new
-slide's title → type is one turn. A double-clicked placeholder is ALWAYS in
-text-edit mode — chaining `cmd+a` → type behind the double-click is safe;
-never spend a turn confirming the caret first. Go one-action-solo only when the next step
+slide's title → type is one turn. Go one-action-solo only when the next step
 depends on what appears: the theme chooser, a just-inserted table or chart,
 an unfamiliar dialog, Edit Chart Data.
 

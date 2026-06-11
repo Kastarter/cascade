@@ -6,10 +6,6 @@ useWhen: reading or sending messages in WhatsApp, Slack, Discord, Messages, Tele
 
 # Messaging
 
-- `read_screen_elements` lists this window's real controls — exact labels,
-  values, and clickable coordinates — instantly, no screenshot needed. Use it
-  FIRST to find the right conversation row or input field, and to VERIFY a
-  draft before sending, instead of zooming or spending a look-only turn.
 - `Return` SENDS the message. Never include a newline in typed message text;
   for a multi-line message use `shift+Return` between lines, sent as separate
   key actions.

@@ -6,10 +6,6 @@ useWhen: reading, triaging, replying to, or composing email (Apple Mail, Gmail, 
 
 # Email
 
-- `read_screen_elements` lists this window's real controls — exact labels,
-  values, and clickable coordinates — instantly, no screenshot needed. Use it
-  FIRST to find a button or field, and to VERIFY what you just set, instead
-  of zooming or spending a look-only turn.
 - Open the message before acting on it — never judge from the preview line.
 - Apple Mail shortcuts: reply `cmd+r`, reply-all `cmd+shift+r`, forward
   `cmd+shift+f`, new message `cmd+n`, send `cmd+shift+d`.

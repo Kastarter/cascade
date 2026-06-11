@@ -50,12 +50,4 @@ When source is copied or substantially adapted, add the original repository, fil
   knowledge (modal transform sequencing, house recipe, import workflow)
   rewritten for Cascade's computer-use agent.
 
-- `mediar-ai/MacosUseSDK` (MIT, © 2025 mediar) — `Sources/MacosUseSDK/AccessibilityTraversal.swift`
-  approach (per-element role/text/bounds shape, visible-only filter, flat
-  element list for the model) → `Sources/MacContextKit/AXElementHarvester.swift`.
-  Idea port, no code copied; the walk follows Cascade's own `AXTextHarvester`.
-
 Do not copy TipTour Neko sprite assets unless their separate BSD 2-Clause license is included and the product actually needs them.
-
-Do not port code from `mediar-ai/mcp-server-macos-use` — it is BSL 1.1
-(non-production license), not open source. `MacosUseSDK` underneath it is MIT.
