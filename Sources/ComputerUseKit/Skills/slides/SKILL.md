@@ -6,6 +6,11 @@ useWhen: creating or editing slides in PowerPoint or Google Slides (Keynote has 
 
 # Slides
 
+`read_screen_elements` lists the window's real controls — exact labels,
+values, and clickable coordinates — instantly, no screenshot needed. Use it
+FIRST to find a control or placeholder, and to VERIFY what you just set,
+instead of zooming or spending a look-only turn.
+
 In Keynote, pull the `keynote` skill instead — it carries the full driving
 manual; this one covers PowerPoint and other slide apps.
 

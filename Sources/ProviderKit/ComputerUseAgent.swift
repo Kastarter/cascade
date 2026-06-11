@@ -241,7 +241,7 @@ public final class ComputerUseAgent {
     /// checkbox" costs ~50ms instead of a zoom round trip.
     static let screenElementsToolDefinition: [String: Any] = [
         "name": "read_screen_elements",
-        "description": "Instantly list the frontmost window's real controls from the system accessibility tree: exact labels, current values, and clickable screenshot coordinates for every button, field, checkbox, link, and text. Use this FIRST to locate a control, read small text, or check a field/checkbox state — it is exact where pixels are ambiguous, and it replaces zooming and look-only turns. Then click the listed @(x,y) center directly. Canvas apps (3D viewports, drawing surfaces) may return little or nothing — the screenshot is the ground truth there.",
+        "description": "Instantly list the frontmost window's real controls from the system accessibility tree: exact labels, current values, and clickable screenshot coordinates for every button, field, checkbox, link, and text. Use this FIRST to locate a control, read small text, or check a field/checkbox state — and to VERIFY text or a value you just set, instead of a look-only screenshot turn. It is exact where pixels are ambiguous and replaces zooming. Then click the listed @(x,y) center directly. Canvas apps (3D viewports, drawing surfaces) may return little or nothing — the screenshot is the ground truth there.",
         "input_schema": ["type": "object", "properties": [String: Any]()],
     ]
 

@@ -316,6 +316,27 @@ struct AppSkillTests {
         }
     }
 
+    @Test func bundledAXFriendlySkillsTeachThePerceptionLane() {
+        let registry = AppSkillRegistry.load()
+        // Pulled skills are the prompt surface the model actually obeys — the
+        // perception lane only gets used if the skills name it (the first two
+        // live runs never called it: the system note alone lost to recipes).
+        for name in [
+            "keynote", "keynote-consulting", "notes", "email", "spreadsheets",
+            "calendar", "finder", "messaging", "pdf-forms", "slides",
+        ] {
+            let skill = registry.skill(named: name)
+            #expect(skill != nil, "missing bundled skill: \(name)")
+            #expect(skill?.instructions.contains("read_screen_elements") == true, "\(name) must teach read_screen_elements")
+        }
+        // Canvas apps have phantom trees — their skills must NOT route to it
+        // (the runtime denies the call there anyway; teaching it would flail).
+        for name in ["blender", "blender-archviz", "blender-modeling", "figma", "photoshop"] {
+            let skill = registry.skill(named: name)
+            #expect(skill?.instructions.contains("read_screen_elements") != true, "\(name) must not teach read_screen_elements")
+        }
+    }
+
     @Test func bundledBlenderPackIsCursorOnly() {
         let registry = AppSkillRegistry.load()
         // The scripting playbook is gone — Blender work is cursor-only, and

@@ -6,6 +6,10 @@ useWhen: entering data, formulas, sorting, or filling ranges in Numbers, Excel, 
 
 # Spreadsheets
 
+- `read_screen_elements` lists this window's real controls — exact labels,
+  values, and clickable coordinates — instantly, no screenshot needed. Use it
+  FIRST to find a control or read a cell/field value, and to VERIFY what you
+  just entered, instead of zooming or spending a look-only turn.
 - Click a cell ONCE, then type — typing replaces the cell's content. Double-click
   only to edit existing content in place.
 - `Return` commits and moves down; `Tab` commits and moves right; `Escape`

@@ -8,7 +8,9 @@ useWhen: building a business, consulting, or executive deck in Keynote — reado
 
 Pull `keynote` too — its focus model, field-not-keys rule, pacing (a
 predictable sequence is ONE chained turn; the next screenshot is the check),
-and table/chart mechanics apply to every recipe here. Build entirely in
+and table/chart mechanics apply to every recipe here. Verify a filled slide
+with `read_screen_elements` (exact text, instant) rather than a look-only
+screenshot turn. Build entirely in
 Keynote's UI — Outline view (below) enters a whole skeleton in one pass;
 never detour to Terminal or AppleScript unless the user asked for a script
 or an export.

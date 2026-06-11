@@ -6,6 +6,10 @@ useWhen: moving, renaming, organizing files and folders, or navigating to paths 
 
 # Finder
 
+- `read_screen_elements` lists this window's real controls and file rows —
+  exact names and clickable coordinates — instantly, no screenshot needed.
+  Use it FIRST to find a file row or sidebar item instead of zooming or
+  spending a look-only turn.
 - `Return` on a selected file RENAMES it (it does not open it). Open with
   `cmd+o` or double-click.
 - Go straight to any path: `cmd+shift+g`, type the absolute path, `Return` —

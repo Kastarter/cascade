@@ -6,6 +6,10 @@ useWhen: filling PDF forms, signing documents, annotating PDFs in Preview
 
 # PDF forms (Preview)
 
+- `read_screen_elements` lists this window's real controls — exact labels,
+  values, and clickable coordinates — instantly, no screenshot needed. Use it
+  FIRST to find form fields, and to VERIFY what you just filled, instead of
+  zooming or spending a look-only turn.
 - Form fields: click the field, type, then `Tab` to commit and jump to the
   next field. Re-screenshot to confirm the text landed in the right box —
   PDF fields are easy to mis-target.

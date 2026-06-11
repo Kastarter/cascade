@@ -6,6 +6,10 @@ useWhen: creating, moving, or checking events and meetings in Calendar
 
 # Calendar
 
+- `read_screen_elements` lists this window's real controls — exact labels,
+  values, and clickable coordinates — instantly, no screenshot needed. Use it
+  FIRST to find a field or event, and to VERIFY what you just set, instead of
+  zooming or spending a look-only turn.
 - Create an event by double-clicking the target day/time slot — the event
   appears with its title field already editable. Type the title, `Return`.
 - Set details (time, invitees, location) by double-clicking the created event

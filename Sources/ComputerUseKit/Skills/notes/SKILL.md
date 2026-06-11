@@ -6,6 +6,10 @@ useWhen: opening, editing, creating, or checking off items in a note in Apple No
 
 # Apple Notes
 
+- `read_screen_elements` lists this window's real controls — exact labels,
+  values, and clickable coordinates — instantly, no screenshot needed. Use it
+  FIRST to find the right note row or checklist circle, and to VERIFY an edit
+  landed, instead of zooming or spending a look-only turn.
 - A "note" lives in THIS app, not on disk. Never satisfy a Notes task by
   reading or editing a similarly named file found with the file tools — the
   note in the app is the artifact; a look-alike `.md`/`.txt` file is context
