@@ -94,7 +94,18 @@ public final class RealtimeVoice: ObservableObject {
 
     // MARK: - Push-to-talk
 
+    /// Tracks the PHYSICAL key, separate from `state`: mic/connection setup is
+    /// async, so a quick tap can release before listening even starts. Without
+    /// this, that release was ignored and the mic stayed hot forever (stuck
+    /// red pill in the notch).
+    private var talkKeyDown = false
+    private var listenStartedAt = Date.distantPast
+    /// Increments per utterance so a stale "thinking" watchdog can't touch a
+    /// newer turn.
+    private var turnToken = 0
+
     public func beginTalking() {
+        talkKeyDown = true
         // Barge-in: cut the agent off and listen.
         if state == .working || playerNode.isPlaying {
             stopPlayback()
@@ -106,16 +117,37 @@ public final class RealtimeVoice: ObservableObject {
         Task { @MainActor in
             guard await ensureMic() else { return }
             guard await ensureConnected() else { return }
+            // The key may have been released while we were connecting — a tap,
+            // not a hold. Starting to listen now would never stop.
+            guard talkKeyDown else { return }
+            listenStartedAt = Date()
             startCapture()
         }
     }
 
     public func endTalking() {
+        talkKeyDown = false
         guard state == .listening else { return }
         stopCapture()
+        // A tap too short to contain speech: don't commit (the API rejects a
+        // near-empty buffer and no transcription event ever comes back, which
+        // stranded the notch on the live pill). Just reset.
+        guard Date().timeIntervalSince(listenStartedAt) > 0.25 else {
+            socket?.sendEvent(["type": "input_audio_buffer.clear"])
+            state = .idle
+            return
+        }
         socket?.sendEvent(["type": "input_audio_buffer.commit"])
         state = .working
         // The transcript arrives via conversation.item.input_audio_transcription.completed.
+        // Watchdog: if it never does (silence, API hiccup), settle back to idle
+        // instead of showing "Thinking…" forever.
+        turnToken += 1
+        let token = turnToken
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(12))
+            if self.turnToken == token, self.state == .working { self.state = .idle }
+        }
     }
 
     public func done() { if state == .working { state = .idle } }
@@ -225,6 +257,9 @@ public final class RealtimeVoice: ObservableObject {
             waiters.forEach { $0.resume(returning: true) }
 
         case "conversation.item.input_audio_transcription.completed":
+            // The transcript arrived — the no-reply watchdog must stand down,
+            // or it would collapse the pill 12s into a legitimate agent run.
+            turnToken += 1
             let said = (json["transcript"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             transcript = ""
             if said.count > 1 {

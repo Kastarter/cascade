@@ -180,7 +180,7 @@ struct NotchView: View {
         // Tall enough that the control row sits fully below the housing line.
         case .expanded: CGSize(width: panelWidth - 8, height: baseNotch.height + 46)
         // Wider on both sides + a touch deeper — unmistakably "live".
-        case .live: CGSize(width: baseNotch.width + 150, height: baseNotch.height + 8)
+        case .live: CGSize(width: baseNotch.width + 190, height: baseNotch.height + 8)
         case .idle: baseNotch
         }
     }
@@ -248,6 +248,9 @@ struct NotchView: View {
                 .foregroundStyle(voiceState == .listening ? Color.cascadeRecDot : Color.cascadeAgent)
             if voiceState == .listening {
                 SpeechWaveform(level: model.voice.inputLevel, color: Color.cascadeRecDot)
+                Text("Listening…")
+                    .font(.cascadeMono(11))
+                    .foregroundStyle(Color.cascadeText2)
             } else {
                 Text("Thinking…")
                     .font(.cascadeMono(11))
