@@ -270,7 +270,7 @@ struct AppSkillTests {
         #expect(registry.skills.count >= 13)
         let names = registry.skills.map { $0.name.lowercased() }
         #expect(Set(names).count == names.count)  // unique
-        for expected in ["blender", "email", "spreadsheets", "web-research", "terminal", "messaging", "finder"] {
+        for expected in ["blender", "email", "spreadsheets", "web-research", "terminal", "messaging", "finder", "notes"] {
             #expect(registry.skill(named: expected) != nil, "missing bundled skill: \(expected)")
         }
         // Every bundled skill has a usable index line and pullable content.

@@ -82,9 +82,10 @@ set options immediately or re-add.
 ## Color and finish
 
 Material Properties tab (checkered-sphere icon) → `New` → click the Base
-Color swatch → `Hex` tab → click the field → `ctrl+a` (the field may keep
-its old hex — typing must replace, not append) → type the hex → `Return` →
-click outside the popup. Then set Roughness: `0.8` matte, `0.3` satin, `0.05` glossy.
+Color swatch → `Hex` tab → single-click the field → type the 6-digit hex →
+`Return` → click outside the popup. Cascade's typing replaces the field's
+old value by itself — never press `ctrl+v`/`cmd+v` to "paste" the hex (that
+pastes the user's clipboard) and never triple-click the field. Then set Roughness: `0.8` matte, `0.3` satin, `0.05` glossy.
 Metallic `1.0` only for actual metal. Emission Strength `3–5` for glowing
 parts (screens, lava, neon). One material per part keeps it simple; a second
 color on some faces = Edit Mode face-select + new slot + `Assign`

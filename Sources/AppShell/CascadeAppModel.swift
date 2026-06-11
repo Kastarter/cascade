@@ -1416,6 +1416,11 @@ public final class CascadeAppModel: ObservableObject {
               let element = ref else { return false }
 
         if !showMenu, let role = axString(element, kAXRoleAttribute), textRoles.contains(role) {
+            // Multi-line editors are clicked to PLACE THE CARET at the click
+            // point. AX focus lands the element but never moves the caret — the
+            // click would "succeed" while typing lands at the old insertion
+            // point. Only a real CGEvent click positions the caret.
+            if role == "AXTextArea" { return false }
             if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
                 return true
             }
@@ -1456,6 +1461,16 @@ public final class CascadeAppModel: ObservableObject {
             if !previous.isEmpty { pasteboard.writeObjects(previous) }
         }
         do {
+            if pointerRouted {
+                // Pointer-routed apps' only paste targets are FIELDS (hex colors,
+                // names, search boxes) — and Blender fields keep their old text:
+                // pasting without a selection APPENDS ("FFFFFFCFCBC3" hex soup,
+                // per the audit log). Select-all first makes the paste REPLACE;
+                // on an empty field it's a no-op. ctrl, not cmd: the literal
+                // Blender binding for both chords.
+                try await driver.act(.computerUse(.key("a", modifiers: ["control"])))
+                try? await Task.sleep(for: .milliseconds(60))
+            }
             try await driver.act(.computerUse(.key("v", modifiers: [pointerRouted ? "control" : "command"])))
             // Let the app consume the pasteboard before we restore it.
             try? await Task.sleep(for: .milliseconds(pointerRouted ? 900 : 180))

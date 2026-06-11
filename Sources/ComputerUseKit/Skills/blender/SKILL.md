@@ -98,11 +98,14 @@ to confirm (`Escape` cancels and fully reverts).
   `Tab`, type Y, `Tab`, type Z, `Return` — chain it all; `Tab` commits and
   advances by itself, so nothing needs re-observing between fields. Verify
   all three numbers in the next screenshot.
-- REPLACING a value: typing into a field that still holds its old text
-  APPENDS (garbage like `FFFFFFCFCBC3` means exactly that happened). Number
-  fields select their content when clicked; text and hex fields may not —
-  when replacing, chain click-field, `ctrl+a`, type, `Return` in one turn.
-  Fix a botched field with `ctrl+a` and retype — never with repeated Delete.
+- REPLACING a value: click the field ONCE, then use the type action, then
+  `Return` — Cascade's typing clears Blender fields automatically (it
+  selects all before delivering), so the new value REPLACES the old one.
+  Never press `ctrl+v` or `cmd+v` yourself to enter content: that pastes
+  whatever the USER last copied and corrupts the field (hex soup like
+  `FFFFFFCFCBC3`). Never triple-click a field either — a single click
+  enters edit mode with the content selected. Fix a botched field with
+  `ctrl+a` and retype — never with repeated Delete.
 - After any Add or tool operation, the Adjust Last Operation panel
   (bottom-left of the viewport, or press `F9`) re-runs it with exact values —
   e.g. after Add → Cube set its Size and Location numerically. It DIES on the

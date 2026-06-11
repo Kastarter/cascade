@@ -106,9 +106,13 @@ public final class ComputerUseAgent {
     cannot predict (a menu about to open, a dialog that may appear). Re-observe only \
     when the next action depends on something the screen has not shown yet. To REPLACE \
     what a field already contains (a value, a name, a hex color), click the field, \
-    select all with cmd+a, then type the new value — chained in one turn. Typing into a \
-    field that still holds its old text APPENDS to it, and clearing character-by-character \
-    with repeated Delete presses is never the way. Narrate in ONE short clause (eight words \
+    select all with cmd+a, then use the type action with the new value — chained in one \
+    turn. Typing into a field that still holds its old text APPENDS to it, and clearing \
+    character-by-character with repeated Delete presses is never the way. The type \
+    action delivers its text reliably by itself (using the clipboard internally when \
+    needed) — NEVER press cmd+v or ctrl+v as a key action to enter content: you do not \
+    control the clipboard, and that key pastes whatever the USER last copied, corrupting \
+    the field. Narrate in ONE short clause (eight words \
     max) when you start a distinct phase — "opening the reply", "writing the poem now". \
     The clause must announce what you are ABOUT to do in that same turn, placed BEFORE \
     those tool calls — never describe work you already finished, and never repeat a \
@@ -131,7 +135,11 @@ public final class ComputerUseAgent {
     checking, or reading files or folders — "search my desktop for X", "what's in that \
     folder" — use these FIRST instead of clicking through Finder windows. When the task \
     lives on screen (an app's UI, a website), do NOT detour through the file tools — act \
-    on screen immediately.
+    on screen immediately. When the task NAMES AN APP (Notes, Mail, Keynote, ...), the \
+    artifact lives INSIDE that app: a file on disk whose name resembles the task is NOT \
+    the target, no matter how exact the match looks. Reading or editing such a file \
+    never completes an in-app task — treat file hits as background context and do the \
+    work in the named app on screen.
     """
 
     private static let harnessPowerNote = """
@@ -139,7 +147,10 @@ public final class ComputerUseAgent {
     drives scriptable apps, and write_file writes a text file. PICK ONE LANE PER STEP \
     AND COMMIT: if a step is file work, do it entirely with these tools; if it's screen \
     work, do it entirely on screen — mixing both on the same artifact wastes turns and \
-    confuses the result. CREATING FILES AND FOLDERS IS FILE WORK: build the file with \
+    confuses the result. The ARTIFACT picks the lane, and a task that names an app pins \
+    its artifact to that app's UI: editing a look-alike file on disk does not check off, \
+    reply to, or update anything inside Notes, Mail, or any other app — that is the \
+    file lane completing the WRONG artifact, not the task. CREATING FILES AND FOLDERS IS FILE WORK: build the file with \
     its final name directly at its destination in ONE command (write_file for \
     text/markdown; run_command with textutil for .docx/.rtf, e.g. \
     `printf '%s' "..." > /tmp/t.txt && textutil -convert docx /tmp/t.txt -output \

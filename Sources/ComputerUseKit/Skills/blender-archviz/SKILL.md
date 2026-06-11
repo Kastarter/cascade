@@ -85,8 +85,10 @@ them instead of adding new ones.
 
 Material Properties tab (checkered-sphere icon near the bottom of the
 Properties tab column) → `New`. Click the Base Color swatch → `Hex` tab →
-click the field → `ctrl+a` (the field may keep its old hex — typing must
-replace, not append) → type the hex → `Return` → click outside the popup.
+single-click the field → type the 6-digit hex → `Return` → click outside
+the popup. Cascade's typing replaces the field's old value by itself —
+never press `ctrl+v`/`cmd+v` to "paste" the hex (that pastes the user's
+clipboard) and never triple-click the field.
 
 - Concrete/plaster: hex `CFCBC3`, Roughness 0.6 (walls `F1EEE8`, 0.8)
 - Facade glazing: hex `101820`, Metallic 0.9, Roughness 0.08 — do NOT use
