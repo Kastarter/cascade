@@ -961,10 +961,11 @@ public final class CascadeAppModel: ObservableObject {
         var actionTime = Duration.zero
         // Streamed execution: the reply arrives as SSE and each completed tool
         // call runs HERE while the rest is still generating — the cursor starts
-        // moving seconds into the round trip instead of after it, and narration
-        // speaks the moment its clause lands. Same gates as the batch path
-        // below: generation + STOP before every action, pace gap between
-        // actions, executeCU failures end the episode.
+        // moving seconds into the round trip instead of after it. Narration is
+        // buffered until the turn's first action (an action-less turn is a
+        // closing/idle line, which episode paths narrate). Same gates as the
+        // batch path below: generation + STOP before every action, pace gap
+        // between actions, executeCU failures end the episode.
         var streamActed = false               // an action ran mid-stream this turn
         var streamFailed = false              // executeCU refused — episode is over
         var streamActionTime = Duration.zero  // this turn's in-stream action time
