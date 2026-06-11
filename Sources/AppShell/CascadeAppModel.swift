@@ -988,6 +988,13 @@ public final class CascadeAppModel: ObservableObject {
             guard let self else { return }
             Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.action.refused", detail: detail)) }
         }
+        // A long think used to look like a hang — the dock kept showing the
+        // previous turn's line for 30+ seconds. The pulse carries the thinking
+        // summary's tail, so the user watches the deliberation happen instead.
+        agent.onThinkingPulse = { [weak self] tail in
+            guard let self, self.assistGeneration == gen else { return }
+            self.dock.show(title: "Cascade is thinking…", detail: tail)
+        }
         agent.streamSink = { [weak self] item in
             guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else { return false }
             switch item {
@@ -1076,7 +1083,18 @@ public final class CascadeAppModel: ObservableObject {
                 return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
             }
 
-            if step.actions.isEmpty && step.streamedActions == 0 {
+            // A turn that only LOOKED — screenshot/wait requests, nothing else —
+            // is staring, not acting: it must count toward the stall guard, not
+            // reset it. Four consecutive look-only turns rode out the 31s
+            // thinking burst un-nudged on 2026-06-11 because .screenshot lands
+            // in step.actions. Zoom stays a real action (it reads new pixels).
+            let observationOnly = step.streamedActions == 0 && !step.actions.isEmpty
+                && step.actions.allSatisfy { action in
+                    if case .screenshot = action { return true }
+                    if case .wait = action { return true }
+                    return false
+                }
+            if (step.actions.isEmpty && step.streamedActions == 0) || observationOnly {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     auditTiming(outcome: "stalled")
@@ -1084,7 +1102,7 @@ public final class CascadeAppModel: ObservableObject {
                     return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
                 }
                 if idleTurns == 2 {
-                    nudge = "You have now replied twice without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
+                    nudge = "You have now spent two turns looking or talking without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
                 }
             } else {
                 idleTurns = 0

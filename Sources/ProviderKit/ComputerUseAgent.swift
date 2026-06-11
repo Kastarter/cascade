@@ -112,6 +112,14 @@ public final class ComputerUseAgent {
     /// from the refusal text delivered as that call's tool_result.
     public var onActionRefused: (@MainActor (String) -> Void)?
 
+    /// Fires (throttled, ~1.2s) while a thinking block streams, carrying the tail
+    /// of its summary text. Thinking precedes every action in a turn, so during a
+    /// long deliberation the sink is structurally silent — without this pulse a
+    /// 30s burst is indistinguishable from a hang (the 2026-06-11 readout runs).
+    /// The summary text was already arriving in the deltas; it was being thrown away.
+    public var onThinkingPulse: (@MainActor (String) -> Void)?
+    private var lastThinkingPulse = ContinuousClock.now
+
     /// Paste-key gate state (see `pasteRefusal`): does the goal's own wording ask
     /// for clipboard work, and has the agent itself copied something this episode
     /// (cmd+c / cmd+x) — which makes the clipboard contents its own.
@@ -146,12 +154,14 @@ public final class ComputerUseAgent {
     chain them ALL as tool calls in ONE turn. Three to six actions is a normal turn; a \
     single-action turn is the exception, reserved for steps whose outcome you genuinely \
     cannot predict (a menu about to open, a dialog that may appear). Re-observe only \
-    when the next action depends on something the screen has not shown yet. Always take \
-    the MOST DIRECT route you know and commit to it before acting: a keyboard shortcut \
-    beats a menu, a menu beats clicking through panels, and a skill's recipe beats \
-    improvising. Never open an app, window, or menu just to verify something the \
-    screenshot already shows, and never redo a step the screen proves succeeded — every \
-    detour is seconds the user spends watching a motionless cursor. To REPLACE \
+    when the next action depends on something the screen has not shown yet. Take the \
+    most direct route you know — a keyboard shortcut beats a menu, a menu beats \
+    clicking through panels, a skill's recipe beats improvising — but do NOT stop to \
+    plan the whole job before the first action: long deliberation is the slowest move \
+    available, and a plan is allowed to be wrong because the next screenshot corrects \
+    it. Pick the next direct step and ACT. Never open an app, window, or menu just to \
+    verify something the screenshot already shows, and never redo a step the screen \
+    proves succeeded. To REPLACE \
     what a field already contains (a value, a name, a hex color), click the field, \
     select all with cmd+a, then use the type action with the new value — chained in one \
     turn. Typing into a field that still holds its old text APPENDS to it, and clearing \
@@ -698,7 +708,17 @@ public final class ComputerUseAgent {
                           let delta = event["delta"] as? [String: Any] else { break }
                     switch delta["type"] as? String {
                     case "text_delta": block.text += delta["text"] as? String ?? ""
-                    case "thinking_delta": block.text += delta["thinking"] as? String ?? ""
+                    case "thinking_delta":
+                        block.text += delta["thinking"] as? String ?? ""
+                        // Liveness during deliberation: surface the summary tail so a
+                        // long think reads as progress, not a frozen cursor.
+                        if let pulse = onThinkingPulse, lastThinkingPulse.duration(to: .now) > .milliseconds(1200) {
+                            lastThinkingPulse = .now
+                            let tail = block.text.suffix(90)
+                                .replacingOccurrences(of: "\n", with: " ")
+                                .trimmingCharacters(in: .whitespaces)
+                            if !tail.isEmpty { pulse(String(tail)) }
+                        }
                     case "input_json_delta": block.json += delta["partial_json"] as? String ?? ""
                     case "signature_delta": block.signature = delta["signature"] as? String ?? block.signature
                     default: break
