@@ -163,7 +163,16 @@ public final class BackgroundWebAgent {
             await sandbox.navigate(to: startURL)
         }
 
-        guard var shot = await sandbox.snapshotPNG() else {
+        // WebKit can hand back a blank snapshot on a cold start; retry a few times
+        // before declaring failure so a transient blank doesn't abort the episode.
+        var shotData = await sandbox.snapshotPNG()
+        var snapTries = 0
+        while shotData == nil, snapTries < 3, !stopped {
+            try? await Task.sleep(for: .milliseconds(400))
+            shotData = await sandbox.snapshotPNG()
+            snapTries += 1
+        }
+        guard var shot = shotData else {
             return (.failed("Couldn't open the sandbox browser."), false)
         }
         onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))

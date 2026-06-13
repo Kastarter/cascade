@@ -20,6 +20,9 @@ public final class WebSandbox: NSObject {
 
     public let webView: WKWebView
     private var loadContinuation: CheckedContinuation<Void, Never>?
+    /// Bumped per navigation so a navigation's safety-timeout can only resume ITS
+    /// OWN load, never a later one's.
+    private var navGeneration = 0
 
     public override init() {
         let config = WKWebViewConfiguration()
@@ -42,13 +45,17 @@ public final class WebSandbox: NSObject {
         var raw = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         if !raw.lowercased().hasPrefix("http") { raw = "https://" + raw }
         guard let url = URL(string: raw) else { return }
+        navGeneration &+= 1
+        let generation = navGeneration
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             loadContinuation = continuation
             webView.load(URLRequest(url: url))
-            // Safety timeout so a hung/slow page can't wedge the loop.
+            // Safety timeout so a hung/slow page can't wedge the loop — but tagged by
+            // generation, so a stale timer from THIS load can't fire during a LATER
+            // load and resume the wrong continuation.
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(12))
-                self.resumeLoad()
+                if self.navGeneration == generation { self.resumeLoad() }
             }
         }
         // Give JS-rendered pages a beat to paint before the first snapshot.
