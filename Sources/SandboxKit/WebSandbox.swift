@@ -23,6 +23,10 @@ public final class WebSandbox: NSObject {
     /// Bumped per navigation so a navigation's safety-timeout can only resume ITS
     /// OWN load, never a later one's.
     private var navGeneration = 0
+    /// The WKNavigation `navigate()` is waiting on. The delegate callbacks resume the
+    /// continuation ONLY for this exact navigation — so an unrelated load (an in-page
+    /// link, a `createWebViewWith` redirect) can't resume it early.
+    private var pendingNavigation: WKNavigation?
 
     public override init() {
         let config = WKWebViewConfiguration()
@@ -49,7 +53,7 @@ public final class WebSandbox: NSObject {
         let generation = navGeneration
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             loadContinuation = continuation
-            webView.load(URLRequest(url: url))
+            pendingNavigation = webView.load(URLRequest(url: url))
             // Safety timeout so a hung/slow page can't wedge the loop — but tagged by
             // generation, so a stale timer from THIS load can't fire during a LATER
             // load and resume the wrong continuation.
@@ -65,6 +69,7 @@ public final class WebSandbox: NSObject {
     private func resumeLoad() {
         loadContinuation?.resume()
         loadContinuation = nil
+        pendingNavigation = nil
     }
 
     /// Renders the live page to a PNG for the agent's vision (and the watch box).
@@ -191,20 +196,24 @@ extension WebSandbox: WKUIDelegate {
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         if let url = navigationAction.request.url {
-            webView.load(URLRequest(url: url))
+            // Collapse the "new tab" into this view, and adopt its navigation so a
+            // navigate() awaiting the superseded load resumes when this one finishes.
+            pendingNavigation = webView.load(URLRequest(url: url))
         }
         return nil
     }
 }
 
 extension WebSandbox: WKNavigationDelegate {
+    // Resume only when the navigation that ended is the one navigate() is waiting on —
+    // a stray in-page or redirected load finishing must not resume it early.
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        resumeLoad()
+        if navigation === pendingNavigation { resumeLoad() }
     }
     public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        resumeLoad()
+        if navigation === pendingNavigation { resumeLoad() }
     }
     public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        resumeLoad()
+        if navigation === pendingNavigation { resumeLoad() }
     }
 }

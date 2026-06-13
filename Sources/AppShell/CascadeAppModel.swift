@@ -486,19 +486,23 @@ public final class CascadeAppModel: ObservableObject {
     /// Spawns a background agent that carries out `task` inside the isolated web
     /// sandbox (its own hidden browser), streaming progress to a small watch box —
     /// the user keeps using their Mac while it works.
-    public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) {
+    /// Returns true if a background agent actually started — false if the request was
+    /// refused (too vague, no key, or the concurrency cap). The scheduler relies on
+    /// this so a cap-refusal doesn't consume the agent's daily slot.
+    @discardableResult
+    public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) -> Bool {
         let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
         // Too vague to act on — ask rather than letting the agent wander (e.g. off
         // googling "how to create an agent").
         if trimmed.count < 5 || trimmed.split(separator: " ").count < 2 {
             teachMessage = "What should the background agent actually do? e.g. \"in the background, find the cheapest flight to Tokyo next month.\""
             voice.speak("What should the background agent do?")
-            return
+            return false
         }
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
             showSettings = true
-            return
+            return false
         }
         // Each agent owns a live WKWebView + a Computer Use loop; cap how many run at
         // once so the box stack and resource use stay sane. Refuse rather than queue —
@@ -506,7 +510,7 @@ public final class CascadeAppModel: ObservableObject {
         guard sandboxRuntimes.count < Self.maxConcurrentSandboxAgents else {
             teachMessage = "Already running \(sandboxRuntimes.count) background agents — stop one before starting another."
             voice.speak("I'm already running a few background agents. Stop one first.")
-            return
+            return false
         }
         let id = UUID()
         let runtime = BackgroundWebAgent()
@@ -523,9 +527,14 @@ public final class CascadeAppModel: ObservableObject {
                 self?.applySandboxUpdate(id, update)
             }
         }
+        return true
     }
 
     public func stopSandboxAgent(_ id: UUID) {
+        // No-op if the run already finalized (e.g. Stop tapped during the box's brief
+        // post-completion window) — otherwise we'd log a false "user stopped" against
+        // a run that actually completed. The box is hidden by the tap handler anyway.
+        guard sandboxRuntimes[id] != nil || backgroundAgents.contains(where: { $0.id == id }) else { return }
         sandboxRuntimes[id]?.stop()
         sandboxRuntimes[id] = nil
         // Drop the entry now: a late "Stopped." update then finds no entry and is a
@@ -2422,12 +2431,15 @@ public final class CascadeAppModel: ObservableObject {
             guard agent.schedule == "daily@\(nowSlot)" else { continue }
             let key = "\(agent.id)@\(today)@\(nowSlot)"
             guard !firedScheduleKeys.contains(key) else { continue }
-            firedScheduleKeys.insert(key)
             if Self.runsInBackground(apps: agent.apps) {
+                // Only consume the daily slot if it actually started — if the cap
+                // refused, leave the key unset so a later tick (this minute) retries.
+                guard createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id) else { continue }
+                firedScheduleKeys.insert(key)
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.fired", detail: agent.name))
                 agentMessage = "Scheduled: running “\(agent.name)” in the background."
-                createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id)
             } else {
+                firedScheduleKeys.insert(key)
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.due", detail: agent.name))
                 dock.show(title: "Scheduled agent is due", detail: "“\(agent.name)” is ready — deploy it from Cascades whenever you want.")
                 Task { [weak self] in

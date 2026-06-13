@@ -173,7 +173,8 @@ public final class BackgroundWebAgent {
             snapTries += 1
         }
         guard var shot = shotData else {
-            return (.failed("Couldn't open the sandbox browser."), false)
+            // A stop during the retry loop is a clean stop, not a browser failure.
+            return (stopped ? .stopped : .failed("Couldn't open the sandbox browser."), false)
         }
         onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
 
