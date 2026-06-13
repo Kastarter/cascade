@@ -97,6 +97,12 @@ public final class ComputerUseAgent {
     /// chain costs zero screenshots.
     private let harnessTier: HarnessTier
     private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
+    /// Caller-supplied tool definitions beyond the built-in Mac harness — e.g. the
+    /// web sandbox's DOM tools. Offered to the model and routed to `harnessProvider`
+    /// in-process (like the Mac harness), so they cost zero screenshots. Empty for
+    /// the on-screen cursor agent, so its behaviour is unchanged.
+    private let extraTools: [[String: Any]]
+    private let extraToolNames: Set<String>
 
     /// Mid-stream delivery: when set, each completed text block and screen action
     /// is handed over the moment it finishes generating, so the caller acts while
@@ -241,7 +247,8 @@ public final class ComputerUseAgent {
         environmentNote: String? = nil,
         skillProvider: ((String) -> String?)? = nil,
         harnessTier: HarnessTier = .off,
-        harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil
+        harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
+        extraTools: [[String: Any]] = []
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -250,6 +257,8 @@ public final class ComputerUseAgent {
         self.skillProvider = skillProvider
         self.harnessTier = harnessProvider == nil ? .off : harnessTier
         self.harnessProvider = harnessProvider
+        self.extraTools = extraTools
+        self.extraToolNames = Set(extraTools.compactMap { $0["name"] as? String })
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -396,6 +405,9 @@ public final class ComputerUseAgent {
         if harnessTier != .off {
             tools.insert(contentsOf: Self.harnessToolDefinitions(tier: harnessTier), at: tools.count - 1)
         }
+        if !extraTools.isEmpty {
+            tools.insert(contentsOf: extraTools, at: tools.count - 1)
+        }
         if skillProvider != nil {
             tools.insert([
                 "name": "use_skill",
@@ -483,10 +495,10 @@ public final class ComputerUseAgent {
                     }
                 case "highlight":
                     if let action = parseHighlight(input) { actions.append(action) }
-                case let name? where AgentHarness.isHarnessTool(name):
-                    // Resolved in-process like use_skill — search/read/run chains
-                    // never touch the screenshot loop. The provider owns audit,
-                    // power gating, and STOP.
+                case let name? where AgentHarness.isHarnessTool(name) || extraToolNames.contains(name):
+                    // Resolved in-process like use_skill — search/read/run and the
+                    // sandbox's DOM tools never touch the screenshot loop. The provider
+                    // owns audit, gating, and STOP.
                     if let id = block["id"] as? String {
                         toolResultOverrides[id] = await harnessProvider?(name, input)
                             ?? "The \(name) tool isn't available in this run."

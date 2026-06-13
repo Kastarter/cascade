@@ -178,7 +178,11 @@ public final class BackgroundWebAgent {
         }
         onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
 
-        let agent = ComputerUseAgent(keyStore: keyStore, model: model, environmentNote: Self.sandboxNote)
+        let agent = ComputerUseAgent(
+            keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
+            harnessProvider: { [sandbox] name, input in await WebHarness.run(name, input, sandbox: sandbox) },
+            extraTools: WebHarness.toolDefinitions()
+        )
         var step = await agent.begin(
             goal: AgentTaskPlanner.goal(for: sub, index: index, total: total, job: originalTask, findings: findings, firmer: firmer),
             screenshot: shot,
@@ -226,6 +230,13 @@ public final class BackgroundWebAgent {
     Actually CARRY OUT the task on the real website(s) for it. Do NOT search for \
     tutorials, articles, or "how to" guides about the task, and do NOT go to \
     ChatGPT/OpenAI to ask how — just do the task itself directly.
+
+    You have instant DOM tools — PREFER them over clicking pixel coordinates or \
+    relying on the screenshot: read_page (read the page's text/title/URL), \
+    list_interactives (see the clickable + fillable elements), click_text (click a \
+    link/button by its visible label), and fill_field (type into an input by its \
+    label). They are exact and fast; fall back to coordinate clicks only when no tool \
+    fits.
 
     If the page is a sign-in / login / "log in to continue" wall and you do not \
     have credentials, do NOT guess or type anything. Stop immediately and reply \

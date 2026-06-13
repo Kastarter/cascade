@@ -175,6 +175,99 @@ public final class WebSandbox: NSObject {
         try? await Task.sleep(for: .milliseconds(150))
     }
 
+    // MARK: - DOM harness (the web analog of the Mac file/shell harness)
+    // These read + act on the page semantically, returned inline so the agent never
+    // needs a screenshot round-trip for content or for clicking a named control.
+
+    /// The page's title, URL, and visible text (capped) — read content directly.
+    public func readPageText() async -> String {
+        let js = """
+        (function(){
+          var t = document.title || '';
+          var u = location.href || '';
+          var body = document.body ? (document.body.innerText || '') : '';
+          body = body.replace(/\\n{3,}/g,'\\n\\n').trim();
+          if (body.length > 4000) body = body.slice(0,4000) + '\\n…[truncated]';
+          return 'TITLE: '+t+'\\nURL: '+u+'\\n\\n'+body;
+        })();
+        """
+        return await runJS(js) ?? "Couldn't read the page."
+    }
+
+    /// The page's visible clickable + fillable elements, labelled — so the agent can
+    /// act on them by text instead of guessing pixel coordinates.
+    public func listInteractives() async -> String {
+        let js = """
+        (function(){
+          var sel = 'a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link]';
+          var els = Array.prototype.slice.call(document.querySelectorAll(sel));
+          var out = [];
+          for (var i=0;i<els.length && out.length<60;i++){
+            var e=els[i]; var r=e.getBoundingClientRect();
+            if (r.width<=0 || r.height<=0) continue;
+            var tag=e.tagName.toLowerCase();
+            var label=((e.getAttribute('aria-label')||e.placeholder||e.value||e.innerText||e.getAttribute('title')||'')+'').trim().replace(/\\s+/g,' ');
+            if (label.length>80) label=label.slice(0,80);
+            var field=(tag==='input'||tag==='textarea'||tag==='select');
+            if (!label && !field) continue;
+            out.push((out.length+1)+'. ['+(field?'field':(tag==='a'?'link':'button'))+'] '+(label||'(unlabeled '+tag+')'));
+          }
+          return out.length ? out.join('\\n') : 'No interactive elements found.';
+        })();
+        """
+        return await runJS(js) ?? "Couldn't list the page elements."
+    }
+
+    /// Clicks the visible element whose label best matches `text` (shortest match wins).
+    public func clickByText(_ text: String) async -> String {
+        let js = """
+        (function(q){
+          q=(q||'').toLowerCase();
+          var sel='a[href], button, [role=button], [role=link], input[type=submit], input[type=button]';
+          var els=Array.prototype.slice.call(document.querySelectorAll(sel));
+          var best=null,bestLen=1e9;
+          for(var i=0;i<els.length;i++){var e=els[i];var r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)continue;
+            var label=((e.getAttribute('aria-label')||e.value||e.innerText||e.getAttribute('title')||'')+'').toLowerCase().trim();
+            if(label.indexOf(q)!==-1 && label.length<bestLen){best=e;bestLen=label.length;}}
+          if(!best) return 'NO_MATCH: nothing clickable matching that text.';
+          best.scrollIntoView({block:'center'});
+          var rr=best.getBoundingClientRect();
+          var o={bubbles:true,cancelable:true,clientX:rr.left+rr.width/2,clientY:rr.top+rr.height/2,view:window};
+          ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){try{best.dispatchEvent(new (t.indexOf('pointer')===0?PointerEvent:MouseEvent)(t,o));}catch(e){}});
+          if(best.focus){try{best.focus();}catch(e){}}
+          return 'CLICKED: '+((best.innerText||best.value||best.getAttribute('aria-label')||best.tagName)+'').trim().slice(0,80);
+        })(\(jsString(text)));
+        """
+        let result = await runJS(js) ?? "Click failed."
+        try? await Task.sleep(for: .milliseconds(250))
+        return result
+    }
+
+    /// Types `value` into the input/textarea whose label/placeholder/name best matches
+    /// `field` (or the sole field on the page).
+    public func fillField(_ field: String, value: String) async -> String {
+        let js = """
+        (function(q,val){
+          q=(q||'').toLowerCase();
+          var els=Array.prototype.slice.call(document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]), textarea'));
+          function labelFor(e){var l=(e.getAttribute('aria-label')||e.placeholder||e.name||'')+'';
+            if(e.id){var lab=document.querySelector('label[for="'+e.id+'"]'); if(lab) l+=' '+lab.innerText;} return l.toLowerCase();}
+          var best=null;
+          for(var i=0;i<els.length;i++){var e=els[i];var r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)continue; if(labelFor(e).indexOf(q)!==-1){best=e;break;}}
+          if(!best && els.length===1) best=els[0];
+          if(!best) return 'NO_MATCH: no field matching that label.';
+          best.focus();
+          var proto=best.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+          var desc=Object.getOwnPropertyDescriptor(proto,'value');
+          if(desc&&desc.set) desc.set.call(best,val); else best.value=val;
+          best.dispatchEvent(new Event('input',{bubbles:true}));
+          best.dispatchEvent(new Event('change',{bubbles:true}));
+          return 'FILLED: '+((best.getAttribute('aria-label')||best.placeholder||best.name||'field')+'').slice(0,60)+' = '+(val+'').slice(0,60);
+        })(\(jsString(field)),\(jsString(value)));
+        """
+        return await runJS(js) ?? "Fill failed."
+    }
+
     private func jsString(_ s: String) -> String {
         let escaped = s
             .replacingOccurrences(of: "\\", with: "\\\\")
