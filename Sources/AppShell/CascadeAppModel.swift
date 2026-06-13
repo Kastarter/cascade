@@ -38,12 +38,11 @@ public struct QATurn: Identifiable, Sendable {
 public struct BackgroundAgentRun: Identifiable, Sendable {
     public let id: UUID
     public let task: String
-    public var status: String
-    public var snapshot: Data?
-    public var done: Bool
-    public var result: String?
     /// Set when this run deploys a saved agent — completion feeds its run count.
     public var agentID: Int64?
+    // No status/snapshot/done/result: the live watch box renders the agent's own
+    // WKWebView, so those were write-only — the snapshot in particular retained a
+    // PNG per step that no view ever read.
 }
 
 @MainActor
@@ -144,6 +143,8 @@ public final class CascadeAppModel: ObservableObject {
     /// Background agents running in the isolated web sandbox.
     @Published public private(set) var backgroundAgents: [BackgroundAgentRun] = []
     private var sandboxRuntimes: [UUID: BackgroundWebAgent] = [:]
+    /// How many background web agents may run at once (each = a WKWebView + a CU loop).
+    static let maxConcurrentSandboxAgents = 3
     private let sandboxBox = SandboxBoxController()
     private let elementLocator = ElementLocator()
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
@@ -485,27 +486,36 @@ public final class CascadeAppModel: ObservableObject {
     /// Spawns a background agent that carries out `task` inside the isolated web
     /// sandbox (its own hidden browser), streaming progress to a small watch box —
     /// the user keeps using their Mac while it works.
-    public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) {
+    /// Returns true if a background agent actually started — false if the request was
+    /// refused (too vague, no key, or the concurrency cap). The scheduler relies on
+    /// this so a cap-refusal doesn't consume the agent's daily slot.
+    @discardableResult
+    public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) -> Bool {
         let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
         // Too vague to act on — ask rather than letting the agent wander (e.g. off
         // googling "how to create an agent").
         if trimmed.count < 5 || trimmed.split(separator: " ").count < 2 {
             teachMessage = "What should the background agent actually do? e.g. \"in the background, find the cheapest flight to Tokyo next month.\""
             voice.speak("What should the background agent do?")
-            return
+            return false
         }
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
             showSettings = true
-            return
+            return false
+        }
+        // Each agent owns a live WKWebView + a Computer Use loop; cap how many run at
+        // once so the box stack and resource use stay sane. Refuse rather than queue —
+        // the user can stop one and retry.
+        guard sandboxRuntimes.count < Self.maxConcurrentSandboxAgents else {
+            teachMessage = "Already running \(sandboxRuntimes.count) background agents — stop one before starting another."
+            voice.speak("I'm already running a few background agents. Stop one first.")
+            return false
         }
         let id = UUID()
         let runtime = BackgroundWebAgent()
         sandboxRuntimes[id] = runtime
-        backgroundAgents.insert(
-            BackgroundAgentRun(id: id, task: trimmed, status: "Starting…", snapshot: nil, done: false, result: nil, agentID: agentID),
-            at: 0
-        )
+        backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
         voice.speak("On it. I'll handle that in the background.")
@@ -517,64 +527,83 @@ public final class CascadeAppModel: ObservableObject {
                 self?.applySandboxUpdate(id, update)
             }
         }
+        return true
     }
 
     public func stopSandboxAgent(_ id: UUID) {
+        // No-op if the run already finalized (e.g. Stop tapped during the box's brief
+        // post-completion window) — otherwise we'd log a false "user stopped" against
+        // a run that actually completed. The box is hidden by the tap handler anyway.
+        guard sandboxRuntimes[id] != nil || backgroundAgents.contains(where: { $0.id == id }) else { return }
         sandboxRuntimes[id]?.stop()
         sandboxRuntimes[id] = nil
-        if let index = backgroundAgents.firstIndex(where: { $0.id == id }) {
-            backgroundAgents[index].done = true
-            backgroundAgents[index].status = "Stopped."
-        }
+        // Drop the entry now: a late "Stopped." update then finds no entry and is a
+        // no-op, so the stop is never re-announced or mis-counted.
+        backgroundAgents.removeAll { $0.id == id }
         sandboxBox.hide(id)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "sandbox.stopped", detail: "user stopped a background agent")) }
     }
 
     private func applySandboxUpdate(_ id: UUID, _ update: BackgroundWebAgent.Update) {
-        if let index = backgroundAgents.firstIndex(where: { $0.id == id }) {
-            backgroundAgents[index].status = update.status
-            if let snapshot = update.snapshotPNG { backgroundAgents[index].snapshot = snapshot }
-            backgroundAgents[index].done = update.done
-            backgroundAgents[index].result = update.result
-        }
         sandboxBox.updateStatus(id, update.status)
         guard update.done else { return }
-        let task = backgroundAgents.first(where: { $0.id == id })?.task ?? "the task"
-        let said = update.result ?? "Finished in the background."
+        // The entry's presence is the "still live, not yet finalized" sentinel: a
+        // stop removes it, so a late terminal update finds nothing and bails — no
+        // double-report, no double-count.
+        guard let entry = backgroundAgents.first(where: { $0.id == id }) else { return }
+        let task = entry.task
 
-        // Sign-in wall: keep the box AND the runtime so Continue resumes at the
-        // pending part of the plan — earlier parts' findings intact — instead of
-        // redoing the whole job from scratch.
+        // Sign-in wall: keep the entry AND the runtime so Continue resumes at the
+        // pending part of the plan — earlier parts' findings intact.
         if update.needsLogin {
+            let said = update.result ?? "Sign-in needed — open the box and log in."
             teachMessage = said
             voice.speak(said)
             sandboxBox.requestLogin(id, message: said) { [weak self] in
                 guard let self, let runtime = self.sandboxRuntimes[id] else { return }
-                if let index = self.backgroundAgents.firstIndex(where: { $0.id == id }) {
-                    self.backgroundAgents[index].done = false
-                    self.backgroundAgents[index].status = "Continuing…"
-                }
                 Task { await runtime.resume { [weak self] update in self?.applySandboxUpdate(id, update) } }
             }
             return
         }
 
+        // Terminal: finalize once, then drop the entry so `backgroundAgents` stays
+        // bounded across a long session.
         sandboxRuntimes[id] = nil
-        teachMessage = "Background agent done — \(said)"
-        assistMemory.remember(user: "[background agent finished: \(task)]", assistant: said)
-        voice.speak(said)
-        // A deployed saved agent finishing in the sandbox is a real completed
-        // run — it feeds the same reclaimed-time math as foreground replays.
-        let deployedAgentID = backgroundAgents.first(where: { $0.id == id })?.agentID
+        backgroundAgents.removeAll { $0.id == id }
+        // Stop, failure, or running out of steps report honestly and count NOTHING;
+        // only a genuine completion says "done" and feeds the reclaimed-time math.
+        let message = Self.sandboxCompletionMessage(for: update)
+        teachMessage = message
+        assistMemory.remember(user: "[background agent: \(task)]", assistant: message)
+        voice.speak(message)
+        let deployedAgentID = entry.agentID
         Task {
-            if let deployedAgentID {
-                try? await store.markAgentRun(id: deployedAgentID)
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: task))
-                await refreshAll()
-            }
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)"))
+            await recordSandboxCompletion(deployedAgentID: deployedAgentID, update: update, task: task)
+            if update.completed, deployedAgentID != nil { await refreshAll() }
         }
         // Leave the box up briefly so the user can glance at the result, then close it.
         Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide(id) }
+    }
+
+    /// The honest user-facing line for a finished/aborted background run: a genuine
+    /// completion is announced as done; a stop, failure, or step-limit shows its own
+    /// status instead of a fake "Finished in the background."
+    static func sandboxCompletionMessage(for update: BackgroundWebAgent.Update) -> String {
+        let detail = update.result.flatMap { $0.isEmpty ? nil : $0 } ?? update.status
+        return update.completed ? "Background agent done — \(detail)" : detail
+    }
+
+    /// Records a background run's end. ONLY a genuine completion increments the run
+    /// counter + audits `agent.run.completed` — a stop / failure / step-limit must
+    /// never inflate the reclaimed-time math (the on-screen replay path, which gates
+    /// `markAgentRun` on `!stoppedEarly`, counts the same way).
+    func recordSandboxCompletion(deployedAgentID: Int64?, update: BackgroundWebAgent.Update, task: String) async {
+        if update.completed, let deployedAgentID {
+            try? await store.markAgentRun(id: deployedAgentID)
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: task))
+        }
+        let outcome = update.completed ? "completed" : "ended without completing"
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) — \(outcome)"))
     }
 
     /// Did the user ask for a background agent ("create an agent…", "in the background",
@@ -2402,12 +2431,15 @@ public final class CascadeAppModel: ObservableObject {
             guard agent.schedule == "daily@\(nowSlot)" else { continue }
             let key = "\(agent.id)@\(today)@\(nowSlot)"
             guard !firedScheduleKeys.contains(key) else { continue }
-            firedScheduleKeys.insert(key)
             if Self.runsInBackground(apps: agent.apps) {
+                // Only consume the daily slot if it actually started — if the cap
+                // refused, leave the key unset so a later tick (this minute) retries.
+                guard createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id) else { continue }
+                firedScheduleKeys.insert(key)
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.fired", detail: agent.name))
                 agentMessage = "Scheduled: running “\(agent.name)” in the background."
-                createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id)
             } else {
+                firedScheduleKeys.insert(key)
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.due", detail: agent.name))
                 dock.show(title: "Scheduled agent is due", detail: "“\(agent.name)” is ready — deploy it from Cascades whenever you want.")
                 Task { [weak self] in

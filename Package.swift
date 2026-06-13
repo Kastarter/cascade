@@ -62,7 +62,7 @@ let package = Package(
         .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit"]),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ProviderKit", "SuggestionEngine"]
+            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ProviderKit", "SuggestionEngine", "SandboxKit"]
         )
     ]
 )

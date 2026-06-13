@@ -4,7 +4,12 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import OSLog
-import ScreenCaptureKit
+// @preconcurrency: on SDKs where ScreenCaptureKit hasn't marked SCShareableContent
+// Sendable (e.g. the Swift 6.0 / Xcode 16 toolchain CI runs), returning it from the
+// nonisolated async API into this @MainActor type is otherwise a hard error. This
+// downgrades that to a warning — no runtime effect, and a no-op on newer SDKs where
+// the type is already Sendable.
+@preconcurrency import ScreenCaptureKit
 
 // ScreenCaptureKit capture flow adapted from `jasonkneen/openclicky`
 // (`cursor-buddy/CompanionScreenCaptureUtility.swift`, MIT License): cursor-screen

@@ -21,6 +21,23 @@ public final class BackgroundWebAgent {
         public let done: Bool
         public let result: String?
         public var needsLogin: Bool = false
+        /// True ONLY for a genuine, finished run — never a stop, a failure, or
+        /// running out of steps. Gates the reclaimed-time accounting downstream so
+        /// an aborted run is never counted (or announced) as a completion.
+        public var completed: Bool = false
+
+        public init(
+            status: String, snapshotPNG: Data?, url: String, done: Bool, result: String?,
+            needsLogin: Bool = false, completed: Bool = false
+        ) {
+            self.status = status
+            self.snapshotPNG = snapshotPNG
+            self.url = url
+            self.done = done
+            self.result = result
+            self.needsLogin = needsLogin
+            self.completed = completed
+        }
     }
 
     private let keyStore: AnthropicKeyStore
@@ -100,8 +117,10 @@ public final class BackgroundWebAgent {
             onUpdate(Update(status: "Stopped.", snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
             return
         }
+        // The one genuine completion: every part ran to its end without a stop,
+        // failure, login wall, or step-limit. Only this counts as a reclaimed run.
         let summary = AgentTaskPlanner.summary(findings: findings, skipped: skipped, ranLongOn: nil)
-        onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary))
+        onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary, completed: true))
     }
 
     private enum EpisodeOutcome {
@@ -144,8 +163,18 @@ public final class BackgroundWebAgent {
             await sandbox.navigate(to: startURL)
         }
 
-        guard var shot = await sandbox.snapshotPNG() else {
-            return (.failed("Couldn't open the sandbox browser."), false)
+        // WebKit can hand back a blank snapshot on a cold start; retry a few times
+        // before declaring failure so a transient blank doesn't abort the episode.
+        var shotData = await sandbox.snapshotPNG()
+        var snapTries = 0
+        while shotData == nil, snapTries < 3, !stopped {
+            try? await Task.sleep(for: .milliseconds(400))
+            shotData = await sandbox.snapshotPNG()
+            snapTries += 1
+        }
+        guard var shot = shotData else {
+            // A stop during the retry loop is a clean stop, not a browser failure.
+            return (stopped ? .stopped : .failed("Couldn't open the sandbox browser."), false)
         }
         onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
 

@@ -1639,10 +1639,12 @@ private struct ManagerScreen: View {
         model.agents.map { $0.estimatedSecondsPerRun * $0.runCount }.reduce(0, +) / 60
     }
 
-    /// Minutes still sitting on the table: unreviewed detected workflows plus
-    /// approved agents that have never actually been deployed.
+    /// Minutes still sitting on the table: the curated workflows awaiting review (the
+    /// same actionable set the Cascades tab surfaces — NOT the raw detector list, which
+    /// includes repetition the curator judged not worth automating) plus approved
+    /// agents that have never actually been deployed.
     private var minutesOnTheTable: Int {
-        let pending = model.pendingDetectedWaste.map(\.estimatedTotalSeconds).reduce(0, +)
+        let pending = model.pendingCuratedAgents.map(\.source.estimatedTotalSeconds).reduce(0, +)
         let approvedNeverRun = model.agents.filter { $0.runCount == 0 }.map(\.estimatedSeconds).reduce(0, +)
         return (pending + approvedNeverRun) / 60
     }
