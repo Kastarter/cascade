@@ -94,8 +94,25 @@ public struct WasteDetector: Sendable {
                 starts[key, default: []].append(i)
                 i += 1
             }
-            for (_, indices) in starts {
-                let nonOverlapping = Self.nonOverlapping(indices.sorted(), length: length)
+            // Process candidates in a STABLE order — Swift dictionary iteration is
+            // per-process random, which made both the chosen set and the output
+            // flaky run to run. Strongest first: most occurrences, then earliest,
+            // then lexicographic, so the result is fully deterministic.
+            let ordered = starts.sorted { lhs, rhs in
+                if lhs.value.count != rhs.value.count { return lhs.value.count > rhs.value.count }
+                let lo = lhs.value.min() ?? 0, ro = rhs.value.min() ?? 0
+                if lo != ro { return lo < ro }
+                return lhs.key < rhs.key
+            }
+            for (_, indices) in ordered {
+                // Re-check `consumed` as we go, not just when `starts` was built: a
+                // longer pass OR an earlier candidate THIS pass may already own some
+                // of these events. Without this, two overlapping shapes both emit and
+                // the same activity is counted into two cards.
+                let free = indices.sorted().filter { start in
+                    !(start..<start + length).contains(where: { consumed.contains($0) })
+                }
+                let nonOverlapping = Self.nonOverlapping(free, length: length)
                 guard nonOverlapping.count >= 2 else { continue }
                 let representativeStart = nonOverlapping.max()!
                 let instance = Array(events[representativeStart..<representativeStart + length])

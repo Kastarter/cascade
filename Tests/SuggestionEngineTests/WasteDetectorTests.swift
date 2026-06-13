@@ -225,3 +225,31 @@ func resultsSortByTotalTimeSavedDescending() {
     #expect(results[0].estimatedTotalSeconds >= results[1].estimatedTotalSeconds)
     #expect(results[0].apps == ["Mail"])
 }
+
+@Test
+func overlappingWorkflowsAreNotDoubleCounted() {
+    // Two length-2 shapes share a boundary event: [click "Inbox", ⌘C] and
+    // [⌘C, ⌘V]. The ⌘C in the middle belongs to BOTH the moment the detector
+    // forgets what it has already claimed — surfacing two cards for one stretch
+    // of activity and counting that time twice. Dictionary iteration order is
+    // per-process random, so before the fix this also made the output flaky.
+    // The earliest/strongest shape must claim its events once; the overlapping
+    // neighbour is then left with too few free occurrences and drops out.
+    func click(_ i: Int) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")
+    }
+    func key(_ i: Int, _ k: String) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: k, modifiers: ["command"], appName: "Mail")
+    }
+    // click ⌘C ⌘V ⌘S click ⌘C ⌘X ⌘C ⌘V  →  [click,⌘C]@{0,4} and [⌘C,⌘V]@{1,7}
+    let events: [InputEvent] = [
+        click(0), key(1, "c"), key(2, "v"), key(3, "s"),
+        click(4), key(5, "c"), key(6, "x"), key(7, "c"), key(8, "v"),
+    ]
+    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    #expect(results.count == 1)
+    #expect(results.first?.signature == "click@Mail|key:command+c@Mail")
+    // The hard invariant: no event id is ever counted into two workflows.
+    let allEvidence = results.flatMap(\.evidence)
+    #expect(Set(allEvidence).count == allEvidence.count)
+}
