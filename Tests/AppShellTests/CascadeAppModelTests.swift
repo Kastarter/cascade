@@ -163,6 +163,26 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
 }
 
 @MainActor @Test
+func deployGoalLeadsWithCuratedGoalThenRecordedSteps() {
+    // On-screen deploy escalates to the cursor runtime with THIS goal: the curated
+    // intent up front, the user's recorded steps as guidance (typing/scroll filtered).
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(order: 0, kind: .activateApp, appName: "Mail"),
+        RecipeStep(order: 1, kind: .click, x: 1, y: 1, appName: "Mail", ocrAnchor: "Reply"),
+        RecipeStep(order: 2, kind: .type, text: "hello", appName: "Mail"),
+        RecipeStep(order: 3, kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
+    ])
+    let withGoal = CascadeAgent(name: "Mail thing", source: .detected, signature: "s", recipe: recipe, goal: "Reply to the latest support email")
+    let g1 = CascadeAppModel.deployGoal(for: withGoal)
+    #expect(g1.hasPrefix("Reply to the latest support email")) // curated intent leads
+    #expect(g1.contains("click “Reply”"))                       // recorded steps as guidance
+    #expect(!g1.contains("hello"))                              // never the typed text
+
+    let noGoal = CascadeAgent(name: "Mail thing", source: .detected, signature: "s2", recipe: recipe)
+    #expect(CascadeAppModel.deployGoal(for: noGoal).hasPrefix("Mail thing")) // falls back to the name
+}
+
+@MainActor @Test
 func completionMessageIsHonestAboutTheOutcome() {
     // Genuine completion announces done; everything else shows its own status —
     // never the old fake "Background agent done — Finished in the background."
