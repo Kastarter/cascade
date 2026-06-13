@@ -183,6 +183,7 @@ public final class BackgroundWebAgent {
 
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
+            skillProvider: { WebSkills.content(named: $0) },
             harnessProvider: { [sandbox] name, input in await WebHarness.run(name, input, sandbox: sandbox) },
             extraTools: WebHarness.toolDefinitions()
         )
@@ -190,7 +191,8 @@ public final class BackgroundWebAgent {
             goal: AgentTaskPlanner.goal(for: sub, index: index, total: total, job: originalTask, findings: findings, firmer: firmer),
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
-            displayHeightPoints: Int(WebSandbox.height)
+            displayHeightPoints: Int(WebSandbox.height),
+            skillIndex: WebSkills.index()
         )
 
         var acted = false
