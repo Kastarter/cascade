@@ -2076,9 +2076,8 @@ public final class CascadeAppModel: ObservableObject {
                 // pause). Hand control back instead of plowing on.
                 if step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick,
                    let modalTitle = await Self.unexpectedModal() {
-                    agentMessage = "Paused “\(agent.name)” — a dialog (“\(modalTitle)”) is open that the recording never saw. Handle it, then deploy again."
-                    dock.show(title: "Paused — dialog open", detail: agentMessage)
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
+                    await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
                     stoppedEarly = true
                     break
                 }
@@ -2137,8 +2136,7 @@ public final class CascadeAppModel: ObservableObject {
                                 unverifiedStreak += 1
                                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeLabel(step)))
                                 if unverifiedStreak >= 2 {
-                                    agentMessage = "Paused “\(agent.name)” — the screen no longer matches the recorded steps. Take over, or re-record the workflow."
-                                    dock.show(title: "Paused", detail: agentMessage)
+                                    await escalateRecipeToAssist(agent, reason: "the screen no longer matches the recorded steps")
                                     stoppedEarly = true
                                     break
                                 }
@@ -2179,6 +2177,53 @@ public final class CascadeAppModel: ObservableObject {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: agent.name))
         }
         await refreshAll()
+    }
+
+    /// The natural-language goal a deployed on-screen workflow hands to the assist
+    /// runtime: the curator's intent (or the agent name) plus the user's recorded
+    /// steps as guidance — so the cursor-class agent reproduces the workflow with the
+    /// full kit (skills, harness, streaming) instead of replaying brittle pixels.
+    static func deployGoal(for agent: CascadeAgent) -> String {
+        let intent = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var goal = (intent?.isEmpty == false) ? intent! : agent.name
+        let steps = agent.recipe.humanSteps.filter { $0 != "type" && $0 != "scroll" }.prefix(8).joined(separator: ", ")
+        if !steps.isEmpty { goal += "\n(The user normally does this as: \(steps).)" }
+        return goal
+    }
+
+    /// Recipe replay drifted from the live UI — instead of pausing, hand the rest of
+    /// the job to the FULL assist runtime (skills, harness, streaming) from the current
+    /// screen. The "fast deterministic replay, escalate to cursor-class on drift"
+    /// model: fast when the UI matches, intelligent when it doesn't. Mirrors the
+    /// hotkey/voice setup (bump generation, capture, supersession guard) so a barge-in
+    /// still stands the escalated agent down. agentRunning stays true (the caller owns it).
+    private func escalateRecipeToAssist(_ agent: CascadeAgent, reason: String) async {
+        // Honor a pending STOP: runAssistTask resets runState on entry, which would
+        // otherwise swallow an abort the user pressed just as drift triggered.
+        guard !driver.runState.isStopRequested else {
+            agentMessage = "Stopped. Control returned to you."
+            dock.show(title: "Stopped", detail: agentMessage)
+            return
+        }
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.escalate", detail: "\(agent.name) — \(reason)"))
+        let mouse = NSEvent.mouseLocation
+        guard hasAnthropicKey, let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
+            agentMessage = "Paused “\(agent.name)” — \(reason), and I can't take over without a Claude key. Take over, or re-record."
+            dock.show(title: "Paused", detail: agentMessage)
+            return
+        }
+        dock.show(title: "Adapting…", detail: "“\(agent.name)” — \(reason); finishing it intelligently.")
+        assistGeneration += 1
+        let gen = assistGeneration
+        let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
+            agentMessage = "Paused “\(agent.name)” — couldn't capture the screen to take over."
+            dock.show(title: "Paused", detail: agentMessage)
+            return
+        }
+        guard assistGeneration == gen else { return } // a barge-in superseded us
+        await runAssistTask(goal: Self.deployGoal(for: agent), screen: screen, firstScreenshotPNG: shot, gen: gen)
+        agentMessage = teachMessage
     }
 
     /// Performs the step's click kind at a CG global point.
