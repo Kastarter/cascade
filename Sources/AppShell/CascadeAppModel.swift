@@ -519,9 +519,11 @@ public final class CascadeAppModel: ObservableObject {
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
         voice.speak("On it. I'll handle that in the background.")
-        sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed) { [weak self] in
+        sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed, onStop: { [weak self] in
             self?.stopSandboxAgent(id)
-        }
+        }, onSteer: { [weak self] message in
+            self?.sandboxRuntimes[id]?.steer(message)
+        })
         Task {
             await runtime.run(task: trimmed) { [weak self] update in
                 self?.applySandboxUpdate(id, update)
