@@ -1,8 +1,20 @@
 # Plan — Smart Cascades + Deployed-Agent Parity (Features 4 & 5)
 
-Status: proposed · Author: audit follow-up · Date: 2026-06-13
+Status: **Feature 4 (R1 — smart detection) shipped; C7 foundation done.** Feature 5 / R2 parity remains. · Date: 2026-06-13
 Scope: Feature 4 (Detected workflows → agents) and Feature 5 (Background web agents).
 Companion: see `docs/FEATURES.md` §4–5 for the current surface; this plan is the upgrade path.
+
+## ✅ Shipped (PR #5 — `feat/feature-4-smart-cascades`)
+
+The R1 "smart, need-aware detection" half of Feature 4, plus the testability foundation:
+- **A1 `WorkflowCurator`** — LLM judges/renames/drops detector candidates; grounded; degrades to raw list. (P2a)
+- **A3 card honesty** — review surface shows the curated name + "why"; counts use the curated queue. (P2b)
+- **Curated goal end-to-end** — persisted on the agent (schema + preserved on re-detect) and drives the background-sandbox deploy. (P3a/b)
+- **Detector hardening** — deterministic emission, no double-counting. (P1)
+- **Generality (the no-hardcoding pass)** — curator judges any workflow shape (P4); browsers detected by capability, not a brand list (P5); **web apps inside the browser detected as distinct, named apps** (P6).
+- **C7 — `AppShellTests`** — `CascadeAppModel` made headless-constructible (injected store/orchestrator/defaults, gated subsystems); wiring proven: `refreshAll`→`curatedWaste`, the pending filter, decline, and approve (curated name + goal). 173 tests green.
+
+**Not in this PR (next):** A2 (proactive from-record proposals — deferred), and all of Workstream B's R2 parity — chiefly **B6** (on-screen deploy via the shared runtime), which is blocked on the **B1/B2** `AgentRuntime` extraction in the Feature 5 foundation work. The C-table's other rows (the `applySandboxUpdate` honest-math bug, lifecycle, navigate race) are Feature 5 and now unblocked by C7.
 
 ## The two rules this plan must satisfy
 
@@ -88,7 +100,7 @@ promote value the detector can't see (R1).
 
 ## 3. Workstream A — Smart, need-aware Cascades (serves R1)
 
-### A1. `WorkflowCurator` (new, ProviderKit — needs the model)
+### A1. `WorkflowCurator` — ✅ DONE (shipped in `AgentOrchestrator`, not ProviderKit)
 - **Input:** `WasteDetector` candidates + a privacy-filtered summary of the recent record
   (apps, recurring window titles, cross-app flows) + existing agents (dedupe) + declined
   signatures (don't re-pitch).
@@ -103,13 +115,13 @@ promote value the detector can't see (R1).
 - **Cadence:** runs in `refreshAll` behind a debounce; haiku-tier, cached; falls back to the
   raw `WasteDetector` list if the key/network is down (never worse than today).
 
-### A2. Proactive "what would help" pass
+### A2. Proactive "what would help" pass — ⛔ DEFERRED (next)
 - The curator also scans for **high-leverage web tasks the user does by hand** (recurring
   manual flows on the same sites) and proposes them as *background* agents — the single
   highest-value thing Cascade can offer, since they run while the user keeps working. This is
   the literal embodiment of "know what the user needs."
 
-### A3. Card honesty
+### A3. Card honesty — ✅ DONE
 - Cards show the curator's name + why-it-helps + the grounded evidence thumbnail + the exact
   goal the agent will run (so "what will happen" is the truth, not a token soup). Keep the
   existing decline-persists + humanSteps preview.
@@ -174,7 +186,7 @@ Instant DOM tools resolved inline (zero screenshots), gated like `HarnessTier`:
 Semantic targeting beats `elementFromPoint` pixel-guessing → fewer steps, fewer misclicks,
 much faster. Keep vision as the fallback when the DOM is opaque (canvas/SPA).
 
-### B6. Hybrid replay for on-screen detected workflows (fast **and** smart)
+### B6. Hybrid replay for on-screen detected workflows (fast **and** smart) — ⛔ BLOCKED on B1/B2
 Don't throw away the recorded recipe — use it as a **fast deterministic first attempt**, then
 **escalate to the full `AgentRuntime`** (skills + harness + vision) the moment it drifts:
 - UI matches → replay the recipe at near-zero latency (today's speed, kept).
@@ -231,7 +243,7 @@ surfaces; a browser data task finishes via harness in one shot; the background a
 | C4 | Fix the `navigate` stale-timer (tag each navigation; the timer only resumes its own). | `WebSandbox.swift:41–61` |
 | C5 | Concurrency cap + lifecycle for background agents (N max, queue or refuse beyond). | `createSandboxAgent` |
 | C6 | First-snapshot retry before declaring `.failed`. | `BackgroundWebAgent.swift:147` |
-| C7 | Stand up **`AppShellTests`**: spawn routes, `applySandboxUpdate` outcomes, reclaimed math, `fireDueSchedules`, hybrid replay escalation. | new test target in `Package.swift` |
+| **C7 ✅** | **DONE** — `AppShellTests` target stood up; `CascadeAppModel` made headless-constructible (injected store/orchestrator/defaults + gated subsystems). Feature 4 wiring proven (refreshAll→curatedWaste, pending filter, decline, approve w/ curated name+goal). The `applySandboxUpdate`/reclaimed-math/`fireDueSchedules` tests it unblocks are Feature 5. | `Package.swift`, `CascadeAppModel` |
 | C8 | Doc fix: FEATURES.md "voice/chat" spawn (chat doesn't spawn) and "reuses your sign-ins" (box-only persistence). | `docs/FEATURES.md:78,75` |
 
 ---
@@ -276,10 +288,11 @@ Ship-able after each step; (1) and (3) each stand alone as user-visible wins.
   out of scope here.
 
 ## 9. Definition of Done — checked against the two rules
-- **R1 (smart):** Cascades shows curator-judged, human-named, grounded proposals (incl.
-  background-web), drops noise, and proposes high-value web tasks the mechanical detector
-  would miss. No agent without evidence.
-- **R2 (parity):** both deployed surfaces run on the shared `AgentRuntime` — streaming, skills,
+- **R1 (smart):** ✅ mostly done — Cascades shows curator-judged, human-named, grounded
+  proposals, drops noise, and routes/names web work (incl. web apps inside the browser). No
+  agent without evidence. *Remaining:* A2 (proactively proposing tasks the mechanical detector
+  never caught).
+- **R2 (parity):** ⛔ not started — both deployed surfaces run on the shared `AgentRuntime` — streaming, skills,
   harness (Mac + Web), memory, auto-learning. The §1.1 table is all ✅. A browser data task
   finishes via harness in one shot; on-screen deploy escalates to the intelligent agent instead
   of pausing; "Reclaimed" only counts verified completions.
