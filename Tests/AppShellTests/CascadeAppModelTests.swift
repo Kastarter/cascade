@@ -41,6 +41,21 @@ private func copyPasteEvents() -> [InputEvent] {
     return events
 }
 
+/// Polls a MainActor condition until true or it times out (~5s), yielding so the
+/// model's fire-and-forget Tasks can run.
+@MainActor
+private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throws {
+    var tries = 0
+    while !condition(), tries < maxTries {
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+}
+
+private let curatorKeepsOne = """
+{"agents":[{"index":0,"name":"Copy invoice totals into Numbers","why":"You do it by hand daily.","goal":"Copy the latest invoice totals out of Mail into the Numbers tracker.","value":0.9}]}
+"""
+
 @MainActor @Test
 func modelBuildsHeadlessWithoutStartingHardware() throws {
     let (model, _) = try makeModel()
@@ -49,4 +64,49 @@ func modelBuildsHeadlessWithoutStartingHardware() throws {
     #expect(model.agents.isEmpty)
     #expect(model.pendingCuratedAgents.isEmpty)
     #expect(!model.agentRunning)
+}
+
+@MainActor @Test
+func refreshAllCuratesDetectedWorkflows() async throws {
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    try await store.insertInputEvents(copyPasteEvents())
+
+    await model.refreshAll()
+
+    // The whole R1 surface wiring: detector caught it → curator judged + renamed it →
+    // it's what the review tab shows.
+    #expect(model.detectedWaste.count == 1)
+    #expect(model.curatedWaste.count == 1)
+    #expect(model.curatedWaste.first?.name == "Copy invoice totals into Numbers")
+    #expect(model.pendingCuratedAgents.count == 1) // nothing approved or declined yet
+}
+
+@MainActor @Test
+func decliningHidesFromPendingImmediately() async throws {
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    try await store.insertInputEvents(copyPasteEvents())
+    await model.refreshAll()
+    let curated = try #require(model.pendingCuratedAgents.first)
+
+    model.declineCurated(curated)
+
+    #expect(model.pendingCuratedAgents.isEmpty) // filtered out at once
+    #expect(model.curatedWaste.count == 1)      // still curated, just hidden
+}
+
+@MainActor @Test
+func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws {
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    try await store.insertInputEvents(copyPasteEvents())
+    await model.refreshAll()
+    let curated = try #require(model.pendingCuratedAgents.first)
+
+    model.approveCurated(curated) // fire-and-forget: createAgent → refreshAll
+    try await waitUntil { model.agents.contains { $0.signature == curated.signature } }
+
+    let agent = try #require(model.agents.first { $0.signature == curated.signature })
+    #expect(agent.name == "Copy invoice totals into Numbers")
+    #expect(agent.goal == "Copy the latest invoice totals out of Mail into the Numbers tracker.")
+    // Approved → it drops out of the review queue.
+    #expect(!model.pendingCuratedAgents.contains { $0.signature == curated.signature })
 }
