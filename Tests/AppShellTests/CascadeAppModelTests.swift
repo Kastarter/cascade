@@ -24,7 +24,10 @@ private func makeModel(curatorReply: String = #"{"agents":[]}"#) throws -> (mode
         .appendingPathComponent("CascadeAppShellIT-\(UUID().uuidString).sqlite").path
     let store = try CascadeStore(path: path)
     let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: curatorReply)))
-    let model = try CascadeAppModel(store: store, orchestrator: orchestrator, startsSubsystems: false)
+    // An ephemeral defaults suite per model — tests never read stale declines from,
+    // or pollute, the real .standard defaults (and so don't contaminate each other).
+    let defaults = UserDefaults(suiteName: "CascadeTest-\(UUID().uuidString)")!
+    let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
     return (model, store)
 }
 

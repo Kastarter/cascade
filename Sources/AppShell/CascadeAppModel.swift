@@ -68,21 +68,21 @@ public final class CascadeAppModel: ObservableObject {
     /// title is the stable identity of a heuristic suggestion. Persisted, like
     /// declined workflow signatures — "no" must survive a relaunch.
     @Published private var dismissedSuggestionTitles: Set<String> {
-        didSet { Self.persist(dismissedSuggestionTitles, key: Self.dismissedSuggestionsKey) }
+        didSet { Self.persist(dismissedSuggestionTitles, key: Self.dismissedSuggestionsKey, defaults: defaultsStore) }
     }
     @Published private var dismissedWasteSignatures: Set<String> {
-        didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey) }
+        didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey, defaults: defaultsStore) }
     }
     private static let dismissedSuggestionsKey = "cascade.dismissedSuggestions"
     private static let dismissedWasteKey = "cascade.dismissedWaste"
 
-    private static func persist(_ values: Set<String>, key: String) {
+    private static func persist(_ values: Set<String>, key: String, defaults: UserDefaults) {
         // Capped so years of declines can't grow the defaults plist unbounded.
-        UserDefaults.standard.set(Array(values.suffix(300)), forKey: key)
+        defaults.set(Array(values.suffix(300)), forKey: key)
     }
 
-    private static func restoreSet(key: String) -> Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    private static func restoreSet(key: String, defaults: UserDefaults) -> Set<String> {
+        Set(defaults.stringArray(forKey: key) ?? [])
     }
     @Published public private(set) var managerCascades: [ManagerCascade] = []
     @Published public private(set) var contexts: [RecordedContext] = []
@@ -116,7 +116,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public var cursorTheme: CursorTheme {
         didSet {
             guidanceOverlay.setTheme(cursorTheme)
-            UserDefaults.standard.set(cursorTheme.rawValue, forKey: Self.cursorThemeKey)
+            defaultsStore.set(cursorTheme.rawValue, forKey: Self.cursorThemeKey)
         }
     }
     private static let cursorThemeKey = "cascade.cursorTheme"
@@ -126,7 +126,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Settings opt-in, default OFF; every call is audited verbatim and the
     /// destructive-command deny-list applies regardless.
     @Published public var powerHarnessEnabled: Bool {
-        didSet { UserDefaults.standard.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
+        didSet { defaultsStore.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
     }
     private static let powerHarnessKey = "cascade.powerHarness"
 
@@ -175,21 +175,26 @@ public final class CascadeAppModel: ObservableObject {
     /// scheduler, no audio I/O — so the orchestration logic can be exercised in
     /// isolation. Production leaves it true and everything starts as before.
     private let startsSubsystems: Bool
+    /// Injectable so tests get an ephemeral suite instead of polluting (and reading
+    /// stale state from) the real `.standard` defaults. Production uses `.standard`.
+    private let defaultsStore: UserDefaults
 
     public init(
         store injectedStore: CascadeStore? = nil,
         orchestrator injectedOrchestrator: CascadeOrchestrator? = nil,
+        defaults: UserDefaults = .standard,
         startsSubsystems: Bool = true
     ) throws {
         self.startsSubsystems = startsSubsystems
+        self.defaultsStore = defaults
         let store = try injectedStore ?? CascadeStore()
         self.store = store
-        cursorTheme = UserDefaults.standard.string(forKey: Self.cursorThemeKey)
+        cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
-        powerHarnessEnabled = UserDefaults.standard.bool(forKey: Self.powerHarnessKey)
-        dismissedSuggestionTitles = Self.restoreSet(key: Self.dismissedSuggestionsKey)
-        dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey)
-        showOnboarding = !UserDefaults.standard.bool(forKey: Self.onboardedKey)
+        powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
+        dismissedSuggestionTitles = Self.restoreSet(key: Self.dismissedSuggestionsKey, defaults: defaults)
+        dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
+        showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
@@ -2427,7 +2432,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Closes the first-run guide for good (Settings can reopen it).
     public func finishOnboarding() {
         showOnboarding = false
-        UserDefaults.standard.set(true, forKey: Self.onboardedKey)
+        defaultsStore.set(true, forKey: Self.onboardedKey)
         refreshPermissionState()
         startRecording()
     }
