@@ -63,7 +63,8 @@ public struct WasteDetector: Sendable {
     public func detect(
         contexts: [RecordedContext],
         inputEvents: [InputEvent],
-        maxResults: Int = 5
+        maxResults: Int = 5,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
     ) -> [DetectedWaste] {
         // Oldest → newest; ignore anything in a sensitive app defensively. Scroll
         // BURSTS collapse to one gesture first — eight wheel ticks while reading
@@ -76,7 +77,12 @@ public struct WasteDetector: Sendable {
         )
         guard events.count >= minRunLength * 2 else { return [] }
 
-        let tokens = events.map(Self.token)
+        // The "surface" an event happened on: the web app inside the browser when one
+        // is identifiable (Gmail, Notion…), else the macOS app. Detecting by surface
+        // is what makes two web apps in the SAME browser distinct workflows instead of
+        // both collapsing into "Chrome". Default (nil resolver) = the app itself.
+        let surface: (InputEvent) -> String = { webAppIdentity?($0) ?? $0.appName }
+        let tokens = events.map { Self.token($0, surface: surface($0)) }
         let n = events.count
         var consumed = Set<Int>()
         var results: [DetectedWaste] = []
@@ -94,8 +100,25 @@ public struct WasteDetector: Sendable {
                 starts[key, default: []].append(i)
                 i += 1
             }
-            for (_, indices) in starts {
-                let nonOverlapping = Self.nonOverlapping(indices.sorted(), length: length)
+            // Process candidates in a STABLE order — Swift dictionary iteration is
+            // per-process random, which made both the chosen set and the output
+            // flaky run to run. Strongest first: most occurrences, then earliest,
+            // then lexicographic, so the result is fully deterministic.
+            let ordered = starts.sorted { lhs, rhs in
+                if lhs.value.count != rhs.value.count { return lhs.value.count > rhs.value.count }
+                let lo = lhs.value.min() ?? 0, ro = rhs.value.min() ?? 0
+                if lo != ro { return lo < ro }
+                return lhs.key < rhs.key
+            }
+            for (_, indices) in ordered {
+                // Re-check `consumed` as we go, not just when `starts` was built: a
+                // longer pass OR an earlier candidate THIS pass may already own some
+                // of these events. Without this, two overlapping shapes both emit and
+                // the same activity is counted into two cards.
+                let free = indices.sorted().filter { start in
+                    !(start..<start + length).contains(where: { consumed.contains($0) })
+                }
+                let nonOverlapping = Self.nonOverlapping(free, length: length)
                 guard nonOverlapping.count >= 2 else { continue }
                 let representativeStart = nonOverlapping.max()!
                 let instance = Array(events[representativeStart..<representativeStart + length])
@@ -112,7 +135,7 @@ public struct WasteDetector: Sendable {
                 let hasIntentMarker = instance.contains(where: Self.isIntentMarker)
                     || Set(instance.map(\.appName)).count >= 2
                 guard structuralCount >= 2, hasIntentMarker else { continue }
-                results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts))
+                results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts, surface: surface))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
                 }
@@ -132,7 +155,7 @@ public struct WasteDetector: Sendable {
 
     // MARK: - Recipe construction
 
-    private func makeWaste(instance: [InputEvent], occurrences: Int, contexts: [RecordedContext]) -> DetectedWaste {
+    private func makeWaste(instance: [InputEvent], occurrences: Int, contexts: [RecordedContext], surface: (InputEvent) -> String) -> DetectedWaste {
         var steps: [RecipeStep] = []
         var order = 0
         var lastApp: String?
@@ -158,11 +181,16 @@ public struct WasteDetector: Sendable {
             order += 1
         }
 
+        // Real macOS apps drive routing (browser → background sandbox) and replay
+        // (activateApp opens the browser). The SURFACE — the web app when there is one
+        // — names the card and keys the signature, so the user sees "Gmail", not
+        // "Chrome", and two web apps in one browser are two distinct agents.
         let apps = Self.orderedDistinct(instance.map(\.appName))
+        let surfaces = Self.orderedDistinct(instance.map(surface))
         let span = instance.last!.capturedAt.timeIntervalSince(instance.first!.capturedAt)
         let perRun = max(instance.count, Int(span.rounded()))
         return DetectedWaste(
-            title: Self.title(apps: apps, steps: steps),
+            title: Self.title(apps: surfaces, steps: steps),
             apps: apps,
             occurrences: occurrences,
             estimatedSecondsPerRun: perRun,
@@ -170,7 +198,7 @@ public struct WasteDetector: Sendable {
             recipe: AgentRecipe(steps: steps),
             evidence: instance.map(\.id),
             confidence: min(0.95, 0.5 + Double(occurrences) * 0.12),
-            signature: instance.map(Self.token).joined(separator: "|"),
+            signature: instance.map { Self.token($0, surface: surface($0)) }.joined(separator: "|"),
             lastSeenAt: instance.last!.capturedAt
         )
     }
@@ -202,15 +230,15 @@ public struct WasteDetector: Sendable {
     /// The token used to compare actions for repetition. Coordinates and typed
     /// content are intentionally ignored — what repeats is the *shape* (kind +
     /// app + shortcut), not the exact pixels or text.
-    private static func token(_ event: InputEvent) -> String {
+    private static func token(_ event: InputEvent, surface: String) -> String {
         switch event.kind {
         case .key:
             let mods = event.modifiers.sorted().joined(separator: "+")
-            return "key:\(mods)+\(event.key ?? "")@\(event.appName)"
+            return "key:\(mods)+\(event.key ?? "")@\(surface)"
         case .type:
-            return "type@\(event.appName)"
+            return "type@\(surface)"
         default:
-            return "\(event.kind.rawValue)@\(event.appName)"
+            return "\(event.kind.rawValue)@\(surface)"
         }
     }
 

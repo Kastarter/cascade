@@ -225,3 +225,62 @@ func resultsSortByTotalTimeSavedDescending() {
     #expect(results[0].estimatedTotalSeconds >= results[1].estimatedTotalSeconds)
     #expect(results[0].apps == ["Mail"])
 }
+
+@Test
+func overlappingWorkflowsAreNotDoubleCounted() {
+    // Two length-2 shapes share a boundary event: [click "Inbox", ⌘C] and
+    // [⌘C, ⌘V]. The ⌘C in the middle belongs to BOTH the moment the detector
+    // forgets what it has already claimed — surfacing two cards for one stretch
+    // of activity and counting that time twice. Dictionary iteration order is
+    // per-process random, so before the fix this also made the output flaky.
+    // The earliest/strongest shape must claim its events once; the overlapping
+    // neighbour is then left with too few free occurrences and drops out.
+    func click(_ i: Int) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")
+    }
+    func key(_ i: Int, _ k: String) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: k, modifiers: ["command"], appName: "Mail")
+    }
+    // click ⌘C ⌘V ⌘S click ⌘C ⌘X ⌘C ⌘V  →  [click,⌘C]@{0,4} and [⌘C,⌘V]@{1,7}
+    let events: [InputEvent] = [
+        click(0), key(1, "c"), key(2, "v"), key(3, "s"),
+        click(4), key(5, "c"), key(6, "x"), key(7, "c"), key(8, "v"),
+    ]
+    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    #expect(results.count == 1)
+    #expect(results.first?.signature == "click@Mail|key:command+c@Mail")
+    // The hard invariant: no event id is ever counted into two workflows.
+    let allEvidence = results.flatMap(\.evidence)
+    #expect(Set(allEvidence).count == allEvidence.count)
+}
+
+@Test
+func webAppsInSameBrowserAreDistinctWorkflows() {
+    // Two different web apps, BOTH in Google Chrome, each a repeated click + ⌘C.
+    // Keyed only on the macOS app they tokenize identically and merge into one
+    // "Chrome" workflow; with a web-app resolver they become two distinct agents,
+    // each named for the web app — while still recording the real browser.
+    func click(_ i: Int, _ title: String) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Compose", appName: "Google Chrome", windowTitle: title)
+    }
+    func copy(_ i: Int, _ title: String) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Google Chrome", windowTitle: title)
+    }
+    let gmail = "Inbox - me@example.com - Gmail"
+    let notion = "Tasks - Notion"
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 { events.append(click(i, gmail)); i += 1; events.append(copy(i, gmail)); i += 1 }
+    for _ in 0..<2 { events.append(click(i, notion)); i += 1; events.append(copy(i, notion)); i += 1 }
+
+    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.from(windowTitle: $0.windowTitle) }
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, webAppIdentity: resolver)
+    #expect(results.count == 2)
+    #expect(results.contains { $0.title.contains("Gmail") })
+    #expect(results.contains { $0.title.contains("Notion") })
+    // The real browser is still what's recorded, so replay + background routing work.
+    #expect(results.allSatisfy { $0.apps == ["Google Chrome"] })
+
+    // Contrast: with no resolver, both collapse into a single "Chrome" workflow.
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).count == 1)
+}

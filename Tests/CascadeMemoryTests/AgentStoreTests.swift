@@ -159,3 +159,24 @@ func humanStepsReadLikeTheWorkflow() {
         "type",  // never the recorded text itself
     ])
 }
+
+@Test
+func curatedGoalRoundTripsAndSurvivesRedetect() async throws {
+    let store = try makeAgentStore()
+    let goal = "Copy the latest invoice totals out of Mail into the Numbers tracker."
+    let agent = try await store.upsertAgent(CascadeAgent(
+        name: "Copy invoice totals into Numbers",
+        source: .detected, signature: "s", recipe: AgentRecipe(steps: []), goal: goal
+    ))
+    #expect(agent.goal == goal)
+
+    // A re-detect refresh supplies no goal — the curated goal (like run history
+    // and schedule) belongs to the approved agent and must survive.
+    _ = try await store.upsertAgent(CascadeAgent(
+        name: "Copy invoice totals into Numbers v2",
+        source: .detected, signature: "s", recipe: AgentRecipe(steps: [])
+    ))
+    let refreshed = try await store.agent(id: agent.id)
+    #expect(refreshed?.goal == goal)
+    #expect(refreshed?.name == "Copy invoice totals into Numbers v2") // name still refreshes
+}

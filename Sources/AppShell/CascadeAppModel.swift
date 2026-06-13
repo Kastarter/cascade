@@ -68,21 +68,21 @@ public final class CascadeAppModel: ObservableObject {
     /// title is the stable identity of a heuristic suggestion. Persisted, like
     /// declined workflow signatures — "no" must survive a relaunch.
     @Published private var dismissedSuggestionTitles: Set<String> {
-        didSet { Self.persist(dismissedSuggestionTitles, key: Self.dismissedSuggestionsKey) }
+        didSet { Self.persist(dismissedSuggestionTitles, key: Self.dismissedSuggestionsKey, defaults: defaultsStore) }
     }
     @Published private var dismissedWasteSignatures: Set<String> {
-        didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey) }
+        didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey, defaults: defaultsStore) }
     }
     private static let dismissedSuggestionsKey = "cascade.dismissedSuggestions"
     private static let dismissedWasteKey = "cascade.dismissedWaste"
 
-    private static func persist(_ values: Set<String>, key: String) {
+    private static func persist(_ values: Set<String>, key: String, defaults: UserDefaults) {
         // Capped so years of declines can't grow the defaults plist unbounded.
-        UserDefaults.standard.set(Array(values.suffix(300)), forKey: key)
+        defaults.set(Array(values.suffix(300)), forKey: key)
     }
 
-    private static func restoreSet(key: String) -> Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    private static func restoreSet(key: String, defaults: UserDefaults) -> Set<String> {
+        Set(defaults.stringArray(forKey: key) ?? [])
     }
     @Published public private(set) var managerCascades: [ManagerCascade] = []
     @Published public private(set) var contexts: [RecordedContext] = []
@@ -91,6 +91,10 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var audit: [AuditEvent] = []
     @Published public private(set) var suggestions: [AgentSuggestion] = []
     @Published public private(set) var detectedWaste: [DetectedWaste] = []
+    /// The curated, judged, human-named view of `detectedWaste` (R1) — what the
+    /// Cascades review surface shows. `detectedWaste` stays the raw recall layer
+    /// behind the Manager analytics.
+    @Published public private(set) var curatedWaste: [CuratedAgent] = []
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
     @Published public private(set) var conversation: [QATurn] = []
@@ -112,7 +116,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public var cursorTheme: CursorTheme {
         didSet {
             guidanceOverlay.setTheme(cursorTheme)
-            UserDefaults.standard.set(cursorTheme.rawValue, forKey: Self.cursorThemeKey)
+            defaultsStore.set(cursorTheme.rawValue, forKey: Self.cursorThemeKey)
         }
     }
     private static let cursorThemeKey = "cascade.cursorTheme"
@@ -122,7 +126,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Settings opt-in, default OFF; every call is audited verbatim and the
     /// destructive-command deny-list applies regardless.
     @Published public var powerHarnessEnabled: Bool {
-        didSet { UserDefaults.standard.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
+        didSet { defaultsStore.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
     }
     private static let powerHarnessKey = "cascade.powerHarness"
 
@@ -166,20 +170,35 @@ public final class CascadeAppModel: ObservableObject {
     private var lastSettingsOpen = Date.distantPast
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
     private var userPaused = false
+    /// False in tests/headless: the model is built with an injected store +
+    /// orchestrator and starts NO hardware — no CGEvent taps, no screen capture, no
+    /// scheduler, no audio I/O — so the orchestration logic can be exercised in
+    /// isolation. Production leaves it true and everything starts as before.
+    private let startsSubsystems: Bool
+    /// Injectable so tests get an ephemeral suite instead of polluting (and reading
+    /// stale state from) the real `.standard` defaults. Production uses `.standard`.
+    private let defaultsStore: UserDefaults
 
-    public init() throws {
-        let store = try CascadeStore()
+    public init(
+        store injectedStore: CascadeStore? = nil,
+        orchestrator injectedOrchestrator: CascadeOrchestrator? = nil,
+        defaults: UserDefaults = .standard,
+        startsSubsystems: Bool = true
+    ) throws {
+        self.startsSubsystems = startsSubsystems
+        self.defaultsStore = defaults
+        let store = try injectedStore ?? CascadeStore()
         self.store = store
-        cursorTheme = UserDefaults.standard.string(forKey: Self.cursorThemeKey)
+        cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
-        powerHarnessEnabled = UserDefaults.standard.bool(forKey: Self.powerHarnessKey)
-        dismissedSuggestionTitles = Self.restoreSet(key: Self.dismissedSuggestionsKey)
-        dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey)
-        showOnboarding = !UserDefaults.standard.bool(forKey: Self.onboardedKey)
+        powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
+        dismissedSuggestionTitles = Self.restoreSet(key: Self.dismissedSuggestionsKey, defaults: defaults)
+        dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
+        showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
-        orchestrator = CascadeOrchestrator(store: store)
+        orchestrator = injectedOrchestrator ?? CascadeOrchestrator(store: store)
         driver = LocalMacDriver(store: store)
         recorder.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -202,7 +221,7 @@ public final class CascadeAppModel: ObservableObject {
                 self?.beginUseDeviceIntent(source: "hotkey")
             }
             .store(in: &cancellables)
-        hotkey.start()
+        if startsSubsystems { hotkey.start() }
         // didSet doesn't fire during init — hand the restored theme to the overlay.
         guidanceOverlay.setTheme(cursorTheme)
         voice.objectWillChange
@@ -223,8 +242,10 @@ public final class CascadeAppModel: ObservableObject {
             ScreenCaptureUtility.prewarm()
         }
         pushToTalk.onRelease = { [weak self] in self?.voice.endTalking() }
-        pushToTalk.start()
-        startScheduler()
+        if startsSubsystems {
+            pushToTalk.start()
+            startScheduler()
+        }
         dock.onStop = { [weak self] in
             guard let self else { return }
             self.driver.runState.requestStop()
@@ -232,7 +253,7 @@ public final class CascadeAppModel: ObservableObject {
             Task { await self.driver.stop() }
         }
         refreshKeyStatus()
-        Task { await refreshAll() }
+        if startsSubsystems { Task { await refreshAll() } }
     }
 
     public func refreshAll() async {
@@ -243,7 +264,8 @@ public final class CascadeAppModel: ObservableObject {
             audit = try await store.recentAudit(limit: 80)
             suggestions = try await orchestrator.suggestions()
             agents = try await orchestrator.agents()
-            detectedWaste = try await orchestrator.detectedWaste()
+            detectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
+            curatedWaste = await orchestrator.curate(detectedWaste)
             managerCascades = try await store.managerCascades()
             statusLine = recorder.status.message
         } catch {
@@ -269,7 +291,7 @@ public final class CascadeAppModel: ObservableObject {
     /// explicitly paused. `recorder.start()` is idempotent, so repeated calls are
     /// safe.
     private func autoStartIfPermitted() {
-        guard !userPaused,
+        guard startsSubsystems, !userPaused,
               recorder.status.permissions.canRecordContext,
               !recorder.status.running else { return }
         recorder.start()
@@ -1874,14 +1896,21 @@ public final class CascadeAppModel: ObservableObject {
         return detectedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
     }
 
-    /// Approving a detected workflow builds the agent from the user's real
-    /// recorded actions and lands it under "Your agents".
-    public func approveWaste(_ waste: DetectedWaste) {
+    /// The curated proposals still awaiting review — the review surface's source of
+    /// truth (R1). Same approved/declined filter as the raw list, keyed by signature.
+    public var pendingCuratedAgents: [CuratedAgent] {
+        let approved = Set(agents.map(\.signature))
+        return curatedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
+    }
+
+    /// Approving a curated proposal builds the agent from the recorded recipe but
+    /// keeps the curator's human name, so "Your agents" reads in the user's words.
+    public func approveCurated(_ curated: CuratedAgent) {
         Task {
             do {
-                _ = try await orchestrator.createAgent(from: waste)
-                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.approved", detail: waste.title))
-                agentMessage = "Approved “\(waste.title)” — it's in Your agents, ready to deploy."
+                _ = try await orchestrator.createAgent(from: curated)
+                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.approved", detail: curated.name))
+                agentMessage = "Approved “\(curated.name)” — it's in Your agents, ready to deploy."
             } catch {
                 agentMessage = "Could not approve: \(error.localizedDescription)"
             }
@@ -1889,10 +1918,10 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Declining a detected workflow means it won't be surfaced again.
-    public func declineWaste(_ waste: DetectedWaste) {
-        dismissedWasteSignatures.insert(waste.signature)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.declined", detail: waste.title)) }
+    /// Declining a curated proposal hides its underlying workflow for good.
+    public func declineCurated(_ curated: CuratedAgent) {
+        dismissedWasteSignatures.insert(curated.signature)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: curated.name)) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {
@@ -1909,24 +1938,55 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Apps whose workflows can run in the isolated web sandbox instead of on
-    /// the user's real screen.
-    private nonisolated static let browserApps: Set<String> = [
-        "safari", "google chrome", "chrome", "chromium", "arc", "firefox",
-        "microsoft edge", "brave browser", "opera", "vivaldi", "zen browser", "dia",
-    ]
-
-    /// Whether a workflow's apps are all browsers — those agents deploy in the
+    /// Whether a workflow's apps are all web browsers — those agents deploy in the
     /// BACKGROUND sandbox (your screen stays yours, saved sign-ins reused).
+    /// "Browser" is decided by CAPABILITY, not a brand list: any app the system
+    /// registers to open https URLs qualifies, so every browser the user actually
+    /// has — today or one installed later — counts, with nothing hardcoded.
     public nonisolated static func runsInBackground(apps: [String]) -> Bool {
-        !apps.isEmpty && apps.allSatisfy { browserApps.contains($0.lowercased()) }
+        !apps.isEmpty && apps.allSatisfy { webBrowserNames.contains($0.lowercased()) }
     }
+
+    /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a
+    /// browser workflow is detected and named as THAT app, not the browser shell.
+    /// Native-app events return nil — their app name already is the app. Passed to the
+    /// detector so two web apps in one browser become two distinct agents.
+    nonisolated static func webAppIdentity(for event: InputEvent) -> String? {
+        guard webBrowserNames.contains(event.appName.lowercased()) else { return nil }
+        return WebAppIdentity.from(windowTitle: event.windowTitle)
+    }
+
+    /// Installed https-handling apps (i.e. the user's browsers), in every name form
+    /// the recorder might have captured them under — filename stem, localized display
+    /// name, and bundle display/name keys. Queried once from LaunchServices and cached
+    /// (`runsInBackground` is called from view bodies, so it must stay a set lookup).
+    /// Empty — e.g. LaunchServices unavailable — degrades safely: agents simply deploy
+    /// on-screen instead of in the sandbox.
+    private nonisolated static let webBrowserNames: Set<String> = {
+        guard let https = URL(string: "https://example.com") else { return [] }
+        var names = Set<String>()
+        for url in NSWorkspace.shared.urlsForApplications(toOpen: https) {
+            names.insert(url.deletingPathExtension().lastPathComponent.lowercased())
+            names.insert(FileManager.default.displayName(atPath: url.path).lowercased())
+            if let info = Bundle(url: url)?.infoDictionary {
+                for key in ["CFBundleDisplayName", "CFBundleName"] {
+                    if let name = info[key] as? String { names.insert(name.lowercased()) }
+                }
+            }
+        }
+        return names
+    }()
 
     /// The natural-language task a recorded web workflow becomes in the sandbox:
     /// the agent there acts from intent (it has its own browser), not from
     /// recorded screen coordinates that mean nothing inside the box.
     static func sandboxTask(for agent: CascadeAgent) -> String {
-        var task = "Do this recurring web task the user normally does by hand: \(agent.name)."
+        // Prefer the curator's plain-language goal — it's the intent written for
+        // exactly this task. Recorded pixels mean nothing inside the sandbox; fall
+        // back to the agent name only when there's no goal.
+        let trimmedGoal = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let intent = trimmedGoal.isEmpty ? agent.name : trimmedGoal
+        var task = "Do this recurring web task the user normally does by hand: \(intent)."
         if let hint = agent.recipe.steps.compactMap(\.windowTitleHint).first(where: { !$0.isEmpty }) {
             task += " It normally happens on the page “\(String(hint.prefix(80)))”."
         }
@@ -2372,7 +2432,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Closes the first-run guide for good (Settings can reopen it).
     public func finishOnboarding() {
         showOnboarding = false
-        UserDefaults.standard.set(true, forKey: Self.onboardedKey)
+        defaultsStore.set(true, forKey: Self.onboardedKey)
         refreshPermissionState()
         startRecording()
     }

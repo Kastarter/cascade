@@ -170,6 +170,11 @@ public actor CascadeOrchestrator {
     private let planner: SingleStepPlanner
     private let suggestionEngine: SuggestionEngine
     private let wasteDetector = WasteDetector()
+    private let curator: WorkflowCurator
+    /// Curation is a model call; cache it against the set of candidate signatures
+    /// (and whether a key is connected) so frequent refreshes don't re-curate the
+    /// same unchanged list.
+    private var curationCache: (key: Set<String>, keyed: Bool, agents: [CuratedAgent])?
     private let keyStore: AnthropicKeyStore
 
     public init(
@@ -179,6 +184,7 @@ public actor CascadeOrchestrator {
         recordAnswerer: RecordAnswering? = nil,
         planner: SingleStepPlanner = ClaudeSingleStepPlanner(),
         suggestionEngine: SuggestionEngine = SuggestionEngine(),
+        curator: WorkflowCurator? = nil,
         keyStore: AnthropicKeyStore = AnthropicKeyStore()
     ) {
         self.store = store
@@ -187,6 +193,7 @@ public actor CascadeOrchestrator {
         self.recordAnswerer = recordAnswerer ?? RecordSearchAnswerer(store: store, keyStore: keyStore)
         self.planner = planner
         self.suggestionEngine = suggestionEngine
+        self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore))
         self.keyStore = keyStore
     }
 
@@ -259,24 +266,46 @@ public actor CascadeOrchestrator {
 
     /// What Cascade detected the user repeating, from recorded input anchored to
     /// the Rewind. Each is a candidate to turn into an agent built from real actions.
-    public func detectedWaste(maxResults: Int = 5) async throws -> [DetectedWaste] {
+    public func detectedWaste(
+        maxResults: Int = 5,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+    ) async throws -> [DetectedWaste] {
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)
-        return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults)
+        return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults, webAppIdentity: webAppIdentity)
     }
 
-    /// Persists (or refreshes) an agent built from a detected workflow.
+    /// The detector's candidates, judged and named by the curator into the few
+    /// genuinely worth automating (R1). Cached against the candidate set so refresh
+    /// churn doesn't re-spend a model call; with no key, degrades to the raw list.
+    public func curate(_ candidates: [DetectedWaste]) async -> [CuratedAgent] {
+        // `keyed` stays in the cache key so connecting a key mid-session invalidates
+        // a fallback result — but the curator itself decides what to do without one
+        // (it degrades internally), so an injected curator is always exercised.
+        let keyed = keyStore.hasKey()
+        let key = Set(candidates.map(\.signature))
+        if let cache = curationCache, cache.key == key, cache.keyed == keyed { return cache.agents }
+        let curated = await curator.curate(candidates)
+        curationCache = (key: key, keyed: keyed, agents: curated)
+        return curated
+    }
+
+    /// Persists an agent from a curated proposal — the recorded recipe drives
+    /// replay, but the agent takes the curator's human NAME so "Your agents" reads
+    /// like the user's own words instead of "Repeated steps in <app>".
     @discardableResult
-    public func createAgent(from waste: DetectedWaste) async throws -> CascadeAgent {
-        try await store.upsertAgent(CascadeAgent(
-            name: waste.title,
+    public func createAgent(from curated: CuratedAgent) async throws -> CascadeAgent {
+        let waste = curated.source
+        return try await store.upsertAgent(CascadeAgent(
+            name: curated.name,
             source: .detected,
             signature: waste.signature,
             recipe: waste.recipe,
             apps: waste.apps,
             estimatedSeconds: waste.estimatedTotalSeconds,
             estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
-            evidenceCount: waste.occurrences
+            evidenceCount: waste.occurrences,
+            goal: curated.goal
         ))
     }
 

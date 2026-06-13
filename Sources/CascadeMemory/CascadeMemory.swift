@@ -282,6 +282,11 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
     public let enabled: Bool
     /// "daily@HH:mm" for a scheduled agent, nil for manual-only.
     public let schedule: String?
+    /// The curator's intent instruction — what a deployed agent should accomplish,
+    /// in plain language ("Copy the latest invoice totals into the Numbers tracker").
+    /// Drives background-sandbox deploys (intent, not recorded pixels); nil for
+    /// agents created before curation or without a goal.
+    public let goal: String?
 
     public init(
         id: Int64 = 0,
@@ -297,7 +302,8 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         createdAt: Date = Date(),
         lastRunAt: Date? = nil,
         enabled: Bool = true,
-        schedule: String? = nil
+        schedule: String? = nil,
+        goal: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -313,6 +319,7 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         self.lastRunAt = lastRunAt
         self.enabled = enabled
         self.schedule = schedule
+        self.goal = goal
     }
 }
 
@@ -683,8 +690,9 @@ public actor CascadeStore {
         }
 
         if let existingID {
-            // run_count and last_run_at are never overwritten by a re-detect —
-            // the run history belongs to the agent, not the detection.
+            // run_count, last_run_at, schedule, and goal are never overwritten by a
+            // re-detect — the run history, schedule, and curated goal belong to the
+            // approved agent, not the detection.
             try withStatement("""
             UPDATE agents SET name = ?, source = ?, recipe_json = ?, apps = ?, estimated_seconds = ?, seconds_per_run = ?, evidence_count = ?
             WHERE id = ?;
@@ -704,8 +712,8 @@ public actor CascadeStore {
 
         try withStatement("""
         INSERT INTO agents
-            (name, source, signature, recipe_json, apps, estimated_seconds, seconds_per_run, evidence_count, run_count, created_at, last_run_at, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (name, source, signature, recipe_json, apps, estimated_seconds, seconds_per_run, evidence_count, run_count, created_at, last_run_at, enabled, schedule, goal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """) { statement in
             bind(agent.name, at: 1, in: statement)
             bind(agent.source.rawValue, at: 2, in: statement)
@@ -719,6 +727,8 @@ public actor CascadeStore {
             bind(DateCodec.string(from: agent.createdAt), at: 10, in: statement)
             bind(agent.lastRunAt.map(DateCodec.string(from:)), at: 11, in: statement)
             sqlite3_bind_int(statement, 12, agent.enabled ? 1 : 0)
+            bind(agent.schedule, at: 13, in: statement)
+            bind(agent.goal, at: 14, in: statement)
             try stepDone(statement)
         }
         let newID = sqlite3_last_insert_rowid(connection.db)
@@ -891,6 +901,7 @@ public actor CascadeStore {
         try? execute("ALTER TABLE agents ADD COLUMN seconds_per_run INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
+        try? execute("ALTER TABLE agents ADD COLUMN goal TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
@@ -951,7 +962,8 @@ public actor CascadeStore {
             created_at TEXT NOT NULL,
             last_run_at TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
-            schedule TEXT
+            schedule TEXT,
+            goal TEXT
         );
 
         CREATE TABLE IF NOT EXISTS manager_cascade (
@@ -1075,7 +1087,7 @@ public actor CascadeStore {
     }
 
     private static let agentColumns =
-        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count, schedule"
+        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count, schedule, goal"
 
     private func decodeAgent(_ statement: OpaquePointer) -> CascadeAgent {
         let appsRaw = text(statement, 5) ?? ""
@@ -1094,7 +1106,8 @@ public actor CascadeStore {
             createdAt: DateCodec.date(from: text(statement, 8)) ?? Date(),
             lastRunAt: DateCodec.date(from: text(statement, 9)),
             enabled: sqlite3_column_int(statement, 10) != 0,
-            schedule: text(statement, 13)
+            schedule: text(statement, 13),
+            goal: text(statement, 14)
         )
     }
 
