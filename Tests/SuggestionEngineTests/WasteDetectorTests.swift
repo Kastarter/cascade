@@ -253,3 +253,34 @@ func overlappingWorkflowsAreNotDoubleCounted() {
     let allEvidence = results.flatMap(\.evidence)
     #expect(Set(allEvidence).count == allEvidence.count)
 }
+
+@Test
+func webAppsInSameBrowserAreDistinctWorkflows() {
+    // Two different web apps, BOTH in Google Chrome, each a repeated click + ⌘C.
+    // Keyed only on the macOS app they tokenize identically and merge into one
+    // "Chrome" workflow; with a web-app resolver they become two distinct agents,
+    // each named for the web app — while still recording the real browser.
+    func click(_ i: Int, _ title: String) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Compose", appName: "Google Chrome", windowTitle: title)
+    }
+    func copy(_ i: Int, _ title: String) -> InputEvent {
+        InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Google Chrome", windowTitle: title)
+    }
+    let gmail = "Inbox - me@example.com - Gmail"
+    let notion = "Tasks - Notion"
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 { events.append(click(i, gmail)); i += 1; events.append(copy(i, gmail)); i += 1 }
+    for _ in 0..<2 { events.append(click(i, notion)); i += 1; events.append(copy(i, notion)); i += 1 }
+
+    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.from(windowTitle: $0.windowTitle) }
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, webAppIdentity: resolver)
+    #expect(results.count == 2)
+    #expect(results.contains { $0.title.contains("Gmail") })
+    #expect(results.contains { $0.title.contains("Notion") })
+    // The real browser is still what's recorded, so replay + background routing work.
+    #expect(results.allSatisfy { $0.apps == ["Google Chrome"] })
+
+    // Contrast: with no resolver, both collapse into a single "Chrome" workflow.
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).count == 1)
+}

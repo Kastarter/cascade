@@ -247,7 +247,7 @@ public final class CascadeAppModel: ObservableObject {
             audit = try await store.recentAudit(limit: 80)
             suggestions = try await orchestrator.suggestions()
             agents = try await orchestrator.agents()
-            detectedWaste = try await orchestrator.detectedWaste()
+            detectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
             curatedWaste = await orchestrator.curate(detectedWaste)
             managerCascades = try await store.managerCascades()
             statusLine = recorder.status.message
@@ -1928,6 +1928,15 @@ public final class CascadeAppModel: ObservableObject {
     /// has — today or one installed later — counts, with nothing hardcoded.
     public nonisolated static func runsInBackground(apps: [String]) -> Bool {
         !apps.isEmpty && apps.allSatisfy { webBrowserNames.contains($0.lowercased()) }
+    }
+
+    /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a
+    /// browser workflow is detected and named as THAT app, not the browser shell.
+    /// Native-app events return nil — their app name already is the app. Passed to the
+    /// detector so two web apps in one browser become two distinct agents.
+    nonisolated static func webAppIdentity(for event: InputEvent) -> String? {
+        guard webBrowserNames.contains(event.appName.lowercased()) else { return nil }
+        return WebAppIdentity.from(windowTitle: event.windowTitle)
     }
 
     /// Installed https-handling apps (i.e. the user's browsers), in every name form
