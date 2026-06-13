@@ -21,3 +21,17 @@ func webHarnessToolDefinitionsAreWellFormed() {
         #expect(def["input_schema"] != nil)
     }
 }
+
+@Test
+func webSkillsIndexListsEverySkillWithContent() {
+    let index = WebSkills.index()
+    #expect(!WebSkills.names.isEmpty)
+    for name in WebSkills.names {
+        // Every skill the agent can pull must appear in the index it's shown, and
+        // resolve to a non-trivial playbook — otherwise it's a dead catalogue entry.
+        #expect(index.contains(name))
+        #expect((WebSkills.content(named: name)?.count ?? 0) > 40)
+    }
+    #expect(WebSkills.content(named: "no-such-skill") == nil)
+    #expect(WebSkills.names.contains("webmail"))
+}
