@@ -1985,6 +1985,15 @@ public final class CascadeAppModel: ObservableObject {
         return WebAppIdentity.from(windowTitle: event.windowTitle)
     }
 
+    /// The app to SHOW for a recorded moment in the Reel: the web app inside the
+    /// browser (Gmail, Notion…) when identifiable, else the macOS app — so the Rewind
+    /// timeline reads like the user's actual workspace instead of "Google Chrome" for
+    /// everything. Native moments return their own name unchanged.
+    nonisolated static func displayApp(appName: String, windowTitle: String?) -> String {
+        guard webBrowserNames.contains(appName.lowercased()) else { return appName }
+        return WebAppIdentity.from(windowTitle: windowTitle) ?? appName
+    }
+
     /// Installed https-handling apps (i.e. the user's browsers), in every name form
     /// the recorder might have captured them under — filename stem, localized display
     /// name, and bundle display/name keys. Queried once from LaunchServices and cached

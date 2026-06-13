@@ -162,6 +162,16 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
 }
 
+@Test
+func displayAppNeverReinterpretsNativeApps() {
+    // The Reel's web-app display must gate on "is a browser" — a native app whose
+    // window title happens to have a separator must NOT be mistaken for a web app.
+    // (The browser → web-app path is covered by WebAppIdentityTests.)
+    #expect(CascadeAppModel.displayApp(appName: "Numbers", windowTitle: "Budget — Numbers") == "Numbers")
+    #expect(CascadeAppModel.displayApp(appName: "Xcode", windowTitle: "Foo.swift — Xcode") == "Xcode")
+    #expect(CascadeAppModel.displayApp(appName: "Blender", windowTitle: nil) == "Blender")
+}
+
 @MainActor @Test
 func deployGoalLeadsWithCuratedGoalThenRecordedSteps() {
     // On-screen deploy escalates to the cursor runtime with THIS goal: the curated
