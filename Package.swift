@@ -54,7 +54,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentOrchestratorTests",
-            dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit"]
+            dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "SuggestionEngine"]
         ),
         .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit"]),
         .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit"]),
