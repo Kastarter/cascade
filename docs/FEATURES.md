@@ -72,10 +72,10 @@ The fast computer-use agent that operates the Mac in front of you.
 
 ## 5. Background web agents (sandbox)
 
-- Isolated WKWebView browser per agent in a floating watch box; persistent data store reuses your sign-ins.
+- Isolated WKWebView browser per agent in a floating watch box, with its own **persistent** data store — a sign-in you do *inside the box* sticks across runs (it does not inherit Safari/Chrome sessions; the **NEEDS_LOGIN** pause is how the first sign-in happens).
 - Same computer-use brain routed to JS actions; **NEEDS_LOGIN** pause → you sign in → Continue resumes mid-plan with findings intact.
-- Task planner (≤5 subtasks, step budgets, findings memo); spoken + chat completion reports; results audited.
-- Spawn by voice/chat ("create an agent that …", "in the background …") or auto via web-workflow deploys.
+- Task planner (≤5 subtasks, step budgets, findings memo); spoken completion reports; results audited. Only a genuine completion counts as a reclaimed run — a stop, failure, or running out of steps reports honestly and counts nothing.
+- Spawn by **voice** ("create an agent that …", "in the background …"), by **deploying** a browser-only detected workflow, or **on schedule**. Up to 3 run at once.
 
 ## 6. Manager (analytics)
 

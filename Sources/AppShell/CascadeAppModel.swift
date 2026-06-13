@@ -143,6 +143,8 @@ public final class CascadeAppModel: ObservableObject {
     /// Background agents running in the isolated web sandbox.
     @Published public private(set) var backgroundAgents: [BackgroundAgentRun] = []
     private var sandboxRuntimes: [UUID: BackgroundWebAgent] = [:]
+    /// How many background web agents may run at once (each = a WKWebView + a CU loop).
+    static let maxConcurrentSandboxAgents = 3
     private let sandboxBox = SandboxBoxController()
     private let elementLocator = ElementLocator()
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
@@ -496,6 +498,14 @@ public final class CascadeAppModel: ObservableObject {
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
             showSettings = true
+            return
+        }
+        // Each agent owns a live WKWebView + a Computer Use loop; cap how many run at
+        // once so the box stack and resource use stay sane. Refuse rather than queue —
+        // the user can stop one and retry.
+        guard sandboxRuntimes.count < Self.maxConcurrentSandboxAgents else {
+            teachMessage = "Already running \(sandboxRuntimes.count) background agents — stop one before starting another."
+            voice.speak("I'm already running a few background agents. Stop one first.")
             return
         }
         let id = UUID()
