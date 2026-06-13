@@ -91,6 +91,10 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var audit: [AuditEvent] = []
     @Published public private(set) var suggestions: [AgentSuggestion] = []
     @Published public private(set) var detectedWaste: [DetectedWaste] = []
+    /// The curated, judged, human-named view of `detectedWaste` (R1) — what the
+    /// Cascades review surface shows. `detectedWaste` stays the raw recall layer
+    /// behind the Manager analytics.
+    @Published public private(set) var curatedWaste: [CuratedAgent] = []
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
     @Published public private(set) var conversation: [QATurn] = []
@@ -244,6 +248,7 @@ public final class CascadeAppModel: ObservableObject {
             suggestions = try await orchestrator.suggestions()
             agents = try await orchestrator.agents()
             detectedWaste = try await orchestrator.detectedWaste()
+            curatedWaste = await orchestrator.curate(detectedWaste)
             managerCascades = try await store.managerCascades()
             statusLine = recorder.status.message
         } catch {
@@ -1874,14 +1879,21 @@ public final class CascadeAppModel: ObservableObject {
         return detectedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
     }
 
-    /// Approving a detected workflow builds the agent from the user's real
-    /// recorded actions and lands it under "Your agents".
-    public func approveWaste(_ waste: DetectedWaste) {
+    /// The curated proposals still awaiting review — the review surface's source of
+    /// truth (R1). Same approved/declined filter as the raw list, keyed by signature.
+    public var pendingCuratedAgents: [CuratedAgent] {
+        let approved = Set(agents.map(\.signature))
+        return curatedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
+    }
+
+    /// Approving a curated proposal builds the agent from the recorded recipe but
+    /// keeps the curator's human name, so "Your agents" reads in the user's words.
+    public func approveCurated(_ curated: CuratedAgent) {
         Task {
             do {
-                _ = try await orchestrator.createAgent(from: waste)
-                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.approved", detail: waste.title))
-                agentMessage = "Approved “\(waste.title)” — it's in Your agents, ready to deploy."
+                _ = try await orchestrator.createAgent(from: curated)
+                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.approved", detail: curated.name))
+                agentMessage = "Approved “\(curated.name)” — it's in Your agents, ready to deploy."
             } catch {
                 agentMessage = "Could not approve: \(error.localizedDescription)"
             }
@@ -1889,10 +1901,10 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Declining a detected workflow means it won't be surfaced again.
-    public func declineWaste(_ waste: DetectedWaste) {
-        dismissedWasteSignatures.insert(waste.signature)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.declined", detail: waste.title)) }
+    /// Declining a curated proposal hides its underlying workflow for good.
+    public func declineCurated(_ curated: CuratedAgent) {
+        dismissedWasteSignatures.insert(curated.signature)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: curated.name)) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {

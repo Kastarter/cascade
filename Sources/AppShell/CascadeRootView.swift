@@ -1,3 +1,4 @@
+import AgentOrchestrator
 import AppKit
 import CascadeDesignSystem
 import CascadeMemory
@@ -1244,7 +1245,7 @@ private struct CascadesScreen: View {
     /// The page's mental model in one strip: review → agents → runs.
     private var pipelineStrip: some View {
         HStack(spacing: CascadeMetrics.s2) {
-            PipelineStat(value: "\(model.pendingDetectedWaste.count)", label: "TO REVIEW", icon: "sparkles")
+            PipelineStat(value: "\(model.pendingCuratedAgents.count)", label: "TO REVIEW", icon: "sparkles")
             pipelineArrow
             PipelineStat(value: "\(model.agents.count)", label: "AGENTS READY", icon: "bolt.badge.checkmark")
             pipelineArrow
@@ -1263,16 +1264,16 @@ private struct CascadesScreen: View {
     /// agent from the recorded actions, decline to never see it again.
     private var detectedSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "STEP 1 · REVIEW — WORKFLOWS CASCADE CAUGHT", trailing: "\(model.pendingDetectedWaste.count) pending")
-            if model.pendingDetectedWaste.isEmpty {
-                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When you repeat a task — same clicks, same shortcuts — it appears here with proof. One approve turns it into an agent.") }
+            SectionLabel(title: "STEP 1 · REVIEW — WORKFLOWS CASCADE CAUGHT", trailing: "\(model.pendingCuratedAgents.count) pending")
+            if model.pendingCuratedAgents.isEmpty {
+                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When you repeat a task — same clicks, same shortcuts — Cascade judges whether it's worth automating and surfaces the worthwhile ones here, named in your words.") }
             } else {
-                ForEach(model.pendingDetectedWaste) { waste in
+                ForEach(model.pendingCuratedAgents) { curated in
                     WasteCard(
-                        waste: waste,
-                        evidenceImagePath: evidenceImagePath(for: waste),
-                        onApprove: { model.approveWaste(waste) },
-                        onDecline: { model.declineWaste(waste) }
+                        curated: curated,
+                        evidenceImagePath: evidenceImagePath(for: curated.source),
+                        onApprove: { model.approveCurated(curated) },
+                        onDecline: { model.declineCurated(curated) }
                     )
                 }
             }
@@ -1426,10 +1427,13 @@ private struct AppChips: View {
 /// recorded AX anchors — informed consent, not a leap of faith. Privacy-safe:
 /// step *shape* and anchors only, never raw typed text or coordinates.
 private struct WasteCard: View {
-    let waste: DetectedWaste
+    let curated: CuratedAgent
     let evidenceImagePath: String?
     let onApprove: () -> Void
     let onDecline: () -> Void
+
+    /// The recorded workflow behind the curated proposal — recipe, apps, evidence.
+    private var waste: DetectedWaste { curated.source }
 
     private static let previewSteps = 5
 
@@ -1439,11 +1443,16 @@ private struct WasteCard: View {
                 thumbnail
                 VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                     HStack(alignment: .top) {
-                        Text(waste.title).font(.cascadeSans(15, .semibold))
+                        Text(curated.name).font(.cascadeSans(15, .semibold))
                         Spacer()
                         Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m saved")
                             .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
                             .fixedSize()
+                    }
+                    if !curated.why.isEmpty {
+                        Text(curated.why)
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     AppChips(apps: waste.apps)
                     deployPreview
