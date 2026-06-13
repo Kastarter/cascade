@@ -93,8 +93,11 @@ public struct WorkflowCurator: Sendable {
     and what it accomplishes.
     - "value": 0.0–1.0, how worth-automating it is.
 
-    Prefer repetitive, cross-app, data-moving tasks. Never invent a workflow that is \
-    not in the candidates.
+    Judge each candidate on its own merit — a task can qualify whether it touches one \
+    app or several, and whatever kind of work it is (data, writing, design, admin, \
+    browsing, anything). What matters is that it genuinely repeats and is worth handing \
+    off — never how well it fits a particular shape. Never invent a workflow that is not \
+    in the candidates.
 
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
