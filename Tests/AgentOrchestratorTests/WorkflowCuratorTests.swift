@@ -1,4 +1,5 @@
 import CascadeMemory
+import Foundation
 import ProviderKit
 import SuggestionEngine
 import Testing
@@ -10,6 +11,42 @@ private struct FakeCompleter: MessageCompleting {
     func complete(system: String?, user: String, model: String, maxTokens: Int) async throws -> String {
         canned
     }
+}
+
+/// Counts how many times the model was asked — to prove the orchestrator caches.
+private actor CallCounter {
+    private(set) var calls = 0
+    func bump() { calls += 1 }
+}
+
+private struct CountingCompleter: MessageCompleting {
+    let canned: String
+    let counter: CallCounter
+    func complete(system: String?, user: String, model: String, maxTokens: Int) async throws -> String {
+        await counter.bump()
+        return canned
+    }
+}
+
+private let base = Date(timeIntervalSince1970: 1_700_000_000)
+
+private func makeStore() throws -> CascadeStore {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeCuratorIT-\(UUID().uuidString).sqlite").path
+    return try CascadeStore(path: path)
+}
+
+/// A repeated Mail→Numbers copy/paste — the detector catches it as one workflow.
+private func copyPasteEvents() -> [InputEvent] {
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    }
+    return events
 }
 
 private struct FailingCompleter: MessageCompleting {
@@ -137,4 +174,53 @@ func curatorToleratesFencedJSON() async {
 func curatorReturnsEmptyForNoCandidates() async {
     let result = await WorkflowCurator(client: FailingCompleter()).curate([])
     #expect(result.isEmpty)
+}
+
+// MARK: - End-to-end through the orchestrator (detect → curate → approve)
+
+@Test
+func curateThenApprovePersistsCuratedNameAndGoal() async throws {
+    let store = try makeStore()
+    try await store.insertInputEvents(copyPasteEvents())
+
+    let canned = """
+    {"agents":[{"index":0,"name":"Copy invoice totals into Numbers","why":"You do it by hand daily.","goal":"Copy the latest invoice totals out of Mail into the Numbers tracker.","value":0.9}]}
+    """
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: canned)))
+
+    // Detector caught the real repeated workflow…
+    let candidates = try await orchestrator.detectedWaste()
+    #expect(candidates.count == 1)
+
+    // …the curator judged + renamed it…
+    let curated = await orchestrator.curate(candidates)
+    #expect(curated.count == 1)
+    #expect(curated[0].name == "Copy invoice totals into Numbers")
+
+    // …and approving persists the curated NAME and GOAL on an agent built from the
+    // real recorded recipe (signature carries through). This is the whole chain.
+    _ = try await orchestrator.createAgent(from: curated[0])
+    let agents = try await orchestrator.agents()
+    #expect(agents.count == 1)
+    #expect(agents[0].name == "Copy invoice totals into Numbers")
+    #expect(agents[0].goal == "Copy the latest invoice totals out of Mail into the Numbers tracker.")
+    #expect(agents[0].signature == candidates[0].signature)
+    #expect(!agents[0].recipe.steps.isEmpty)
+}
+
+@Test
+func curateCachesByCandidateSet() async throws {
+    let store = try makeStore()
+    try await store.insertInputEvents(copyPasteEvents())
+    let counter = CallCounter()
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        curator: WorkflowCurator(client: CountingCompleter(canned: #"{"agents":[]}"#, counter: counter))
+    )
+
+    let candidates = try await orchestrator.detectedWaste()
+    _ = await orchestrator.curate(candidates)
+    _ = await orchestrator.curate(candidates)
+    // Same candidate set → the model is asked once, not on every refresh.
+    #expect(await counter.calls == 1)
 }

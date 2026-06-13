@@ -276,10 +276,13 @@ public actor CascadeOrchestrator {
     /// genuinely worth automating (R1). Cached against the candidate set so refresh
     /// churn doesn't re-spend a model call; with no key, degrades to the raw list.
     public func curate(_ candidates: [DetectedWaste]) async -> [CuratedAgent] {
+        // `keyed` stays in the cache key so connecting a key mid-session invalidates
+        // a fallback result — but the curator itself decides what to do without one
+        // (it degrades internally), so an injected curator is always exercised.
         let keyed = keyStore.hasKey()
         let key = Set(candidates.map(\.signature))
         if let cache = curationCache, cache.key == key, cache.keyed == keyed { return cache.agents }
-        let curated = keyed ? await curator.curate(candidates) : candidates.map(WorkflowCurator.fallback)
+        let curated = await curator.curate(candidates)
         curationCache = (key: key, keyed: keyed, agents: curated)
         return curated
     }
@@ -298,7 +301,8 @@ public actor CascadeOrchestrator {
             apps: waste.apps,
             estimatedSeconds: waste.estimatedTotalSeconds,
             estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
-            evidenceCount: waste.occurrences
+            evidenceCount: waste.occurrences,
+            goal: curated.goal
         ))
     }
 

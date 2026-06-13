@@ -1938,7 +1938,12 @@ public final class CascadeAppModel: ObservableObject {
     /// the agent there acts from intent (it has its own browser), not from
     /// recorded screen coordinates that mean nothing inside the box.
     static func sandboxTask(for agent: CascadeAgent) -> String {
-        var task = "Do this recurring web task the user normally does by hand: \(agent.name)."
+        // Prefer the curator's plain-language goal — it's the intent written for
+        // exactly this task. Recorded pixels mean nothing inside the sandbox; fall
+        // back to the agent name only when there's no goal.
+        let trimmedGoal = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let intent = trimmedGoal.isEmpty ? agent.name : trimmedGoal
+        var task = "Do this recurring web task the user normally does by hand: \(intent)."
         if let hint = agent.recipe.steps.compactMap(\.windowTitleHint).first(where: { !$0.isEmpty }) {
             task += " It normally happens on the page “\(String(hint.prefix(80)))”."
         }
