@@ -2,6 +2,7 @@ import AgentOrchestrator
 import CascadeMemory
 import Foundation
 import ProviderKit
+import SandboxKit
 import SuggestionEngine
 import Testing
 
@@ -112,4 +113,61 @@ func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws
     #expect(agent.goal == "Copy the latest invoice totals out of Mail into the Numbers tracker.")
     // Approved → it drops out of the review queue.
     #expect(!model.pendingCuratedAgents.contains { $0.signature == curated.signature })
+}
+
+// MARK: - C1: honest math (only genuine completions count as reclaimed runs)
+
+private func completedUpdate(_ result: String) -> BackgroundWebAgent.Update {
+    BackgroundWebAgent.Update(status: result, snapshotPNG: nil, url: "", done: true, result: result, completed: true)
+}
+private func stoppedUpdate() -> BackgroundWebAgent.Update {
+    BackgroundWebAgent.Update(status: "Stopped.", snapshotPNG: nil, url: "", done: true, result: nil)
+}
+private func failedUpdate(_ reason: String) -> BackgroundWebAgent.Update {
+    BackgroundWebAgent.Update(status: reason, snapshotPNG: nil, url: "", done: true, result: nil)
+}
+private func stepLimitUpdate(_ summary: String) -> BackgroundWebAgent.Update {
+    BackgroundWebAgent.Update(status: summary, snapshotPNG: nil, url: "", done: true, result: summary)
+}
+
+@MainActor
+private func deployedAgent(in store: CascadeStore) async throws -> CascadeAgent {
+    try await store.upsertAgent(CascadeAgent(
+        name: "Daily web report", source: .detected, signature: "web-sig",
+        recipe: AgentRecipe(steps: []), estimatedSecondsPerRun: 45
+    ))
+}
+
+@MainActor @Test
+func genuineCompletionCountsAsOneReclaimedRun() async throws {
+    let (model, store) = try makeModel()
+    let agent = try await deployedAgent(in: store)
+    #expect(agent.runCount == 0)
+
+    await model.recordSandboxCompletion(deployedAgentID: agent.id, update: completedUpdate("Found $420 on Delta"), task: "find the fare")
+
+    #expect(try await store.agent(id: agent.id)?.runCount == 1)
+}
+
+@MainActor @Test
+func stoppedFailedAndStepLimitRunsNeverCount() async throws {
+    let (model, store) = try makeModel()
+    let agent = try await deployedAgent(in: store)
+
+    await model.recordSandboxCompletion(deployedAgentID: agent.id, update: stoppedUpdate(), task: "t")
+    await model.recordSandboxCompletion(deployedAgentID: agent.id, update: failedUpdate("Couldn't open the sandbox browser."), task: "t")
+    await model.recordSandboxCompletion(deployedAgentID: agent.id, update: stepLimitUpdate("Ran out of steps — ask again."), task: "t")
+
+    // None of these finished the task, so "Reclaimed" must stay at zero.
+    #expect(try await store.agent(id: agent.id)?.runCount == 0)
+}
+
+@MainActor @Test
+func completionMessageIsHonestAboutTheOutcome() {
+    // Genuine completion announces done; everything else shows its own status —
+    // never the old fake "Background agent done — Finished in the background."
+    #expect(CascadeAppModel.sandboxCompletionMessage(for: completedUpdate("Booked, conf #A1")) == "Background agent done — Booked, conf #A1")
+    #expect(CascadeAppModel.sandboxCompletionMessage(for: failedUpdate("Couldn't open the sandbox browser.")) == "Couldn't open the sandbox browser.")
+    #expect(CascadeAppModel.sandboxCompletionMessage(for: stoppedUpdate()) == "Stopped.")
+    #expect(CascadeAppModel.sandboxCompletionMessage(for: stepLimitUpdate("Ran out of steps — ask again.")) == "Ran out of steps — ask again.")
 }

@@ -559,22 +559,40 @@ public final class CascadeAppModel: ObservableObject {
         }
 
         sandboxRuntimes[id] = nil
-        teachMessage = "Background agent done — \(said)"
-        assistMemory.remember(user: "[background agent finished: \(task)]", assistant: said)
-        voice.speak(said)
-        // A deployed saved agent finishing in the sandbox is a real completed
-        // run — it feeds the same reclaimed-time math as foreground replays.
+        // Stop, failure, or running out of steps report honestly and count NOTHING;
+        // only a genuine completion says "done" and feeds the reclaimed-time math.
+        let message = Self.sandboxCompletionMessage(for: update)
+        teachMessage = message
+        assistMemory.remember(user: "[background agent: \(task)]", assistant: message)
+        voice.speak(message)
         let deployedAgentID = backgroundAgents.first(where: { $0.id == id })?.agentID
         Task {
-            if let deployedAgentID {
-                try? await store.markAgentRun(id: deployedAgentID)
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: task))
-                await refreshAll()
-            }
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) → \(said)"))
+            await recordSandboxCompletion(deployedAgentID: deployedAgentID, update: update, task: task)
+            if update.completed, deployedAgentID != nil { await refreshAll() }
         }
         // Leave the box up briefly so the user can glance at the result, then close it.
         Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide(id) }
+    }
+
+    /// The honest user-facing line for a finished/aborted background run: a genuine
+    /// completion is announced as done; a stop, failure, or step-limit shows its own
+    /// status instead of a fake "Finished in the background."
+    static func sandboxCompletionMessage(for update: BackgroundWebAgent.Update) -> String {
+        let detail = update.result.flatMap { $0.isEmpty ? nil : $0 } ?? update.status
+        return update.completed ? "Background agent done — \(detail)" : detail
+    }
+
+    /// Records a background run's end. ONLY a genuine completion increments the run
+    /// counter + audits `agent.run.completed` — a stop / failure / step-limit must
+    /// never inflate the reclaimed-time math (the on-screen replay path, which gates
+    /// `markAgentRun` on `!stoppedEarly`, counts the same way).
+    func recordSandboxCompletion(deployedAgentID: Int64?, update: BackgroundWebAgent.Update, task: String) async {
+        if update.completed, let deployedAgentID {
+            try? await store.markAgentRun(id: deployedAgentID)
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: task))
+        }
+        let outcome = update.completed ? "completed" : "ended without completing"
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) — \(outcome)"))
     }
 
     /// Did the user ask for a background agent ("create an agent…", "in the background",

@@ -21,6 +21,23 @@ public final class BackgroundWebAgent {
         public let done: Bool
         public let result: String?
         public var needsLogin: Bool = false
+        /// True ONLY for a genuine, finished run — never a stop, a failure, or
+        /// running out of steps. Gates the reclaimed-time accounting downstream so
+        /// an aborted run is never counted (or announced) as a completion.
+        public var completed: Bool = false
+
+        public init(
+            status: String, snapshotPNG: Data?, url: String, done: Bool, result: String?,
+            needsLogin: Bool = false, completed: Bool = false
+        ) {
+            self.status = status
+            self.snapshotPNG = snapshotPNG
+            self.url = url
+            self.done = done
+            self.result = result
+            self.needsLogin = needsLogin
+            self.completed = completed
+        }
     }
 
     private let keyStore: AnthropicKeyStore
@@ -100,8 +117,10 @@ public final class BackgroundWebAgent {
             onUpdate(Update(status: "Stopped.", snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
             return
         }
+        // The one genuine completion: every part ran to its end without a stop,
+        // failure, login wall, or step-limit. Only this counts as a reclaimed run.
         let summary = AgentTaskPlanner.summary(findings: findings, skipped: skipped, ranLongOn: nil)
-        onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary))
+        onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary, completed: true))
     }
 
     private enum EpisodeOutcome {
