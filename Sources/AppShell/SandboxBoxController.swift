@@ -155,8 +155,10 @@ final class SandboxBoxController: NSObject {
             if inside, !box.isExpanded {
                 layout(box, expanded: true, animate: true)
             } else if !inside, box.isExpanded {
-                // Only a pending sign-in pins the box open.
-                guard box.onContinue == nil else { continue }
+                // Pinned open during a sign-in OR while the user is typing in it (key
+                // window) — so it never collapses mid-login or mid-steer if the cursor
+                // drifts off the box.
+                guard box.onContinue == nil, !box.panel.isKeyWindow else { continue }
                 layout(box, expanded: false, animate: true)
             }
         }
