@@ -58,7 +58,10 @@ public final class BackgroundWebAgent {
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
         self.model = model
-        self.planner = AgentTaskPlanner(client: AnthropicClient(keyStore: keyStore), model: model)
+        // The planner only splits a job into ≤5 subtasks + picks start URLs — a
+        // structurally simple task. Run it on haiku so the up-front round trip (pure
+        // latency before any visible progress) is cheap; the agent loop stays on `model`.
+        self.planner = AgentTaskPlanner(client: AnthropicClient(keyStore: keyStore), model: AnthropicModel.haiku)
     }
 
     public func stop() { stopped = true }
