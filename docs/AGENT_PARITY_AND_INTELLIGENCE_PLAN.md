@@ -292,7 +292,19 @@ Ship-able after each step; (1) and (3) each stand alone as user-visible wins.
   proposals, drops noise, and routes/names web work (incl. web apps inside the browser). No
   agent without evidence. *Remaining:* A2 (proactively proposing tasks the mechanical detector
   never caught).
-- **R2 (parity):** ⛔ not started — both deployed surfaces run on the shared `AgentRuntime` — streaming, skills,
-  harness (Mac + Web), memory, auto-learning. The §1.1 table is all ✅. A browser data task
-  finishes via harness in one shot; on-screen deploy escalates to the intelligent agent instead
-  of pausing; "Reclaimed" only counts verified completions.
+- **R2 (parity):** 🟡 core delivered (PR #7) — the substantive gap (deployed agents weren't
+  harnessed/intelligent) is closed:
+  - **On-screen deploy → cursor-class on drift (B6):** fast recipe replay when the UI matches;
+    on an unexpected dialog or two unverified clicks it now escalates to the FULL assist runtime
+    (skills, Mac harness, streaming, memory) instead of pausing — honoring STOP.
+  - **Background agent → harnessed (B5):** a `WebHarness` (read_page / list_interactives /
+    click_text / fill_field) routed through a new, additive `ComputerUseAgent.extraTools` hook,
+    so it reads + acts semantically and instantly instead of pixel-poking.
+  - **Cheaper planner (B9).**
+  *Remaining (deferred, with reasons):* background **streaming** (low marginal value for an
+  unwatched agent now that DOM tools cut the round-trips; risky un-verifiable restructure);
+  **web-specific skills** (the existing skills are native-app playbooks that would mislead in a
+  browser — needs new content, not plumbing); **B8 JPEG-at-resolution** (low value once the
+  agent stopped relying on the screenshot); the full **B1/B2 `AgentRuntime` extraction** (reused
+  `runAssistTask` pragmatically rather than refactor the live cursor agent). None of R2 is
+  runtime-verified — it's computer-use/WebKit code that needs a real run with a key.
