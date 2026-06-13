@@ -38,12 +38,11 @@ public struct QATurn: Identifiable, Sendable {
 public struct BackgroundAgentRun: Identifiable, Sendable {
     public let id: UUID
     public let task: String
-    public var status: String
-    public var snapshot: Data?
-    public var done: Bool
-    public var result: String?
     /// Set when this run deploys a saved agent — completion feeds its run count.
     public var agentID: Int64?
+    // No status/snapshot/done/result: the live watch box renders the agent's own
+    // WKWebView, so those were write-only — the snapshot in particular retained a
+    // PNG per step that no view ever read.
 }
 
 @MainActor
@@ -502,10 +501,7 @@ public final class CascadeAppModel: ObservableObject {
         let id = UUID()
         let runtime = BackgroundWebAgent()
         sandboxRuntimes[id] = runtime
-        backgroundAgents.insert(
-            BackgroundAgentRun(id: id, task: trimmed, status: "Starting…", snapshot: nil, done: false, result: nil, agentID: agentID),
-            at: 0
-        )
+        backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
         voice.speak("On it. I'll handle that in the background.")
@@ -522,50 +518,46 @@ public final class CascadeAppModel: ObservableObject {
     public func stopSandboxAgent(_ id: UUID) {
         sandboxRuntimes[id]?.stop()
         sandboxRuntimes[id] = nil
-        if let index = backgroundAgents.firstIndex(where: { $0.id == id }) {
-            backgroundAgents[index].done = true
-            backgroundAgents[index].status = "Stopped."
-        }
+        // Drop the entry now: a late "Stopped." update then finds no entry and is a
+        // no-op, so the stop is never re-announced or mis-counted.
+        backgroundAgents.removeAll { $0.id == id }
         sandboxBox.hide(id)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "sandbox.stopped", detail: "user stopped a background agent")) }
     }
 
     private func applySandboxUpdate(_ id: UUID, _ update: BackgroundWebAgent.Update) {
-        if let index = backgroundAgents.firstIndex(where: { $0.id == id }) {
-            backgroundAgents[index].status = update.status
-            if let snapshot = update.snapshotPNG { backgroundAgents[index].snapshot = snapshot }
-            backgroundAgents[index].done = update.done
-            backgroundAgents[index].result = update.result
-        }
         sandboxBox.updateStatus(id, update.status)
         guard update.done else { return }
-        let task = backgroundAgents.first(where: { $0.id == id })?.task ?? "the task"
-        let said = update.result ?? "Finished in the background."
+        // The entry's presence is the "still live, not yet finalized" sentinel: a
+        // stop removes it, so a late terminal update finds nothing and bails — no
+        // double-report, no double-count.
+        guard let entry = backgroundAgents.first(where: { $0.id == id }) else { return }
+        let task = entry.task
 
-        // Sign-in wall: keep the box AND the runtime so Continue resumes at the
-        // pending part of the plan — earlier parts' findings intact — instead of
-        // redoing the whole job from scratch.
+        // Sign-in wall: keep the entry AND the runtime so Continue resumes at the
+        // pending part of the plan — earlier parts' findings intact.
         if update.needsLogin {
+            let said = update.result ?? "Sign-in needed — open the box and log in."
             teachMessage = said
             voice.speak(said)
             sandboxBox.requestLogin(id, message: said) { [weak self] in
                 guard let self, let runtime = self.sandboxRuntimes[id] else { return }
-                if let index = self.backgroundAgents.firstIndex(where: { $0.id == id }) {
-                    self.backgroundAgents[index].done = false
-                    self.backgroundAgents[index].status = "Continuing…"
-                }
                 Task { await runtime.resume { [weak self] update in self?.applySandboxUpdate(id, update) } }
             }
             return
         }
 
+        // Terminal: finalize once, then drop the entry so `backgroundAgents` stays
+        // bounded across a long session.
         sandboxRuntimes[id] = nil
+        backgroundAgents.removeAll { $0.id == id }
         // Stop, failure, or running out of steps report honestly and count NOTHING;
         // only a genuine completion says "done" and feeds the reclaimed-time math.
         let message = Self.sandboxCompletionMessage(for: update)
         teachMessage = message
         assistMemory.remember(user: "[background agent: \(task)]", assistant: message)
         voice.speak(message)
-        let deployedAgentID = backgroundAgents.first(where: { $0.id == id })?.agentID
+        let deployedAgentID = entry.agentID
         Task {
             await recordSandboxCompletion(deployedAgentID: deployedAgentID, update: update, task: task)
             if update.completed, deployedAgentID != nil { await refreshAll() }
