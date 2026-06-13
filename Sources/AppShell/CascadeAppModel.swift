@@ -2198,6 +2198,13 @@ public final class CascadeAppModel: ObservableObject {
     /// hotkey/voice setup (bump generation, capture, supersession guard) so a barge-in
     /// still stands the escalated agent down. agentRunning stays true (the caller owns it).
     private func escalateRecipeToAssist(_ agent: CascadeAgent, reason: String) async {
+        // Honor a pending STOP: runAssistTask resets runState on entry, which would
+        // otherwise swallow an abort the user pressed just as drift triggered.
+        guard !driver.runState.isStopRequested else {
+            agentMessage = "Stopped. Control returned to you."
+            dock.show(title: "Stopped", detail: agentMessage)
+            return
+        }
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.escalate", detail: "\(agent.name) — \(reason)"))
         let mouse = NSEvent.mouseLocation
         guard hasAnthropicKey, let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
