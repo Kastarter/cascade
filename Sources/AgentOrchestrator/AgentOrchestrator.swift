@@ -284,7 +284,18 @@ public actor CascadeOrchestrator {
         // (it degrades internally), so an injected curator is always exercised.
         let keyed = keyStore.hasKey()
         let key = Set(candidates.map(\.signature))
-        if let cache = curationCache, cache.key == key, cache.keyed == keyed { return cache.agents }
+        if let cache = curationCache, cache.key == key, cache.keyed == keyed {
+            // Cache HIT, but refresh each proposal's `source` from the CURRENT
+            // candidate of the same signature: a signature is the token SHAPE (counts
+            // excluded), so it's stable while the user keeps repeating the workflow —
+            // without this re-map the card's occurrences / minutes / last-seen (and the
+            // numbers persisted on approve) would freeze at first curation.
+            let bySignature = Dictionary(candidates.map { ($0.signature, $0) }, uniquingKeysWith: { first, _ in first })
+            return cache.agents.map { agent in
+                guard let fresh = bySignature[agent.signature] else { return agent }
+                return CuratedAgent(id: agent.id, source: fresh, name: agent.name, why: agent.why, goal: agent.goal, value: agent.value)
+            }
+        }
         let curated = await curator.curate(candidates)
         curationCache = (key: key, keyed: keyed, agents: curated)
         return curated

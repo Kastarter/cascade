@@ -209,6 +209,26 @@ func curateThenApprovePersistsCuratedNameAndGoal() async throws {
 }
 
 @Test
+func curateCacheRefreshesSourceCountsOnHit() async throws {
+    // Same workflow, more occurrences later: the signature (token shape) is unchanged
+    // so the cache hits — but the card's counts must still update, not freeze at first
+    // curation. A signature excludes counts, so the cache key alone can't see growth.
+    let v1 = [waste("Repeated in Mail", apps: ["Mail", "Numbers"], signature: "sig", occurrences: 2, perRun: 30)]
+    let v2 = [waste("Repeated in Mail", apps: ["Mail", "Numbers"], signature: "sig", occurrences: 5, perRun: 30)]
+    let canned = #"{"agents":[{"index":0,"name":"Copy into Numbers","why":"x","goal":"Copy into Numbers.","value":0.8}]}"#
+    let store = try makeStore()
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: canned)))
+
+    let first = await orchestrator.curate(v1)
+    #expect(first.first?.source.occurrences == 2)
+
+    let second = await orchestrator.curate(v2) // cache hit (same signature set)
+    #expect(second.first?.source.occurrences == 5)              // refreshed, not frozen
+    #expect(second.first?.source.estimatedTotalSeconds == 150)  // 30 × 5
+    #expect(second.first?.name == "Copy into Numbers")          // curated fields preserved
+}
+
+@Test
 func curateCachesByCandidateSet() async throws {
     let store = try makeStore()
     try await store.insertInputEvents(copyPasteEvents())
