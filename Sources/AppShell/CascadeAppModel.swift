@@ -170,9 +170,19 @@ public final class CascadeAppModel: ObservableObject {
     private var lastSettingsOpen = Date.distantPast
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
     private var userPaused = false
+    /// False in tests/headless: the model is built with an injected store +
+    /// orchestrator and starts NO hardware — no CGEvent taps, no screen capture, no
+    /// scheduler, no audio I/O — so the orchestration logic can be exercised in
+    /// isolation. Production leaves it true and everything starts as before.
+    private let startsSubsystems: Bool
 
-    public init() throws {
-        let store = try CascadeStore()
+    public init(
+        store injectedStore: CascadeStore? = nil,
+        orchestrator injectedOrchestrator: CascadeOrchestrator? = nil,
+        startsSubsystems: Bool = true
+    ) throws {
+        self.startsSubsystems = startsSubsystems
+        let store = try injectedStore ?? CascadeStore()
         self.store = store
         cursorTheme = UserDefaults.standard.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
@@ -183,7 +193,7 @@ public final class CascadeAppModel: ObservableObject {
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
-        orchestrator = CascadeOrchestrator(store: store)
+        orchestrator = injectedOrchestrator ?? CascadeOrchestrator(store: store)
         driver = LocalMacDriver(store: store)
         recorder.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -206,7 +216,7 @@ public final class CascadeAppModel: ObservableObject {
                 self?.beginUseDeviceIntent(source: "hotkey")
             }
             .store(in: &cancellables)
-        hotkey.start()
+        if startsSubsystems { hotkey.start() }
         // didSet doesn't fire during init — hand the restored theme to the overlay.
         guidanceOverlay.setTheme(cursorTheme)
         voice.objectWillChange
@@ -227,8 +237,10 @@ public final class CascadeAppModel: ObservableObject {
             ScreenCaptureUtility.prewarm()
         }
         pushToTalk.onRelease = { [weak self] in self?.voice.endTalking() }
-        pushToTalk.start()
-        startScheduler()
+        if startsSubsystems {
+            pushToTalk.start()
+            startScheduler()
+        }
         dock.onStop = { [weak self] in
             guard let self else { return }
             self.driver.runState.requestStop()
@@ -236,7 +248,7 @@ public final class CascadeAppModel: ObservableObject {
             Task { await self.driver.stop() }
         }
         refreshKeyStatus()
-        Task { await refreshAll() }
+        if startsSubsystems { Task { await refreshAll() } }
     }
 
     public func refreshAll() async {
@@ -274,7 +286,7 @@ public final class CascadeAppModel: ObservableObject {
     /// explicitly paused. `recorder.start()` is idempotent, so repeated calls are
     /// safe.
     private func autoStartIfPermitted() {
-        guard !userPaused,
+        guard startsSubsystems, !userPaused,
               recorder.status.permissions.canRecordContext,
               !recorder.status.running else { return }
         recorder.start()
