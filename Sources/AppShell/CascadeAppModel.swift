@@ -1921,18 +1921,35 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Apps whose workflows can run in the isolated web sandbox instead of on
-    /// the user's real screen.
-    private nonisolated static let browserApps: Set<String> = [
-        "safari", "google chrome", "chrome", "chromium", "arc", "firefox",
-        "microsoft edge", "brave browser", "opera", "vivaldi", "zen browser", "dia",
-    ]
-
-    /// Whether a workflow's apps are all browsers — those agents deploy in the
+    /// Whether a workflow's apps are all web browsers — those agents deploy in the
     /// BACKGROUND sandbox (your screen stays yours, saved sign-ins reused).
+    /// "Browser" is decided by CAPABILITY, not a brand list: any app the system
+    /// registers to open https URLs qualifies, so every browser the user actually
+    /// has — today or one installed later — counts, with nothing hardcoded.
     public nonisolated static func runsInBackground(apps: [String]) -> Bool {
-        !apps.isEmpty && apps.allSatisfy { browserApps.contains($0.lowercased()) }
+        !apps.isEmpty && apps.allSatisfy { webBrowserNames.contains($0.lowercased()) }
     }
+
+    /// Installed https-handling apps (i.e. the user's browsers), in every name form
+    /// the recorder might have captured them under — filename stem, localized display
+    /// name, and bundle display/name keys. Queried once from LaunchServices and cached
+    /// (`runsInBackground` is called from view bodies, so it must stay a set lookup).
+    /// Empty — e.g. LaunchServices unavailable — degrades safely: agents simply deploy
+    /// on-screen instead of in the sandbox.
+    private nonisolated static let webBrowserNames: Set<String> = {
+        guard let https = URL(string: "https://example.com") else { return [] }
+        var names = Set<String>()
+        for url in NSWorkspace.shared.urlsForApplications(toOpen: https) {
+            names.insert(url.deletingPathExtension().lastPathComponent.lowercased())
+            names.insert(FileManager.default.displayName(atPath: url.path).lowercased())
+            if let info = Bundle(url: url)?.infoDictionary {
+                for key in ["CFBundleDisplayName", "CFBundleName"] {
+                    if let name = info[key] as? String { names.insert(name.lowercased()) }
+                }
+            }
+        }
+        return names
+    }()
 
     /// The natural-language task a recorded web workflow becomes in the sandbox:
     /// the agent there acts from intent (it has its own browser), not from
