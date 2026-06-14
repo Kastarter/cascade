@@ -62,6 +62,11 @@ public final class BackgroundWebAgent {
     /// the watch box can fly its native cursor overlay there.
     public var onCursor: (@MainActor (CGPoint) -> Void)?
 
+    /// Fired for every web action / tool / turn outcome (action, detail) so the run is
+    /// AUDITABLE — without it the background agent was a black box (only its final
+    /// `sandbox.task` row was recorded), which made misbehavior impossible to diagnose.
+    public var onAudit: (@MainActor (_ action: String, _ detail: String) -> Void)?
+
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
         self.model = model
@@ -205,6 +210,7 @@ public final class BackgroundWebAgent {
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
                 if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
+                self?.onAudit?("sandbox.tool", "\(name) \(Self.argSummary(input)) → \(result.prefix(70))")
                 return result
             },
             extraTools: WebHarness.toolDefinitions()
@@ -243,12 +249,20 @@ public final class BackgroundWebAgent {
         while count < maxSteps, !stopped {
             if step.done {
                 let raw = step.text.isEmpty ? "Done." : step.text
-                if let site = Self.loginSite(in: raw) { return (.needsLogin(site), acted) }
+                if let site = Self.loginSite(in: raw) {
+                    onAudit?("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                    return (.needsLogin(site), acted)
+                }
                 // The agent said done but flagged it couldn't actually finish — report it
                 // honestly and do NOT let it count as a completion.
-                if let reason = Self.incompleteReason(in: raw) { return (.failed("Couldn't finish — \(reason)"), acted) }
+                if let reason = Self.incompleteReason(in: raw) {
+                    onAudit?("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                    return (.failed("Couldn't finish — \(reason)"), acted)
+                }
+                onAudit?("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
                 return (.finished(raw), acted)
             }
+            if !step.text.isEmpty { onAudit?("sandbox.turn", String(step.text.prefix(90))) }
             // Streamed actions already ran via the sink; this handles any non-streamed
             // leftovers (zoom/screenshot are no-ops here, harness/skill resolve inline).
             for action in step.actions {
@@ -333,6 +347,7 @@ public final class BackgroundWebAgent {
         func topLeftY(_ y: Double) -> CGFloat { WebSandbox.height - CGFloat(y) }
         switch action {
         case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y), .tripleClick(let x, let y):
+            onAudit?("sandbox.act", "click (\(Int(x)),\(Int(topLeftY(y))))")
             await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: topLeftY(y))
         case .drag(_, _, let toX, let toY):
             // No real drag in the JS bridge — landing on the destination is the
@@ -341,8 +356,10 @@ public final class BackgroundWebAgent {
         case .move(let x, let y):
             await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: topLeftY(y))
         case .type(let text):
+            onAudit?("sandbox.act", "type \"\(text.prefix(40))\"")
             await sandbox.typeText(text)
         case .key(let combo):
+            onAudit?("sandbox.act", "key \(combo)")
             await sandbox.pressKey(combo)
         case .scroll(_, _, let direction, let amount):
             let magnitude = CGFloat(max(1, amount)) * 120
@@ -356,9 +373,21 @@ public final class BackgroundWebAgent {
         case .openApp:
             break  // no apps inside the web sandbox
         case .openURL(let urlString):
+            onAudit?("sandbox.act", "open \(urlString.prefix(60))")
             await sandbox.navigate(to: urlString)
             try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
         }
+    }
+
+    /// A short readable summary of a tool's input for the audit trail.
+    private static func argSummary(_ input: [String: Any]) -> String {
+        for key in ["text", "field", "url", "query"] {
+            if let v = input[key] as? String, !v.isEmpty {
+                let value = (input["value"] as? String).map { " = \"\($0.prefix(30))\"" } ?? ""
+                return "\"\(v.prefix(40))\"\(value)"
+            }
+        }
+        return ""
     }
 
     /// Detects the agent's NEEDS_LOGIN signal and returns the site name.
@@ -372,11 +401,15 @@ public final class BackgroundWebAgent {
         return "this site"
     }
 
-    /// Detects the agent's honest INCOMPLETE signal (it said done but couldn't actually
-    /// finish) and returns the reason — so the run is NOT counted as a completion.
+    /// Detects the agent's honest INCOMPLETE signal — but ONLY as a leading marker (the
+    /// protocol is "reply starting with INCOMPLETE:"), never mid-sentence, so a genuine
+    /// success that merely mentions the word ("some dates had incomplete pricing") is
+    /// not mistaken for a failure.
     private static func incompleteReason(in text: String) -> String? {
-        guard let range = text.range(of: "INCOMPLETE", options: .caseInsensitive) else { return nil }
-        let rest = text[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.uppercased().hasPrefix("INCOMPLETE") else { return nil }
+        let rest = trimmed.dropFirst("INCOMPLETE".count)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
         return rest.isEmpty ? "I couldn't finish this one." : rest
     }
 }
