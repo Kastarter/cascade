@@ -1689,6 +1689,18 @@ private struct ManagerScreen: View {
     private var reviewQueueSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
             SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(model.pendingCuratedAgents.count) pending")
+            if let note = model.managerReviewNote {
+                HStack(spacing: CascadeMetrics.s2) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 12)).foregroundStyle(Color.cascadeAgent)
+                    Text(note).font(.cascadeSans(12, .medium)).foregroundStyle(Color.cascadeText2)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, CascadeMetrics.s3).padding(.vertical, CascadeMetrics.s2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.cascadeAgent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .transition(.opacity)
+            }
             if model.pendingCuratedAgents.isEmpty {
                 CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a background-doable task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
             } else {
@@ -1702,6 +1714,7 @@ private struct ManagerScreen: View {
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.25), value: model.managerReviewNote)
     }
 
     /// The rewind frame nearest to when the workflow was last observed, from the

@@ -1928,18 +1928,29 @@ public final class CascadeAppModel: ObservableObject {
 
     // MARK: - Agents built from recorded workflows
 
-    /// Detected workflows still awaiting review in the Cascades tab — excludes
-    /// ones already approved (an agent exists) or declined.
-    public var pendingDetectedWaste: [DetectedWaste] {
-        let approved = Set(agents.map(\.signature))
-        return detectedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
-    }
-
     /// The curated proposals still awaiting review — the review surface's source of
     /// truth (R1). Same approved/declined filter as the raw list, keyed by signature.
     public var pendingCuratedAgents: [CuratedAgent] {
         let approved = Set(agents.map(\.signature))
         return curatedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
+    }
+
+    /// A transient confirmation for the Manager's review queue — approve/decline
+    /// happen on the Manager tab, so the only feedback (the new agent landing in the
+    /// Cascades tab) is somewhere the manager isn't looking. This banner closes that
+    /// gap. It auto-clears, superseded by the next review action.
+    @Published public private(set) var managerReviewNote: String?
+    private var managerReviewNoteToken = 0
+
+    private func flashManagerReviewNote(_ text: String) {
+        managerReviewNoteToken += 1
+        let token = managerReviewNoteToken
+        managerReviewNote = text
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard let self, self.managerReviewNoteToken == token else { return }
+            self.managerReviewNote = nil
+        }
     }
 
     /// The MANAGER approves a curated proposal from the review queue: it builds the
@@ -1951,9 +1962,9 @@ public final class CascadeAppModel: ObservableObject {
             do {
                 _ = try await orchestrator.createAgent(from: curated)
                 _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.approved", detail: curated.name))
-                agentMessage = "Approved “\(curated.name)” — it's in the employee's Cascades, ready to deploy."
+                flashManagerReviewNote("Approved “\(curated.name)” — it's now in the employee's Cascades, ready to deploy.")
             } catch {
-                agentMessage = "Could not approve: \(error.localizedDescription)"
+                flashManagerReviewNote("Couldn't approve “\(curated.name)”: \(error.localizedDescription)")
             }
             await refreshAll()
         }
@@ -1963,6 +1974,7 @@ public final class CascadeAppModel: ObservableObject {
     /// good, so it never returns to the review queue.
     public func declineCurated(_ curated: CuratedAgent) {
         dismissedWasteSignatures.insert(curated.signature)
+        flashManagerReviewNote("Dismissed “\(curated.name)” — you won't see it again.")
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.declined", detail: curated.name)) }
     }
 

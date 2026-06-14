@@ -143,6 +143,34 @@ func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws
     #expect(!model.pendingCuratedAgents.contains { $0.signature == curated.signature })
 }
 
+@MainActor @Test
+func approveFlashesAManagerReviewNote() async throws {
+    // The regression this fixes: approve happens on the Manager tab, so it must
+    // give feedback THERE — the new agent landing in Cascades is out of sight.
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    try await store.insertInputEvents(webWorkflowEvents())
+    await model.refreshAll()
+    let curated = try #require(model.pendingCuratedAgents.first)
+    #expect(model.managerReviewNote == nil)
+
+    model.approveCurated(curated) // fire-and-forget: createAgent → note → refreshAll
+    try await waitUntil { model.managerReviewNote != nil }
+
+    #expect(model.managerReviewNote?.contains(curated.name) == true)
+}
+
+@MainActor @Test
+func declineFlashesAManagerReviewNote() async throws {
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    try await store.insertInputEvents(webWorkflowEvents())
+    await model.refreshAll()
+    let curated = try #require(model.pendingCuratedAgents.first)
+
+    model.declineCurated(curated) // sets the note synchronously
+
+    #expect(model.managerReviewNote?.contains(curated.name) == true)
+}
+
 // MARK: - C1: honest math (only genuine completions count as reclaimed runs)
 
 private func completedUpdate(_ result: String) -> BackgroundWebAgent.Update {
