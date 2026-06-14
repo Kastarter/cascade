@@ -150,7 +150,18 @@ public final class WebSandbox: NSObject {
           ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
             try { el.dispatchEvent(new (t.indexOf('pointer')===0?PointerEvent:MouseEvent)(t, opts)); } catch(e){}
           });
-          if (el.focus) { try { el.focus(); } catch(e){} }
+          // Focus the right target AND place the caret, so a following type lands here.
+          // Rich editors (Notion, Google Docs) are contenteditable, not inputs — a
+          // synthetic click alone never puts the caret in them, so typing went nowhere.
+          var host = el;
+          while (host && host.parentElement && host.parentElement.isContentEditable) host = host.parentElement;
+          if (host && host.isContentEditable) {
+            try { host.focus(); } catch(e){}
+            try {
+              var r = document.caretRangeFromPoint(x, y);
+              if (r) { var s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
+            } catch(e){}
+          } else if (el.focus) { try { el.focus(); } catch(e){} }
           return (el.tagName || '') + (el.href ? (' '+el.href) : '');
         })(\(Int(x)), \(Int(y)));
         """
@@ -168,8 +179,16 @@ public final class WebSandbox: NSObject {
           var pt = '';
           if (el.getBoundingClientRect) { var br = el.getBoundingClientRect();
             pt = '@@' + Math.round(br.left + 12) + ',' + Math.round(br.top + br.height/2) + '@@'; }
-          if (el.isContentEditable) { el.textContent = (el.textContent||'') + t;
-            el.dispatchEvent(new InputEvent('input',{bubbles:true})); return pt+'ce'; }
+          if (el.isContentEditable) {
+            // Insert AT THE CARET via execCommand — ProseMirror/Notion/Docs see the right
+            // beforeinput/input events; clobbering textContent (the old way) corrupts them.
+            var ok = false; try { ok = document.execCommand('insertText', false, t); } catch(e){}
+            if (!ok) {
+              try { el.dispatchEvent(new InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'insertText',data:t})); } catch(e){}
+              try { el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:t})); } catch(e){}
+            }
+            return pt+'ce';
+          }
           var proto = el.tagName==='TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
           var desc = Object.getOwnPropertyDescriptor(proto,'value');
           var next = (el.value||'') + t;
