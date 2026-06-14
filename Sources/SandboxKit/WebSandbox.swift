@@ -70,6 +70,9 @@ public final class WebSandbox: NSObject {
         }
         // Give JS-rendered pages a beat to paint before the first snapshot.
         try? await Task.sleep(for: .milliseconds(900))
+        // Re-assert the companion cursor: the document-end user script can be missed on
+        // a slow/heavy page, and this is idempotent (rebuilds only if absent).
+        _ = await runJS(Self.cursorOverlayJS)
     }
 
     private func resumeLoad() {
@@ -117,38 +120,40 @@ public final class WebSandbox: NSObject {
     /// flies it (CSS transition) to a viewport point; `tap(x,y)` pings a ripple there.
     static let cursorOverlayJS = """
     (function(){
-      if (window.__cascadeCursorReady) return;
-      window.__cascadeCursorReady = true;
-      function host(){ return document.body || document.documentElement; }
+      // Re-run safe: define the API every time, but only build the element once.
+      // host() is the <html> element — SPAs (Google Flights) replace document.body on
+      // hydration, which wiped a body-mounted cursor; documentElement survives that.
+      function host(){ return document.documentElement; }
       function ensure(){
         var c = document.getElementById('__cascadeCursor');
         if (c) return c;
         c = document.createElement('div');
         c.id = '__cascadeCursor';
         c.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;'
-          + 'transition:transform .34s cubic-bezier(.22,1,.36,1);will-change:transform;'
-          + 'filter:drop-shadow(0 2px 4px rgba(0,0,0,.45));';
-        c.innerHTML = '<svg width="26" height="26" viewBox="0 0 26 26">'
+          + 'transform:translate(36px,36px);transition:transform .34s cubic-bezier(.22,1,.36,1);'
+          + 'will-change:transform;'
+          + 'filter:drop-shadow(0 1px 3px rgba(0,0,0,.5)) drop-shadow(0 0 7px rgba(47,123,246,.9));';
+        c.innerHTML = '<svg width="34" height="34" viewBox="0 0 26 26">'
           + '<path d="M5 3 L5 20 L9.6 15.7 L12.6 22 L15 21 L12 14.7 L18.6 14.7 Z" '
-          + 'fill="#2f7bf6" stroke="#ffffff" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+          + 'fill="#2f7bf6" stroke="#ffffff" stroke-width="1.6" stroke-linejoin="round"/></svg>';
         host().appendChild(c);
         return c;
       }
       window.__cascadeCursor = {
-        move: function(x,y){ var c = ensure(); c.style.transform = 'translate('+x+'px,'+y+'px)'; },
+        move: function(x,y){ var c = ensure(); c.style.transform = 'translate('+(x-4)+'px,'+(y-3)+'px)'; },
         tap: function(x,y){
           var r = document.createElement('div');
-          r.style.cssText = 'position:fixed;left:'+(x-9)+'px;top:'+(y-9)+'px;width:18px;height:18px;'
+          r.style.cssText = 'position:fixed;left:'+(x-11)+'px;top:'+(y-11)+'px;width:22px;height:22px;'
             + 'border-radius:50%;background:rgba(47,123,246,.30);border:2px solid rgba(47,123,246,.95);'
-            + 'z-index:2147483646;pointer-events:none;animation:__cascadeTap .45s ease-out forwards;';
+            + 'z-index:2147483646;pointer-events:none;animation:__cascadeTap .5s ease-out forwards;';
           host().appendChild(r);
-          setTimeout(function(){ if (r.parentNode) r.parentNode.removeChild(r); }, 480);
+          setTimeout(function(){ if (r.parentNode) r.parentNode.removeChild(r); }, 520);
         }
       };
       if (!document.getElementById('__cascadeCursorStyle')) {
         var st = document.createElement('style');
         st.id = '__cascadeCursorStyle';
-        st.textContent = '@keyframes __cascadeTap{0%{transform:scale(.4);opacity:.95}100%{transform:scale(2.6);opacity:0}}';
+        st.textContent = '@keyframes __cascadeTap{0%{transform:scale(.4);opacity:.95}100%{transform:scale(2.8);opacity:0}}';
         (document.head || host()).appendChild(st);
       }
       ensure();
