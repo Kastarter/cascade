@@ -244,6 +244,9 @@ public final class BackgroundWebAgent {
             if step.done {
                 let raw = step.text.isEmpty ? "Done." : step.text
                 if let site = Self.loginSite(in: raw) { return (.needsLogin(site), acted) }
+                // The agent said done but flagged it couldn't actually finish — report it
+                // honestly and do NOT let it count as a completion.
+                if let reason = Self.incompleteReason(in: raw) { return (.failed("Couldn't finish — \(reason)"), acted) }
                 return (.finished(raw), acted)
             }
             // Streamed actions already ran via the sink; this handles any non-streamed
@@ -306,10 +309,22 @@ public final class BackgroundWebAgent {
     have credentials, do NOT guess or type anything. Stop immediately and reply \
     with exactly: NEEDS_LOGIN <site name>.
 
-    When the task is finished, instead of the usual five-word confirmation reply \
-    with ONE short line stating the concrete outcome and the key facts you found \
-    or produced — names, prices, dates, links, confirmation numbers — because \
-    later parts of the job rely on that line.
+    Before you say you are DONE, VERIFY the outcome actually exists — call \
+    read_page and confirm it is really there (the page shows the text you typed, \
+    the form submitted, the result is present). Taking actions is NOT the same as \
+    finishing: a click can do nothing, a field can silently reject input. Check, \
+    do not assume.
+
+    If you genuinely CANNOT complete the task — a control won't take your input, \
+    the page won't cooperate, the thing doesn't exist — do NOT pretend you \
+    succeeded. Reply starting with exactly: INCOMPLETE: <one line on what blocked \
+    you>. A false "done" is worse than an honest "incomplete", and the user is \
+    watching, so they can take over.
+
+    When the task is TRULY finished and verified, reply with ONE short line \
+    stating the concrete outcome and the key facts you found or produced — names, \
+    prices, dates, links, confirmation numbers — because later parts of the job \
+    rely on that line.
     """
 
     /// Maps a Computer Use action onto the web sandbox. The agent works in bottom-left
@@ -355,5 +370,13 @@ public final class BackgroundWebAgent {
             if !rest.isEmpty { return rest }
         }
         return "this site"
+    }
+
+    /// Detects the agent's honest INCOMPLETE signal (it said done but couldn't actually
+    /// finish) and returns the reason — so the run is NOT counted as a completion.
+    private static func incompleteReason(in text: String) -> String? {
+        guard let range = text.range(of: "INCOMPLETE", options: .caseInsensitive) else { return nil }
+        let rest = text[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
+        return rest.isEmpty ? "I couldn't finish this one." : rest
     }
 }
