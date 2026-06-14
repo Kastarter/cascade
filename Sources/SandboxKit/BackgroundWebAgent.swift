@@ -43,6 +43,8 @@ public final class BackgroundWebAgent {
     private let keyStore: AnthropicKeyStore
     private let model: String
     private let planner: AgentTaskPlanner
+    /// Cheap second opinion that checks a claimed completion against the actual page.
+    private let verifier: any MessageCompleting
     private var stopped = false
     /// A mid-run correction the user typed into the watch box. Injected into the next
     /// turn as a prominent note, then cleared — the agent's "cursor for agents".
@@ -55,6 +57,9 @@ public final class BackgroundWebAgent {
     private var nextIndex = 0
     private var findings: [(task: String, result: String)] = []
     private var skipped: [AgentSubtask] = []
+    /// Set once the first steer supersedes the auto-planned remainder — so later steers
+    /// ADD to the queue instead of dropping the ones already queued.
+    private var droppedOriginalPlanForSteer = false
 
     public let sandbox = WebSandbox()
 
@@ -74,6 +79,7 @@ public final class BackgroundWebAgent {
         // structurally simple task. Run it on haiku so the up-front round trip (pure
         // latency before any visible progress) is cheap; the agent loop stays on `model`.
         self.planner = AgentTaskPlanner(client: AnthropicClient(keyStore: keyStore), model: AnthropicModel.haiku)
+        self.verifier = AnthropicClient(keyStore: keyStore)
     }
 
     public func stop() { stopped = true }
@@ -94,6 +100,7 @@ public final class BackgroundWebAgent {
         nextIndex = 0
         findings = []
         skipped = []
+        droppedOriginalPlanForSteer = false
         onUpdate(Update(status: "Planning…", snapshotPNG: nil, url: "", done: false, result: nil))
         plan = await planner.plan(for: task, in: .webSandbox)
         await execute(onUpdate: onUpdate)
@@ -165,7 +172,50 @@ public final class BackgroundWebAgent {
         if case .finished = attempt.outcome, !attempt.acted, !stopped {
             attempt = await episodeOnce(sub, index: index, total: total, firmer: true, onUpdate: onUpdate)
         }
+        // The model's "done" is not enough — verify the outcome against the actual page
+        // before trusting it (the false-completion the user kept hitting). Only a CLEAR
+        // mismatch downgrades to a failure; doubt leans verified so real wins still pass.
+        if case .finished(let finding) = attempt.outcome, !stopped {
+            if let reason = await verifyCompletion(task: sub.task, claimed: finding) {
+                onAudit?("sandbox.verify", "INCOMPLETE: \(reason.prefix(80))")
+                return .failed("Couldn't finish — \(reason)")
+            }
+            onAudit?("sandbox.verify", "verified: \(finding.prefix(70))")
+        }
         return attempt.outcome
+    }
+
+    /// A cheap, page-grounded second opinion on a claimed completion. Returns an
+    /// INCOMPLETE reason only when the page CLEARLY shows the task isn't done; returns
+    /// nil (accept) on success, doubt, or an unavailable verifier — so it never
+    /// false-fails a genuine win.
+    private func verifyCompletion(task: String, claimed: String) async -> String? {
+        let page = await sandbox.readPageText()
+        // Can't judge a page we couldn't READ (a JS error) — accept rather than
+        // false-fail a win. A short-but-readable page (a blank artifact) is exactly
+        // what we DO want to catch, so it must still go to the verifier.
+        if page.hasPrefix("Couldn't read") { return nil }
+        let user = """
+        A background web agent was asked to: \(task)
+        When it claimed DONE it reported: \(claimed)
+        The page it ended on (title, URL, visible text):
+        \(page.prefix(2800))
+
+        Judging ONLY by that page, did it ACTUALLY accomplish the task — is the result or \
+        artifact the task wanted genuinely present (the page made and filled, the form \
+        submitted, the info clearly shown)? If yes, or if you're not sure, reply exactly: \
+        VERIFIED. Only if the page CLEARLY shows it is not done (blank/wrong page, nothing \
+        created, the thing isn't there) reply: INCOMPLETE: <one short line on what's missing>
+        """
+        guard let reply = try? await verifier.complete(
+            system: "You verify whether a web agent truly finished its task, judging only by the page it ended on. Lean VERIFIED unless it's clearly not done.",
+            user: user, model: AnthropicModel.haiku, maxTokens: 120
+        ) else { return nil } // verifier unavailable → don't block the completion
+        let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.uppercased().hasPrefix("INCOMPLETE") else { return nil } // VERIFIED / unclear → accept
+        let reason = trimmed.dropFirst("INCOMPLETE".count)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
+        return reason.isEmpty ? "the page doesn't show the task was completed" : reason
     }
 
     private func episodeOnce(
@@ -206,6 +256,9 @@ public final class BackgroundWebAgent {
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
             skillProvider: { WebSkills.content(named: $0) },
             harnessProvider: { [weak self, sandbox] name, input in
+                // Using any tool IS acting (reading/clicking/filling) — not the model
+                // narrating instead of working, so it must clear the firmer-retry guard.
+                acted = true
                 let result = await WebHarness.run(name, input, sandbox: sandbox)
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
@@ -289,9 +342,14 @@ public final class BackgroundWebAgent {
                 If it REPLACES your current task, wrap up now so that step takes over. \
                 Either way, do NOT ignore it.
                 """
-                // Keep done + current parts, append the steer as the next part, drop the
-                // rest of the stale original plan.
-                plan = Array(plan.prefix(index + 1)) + [AgentSubtask(task: steer, web: true)]
+                // Supersede the stale auto-planned remainder ONCE; after that, each steer
+                // ADDS to the queue (so "do A" then "also do B" both run, in order)
+                // instead of the newer steer dropping the one already queued.
+                if !droppedOriginalPlanForSteer {
+                    plan = Array(plan.prefix(index + 1))
+                    droppedOriginalPlanForSteer = true
+                }
+                plan.append(AgentSubtask(task: steer, web: true))
             }
             step = await agent.proceed(screenshot: shot, note: steerNote)
             count += 1
