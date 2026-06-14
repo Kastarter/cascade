@@ -228,9 +228,22 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(350))
             shot = await sandbox.snapshotPNG() ?? shot
             onUpdate(Update(status: step.text.isEmpty ? "\(prefix)Working…" : prefix + step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
-            // Deliver any course-correction the user typed into the box this turn.
+            // Deliver any message the user typed into the box this turn. It is
+            // AUTHORITATIVE — whatever they just said is what they want now, even if it
+            // throws out the original task. The agent follows it; we also drop the rest
+            // of the planned job so it can't snap back to stale subtasks after a redirect.
             var steerNote: String?
-            if let steer = pendingSteer { pendingSteer = nil; steerNote = "The user just sent you a correction — follow it now: \(steer)" }
+            if let steer = pendingSteer {
+                pendingSteer = nil
+                steerNote = """
+                ⚠️ NEW INSTRUCTION FROM THE USER — this is what they want NOW and it \
+                OVERRIDES everything above, even if it completely changes or replaces the \
+                task. Stop your current approach and do exactly this: \(steer)
+                If it replaces the original task, abandon that goal entirely and pursue \
+                only this. If it just refines what you're doing, fold it in immediately.
+                """
+                plan = Array(plan.prefix(index + 1))
+            }
             step = await agent.proceed(screenshot: shot, note: steerNote)
             count += 1
         }
@@ -278,8 +291,8 @@ public final class BackgroundWebAgent {
             // No real drag in the JS bridge — landing on the destination is the
             // closest meaningful approximation.
             await sandbox.click(xTopLeft: CGFloat(toX), yTopLeft: topLeftY(toY))
-        case .move:
-            break  // no pointer in the sandbox
+        case .move(let x, let y):
+            await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: topLeftY(y))
         case .type(let text):
             await sandbox.typeText(text)
         case .key(let combo):

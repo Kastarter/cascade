@@ -78,44 +78,79 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         required init?(coder: NSCoder) { fatalError() }
 
         func append(role: Role, text: String) {
-            let usableWidth = max(bounds.width, 320) - 20 // minus stack insets
-            let bubbleMax = usableWidth * 0.82
-
+            let avail = max(bounds.width, 360)
             let row = NSView()
             row.translatesAutoresizingMaskIntoConstraints = false
 
-            let bubble = NSView()
-            bubble.translatesAutoresizingMaskIntoConstraints = false
-            bubble.wantsLayer = true
-            bubble.layer?.cornerRadius = 13
-            bubble.layer?.backgroundColor = (role == .user
-                ? NSColor.controlAccentColor
-                : NSColor(calibratedWhite: 0.22, alpha: 1)).cgColor
+            switch role {
+            case .agent:
+                // A Claude-Code-style step line: an accent dot in the gutter, then the
+                // agent's words running full width. No bubble — reads like a transcript.
+                let dot = NSView()
+                dot.translatesAutoresizingMaskIntoConstraints = false
+                dot.wantsLayer = true
+                dot.layer?.cornerRadius = 3.5
+                dot.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
 
-            let label = NSTextField(wrappingLabelWithString: text)
-            label.translatesAutoresizingMaskIntoConstraints = false
-            label.font = .systemFont(ofSize: 12)
-            label.textColor = role == .user ? .white : NSColor(calibratedWhite: 0.96, alpha: 1)
-            label.isSelectable = true
-            label.preferredMaxLayoutWidth = bubbleMax - 20
-            bubble.addSubview(label)
-            row.addSubview(bubble)
+                let label = NSTextField(wrappingLabelWithString: text)
+                label.translatesAutoresizingMaskIntoConstraints = false
+                label.font = .systemFont(ofSize: 12)
+                label.textColor = NSColor(calibratedWhite: 0.86, alpha: 1)
+                label.isSelectable = true
+                label.preferredMaxLayoutWidth = avail - 56
 
-            NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 11),
-                label.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -11),
-                label.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 7),
-                label.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -7),
-                bubble.topAnchor.constraint(equalTo: row.topAnchor),
-                bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-                bubble.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMax),
-            ])
-            if role == .user {
-                bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor).isActive = true
-                bubble.leadingAnchor.constraint(greaterThanOrEqualTo: row.leadingAnchor).isActive = true
-            } else {
-                bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor).isActive = true
-                bubble.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor).isActive = true
+                row.addSubview(dot)
+                row.addSubview(label)
+                NSLayoutConstraint.activate([
+                    dot.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 2),
+                    dot.topAnchor.constraint(equalTo: row.topAnchor, constant: 5),
+                    dot.widthAnchor.constraint(equalToConstant: 7),
+                    dot.heightAnchor.constraint(equalToConstant: 7),
+                    label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 9),
+                    label.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                    label.topAnchor.constraint(equalTo: row.topAnchor),
+                    label.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                ])
+
+            case .user:
+                // A distinct card — accent left bar + faint tint — so the user's own
+                // words clearly stand apart from the agent's stream (Cursor-style).
+                let card = NSView()
+                card.translatesAutoresizingMaskIntoConstraints = false
+                card.wantsLayer = true
+                card.layer?.cornerRadius = 8
+                card.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor
+
+                let bar = NSView()
+                bar.translatesAutoresizingMaskIntoConstraints = false
+                bar.wantsLayer = true
+                bar.layer?.cornerRadius = 1.5
+                bar.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+
+                let label = NSTextField(wrappingLabelWithString: text)
+                label.translatesAutoresizingMaskIntoConstraints = false
+                label.font = .systemFont(ofSize: 12, weight: .medium)
+                label.textColor = .white
+                label.isSelectable = true
+                label.preferredMaxLayoutWidth = avail - 70
+
+                row.addSubview(card)
+                card.addSubview(bar)
+                card.addSubview(label)
+                NSLayoutConstraint.activate([
+                    card.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+                    card.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                    card.topAnchor.constraint(equalTo: row.topAnchor),
+                    card.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                    bar.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
+                    bar.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
+                    bar.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
+                    bar.widthAnchor.constraint(equalToConstant: 3),
+                    label.leadingAnchor.constraint(equalTo: bar.trailingAnchor, constant: 10),
+                    label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+                    label.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
+                    label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
+                ])
             }
 
             stack.addArrangedSubview(row)
