@@ -196,6 +196,7 @@ public final class BackgroundWebAgent {
         }
         onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
 
+        var acted = false
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
             skillProvider: { WebSkills.content(named: $0) },
@@ -208,6 +209,24 @@ public final class BackgroundWebAgent {
             },
             extraTools: WebHarness.toolDefinitions()
         )
+        // Stream like the cursor agent: each narration clause lands in the chat AND each
+        // action runs the instant it's generated (the cursor moves seconds sooner) rather
+        // than waiting for the whole turn. A pending steer returns false → the stream
+        // halts immediately, so the user's message is handled now, not after the turn.
+        agent.streamSink = { [weak self] item in
+            guard let self, !self.stopped else { return false }
+            switch item {
+            case .text(let line):
+                onUpdate(Update(status: prefix + line, snapshotPNG: nil, url: self.sandbox.currentURL, done: false, result: nil))
+                return true
+            case .action(let action):
+                if self.pendingSteer != nil { return false }
+                await self.apply(action)
+                if let pt = self.sandbox.consumeActionPoint() { self.onCursor?(pt) }
+                acted = true
+                return true
+            }
+        }
         var step = await agent.begin(
             goal: AgentTaskPlanner.goal(for: sub, index: index, total: total, job: originalTask, findings: findings, firmer: firmer),
             screenshot: shot,
@@ -216,7 +235,6 @@ public final class BackgroundWebAgent {
             skillIndex: WebSkills.index()
         )
 
-        var acted = false
         // Runaway backstop, not a budget — research/multi-page tasks routinely
         // need 30+ steps; the real terminators are the model finishing, the user
         // stopping the box, or a sign-in wall.
@@ -228,20 +246,16 @@ public final class BackgroundWebAgent {
                 if let site = Self.loginSite(in: raw) { return (.needsLogin(site), acted) }
                 return (.finished(raw), acted)
             }
-            if !step.text.isEmpty {
-                onUpdate(Update(status: prefix + step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
-            }
-            if !step.actions.isEmpty { acted = true }
+            // Streamed actions already ran via the sink; this handles any non-streamed
+            // leftovers (zoom/screenshot are no-ops here, harness/skill resolve inline).
             for action in step.actions {
-                // A message the user just typed interrupts the batch: stop here, go
-                // re-think with it now instead of grinding through the rest of the plan.
                 if pendingSteer != nil || stopped { break }
                 await apply(action)
                 if let pt = sandbox.consumeActionPoint() { onCursor?(pt) }
+                acted = true
             }
-            try? await Task.sleep(for: .milliseconds(350))
+            try? await Task.sleep(for: .milliseconds(300))
             shot = await sandbox.snapshotPNG() ?? shot
-            onUpdate(Update(status: step.text.isEmpty ? "\(prefix)Working…" : prefix + step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
             // Deliver any message the user typed into the box this turn. It is
             // AUTHORITATIVE — whatever they just said is what they want now, even if it
             // throws out the original task. The agent follows it; we also drop the rest

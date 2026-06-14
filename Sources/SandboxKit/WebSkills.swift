@@ -90,14 +90,57 @@ public enum WebSkills {
             - Report the event's title, date, and time back.
             """
         ),
+        Skill(
+            name: "web-travel",
+            useWhen: "finding or comparing flights, hotels, or trips (Google Flights, airlines, booking sites)",
+            playbook: """
+            WEB TRAVEL (flights/hotels — Google Flights = google.com/travel/flights, or the airline / booking site directly):
+            - Pick the surface: Google Flights to COMPARE across airlines & dates; a specific airline/hotel site to book on it.
+            - Set the trip with the page's own controls: fill_field origin + destination (type, then click_text the matching
+              airport/city suggestion), set Round trip / One way, passengers, cabin. For dates, open the date picker and
+              click_text the day — use the next/prev month arrows to reach the right month.
+            - Read results with read_page: capture the CHEAPEST and/or BEST option with price + currency + airline + times +
+              stops + dates. Narrow with the filters (Stops, Airlines, Price) via click_text when the task calls for it.
+            - Report concrete fares, e.g. "Cheapest CA$2,579 — Air Canada/Etihad, Aug 8–Sep 14, 3 stops"; compare a couple if asked.
+            - STOP before actually booking or paying (see web-forms). NEEDS_LOGIN <site> if a fare/booking needs an account.
+            """
+        ),
+        Skill(
+            name: "web-shopping",
+            useWhen: "finding, comparing, or buying a product on a store (Amazon, retailers)",
+            playbook: """
+            WEB SHOPPING (Amazon, retailers):
+            - Search the store (fill_field the search box, press Enter), click_text the product, read_page for price,
+              specs, availability, and rating. Compare options by reading each product page.
+            - Report the pick with its price + a one-line why. Add to cart (click_text "Add to Cart") only if the task
+              asks to buy — then STOP at the checkout review; never enter payment or place the order unless explicitly
+              authorized (see web-forms).
+            - NEEDS_LOGIN <site> if the cart or account is gated.
+            """
+        ),
+        Skill(
+            name: "web-general",
+            useWhen: "any web task that no other skill specifically covers — the universal method",
+            playbook: """
+            ANY WEB TASK (use when no specific skill fits — you can do ANYTHING a person can in a browser):
+            - Tools: open_url to navigate, read_page to read, list_interactives to find controls, click_text to click,
+              fill_field to type; fall back to coordinate clicks only when no tool fits.
+            - Work on the REAL site for the task, in place (there are no tabs). After every navigation, re-read with
+              read_page so you act on the CURRENT state, not a stale screenshot.
+            - Break a big job into steps; verify each with read_page before the next. A long task is fine — keep going.
+            - Report the concrete outcome with evidence (names, prices, dates, links, confirmation numbers).
+            - NEEDS_LOGIN <site> for an auth wall; STOP before anything irreversible or costly unless authorized.
+            """
+        ),
     ]
 
     /// The one-line-per-skill catalogue for `ComputerUseAgent(begin: skillIndex:)`.
     public static func index() -> String {
         let lines = skills.map { "- \($0.name): \($0.useWhen)" }
         return """
-        Skills available through your use_skill tool — proven playbooks for common web tasks. \
-        When one matches what you're about to do, call use_skill with its name FIRST and follow it:
+        You can carry out ANY web task in this sandbox. These are proven playbooks available \
+        through your use_skill tool — when one matches what you're about to do, call use_skill with \
+        its name FIRST and follow it; web-general covers anything the others don't:
         \(lines.joined(separator: "\n"))
         """
     }
