@@ -21,6 +21,7 @@ final class SandboxBoxController: NSObject {
         let statusLabel: NSTextField
         let continueButton: NSButton
         let stopButton: NSButton
+        let steerField: NSTextField
         let cover: NSView
         let logo: NSImageView
         /// Current scaleUnitSquare factor applied to `scaler` (1 = full size).
@@ -28,13 +29,15 @@ final class SandboxBoxController: NSObject {
         var isExpanded = true
         var onStop: (() -> Void)?
         var onContinue: (() -> Void)?
+        var onSteer: ((String) -> Void)?
 
-        init(panel: NSPanel, scaler: NSView, statusLabel: NSTextField, continueButton: NSButton, stopButton: NSButton, cover: NSView, logo: NSImageView) {
+        init(panel: NSPanel, scaler: NSView, statusLabel: NSTextField, continueButton: NSButton, stopButton: NSButton, steerField: NSTextField, cover: NSView, logo: NSImageView) {
             self.panel = panel
             self.scaler = scaler
             self.statusLabel = statusLabel
             self.continueButton = continueButton
             self.stopButton = stopButton
+            self.steerField = steerField
             self.cover = cover
             self.logo = logo
         }
@@ -51,13 +54,16 @@ final class SandboxBoxController: NSObject {
     private let viewW: CGFloat = WebSandbox.width
     private let viewH: CGFloat = WebSandbox.height
     private let headerH: CGFloat = 40
+    /// Footer row holding the "steer the agent" text field (expanded only).
+    private let steerRowH: CGFloat = 36
     /// Side of the collapsed logo chip.
     private let chipSide: CGFloat = 60
 
-    func show(_ id: UUID, webView: WKWebView, task: String, onStop: @escaping () -> Void) {
+    func show(_ id: UUID, webView: WKWebView, task: String, onStop: @escaping () -> Void, onSteer: @escaping (String) -> Void) {
         let isNew = boxes[id] == nil
         let box = boxes[id] ?? makeBox(for: id)
         box.onStop = onStop
+        box.onSteer = onSteer
         box.onContinue = nil
         if webView.superview !== box.scaler {
             webView.removeFromSuperview()
@@ -113,6 +119,17 @@ final class SandboxBoxController: NSObject {
         resume?()
     }
 
+    /// User typed a correction into the box and pressed Return — hand it to the agent
+    /// for its next turn, then clear the field + reflect it in the status.
+    @objc private func steerSubmitted(_ sender: NSTextField) {
+        guard let box = boxes.first(where: { $0.value.panel === sender.window })?.value else { return }
+        let message = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        box.onSteer?(message)
+        sender.stringValue = ""
+        box.statusLabel.stringValue = "↳ told it: \(message)"
+    }
+
     // MARK: - Hover expand / collapse
 
     /// Hover is driven by polling the global mouse position (same pattern as the
@@ -138,8 +155,10 @@ final class SandboxBoxController: NSObject {
             if inside, !box.isExpanded {
                 layout(box, expanded: true, animate: true)
             } else if !inside, box.isExpanded {
-                // Only a pending sign-in pins the box open.
-                guard box.onContinue == nil else { continue }
+                // Pinned open during a sign-in OR while the user is typing in it (key
+                // window) — so it never collapses mid-login or mid-steer if the cursor
+                // drifts off the box.
+                guard box.onContinue == nil, !box.panel.isKeyWindow else { continue }
                 layout(box, expanded: false, animate: true)
             }
         }
@@ -151,7 +170,7 @@ final class SandboxBoxController: NSObject {
     private func layout(_ box: Box, expanded: Bool, animate: Bool) {
         box.isExpanded = expanded
         let width: CGFloat = expanded ? viewW + 20 : chipSide
-        let height: CGFloat = expanded ? viewH + headerH + 16 : chipSide
+        let height: CGFloat = expanded ? viewH + headerH + 16 + steerRowH : chipSide
 
         // The webview scales to sit (faint, covered by the logo chip) inside the
         // collapsed box, which keeps WebKit painting between hovers.
@@ -167,7 +186,8 @@ final class SandboxBoxController: NSObject {
         box.panel.setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true, animate: animate)
 
         if expanded {
-            box.scaler.frame = NSRect(x: 10, y: 10, width: viewW, height: viewH)
+            // Shifted up by the footer steer row.
+            box.scaler.frame = NSRect(x: 10, y: 10 + steerRowH, width: viewW, height: viewH)
         } else {
             let pw = round(viewW * s), ph = round(viewH * s)
             box.scaler.frame = NSRect(x: (chipSide - pw) / 2, y: (chipSide - ph) / 2, width: pw, height: ph)
@@ -176,10 +196,13 @@ final class SandboxBoxController: NSObject {
         box.statusLabel.isHidden = !expanded
         box.stopButton.isHidden = !expanded
         box.continueButton.isHidden = !expanded || box.onContinue == nil
+        box.steerField.isHidden = !expanded
         if expanded {
-            box.statusLabel.frame = NSRect(x: 12, y: viewH + 18, width: width - 172, height: 20)
-            box.stopButton.frame = NSRect(x: width - 72, y: viewH + 14, width: 60, height: 26)
-            box.continueButton.frame = NSRect(x: width - 156, y: viewH + 14, width: 80, height: 26)
+            let top = viewH + 10 + steerRowH // y of the webView's top edge; the header sits just above it
+            box.statusLabel.frame = NSRect(x: 12, y: top + 8, width: width - 172, height: 20)
+            box.stopButton.frame = NSRect(x: width - 72, y: top + 4, width: 60, height: 26)
+            box.continueButton.frame = NSRect(x: width - 156, y: top + 4, width: 80, height: 26)
+            box.steerField.frame = NSRect(x: 12, y: 8, width: width - 24, height: 24)
         }
 
         box.cover.isHidden = expanded
@@ -190,7 +213,7 @@ final class SandboxBoxController: NSObject {
 
     private func makeBox(for id: UUID) -> Box {
         let width = viewW + 20
-        let height = viewH + headerH + 16
+        let height = viewH + headerH + 16 + steerRowH
         // Activatable (not .nonactivatingPanel) so the user can click + type to sign in
         // inside the box when a task needs a login.
         let panel = SandboxPanel(
@@ -255,6 +278,18 @@ final class SandboxBoxController: NSObject {
         cont.isHidden = true
         content.addSubview(cont)
 
+        // Footer: "cursor for the agent" — type a correction, ⏎ sends it to the agent's
+        // next turn. Editable, so the panel must be able to become key (SandboxPanel is).
+        let steer = NSTextField()
+        steer.frame = NSRect(x: 12, y: 8, width: width - 24, height: 24)
+        steer.placeholderString = "Tell the agent something… (⏎ to send)"
+        steer.font = .systemFont(ofSize: 11)
+        steer.bezelStyle = .roundedBezel
+        steer.focusRingType = .none
+        steer.target = self
+        steer.action = #selector(steerSubmitted(_:))
+        content.addSubview(steer)
+
         // Collapsed-state face: a dim cover with the Cascade logo, sitting above
         // the (tiny, still-painting) webview.
         let cover = NSView(frame: content.bounds)
@@ -271,7 +306,7 @@ final class SandboxBoxController: NSObject {
         content.addSubview(logo)
 
         panel.contentView = content
-        let box = Box(panel: panel, scaler: scaler, statusLabel: status, continueButton: cont, stopButton: stop, cover: cover, logo: logo)
+        let box = Box(panel: panel, scaler: scaler, statusLabel: status, continueButton: cont, stopButton: stop, steerField: steer, cover: cover, logo: logo)
         boxes[id] = box
         return box
     }

@@ -44,6 +44,9 @@ public final class BackgroundWebAgent {
     private let model: String
     private let planner: AgentTaskPlanner
     private var stopped = false
+    /// A mid-run correction the user typed into the watch box. Injected into the next
+    /// turn as a prominent note, then cleared — the agent's "cursor for agents".
+    private var pendingSteer: String?
 
     // The current plan. Survives a login pause so `resume()` re-enters at
     // `nextIndex` with the earlier parts' findings intact.
@@ -65,6 +68,14 @@ public final class BackgroundWebAgent {
     }
 
     public func stop() { stopped = true }
+
+    /// Mid-run course-correction from the user (typed into the watch box). Queued and
+    /// delivered to the agent on its next turn — like talking to the cursor agent.
+    public func steer(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        pendingSteer = pendingSteer.map { "\($0)\n\(trimmed)" } ?? trimmed
+    }
 
     /// Plans `task` into parts, then carries them out in the sandbox, calling
     /// `onUpdate` after each step.
@@ -217,7 +228,10 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(350))
             shot = await sandbox.snapshotPNG() ?? shot
             onUpdate(Update(status: step.text.isEmpty ? "\(prefix)Working…" : prefix + step.text, snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
-            step = await agent.proceed(screenshot: shot)
+            // Deliver any course-correction the user typed into the box this turn.
+            var steerNote: String?
+            if let steer = pendingSteer { pendingSteer = nil; steerNote = "The user just sent you a correction — follow it now: \(steer)" }
+            step = await agent.proceed(screenshot: shot, note: steerNote)
             count += 1
         }
         return (stopped ? .stopped : .stepLimit, acted)

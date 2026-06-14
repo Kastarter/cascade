@@ -532,7 +532,7 @@ private struct ReelScreen: View {
         if let ocr = selected.ocrText, let first = ocr.split(separator: "\n").first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
             return String(first.prefix(90))
         }
-        return "A local moment in \(selected.appName)"
+        return "A local moment in \(CascadeAppModel.displayApp(appName: selected.appName, windowTitle: selected.windowTitle))"
     }
 
     /// Window titles often lead with decorative bullets ("· Redesign…", "✳ Build…")
@@ -636,7 +636,7 @@ private struct SceneCard: View {
                     .frame(maxHeight: 150)
                     .padding(.horizontal, CascadeMetrics.s6)
                 } else {
-                    Text("A local moment in \(context.appName)")
+                    Text("A local moment in \(CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle))")
                         .font(.cascadeSans(12))
                         .foregroundStyle(Color.cascadeText3)
                 }
@@ -806,10 +806,14 @@ private struct ActivityTimeline: View {
     private var runs: [Run] {
         var result: [Run] = []
         for context in contexts.reversed() {
-            if let last = result.last, last.app == context.appName {
+            // Group by the web app inside the browser when there is one, so the lanes
+            // read "Gmail" / "Google Docs" instead of one long "Google Chrome".
+            let app = CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle)
+            let bundle = app == context.appName ? context.bundleIdentifier : nil
+            if let last = result.last, last.app == app {
                 result[result.count - 1] = Run(app: last.app, bundle: last.bundle, count: last.count + 1)
             } else {
-                result.append(Run(app: context.appName, bundle: context.bundleIdentifier, count: 1))
+                result.append(Run(app: app, bundle: bundle, count: 1))
             }
         }
         return result
@@ -818,9 +822,12 @@ private struct ActivityTimeline: View {
     private var legend: [LegendItem] {
         var seen = Set<String>()
         var items: [LegendItem] = []
-        for context in contexts where !seen.contains(context.appName) {
-            seen.insert(context.appName)
-            items.append(LegendItem(id: context.appName, app: context.appName, bundle: context.bundleIdentifier))
+        for context in contexts {
+            let app = CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle)
+            guard !seen.contains(app) else { continue }
+            seen.insert(app)
+            let bundle = app == context.appName ? context.bundleIdentifier : nil
+            items.append(LegendItem(id: app, app: app, bundle: bundle))
         }
         return items.sorted { $0.app < $1.app }
     }
@@ -1058,10 +1065,11 @@ private struct AskPanel: View {
     /// "WhatsApp · chat title", deduped when the window title is just the app name.
     private var headerLine: String {
         guard let selected else { return "Local record" }
-        if let title = selected.windowTitle, !title.isEmpty, title != selected.appName {
-            return "\(selected.appName) · \(title)"
+        let app = CascadeAppModel.displayApp(appName: selected.appName, windowTitle: selected.windowTitle)
+        if let title = selected.windowTitle, !title.isEmpty, title != selected.appName, title != app {
+            return "\(app) · \(title)"
         }
-        return selected.appName
+        return app
     }
 
     private var canSend: Bool {

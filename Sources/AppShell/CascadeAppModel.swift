@@ -519,9 +519,11 @@ public final class CascadeAppModel: ObservableObject {
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
         voice.speak("On it. I'll handle that in the background.")
-        sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed) { [weak self] in
+        sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed, onStop: { [weak self] in
             self?.stopSandboxAgent(id)
-        }
+        }, onSteer: { [weak self] message in
+            self?.sandboxRuntimes[id]?.steer(message)
+        })
         Task {
             await runtime.run(task: trimmed) { [weak self] update in
                 self?.applySandboxUpdate(id, update)
@@ -1983,6 +1985,15 @@ public final class CascadeAppModel: ObservableObject {
     nonisolated static func webAppIdentity(for event: InputEvent) -> String? {
         guard webBrowserNames.contains(event.appName.lowercased()) else { return nil }
         return WebAppIdentity.from(windowTitle: event.windowTitle)
+    }
+
+    /// The app to SHOW for a recorded moment in the Reel: the web app inside the
+    /// browser (Gmail, Notion…) when identifiable, else the macOS app — so the Rewind
+    /// timeline reads like the user's actual workspace instead of "Google Chrome" for
+    /// everything. Native moments return their own name unchanged.
+    nonisolated static func displayApp(appName: String, windowTitle: String?) -> String {
+        guard webBrowserNames.contains(appName.lowercased()) else { return appName }
+        return WebAppIdentity.from(windowTitle: windowTitle) ?? appName
     }
 
     /// Installed https-handling apps (i.e. the user's browsers), in every name form
