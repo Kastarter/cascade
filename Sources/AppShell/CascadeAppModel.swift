@@ -266,7 +266,10 @@ public final class CascadeAppModel: ObservableObject {
             suggestions = try await orchestrator.suggestions()
             agents = try await orchestrator.agents()
             detectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
-            curatedWaste = await orchestrator.curate(detectedWaste)
+            // Only genuinely repeated, background-doable workflows reach the curator
+            // and the manager's review queue. The raw `detectedWaste` stays the recall
+            // layer behind the Manager's "where the time goes" analytics.
+            curatedWaste = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
             managerCascades = try await store.managerCascades()
             statusLine = recorder.status.message
         } catch {
@@ -1939,14 +1942,16 @@ public final class CascadeAppModel: ObservableObject {
         return curatedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
     }
 
-    /// Approving a curated proposal builds the agent from the recorded recipe but
-    /// keeps the curator's human name, so "Your agents" reads in the user's words.
+    /// The MANAGER approves a curated proposal from the review queue: it builds the
+    /// agent from the recorded recipe but keeps the curator's human name, and the
+    /// approved agent lands in the employee's Cascades tab ("Your agents"), ready to
+    /// deploy in the background.
     public func approveCurated(_ curated: CuratedAgent) {
         Task {
             do {
                 _ = try await orchestrator.createAgent(from: curated)
-                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.approved", detail: curated.name))
-                agentMessage = "Approved “\(curated.name)” — it's in Your agents, ready to deploy."
+                _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.approved", detail: curated.name))
+                agentMessage = "Approved “\(curated.name)” — it's in the employee's Cascades, ready to deploy."
             } catch {
                 agentMessage = "Could not approve: \(error.localizedDescription)"
             }
@@ -1954,10 +1959,11 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    /// Declining a curated proposal hides its underlying workflow for good.
+    /// The manager dismisses a curated proposal — hides its underlying workflow for
+    /// good, so it never returns to the review queue.
     public func declineCurated(_ curated: CuratedAgent) {
         dismissedWasteSignatures.insert(curated.signature)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: curated.name)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.declined", detail: curated.name)) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {
@@ -1981,6 +1987,27 @@ public final class CascadeAppModel: ObservableObject {
     /// has — today or one installed later — counts, with nothing hardcoded.
     public nonisolated static func runsInBackground(apps: [String]) -> Bool {
         !apps.isEmpty && apps.allSatisfy { webBrowserNames.contains($0.lowercased()) }
+    }
+
+    /// How many non-overlapping repeats a detected workflow needs before it is
+    /// worth a manager's attention. The detector recalls anything seen twice (it
+    /// powers the Manager's "where the time goes" insight), but turning something
+    /// into a reviewable agent demands a genuine HABIT — three or more.
+    nonisolated static let minRepeatsToAutomate = 3
+
+    /// The pure repetition half of the automatable bar — split out so it can be
+    /// pinned without depending on the machine's installed browsers.
+    nonisolated static func meetsRepetitionBar(_ waste: DetectedWaste) -> Bool {
+        waste.occurrences >= minRepeatsToAutomate
+    }
+
+    /// The product bar for promoting a detected repetition into an agent the
+    /// manager reviews: it must be a real habit (≥ `minRepeatsToAutomate`) AND
+    /// doable by the background web agent. Option A — only web workflows are
+    /// automatable today, so native-app repetition stays insight-only and never
+    /// reaches the review queue (we'd have nothing that could actually run it).
+    nonisolated static func isAutomatable(_ waste: DetectedWaste) -> Bool {
+        meetsRepetitionBar(waste) && runsInBackground(apps: waste.apps)
     }
 
     /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a

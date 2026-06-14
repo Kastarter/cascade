@@ -78,9 +78,15 @@ public struct WorkflowCurator: Sendable {
     repeat the same actions, into the few that are genuinely worth turning into an \
     agent FOR THIS USER.
 
-    For each candidate, judge: is automating this actually useful, or is it noise — \
-    incidental reading, scrolling, navigation, or one-off clicking a person would \
-    never hand off? KEEP only the worthwhile ones. It is correct to keep none.
+    Every candidate already cleared two bars before reaching you: it repeats at least \
+    three times, and it runs entirely in the browser (so a background web agent can \
+    carry it out while the user keeps working). Your job is the final judgment of \
+    WORTH.
+
+    For each candidate, judge: would automating this actually save real time and \
+    tedium, or is it noise — incidental reading, scrolling, navigation, or one-off \
+    clicking a person would never hand off? KEEP only the ones genuinely worth handing \
+    to an agent. It is correct to keep none.
 
     For each KEPT candidate return:
     - "index": the candidate's number from the list.

@@ -32,15 +32,17 @@ private func makeModel(curatorReply: String = #"{"agents":[]}"#) throws -> (mode
     return (model, store)
 }
 
-/// A repeated Mail→Numbers copy/paste the detector catches as one workflow.
-private func copyPasteEvents() -> [InputEvent] {
+/// A repeated in-browser workflow the detector catches AND the automatable bar
+/// keeps: a named-element click + a command shortcut in Safari, three times.
+/// Safari is always registered to open https on macOS, so it passes
+/// `runsInBackground` deterministically on any test Mac; three repeats clear the
+/// `minRepeatsToAutomate` bar.
+private func webWorkflowEvents() -> [InputEvent] {
     var events: [InputEvent] = []
     var i = 0
-    for _ in 0..<2 {
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    for _ in 0..<3 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
     }
     return events
 }
@@ -57,7 +59,7 @@ private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throw
 }
 
 private let curatorKeepsOne = """
-{"agents":[{"index":0,"name":"Copy invoice totals into Numbers","why":"You do it by hand daily.","goal":"Copy the latest invoice totals out of Mail into the Numbers tracker.","value":0.9}]}
+{"agents":[{"index":0,"name":"Reply to refund emails with the policy link","why":"You do it by hand several times a day.","goal":"In Gmail, reply to each new refund request with the standard policy link.","value":0.9}]}
 """
 
 @MainActor @Test
@@ -73,22 +75,46 @@ func modelBuildsHeadlessWithoutStartingHardware() throws {
 @MainActor @Test
 func refreshAllCuratesDetectedWorkflows() async throws {
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
-    try await store.insertInputEvents(copyPasteEvents())
+    try await store.insertInputEvents(webWorkflowEvents())
 
     await model.refreshAll()
 
-    // The whole R1 surface wiring: detector caught it → curator judged + renamed it →
-    // it's what the review tab shows.
+    // The whole review surface wiring: detector caught it → the automatable bar
+    // (≥3×, background-doable) kept it → curator judged + named it → it's what the
+    // manager's review queue shows.
     #expect(model.detectedWaste.count == 1)
     #expect(model.curatedWaste.count == 1)
-    #expect(model.curatedWaste.first?.name == "Copy invoice totals into Numbers")
+    #expect(model.curatedWaste.first?.name == "Reply to refund emails with the policy link")
     #expect(model.pendingCuratedAgents.count == 1) // nothing approved or declined yet
+}
+
+@MainActor @Test
+func nativeWorkflowNeverReachesTheReviewQueue() async throws {
+    // Option A: a repeated NATIVE-app workflow (Mail→Numbers) the background web
+    // agent can't run is recalled for analytics but never curated into a reviewable
+    // agent — there's nothing that could carry it out today.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<3 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    }
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    try await store.insertInputEvents(events)
+
+    await model.refreshAll()
+
+    #expect(model.detectedWaste.count == 1) // recalled for insight…
+    #expect(model.curatedWaste.isEmpty)     // …but filtered out before curation
+    #expect(model.pendingCuratedAgents.isEmpty)
 }
 
 @MainActor @Test
 func decliningHidesFromPendingImmediately() async throws {
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
-    try await store.insertInputEvents(copyPasteEvents())
+    try await store.insertInputEvents(webWorkflowEvents())
     await model.refreshAll()
     let curated = try #require(model.pendingCuratedAgents.first)
 
@@ -101,7 +127,7 @@ func decliningHidesFromPendingImmediately() async throws {
 @MainActor @Test
 func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws {
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
-    try await store.insertInputEvents(copyPasteEvents())
+    try await store.insertInputEvents(webWorkflowEvents())
     await model.refreshAll()
     let curated = try #require(model.pendingCuratedAgents.first)
 
@@ -109,8 +135,10 @@ func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws
     try await waitUntil { model.agents.contains { $0.signature == curated.signature } }
 
     let agent = try #require(model.agents.first { $0.signature == curated.signature })
-    #expect(agent.name == "Copy invoice totals into Numbers")
-    #expect(agent.goal == "Copy the latest invoice totals out of Mail into the Numbers tracker.")
+    #expect(agent.name == "Reply to refund emails with the policy link")
+    #expect(agent.goal == "In Gmail, reply to each new refund request with the standard policy link.")
+    // The agent is web-only, so it deploys in the background.
+    #expect(CascadeAppModel.runsInBackground(apps: agent.apps))
     // Approved → it drops out of the review queue.
     #expect(!model.pendingCuratedAgents.contains { $0.signature == curated.signature })
 }
@@ -160,6 +188,32 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
 
     // None of these finished the task, so "Reclaimed" must stay at zero.
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
+}
+
+private func waste(apps: [String], occurrences: Int) -> DetectedWaste {
+    DetectedWaste(
+        title: "t", apps: apps, occurrences: occurrences,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 20 * occurrences,
+        recipe: AgentRecipe(steps: []), evidence: [], confidence: 0.7, signature: "sig"
+    )
+}
+
+@Test
+func repetitionBarNeedsThreeRepeats() {
+    // The detector recalls anything seen twice; promoting to a reviewable agent
+    // demands a genuine habit — three or more.
+    #expect(!CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 2)))
+    #expect(CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 3)))
+}
+
+@Test
+func automatableBarRequiresHabitAndBackgroundApp() {
+    // Web + habit → reviewable. Safari is always an https handler on macOS.
+    #expect(CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3)))
+    // A native app the background web agent can't run is never automatable (Option A).
+    #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Numbers"], occurrences: 5)))
+    // Web but not yet a habit → not reviewable.
+    #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 2)))
 }
 
 @Test
