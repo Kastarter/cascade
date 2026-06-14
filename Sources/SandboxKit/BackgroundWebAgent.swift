@@ -257,20 +257,24 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(300))
             shot = await sandbox.snapshotPNG() ?? shot
             // Deliver any message the user typed into the box this turn. It is
-            // AUTHORITATIVE — whatever they just said is what they want now, even if it
-            // throws out the original task. The agent follows it; we also drop the rest
-            // of the planned job so it can't snap back to stale subtasks after a redirect.
+            // AUTHORITATIVE. Crucially it may EXTEND the job ("after that, make a notion
+            // page") — so we QUEUE it as the next subtask (carrying the findings so far),
+            // not just inject a note. The original plan's later parts are dropped (the
+            // steer supersedes them); a queued part means a follow-up actually runs
+            // instead of the agent finishing after the current task.
             var steerNote: String?
             if let steer = pendingSteer {
                 pendingSteer = nil
                 steerNote = """
-                ⚠️ NEW INSTRUCTION FROM THE USER — this is what they want NOW and it \
-                OVERRIDES everything above, even if it completely changes or replaces the \
-                task. Stop your current approach and do exactly this: \(steer)
-                If it replaces the original task, abandon that goal entirely and pursue \
-                only this. If it just refines what you're doing, fold it in immediately.
+                ⚠️ The user just sent you this, and it's the priority now: \(steer)
+                If it's a FOLLOW-UP ("after that", "also", "then"), finish your current \
+                task first — a queued step will carry this out next with your findings. \
+                If it REPLACES your current task, wrap up now so that step takes over. \
+                Either way, do NOT ignore it.
                 """
-                plan = Array(plan.prefix(index + 1))
+                // Keep done + current parts, append the steer as the next part, drop the
+                // rest of the stale original plan.
+                plan = Array(plan.prefix(index + 1)) + [AgentSubtask(task: steer, web: true)]
             }
             step = await agent.proceed(screenshot: shot, note: steerNote)
             count += 1
