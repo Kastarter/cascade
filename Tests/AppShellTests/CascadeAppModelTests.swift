@@ -33,16 +33,21 @@ private func makeModel(curatorReply: String = #"{"agents":[]}"#) throws -> (mode
 }
 
 /// A repeated in-browser workflow the detector catches AND the automatable bar
-/// keeps: a named-element click + a command shortcut in Safari, three times.
-/// Safari is always registered to open https on macOS, so it passes
-/// `runsInBackground` deterministically on any test Mac; three repeats clear the
-/// `minRepeatsToAutomate` bar.
+/// keeps: a real five-action email reply in Safari (compose → select → type →
+/// send), three times, spaced ~3s/action so each run represents ~12s — clearing
+/// both the `minRepeatsToAutomate` and `minSecondsToReview` bars. Safari is always
+/// registered to open https on macOS, so it passes `runsInBackground`
+/// deterministically on any test Mac.
 private func webWorkflowEvents() -> [InputEvent] {
     var events: [InputEvent] = []
     var i = 0
+    func at() -> Date { base.addingTimeInterval(Double(i) * 3) }
     for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "a", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .type, text: "reply", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 30, y: 30, text: "Send", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
     }
     return events
 }
@@ -218,10 +223,10 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
 }
 
-private func waste(apps: [String], occurrences: Int) -> DetectedWaste {
+private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> DetectedWaste {
     DetectedWaste(
         title: "t", apps: apps, occurrences: occurrences,
-        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 20 * occurrences,
+        estimatedSecondsPerRun: perRun, estimatedTotalSeconds: perRun * occurrences,
         recipe: AgentRecipe(steps: []), evidence: [], confidence: 0.7, signature: "sig"
     )
 }
@@ -235,13 +240,23 @@ func repetitionBarNeedsThreeRepeats() {
 }
 
 @Test
-func automatableBarRequiresHabitAndBackgroundApp() {
-    // Web + habit → reviewable. Safari is always an https handler on macOS.
+func realTimeBarKeepsTrivialHabitsOut() {
+    // "Really save time": ~60s clears the floor, 6s doesn't — independent of how
+    // many times it repeated.
+    #expect(CascadeAppModel.representsRealTime(waste(apps: ["Safari"], occurrences: 3)))             // 60s
+    #expect(!CascadeAppModel.representsRealTime(waste(apps: ["Safari"], occurrences: 3, perRun: 2))) // 6s
+}
+
+@Test
+func automatableBarRequiresHabitTimeAndBackgroundApp() {
+    // Web + habit + real time → reviewable. Safari is always an https handler.
     #expect(CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3)))
     // A native app the background web agent can't run is never automatable (Option A).
     #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Numbers"], occurrences: 5)))
     // Web but not yet a habit → not reviewable.
     #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 2)))
+    // Web habit but trivially quick → kept out of the queue ("really save time").
+    #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3, perRun: 2)))
 }
 
 @Test

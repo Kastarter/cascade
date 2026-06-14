@@ -2007,19 +2007,33 @@ public final class CascadeAppModel: ObservableObject {
     /// into a reviewable agent demands a genuine HABIT — three or more.
     nonisolated static let minRepeatsToAutomate = 3
 
-    /// The pure repetition half of the automatable bar — split out so it can be
-    /// pinned without depending on the machine's installed browsers.
+    /// The minimum observed time (seconds, across all repeats) a workflow must
+    /// represent before it's worth a manager's review. The model's WORTH judgment
+    /// (the curator) refines this, but the curator falls back to keeping everything
+    /// without a key — so a deterministic floor keeps trivial sub-minute habits out
+    /// of the queue regardless. "Really save time" starts here.
+    nonisolated static let minSecondsToReview = 30
+
+    /// A real habit — repeated often enough to be worth automating, not a one-off.
+    /// Browser-independent, so it can be pinned without the machine's browser list.
     nonisolated static func meetsRepetitionBar(_ waste: DetectedWaste) -> Bool {
         waste.occurrences >= minRepeatsToAutomate
     }
 
+    /// Represents real time — the cumulative observed seconds clear the floor, so a
+    /// trivial sub-minute habit never reaches the queue even when the curator (which
+    /// refines WORTH) is unavailable and would otherwise keep everything.
+    nonisolated static func representsRealTime(_ waste: DetectedWaste) -> Bool {
+        waste.estimatedTotalSeconds >= minSecondsToReview
+    }
+
     /// The product bar for promoting a detected repetition into an agent the
-    /// manager reviews: it must be a real habit (≥ `minRepeatsToAutomate`) AND
-    /// doable by the background web agent. Option A — only web workflows are
-    /// automatable today, so native-app repetition stays insight-only and never
-    /// reaches the review queue (we'd have nothing that could actually run it).
+    /// manager reviews: a real, time-saving habit the background web agent can run.
+    /// Option A — only web workflows are automatable today, so native-app repetition
+    /// stays insight-only and never reaches the review queue (we'd have nothing that
+    /// could actually run it).
     nonisolated static func isAutomatable(_ waste: DetectedWaste) -> Bool {
-        meetsRepetitionBar(waste) && runsInBackground(apps: waste.apps)
+        meetsRepetitionBar(waste) && representsRealTime(waste) && runsInBackground(apps: waste.apps)
     }
 
     /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a
