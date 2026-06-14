@@ -515,6 +515,8 @@ public final class CascadeAppModel: ObservableObject {
         let id = UUID()
         let runtime = BackgroundWebAgent()
         sandboxRuntimes[id] = runtime
+        // The agent's pointer drives the box's native cursor overlay.
+        runtime.onCursor = { [weak self] point in self?.sandboxBox.moveCursor(id, toPagePoint: point) }
         backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
@@ -522,7 +524,10 @@ public final class CascadeAppModel: ObservableObject {
         sandboxBox.show(id, webView: runtime.sandbox.webView, task: trimmed, onStop: { [weak self] in
             self?.stopSandboxAgent(id)
         }, onSteer: { [weak self] message in
-            self?.sandboxRuntimes[id]?.steer(message)
+            guard let self else { return }
+            self.sandboxRuntimes[id]?.steer(message)
+            // Audit the steer so its timing vs the agent's reaction is on the record.
+            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "employee", action: "sandbox.steer", detail: String(message.prefix(160)))) }
         })
         Task {
             await runtime.run(task: trimmed) { [weak self] update in

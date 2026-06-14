@@ -34,12 +34,6 @@ public final class WebSandbox: NSObject {
         // (the agent reuses it on later tasks instead of hitting the login wall again).
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        // Inject the companion cursor on every page (it gets wiped on each full
-        // navigation, so re-inject at document end) — the user watches it fly to and
-        // tap each spot the agent acts on, just like the on-screen agent's blue cursor.
-        config.userContentController.addUserScript(WKUserScript(
-            source: Self.cursorOverlayJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true
-        ))
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: WebSandbox.width, height: WebSandbox.height), configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         super.init()
@@ -70,9 +64,6 @@ public final class WebSandbox: NSObject {
         }
         // Give JS-rendered pages a beat to paint before the first snapshot.
         try? await Task.sleep(for: .milliseconds(900))
-        // Re-assert the companion cursor: the document-end user script can be missed on
-        // a slow/heavy page, and this is idempotent (rebuilds only if absent).
-        _ = await runJS(Self.cursorOverlayJS)
     }
 
     private func resumeLoad() {
@@ -114,69 +105,45 @@ public final class WebSandbox: NSObject {
         return String(describing: result)
     }
 
-    // MARK: - Companion cursor (visible in the watch box)
+    // MARK: - Action point (drives the native companion cursor in the watch box)
 
-    /// The blue arrow + tap-ripple overlay, re-injected on every page. `move(x,y)`
-    /// flies it (CSS transition) to a viewport point; `tap(x,y)` pings a ripple there.
-    static let cursorOverlayJS = """
-    (function(){
-      // Re-run safe: define the API every time, but only build the element once.
-      // host() is the <html> element — SPAs (Google Flights) replace document.body on
-      // hydration, which wiped a body-mounted cursor; documentElement survives that.
-      function host(){ return document.documentElement; }
-      function ensure(){
-        var c = document.getElementById('__cascadeCursor');
-        if (c) return c;
-        c = document.createElement('div');
-        c.id = '__cascadeCursor';
-        c.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;'
-          + 'transform:translate(36px,36px);transition:transform .34s cubic-bezier(.22,1,.36,1);'
-          + 'will-change:transform;'
-          + 'filter:drop-shadow(0 1px 3px rgba(0,0,0,.5)) drop-shadow(0 0 7px rgba(47,123,246,.9));';
-        c.innerHTML = '<svg width="34" height="34" viewBox="0 0 26 26">'
-          + '<path d="M5 3 L5 20 L9.6 15.7 L12.6 22 L15 21 L12 14.7 L18.6 14.7 Z" '
-          + 'fill="#2f7bf6" stroke="#ffffff" stroke-width="1.6" stroke-linejoin="round"/></svg>';
-        host().appendChild(c);
-        return c;
-      }
-      window.__cascadeCursor = {
-        move: function(x,y){ var c = ensure(); c.style.transform = 'translate('+(x-4)+'px,'+(y-3)+'px)'; },
-        tap: function(x,y){
-          var r = document.createElement('div');
-          r.style.cssText = 'position:fixed;left:'+(x-11)+'px;top:'+(y-11)+'px;width:22px;height:22px;'
-            + 'border-radius:50%;background:rgba(47,123,246,.30);border:2px solid rgba(47,123,246,.95);'
-            + 'z-index:2147483646;pointer-events:none;animation:__cascadeTap .5s ease-out forwards;';
-          host().appendChild(r);
-          setTimeout(function(){ if (r.parentNode) r.parentNode.removeChild(r); }, 520);
-        }
-      };
-      if (!document.getElementById('__cascadeCursorStyle')) {
-        var st = document.createElement('style');
-        st.id = '__cascadeCursorStyle';
-        st.textContent = '@keyframes __cascadeTap{0%{transform:scale(.4);opacity:.95}100%{transform:scale(2.8);opacity:0}}';
-        (document.head || host()).appendChild(st);
-      }
-      ensure();
-    })();
-    """
+    /// The last page point (top-left coords) the agent acted on. The watch box reads
+    /// this after each action and flies its NATIVE cursor overlay there — bulletproof
+    /// vs. an in-page cursor (no page CSP/SPA can wipe it, and it stays out of the
+    /// agent's own screenshots).
+    public private(set) var lastActionPoint: CGPoint?
 
-    /// Flies the companion cursor to a top-left page point (no click). Used for the
-    /// agent's explicit pointer moves so the user can follow where it's headed.
+    /// Returns the pending action point and clears it, so a non-acting tool
+    /// (read_page / list_interactives) never re-fires a stale point.
+    public func consumeActionPoint() -> CGPoint? {
+        defer { lastActionPoint = nil }
+        return lastActionPoint
+    }
+
+    /// Pulls a leading "@@x,y@@" the action JS prepends (the element centre it acted on)
+    /// into `lastActionPoint`, returning the result with that marker stripped.
+    @discardableResult
+    private func captureActionPoint(_ result: String?) -> String? {
+        guard let result, result.hasPrefix("@@"),
+              let close = result.range(of: "@@", range: result.index(result.startIndex, offsetBy: 2)..<result.endIndex)
+        else { return result }
+        let coords = result[result.index(result.startIndex, offsetBy: 2)..<close.lowerBound].split(separator: ",").compactMap { Double($0) }
+        if coords.count == 2 { lastActionPoint = CGPoint(x: coords[0], y: coords[1]) }
+        return String(result[close.upperBound...])
+    }
+
+    /// Records where the agent's pointer is headed (top-left page coords) — there's no
+    /// real pointer in the sandbox, so this only feeds the watch box's cursor overlay.
     public func moveCursor(toTopLeftX x: CGFloat, y: CGFloat) async {
-        _ = await runJS("window.__cascadeCursor && window.__cascadeCursor.move(\(Int(x)), \(Int(y)));")
-        try? await Task.sleep(for: .milliseconds(360))
+        lastActionPoint = CGPoint(x: x, y: y)
     }
 
     /// Clicks at a top-left page coordinate by synthesizing real mouse events on the
-    /// element under that point — after flying the visible cursor there and tapping.
+    /// element under that point.
     public func click(xTopLeft x: CGFloat, yTopLeft y: CGFloat) async {
-        // 1) Fly the cursor to the spot so the watcher sees it move first.
-        _ = await runJS("window.__cascadeCursor && window.__cascadeCursor.move(\(Int(x)), \(Int(y)));")
-        try? await Task.sleep(for: .milliseconds(360))
-        // 2) Ripple + dispatch the real events on whatever is under the point now.
+        lastActionPoint = CGPoint(x: x, y: y)
         let js = """
         (function(x, y){
-          if (window.__cascadeCursor) window.__cascadeCursor.tap(x, y);
           var el = document.elementFromPoint(x, y);
           if (!el) return 'none';
           var opts = {bubbles:true, cancelable:true, clientX:x, clientY:y, view:window};
@@ -188,7 +155,7 @@ public final class WebSandbox: NSObject {
         })(\(Int(x)), \(Int(y)));
         """
         _ = await runJS(js)
-        try? await Task.sleep(for: .milliseconds(180))
+        try? await Task.sleep(for: .milliseconds(150))
     }
 
     /// Types text into the currently focused field.
@@ -198,22 +165,21 @@ public final class WebSandbox: NSObject {
         (function(t){
           var el = document.activeElement;
           if (!el) return 'noactive';
-          if (window.__cascadeCursor && el.getBoundingClientRect) {
-            var br = el.getBoundingClientRect();
-            window.__cascadeCursor.move(br.left + 10, br.top + br.height/2);
-          }
+          var pt = '';
+          if (el.getBoundingClientRect) { var br = el.getBoundingClientRect();
+            pt = '@@' + Math.round(br.left + 12) + ',' + Math.round(br.top + br.height/2) + '@@'; }
           if (el.isContentEditable) { el.textContent = (el.textContent||'') + t;
-            el.dispatchEvent(new InputEvent('input',{bubbles:true})); return 'ce'; }
+            el.dispatchEvent(new InputEvent('input',{bubbles:true})); return pt+'ce'; }
           var proto = el.tagName==='TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
           var desc = Object.getOwnPropertyDescriptor(proto,'value');
           var next = (el.value||'') + t;
           if (desc && desc.set) desc.set.call(el, next); else el.value = next;
           el.dispatchEvent(new Event('input',{bubbles:true}));
           el.dispatchEvent(new Event('change',{bubbles:true}));
-          return 'ok';
+          return pt+'ok';
         })(\(escaped));
         """
-        _ = await runJS(js)
+        captureActionPoint(await runJS(js))
     }
 
     /// Presses a key on the focused element (Enter submits its form).
@@ -290,10 +256,9 @@ public final class WebSandbox: NSObject {
     }
 
     /// Clicks the visible element whose label best matches `text` (shortest match wins).
-    /// Two passes: locate + fly the cursor there, then (after it lands) tap + dispatch —
-    /// so the watcher sees the cursor travel to the control before it activates.
+    /// Reports the element centre (for the watch box's cursor) via the "@@x,y@@" marker.
     public func clickByText(_ text: String) async -> String {
-        let locate = """
+        let js = """
         (function(q){
           q=(q||'').toLowerCase();
           var sel='a[href], button, [role=button], [role=link], input[type=submit], input[type=button]';
@@ -304,29 +269,16 @@ public final class WebSandbox: NSObject {
             if(label.indexOf(q)!==-1 && label.length<bestLen){best=e;bestLen=label.length;}}
           if(!best) return 'NO_MATCH: nothing clickable matching that text.';
           best.scrollIntoView({block:'center'});
-          window.__cascadeTarget=best;
-          var rr=best.getBoundingClientRect();
-          if(window.__cascadeCursor) window.__cascadeCursor.move(rr.left+rr.width/2, rr.top+rr.height/2);
-          return 'OK: '+((best.innerText||best.value||best.getAttribute('aria-label')||best.tagName)+'').trim().slice(0,80);
-        })(\(jsString(text)));
-        """
-        let located = await runJS(locate) ?? "Click failed."
-        guard located.hasPrefix("OK: ") else { return located } // NO_MATCH / failure passes through
-        try? await Task.sleep(for: .milliseconds(380)) // let the cursor land
-        let clickIt = """
-        (function(){
-          var best=window.__cascadeTarget; if(!best) return 'GONE';
           var rr=best.getBoundingClientRect(); var cx=rr.left+rr.width/2, cy=rr.top+rr.height/2;
-          if(window.__cascadeCursor) window.__cascadeCursor.tap(cx,cy);
           var o={bubbles:true,cancelable:true,clientX:cx,clientY:cy,view:window};
           ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){try{best.dispatchEvent(new (t.indexOf('pointer')===0?PointerEvent:MouseEvent)(t,o));}catch(e){}});
           if(best.focus){try{best.focus();}catch(e){}}
-          window.__cascadeTarget=null; return 'CLICKED';
-        })();
+          return '@@'+Math.round(cx)+','+Math.round(cy)+'@@CLICKED: '+((best.innerText||best.value||best.getAttribute('aria-label')||best.tagName)+'').trim().slice(0,80);
+        })(\(jsString(text)));
         """
-        _ = await runJS(clickIt)
-        try? await Task.sleep(for: .milliseconds(220))
-        return "CLICKED: " + located.dropFirst(4) // reuse the matched label
+        let result = captureActionPoint(await runJS(js)) ?? "Click failed."
+        try? await Task.sleep(for: .milliseconds(250))
+        return result
     }
 
     /// Types `value` into the input/textarea whose label/placeholder/name best matches
@@ -343,18 +295,17 @@ public final class WebSandbox: NSObject {
           if(!best && els.length===1) best=els[0];
           if(!best) return 'NO_MATCH: no field matching that label.';
           best.scrollIntoView({block:'center'});
-          var fr=best.getBoundingClientRect();
-          if(window.__cascadeCursor){window.__cascadeCursor.move(fr.left+12, fr.top+fr.height/2); window.__cascadeCursor.tap(fr.left+12, fr.top+fr.height/2);}
+          var fr=best.getBoundingClientRect(); var cx=fr.left+12, cy=fr.top+fr.height/2;
           best.focus();
           var proto=best.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
           var desc=Object.getOwnPropertyDescriptor(proto,'value');
           if(desc&&desc.set) desc.set.call(best,val); else best.value=val;
           best.dispatchEvent(new Event('input',{bubbles:true}));
           best.dispatchEvent(new Event('change',{bubbles:true}));
-          return 'FILLED: '+((best.getAttribute('aria-label')||best.placeholder||best.name||'field')+'').slice(0,60)+' = '+(val+'').slice(0,60);
+          return '@@'+Math.round(cx)+','+Math.round(cy)+'@@FILLED: '+((best.getAttribute('aria-label')||best.placeholder||best.name||'field')+'').slice(0,60)+' = '+(val+'').slice(0,60);
         })(\(jsString(field)),\(jsString(value)));
         """
-        return await runJS(js) ?? "Fill failed."
+        return captureActionPoint(await runJS(js)) ?? "Fill failed."
     }
 
     private func jsString(_ s: String) -> String {

@@ -58,6 +58,10 @@ public final class BackgroundWebAgent {
 
     public let sandbox = WebSandbox()
 
+    /// Fired with the page point (top-left coords) after each action the agent takes, so
+    /// the watch box can fly its native cursor overlay there.
+    public var onCursor: (@MainActor (CGPoint) -> Void)?
+
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
         self.model = model
@@ -195,7 +199,13 @@ public final class BackgroundWebAgent {
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
             skillProvider: { WebSkills.content(named: $0) },
-            harnessProvider: { [sandbox] name, input in await WebHarness.run(name, input, sandbox: sandbox) },
+            harnessProvider: { [weak self, sandbox] name, input in
+                let result = await WebHarness.run(name, input, sandbox: sandbox)
+                // DOM tools (click_text / fill_field) act by element — surface where they
+                // landed so the watch-box cursor follows them too.
+                if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
+                return result
+            },
             extraTools: WebHarness.toolDefinitions()
         )
         var step = await agent.begin(
@@ -223,7 +233,11 @@ public final class BackgroundWebAgent {
             }
             if !step.actions.isEmpty { acted = true }
             for action in step.actions {
+                // A message the user just typed interrupts the batch: stop here, go
+                // re-think with it now instead of grinding through the rest of the plan.
+                if pendingSteer != nil || stopped { break }
                 await apply(action)
+                if let pt = sandbox.consumeActionPoint() { onCursor?(pt) }
             }
             try? await Task.sleep(for: .milliseconds(350))
             shot = await sandbox.snapshotPNG() ?? shot

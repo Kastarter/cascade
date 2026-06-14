@@ -2,6 +2,29 @@ import AppKit
 import SandboxKit
 import WebKit
 
+/// Cascade design tokens for the watch box (dark values — the box is always darkAqua),
+/// mirrored from CascadeDesignSystem so the box reads in the same language as the Reel
+/// page: the live screen is framed like a SceneCard, agent surfaces use the "intentional
+/// blue" (cascadeAgent), and the chrome uses the cascade panel/border ramp.
+private enum Tok {
+    static func hex(_ h: String) -> NSColor {
+        var v: UInt64 = 0
+        Scanner(string: h).scanHexInt64(&v)
+        return NSColor(srgbRed: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+    }
+    static let bg = hex("141713")        // cascadePanel
+    static let bgDeep = hex("0A0D0A")    // cascadeBG
+    static let panel2 = hex("1D211C")    // cascadePanel2
+    static let border = hex("2D322C")    // cascadeBorder
+    static let borderHi = hex("454B44")  // cascadeBorderHi
+    static let agent = hex("5BC8EA")     // cascadeAgent — live-agent blue
+    static let good = hex("8FBF7A")      // cascadeGood
+    static let warn = hex("E9A679")      // cascadeWarn / cascadeAccent
+    static let text = hex("F4F4EF")      // cascadeText
+    static let text2 = hex("B1B0A9")     // cascadeText2
+    static let text3 = hex("75756D")     // cascadeText3
+}
+
 /// Floating chat windows — one per background agent — that let you watch each agent
 /// work inside its sandbox AND talk to it like a chat.
 ///
@@ -90,12 +113,12 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
                 dot.translatesAutoresizingMaskIntoConstraints = false
                 dot.wantsLayer = true
                 dot.layer?.cornerRadius = 3.5
-                dot.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+                dot.layer?.backgroundColor = Tok.agent.cgColor
 
                 let label = NSTextField(wrappingLabelWithString: text)
                 label.translatesAutoresizingMaskIntoConstraints = false
                 label.font = .systemFont(ofSize: 12)
-                label.textColor = NSColor(calibratedWhite: 0.86, alpha: 1)
+                label.textColor = Tok.text2
                 label.isSelectable = true
                 label.preferredMaxLayoutWidth = avail - 56
 
@@ -119,18 +142,18 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
                 card.translatesAutoresizingMaskIntoConstraints = false
                 card.wantsLayer = true
                 card.layer?.cornerRadius = 8
-                card.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor
+                card.layer?.backgroundColor = Tok.agent.withAlphaComponent(0.16).cgColor
 
                 let bar = NSView()
                 bar.translatesAutoresizingMaskIntoConstraints = false
                 bar.wantsLayer = true
                 bar.layer?.cornerRadius = 1.5
-                bar.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+                bar.layer?.backgroundColor = Tok.agent.cgColor
 
                 let label = NSTextField(wrappingLabelWithString: text)
                 label.translatesAutoresizingMaskIntoConstraints = false
                 label.font = .systemFont(ofSize: 12, weight: .medium)
-                label.textColor = .white
+                label.textColor = Tok.text
                 label.isSelectable = true
                 label.preferredMaxLayoutWidth = avail - 70
 
@@ -182,6 +205,10 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         let stopButton: NSButton
         let cover: NSView
         let logo: NSImageView
+        /// Native companion cursor over the live screen (the agent's "cursor").
+        let cursorView: NSImageView
+        /// "● LIVE" badge on the screen pane, echoing the Reel's "Captured · Local".
+        let liveBadge: NSView
         /// Current scaleUnitSquare factor applied to `scaler` (1 = unscaled bounds).
         var scale: CGFloat = 1
         var isExpanded = true
@@ -194,7 +221,7 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         init(panel: NSPanel, scaler: NSView, statusDot: NSView, titleLabel: NSTextField,
              transcript: ChatTranscriptView, inputBar: NSView, steerField: NSTextField,
              sendButton: NSButton, continueButton: NSButton, stopButton: NSButton,
-             cover: NSView, logo: NSImageView) {
+             cover: NSView, logo: NSImageView, cursorView: NSImageView, liveBadge: NSView) {
             self.panel = panel
             self.scaler = scaler
             self.statusDot = statusDot
@@ -207,6 +234,8 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
             self.stopButton = stopButton
             self.cover = cover
             self.logo = logo
+            self.cursorView = cursorView
+            self.liveBadge = liveBadge
         }
     }
 
@@ -243,6 +272,11 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
     private var chatW: CGFloat { boxW - chatX - pad }
     /// Top of the content area (below the header strip).
     private var contentTop: CGFloat { boxH - pad - headerH - 8 }
+    /// The live-screen pane's frame when expanded (left pane, vertically centred).
+    private var expandedScreenFrame: NSRect {
+        let pw = round(viewW * previewScale), ph = round(viewH * previewScale)
+        return NSRect(x: pad, y: pad + ((contentTop - pad) - ph) / 2, width: pw, height: ph)
+    }
 
     func show(_ id: UUID, webView: WKWebView, task: String, onStop: @escaping () -> Void, onSteer: @escaping (String) -> Void) {
         let isNew = boxes[id] == nil
@@ -306,8 +340,47 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
     private enum DotState { case working, needsYou }
 
     private func setDot(_ box: Box, _ state: DotState) {
-        box.statusDot.layer?.backgroundColor = (state == .needsYou
-            ? NSColor.systemOrange : NSColor.systemGreen).cgColor
+        box.statusDot.layer?.backgroundColor = (state == .needsYou ? Tok.warn : Tok.good).cgColor
+    }
+
+    /// Flies the native companion cursor to a page point (top-left coords, 900×560) and
+    /// pings a ripple — the agent's visible "cursor" over the live screen.
+    func moveCursor(_ id: UUID, toPagePoint p: CGPoint) {
+        guard let box = boxes[id], box.isExpanded else { return }
+        let sf = box.scaler.frame
+        let cx = sf.minX + p.x * previewScale
+        let cy = sf.maxY - p.y * previewScale // page y is top-down; content is bottom-up
+        let h = box.cursorView.frame.height
+        box.cursorView.isHidden = false
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.32
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            box.cursorView.animator().setFrameOrigin(NSPoint(x: cx - 2, y: cy - h + 2))
+        }
+        rippleCursor(box, at: NSPoint(x: cx, y: cy))
+    }
+
+    /// A quick expanding ring at the tap point, like the on-screen agent's click ripple.
+    private func rippleCursor(_ box: Box, at point: NSPoint) {
+        guard let host = box.panel.contentView?.layer else { return }
+        let r: CGFloat = 9
+        let ring = CAShapeLayer()
+        ring.frame = CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2)
+        ring.path = CGPath(ellipseIn: CGRect(x: 0, y: 0, width: r * 2, height: r * 2), transform: nil)
+        ring.fillColor = Tok.agent.withAlphaComponent(0.25).cgColor
+        ring.strokeColor = Tok.agent.cgColor
+        ring.lineWidth = 2
+        host.addSublayer(ring)
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.5; scale.toValue = 2.6
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.95; fade.toValue = 0
+        let group = CAAnimationGroup()
+        group.animations = [scale, fade]
+        group.duration = 0.5
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ring.add(group, forKey: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { ring.removeFromSuperlayer() }
     }
 
     private func appendAgent(_ box: Box, _ text: String) {
@@ -425,9 +498,7 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
 
         let pw = round(viewW * s), ph = round(viewH * s)
         if expanded {
-            // Left pane, vertically centred in the content area (chat column is taller).
-            let y = pad + ((contentTop - pad) - ph) / 2
-            box.scaler.frame = NSRect(x: pad, y: y, width: pw, height: ph)
+            box.scaler.frame = expandedScreenFrame // left pane, vertically centred
         } else {
             box.scaler.frame = NSRect(x: (chipSide - pw) / 2, y: (chipSide - ph) / 2, width: pw, height: ph)
         }
@@ -436,6 +507,8 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         box.titleLabel.isHidden = !expanded
         box.stopButton.isHidden = !expanded
         box.transcript.isHidden = !expanded
+        box.liveBadge.isHidden = !expanded
+        box.cursorView.isHidden = true // re-appears on the next agent action
         showInputBar(box)
 
         box.cover.isHidden = expanded
@@ -473,25 +546,25 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: boxW, height: boxH))
         content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 0.98).cgColor
+        content.layer?.backgroundColor = Tok.bg.cgColor
         content.layer?.cornerRadius = 16
         content.layer?.masksToBounds = true
-        content.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.14).cgColor
+        content.layer?.borderColor = Tok.border.cgColor
         content.layer?.borderWidth = 1
         content.autoresizingMask = [.width, .height]
 
-        // --- Header: status dot · task title · Stop --------------------------------
+        // --- Header: status dot · Cascade · task · Stop ----------------------------
         let headerY = boxH - pad - headerH
         let dot = NSView(frame: NSRect(x: pad + 2, y: headerY + (headerH - 9) / 2, width: 9, height: 9))
         dot.wantsLayer = true
         dot.layer?.cornerRadius = 4.5
-        dot.layer?.backgroundColor = NSColor.systemGreen.cgColor
+        dot.layer?.backgroundColor = Tok.good.cgColor
         content.addSubview(dot)
 
         let title = NSTextField(labelWithString: "Starting…")
         title.frame = NSRect(x: pad + 18, y: headerY + 3, width: boxW - (pad + 18) - 64, height: 18)
         title.font = .systemFont(ofSize: 13, weight: .semibold)
-        title.textColor = .labelColor
+        title.textColor = Tok.text
         title.lineBreakMode = .byTruncatingTail
         content.addSubview(title)
 
@@ -502,20 +575,20 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         stop.contentTintColor = .systemRed
         content.addSubview(stop)
 
-        // --- Preview strip (set precisely in layout) -------------------------------
+        // --- Left pane: the live screen, framed like the Reel's SceneCard ----------
         let scaler = NSView(frame: NSRect(x: pad, y: 0, width: viewW, height: viewH))
         scaler.wantsLayer = true
         scaler.layer?.backgroundColor = NSColor.black.cgColor
-        scaler.layer?.cornerRadius = 8
+        scaler.layer?.cornerRadius = 12
         scaler.layer?.masksToBounds = true
-        scaler.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.12).cgColor
+        scaler.layer?.borderColor = Tok.borderHi.cgColor
         scaler.layer?.borderWidth = 1
         content.addSubview(scaler)
 
         // Faint divider between the screen pane and the chat column.
         let divider = NSView(frame: NSRect(x: chatX - gap / 2, y: pad, width: 1, height: contentTop - pad))
         divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.08).cgColor
+        divider.layer?.backgroundColor = Tok.border.cgColor
         content.addSubview(divider)
 
         // --- Right column: chat transcript above the composer ----------------------
@@ -524,15 +597,15 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         let transcript = ChatTranscriptView(frame: NSRect(
             x: chatX, y: transcriptY, width: chatW, height: max(80, contentTop - transcriptY)
         ))
-        transcript.layer?.backgroundColor = NSColor(calibratedWhite: 0, alpha: 0.18).cgColor
+        transcript.layer?.backgroundColor = Tok.bgDeep.withAlphaComponent(0.5).cgColor
         content.addSubview(transcript)
 
         // --- Composer: rounded pill with a send button -----------------------------
         let inputBar = NSView(frame: NSRect(x: chatX, y: pad, width: chatW, height: inputH))
         inputBar.wantsLayer = true
         inputBar.layer?.cornerRadius = inputH / 2
-        inputBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1).cgColor
-        inputBar.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.10).cgColor
+        inputBar.layer?.backgroundColor = Tok.panel2.cgColor
+        inputBar.layer?.borderColor = Tok.border.cgColor
         inputBar.layer?.borderWidth = 1
 
         let steer = NSTextField(frame: NSRect(x: 14, y: (inputH - 20) / 2, width: inputBar.frame.width - 14 - 44, height: 20))
@@ -540,10 +613,10 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         steer.drawsBackground = false
         steer.focusRingType = .none
         steer.font = .systemFont(ofSize: 12)
-        steer.textColor = .white
+        steer.textColor = Tok.text
         steer.placeholderAttributedString = NSAttributedString(
             string: "Message the agent…",
-            attributes: [.foregroundColor: NSColor(calibratedWhite: 0.6, alpha: 1), .font: NSFont.systemFont(ofSize: 12)]
+            attributes: [.foregroundColor: Tok.text3, .font: NSFont.systemFont(ofSize: 12)]
         )
         steer.delegate = self
         inputBar.addSubview(steer)
@@ -552,7 +625,7 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         send.frame = NSRect(x: inputBar.frame.width - 34, y: (inputH - 26) / 2, width: 26, height: 26)
         send.isBordered = false
         send.imageScaling = .scaleProportionallyUpOrDown
-        send.contentTintColor = .controlAccentColor
+        send.contentTintColor = Tok.agent
         send.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
         inputBar.addSubview(send)
         content.addSubview(inputBar)
@@ -565,10 +638,44 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         cont.isHidden = true
         content.addSubview(cont)
 
+        // "● LIVE" badge on the screen pane (top-right), echoing the Reel's capture badge.
+        let sf = expandedScreenFrame
+        let badge = NSView(frame: NSRect(x: sf.maxX - 60, y: sf.maxY - 26, width: 52, height: 18))
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 9
+        badge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.5).cgColor
+        badge.layer?.borderColor = Tok.agent.withAlphaComponent(0.4).cgColor
+        badge.layer?.borderWidth = 1
+        let bdot = NSView(frame: NSRect(x: 9, y: 6, width: 6, height: 6))
+        bdot.wantsLayer = true
+        bdot.layer?.cornerRadius = 3
+        bdot.layer?.backgroundColor = Tok.good.cgColor
+        badge.addSubview(bdot)
+        let blabel = NSTextField(labelWithString: "LIVE")
+        blabel.frame = NSRect(x: 20, y: 2, width: 28, height: 13)
+        blabel.font = .systemFont(ofSize: 9, weight: .bold)
+        blabel.textColor = Tok.agent
+        badge.addSubview(blabel)
+        content.addSubview(badge)
+
+        // Native companion cursor over the live screen — bulletproof vs. an in-page one.
+        let cursorView = NSImageView(image: NSImage(systemSymbolName: "cursorarrow", accessibilityDescription: "Agent cursor") ?? NSImage())
+        cursorView.frame = NSRect(x: sf.minX + 20, y: sf.midY, width: 22, height: 22)
+        cursorView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .bold)
+        cursorView.contentTintColor = Tok.agent
+        cursorView.wantsLayer = true
+        cursorView.layer?.shadowColor = NSColor.black.cgColor
+        cursorView.layer?.shadowRadius = 3
+        cursorView.layer?.shadowOpacity = 0.75
+        cursorView.layer?.shadowOffset = .zero
+        cursorView.layer?.masksToBounds = false
+        cursorView.isHidden = true
+        content.addSubview(cursorView)
+
         // --- Collapsed chip face ---------------------------------------------------
         let cover = NSView(frame: content.bounds)
         cover.wantsLayer = true
-        cover.layer?.backgroundColor = NSColor(calibratedWhite: 0.05, alpha: 0.72).cgColor
+        cover.layer?.backgroundColor = Tok.bgDeep.withAlphaComponent(0.72).cgColor
         content.addSubview(cover)
 
         let logoImage = NSImage(named: "cascadeTemplate")
@@ -583,7 +690,7 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         let box = Box(panel: panel, scaler: scaler, statusDot: dot, titleLabel: title,
                       transcript: transcript, inputBar: inputBar, steerField: steer,
                       sendButton: send, continueButton: cont, stopButton: stop,
-                      cover: cover, logo: logo)
+                      cover: cover, logo: logo, cursorView: cursorView, liveBadge: badge)
         boxes[id] = box
         return box
     }
