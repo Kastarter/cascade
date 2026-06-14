@@ -78,7 +78,7 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         required init?(coder: NSCoder) { fatalError() }
 
         func append(role: Role, text: String) {
-            let avail = max(bounds.width, 360)
+            let avail = bounds.width > 1 ? bounds.width : 280
             let row = NSView()
             row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -221,18 +221,28 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
     private let viewW: CGFloat = WebSandbox.width
     private let viewH: CGFloat = WebSandbox.height
 
-    // Chat-window geometry (a fixed-size expanded box — every inner frame is constant,
-    // so layout() only ever toggles between this and the collapsed chip).
-    private let boxW: CGFloat = 420
-    private let boxH: CGFloat = 600
+    // Side-by-side geometry (a fixed-size expanded box — every inner frame is constant,
+    // so layout() only ever toggles between this and the collapsed chip): the live
+    // sandbox screen on the LEFT, the chat column (transcript + composer) on the RIGHT,
+    // a header spanning the top.
+    private let boxW: CGFloat = 760
+    private let boxH: CGFloat = 430
     private let pad: CGFloat = 12
-    private let headerH: CGFloat = 26
-    private let inputH: CGFloat = 40
+    private let headerH: CGFloat = 28
+    private let inputH: CGFloat = 38
+    private let gap: CGFloat = 12
+    /// Width of the left-hand live-screen pane.
+    private let screenAreaW: CGFloat = 430
     /// Side of the collapsed logo chip.
     private let chipSide: CGFloat = 60
 
-    /// Scale that fits the 900×560 sandbox into the chat preview strip.
-    private var previewScale: CGFloat { (boxW - 2 * pad) / viewW }
+    /// Scale that fits the 900×560 sandbox into the left screen pane.
+    private var previewScale: CGFloat { screenAreaW / viewW }
+    /// Left edge + width of the right-hand chat column.
+    private var chatX: CGFloat { pad + screenAreaW + gap }
+    private var chatW: CGFloat { boxW - chatX - pad }
+    /// Top of the content area (below the header strip).
+    private var contentTop: CGFloat { boxH - pad - headerH - 8 }
 
     func show(_ id: UUID, webView: WKWebView, task: String, onStop: @escaping () -> Void, onSteer: @escaping (String) -> Void) {
         let isNew = boxes[id] == nil
@@ -248,7 +258,13 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
             webView.autoresizingMask = []
             box.scaler.addSubview(webView)
         }
-        box.titleLabel.stringValue = task
+        let identity = NSMutableAttributedString(string: "Cascade", attributes: [
+            .foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+        ])
+        identity.append(NSAttributedString(string: "   \(task)", attributes: [
+            .foregroundColor: NSColor(calibratedWhite: 0.6, alpha: 1), .font: NSFont.systemFont(ofSize: 12),
+        ]))
+        box.titleLabel.attributedStringValue = identity
         setDot(box, .working)
         if isNew { layout(box, expanded: false, animate: false) }
         ensureHoverTimer()
@@ -407,12 +423,12 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         let origin = NSPoint(x: current.maxX - width, y: current.midY - height / 2)
         box.panel.setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true, animate: animate)
 
+        let pw = round(viewW * s), ph = round(viewH * s)
         if expanded {
-            let pw = round(viewW * s), ph = round(viewH * s)
-            // Preview sits below the header strip.
-            box.scaler.frame = NSRect(x: pad, y: boxH - pad - headerH - 8 - ph, width: pw, height: ph)
+            // Left pane, vertically centred in the content area (chat column is taller).
+            let y = pad + ((contentTop - pad) - ph) / 2
+            box.scaler.frame = NSRect(x: pad, y: y, width: pw, height: ph)
         } else {
-            let pw = round(viewW * s), ph = round(viewH * s)
             box.scaler.frame = NSRect(x: (chipSide - pw) / 2, y: (chipSide - ph) / 2, width: pw, height: ph)
         }
 
@@ -496,21 +512,23 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         scaler.layer?.borderWidth = 1
         content.addSubview(scaler)
 
-        // --- Transcript (between preview and input) --------------------------------
-        let previewH = round(viewH * previewScale)
-        let previewBottom = boxH - pad - headerH - 8 - previewH
+        // Faint divider between the screen pane and the chat column.
+        let divider = NSView(frame: NSRect(x: chatX - gap / 2, y: pad, width: 1, height: contentTop - pad))
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.08).cgColor
+        content.addSubview(divider)
+
+        // --- Right column: chat transcript above the composer ----------------------
         let inputTop = pad + inputH
         let transcriptY = inputTop + 10
         let transcript = ChatTranscriptView(frame: NSRect(
-            x: pad, y: transcriptY,
-            width: boxW - 2 * pad,
-            height: max(60, previewBottom - 10 - transcriptY)
+            x: chatX, y: transcriptY, width: chatW, height: max(80, contentTop - transcriptY)
         ))
         transcript.layer?.backgroundColor = NSColor(calibratedWhite: 0, alpha: 0.18).cgColor
         content.addSubview(transcript)
 
-        // --- Input bar: rounded pill with a send button ----------------------------
-        let inputBar = NSView(frame: NSRect(x: pad, y: pad, width: boxW - 2 * pad, height: inputH))
+        // --- Composer: rounded pill with a send button -----------------------------
+        let inputBar = NSView(frame: NSRect(x: chatX, y: pad, width: chatW, height: inputH))
         inputBar.wantsLayer = true
         inputBar.layer?.cornerRadius = inputH / 2
         inputBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1).cgColor
@@ -541,7 +559,7 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
 
         // Sign-in resume button — occupies the input bar's slot when a login is pending.
         let cont = NSButton(title: "I've signed in — continue", target: self, action: #selector(continueTapped(_:)))
-        cont.frame = NSRect(x: pad, y: pad, width: boxW - 2 * pad, height: inputH)
+        cont.frame = NSRect(x: chatX, y: pad, width: chatW, height: inputH)
         cont.bezelStyle = .rounded
         cont.keyEquivalent = "\r" // only active while shown (login); hidden buttons are skipped
         cont.isHidden = true
