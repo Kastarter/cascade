@@ -34,6 +34,12 @@ public final class WebSandbox: NSObject {
         // (the agent reuses it on later tasks instead of hitting the login wall again).
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        // Inject the companion cursor on every page (it gets wiped on each full
+        // navigation, so re-inject at document end) — the user watches it fly to and
+        // tap each spot the agent acts on, just like the on-screen agent's blue cursor.
+        config.userContentController.addUserScript(WKUserScript(
+            source: Self.cursorOverlayJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: WebSandbox.width, height: WebSandbox.height), configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         super.init()
@@ -105,11 +111,67 @@ public final class WebSandbox: NSObject {
         return String(describing: result)
     }
 
+    // MARK: - Companion cursor (visible in the watch box)
+
+    /// The blue arrow + tap-ripple overlay, re-injected on every page. `move(x,y)`
+    /// flies it (CSS transition) to a viewport point; `tap(x,y)` pings a ripple there.
+    static let cursorOverlayJS = """
+    (function(){
+      if (window.__cascadeCursorReady) return;
+      window.__cascadeCursorReady = true;
+      function host(){ return document.body || document.documentElement; }
+      function ensure(){
+        var c = document.getElementById('__cascadeCursor');
+        if (c) return c;
+        c = document.createElement('div');
+        c.id = '__cascadeCursor';
+        c.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;'
+          + 'transition:transform .34s cubic-bezier(.22,1,.36,1);will-change:transform;'
+          + 'filter:drop-shadow(0 2px 4px rgba(0,0,0,.45));';
+        c.innerHTML = '<svg width="26" height="26" viewBox="0 0 26 26">'
+          + '<path d="M5 3 L5 20 L9.6 15.7 L12.6 22 L15 21 L12 14.7 L18.6 14.7 Z" '
+          + 'fill="#2f7bf6" stroke="#ffffff" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+        host().appendChild(c);
+        return c;
+      }
+      window.__cascadeCursor = {
+        move: function(x,y){ var c = ensure(); c.style.transform = 'translate('+x+'px,'+y+'px)'; },
+        tap: function(x,y){
+          var r = document.createElement('div');
+          r.style.cssText = 'position:fixed;left:'+(x-9)+'px;top:'+(y-9)+'px;width:18px;height:18px;'
+            + 'border-radius:50%;background:rgba(47,123,246,.30);border:2px solid rgba(47,123,246,.95);'
+            + 'z-index:2147483646;pointer-events:none;animation:__cascadeTap .45s ease-out forwards;';
+          host().appendChild(r);
+          setTimeout(function(){ if (r.parentNode) r.parentNode.removeChild(r); }, 480);
+        }
+      };
+      if (!document.getElementById('__cascadeCursorStyle')) {
+        var st = document.createElement('style');
+        st.id = '__cascadeCursorStyle';
+        st.textContent = '@keyframes __cascadeTap{0%{transform:scale(.4);opacity:.95}100%{transform:scale(2.6);opacity:0}}';
+        (document.head || host()).appendChild(st);
+      }
+      ensure();
+    })();
+    """
+
+    /// Flies the companion cursor to a top-left page point (no click). Used for the
+    /// agent's explicit pointer moves so the user can follow where it's headed.
+    public func moveCursor(toTopLeftX x: CGFloat, y: CGFloat) async {
+        _ = await runJS("window.__cascadeCursor && window.__cascadeCursor.move(\(Int(x)), \(Int(y)));")
+        try? await Task.sleep(for: .milliseconds(360))
+    }
+
     /// Clicks at a top-left page coordinate by synthesizing real mouse events on the
-    /// element under that point.
+    /// element under that point — after flying the visible cursor there and tapping.
     public func click(xTopLeft x: CGFloat, yTopLeft y: CGFloat) async {
+        // 1) Fly the cursor to the spot so the watcher sees it move first.
+        _ = await runJS("window.__cascadeCursor && window.__cascadeCursor.move(\(Int(x)), \(Int(y)));")
+        try? await Task.sleep(for: .milliseconds(360))
+        // 2) Ripple + dispatch the real events on whatever is under the point now.
         let js = """
         (function(x, y){
+          if (window.__cascadeCursor) window.__cascadeCursor.tap(x, y);
           var el = document.elementFromPoint(x, y);
           if (!el) return 'none';
           var opts = {bubbles:true, cancelable:true, clientX:x, clientY:y, view:window};
@@ -121,7 +183,7 @@ public final class WebSandbox: NSObject {
         })(\(Int(x)), \(Int(y)));
         """
         _ = await runJS(js)
-        try? await Task.sleep(for: .milliseconds(150))
+        try? await Task.sleep(for: .milliseconds(180))
     }
 
     /// Types text into the currently focused field.
@@ -131,6 +193,10 @@ public final class WebSandbox: NSObject {
         (function(t){
           var el = document.activeElement;
           if (!el) return 'noactive';
+          if (window.__cascadeCursor && el.getBoundingClientRect) {
+            var br = el.getBoundingClientRect();
+            window.__cascadeCursor.move(br.left + 10, br.top + br.height/2);
+          }
           if (el.isContentEditable) { el.textContent = (el.textContent||'') + t;
             el.dispatchEvent(new InputEvent('input',{bubbles:true})); return 'ce'; }
           var proto = el.tagName==='TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
@@ -219,8 +285,10 @@ public final class WebSandbox: NSObject {
     }
 
     /// Clicks the visible element whose label best matches `text` (shortest match wins).
+    /// Two passes: locate + fly the cursor there, then (after it lands) tap + dispatch —
+    /// so the watcher sees the cursor travel to the control before it activates.
     public func clickByText(_ text: String) async -> String {
-        let js = """
+        let locate = """
         (function(q){
           q=(q||'').toLowerCase();
           var sel='a[href], button, [role=button], [role=link], input[type=submit], input[type=button]';
@@ -231,16 +299,29 @@ public final class WebSandbox: NSObject {
             if(label.indexOf(q)!==-1 && label.length<bestLen){best=e;bestLen=label.length;}}
           if(!best) return 'NO_MATCH: nothing clickable matching that text.';
           best.scrollIntoView({block:'center'});
+          window.__cascadeTarget=best;
           var rr=best.getBoundingClientRect();
-          var o={bubbles:true,cancelable:true,clientX:rr.left+rr.width/2,clientY:rr.top+rr.height/2,view:window};
-          ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){try{best.dispatchEvent(new (t.indexOf('pointer')===0?PointerEvent:MouseEvent)(t,o));}catch(e){}});
-          if(best.focus){try{best.focus();}catch(e){}}
-          return 'CLICKED: '+((best.innerText||best.value||best.getAttribute('aria-label')||best.tagName)+'').trim().slice(0,80);
+          if(window.__cascadeCursor) window.__cascadeCursor.move(rr.left+rr.width/2, rr.top+rr.height/2);
+          return 'OK: '+((best.innerText||best.value||best.getAttribute('aria-label')||best.tagName)+'').trim().slice(0,80);
         })(\(jsString(text)));
         """
-        let result = await runJS(js) ?? "Click failed."
-        try? await Task.sleep(for: .milliseconds(250))
-        return result
+        let located = await runJS(locate) ?? "Click failed."
+        guard located.hasPrefix("OK: ") else { return located } // NO_MATCH / failure passes through
+        try? await Task.sleep(for: .milliseconds(380)) // let the cursor land
+        let clickIt = """
+        (function(){
+          var best=window.__cascadeTarget; if(!best) return 'GONE';
+          var rr=best.getBoundingClientRect(); var cx=rr.left+rr.width/2, cy=rr.top+rr.height/2;
+          if(window.__cascadeCursor) window.__cascadeCursor.tap(cx,cy);
+          var o={bubbles:true,cancelable:true,clientX:cx,clientY:cy,view:window};
+          ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){try{best.dispatchEvent(new (t.indexOf('pointer')===0?PointerEvent:MouseEvent)(t,o));}catch(e){}});
+          if(best.focus){try{best.focus();}catch(e){}}
+          window.__cascadeTarget=null; return 'CLICKED';
+        })();
+        """
+        _ = await runJS(clickIt)
+        try? await Task.sleep(for: .milliseconds(220))
+        return "CLICKED: " + located.dropFirst(4) // reuse the matched label
     }
 
     /// Types `value` into the input/textarea whose label/placeholder/name best matches
@@ -256,6 +337,9 @@ public final class WebSandbox: NSObject {
           for(var i=0;i<els.length;i++){var e=els[i];var r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)continue; if(labelFor(e).indexOf(q)!==-1){best=e;break;}}
           if(!best && els.length===1) best=els[0];
           if(!best) return 'NO_MATCH: no field matching that label.';
+          best.scrollIntoView({block:'center'});
+          var fr=best.getBoundingClientRect();
+          if(window.__cascadeCursor){window.__cascadeCursor.move(fr.left+12, fr.top+fr.height/2); window.__cascadeCursor.tap(fr.left+12, fr.top+fr.height/2);}
           best.focus();
           var proto=best.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
           var desc=Object.getOwnPropertyDescriptor(proto,'value');
