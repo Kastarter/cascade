@@ -2,7 +2,7 @@ import CascadeMemory
 import Foundation
 import OSLog
 import ProviderKit
-import SuggestionEngine
+import WasteDetection
 
 /// A detected workflow the curator judged worth turning into an agent — named in
 /// the user's words, with a one-line reason and the intent goal a deployed agent
@@ -71,7 +71,77 @@ public struct WorkflowCurator: Sendable {
         return candidates.map(Self.fallback)
     }
 
+    /// Curates ONE recorded recipe — a Teach-once demonstration (or a Reel
+    /// selection) — into a named, grounded `CuratedAgent`. Unlike `curate`, it
+    /// judges a single recipe that may have occurred only once and may run
+    /// on-screen, and it folds in the user's spoken `statedIntent` (what they said
+    /// while demonstrating) as the strongest signal for the name and goal. It
+    /// ALWAYS returns a candidate: a deliberate demonstration is something the user
+    /// wants, so a failed/empty model reply degrades to the detector's own naming
+    /// (`fallback`) — never worse than the automatic path, never nothing.
+    public func curateOne(_ waste: DetectedWaste, statedIntent: String? = nil) async -> CuratedAgent {
+        let intent = statedIntent?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = try? await client.complete(
+            system: Self.curateOneSystemPrompt,
+            user: Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil),
+            model: model,
+            maxTokens: 400
+        )
+        if let raw, let picked = Self.parse(raw, candidates: [waste])?.first {
+            return picked
+        }
+        Self.logger.error("single-recipe curation fell back to detector naming — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
+        return Self.fallback(waste)
+    }
+
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "curator")
+
+    static let curateOneSystemPrompt = """
+    The user just DEMONSTRATED a task by hand for you to turn into an agent — they \
+    did it once, on purpose, and want it automated. Your job is to name it the way \
+    they would and write the goal a deployed agent will carry out. This is NOT noise \
+    filtering: they chose to record this, so you KEEP it and describe it well.
+
+    It may run in the browser (a background web agent) or in a native app (an \
+    on-screen agent reproduces it) — that routing is decided elsewhere, so don't say \
+    where it runs.
+
+    Return one kept entry:
+    - "index": always 0 (there is a single recipe).
+    - "name": what the task IS, in the user's words (e.g. "Compile the weekly \
+    numbers into the Monday report") — never "Repeated steps in <app>".
+    - "why": one short line on why automating it helps (time saved, tedium, error-prone).
+    - "goal": ONE imperative instruction a computer-use agent could carry out to \
+    reproduce the task from intent — NOT a list of clicks. Carry the concrete \
+    app/site and what it accomplishes.
+    - "value": 0.0–1.0, how worth-automating it is.
+
+    If the user told you in their own words what they were doing, THAT description is \
+    the strongest signal — base the name and goal on it. Never invent steps the \
+    recipe does not contain.
+
+    Reply with ONLY this JSON, no prose:
+    {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
+    """
+
+    /// The single recorded recipe as the curator's input, with the user's spoken
+    /// intent appended when they narrated the demo.
+    static func userPromptOne(_ waste: DetectedWaste, statedIntent: String?) -> String {
+        let apps = waste.apps.joined(separator: " → ")
+        let steps = waste.recipe.humanSteps
+            .filter { $0 != "type" && $0 != "scroll" }
+            .prefix(8)
+            .joined(separator: ", ")
+        var lines = ["The recorded demonstration:"]
+        var line = "[0] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps) · ~\(waste.estimatedSecondsPerRun)s"
+        if !steps.isEmpty { line += " · steps: \(steps)" }
+        lines.append(line)
+        if let statedIntent, !statedIntent.isEmpty {
+            lines.append("")
+            lines.append("What the user SAID while demonstrating (their own words — use them): “\(statedIntent)”")
+        }
+        return lines.joined(separator: "\n")
+    }
 
     static let systemPrompt = """
     You curate a list of repeated workflows the system detected by watching the user \
@@ -79,9 +149,10 @@ public struct WorkflowCurator: Sendable {
     agent FOR THIS USER.
 
     Every candidate already cleared two bars before reaching you: it repeats at least \
-    three times, and it runs entirely in the browser (so a background web agent can \
-    carry it out while the user keeps working). Your job is the final judgment of \
-    WORTH.
+    three times, and it represents real time. Some run entirely in the browser (a \
+    background web agent carries those out while the user keeps working); others run in \
+    native apps (an on-screen agent reproduces those). Your job is the final judgment of \
+    WORTH — not where it runs.
 
     For each candidate, judge: would automating this actually save real time and \
     tedium, or is it noise — incidental reading, scrolling, navigation, or one-off \

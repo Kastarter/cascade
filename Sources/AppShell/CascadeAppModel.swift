@@ -8,7 +8,7 @@ import Foundation
 import MacContextKit
 import ProviderKit
 import SandboxKit
-import SuggestionEngine
+import WasteDetection
 
 /// One real Q&A turn over local context — drives the Reel "Ask about this moment" thread.
 /// A moment an answer was grounded in — rendered as a proof chip under the
@@ -62,17 +62,10 @@ public final class CascadeAppModel: ObservableObject {
     /// empty Reel with no idea why nothing records.
     @Published public var showOnboarding: Bool
     @Published public var prefersDark = true
-    /// Declined suggestions, keyed by TITLE: suggestion ids are regenerated on
-    /// every refresh, so an id-keyed set forgot the decline within seconds. The
-    /// title is the stable identity of a heuristic suggestion. Persisted, like
-    /// declined workflow signatures — "no" must survive a relaunch.
-    @Published private var dismissedSuggestionTitles: Set<String> {
-        didSet { Self.persist(dismissedSuggestionTitles, key: Self.dismissedSuggestionsKey, defaults: defaultsStore) }
-    }
+    /// Declined workflow signatures — "no" must survive a relaunch (persisted).
     @Published private var dismissedWasteSignatures: Set<String> {
         didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey, defaults: defaultsStore) }
     }
-    private static let dismissedSuggestionsKey = "cascade.dismissedSuggestions"
     private static let dismissedWasteKey = "cascade.dismissedWaste"
 
     private static func persist(_ values: Set<String>, key: String, defaults: UserDefaults) {
@@ -83,16 +76,15 @@ public final class CascadeAppModel: ObservableObject {
     private static func restoreSet(key: String, defaults: UserDefaults) -> Set<String> {
         Set(defaults.stringArray(forKey: key) ?? [])
     }
-    @Published public private(set) var managerCascades: [ManagerCascade] = []
     @Published public private(set) var contexts: [RecordedContext] = []
     @Published public private(set) var searchResults: [RecordedContext] = []
     @Published public private(set) var searchQuery: String = ""
     @Published public private(set) var audit: [AuditEvent] = []
-    @Published public private(set) var suggestions: [AgentSuggestion] = []
+    /// The raw recall layer: every repeated sequence the detector found, before the
+    /// automatable filter and curation. Kept observable so the pipeline is testable.
     @Published public private(set) var detectedWaste: [DetectedWaste] = []
-    /// The curated, judged, human-named view of `detectedWaste` (R1) — what the
-    /// Cascades review surface shows. `detectedWaste` stays the raw recall layer
-    /// behind the Manager analytics.
+    /// The curated, judged, human-named view of `detectedWaste` — what the manager's
+    /// review queue shows (the only place detected workflows surface to a person).
     @Published public private(set) var curatedWaste: [CuratedAgent] = []
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
@@ -109,6 +101,28 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var agentRunning = false
     @Published public private(set) var agentMessage = "Connect a Claude key and a goal, then watch Cascade use this Mac."
     @Published public private(set) var teachMessage = "Ask “where do I find X” and Cascade points at it on your screen."
+    /// Teach-once: true while the user is demonstrating a task by hand for Cascade to
+    /// turn into an agent. Recording is already always-on — this only BRACKETS a time
+    /// range and reroutes any narration into the intent buffer.
+    @Published public private(set) var teachingMode = false
+    /// The live teaching banner ("Teaching — do the task…", "Saving…", or the
+    /// nothing-repeatable result). Kept separate from `teachMessage` so the assist
+    /// agent's status and the demonstration status never clobber each other.
+    @Published public private(set) var teachStatus: String?
+    /// The curated agent built from the last demonstration, awaiting the user's review
+    /// in the preview sheet (nil = no sheet). They pick "Add to my agents" or "Send to
+    /// manager" from there.
+    @Published public var teachPreview: CuratedAgent?
+    /// Demonstrations the employee chose to route to the MANAGER instead of adding
+    /// directly — they surface in the manager's review queue alongside auto-detected
+    /// workflows. In-memory for v1 (a taught recipe has no repeated waste behind it,
+    /// so unlike auto-detected proposals it does not re-derive on relaunch).
+    @Published public private(set) var taughtForReview: [CuratedAgent] = []
+    /// When the demonstration started; the bracket's lower bound.
+    private var teachStartedAt: Date?
+    /// Everything the user narrated during the demonstration, in order — joined into
+    /// the curator's `statedIntent` (their own words = the best naming signal).
+    private var teachIntentBuffer: [String] = []
 
     /// The companion-cursor colorway (cursor, trail, ripple, and highlight marquee
     /// all follow it). Picked from the notch; persists across launches.
@@ -134,6 +148,9 @@ public final class CascadeAppModel: ObservableObject {
     public let recorder: ContextRecorder
     public let dock: ControlDockModel
     public let hotkey: UseDeviceHotkeyMonitor
+    /// ⌥⌃T starts/stops a Teach-once demonstration — the same monitor type as the
+    /// use-device hotkey, just a different chord.
+    public let teachHotkey: UseDeviceHotkeyMonitor
     private let orchestrator: CascadeOrchestrator
     private let keyStore = AnthropicKeyStore()
     private let openAIKeyStore = OpenAIKeyStore()
@@ -193,12 +210,13 @@ public final class CascadeAppModel: ObservableObject {
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
-        dismissedSuggestionTitles = Self.restoreSet(key: Self.dismissedSuggestionsKey, defaults: defaults)
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
+        teachHotkey = UseDeviceHotkeyMonitor(hotkey: UseDeviceHotkey(
+            keyCode: 17, requiredModifiers: [.control, .option], label: "Control-Option-T"))
         orchestrator = injectedOrchestrator ?? CascadeOrchestrator(store: store)
         driver = LocalMacDriver(store: store)
         recorder.objectWillChange
@@ -222,7 +240,15 @@ public final class CascadeAppModel: ObservableObject {
                 self?.beginUseDeviceIntent(source: "hotkey")
             }
             .store(in: &cancellables)
-        if startsSubsystems { hotkey.start() }
+        teachHotkey.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        teachHotkey.pressed
+            .sink { [weak self] in
+                self?.toggleTeaching()
+            }
+            .store(in: &cancellables)
+        if startsSubsystems { hotkey.start(); teachHotkey.start() }
         // didSet doesn't fire during init — hand the restored theme to the overlay.
         guidanceOverlay.setTheme(cursorTheme)
         voice.objectWillChange
@@ -263,14 +289,11 @@ public final class CascadeAppModel: ObservableObject {
             await refreshComputerUseHealth()
             contexts = try await store.recentContexts(limit: 80)
             audit = try await store.recentAudit(limit: 80)
-            suggestions = try await orchestrator.suggestions()
             agents = try await orchestrator.agents()
             detectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
-            // Only genuinely repeated, background-doable workflows reach the curator
-            // and the manager's review queue. The raw `detectedWaste` stays the recall
-            // layer behind the Manager's "where the time goes" analytics.
+            // Only genuinely repeated, time-saving workflows (the automatable filter)
+            // reach the curator and the manager's review queue.
             curatedWaste = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
-            managerCascades = try await store.managerCascades()
             statusLine = recorder.status.message
         } catch {
             statusLine = error.localizedDescription
@@ -362,6 +385,15 @@ public final class CascadeAppModel: ObservableObject {
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: "citation #\(citation.id)")) }
     }
 
+    /// Jump the Reel to a recorded time — the Teach-once provenance chip's "show me
+    /// the recording this agent was built from".
+    public func jumpToReel(at date: Date) {
+        searchQuery = ""
+        selectedTab = .reel
+        reelJumpTarget = date
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: "teach provenance")) }
+    }
+
     /// Captures the current screen, points the blue companion cursor at the element
     /// the user asked about, and adds a brief reply to the chat. Falls back to a text
     /// answer when there's no key or no screen access.
@@ -442,43 +474,6 @@ public final class CascadeAppModel: ObservableObject {
             _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "device.intent", detail: source))
             await refreshAll()
         }
-    }
-
-    /// Autonomously works toward `goal` through the SAME episode pipeline as the
-    /// voice/hotkey assistant — multi-part planning, batched actions, zoom,
-    /// skills, STOP — instead of the retired one-step-at-a-time planner loop.
-    /// Used by goal runs, deployed suggestions, and manager cascades. Returns
-    /// whether the run was accepted (validations passed and the agent started).
-    @discardableResult
-    public func runAgent(goal: String) -> Bool {
-        let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { agentMessage = "Enter a goal to run."; return false }
-        guard hasAnthropicKey else {
-            agentMessage = "Connect your Claude key in Settings first."
-            showSettings = true
-            return false
-        }
-        guard !agentRunning else { return false }
-        let mouse = NSEvent.mouseLocation
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else { return false }
-        // Bumped only once the run is definitely happening — a rejected start must
-        // not supersede an in-flight voice turn.
-        assistGeneration += 1
-        let gen = assistGeneration
-        agentRunning = true
-        agentMessage = "Cascade is using this Mac…"
-        Task {
-            defer { agentRunning = false }
-            let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
-            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
-                agentMessage = "Grant Screen Recording so Cascade can see the screen."
-                return
-            }
-            guard assistGeneration == gen else { return }
-            await runAssistTask(goal: trimmed, screen: screen, firstScreenshotPNG: shot, gen: gen)
-            agentMessage = teachMessage
-        }
-        return true
     }
 
     /// Captures the current screen (excluding Cascade's own windows), asks Claude's
@@ -677,6 +672,16 @@ public final class CascadeAppModel: ObservableObject {
     public func teach(question: String) {
         var q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { teachMessage = "Ask where something is, or what to do."; return }
+        // Teach-once: while demonstrating, the user narrates what they're doing.
+        // Those words are the agent's INTENT — captured for the curator, never run as
+        // a command. Buffer them and stand down; nothing launches mid-demonstration.
+        if teachingMode {
+            teachIntentBuffer.append(q)
+            teachStatus = "Teaching — heard “\(q.prefix(48))”. Press ⌥⌃T to finish."
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.intent", detail: String(q.prefix(120)))) }
+            voice.done()
+            return
+        }
         // Voice gives us everything the user says — including acknowledgments
         // ("Sure!", "Ok.") and stop requests. Neither is a goal: an ack must not
         // supersede (and kill) a running task, and "stop" means STOP, not a new
@@ -1921,39 +1926,150 @@ public final class CascadeAppModel: ObservableObject {
         return CGPoint(x: appkit.x, y: primaryHeight - appkit.y)
     }
 
-    /// Manager-cascaded helpers the employee hasn't dismissed.
-    public var visibleSuggestions: [AgentSuggestion] {
-        suggestions.filter { !dismissedSuggestionTitles.contains($0.title) }
+    // MARK: - Teach-once (demonstrate a task → agent)
+
+    /// How far before the finishing ⌥⌃T press the bracket ends — enough to exclude
+    /// the recorded hotkey combo without dropping real work (the user is mid-keystroke
+    /// reaching for the chord, not acting in the app).
+    private static let teachFinishGuard: TimeInterval = 0.3
+
+    /// ⌥⌃T toggles a demonstration: first press starts the bracket, second press ends
+    /// it and curates the recording into an agent.
+    public func toggleTeaching() {
+        if teachingMode { endTeaching() } else { beginTeaching() }
     }
 
-    /// "DEPLOY" a reviewed helper: plan its first step for approval.
-    /// Heuristic suggestions are observations, not recorded recipes — running
-    /// one produces a grounded deliverable in the Reel chat (the card title is
-    /// display copy, not an executable goal; handing it to the screen agent
-    /// just made it flail).
-    public func deploySuggestion(_ suggestion: AgentSuggestion) {
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "suggestion.run", detail: suggestion.title)) }
-        switch suggestion.kind {
-        case .dailyRecap:
-            selectedTab = .reel
-            ask("Write my daily recap from the local record: the main tasks I worked on, which apps, and anything that looks unfinished. Keep it under 150 words.")
-        case .repeatedWorkflow:
-            selectedTab = .reel
-            let place = [suggestion.appName, suggestion.windowTitle.map { "“\($0)”" }]
-                .compactMap(\.self).joined(separator: " — ")
-            ask("I keep spending time in \(place.isEmpty ? "the same window" : place). From the recorded history, what exactly did I do there each time, and which part could an agent take over?")
-        case .reviewQueue:
-            runAgent(goal: suggestion.title)
+    /// The banner dismiss (×). The persistent "Teaching…"/"Saving…" states move on by
+    /// themselves; this is for the terminal result lines.
+    public func dismissTeachStatus() { teachStatus = nil }
+
+    private var teachStatusToken = 0
+
+    /// A terminal teach status that fades on its own (added/sent/nothing-found/error),
+    /// unless a newer one supersedes it or a demonstration is in progress.
+    private func flashTeachStatus(_ text: String) {
+        teachStatusToken += 1
+        let token = teachStatusToken
+        teachStatus = text
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard let self, self.teachStatusToken == token, !self.teachingMode else { return }
+            self.teachStatus = nil
         }
+    }
+
+    /// Start a demonstration. Recording is already always-on, so this only stamps the
+    /// lower bound of the time range and reroutes narration into the intent buffer —
+    /// nothing new is captured. Refuses while an agent is acting (those events would
+    /// be the agent's, not the user's hand).
+    public func beginTeaching() {
+        guard !teachingMode else { return }
+        guard !assistTaskRunning, !agentRunning else {
+            flashTeachStatus("Finish the running task before teaching.")
+            return
+        }
+        teachStartedAt = Date()
+        teachIntentBuffer.removeAll()
+        teachingMode = true
+        teachStatus = "Teaching — do the task, narrate if you like, then press ⌥⌃T to finish."
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.started", detail: "")) }
+    }
+
+    /// End the demonstration and turn the bracketed range into a curated agent (shown
+    /// in the preview sheet). The curation rides the SAME spine as auto-detection —
+    /// `curateRange` → `DetectedWaste` → `curateOne` → the existing `createAgent`.
+    public func endTeaching() {
+        guard teachingMode, let start = teachStartedAt else { return }
+        // The finishing ⌥⌃T press is itself recorded (control+option = a structural
+        // key combo), so end the bracket just BEFORE it — otherwise it becomes a
+        // spurious recipe step that on replay would re-trigger teaching. (The start
+        // press is already excluded: it lands before `teachStartedAt` was stamped.)
+        // The guard only drops the fraction of a second around the hotkey, where the
+        // user is reaching for keys, never doing the task.
+        let end = max(start, Date().addingTimeInterval(-Self.teachFinishGuard))
+        teachingMode = false
+        teachStartedAt = nil
+        let intent = teachIntentBuffer.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        teachIntentBuffer.removeAll()
+        teachStatus = "Saving your demonstration…"
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.stopped", detail: intent.isEmpty ? "(silent)" : String(intent.prefix(120)))) }
+        Task { await buildTaughtAgent(from: start, to: end, statedIntent: intent.isEmpty ? nil : intent) }
+    }
+
+    private func buildTaughtAgent(from start: Date, to end: Date, statedIntent: String?) async {
+        // Let the always-on recorder's 1s drain flush the bracketed events AND attach
+        // AX click labels before we read them — the drain defers unlabeled clicks
+        // <0.35s old, and those labels are the strongest replay anchor, so a forced
+        // immediate flush would lose them. ~1.5s is a safe settle.
+        try? await Task.sleep(for: .milliseconds(1500))
+        do {
+            let curated = try await orchestrator.curateRange(
+                from: start, to: end,
+                statedIntent: statedIntent,
+                webAppIdentity: Self.webAppIdentity
+            )
+            if let curated {
+                teachStatus = nil
+                teachPreview = curated
+            } else {
+                flashTeachStatus("Nothing repeatable in that demonstration yet — try the task again.")
+            }
+        } catch {
+            flashTeachStatus("Couldn't build an agent from that: \(error.localizedDescription)")
+        }
+    }
+
+    /// "Add to my agents": the employee self-serves the taught recipe straight into
+    /// their Cascades, ready to deploy — the same `createAgent` the manager path uses.
+    public func createTaughtAgent(_ curated: CuratedAgent) {
+        teachPreview = nil
+        Task {
+            do {
+                _ = try await orchestrator.createAgent(from: curated)
+                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.taught", detail: curated.name))
+                selectedTab = .cascades
+                flashTeachStatus("Added “\(curated.name)” to your agents.")
+            } catch {
+                flashTeachStatus("Couldn't add “\(curated.name)”: \(error.localizedDescription)")
+            }
+            await refreshAll()
+        }
+    }
+
+    /// "Send to manager": the taught recipe joins the manager's review queue
+    /// (`pendingCuratedAgents`) instead of being created directly — the manager
+    /// approves or declines it like any auto-detected workflow.
+    public func sendTaughtAgentToManager(_ curated: CuratedAgent) {
+        teachPreview = nil
+        if !taughtForReview.contains(where: { $0.signature == curated.signature }) {
+            taughtForReview.insert(curated, at: 0)
+        }
+        flashTeachStatus("Sent “\(curated.name)” to your manager for review.")
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.sentToManager", detail: curated.name)) }
+    }
+
+    /// Drop a taught proposal from the review queue once it's been acted on (approved
+    /// → it's a real agent now; declined → it's dismissed).
+    private func clearTaughtForReview(signature: String) {
+        taughtForReview.removeAll { $0.signature == signature }
     }
 
     // MARK: - Agents built from recorded workflows
 
     /// The curated proposals still awaiting review — the review surface's source of
-    /// truth (R1). Same approved/declined filter as the raw list, keyed by signature.
+    /// truth (R1). Auto-detected workflows plus the demonstrations the employee sent
+    /// up for review (taught-once); same approved/declined filter, keyed by signature.
+    /// Taught proposals lead — they're the freshest, most intentional candidates.
     public var pendingCuratedAgents: [CuratedAgent] {
         let approved = Set(agents.map(\.signature))
-        return curatedWaste.filter { !approved.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature) }
+        var seen = Set<String>()
+        return (taughtForReview + curatedWaste).filter { candidate in
+            guard !approved.contains(candidate.signature),
+                  !dismissedWasteSignatures.contains(candidate.signature),
+                  !seen.contains(candidate.signature) else { return false }
+            seen.insert(candidate.signature)
+            return true
+        }
     }
 
     /// A transient confirmation for the Manager's review queue — approve/decline
@@ -1977,8 +2093,9 @@ public final class CascadeAppModel: ObservableObject {
     /// The MANAGER approves a curated proposal from the review queue: it builds the
     /// agent from the recorded recipe but keeps the curator's human name, and the
     /// approved agent lands in the employee's Cascades tab ("Your agents"), ready to
-    /// deploy in the background.
+    /// deploy (in the background sandbox for web work, on-screen for native).
     public func approveCurated(_ curated: CuratedAgent) {
+        clearTaughtForReview(signature: curated.signature)
         Task {
             do {
                 _ = try await orchestrator.createAgent(from: curated)
@@ -1994,9 +2111,10 @@ public final class CascadeAppModel: ObservableObject {
     /// The manager dismisses a curated proposal — hides its underlying workflow for
     /// good, so it never returns to the review queue.
     public func declineCurated(_ curated: CuratedAgent) {
+        clearTaughtForReview(signature: curated.signature)
         dismissedWasteSignatures.insert(curated.signature)
         flashManagerReviewNote("Dismissed “\(curated.name)” — you won't see it again.")
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.declined", detail: curated.name)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: curated.name)) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {
@@ -2049,12 +2167,13 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// The product bar for promoting a detected repetition into an agent the
-    /// manager reviews: a real, time-saving habit the background web agent can run.
-    /// Option A — only web workflows are automatable today, so native-app repetition
-    /// stays insight-only and never reaches the review queue (we'd have nothing that
-    /// could actually run it).
+    /// manager reviews: a real, time-saving habit — repeated enough to be a habit and
+    /// representing real time. App identity does NOT gate this: a browser-only
+    /// workflow deploys to the background sandbox, a native-app one replays on-screen
+    /// (and escalates to the full cursor-class runtime on drift), so every kind of
+    /// repeated work can become an agent. `deployAgent` routes by app at deploy time.
     nonisolated static func isAutomatable(_ waste: DetectedWaste) -> Bool {
-        meetsRepetitionBar(waste) && representsRealTime(waste) && runsInBackground(apps: waste.apps)
+        meetsRepetitionBar(waste) && representsRealTime(waste)
     }
 
     /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a
@@ -2439,11 +2558,6 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
-    public func declineSuggestion(_ suggestion: AgentSuggestion) {
-        dismissedSuggestionTitles.insert(suggestion.title)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: suggestion.title)) }
-    }
-
     // MARK: - Skill auto-learning (the library compounds with usage)
 
     /// A skill draft distilled from a successful assist run, awaiting the
@@ -2606,47 +2720,6 @@ public final class CascadeAppModel: ObservableObject {
 
     public func toggleTheme() {
         prefersDark.toggle()
-    }
-
-    /// Cascades still awaiting the employee's decision.
-    public var visibleManagerCascades: [ManagerCascade] {
-        managerCascades.filter { $0.status == .pending }
-    }
-
-    /// The manager cascades a plain-English automation to this employee. It is
-    /// PERSISTED in the local store, so the inbox survives restarts — manager and
-    /// employee share this one app for now; a separate platform delivers these
-    /// across devices later.
-    public func cascadeFromManager(_ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        Task {
-            _ = try? await store.insertManagerCascade(
-                title: trimmed,
-                summary: "Cascaded by your manager for you to review and deploy."
-            )
-            _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.sent", detail: trimmed))
-            await refreshAll()
-        }
-    }
-
-    /// Employee deploys a cascade: only marked deployed once the agent actually
-    /// accepted the run — a rejected start (no key, agent busy) keeps it pending.
-    public func deployCascade(_ cascade: ManagerCascade) {
-        guard runAgent(goal: cascade.title) else { return }
-        Task {
-            try? await store.setManagerCascadeStatus(id: cascade.id, status: .deployed)
-            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.deployed", detail: cascade.title))
-            await refreshAll()
-        }
-    }
-
-    public func declineCascade(_ cascade: ManagerCascade) {
-        Task {
-            try? await store.setManagerCascadeStatus(id: cascade.id, status: .declined)
-            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "cascade.declined", detail: cascade.title))
-            await refreshAll()
-        }
     }
 
     public func refreshKeyStatus() {

@@ -24,10 +24,10 @@ let package = Package(
         ),
         .target(name: "ProviderKit", dependencies: ["CascadeMemory"]),
         .target(name: "SandboxKit", dependencies: ["ProviderKit", "CascadeMemory"]),
-        .target(name: "SuggestionEngine", dependencies: ["CascadeMemory"]),
+        .target(name: "WasteDetection", dependencies: ["CascadeMemory"]),
         .target(
             name: "AgentOrchestrator",
-            dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "SuggestionEngine"]
+            dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
         .target(
             name: "AppShell",
@@ -39,7 +39,7 @@ let package = Package(
                 "MacContextKit",
                 "ProviderKit",
                 "SandboxKit",
-                "SuggestionEngine"
+                "WasteDetection"
             ]
         ),
         .executableTarget(
@@ -49,12 +49,12 @@ let package = Package(
         ),
         .testTarget(name: "CascadeMemoryTests", dependencies: ["CascadeMemory"]),
         .testTarget(
-            name: "SuggestionEngineTests",
-            dependencies: ["CascadeMemory", "SuggestionEngine"]
+            name: "WasteDetectionTests",
+            dependencies: ["CascadeMemory", "WasteDetection"]
         ),
         .testTarget(
             name: "AgentOrchestratorTests",
-            dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "SuggestionEngine"]
+            dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
         .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit"]),
         .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit"]),
@@ -62,7 +62,7 @@ let package = Package(
         .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit"]),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ProviderKit", "SuggestionEngine", "SandboxKit"]
+            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ProviderKit", "WasteDetection", "SandboxKit"]
         )
     ]
 )

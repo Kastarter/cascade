@@ -1,6 +1,6 @@
 import CascadeMemory
 import Foundation
-import SuggestionEngine
+import WasteDetection
 import Testing
 
 private let base = Date(timeIntervalSince1970: 1_700_000_000)
@@ -252,6 +252,62 @@ func overlappingWorkflowsAreNotDoubleCounted() {
     // The hard invariant: no event id is ever counted into two workflows.
     let allEvidence = results.flatMap(\.evidence)
     #expect(Set(allEvidence).count == allEvidence.count)
+}
+
+// MARK: - waste(fromInstance:) — the reusable single-range entry point (Teach-once)
+
+/// One occurrence of the cross-app copy/paste, offset so two of them form the
+/// repeated workflow `detect` mines.
+private func copyPasteInstance(_ start: Int) -> [InputEvent] {
+    var e: [InputEvent] = []
+    var i = start
+    e.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+    e.append(event(i, .key, app: "Mail", key: "c", modifiers: ["command"])); i += 1
+    e.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+    e.append(event(i, .key, app: "Numbers", key: "v", modifiers: ["command"])); i += 1
+    return e
+}
+
+@Test
+func wasteFromInstanceBuildsTheSameRecipeAsDetect() {
+    // The intentional path (Teach-once) must yield the very recipe the automatic path
+    // would for that instance — one creation spine, not a divergent second one.
+    let detector = WasteDetector()
+    let detected = detector.detect(contexts: [], inputEvents: copyPasteInstance(0) + copyPasteInstance(4)).first!
+    let taught = detector.waste(fromInstance: copyPasteInstance(0), contexts: [])
+
+    let one = try! #require(taught)
+    #expect(one.signature == detected.signature)               // same token shape
+    #expect(one.recipe.steps.count == detected.recipe.steps.count) // activateApp×2 + 4 actions
+    #expect(one.apps == ["Mail", "Numbers"])
+    #expect(one.occurrences == 1)                              // a single demonstration
+    #expect(one.recipe.steps.contains { $0.kind == .key && $0.key == "v" })
+}
+
+@Test
+func wasteFromInstanceRefusesAJunkRange() {
+    // A demonstration of only scrolling, or only typing, has no automatable structure
+    // — the same guard `detect` uses returns nil ("nothing repeatable here yet").
+    let detector = WasteDetector()
+    let scrolls = (0..<8).map { event($0, .scroll, app: "Safari") }
+    #expect(detector.waste(fromInstance: scrolls, contexts: []) == nil)
+    let typing = [InputEvent(id: 1, capturedAt: base, kind: .type, text: "hello", appName: "Notes")]
+    #expect(detector.waste(fromInstance: typing, contexts: []) == nil)
+}
+
+@Test
+func wasteFromInstanceHonorsTheWebSurfaceResolver() {
+    // With a web-identity resolver a browser demonstration is named for the web app,
+    // exactly as the detector names it — while still recording the real browser.
+    let detector = WasteDetector()
+    var events: [InputEvent] = []
+    var i = 0
+    events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Compose", appName: "Google Chrome", windowTitle: "Inbox - Gmail")); i += 1
+    events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Google Chrome", windowTitle: "Inbox - Gmail")); i += 1
+    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.from(windowTitle: $0.windowTitle) }
+    let taught = try! #require(detector.waste(fromInstance: events, contexts: [], surface: resolver))
+    #expect(taught.title.contains("Gmail"))
+    #expect(taught.apps == ["Google Chrome"])
 }
 
 @Test

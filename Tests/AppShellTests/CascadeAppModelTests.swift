@@ -3,7 +3,7 @@ import CascadeMemory
 import Foundation
 import ProviderKit
 import SandboxKit
-import SuggestionEngine
+import WasteDetection
 import Testing
 
 @testable import AppShell
@@ -85,7 +85,7 @@ func refreshAllCuratesDetectedWorkflows() async throws {
     await model.refreshAll()
 
     // The whole review surface wiring: detector caught it → the automatable bar
-    // (≥3×, background-doable) kept it → curator judged + named it → it's what the
+    // (≥3×, real time) kept it → curator judged + named it → it's what the
     // manager's review queue shows.
     #expect(model.detectedWaste.count == 1)
     #expect(model.curatedWaste.count == 1)
@@ -94,26 +94,30 @@ func refreshAllCuratesDetectedWorkflows() async throws {
 }
 
 @MainActor @Test
-func nativeWorkflowNeverReachesTheReviewQueue() async throws {
-    // Option A: a repeated NATIVE-app workflow (Mail→Numbers) the background web
-    // agent can't run is recalled for analytics but never curated into a reviewable
-    // agent — there's nothing that could carry it out today.
+func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
+    // A repeated NATIVE-app workflow (Mail→Numbers) that clears the habit + real-time
+    // bars now becomes a reviewable agent — app identity no longer gates it. Browser
+    // workflows deploy to the background sandbox; native ones replay on-screen (and
+    // escalate to the cursor-class runtime on drift).
     var events: [InputEvent] = []
     var i = 0
+    func at() -> Date { base.addingTimeInterval(Double(i) * 4) } // clear the 30s floor
     for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
     }
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
     try await store.insertInputEvents(events)
 
     await model.refreshAll()
 
-    #expect(model.detectedWaste.count == 1) // recalled for insight…
-    #expect(model.curatedWaste.isEmpty)     // …but filtered out before curation
-    #expect(model.pendingCuratedAgents.isEmpty)
+    #expect(model.detectedWaste.count == 1)
+    #expect(model.curatedWaste.count == 1)        // native now reaches curation…
+    let curated = try #require(model.pendingCuratedAgents.first) // …and the review queue
+    // A native workflow deploys ON-SCREEN, not in the background sandbox.
+    #expect(!CascadeAppModel.runsInBackground(apps: curated.source.apps))
 }
 
 @MainActor @Test
@@ -248,14 +252,17 @@ func realTimeBarKeepsTrivialHabitsOut() {
 }
 
 @Test
-func automatableBarRequiresHabitTimeAndBackgroundApp() {
-    // Web + habit + real time → reviewable. Safari is always an https handler.
+func automatableBarRequiresHabitAndTime() {
+    // A real, time-saving habit is reviewable regardless of which app it runs in:
+    // browser workflows deploy to the background sandbox, native ones replay
+    // on-screen (escalating to the cursor-class runtime on drift). App identity no
+    // longer gates automatability.
     #expect(CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3)))
-    // A native app the background web agent can't run is never automatable (Option A).
-    #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Numbers"], occurrences: 5)))
-    // Web but not yet a habit → not reviewable.
+    // A native-app habit is now automatable too — it runs on-screen.
+    #expect(CascadeAppModel.isAutomatable(waste(apps: ["Numbers"], occurrences: 5)))
+    // Not yet a habit → not reviewable.
     #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 2)))
-    // Web habit but trivially quick → kept out of the queue ("really save time").
+    // A habit but trivially quick → kept out of the queue ("really save time").
     #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3, perRun: 2)))
 }
 
@@ -297,4 +304,92 @@ func completionMessageIsHonestAboutTheOutcome() {
     #expect(CascadeAppModel.sandboxCompletionMessage(for: failedUpdate("Couldn't open the sandbox browser.")) == "Couldn't open the sandbox browser.")
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stoppedUpdate()) == "Stopped.")
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stepLimitUpdate("Ran out of steps — ask again.")) == "Ran out of steps — ask again.")
+}
+
+// MARK: - Teach-once (demonstrate a task → agent, over the shared spine)
+
+/// A single cross-app copy/paste demonstration timestamped INSIDE the bracket
+/// `[now, now+offsets]`, increasing 1ms apart so the recipe order is deterministic.
+private func taughtCopyPasteEvents(at now: Date) -> [InputEvent] {
+    [
+        InputEvent(id: 0, capturedAt: now.addingTimeInterval(0.000), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail"),
+        InputEvent(id: 1, capturedAt: now.addingTimeInterval(0.001), kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        InputEvent(id: 2, capturedAt: now.addingTimeInterval(0.002), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers"),
+        InputEvent(id: 3, capturedAt: now.addingTimeInterval(0.003), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
+    ]
+}
+
+/// A taught proposal built directly, so the create/review paths can be tested without
+/// driving a live demonstration.
+private func taughtCurated(signature: String = "sig-taught", name: String = "My taught task") -> CuratedAgent {
+    let waste = DetectedWaste(
+        title: "Mail → Numbers: copy", apps: ["Mail", "Numbers"], occurrences: 1,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 20,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .activateApp, appName: "Mail"),
+            RecipeStep(order: 1, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        ]),
+        evidence: [1], confidence: 0.7, signature: signature
+    )
+    return CuratedAgent(source: waste, name: name, why: "You showed me once.", goal: "Do the taught task.", value: 0.8)
+}
+
+@MainActor @Test
+func teachOnceBracketsTheDemonstrationIntoAPreview() async throws {
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    model.beginTeaching()
+    #expect(model.teachingMode)
+
+    let now = Date()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: now))
+    // endTeaching insets the bracket end by ~0.3s (to drop the finishing hotkey), so
+    // the demonstration events must sit comfortably before that inset window.
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+    #expect(!model.teachingMode)
+
+    // buildTaughtAgent settles ~1.5s (drain + AX labels) then curates → preview.
+    try await waitUntil({ model.teachPreview != nil }, maxTries: 500)
+    #expect(model.teachPreview?.name == "Reply to refund emails with the policy link")
+    #expect(model.teachPreview?.apps == ["Mail", "Numbers"])
+}
+
+@MainActor @Test
+func teachingGatesNarrationIntoIntentNotAnAssistRun() throws {
+    let (model, _) = try makeModel()
+    model.beginTeaching()
+    // A spoken phrase during a demonstration is INTENT, not a command — it must not
+    // launch an assist run (which, with no key, would force open Settings).
+    model.teach(question: "pulling the weekly numbers into the Monday report")
+    #expect(model.teachingMode)             // still demonstrating
+    #expect(!model.showSettings)            // the no-key assist path never ran
+    #expect(model.teachStatus?.contains("heard") == true)
+}
+
+@MainActor @Test
+func createTaughtAgentLandsInYourAgents() async throws {
+    let (model, _) = try makeModel()
+    model.teachPreview = taughtCurated()
+
+    model.createTaughtAgent(taughtCurated())
+
+    try await waitUntil({ !model.agents.isEmpty }, maxTries: 500)
+    #expect(model.agents.first?.name == "My taught task")
+    #expect(model.selectedTab == .cascades)
+    #expect(model.teachPreview == nil)
+}
+
+@MainActor @Test
+func sendTaughtAgentToManagerSurfacesInTheReviewQueue() throws {
+    let (model, _) = try makeModel()
+    let curated = taughtCurated()
+    model.sendTaughtAgentToManager(curated)
+
+    // It joins the manager's review queue (no auto-create) and clears the sheet.
+    #expect(model.pendingCuratedAgents.contains { $0.signature == "sig-taught" })
+    #expect(model.teachPreview == nil)
+
+    // Declining drops it back out of the queue immediately.
+    model.declineCurated(curated)
+    #expect(!model.pendingCuratedAgents.contains { $0.signature == "sig-taught" })
 }

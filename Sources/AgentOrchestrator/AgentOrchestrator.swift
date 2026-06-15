@@ -2,7 +2,7 @@ import CascadeMemory
 import ComputerUseKit
 import Foundation
 import ProviderKit
-import SuggestionEngine
+import WasteDetection
 
 public struct AgentObservation: Sendable {
     public let contexts: [RecordedContext]
@@ -168,7 +168,6 @@ public actor CascadeOrchestrator {
     private let claudeAnswerer: ContextQuestionAnswering
     private let recordAnswerer: RecordAnswering
     private let planner: SingleStepPlanner
-    private let suggestionEngine: SuggestionEngine
     private let wasteDetector = WasteDetector()
     private let curator: WorkflowCurator
     /// Curation is a model call; cache it against the set of candidate signatures
@@ -183,7 +182,6 @@ public actor CascadeOrchestrator {
         claudeAnswerer: ContextQuestionAnswering = ClaudeGroundedAnswerer(),
         recordAnswerer: RecordAnswering? = nil,
         planner: SingleStepPlanner = ClaudeSingleStepPlanner(),
-        suggestionEngine: SuggestionEngine = SuggestionEngine(),
         curator: WorkflowCurator? = nil,
         keyStore: AnthropicKeyStore = AnthropicKeyStore()
     ) {
@@ -192,7 +190,6 @@ public actor CascadeOrchestrator {
         self.claudeAnswerer = claudeAnswerer
         self.recordAnswerer = recordAnswerer ?? RecordSearchAnswerer(store: store, keyStore: keyStore)
         self.planner = planner
-        self.suggestionEngine = suggestionEngine
         self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore))
         self.keyStore = keyStore
     }
@@ -260,10 +257,6 @@ public actor CascadeOrchestrator {
         return try await planner.proposeNextStep(goal: goal, contexts: contexts)
     }
 
-    public func suggestions() async throws -> [AgentSuggestion] {
-        suggestionEngine.suggest(from: try await store.recentContexts(limit: 120))
-    }
-
     /// What Cascade detected the user repeating, from recorded input anchored to
     /// the Rewind. Each is a candidate to turn into an agent built from real actions.
     public func detectedWaste(
@@ -273,6 +266,28 @@ public actor CascadeOrchestrator {
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)
         return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults, webAppIdentity: webAppIdentity)
+    }
+
+    /// Turns an arbitrary recorded time range into ONE named, grounded
+    /// `CuratedAgent` — the single backend every *intentional* agent-creation front
+    /// door shares (Teach-once today; a Reel selection next). It pulls the bracketed
+    /// input events and the contexts that anchor their clicks, builds one
+    /// `DetectedWaste` (or `nil` when the range holds nothing automatable — only
+    /// scrolling/typing), and curates it with the user's spoken intent. Approving
+    /// the result runs the exact same `createAgent(from:)` the automatic pipeline
+    /// uses: one creation path, many doors.
+    public func curateRange(
+        from start: Date,
+        to end: Date,
+        statedIntent: String? = nil,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+    ) async throws -> CuratedAgent? {
+        let events = try await store.inputEvents(between: start, and: end)
+        let contexts = try await store.contexts(between: start, and: end)
+        guard let waste = wasteDetector.waste(fromInstance: events, contexts: contexts, surface: webAppIdentity) else {
+            return nil
+        }
+        return await curator.curateOne(waste, statedIntent: statedIntent)
     }
 
     /// The detector's candidates, judged and named by the curator into the few
