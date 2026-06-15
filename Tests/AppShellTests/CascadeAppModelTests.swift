@@ -85,7 +85,7 @@ func refreshAllCuratesDetectedWorkflows() async throws {
     await model.refreshAll()
 
     // The whole review surface wiring: detector caught it → the automatable bar
-    // (≥3×, background-doable) kept it → curator judged + named it → it's what the
+    // (≥3×, real time) kept it → curator judged + named it → it's what the
     // manager's review queue shows.
     #expect(model.detectedWaste.count == 1)
     #expect(model.curatedWaste.count == 1)
@@ -94,26 +94,30 @@ func refreshAllCuratesDetectedWorkflows() async throws {
 }
 
 @MainActor @Test
-func nativeWorkflowNeverReachesTheReviewQueue() async throws {
-    // Option A: a repeated NATIVE-app workflow (Mail→Numbers) the background web
-    // agent can't run is recalled for analytics but never curated into a reviewable
-    // agent — there's nothing that could carry it out today.
+func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
+    // A repeated NATIVE-app workflow (Mail→Numbers) that clears the habit + real-time
+    // bars now becomes a reviewable agent — app identity no longer gates it. Browser
+    // workflows deploy to the background sandbox; native ones replay on-screen (and
+    // escalate to the cursor-class runtime on drift).
     var events: [InputEvent] = []
     var i = 0
+    func at() -> Date { base.addingTimeInterval(Double(i) * 4) } // clear the 30s floor
     for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
     }
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
     try await store.insertInputEvents(events)
 
     await model.refreshAll()
 
-    #expect(model.detectedWaste.count == 1) // recalled for insight…
-    #expect(model.curatedWaste.isEmpty)     // …but filtered out before curation
-    #expect(model.pendingCuratedAgents.isEmpty)
+    #expect(model.detectedWaste.count == 1)
+    #expect(model.curatedWaste.count == 1)        // native now reaches curation…
+    let curated = try #require(model.pendingCuratedAgents.first) // …and the review queue
+    // A native workflow deploys ON-SCREEN, not in the background sandbox.
+    #expect(!CascadeAppModel.runsInBackground(apps: curated.source.apps))
 }
 
 @MainActor @Test
@@ -248,14 +252,17 @@ func realTimeBarKeepsTrivialHabitsOut() {
 }
 
 @Test
-func automatableBarRequiresHabitTimeAndBackgroundApp() {
-    // Web + habit + real time → reviewable. Safari is always an https handler.
+func automatableBarRequiresHabitAndTime() {
+    // A real, time-saving habit is reviewable regardless of which app it runs in:
+    // browser workflows deploy to the background sandbox, native ones replay
+    // on-screen (escalating to the cursor-class runtime on drift). App identity no
+    // longer gates automatability.
     #expect(CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3)))
-    // A native app the background web agent can't run is never automatable (Option A).
-    #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Numbers"], occurrences: 5)))
-    // Web but not yet a habit → not reviewable.
+    // A native-app habit is now automatable too — it runs on-screen.
+    #expect(CascadeAppModel.isAutomatable(waste(apps: ["Numbers"], occurrences: 5)))
+    // Not yet a habit → not reviewable.
     #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 2)))
-    // Web habit but trivially quick → kept out of the queue ("really save time").
+    // A habit but trivially quick → kept out of the queue ("really save time").
     #expect(!CascadeAppModel.isAutomatable(waste(apps: ["Safari"], occurrences: 3, perRun: 2)))
 }
 

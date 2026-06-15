@@ -168,7 +168,6 @@ public actor CascadeOrchestrator {
     private let claudeAnswerer: ContextQuestionAnswering
     private let recordAnswerer: RecordAnswering
     private let planner: SingleStepPlanner
-    private let suggestionEngine: SuggestionEngine
     private let wasteDetector = WasteDetector()
     private let curator: WorkflowCurator
     /// Curation is a model call; cache it against the set of candidate signatures
@@ -183,7 +182,6 @@ public actor CascadeOrchestrator {
         claudeAnswerer: ContextQuestionAnswering = ClaudeGroundedAnswerer(),
         recordAnswerer: RecordAnswering? = nil,
         planner: SingleStepPlanner = ClaudeSingleStepPlanner(),
-        suggestionEngine: SuggestionEngine = SuggestionEngine(),
         curator: WorkflowCurator? = nil,
         keyStore: AnthropicKeyStore = AnthropicKeyStore()
     ) {
@@ -192,7 +190,6 @@ public actor CascadeOrchestrator {
         self.claudeAnswerer = claudeAnswerer
         self.recordAnswerer = recordAnswerer ?? RecordSearchAnswerer(store: store, keyStore: keyStore)
         self.planner = planner
-        self.suggestionEngine = suggestionEngine
         self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore))
         self.keyStore = keyStore
     }
@@ -258,10 +255,6 @@ public actor CascadeOrchestrator {
     public func proposeStep(goal: String) async throws -> ProposedStep {
         let contexts = try await store.recentContexts(limit: 24).filter { !PrivacyRules.isSensitive($0) }
         return try await planner.proposeNextStep(goal: goal, contexts: contexts)
-    }
-
-    public func suggestions() async throws -> [AgentSuggestion] {
-        suggestionEngine.suggest(from: try await store.recentContexts(limit: 120))
     }
 
     /// What Cascade detected the user repeating, from recorded input anchored to

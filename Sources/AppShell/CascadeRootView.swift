@@ -1217,14 +1217,12 @@ private struct CascadesScreen: View {
                     VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
                         CascadeTag("Cascades", tone: .cascadeAgent)
                         Text("Everything you can run").font(.cascadeSerif(30))
-                        Text("Cascade catches what you repeat and your manager reviews it. Once approved, it lands here as an agent that runs the task for you in the background.")
+                        Text("Cascade catches what you repeat and your manager reviews it. Once approved, it lands here as an agent that runs the task for you — in the background for web work, on-screen for everything else.")
                             .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                     }
                     pipelineStrip
                     agentsSection.id(Self.agentsAnchor)
                     learnedSkillsSection
-                    managerInboxSection
-                    suggestionsSection
                     activitySection
                 }
                 .padding(.horizontal, CascadeMetrics.s6)
@@ -1325,51 +1323,6 @@ private struct CascadesScreen: View {
         }
     }
 
-    /// The persisted manager → employee inbox: pending cascades to review.
-    private var managerInboxSection: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "INBOX — FROM YOUR MANAGER", trailing: "\(model.visibleManagerCascades.count) pending")
-            if model.visibleManagerCascades.isEmpty {
-                CascadePanel { EmptyState(title: "Nothing here yet", detail: "When your manager cascades an agent from the Manager dashboard, it lands here to review and deploy.") }
-            } else {
-                ForEach(model.visibleManagerCascades) { cascade in
-                    ManagerCascadeCard(
-                        eyebrow: "CASCADED FROM YOUR MANAGER",
-                        title: cascade.title,
-                        summary: cascade.summary,
-                        evidence: nil,
-                        fromManager: true,
-                        onDeploy: { model.deployCascade(cascade) },
-                        onDecline: { model.declineCascade(cascade) }
-                    )
-                }
-            }
-        }
-    }
-
-    /// What Cascade itself noticed in the local record — evidence-backed, one
-    /// click to run through the agent.
-    private var suggestionsSection: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "QUICK ACTIONS — FROM YOUR RECORD", trailing: "\(model.visibleSuggestions.count) available")
-            if model.visibleSuggestions.isEmpty {
-                CascadePanel { EmptyState(title: "Nothing yet", detail: "Once Cascade has recorded some work, one-click deliverables appear here — like a daily recap drafted from your actual day.") }
-            } else {
-                ForEach(model.visibleSuggestions) { suggestion in
-                    ManagerCascadeCard(
-                        eyebrow: "QUICK ACTION · GROUNDED IN THE LOCAL RECORD",
-                        title: suggestion.title,
-                        summary: suggestion.summary,
-                        evidence: suggestion.evidence.first,
-                        fromManager: false,
-                        deployLabel: "RUN  →",
-                        onDeploy: { model.deploySuggestion(suggestion) },
-                        onDecline: { model.declineSuggestion(suggestion) }
-                    )
-                }
-            }
-        }
-    }
 
     private var activitySection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
@@ -1627,20 +1580,13 @@ private struct ManagerScreen: View {
             .sorted { $0.count != $1.count ? $0.count > $1.count : $0.app < $1.app }
     }
 
-    private var managerChips: [String] {
-        var result = Array(Set(model.contexts.map(\.appName))).prefix(2).map { "Auto-summarize \($0) sessions" }
-        if let detected = model.visibleSuggestions.first?.title { result.append(detected) }
-        if result.isEmpty { result = ["Batch newsletters until 4pm", "Mute Slack during deep work"] }
-        return result
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: CascadeMetrics.s6) {
                 VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
                     CascadeTag("Manager", tone: .cascadeAgent)
                     Text("Review what's worth automating").font(.cascadeSerif(30))
-                    Text("Cascade surfaces the genuinely repeated, background-doable workflows here. Approve one and it lands in the employee's Cascades as a ready agent. Aggregate-only signals — never raw OCR, screenshots, or keystrokes.")
+                    Text("Cascade surfaces the genuinely repeated, time-saving workflows here. Approve one and it lands in the employee's Cascades as a ready agent. Aggregate-only signals — never raw OCR, screenshots, or keystrokes.")
                         .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                 }
                 HStack(spacing: CascadeMetrics.s3) {
@@ -1652,28 +1598,6 @@ private struct ManagerScreen: View {
                 }
                 reviewQueueSection
                 whereTimeGoesSection
-                ComposeBox(
-                    eyebrow: "Cascade an agent to this employee",
-                    placeholder: "Describe an automation to cascade. Plain English.",
-                    hint: "lands in the employee's Cascades inbox",
-                    chips: managerChips,
-                    submit: { model.cascadeFromManager($0) }
-                )
-                VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-                    SectionLabel(title: "CASCADES YOU'VE SENT", trailing: "\(model.managerCascades.count) total")
-                    if model.managerCascades.isEmpty {
-                        CascadePanel { EmptyState(title: "No cascades sent", detail: "Compose an automation above to cascade it to this employee's Cascades inbox.") }
-                    } else {
-                        ForEach(model.managerCascades) { cascade in
-                            AgentActivityRow(event: AuditEvent(
-                                createdAt: cascade.createdAt,
-                                actor: "manager",
-                                action: "cascade.\(cascade.status.rawValue)",
-                                detail: cascade.title
-                            ))
-                        }
-                    }
-                }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, CascadeMetrics.s6)
@@ -1702,7 +1626,7 @@ private struct ManagerScreen: View {
                 .transition(.opacity)
             }
             if model.pendingCuratedAgents.isEmpty {
-                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a background-doable task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
+                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
             } else {
                 ForEach(model.pendingCuratedAgents) { curated in
                     WasteCard(
@@ -1852,87 +1776,6 @@ private struct MetricCard: View {
             }
         }
         .frame(maxWidth: .infinity)
-    }
-}
-
-/// Reusable compose box for both the employee (plan a step) and the manager
-/// (cascade an agent). The action and copy are injected — no hardcoded content.
-private struct ComposeBox: View {
-    let eyebrow: String
-    let placeholder: String
-    let hint: String
-    let chips: [String]
-    let submit: (String) -> Void
-    @State private var text = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            HStack {
-                CascadeTag(eyebrow, tone: .cascadeAgent)
-                Spacer()
-                Text(hint).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText4)
-            }
-            HStack(spacing: CascadeMetrics.s3) {
-                Image(systemName: "chevron.right").font(.system(size: 13, weight: .bold)).foregroundStyle(Color.cascadeAgent)
-                TextField(placeholder, text: $text)
-                    .textFieldStyle(.plain)
-                    .font(.cascadeSans(16))
-                    .onSubmit { fire() }
-                Button("CASCADE  →") { fire() }
-                    .buttonStyle(AgentButtonStyle())
-            }
-            .padding(CascadeMetrics.s4)
-            .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-            if !chips.isEmpty {
-                FlowChips(items: chips) { chip in text = chip; fire() }
-            }
-        }
-        .padding(CascadeMetrics.s5)
-        .background(Color.cascadePanel.opacity(0.6), in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous).stroke(Color.cascadeAgent.opacity(0.55), lineWidth: 1.5))
-        .shadow(color: Color.cascadeAgent.opacity(0.18), radius: 18, y: 4)
-    }
-
-    private func fire() {
-        let value = text
-        text = ""
-        submit(value)
-    }
-}
-
-private struct ManagerCascadeCard: View {
-    let eyebrow: String
-    let title: String
-    let summary: String
-    let evidence: String?
-    var fromManager: Bool = false
-    var deployLabel: String = "DEPLOY  →"
-    let onDeploy: () -> Void
-    let onDecline: () -> Void
-
-    var body: some View {
-        HStack(alignment: .top, spacing: CascadeMetrics.s4) {
-            RoundedRectangle(cornerRadius: 3).fill(Color.cascadeAgent).frame(width: 3)
-            Image(systemName: fromManager ? "person.badge.shield.checkmark" : "wand.and.stars")
-                .font(.system(size: 18)).foregroundStyle(Color.cascadeAgent).frame(width: 28)
-            VStack(alignment: .leading, spacing: CascadeMetrics.s1 + 2) {
-                Text(eyebrow)
-                    .font(.cascadeMono(10, .semibold)).foregroundStyle(Color.cascadeAgent)
-                Text(title).font(.cascadeSans(15, .semibold))
-                Text(summary).font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2).lineLimit(2)
-                if let evidence {
-                    Text("↳ \(evidence)").font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
-                }
-            }
-            Spacer()
-            VStack(spacing: CascadeMetrics.s2) {
-                Button(deployLabel) { onDeploy() }.buttonStyle(AgentButtonStyle())
-                Button("DECLINE") { onDecline() }.buttonStyle(CascadeQuietButtonStyle())
-            }
-        }
-        .padding(CascadeMetrics.s4)
-        .background(Color.cascadePanel, in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous).stroke(Color.cascadeAgent.opacity(0.35), lineWidth: 1))
     }
 }
 

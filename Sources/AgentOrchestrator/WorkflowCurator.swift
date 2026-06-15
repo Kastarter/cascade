@@ -79,9 +79,10 @@ public struct WorkflowCurator: Sendable {
     agent FOR THIS USER.
 
     Every candidate already cleared two bars before reaching you: it repeats at least \
-    three times, and it runs entirely in the browser (so a background web agent can \
-    carry it out while the user keeps working). Your job is the final judgment of \
-    WORTH.
+    three times, and it represents real time. Some run entirely in the browser (a \
+    background web agent carries those out while the user keeps working); others run in \
+    native apps (an on-screen agent reproduces those). Your job is the final judgment of \
+    WORTH — not where it runs.
 
     For each candidate, judge: would automating this actually save real time and \
     tedium, or is it noise — incidental reading, scrolling, navigation, or one-off \

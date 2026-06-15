@@ -233,33 +233,6 @@ public enum AgentSource: String, Codable, Sendable {
     case manual
 }
 
-// MARK: - Manager cascades
-
-public enum ManagerCascadeStatus: String, Codable, Sendable {
-    case pending
-    case deployed
-    case declined
-}
-
-/// A plain-English automation the manager cascaded to the employee. Lives in the
-/// local store so the inbox survives restarts — in this build the manager and
-/// employee share one device/app; a separate platform delivers these later.
-public struct ManagerCascade: Identifiable, Codable, Equatable, Sendable {
-    public let id: Int64
-    public let createdAt: Date
-    public let title: String
-    public let summary: String
-    public let status: ManagerCascadeStatus
-
-    public init(id: Int64, createdAt: Date, title: String, summary: String, status: ManagerCascadeStatus) {
-        self.id = id
-        self.createdAt = createdAt
-        self.title = title
-        self.summary = summary
-        self.status = status
-    }
-}
-
 /// A saved Cascade: a named, re-runnable agent built from a recorded workflow.
 public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
     public let id: Int64
@@ -786,46 +759,6 @@ public actor CascadeStore {
         }
     }
 
-    // MARK: - Manager cascades (the in-app manager → employee channel)
-
-    @discardableResult
-    public func insertManagerCascade(title: String, summary: String, at date: Date = Date()) throws -> ManagerCascade {
-        try withStatement("INSERT INTO manager_cascade (created_at, title, summary, status) VALUES (?, ?, ?, 'pending');") { statement in
-            bind(DateCodec.string(from: date), at: 1, in: statement)
-            bind(title, at: 2, in: statement)
-            bind(summary, at: 3, in: statement)
-            try stepDone(statement)
-        }
-        return ManagerCascade(
-            id: sqlite3_last_insert_rowid(connection.db),
-            createdAt: date, title: title, summary: summary, status: .pending
-        )
-    }
-
-    public func managerCascades() throws -> [ManagerCascade] {
-        try withStatement("SELECT id, created_at, title, summary, status FROM manager_cascade ORDER BY created_at DESC, id DESC;") { statement in
-            var rows: [ManagerCascade] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                rows.append(ManagerCascade(
-                    id: sqlite3_column_int64(statement, 0),
-                    createdAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
-                    title: text(statement, 2) ?? "",
-                    summary: text(statement, 3) ?? "",
-                    status: ManagerCascadeStatus(rawValue: text(statement, 4) ?? "") ?? .pending
-                ))
-            }
-            return rows
-        }
-    }
-
-    public func setManagerCascadeStatus(id: Int64, status: ManagerCascadeStatus) throws {
-        try withStatement("UPDATE manager_cascade SET status = ? WHERE id = ?;") { statement in
-            bind(status.rawValue, at: 1, in: statement)
-            sqlite3_bind_int64(statement, 2, id)
-            try stepDone(statement)
-        }
-    }
-
     public func appendAudit(_ event: AuditEvent) throws -> AuditEvent {
         let sql = "INSERT INTO audit_event (created_at, actor, action, detail) VALUES (?, ?, ?, ?);"
         try withStatement(sql) { statement in
@@ -964,14 +897,6 @@ public actor CascadeStore {
             enabled INTEGER NOT NULL DEFAULT 1,
             schedule TEXT,
             goal TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS manager_cascade (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            title TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending'
         );
 
         CREATE TABLE IF NOT EXISTS context_embedding (
