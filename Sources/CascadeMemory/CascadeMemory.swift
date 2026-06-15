@@ -648,6 +648,30 @@ public actor CascadeStore {
         }
     }
 
+    /// Input events inside a time window, oldest-first — the time-range mirror of
+    /// `recentInputEvents`. Powers turning an arbitrary recorded range (a Teach-once
+    /// demonstration, a Reel selection) into a workflow recipe; oldest-first matches
+    /// what `WasteDetector` expects, so the bracketed events feed it directly.
+    public func inputEvents(between start: Date, and end: Date, limit: Int = 2000) throws -> [InputEvent] {
+        let sql = """
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title
+        FROM input_event
+        WHERE captured_at >= ? AND captured_at <= ?
+        ORDER BY captured_at ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(DateCodec.string(from: start), at: 1, in: statement)
+            bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [InputEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeInputEvent(statement))
+            }
+            return rows
+        }
+    }
+
     // MARK: - Agents
 
     /// Inserts a new agent, or updates the existing one with the same `signature`

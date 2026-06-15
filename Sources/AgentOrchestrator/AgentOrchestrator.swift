@@ -268,6 +268,28 @@ public actor CascadeOrchestrator {
         return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults, webAppIdentity: webAppIdentity)
     }
 
+    /// Turns an arbitrary recorded time range into ONE named, grounded
+    /// `CuratedAgent` — the single backend every *intentional* agent-creation front
+    /// door shares (Teach-once today; a Reel selection next). It pulls the bracketed
+    /// input events and the contexts that anchor their clicks, builds one
+    /// `DetectedWaste` (or `nil` when the range holds nothing automatable — only
+    /// scrolling/typing), and curates it with the user's spoken intent. Approving
+    /// the result runs the exact same `createAgent(from:)` the automatic pipeline
+    /// uses: one creation path, many doors.
+    public func curateRange(
+        from start: Date,
+        to end: Date,
+        statedIntent: String? = nil,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+    ) async throws -> CuratedAgent? {
+        let events = try await store.inputEvents(between: start, and: end)
+        let contexts = try await store.contexts(between: start, and: end)
+        guard let waste = wasteDetector.waste(fromInstance: events, contexts: contexts, surface: webAppIdentity) else {
+            return nil
+        }
+        return await curator.curateOne(waste, statedIntent: statedIntent)
+    }
+
     /// The detector's candidates, judged and named by the curator into the few
     /// genuinely worth automating (R1). Cached against the candidate set so refresh
     /// churn doesn't re-spend a model call; with no key, degrades to the raw list.
