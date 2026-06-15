@@ -23,6 +23,19 @@ private enum Tok {
     static let text = hex("F4F4EF")      // cascadeText
     static let text2 = hex("B1B0A9")     // cascadeText2
     static let text3 = hex("75756D")     // cascadeText3
+    static let onAccent = hex("220A00")  // cascadeOnAccent — text on the agent-blue bubble
+    static let recDot = hex("F17260")    // cascadeRecDot — the Reel's capture-badge dot
+    static let recText = hex("FDB7A5")   // cascadeRecText — the Reel's capture-badge text
+
+    /// The Reel headline face — system serif, italic — used for the "Cascade" wordmark
+    /// in the box header so it reads in the same display language as the reel page.
+    static func serif(_ size: CGFloat, weight: NSFont.Weight = .semibold) -> NSFont {
+        let base = NSFont.systemFont(ofSize: size, weight: weight)
+        var desc = base.fontDescriptor
+        if let serif = desc.withDesign(.serif) { desc = serif }
+        desc = desc.withSymbolicTraits(.italic)
+        return NSFont(descriptor: desc, size: size) ?? base
+    }
 }
 
 /// Floating chat windows — one per background agent — that let you watch each agent
@@ -102,78 +115,43 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
 
         func append(role: Role, text: String) {
             let avail = bounds.width > 1 ? bounds.width : 280
+            // The same message-bubble language as the Reel's AskPanel: the user's steers
+            // sit RIGHT in an agent-blue bubble (dark on-accent text, pinched bottom-right
+            // corner); the agent's words sit LEFT in a bordered panel bubble (pinched
+            // bottom-left corner). No avatar/dot gutter — it reads like the reel chat.
+            let mine = (role == .user)
+            let maxBubble = max(140, avail - 30)
+
             let row = NSView()
             row.translatesAutoresizingMaskIntoConstraints = false
 
-            switch role {
-            case .agent:
-                // A Claude-Code-style step line: an accent dot in the gutter, then the
-                // agent's words running full width. No bubble — reads like a transcript.
-                let dot = NSView()
-                dot.translatesAutoresizingMaskIntoConstraints = false
-                dot.wantsLayer = true
-                dot.layer?.cornerRadius = 3.5
-                dot.layer?.backgroundColor = Tok.agent.cgColor
+            let bubble = PinchedBubble(mine: mine)
+            bubble.translatesAutoresizingMaskIntoConstraints = false
 
-                let label = NSTextField(wrappingLabelWithString: text)
-                label.translatesAutoresizingMaskIntoConstraints = false
-                label.font = .systemFont(ofSize: 12)
-                label.textColor = Tok.text2
-                label.isSelectable = true
-                label.preferredMaxLayoutWidth = avail - 56
+            let label = NSTextField(wrappingLabelWithString: text)
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.font = .systemFont(ofSize: 13)
+            label.textColor = mine ? Tok.onAccent : Tok.text
+            label.isSelectable = true
+            label.preferredMaxLayoutWidth = maxBubble - 26
 
-                row.addSubview(dot)
-                row.addSubview(label)
-                NSLayoutConstraint.activate([
-                    dot.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 2),
-                    dot.topAnchor.constraint(equalTo: row.topAnchor, constant: 5),
-                    dot.widthAnchor.constraint(equalToConstant: 7),
-                    dot.heightAnchor.constraint(equalToConstant: 7),
-                    label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 9),
-                    label.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-                    label.topAnchor.constraint(equalTo: row.topAnchor),
-                    label.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-                ])
-
-            case .user:
-                // A distinct card — accent left bar + faint tint — so the user's own
-                // words clearly stand apart from the agent's stream (Cursor-style).
-                let card = NSView()
-                card.translatesAutoresizingMaskIntoConstraints = false
-                card.wantsLayer = true
-                card.layer?.cornerRadius = 8
-                card.layer?.backgroundColor = Tok.agent.withAlphaComponent(0.16).cgColor
-
-                let bar = NSView()
-                bar.translatesAutoresizingMaskIntoConstraints = false
-                bar.wantsLayer = true
-                bar.layer?.cornerRadius = 1.5
-                bar.layer?.backgroundColor = Tok.agent.cgColor
-
-                let label = NSTextField(wrappingLabelWithString: text)
-                label.translatesAutoresizingMaskIntoConstraints = false
-                label.font = .systemFont(ofSize: 12, weight: .medium)
-                label.textColor = Tok.text
-                label.isSelectable = true
-                label.preferredMaxLayoutWidth = avail - 70
-
-                row.addSubview(card)
-                card.addSubview(bar)
-                card.addSubview(label)
-                NSLayoutConstraint.activate([
-                    card.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-                    card.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-                    card.topAnchor.constraint(equalTo: row.topAnchor),
-                    card.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-                    bar.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
-                    bar.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
-                    bar.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
-                    bar.widthAnchor.constraint(equalToConstant: 3),
-                    label.leadingAnchor.constraint(equalTo: bar.trailingAnchor, constant: 10),
-                    label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
-                    label.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
-                    label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
-                ])
+            bubble.addSubview(label)
+            row.addSubview(bubble)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 13),
+                label.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -13),
+                label.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 8),
+                label.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -8),
+                bubble.topAnchor.constraint(equalTo: row.topAnchor),
+                bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                bubble.widthAnchor.constraint(lessThanOrEqualToConstant: maxBubble),
+            ])
+            if mine {
+                bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor).isActive = true
+                bubble.leadingAnchor.constraint(greaterThanOrEqualTo: row.leadingAnchor, constant: 22).isActive = true
+            } else {
+                bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor).isActive = true
+                bubble.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -22).isActive = true
             }
 
             stack.addArrangedSubview(row)
@@ -187,6 +165,58 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
             let y = max(0, doc.frame.height - scroll.contentView.bounds.height)
             scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
             scroll.reflectScrolledClipView(scroll.contentView)
+        }
+
+        /// A chat bubble with the Reel's "Messages" corner language — three big corners
+        /// and the one nearest the sender pinched — drawn with a CAShapeLayer so the
+        /// per-corner radii (which a uniform `cornerRadius` can't express) match exactly.
+        private final class PinchedBubble: NSView {
+            private let shape = CAShapeLayer()
+            private let mine: Bool
+
+            init(mine: Bool) {
+                self.mine = mine
+                super.init(frame: .zero)
+                wantsLayer = true
+                layer?.masksToBounds = false
+                shape.fillColor = mine ? Tok.agent.cgColor : Tok.panel2.cgColor
+                shape.strokeColor = mine ? NSColor.clear.cgColor : Tok.border.cgColor
+                shape.lineWidth = mine ? 0 : 1
+                layer?.insertSublayer(shape, at: 0)
+            }
+            required init?(coder: NSCoder) { fatalError() }
+
+            override func layout() {
+                super.layout()
+                shape.frame = bounds
+                let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+                let big: CGFloat = 14, pinch: CGFloat = 5
+                // Layer space is y-up: the pinched corner is on the BOTTOM, nearest the
+                // sender — bottom-right for the user, bottom-left for the agent.
+                shape.path = Self.roundedPath(
+                    r, topLeft: big, topRight: big,
+                    bottomRight: mine ? pinch : big, bottomLeft: mine ? big : pinch
+                )
+            }
+
+            private static func roundedPath(
+                _ rect: CGRect, topLeft tl: CGFloat, topRight tr: CGFloat,
+                bottomRight br: CGFloat, bottomLeft bl: CGFloat
+            ) -> CGPath {
+                let p = CGMutablePath()
+                let (minX, minY, maxX, maxY) = (rect.minX, rect.minY, rect.maxX, rect.maxY)
+                p.move(to: CGPoint(x: minX + tl, y: maxY))
+                p.addLine(to: CGPoint(x: maxX - tr, y: maxY))
+                p.addArc(tangent1End: CGPoint(x: maxX, y: maxY), tangent2End: CGPoint(x: maxX, y: maxY - tr), radius: tr)
+                p.addLine(to: CGPoint(x: maxX, y: minY + br))
+                p.addArc(tangent1End: CGPoint(x: maxX, y: minY), tangent2End: CGPoint(x: maxX - br, y: minY), radius: br)
+                p.addLine(to: CGPoint(x: minX + bl, y: minY))
+                p.addArc(tangent1End: CGPoint(x: minX, y: minY), tangent2End: CGPoint(x: minX, y: minY + bl), radius: bl)
+                p.addLine(to: CGPoint(x: minX, y: maxY - tl))
+                p.addArc(tangent1End: CGPoint(x: minX, y: maxY), tangent2End: CGPoint(x: minX + tl, y: maxY), radius: tl)
+                p.closeSubpath()
+                return p
+            }
         }
     }
 
@@ -293,10 +323,10 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
             box.scaler.addSubview(webView)
         }
         let identity = NSMutableAttributedString(string: "Cascade", attributes: [
-            .foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: Tok.text, .font: Tok.serif(15),
         ])
         identity.append(NSAttributedString(string: "   \(task)", attributes: [
-            .foregroundColor: NSColor(calibratedWhite: 0.6, alpha: 1), .font: NSFont.systemFont(ofSize: 12),
+            .foregroundColor: Tok.text2, .font: NSFont.systemFont(ofSize: 12),
         ]))
         box.titleLabel.attributedStringValue = identity
         setDot(box, .working)
@@ -579,9 +609,9 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         let scaler = NSView(frame: NSRect(x: pad, y: 0, width: viewW, height: viewH))
         scaler.wantsLayer = true
         scaler.layer?.backgroundColor = NSColor.black.cgColor
-        scaler.layer?.cornerRadius = 12
+        scaler.layer?.cornerRadius = 14
         scaler.layer?.masksToBounds = true
-        scaler.layer?.borderColor = Tok.borderHi.cgColor
+        scaler.layer?.borderColor = Tok.borderHi.withAlphaComponent(0.55).cgColor
         scaler.layer?.borderWidth = 1
         content.addSubview(scaler)
 
@@ -597,7 +627,9 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         let transcript = ChatTranscriptView(frame: NSRect(
             x: chatX, y: transcriptY, width: chatW, height: max(80, contentTop - transcriptY)
         ))
-        transcript.layer?.backgroundColor = Tok.bgDeep.withAlphaComponent(0.5).cgColor
+        // No inner card behind the bubbles — they sit directly on the panel, the way
+        // the Reel's AskPanel chat does.
+        transcript.layer?.backgroundColor = NSColor.clear.cgColor
         content.addSubview(transcript)
 
         // --- Composer: rounded pill with a send button -----------------------------
@@ -621,12 +653,19 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         steer.delegate = self
         inputBar.addSubview(steer)
 
-        let send = NSButton(image: NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: "Send") ?? NSImage(), target: self, action: #selector(sendTapped(_:)))
-        send.frame = NSRect(x: inputBar.frame.width - 34, y: (inputH - 26) / 2, width: 26, height: 26)
+        // Circular agent-blue send button with a bold up-arrow, matching the Reel
+        // composer's send affordance (white-on-accent glyph inside a filled circle).
+        let send = NSButton(image: NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "Send") ?? NSImage(), target: self, action: #selector(sendTapped(_:)))
+        let sendSide: CGFloat = 28
+        send.frame = NSRect(x: inputBar.frame.width - sendSide - 5, y: (inputH - sendSide) / 2, width: sendSide, height: sendSide)
         send.isBordered = false
-        send.imageScaling = .scaleProportionallyUpOrDown
-        send.contentTintColor = Tok.agent
-        send.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
+        send.imageScaling = .scaleProportionallyDown
+        send.contentTintColor = Tok.onAccent
+        send.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .bold)
+        send.wantsLayer = true
+        send.layer?.backgroundColor = Tok.agent.cgColor
+        send.layer?.cornerRadius = sendSide / 2
+        send.layer?.masksToBounds = true
         inputBar.addSubview(send)
         content.addSubview(inputBar)
 
@@ -638,23 +677,28 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         cont.isHidden = true
         content.addSubview(cont)
 
-        // "● LIVE" badge on the screen pane (top-right), echoing the Reel's capture badge.
+        // "● LIVE" badge on the screen pane (top-right), styled exactly like the Reel's
+        // "Captured · Local" capture badge — recording-red dot + red mono uppercase text
+        // on a dark capsule — so the live agent feed reads in the same badge language.
         let sf = expandedScreenFrame
-        let badge = NSView(frame: NSRect(x: sf.maxX - 60, y: sf.maxY - 26, width: 52, height: 18))
+        let badge = NSView(frame: NSRect(x: sf.maxX - 62, y: sf.maxY - 26, width: 54, height: 18))
         badge.wantsLayer = true
         badge.layer?.cornerRadius = 9
-        badge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.5).cgColor
-        badge.layer?.borderColor = Tok.agent.withAlphaComponent(0.4).cgColor
+        badge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
+        badge.layer?.borderColor = Tok.recText.withAlphaComponent(0.35).cgColor
         badge.layer?.borderWidth = 1
         let bdot = NSView(frame: NSRect(x: 9, y: 6, width: 6, height: 6))
         bdot.wantsLayer = true
         bdot.layer?.cornerRadius = 3
-        bdot.layer?.backgroundColor = Tok.good.cgColor
+        bdot.layer?.backgroundColor = Tok.recDot.cgColor
         badge.addSubview(bdot)
         let blabel = NSTextField(labelWithString: "LIVE")
-        blabel.frame = NSRect(x: 20, y: 2, width: 28, height: 13)
-        blabel.font = .systemFont(ofSize: 9, weight: .bold)
-        blabel.textColor = Tok.agent
+        blabel.attributedStringValue = NSAttributedString(string: "LIVE", attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: Tok.recText,
+            .kern: 0.7,
+        ])
+        blabel.frame = NSRect(x: 20, y: 2, width: 30, height: 13)
         badge.addSubview(blabel)
         content.addSubview(badge)
 
