@@ -2,7 +2,7 @@ import CascadeMemory
 import ComputerUseKit
 import Foundation
 import ProviderKit
-import SuggestionEngine
+import WasteDetection
 
 public struct AgentObservation: Sendable {
     public let contexts: [RecordedContext]

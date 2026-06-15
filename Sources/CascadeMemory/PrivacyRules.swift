@@ -4,7 +4,7 @@ import Foundation
 /// entirely — never saved, never OCR'd, never stored — when its app/window/text
 /// looks sensitive (banking, health, legal, dating, private browsing, password
 /// managers, wallets). Lives in `CascadeMemory` so both the recorder
-/// (`MacContextKit`) and downstream consumers (`SuggestionEngine`) can gate on it
+/// (`MacContextKit`) and downstream consumers (`WasteDetection`) can gate on it
 /// without depending on each other.
 public enum PrivacyRules {
     /// Keywords that mark a moment as off-limits. Matched case-insensitively

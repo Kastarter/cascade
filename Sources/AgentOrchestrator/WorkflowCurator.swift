@@ -2,7 +2,7 @@ import CascadeMemory
 import Foundation
 import OSLog
 import ProviderKit
-import SuggestionEngine
+import WasteDetection
 
 /// A detected workflow the curator judged worth turning into an agent — named in
 /// the user's words, with a one-line reason and the intent goal a deployed agent

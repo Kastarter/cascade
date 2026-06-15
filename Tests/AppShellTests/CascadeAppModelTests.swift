@@ -3,7 +3,7 @@ import CascadeMemory
 import Foundation
 import ProviderKit
 import SandboxKit
-import SuggestionEngine
+import WasteDetection
 import Testing
 
 @testable import AppShell

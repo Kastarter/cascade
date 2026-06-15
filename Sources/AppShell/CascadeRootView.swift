@@ -3,7 +3,7 @@ import AppKit
 import CascadeDesignSystem
 import CascadeMemory
 import MacContextKit
-import SuggestionEngine
+import WasteDetection
 import SwiftUI
 
 // MARK: - App visuals (real app icons + stable per-app colors)
@@ -1203,7 +1203,7 @@ private struct CascadesScreen: View {
     @ObservedObject var model: CascadeAppModel
 
     private var agentActivity: [AuditEvent] {
-        model.audit.filter { $0.action.hasPrefix("step.") || $0.action.hasPrefix("agent.") || $0.action == "computer.act" || $0.action == "cascade.declined" }
+        model.audit.filter { $0.action.hasPrefix("step.") || $0.action.hasPrefix("agent.") || $0.action == "computer.act" }
     }
 
     /// Newly approved agent to flash + scroll to, so an approve never feels
@@ -1607,9 +1607,9 @@ private struct ManagerScreen: View {
         }
     }
 
-    /// The manager's review queue: the genuinely repeated, background-doable
-    /// workflows Cascade caught, each judged and named by the curator. Approve to
-    /// land a ready agent in the employee's Cascades; dismiss to never see it again.
+    /// The manager's review queue: the genuinely repeated, time-saving workflows
+    /// Cascade caught, each judged and named by the curator. Approve to land a ready
+    /// agent in the employee's Cascades; dismiss to never see it again.
     private var reviewQueueSection: some View {
         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
             SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(model.pendingCuratedAgents.count) pending")
@@ -2164,7 +2164,7 @@ private struct ClaudeKeyCard: View {
                     Button("Save key") { model.saveAnthropicKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
                     Button("Clear") { model.clearAnthropicKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
-                Text("Stored in macOS Keychain. Used only for Claude-backed Q&A, suggestions, and reviewed agents.")
+                Text("Stored in macOS Keychain. Used only for Claude-backed Q&A and reviewed agents.")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
         }

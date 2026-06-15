@@ -1,6 +1,6 @@
 import CascadeMemory
 import Foundation
-import SuggestionEngine
+import WasteDetection
 import Testing
 
 private let base = Date(timeIntervalSince1970: 1_700_000_000)

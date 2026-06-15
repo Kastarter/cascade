@@ -8,7 +8,7 @@ import Foundation
 import MacContextKit
 import ProviderKit
 import SandboxKit
-import SuggestionEngine
+import WasteDetection
 
 /// One real Q&A turn over local context — drives the Reel "Ask about this moment" thread.
 /// A moment an answer was grounded in — rendered as a proof chip under the
@@ -80,10 +80,11 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var searchResults: [RecordedContext] = []
     @Published public private(set) var searchQuery: String = ""
     @Published public private(set) var audit: [AuditEvent] = []
+    /// The raw recall layer: every repeated sequence the detector found, before the
+    /// automatable filter and curation. Kept observable so the pipeline is testable.
     @Published public private(set) var detectedWaste: [DetectedWaste] = []
-    /// The curated, judged, human-named view of `detectedWaste` (R1) — what the
-    /// Cascades review surface shows. `detectedWaste` stays the raw recall layer
-    /// behind the Manager analytics.
+    /// The curated, judged, human-named view of `detectedWaste` — what the manager's
+    /// review queue shows (the only place detected workflows surface to a person).
     @Published public private(set) var curatedWaste: [CuratedAgent] = []
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
@@ -255,9 +256,8 @@ public final class CascadeAppModel: ObservableObject {
             audit = try await store.recentAudit(limit: 80)
             agents = try await orchestrator.agents()
             detectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
-            // Only genuinely repeated, time-saving workflows reach the curator and the
-            // manager's review queue. The raw `detectedWaste` stays the recall layer
-            // behind the Manager's "where the time goes" analytics.
+            // Only genuinely repeated, time-saving workflows (the automatable filter)
+            // reach the curator and the manager's review queue.
             curatedWaste = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
             statusLine = recorder.status.message
         } catch {
@@ -1902,7 +1902,7 @@ public final class CascadeAppModel: ObservableObject {
     /// The MANAGER approves a curated proposal from the review queue: it builds the
     /// agent from the recorded recipe but keeps the curator's human name, and the
     /// approved agent lands in the employee's Cascades tab ("Your agents"), ready to
-    /// deploy in the background.
+    /// deploy (in the background sandbox for web work, on-screen for native).
     public func approveCurated(_ curated: CuratedAgent) {
         Task {
             do {
@@ -1921,7 +1921,7 @@ public final class CascadeAppModel: ObservableObject {
     public func declineCurated(_ curated: CuratedAgent) {
         dismissedWasteSignatures.insert(curated.signature)
         flashManagerReviewNote("Dismissed “\(curated.name)” — you won't see it again.")
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "cascade.declined", detail: curated.name)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: curated.name)) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {

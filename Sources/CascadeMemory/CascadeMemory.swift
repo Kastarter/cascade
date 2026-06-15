@@ -228,9 +228,10 @@ public struct AgentRecipe: Codable, Equatable, Sendable {
 }
 
 public enum AgentSource: String, Codable, Sendable {
+    /// Every agent now originates from a detected, manager-approved workflow —
+    /// the one creation path. (Decoding tolerates legacy rows via the `.detected`
+    /// fallback at the read site.)
     case detected
-    case manager
-    case manual
 }
 
 /// A saved Cascade: a named, re-runnable agent built from a recorded workflow.
