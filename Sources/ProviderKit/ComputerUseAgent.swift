@@ -39,12 +39,19 @@ public struct CUStep: Sendable {
     /// Screen actions already executed mid-stream through `streamSink` — they are
     /// NOT in `actions`. Lets callers count activity without re-running them.
     public let streamedActions: Int
+    /// True when this `done` step is NOT a genuine model completion but a transport
+    /// or encoding failure surfaced as `done` (the request couldn't be sent, or the
+    /// model couldn't be reached). Callers must never treat this as a finished task —
+    /// an unreachable turn was being counted as a completed run. `done && !failed` is
+    /// a real finish; `done && failed` is "the turn never happened".
+    public let failed: Bool
 
-    init(actions: [CUAction], text: String, done: Bool, streamedActions: Int = 0) {
+    init(actions: [CUAction], text: String, done: Bool, streamedActions: Int = 0, failed: Bool = false) {
         self.actions = actions
         self.text = text
         self.done = done
         self.streamedActions = streamedActions
+        self.failed = failed
     }
 }
 
@@ -443,12 +450,12 @@ public final class ComputerUseAgent {
         // .sortedKeys keeps the rendered body byte-stable across turns — prompt
         // caching is a prefix match, and unordered keys would silently invalidate it.
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
-            return CUStep(actions: [], text: "", done: true)
+            return CUStep(actions: [], text: "", done: true, failed: true)
         }
         request.httpBody = bodyData
 
         guard let streamed = await streamMessage(request) else {
-            return CUStep(actions: [], text: "I couldn't reach Claude just now.", done: true)
+            return CUStep(actions: [], text: "I couldn't reach Claude just now.", done: true, failed: true)
         }
         if streamed.aborted {
             // The sink stopped the turn mid-stream (STOP, supersession, or a

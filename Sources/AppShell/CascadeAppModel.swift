@@ -144,7 +144,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var backgroundAgents: [BackgroundAgentRun] = []
     private var sandboxRuntimes: [UUID: BackgroundWebAgent] = [:]
     /// How many background web agents may run at once (each = a WKWebView + a CU loop).
-    static let maxConcurrentSandboxAgents = 3
+    static let maxConcurrentSandboxAgents = 8
     private let sandboxBox = SandboxBoxController()
     private let elementLocator = ElementLocator()
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
@@ -496,10 +496,15 @@ public final class CascadeAppModel: ObservableObject {
     public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) -> Bool {
         let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
         // Too vague to act on — ask rather than letting the agent wander (e.g. off
-        // googling "how to create an agent").
-        if trimmed.count < 5 || trimmed.split(separator: " ").count < 2 {
+        // googling "how to create an agent"). Also catch a topic-LESS request — a bare
+        // verb ending in a dangling preposition ("research about", "look up", "find")
+        // where the voice trailed off — which otherwise runs and "completes" instantly.
+        let words = trimmed.lowercased().split(separator: " ")
+        let danglingTail: Set<String> = ["about", "for", "on", "regarding", "of", "at", "into", "to", "the", "a", "an", "up", "out"]
+        let topicless = words.count < 2 || (words.last.map { danglingTail.contains(String($0)) } ?? true)
+        if trimmed.count < 5 || topicless {
             teachMessage = "What should the background agent actually do? e.g. \"in the background, find the cheapest flight to Tokyo next month.\""
-            voice.speak("What should the background agent do?")
+            voice.speak("What should the background agent research or do?")
             return false
         }
         guard hasAnthropicKey else {
@@ -520,6 +525,15 @@ public final class CascadeAppModel: ObservableObject {
         sandboxRuntimes[id] = runtime
         // The agent's pointer drives the box's native cursor overlay.
         runtime.onCursor = { [weak self] point in self?.sandboxBox.moveCursor(id, toPagePoint: point) }
+        // Tag every audited row with this run's id so concurrent background agents (up to
+        // the cap) can be told apart in the one shared audit log — without it parallel
+        // runs' rows interleave with no way to attribute them.
+        runtime.auditTag = String(id.uuidString.prefix(8))
+        // Record every web action/turn so the background run is auditable, not a black box.
+        runtime.onAudit = { [weak self] action, detail in
+            guard let self else { return }
+            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: action, detail: String(detail.prefix(240)))) }
+        }
         backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
@@ -636,6 +650,13 @@ public final class CascadeAppModel: ObservableObject {
         // agent (that/to/which/for/and)" preamble, keeping everything after it.
         let preamble = #"^(?:hey\s+)?(?:cascade[,\s]+)?(?:can you\s+|could you\s+|please\s+|i(?:'?d like| want)(?:\syou)?\sto\s+|go ahead and\s+)?(?:create|make|build|spin\s*up|run|start|set\s*up)\s+(?:me\s+)?(?:a|an)?\s*(?:new\s+)?(?:background\s+)?(?:computer[-\s]?use\s+)?agent\b\s*(?:that\s+(?:can\s+|will\s+)?|to\s+|which\s+(?:can\s+|will\s+)?|for\s+|and\s+|:\s*)?"#
         if let range = t.range(of: preamble, options: [.regularExpression, .caseInsensitive]) {
+            t = String(t[range.upperBound...])
+        }
+        // Also strip the verb-less request form — "let / have / tell / get the agent
+        // (to / that / which) …" — which the create-preamble above doesn't cover, so the
+        // goal doesn't carry "let the agent …" cruft.
+        let agentLet = #"^(?:hey\s+)?(?:cascade[,\s]+)?(?:can you\s+|could you\s+|please\s+|go ahead and\s+)?(?:let|have|tell|get|ask)\s+(?:the\s+|your\s+|our\s+)?agent\b\s*(?:to\s+|that\s+(?:can\s+|will\s+|should\s+)?|which\s+(?:can\s+|will\s+|should\s+)?|should\s+|and\s+)?"#
+        if let range = t.range(of: agentLet, options: [.regularExpression, .caseInsensitive]) {
             t = String(t[range.upperBound...])
         }
         // Remove sandbox/background qualifiers wherever they appear.

@@ -72,6 +72,23 @@ public final class BackgroundWebAgent {
     /// `sandbox.task` row was recorded), which made misbehavior impossible to diagnose.
     public var onAudit: (@MainActor (_ action: String, _ detail: String) -> Void)?
 
+    /// A short, stable tag identifying THIS run, prefixed onto every audited detail so
+    /// concurrent background agents (up to the cap) can be told apart in the one shared
+    /// audit log. Without it, parallel runs' rows interleave unattributably — exactly
+    /// what made the multi-run audit window impossible to read back. Set by the owner.
+    public var auditTag: String = ""
+
+    /// Emits an audit row through `onAudit`, prefixing the run tag so the row stays
+    /// attributable to this run even when several agents log into the same stream.
+    private func audit(_ action: String, _ detail: String) {
+        onAudit?(action, Self.taggedDetail(tag: auditTag, detail))
+    }
+
+    /// Prefixes `detail` with the run tag (pure, so the format is unit-tested).
+    nonisolated static func taggedDetail(tag: String, _ detail: String) -> String {
+        tag.isEmpty ? detail : "[\(tag)] \(detail)"
+    }
+
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
         self.model = model
@@ -177,10 +194,10 @@ public final class BackgroundWebAgent {
         // mismatch downgrades to a failure; doubt leans verified so real wins still pass.
         if case .finished(let finding) = attempt.outcome, !stopped {
             if let reason = await verifyCompletion(task: sub.task, claimed: finding) {
-                onAudit?("sandbox.verify", "INCOMPLETE: \(reason.prefix(80))")
+                audit("sandbox.verify", "INCOMPLETE: \(reason.prefix(80))")
                 return .failed("Couldn't finish — \(reason)")
             }
-            onAudit?("sandbox.verify", "verified: \(finding.prefix(70))")
+            audit("sandbox.verify", "verified: \(finding.prefix(70))")
         }
         return attempt.outcome
     }
@@ -263,7 +280,7 @@ public final class BackgroundWebAgent {
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
                 if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
-                self?.onAudit?("sandbox.tool", "\(name) \(Self.argSummary(input)) → \(result.prefix(70))")
+                self?.audit("sandbox.tool", "\(name) \(Self.argSummary(input)) → \(result.prefix(70))")
                 return result
             },
             extraTools: WebHarness.toolDefinitions()
@@ -301,21 +318,30 @@ public final class BackgroundWebAgent {
         var count = 0
         while count < maxSteps, !stopped {
             if step.done {
-                let raw = step.text.isEmpty ? "Done." : step.text
-                if let site = Self.loginSite(in: raw) {
-                    onAudit?("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                switch Self.classifyDone(rawText: step.text, failed: step.failed) {
+                case .transportFailure:
+                    // The turn never reached the model (network / encoding) — this "done"
+                    // is an artifact of the failure, NOT a finished task. Counting it as a
+                    // completion (while the page-verifier fails open on the SAME outage) was
+                    // the false-completion the audit log caught: a mid-task run reported
+                    // "done — I couldn't reach Claude" and was marked completed. Report it
+                    // honestly and count nothing.
+                    audit("sandbox.done", "unreachable — couldn't reach Claude (acted=\(acted))")
+                    return (.failed("I couldn't reach Claude just now — ask again and I'll continue."), acted)
+                case .needsLogin(let site):
+                    audit("sandbox.done", "needs-login: \(site) · acted=\(acted)")
                     return (.needsLogin(site), acted)
-                }
-                // The agent said done but flagged it couldn't actually finish — report it
-                // honestly and do NOT let it count as a completion.
-                if let reason = Self.incompleteReason(in: raw) {
-                    onAudit?("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                case .incomplete(let reason):
+                    // The agent said done but flagged it couldn't actually finish — report
+                    // it honestly and do NOT let it count as a completion.
+                    audit("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
                     return (.failed("Couldn't finish — \(reason)"), acted)
+                case .finished(let raw):
+                    audit("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
+                    return (.finished(raw), acted)
                 }
-                onAudit?("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
-                return (.finished(raw), acted)
             }
-            if !step.text.isEmpty { onAudit?("sandbox.turn", String(step.text.prefix(90))) }
+            if !step.text.isEmpty { audit("sandbox.turn", String(step.text.prefix(90))) }
             // Streamed actions already ran via the sink; this handles any non-streamed
             // leftovers (zoom/screenshot are no-ops here, harness/skill resolve inline).
             for action in step.actions {
@@ -405,7 +431,7 @@ public final class BackgroundWebAgent {
         func topLeftY(_ y: Double) -> CGFloat { WebSandbox.height - CGFloat(y) }
         switch action {
         case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y), .tripleClick(let x, let y):
-            onAudit?("sandbox.act", "click (\(Int(x)),\(Int(topLeftY(y))))")
+            audit("sandbox.act", "click (\(Int(x)),\(Int(topLeftY(y))))")
             await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: topLeftY(y))
         case .drag(_, _, let toX, let toY):
             // No real drag in the JS bridge — landing on the destination is the
@@ -414,10 +440,10 @@ public final class BackgroundWebAgent {
         case .move(let x, let y):
             await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: topLeftY(y))
         case .type(let text):
-            onAudit?("sandbox.act", "type \"\(text.prefix(40))\"")
+            audit("sandbox.act", "type \"\(text.prefix(40))\"")
             await sandbox.typeText(text)
         case .key(let combo):
-            onAudit?("sandbox.act", "key \(combo)")
+            audit("sandbox.act", "key \(combo)")
             await sandbox.pressKey(combo)
         case .scroll(_, _, let direction, let amount):
             let magnitude = CGFloat(max(1, amount)) * 120
@@ -431,7 +457,7 @@ public final class BackgroundWebAgent {
         case .openApp:
             break  // no apps inside the web sandbox
         case .openURL(let urlString):
-            onAudit?("sandbox.act", "open \(urlString.prefix(60))")
+            audit("sandbox.act", "open \(urlString.prefix(60))")
             await sandbox.navigate(to: urlString)
             try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
         }
@@ -448,8 +474,34 @@ public final class BackgroundWebAgent {
         return ""
     }
 
+    /// What a finished model turn means, BEFORE page-verification. Kept pure (no I/O)
+    /// so the invariant the audit log proved we need — a turn that never reached the
+    /// model is NEVER a completion — is unit-tested.
+    enum DoneKind: Equatable {
+        /// The request failed to send / the model was unreachable. `done` is an
+        /// artifact of the failure, not a real finish — must count as a failure.
+        case transportFailure
+        /// A sign-in wall: the agent asked the user to log in (NEEDS_LOGIN).
+        case needsLogin(String)
+        /// The agent honestly reported it couldn't finish (INCOMPLETE).
+        case incomplete(String)
+        /// A genuine completion, carrying the agent's final one-line result.
+        case finished(String)
+    }
+
+    /// Classifies a `done` turn. A failed turn (`CUStep.failed`) is a transport failure
+    /// no matter what text it carries — so an unreachable round trip can never be read
+    /// as "finished", which is what let a mid-task run get counted as completed.
+    nonisolated static func classifyDone(rawText: String, failed: Bool) -> DoneKind {
+        if failed { return .transportFailure }
+        let raw = rawText.isEmpty ? "Done." : rawText
+        if let site = loginSite(in: raw) { return .needsLogin(site) }
+        if let reason = incompleteReason(in: raw) { return .incomplete(reason) }
+        return .finished(raw)
+    }
+
     /// Detects the agent's NEEDS_LOGIN signal and returns the site name.
-    private static func loginSite(in text: String) -> String? {
+    nonisolated private static func loginSite(in text: String) -> String? {
         let upper = text.uppercased()
         guard upper.contains("NEEDS_LOGIN") else { return nil }
         if let range = text.range(of: "NEEDS_LOGIN", options: .caseInsensitive) {
@@ -463,7 +515,7 @@ public final class BackgroundWebAgent {
     /// protocol is "reply starting with INCOMPLETE:"), never mid-sentence, so a genuine
     /// success that merely mentions the word ("some dates had incomplete pricing") is
     /// not mistaken for a failure.
-    private static func incompleteReason(in text: String) -> String? {
+    nonisolated private static func incompleteReason(in text: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.uppercased().hasPrefix("INCOMPLETE") else { return nil }
         let rest = trimmed.dropFirst("INCOMPLETE".count)
