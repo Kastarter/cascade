@@ -73,6 +73,10 @@ public struct WasteDetector: Sendable {
         let collapsed = Self.collapsingScrollBursts(
             inputEvents
                 .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+                // H6: video-meeting apps are inherently noisy (mute, camera, reactions,
+                // chat scrolling) and almost never hold a real automatable routine —
+                // exclude them so meeting fidgeting can't fabricate "workflows".
+                .filter { !Self.isNoisyApp(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier) }
                 .sorted { $0.capturedAt < $1.capturedAt }
         )
         guard collapsed.count >= minRunLength * 2 else { return [] }
@@ -268,8 +272,9 @@ public struct WasteDetector: Sendable {
     }
 
     /// True when the recipe copies in one app and pastes in another — the strongest
-    /// "this is a real, automatable routine" signal in the literature.
-    static func hasCrossAppCopyPaste(_ steps: [RecipeStep]) -> Bool {
+    /// "this is a real, automatable routine" signal in the literature. Public: the
+    /// curator reads it to favour and name data-transfer routines.
+    public static func hasCrossAppCopyPaste(_ steps: [RecipeStep]) -> Bool {
         guard let copy = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "c" && ($0.modifiers.contains("command") || $0.modifiers.contains("control")) }),
               let paste = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "v" && ($0.modifiers.contains("command") || $0.modifiers.contains("control")) })
         else { return false }
@@ -421,6 +426,21 @@ public struct WasteDetector: Sendable {
         case .scroll:
             return "scroll@\(surface)"
         }
+    }
+
+    /// Video-meeting apps whose input is overwhelmingly noise (mute/camera/chat),
+    /// excluded from routine mining. Conservative on purpose — matched by bundle id or
+    /// an exact app name, NOT a loose substring, so unrelated apps aren't swept in, and
+    /// it deliberately omits chat apps like Slack which CAN hold real workflows.
+    static func isNoisyApp(appName: String, bundleIdentifier: String?) -> Bool {
+        let noisyBundles = ["us.zoom.xos", "com.microsoft.teams", "com.microsoft.teams2",
+                            "com.cisco.webexmeetingsapp", "com.webex.meetingmanager", "com.google.meet"]
+        if let bundle = bundleIdentifier?.lowercased(), noisyBundles.contains(where: { bundle == $0 }) {
+            return true
+        }
+        let noisyNames: Set<String> = ["zoom", "zoom.us", "microsoft teams", "webex",
+                                       "cisco webex meetings", "google meet"]
+        return noisyNames.contains(appName.lowercased())
     }
 
     /// A step gap longer than this means a new sitting/task, not a pause within one

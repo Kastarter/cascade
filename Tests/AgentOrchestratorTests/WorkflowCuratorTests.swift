@@ -233,6 +233,26 @@ func curatorPromptFlagsParametersThatChangeEachRun() async {
 }
 
 @Test
+func curatorPromptFlagsCrossAppDataTransfer() async {
+    // H6: a copy-in-one-app / paste-in-another routine is the canonical high-value
+    // automatable task — the curator must be told so it favours and names it.
+    let capture = PromptCapture()
+    let transfer = DetectedWaste(
+        title: "Copy from Mail into Numbers", apps: ["Mail", "Numbers"], occurrences: 3,
+        estimatedSecondsPerRun: 30, estimatedTotalSeconds: 90,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+            RecipeStep(order: 1, kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
+        ]),
+        evidence: [1], confidence: 0.7, signature: "x-app-sig"
+    )
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
+    _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture)).curate([transfer])
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("moves data between apps"))
+}
+
+@Test
 func curateOnePassesOnScreenContentToThePrompt() async {
     let capture = PromptCapture()
     let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#

@@ -199,6 +199,10 @@ public struct WorkflowCurator: Sendable {
     today's date", "…for the requested order"), and NEVER bake the one recorded value \
     into the goal as if it were fixed.
 
+    A candidate marked "moves data between apps" copies from one app and pastes into \
+    another — the highest-value kind of task to automate (tedious, error-prone, clearly \
+    deterministic). Favour keeping these, and name the goal around the data being moved.
+
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
     """
@@ -219,6 +223,8 @@ public struct WorkflowCurator: Sendable {
             if !steps.isEmpty { line += " · steps: \(steps)" }
             let parameterCount = waste.recipe.steps.filter { $0.isParameter }.count
             if parameterCount > 0 { line += " · \(parameterCount) value(s) change each run" }
+            // The canonical high-value automatable routine: data moved between apps.
+            if WasteDetector.hasCrossAppCopyPaste(waste.recipe.steps) { line += " · moves data between apps" }
             lines.append(line)
             if let screen = onScreen[waste.signature], !screen.isEmpty {
                 lines.append("    on screen: “\(screen)”")
