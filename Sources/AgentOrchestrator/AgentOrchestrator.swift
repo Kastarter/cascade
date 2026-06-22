@@ -311,12 +311,16 @@ public actor CascadeOrchestrator {
                 return CuratedAgent(id: agent.id, source: fresh, name: agent.name, why: agent.why, goal: agent.goal, value: agent.value)
             }
         }
-        // On a miss only (so cache hits never touch the DB): resolve the on-screen
-        // content of each candidate's most recent occurrence so the curator can write
-        // a content-aware goal instead of a shape-only one.
+        // On a miss only (so cache hits never touch the DB) AND only when a key is
+        // connected: resolve the on-screen content of each candidate's most recent
+        // occurrence so the curator can write a content-aware goal instead of a
+        // shape-only one. With no key the curator degrades to mechanical naming and
+        // ignores `onScreen`, so resolving it would be pure DB work on every refresh.
         var onScreen: [String: String] = [:]
-        for candidate in candidates {
-            if let text = await onScreenText(for: candidate) { onScreen[candidate.signature] = text }
+        if keyed {
+            for candidate in candidates {
+                if let text = await onScreenText(for: candidate) { onScreen[candidate.signature] = text }
+            }
         }
         let curated = await curator.curate(candidates, onScreen: onScreen)
         curationCache = (key: key, keyed: keyed, agents: curated)
