@@ -53,6 +53,47 @@ func distinctButtonSequencesAreDistinctWorkflows() {
     #expect(sig.contains("mark paid"))
 }
 
+// MARK: - H3 infrequent-token noise filter
+
+@Test
+func noiseFilterDropsOneOffsButKeepsRepeatedSteps() {
+    let surface: (InputEvent) -> String = { $0.appName }
+    // "Open" + ⌘C each appear 3×; "Junk-N" clicks each appear once.
+    var events: [InputEvent] = []
+    var i = 0
+    for run in 0..<3 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, text: "Open", appName: "Books")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, text: "Junk-\(run)", appName: "Books")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Books")); i += 1
+    }
+    let kept = WasteDetector.keepingRepeatableTokens(events, surface: surface, minSupport: 2)
+    // The one-off junk clicks are gone; every repeated step survives.
+    #expect(!kept.contains { ($0.text ?? "").hasPrefix("Junk") })
+    #expect(kept.count(where: { $0.text == "Open" }) == 3)
+    #expect(kept.count(where: { $0.kind == .key }) == 3)
+}
+
+@Test
+func interruptedRoutineIsRescuedByNoiseFilter() {
+    // A routine [click "Open", ⌘C] done 3×, but each run is interrupted by a UNIQUE
+    // stray click in the middle — so no contiguous [open, ⌘C] window ever exists.
+    // After the noise filter removes the one-off strays it closes up and is detected.
+    var events: [InputEvent] = []
+    var i = 0
+    for run in 0..<3 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: "Open", appName: "Books")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 9, y: 9, text: "Stray-\(run)", appName: "Books")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Books")); i += 1
+    }
+    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    let waste = try? #require(results.first)
+    if let waste {
+        #expect(waste.occurrences == 3)
+        #expect(waste.signature == "click:open@Books|key:command+c@Books")
+        #expect(!waste.recipe.steps.contains { ($0.ocrAnchor ?? "").hasPrefix("Stray") })
+    }
+}
+
 // MARK: - H2 composite ranking
 
 private func rankWaste(occ: Int = 3, perRun: Int = 30, steps: [RecipeStep], lastSeen: Date = base, sig: String = "s") -> DetectedWaste {
