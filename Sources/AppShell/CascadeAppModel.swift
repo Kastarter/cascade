@@ -2799,7 +2799,8 @@ public final class CascadeAppModel: ObservableObject {
             bundleIdentifier: step.bundleIdentifier,
             windowTitleHint: step.windowTitleHint,
             ocrAnchor: step.ocrAnchor,
-            targetDescriptor: step.targetDescriptor
+            targetDescriptor: step.targetDescriptor,
+            isParameter: step.isParameter
         )
     }
 

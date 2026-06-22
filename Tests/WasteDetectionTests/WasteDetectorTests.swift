@@ -1,6 +1,6 @@
 import CascadeMemory
 import Foundation
-import WasteDetection
+@testable import WasteDetection
 import Testing
 
 private let base = Date(timeIntervalSince1970: 1_700_000_000)
@@ -16,6 +16,54 @@ private func event(_ i: Int, _ kind: InputEventKind, app: String, key: String? =
         modifiers: modifiers,
         appName: app
     )
+}
+
+// MARK: - B5 parameter extraction
+
+private func typeEvent(_ i: Int, app: String, text: String) -> InputEvent {
+    InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: text, appName: app)
+}
+
+@Test
+func variableTypePositionsFindsValuesThatChangeAcrossRuns() {
+    // Two occurrences of [click, type, key]; only the typed value differs → position 1
+    // is a parameter, the click and key are fixed.
+    let runA = [event(0, .click, app: "Mail"), typeEvent(1, app: "Mail", text: "INV-001"), event(2, .key, app: "Mail", key: "s", modifiers: ["command"])]
+    let runB = [event(0, .click, app: "Mail"), typeEvent(1, app: "Mail", text: "INV-002"), event(2, .key, app: "Mail", key: "s", modifiers: ["command"])]
+    #expect(WasteDetector.variableTypePositions([runA, runB]) == [1])
+}
+
+@Test
+func variableTypePositionsIgnoresConstantTypingAndSingleRuns() {
+    let runA = [typeEvent(0, app: "Mail", text: "ls"), event(1, .click, app: "Mail")]
+    let runB = [typeEvent(0, app: "Mail", text: "ls"), event(1, .click, app: "Mail")]
+    // Same typed value every run → fixed content, not a parameter.
+    #expect(WasteDetector.variableTypePositions([runA, runB]).isEmpty)
+    // A single demonstration can't reveal what changes.
+    #expect(WasteDetector.variableTypePositions([runA]).isEmpty)
+    // A position that isn't a `.type` in every run is never a parameter.
+    let mixed = [[typeEvent(0, app: "Mail", text: "a")], [event(0, .click, app: "Mail")]]
+    #expect(WasteDetector.variableTypePositions(mixed).isEmpty)
+}
+
+@Test
+func detectMarksVaryingTypedValueAsParameter() {
+    // A repeated save-with-a-changing-name workflow: the typed value differs each run,
+    // so the deployed recipe must flag it (don't blindly retype the stale value).
+    var events: [InputEvent] = []
+    let values = ["report-q1", "report-q2"]
+    var i = 0
+    for run in 0..<2 {
+        events.append(event(i, .click, app: "TextEdit")); i += 1
+        events.append(typeEvent(i, app: "TextEdit", text: values[run])); i += 1
+        events.append(event(i, .key, app: "TextEdit", key: "s", modifiers: ["command"])); i += 1
+    }
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    let typeStep = waste.recipe.steps.first { $0.kind == .type }
+    #expect(typeStep?.isParameter == true)
+    // Fixed steps stay fixed.
+    #expect(waste.recipe.steps.filter { $0.kind == .click }.allSatisfy { !$0.isParameter })
+    #expect(waste.recipe.steps.filter { $0.kind == .key }.allSatisfy { !$0.isParameter })
 }
 
 @Test

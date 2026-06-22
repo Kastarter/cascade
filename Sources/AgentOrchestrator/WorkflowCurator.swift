@@ -193,6 +193,12 @@ public struct WorkflowCurator: Sendable {
     than "reply to emails") — but NEVER invent details the snippet does not show, and \
     never copy private/sensitive values verbatim into the goal.
 
+    When a candidate notes that "N value(s) change each run", those are parameters — the \
+    user typed a DIFFERENT value each time (an order number, a date, a name). Write the \
+    goal so the agent supplies the CURRENT/appropriate value at run time (e.g. "…using \
+    today's date", "…for the requested order"), and NEVER bake the one recorded value \
+    into the goal as if it were fixed.
+
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
     """
@@ -211,6 +217,8 @@ public struct WorkflowCurator: Sendable {
             var line = "[\(index)] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps)"
             line += " · seen \(waste.occurrences)× (~\(waste.estimatedSecondsPerRun)s each)"
             if !steps.isEmpty { line += " · steps: \(steps)" }
+            let parameterCount = waste.recipe.steps.filter { $0.isParameter }.count
+            if parameterCount > 0 { line += " · \(parameterCount) value(s) change each run" }
             lines.append(line)
             if let screen = onScreen[waste.signature], !screen.isEmpty {
                 lines.append("    on screen: “\(screen)”")

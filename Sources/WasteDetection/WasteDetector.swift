@@ -130,7 +130,8 @@ public struct WasteDetector: Sendable {
                 // re-presses Delete for them. The same bar gates the intentional
                 // `waste(fromInstance:)` path — one rule, one place.
                 guard Self.isAutomatableInstance(instance) else { continue }
-                results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts, surface: surface))
+                let allOccurrences = nonOverlapping.map { Array(events[$0..<$0 + length]) }
+                results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts, surface: surface, allOccurrences: allOccurrences))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
                 }
@@ -172,13 +173,34 @@ public struct WasteDetector: Sendable {
         return makeWaste(instance: instance, occurrences: max(1, occurrences), contexts: contexts, surface: resolve)
     }
 
+    /// The instance-array positions whose `.type` value VARIES across a workflow's
+    /// recorded occurrences — its parameters (AWM placeholder abstraction). A position
+    /// qualifies only when EVERY occurrence has a `.type` event there (same shape) and
+    /// at least two of the recorded values differ. Pure + unit-pinned. Empty for fewer
+    /// than two occurrences (a single demo can't reveal what changes).
+    static func variableTypePositions(_ occurrences: [[InputEvent]]) -> Set<Int> {
+        guard occurrences.count >= 2, let length = occurrences.first?.count else { return [] }
+        var variable = Set<Int>()
+        for position in 0..<length {
+            let cells = occurrences.compactMap { $0.indices.contains(position) ? $0[position] : nil }
+            guard cells.count == occurrences.count, cells.allSatisfy({ $0.kind == .type }) else { continue }
+            let values = Set(cells.map { ($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines) })
+            if values.count >= 2 { variable.insert(position) }
+        }
+        return variable
+    }
+
     // MARK: - Recipe construction
 
-    private func makeWaste(instance: [InputEvent], occurrences: Int, contexts: [RecordedContext], surface: (InputEvent) -> String) -> DetectedWaste {
+    private func makeWaste(instance: [InputEvent], occurrences: Int, contexts: [RecordedContext], surface: (InputEvent) -> String, allOccurrences: [[InputEvent]] = []) -> DetectedWaste {
+        // Which positions hold a typed value that CHANGES across the recorded
+        // occurrences — those are parameters, not fixed content (B5/AWM). Empty for
+        // the single-demonstration (Teach-once) path, which has no occurrences to diff.
+        let variablePositions = Self.variableTypePositions(allOccurrences)
         var steps: [RecipeStep] = []
         var order = 0
         var lastApp: String?
-        for event in instance {
+        for (position, event) in instance.enumerated() {
             if event.appName != lastApp {
                 steps.append(RecipeStep(order: order, kind: .activateApp, appName: event.appName, bundleIdentifier: event.bundleIdentifier))
                 order += 1
@@ -196,7 +218,8 @@ public struct WasteDetector: Sendable {
                 bundleIdentifier: event.bundleIdentifier,
                 windowTitleHint: event.windowTitle,
                 ocrAnchor: Self.ocrAnchor(for: event, contexts: contexts),
-                targetDescriptor: event.targetDescriptor
+                targetDescriptor: event.targetDescriptor,
+                isParameter: variablePositions.contains(position)
             ))
             order += 1
         }
