@@ -1103,15 +1103,19 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
-    /// Builds the on-screen grounder from gated UserDefaults config, or nil when
-    /// off (the default). Backend "claude" uses the proven cloud ElementLocator
-    /// (verify the fill_target wiring end-to-end before standing up a local model);
-    /// "uitars" uses a locally-served UI-TARS-1.5-7B (the cost + latency win).
-    /// Mirrors the powerHarness opt-in pattern: never offer a tool whose backend
-    /// isn't there. See [[cascade-cu-downgrade-research]].
+    /// Builds the on-screen grounder that backs `fill_target`. ON by default (no
+    /// Settings UI yet) — opt out with `cascade.visualGrounder = false`. Backend
+    /// defaults to "claude" (the proven cloud ElementLocator) so the grounding
+    /// split works with zero local setup; set `cascade.visualGrounder.backend =
+    /// "uitars"` AND serve a local UI-TARS-1.5-7B for the free, on-device grounder
+    /// (the cost + latency win). When uitars is selected but no model is serving,
+    /// each ground call fails fast and the agent falls back to the computer tool —
+    /// degraded, never broken. See [[cascade-cu-downgrade-research]].
     static func assistGrounder() -> VisualGrounder? {
         let d = UserDefaults.standard
-        guard d.bool(forKey: "cascade.visualGrounder") else { return nil }
+        // Default ON: unset → enabled; explicit false → disabled.
+        let enabled = (d.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
+        guard enabled else { return nil }
         switch d.string(forKey: "cascade.visualGrounder.backend") {
         case "uitars":
             let url = d.string(forKey: "cascade.visualGrounder.uitarsURL").flatMap(URL.init(string:))
