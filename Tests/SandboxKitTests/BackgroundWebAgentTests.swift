@@ -1,5 +1,6 @@
 import Testing
 
+@testable import ProviderKit
 @testable import SandboxKit
 
 // MARK: - Fix #1: a transport failure must never be read as a completion
@@ -87,4 +88,24 @@ func auditTagPrefixesDetailSoConcurrentRunsAreDistinguishable() {
 func emptyTagLeavesDetailUntouched() {
     // No tag set → legacy behavior, so an untagged caller never gains a stray "[] ".
     #expect(BackgroundWebAgent.taggedDetail(tag: "", "key Return") == "key Return")
+}
+
+// MARK: - Efficiency parity: state-change classification gates both circuit-breakers
+
+@Test
+func observationActionsDoNotCountAsStateChange() {
+    // A read/look turn must NOT count as acting, or no-effect would false-fire on a
+    // read and the stall guard would never catch a model that only observes.
+    #expect(BackgroundWebAgent.isStateChanging(.screenshot) == false)
+    #expect(BackgroundWebAgent.isStateChanging(.wait) == false)
+    #expect(BackgroundWebAgent.isStateChanging(.zoom(nx: 0, ny: 0, nw: 1, nh: 1)) == false)
+    #expect(BackgroundWebAgent.isStateChanging(.highlight(x: 0, y: 0, width: 1, height: 1, label: "x")) == false)
+}
+
+@Test
+func realActionsCountAsStateChange() {
+    #expect(BackgroundWebAgent.isStateChanging(.click(x: 1, y: 2)))
+    #expect(BackgroundWebAgent.isStateChanging(.type("hi")))
+    #expect(BackgroundWebAgent.isStateChanging(.openURL("https://example.com")))
+    #expect(BackgroundWebAgent.isStateChanging(.key("return")))
 }
