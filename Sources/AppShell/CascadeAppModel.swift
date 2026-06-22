@@ -58,6 +58,10 @@ public final class CascadeAppModel: ObservableObject {
 
     @Published public var selectedTab: Tab = .reel
     @Published public var showSettings = false
+    /// The multi-agent launcher sheet — give several orders at once, each spawns
+    /// its own cursor agent (native app via pid-posting, or web via the sandbox).
+    @Published public var showAgentLauncher = false
+    @Published public var agentOrdersDraft = ""
     /// First-run setup: permissions + keys, shown once over everything until
     /// dismissed (reopenable from Settings). Without it a new user lands on an
     /// empty Reel with no idea why nothing records.
@@ -755,12 +759,8 @@ public final class CascadeAppModel: ObservableObject {
         // the isolated web sandbox.
         if Self.isBackgroundRequest(q) {
             let task = Self.backgroundTask(from: q)
-            if let app = appSkills.appNamed(inGoal: task), !Self.runsInBackground(apps: [app]) {
-                launchBackgroundNativeAgent(goal: task, appName: app)
-                teachMessage = "Running in the background in \(app): \(task)"
-            } else {
-                createSandboxAgent(task: task)
-            }
+            routeAgentOrder(task)
+            teachMessage = "Running in the background: \(task)"
             return
         }
         // Every new turn supersedes whatever an earlier turn is still doing. The

@@ -222,6 +222,30 @@ extension CascadeAppModel {
         }
     }
 
+    /// Launches one cursor agent per order — each runs in parallel with its own
+    /// companion cursor. An order naming a native app drives that app via
+    /// pid-posted events; anything else (research, a website) runs in the web
+    /// sandbox. This is the "give orders to several agents at once" entry; it is
+    /// NOT hardcoded to any app — each order picks its own surface.
+    public func launchAgents(orders: [String]) {
+        for raw in orders {
+            let order = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !order.isEmpty else { continue }
+            routeAgentOrder(order)
+        }
+    }
+
+    /// Routes one order to the right surface: a native app → background-native
+    /// agent; web/research → the web sandbox. Shared by the single-order voice
+    /// path and the multi-order launcher.
+    func routeAgentOrder(_ order: String) {
+        if let app = appSkills.appNamed(inGoal: order), !Self.runsInBackground(apps: [app]) {
+            launchBackgroundNativeAgent(goal: order, appName: app)
+        } else {
+            createSandboxAgent(task: order)
+        }
+    }
+
     /// Stops every running background-native agent.
     public func stopBackgroundNativeAgents() {
         for (_, runState) in backgroundNativeRuns { runState.requestStop() }
