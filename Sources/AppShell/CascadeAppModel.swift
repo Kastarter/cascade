@@ -173,10 +173,6 @@ public final class CascadeAppModel: ObservableObject {
     private let orchestrator: CascadeOrchestrator
     private let keyStore = AnthropicKeyStore()
     private let openAIKeyStore = OpenAIKeyStore()
-    /// Focused "where is X" grounder for elements AX can't see (canvas
-    /// placeholders/shapes) — backs the on-screen agent's find_element tool.
-    /// Swap for a local MLX grounder later to drop the per-find frontier call.
-    private let visualGrounder: VisualGrounder = ClaudeVisualGrounder()
     public let guidanceOverlay = GuidanceOverlayController()
     public let voice = RealtimeVoice()
     public let pushToTalk = PushToTalkMonitor()
@@ -1188,32 +1184,6 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         wire(agent)
-        // Visual grounding for find_element: capture a fresh frame, locate the
-        // described target visually (the canvas answer — AX can't see slide
-        // placeholders/shapes), and hand back the coordinate. Captured by value
-        // so the closure doesn't retain the agent.
-        let grounderSize = agent.captureSize
-        agent.elementGrounder = { [weak self] target in
-            guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else {
-                return "The user stopped this task. Do not continue — end now."
-            }
-            guard !target.isEmpty else { return "Give a short description of the element to find." }
-            self.dock.show(title: "Cascade is looking", detail: target)
-            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: grounderSize.width, height: grounderSize.height) else {
-                return "Couldn't capture the screen to locate “\(target)”."
-            }
-            let point = await self.visualGrounder.locate(
-                target: target, screenshot: shot,
-                displayWidthPoints: Int(screen.frame.width), displayHeightPoints: Int(screen.frame.height)
-            )
-            guard let point else {
-                _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: String(target.prefix(80))))
-                return "Couldn't find “\(target)” on screen — it may not be visible. Open the menu or panel that contains it, then try again."
-            }
-            let x = Int(point.x.rounded()), y = Int(point.y.rounded())
-            _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.hit", detail: "\(String(target.prefix(60))) → \(x),\(y)"))
-            return "Found “\(target)” at \(x),\(y). Click there now — left_click at [\(x),\(y)], or fill_field with coordinate [\(x),\(y)]."
-        }
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
@@ -1396,7 +1366,7 @@ public final class CascadeAppModel: ObservableObject {
                         auditTiming(outcome: "stalled-noeffect")
                         return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
                     }
-                    nudge = "Your last action did NOT change the screen at all — it had no effect (the control isn't where you clicked, is disabled, or needs a different gesture). Do NOT repeat that same click. If your target is something you can SEE but keep missing — a canvas placeholder, a shape, a drawn object — call find_element with a short description to get its exact coordinate instead of guessing."
+                    nudge = "Your last action did NOT change the screen at all — it had no effect (the control isn't where you clicked, is disabled, or needs a different gesture). Do NOT repeat that same click."
                     // Flail-moment grounding push (Cascade's "push elements at a
                     // flail moment, never a pull tool" lesson + the literature's
                     // grounding>reasoning finding): hand the model the controls that

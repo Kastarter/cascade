@@ -140,15 +140,6 @@ public final class ComputerUseAgent {
     public var onThinkingPulse: (@MainActor (String) -> Void)?
     private var lastThinkingPulse = ContinuousClock.now
 
-    /// Visual grounding for elements the model can SEE but can't reliably click by
-    /// guessing — canvas placeholders (Keynote/Blender) that expose nothing to AX.
-    /// Given a short target description, returns a ready tool_result string with
-    /// the element's coordinate (or a "not found" instruction). Resolved
-    /// in-process like use_skill — zero screenshot round trip. Set only for the
-    /// on-screen agent (the web sandbox grounds via the DOM); when nil the tool
-    /// isn't offered.
-    public var elementGrounder: (@MainActor (String) async -> String)?
-
     /// Paste-key gate state (see `pasteRefusal`): does the goal's own wording ask
     /// for clipboard work, and has the agent itself copied something this episode
     /// (cmd+c / cmd+x) — which makes the clipboard contents its own.
@@ -473,19 +464,6 @@ public final class ComputerUseAgent {
         if extraTools.isEmpty {
             tools.insert(Self.fillFieldToolDefinition(), at: tools.count - 1)
         }
-        // Visual grounding tool — offered only when a grounder is wired (on-screen
-        // agent). The canvas answer: locate a placeholder/shape AX can't see.
-        if elementGrounder != nil {
-            tools.insert([
-                "name": "find_element",
-                "description": "Locate a UI element you can SEE but can't reliably click by guessing — ESPECIALLY on a canvas (a Keynote slide title/subtitle placeholder, a shape, a drawn object) where the normal controls aren't selectable. Give a short description of the target; it returns the exact click coordinate. Reach for this the moment a click misses or whenever you're unsure exactly where something is, instead of guessing coordinates and missing.",
-                "input_schema": [
-                    "type": "object",
-                    "properties": ["target": ["type": "string", "description": "Short description of the element to find, e.g. \"the subtitle text placeholder\" or \"the green Send button\""]],
-                    "required": ["target"],
-                ],
-            ], at: tools.count - 1)
-        }
         if skillProvider != nil {
             tools.insert([
                 "name": "use_skill",
@@ -574,15 +552,6 @@ public final class ComputerUseAgent {
                     }
                 case "highlight":
                     if let action = parseHighlight(input) { actions.append(action) }
-                case "find_element":
-                    // Resolved in-process like use_skill — the grounder locates the
-                    // target and the result (a coordinate, or a not-found hint) is
-                    // delivered as this id's tool_result; no screenshot needed.
-                    if let id = block["id"] as? String {
-                        let target = (input["target"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                        toolResultOverrides[id] = await elementGrounder?(target)
-                            ?? "Visual grounding isn't available in this run."
-                    }
                 case "fill_field":
                     // Expands to click → cmd+a → type → submit, all executed in
                     // THIS turn's batch (one screenshot after) — not streamed, so
