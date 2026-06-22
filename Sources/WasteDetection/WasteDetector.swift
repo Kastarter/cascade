@@ -104,6 +104,11 @@ public struct WasteDetector: Sendable {
             var i = 0
             while i + length <= n {
                 if (i..<i + length).contains(where: { consumed.contains($0) }) { i += 1; continue }
+                // H4 session boundary: a real routine happens within one sitting — reject
+                // a window that straddles a long idle gap (the user stepped away / moved
+                // to a different task), so two unrelated stretches can't fuse into one
+                // "pattern" just because they share an action shape.
+                if !Self.isWithinOneSession(events, start: i, length: length) { i += 1; continue }
                 let key = tokens[i..<i + length].joined(separator: "|")
                 starts[key, default: []].append(i)
                 i += 1
@@ -337,6 +342,22 @@ public struct WasteDetector: Sendable {
         case .scroll:
             return "scroll@\(surface)"
         }
+    }
+
+    /// A step gap longer than this means a new sitting/task, not a pause within one
+    /// routine — real routine steps are seconds apart (UiPath disregards actions >10min
+    /// after their predecessor; this is tighter so a distraction ends the routine).
+    static let maxIdleGap: TimeInterval = 180
+
+    /// Whether the window `events[start ..< start+length]` is one continuous session —
+    /// no internal step gap exceeds `maxGap`. A window that spans a big idle gap is two
+    /// tasks, not one routine, and must not become a detected pattern. Pure.
+    static func isWithinOneSession(_ events: [InputEvent], start: Int, length: Int, maxGap: TimeInterval = maxIdleGap) -> Bool {
+        guard length >= 2, start >= 0, start + length <= events.count else { return true }
+        for k in (start + 1)..<(start + length) where events[k].capturedAt.timeIntervalSince(events[k - 1].capturedAt) > maxGap {
+            return false
+        }
+        return true
     }
 
     /// Drops events whose token appears fewer than `minSupport` times in the stream.

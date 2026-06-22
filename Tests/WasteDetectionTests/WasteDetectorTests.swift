@@ -94,6 +94,34 @@ func interruptedRoutineIsRescuedByNoiseFilter() {
     }
 }
 
+// MARK: - H4 idle-gap session boundary
+
+@Test
+func isWithinOneSessionRejectsBigInternalGaps() {
+    // 1s-apart steps = one session; a 5-min internal gap = a boundary.
+    let tight = (0..<3).map { event($0, .click, app: "A") }
+    #expect(WasteDetector.isWithinOneSession(tight, start: 0, length: 3))
+    let split = [
+        InputEvent(id: 0, capturedAt: base, kind: .click, appName: "A"),
+        InputEvent(id: 1, capturedAt: base.addingTimeInterval(300), kind: .click, appName: "A"),
+    ]
+    #expect(!WasteDetector.isWithinOneSession(split, start: 0, length: 2))
+}
+
+@Test
+func patternStraddlingAnIdleGapIsNotCounted() {
+    // [click "Open", ⌘C] three times seconds apart, then a fourth pair whose two events
+    // are 5 minutes apart — that window straddles a session boundary and must not count.
+    func pair(_ i: Int, clickAt: TimeInterval, keyAt: TimeInterval) -> [InputEvent] {
+        [InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(clickAt), kind: .click, x: 1, y: 1, text: "Open", appName: "Books"),
+         InputEvent(id: Int64(i + 1), capturedAt: base.addingTimeInterval(keyAt), kind: .key, key: "c", modifiers: ["command"], appName: "Books")]
+    }
+    var events = pair(0, clickAt: 0, keyAt: 1) + pair(2, clickAt: 2, keyAt: 3) + pair(4, clickAt: 4, keyAt: 5)
+    events += pair(6, clickAt: 400, keyAt: 700) // 300s internal gap → rejected
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first
+    #expect(waste?.occurrences == 3) // the gap-straddling 4th pair is not counted
+}
+
 // MARK: - H2 composite ranking
 
 private func rankWaste(occ: Int = 3, perRun: Int = 30, steps: [RecipeStep], lastSeen: Date = base, sig: String = "s") -> DetectedWaste {
