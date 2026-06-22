@@ -287,7 +287,7 @@ public actor CascadeOrchestrator {
         guard let waste = wasteDetector.waste(fromInstance: events, contexts: contexts, surface: webAppIdentity) else {
             return nil
         }
-        return await curator.curateOne(waste, statedIntent: statedIntent)
+        return await curator.curateOne(waste, statedIntent: statedIntent, onScreen: await onScreenText(for: waste))
     }
 
     /// The detector's candidates, judged and named by the curator into the few
@@ -311,9 +311,43 @@ public actor CascadeOrchestrator {
                 return CuratedAgent(id: agent.id, source: fresh, name: agent.name, why: agent.why, goal: agent.goal, value: agent.value)
             }
         }
-        let curated = await curator.curate(candidates)
+        // On a miss only (so cache hits never touch the DB): resolve the on-screen
+        // content of each candidate's most recent occurrence so the curator can write
+        // a content-aware goal instead of a shape-only one.
+        var onScreen: [String: String] = [:]
+        for candidate in candidates {
+            if let text = await onScreenText(for: candidate) { onScreen[candidate.signature] = text }
+        }
+        let curated = await curator.curate(candidates, onScreen: onScreen)
         curationCache = (key: key, keyed: keyed, agents: curated)
         return curated
+    }
+
+    /// A short, privacy-filtered excerpt of the text that was actually on screen while
+    /// a detected workflow happened — the OCR/AX content of the moments around its most
+    /// recent occurrence (`lastSeenAt` back one run length). Feeds the curator so goals
+    /// name the real subject matter ("reply to refund emails") rather than the shape
+    /// ("reply to emails"). Returns nil when nothing legible/safe is on record.
+    private func onScreenText(for waste: DetectedWaste) async -> String? {
+        let runLength = max(8.0, Double(waste.estimatedSecondsPerRun))
+        let start = waste.lastSeenAt.addingTimeInterval(-runLength - 3)
+        let end = waste.lastSeenAt.addingTimeInterval(3)
+        guard let moments = try? await store.contexts(between: start, and: end, limit: 12) else { return nil }
+        var seen = Set<String>()
+        var snippets: [String] = []
+        for moment in moments where !PrivacyRules.isSensitive(moment) {
+            guard let raw = moment.ocrText else { continue }
+            // Collapse the OCR's runs of whitespace/newlines into single spaces, then
+            // bound each snippet so one busy screen can't dominate the prompt.
+            let cleaned = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard cleaned.count >= 8 else { continue }
+            let snippet = String(cleaned.prefix(200))
+            if seen.insert(snippet).inserted { snippets.append(snippet) }
+            if snippets.count >= 3 { break }
+        }
+        let joined = snippets.joined(separator: " ⋯ ")
+        return joined.isEmpty ? nil : String(joined.prefix(600))
     }
 
     /// Persists an agent from a curated proposal — the recorded recipe drives

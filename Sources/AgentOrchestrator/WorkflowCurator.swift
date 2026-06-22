@@ -56,11 +56,16 @@ public struct WorkflowCurator: Sendable {
     /// enriched proposals (possibly empty — the curator is allowed to decide that
     /// nothing is worth automating). Falls back to the raw list only when the call
     /// or the parse fails, never to paper over an intentional "keep none".
-    public func curate(_ candidates: [DetectedWaste]) async -> [CuratedAgent] {
+    /// `onScreen` carries, per candidate `signature`, a short privacy-filtered
+    /// excerpt of the text actually visible while the user did the work (resolved by
+    /// the orchestrator from the recorded OCR/AX). It is what lets the curator write a
+    /// *content-aware* goal ("reply to refund-request emails") instead of a shape-only
+    /// one ("reply to emails"). Optional — with none, behaviour is exactly as before.
+    public func curate(_ candidates: [DetectedWaste], onScreen: [String: String] = [:]) async -> [CuratedAgent] {
         guard !candidates.isEmpty else { return [] }
         let raw = try? await client.complete(
             system: Self.systemPrompt,
-            user: Self.userPrompt(candidates),
+            user: Self.userPrompt(candidates, onScreen: onScreen),
             model: model,
             maxTokens: 900
         )
@@ -79,11 +84,11 @@ public struct WorkflowCurator: Sendable {
     /// ALWAYS returns a candidate: a deliberate demonstration is something the user
     /// wants, so a failed/empty model reply degrades to the detector's own naming
     /// (`fallback`) — never worse than the automatic path, never nothing.
-    public func curateOne(_ waste: DetectedWaste, statedIntent: String? = nil) async -> CuratedAgent {
+    public func curateOne(_ waste: DetectedWaste, statedIntent: String? = nil, onScreen: String? = nil) async -> CuratedAgent {
         let intent = statedIntent?.trimmingCharacters(in: .whitespacesAndNewlines)
         let raw = try? await client.complete(
             system: Self.curateOneSystemPrompt,
-            user: Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil),
+            user: Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil, onScreen: onScreen),
             model: model,
             maxTokens: 400
         )
@@ -117,16 +122,19 @@ public struct WorkflowCurator: Sendable {
     - "value": 0.0–1.0, how worth-automating it is.
 
     If the user told you in their own words what they were doing, THAT description is \
-    the strongest signal — base the name and goal on it. Never invent steps the \
-    recipe does not contain.
+    the strongest signal — base the name and goal on it. When an "on screen" line is \
+    given, it is the text actually visible while they worked — use it to make the name \
+    and goal CONCRETE about the real subject matter (e.g. "reply to the refund-request \
+    emails", "update the Q2 pipeline sheet"), not generic. Never invent steps the \
+    recipe does not contain, and never copy private values verbatim into the goal.
 
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
     """
 
-    /// The single recorded recipe as the curator's input, with the user's spoken
-    /// intent appended when they narrated the demo.
-    static func userPromptOne(_ waste: DetectedWaste, statedIntent: String?) -> String {
+    /// The single recorded recipe as the curator's input, with the on-screen content
+    /// and the user's spoken intent appended when present.
+    static func userPromptOne(_ waste: DetectedWaste, statedIntent: String?, onScreen: String? = nil) -> String {
         let apps = waste.apps.joined(separator: " → ")
         let steps = waste.recipe.humanSteps
             .filter { $0 != "type" && $0 != "scroll" }
@@ -136,6 +144,9 @@ public struct WorkflowCurator: Sendable {
         var line = "[0] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps) · ~\(waste.estimatedSecondsPerRun)s"
         if !steps.isEmpty { line += " · steps: \(steps)" }
         lines.append(line)
+        if let onScreen, !onScreen.isEmpty {
+            lines.append("    on screen: “\(onScreen)”")
+        }
         if let statedIntent, !statedIntent.isEmpty {
             lines.append("")
             lines.append("What the user SAID while demonstrating (their own words — use them): “\(statedIntent)”")
@@ -176,12 +187,20 @@ public struct WorkflowCurator: Sendable {
     off — never how well it fits a particular shape. Never invent a workflow that is not \
     in the candidates.
 
+    Some candidates include an "on screen" sub-line: the text actually visible while the \
+    user did the work. USE it to make the name and goal content-aware about the real \
+    subject matter (e.g. "reply to refund-request emails with the policy link" rather \
+    than "reply to emails") — but NEVER invent details the snippet does not show, and \
+    never copy private/sensitive values verbatim into the goal.
+
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
     """
 
     /// The candidates as a compact numbered list — the facts the curator judges on.
-    static func userPrompt(_ candidates: [DetectedWaste]) -> String {
+    /// When `onScreen[signature]` holds the text visible while a workflow happened, it
+    /// is added as an indented sub-line so the curator can name the real subject matter.
+    static func userPrompt(_ candidates: [DetectedWaste], onScreen: [String: String] = [:]) -> String {
         var lines = ["Candidates:"]
         for (index, waste) in candidates.enumerated() {
             let apps = waste.apps.joined(separator: " → ")
@@ -193,6 +212,9 @@ public struct WorkflowCurator: Sendable {
             line += " · seen \(waste.occurrences)× (~\(waste.estimatedSecondsPerRun)s each)"
             if !steps.isEmpty { line += " · steps: \(steps)" }
             lines.append(line)
+            if let screen = onScreen[waste.signature], !screen.isEmpty {
+                lines.append("    on screen: “\(screen)”")
+            }
         }
         return lines.joined(separator: "\n")
     }
