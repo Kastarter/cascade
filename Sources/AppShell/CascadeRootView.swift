@@ -187,10 +187,6 @@ public struct CascadeRootView: View {
                 TeachPreviewSheet(model: model)
                     .transition(.opacity)
             }
-            if model.showAgentLauncher {
-                AgentLauncherSheet(model: model)
-                    .transition(.opacity)
-            }
         }
         .foregroundStyle(Color.cascadeText)
         .frame(minWidth: 1040, minHeight: 720)
@@ -200,7 +196,6 @@ public struct CascadeRootView: View {
         .animation(.easeOut(duration: 0.2), value: model.teachingMode)
         .animation(.easeOut(duration: 0.2), value: model.teachStatus)
         .animation(.easeOut(duration: 0.2), value: model.teachPreview?.id)
-        .animation(.easeOut(duration: 0.2), value: model.showAgentLauncher)
     }
 }
 
@@ -243,72 +238,6 @@ private struct TeachBanner: View {
 /// human name, the goal a deployed agent will run, where it will run, and a chip
 /// back to the recording it was built from. The user picks "Add to my agents"
 /// (self-serve into Cascades) or "Send to manager" (into the review queue).
-/// Give several orders at once — each line becomes its own cursor agent, running
-/// in parallel. Native-app orders drive that app directly (pid-posted); research
-/// or website orders run in the background sandbox. Not hardcoded to any app.
-private struct AgentLauncherSheet: View {
-    @ObservedObject var model: CascadeAppModel
-
-    private var orders: [String] {
-        model.agentOrdersDraft.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.45).ignoresSafeArea()
-                .onTapGesture { model.showAgentLauncher = false }
-            CascadePanel {
-                VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
-                    HStack(spacing: CascadeMetrics.s2) {
-                        Image(systemName: "cursorarrow.rays").font(.system(size: 12)).foregroundStyle(Color.cascadeAgent)
-                        Text("Run several agents").font(.cascadeSerif(24))
-                        Spacer()
-                        if !model.backgroundNativeRuns.isEmpty {
-                            CascadeTag("\(model.backgroundNativeRuns.count) RUNNING", tone: .cascadeAgent)
-                        }
-                    }
-                    Text("One order per line. Each becomes its own cursor agent, working in parallel — a native app (Keynote, Notes…) is driven directly; research or a website runs in the background sandbox.")
-                        .font(.cascadeSans(13)).foregroundStyle(Color.cascadeText3)
-                        .fixedSize(horizontal: false, vertical: true)
-                    TextEditor(text: $model.agentOrdersDraft)
-                        .font(.cascadeSans(14))
-                        .scrollContentBackground(.hidden)
-                        .frame(height: 150)
-                        .padding(8)
-                        .background(Color.cascadeBorder.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
-                        .overlay(alignment: .topLeading) {
-                            if model.agentOrdersDraft.isEmpty {
-                                Text("In Keynote, design a title slide for Acme\nIn Notes, write tomorrow's to-dos\nFind the cheapest flight to Tokyo")
-                                    .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText4)
-                                    .padding(.horizontal, 13).padding(.vertical, 16)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                    HStack(spacing: CascadeMetrics.s3) {
-                        if !model.backgroundNativeRuns.isEmpty {
-                            Button("Stop all") { model.stopBackgroundNativeAgents() }
-                                .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
-                        }
-                        Spacer()
-                        Button("Cancel") { model.showAgentLauncher = false }
-                            .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
-                        Button(orders.count <= 1 ? "Launch agent  →" : "Launch \(orders.count) agents  →") {
-                            model.launchAgents(orders: orders)
-                            model.agentOrdersDraft = ""
-                            model.showAgentLauncher = false
-                        }
-                        .buttonStyle(CascadeAccentButtonStyle())
-                        .disabled(orders.isEmpty)
-                    }
-                }
-            }
-            .frame(maxWidth: 560)
-            .padding(CascadeMetrics.s6)
-        }
-    }
-}
-
 private struct TeachPreviewSheet: View {
     @ObservedObject var model: CascadeAppModel
 
@@ -520,11 +449,6 @@ private struct CascadeTopBar: View {
                     icon: model.prefersDark ? "sun.max" : "moon",
                     help: "Toggle light / dark"
                 ) { model.toggleTheme() }
-                quickControl(
-                    icon: "cursorarrow.rays",
-                    help: "Run several agents at once",
-                    active: model.showAgentLauncher
-                ) { model.showAgentLauncher = true }
                 quickControl(
                     icon: "gearshape",
                     help: "Settings — hotkeys, access & model keys",
@@ -2085,8 +2009,6 @@ private struct SettingsScreen: View {
                     .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
             }
             Spacer()
-            Button("Preview cursors") { model.previewAgentCursors() }
-                .buttonStyle(CascadeQuietButtonStyle())
             Button("Setup guide") { model.showOnboarding = true }
                 .buttonStyle(CascadeQuietButtonStyle())
             Button {

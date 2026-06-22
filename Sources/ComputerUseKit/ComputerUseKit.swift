@@ -461,7 +461,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     }
 }
 
-enum KeyCodes {
+private enum KeyCodes {
     /// Full ANSI layout — a shortcut with ANY letter/digit/symbol must work; an
     /// "Unknown key" here used to abort entire agent runs (e.g. cmd+n in Figma).
     static func code(for key: String) -> CGKeyCode? {

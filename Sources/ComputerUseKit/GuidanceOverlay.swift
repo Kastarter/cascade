@@ -123,8 +123,6 @@ public final class GuidanceOverlayController {
     /// Drives multi-stage flights (the pink swoop); cancelled whenever a new
     /// destination arrives so stale waypoints never fight a fresh flight.
     private var flightTask: Task<Void, Never>?
-    /// Drives the multi-cursor preview choreography.
-    private var previewTask: Task<Void, Never>?
     private var spaceObserver: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
     private var reorderTick = 0
@@ -261,102 +259,6 @@ public final class GuidanceOverlayController {
     /// Recolors the whole guidance overlay (cursor, trail, ripple, marquee).
     public func setTheme(_ theme: CursorTheme) {
         state.theme = theme
-    }
-
-    // MARK: - Companion cursors (more than one agent on screen at once)
-
-    /// Adds a translucent companion cursor with `id` at a global AppKit point (or
-    /// re-homes it if `id` already exists). Each carries its own theme colour so
-    /// several read as distinct agents. The primary cursor is untouched.
-    public func addCompanion(id: String, theme: CursorTheme, atGlobalPoint point: CGPoint) {
-        ensureWindows()
-        state.visible = true
-        orderFront()
-        observeEnvironment()
-        if let existing = state.extras.first(where: { $0.id == id }) {
-            existing.globalPoint = point
-            return
-        }
-        state.extras.append(CompanionCursor(id: id, theme: theme, globalPoint: point))
-    }
-
-    /// Flies companion `id` to a global point — a distance-scaled spring, and its
-    /// halo breathes (pointing) so the motion reads as purposeful work.
-    public func flyCompanion(id: String, toGlobalPoint point: CGPoint) {
-        guard let cursor = state.extras.first(where: { $0.id == id }) else { return }
-        cursor.pointing = true
-        let distance = hypot(point.x - cursor.globalPoint.x, point.y - cursor.globalPoint.y)
-        let response = min(0.6, 0.18 + distance / 2600)
-        withAnimation(.spring(response: response, dampingFraction: 0.74)) {
-            cursor.globalPoint = point
-        }
-    }
-
-    /// Fires companion `id`'s press ripple.
-    public func pressCompanion(id: String) {
-        state.extras.first(where: { $0.id == id })?.pressTrigger &+= 1
-    }
-
-    /// Toggles companion `id`'s thinking sonar pulse.
-    public func setCompanionThinking(id: String, _ on: Bool) {
-        state.extras.first(where: { $0.id == id })?.thinking = on
-    }
-
-    /// Sets companion `id`'s "what it's doing" label.
-    public func labelCompanion(id: String, _ text: String) {
-        state.extras.first(where: { $0.id == id })?.label = text
-    }
-
-    public func removeCompanion(id: String) {
-        state.extras.removeAll { $0.id == id }
-    }
-
-    public func clearCompanions() {
-        previewTask?.cancel()
-        previewTask = nil
-        state.extras.removeAll()
-    }
-
-    /// Demo choreography: three translucent companion cursors fly around the main
-    /// screen, click, and pulse — each labelled like a working agent — so the
-    /// multi-cursor capability is visible at a glance. Auto-clears.
-    public func previewCompanions() {
-        guard let screen = NSScreen.main?.frame else { return }
-        clearCompanions()
-        let specs: [(id: String, theme: CursorTheme, label: String, home: CGPoint)] = [
-            ("preview-1", .pink, "Agent · drafting a reply", CGPoint(x: screen.midX - 280, y: screen.midY + 140)),
-            ("preview-2", .peach, "Agent · filling the form", CGPoint(x: screen.midX + 40, y: screen.midY - 30)),
-            ("preview-3", .purple, "Agent · comparing prices", CGPoint(x: screen.midX + 260, y: screen.midY + 180)),
-        ]
-        for spec in specs {
-            addCompanion(id: spec.id, theme: spec.theme, atGlobalPoint: spec.home)
-            labelCompanion(id: spec.id, spec.label)
-        }
-        // Fixed waypoint offsets cycled per round — engaging without randomness.
-        let hops: [CGPoint] = [
-            CGPoint(x: 180, y: -120), CGPoint(x: -150, y: 90),
-            CGPoint(x: 120, y: 140), CGPoint(x: -200, y: -60),
-        ]
-        previewTask = Task { [weak self] in
-            guard let self else { return }
-            for round in 0..<6 {
-                for (i, spec) in specs.enumerated() {
-                    guard !Task.isCancelled else { return }
-                    let hop = hops[(round + i) % hops.count]
-                    self.flyCompanion(id: spec.id, toGlobalPoint: CGPoint(x: spec.home.x + hop.x, y: spec.home.y + hop.y))
-                    self.setCompanionThinking(id: spec.id, true)
-                }
-                try? await Task.sleep(for: .milliseconds(900))
-                guard !Task.isCancelled else { return }
-                for spec in specs {
-                    self.setCompanionThinking(id: spec.id, false)
-                    self.pressCompanion(id: spec.id)
-                }
-                try? await Task.sleep(for: .milliseconds(700))
-            }
-            guard !Task.isCancelled else { return }
-            self.clearCompanions()
-        }
     }
 
     /// Fully removes the companion (used if the assistant is turned off).
@@ -511,31 +413,7 @@ public final class GuidanceOverlayController {
     }
 }
 
-/// One additional companion cursor beyond the primary — its own colour, position,
-/// label, and animations, drawn TRANSLUCENT so several agents can work the screen
-/// at once without obscuring it (macOS has only one real pointer; these are all
-/// drawn). An independent ObservableObject so each animates on its own.
-@MainActor
-final class CompanionCursor: ObservableObject, Identifiable {
-    nonisolated let id: String
-    let theme: CursorTheme
-    @Published var globalPoint: CGPoint
-    @Published var label: String = ""
-    @Published var pointing = false
-    @Published var thinking = false
-    @Published var pressTrigger = 0
-
-    init(id: String, theme: CursorTheme, globalPoint: CGPoint) {
-        self.id = id
-        self.theme = theme
-        self.globalPoint = globalPoint
-    }
-}
-
 final class GuidanceState: ObservableObject {
-    /// Extra companion cursors (the primary cursor is the fields below). Each is
-    /// its own observable so per-cursor flights/presses animate independently.
-    @Published var extras: [CompanionCursor] = []
     /// Companion position in global AppKit coordinates (bottom-left origin). Each
     /// per-screen window maps this into its own local space.
     @Published var globalPoint: CGPoint = .zero
@@ -645,11 +523,6 @@ struct GuidanceOverlayView: View {
                     // Rides the same spring the offset uses, sampling each interpolated
                     // position into the trail buffer. Only records while pointing/flying.
                     .modifier(FlightSampler(point: point, store: trail, recording: state.pointing))
-            }
-            // Additional translucent companion cursors — more than one agent on
-            // screen at once, each drawn where it's working on this screen.
-            ForEach(state.extras) { cursor in
-                CompanionCursorView(cursor: cursor, screenFrame: screenFrame)
             }
         }
         .ignoresSafeArea()
@@ -951,9 +824,6 @@ struct GuideCursor: View {
     var pointing: Bool = false
     var thinking: Bool = false
     var pressTrigger: Int = 0
-    /// Translucent rendering for a companion cursor (several on screen at once) so
-    /// they stay visible without obscuring the work underneath.
-    var ghost: Bool = false
     @State private var pressed = false
     @State private var breathing = false
 
@@ -1041,43 +911,6 @@ struct GuideCursor: View {
             }
         }
         .animation(.easeOut(duration: 0.18), value: label)
-        .opacity(ghost ? 0.6 : 1.0)
-    }
-}
-
-/// Renders one translucent companion cursor (its own observable) at its global
-/// point on this window's screen — the multi-cursor layer drawn alongside the
-/// primary. Reuses the same glyph/halo/press/thinking chrome via `GuideCursor`.
-private struct CompanionCursorView: View {
-    @ObservedObject var cursor: CompanionCursor
-    let screenFrame: CGRect
-
-    private var localPoint: CGPoint? {
-        let g = cursor.globalPoint
-        guard screenFrame.contains(g) else { return nil }
-        return CGPoint(
-            x: min(max(g.x - screenFrame.minX, 0), screenFrame.width),
-            y: min(max(screenFrame.height - (g.y - screenFrame.minY), 0), screenFrame.height)
-        )
-    }
-
-    var body: some View {
-        if let point = localPoint {
-            ZStack(alignment: .topLeading) {
-                if cursor.thinking {
-                    ThinkingPulse(color: cursor.theme.core)
-                        .offset(x: point.x - 24, y: point.y - 24)
-                        .transaction { $0.animation = nil }
-                }
-                PressRipple(trigger: cursor.pressTrigger, color: cursor.theme.core)
-                    .offset(x: point.x - 17, y: point.y - 17)
-                GuideCursor(
-                    theme: cursor.theme, label: cursor.label, pointing: cursor.pointing,
-                    thinking: cursor.thinking, pressTrigger: cursor.pressTrigger, ghost: true
-                )
-                .offset(x: point.x, y: point.y)
-            }
-        }
     }
 }
 

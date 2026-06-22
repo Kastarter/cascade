@@ -58,10 +58,6 @@ public final class CascadeAppModel: ObservableObject {
 
     @Published public var selectedTab: Tab = .reel
     @Published public var showSettings = false
-    /// The multi-agent launcher sheet — give several orders at once, each spawns
-    /// its own cursor agent (native app via pid-posting, or web via the sandbox).
-    @Published public var showAgentLauncher = false
-    @Published public var agentOrdersDraft = ""
     /// First-run setup: permissions + keys, shown once over everything until
     /// dismissed (reopenable from Settings). Without it a new user lands on an
     /// empty Reel with no idea why nothing records.
@@ -190,11 +186,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
     /// instructions plus runtime policies, matched against the frontmost app.
     /// User files at App Support/Cascade/Skills override the bundled ones.
-    var appSkills = AppSkillRegistry.load()
-    /// Running background-native agents (parallel on-screen agents driving native
-    /// apps via pid-posted events), keyed by their companion-cursor id — for STOP
-    /// and concurrency tracking. See BackgroundNativeAgent.swift.
-    var backgroundNativeRuns: [String: AgentRunState] = [:]
+    private var appSkills = AppSkillRegistry.load()
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -753,14 +745,10 @@ public final class CascadeAppModel: ObservableObject {
             showSettings = true
             return
         }
-        // "do X in the background" → run it without taking over the screen. A task
-        // that names a NATIVE app (Notes, Keynote, …) runs as a background-native
-        // agent driving that app via pid-posted events; web/research tasks go to
-        // the isolated web sandbox.
+        // "create an agent that … in the background" → run it in the isolated web
+        // sandbox instead of taking over the screen.
         if Self.isBackgroundRequest(q) {
-            let task = Self.backgroundTask(from: q)
-            routeAgentOrder(task)
-            teachMessage = "Running in the background: \(task)"
+            createSandboxAgent(task: Self.backgroundTask(from: q))
             return
         }
         // Every new turn supersedes whatever an earlier turn is still doing. The
@@ -2743,7 +2731,7 @@ public final class CascadeAppModel: ObservableObject {
     /// the name through LaunchServices — handles apps that aren't running yet and
     /// localized names, unlike a runningApplications scan. Returns whether `open`
     /// accepted the name.
-    static func openApp(named name: String) async -> Bool {
+    private static func openApp(named name: String) async -> Bool {
         await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -2986,12 +2974,6 @@ public final class CascadeAppModel: ObservableObject {
         permissionDiagnostics = PermissionProbe.diagnostics()
         autoStartIfPermitted()
         statusLine = recorder.status.message
-    }
-
-    /// Shows the multiple-companion-cursor preview — several translucent agent
-    /// cursors flying, clicking, and pulsing on screen at once.
-    public func previewAgentCursors() {
-        guidanceOverlay.previewCompanions()
     }
 
     /// Prepends a freshly recorded moment to the Reel, newest-first, capped so the
