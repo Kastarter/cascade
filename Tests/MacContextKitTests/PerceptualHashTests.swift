@@ -56,6 +56,26 @@ func gridStillDedupesIdenticalFrames() {
     #expect(PerceptualHash.isDuplicateGrid(a, of: b))
 }
 
+@Test
+func combinedHashIsStableAndMovesWithContent() {
+    let same = PerceptualHash.gridHashes(horizontalGradient())
+    let other = PerceptualHash.gridHashes(horizontalGradient(reversed: true))
+    // Same frame → same folded signature (deterministic; replay-safe).
+    #expect(PerceptualHash.combinedHash(same) == PerceptualHash.combinedHash(PerceptualHash.gridHashes(horizontalGradient())))
+    // A wholesale content change moves the signature.
+    #expect(PerceptualHash.combinedHash(same) != PerceptualHash.combinedHash(other))
+}
+
+@Test
+func combinedHashDoesNotCollideOnRegionPosition() {
+    // Two frames that differ only in WHICH region carries the change must fold
+    // to different signatures — the per-index rotation is what stops a plain
+    // XOR from cancelling them to the same value.
+    let g1: [UInt64] = [1, 0, 0, 0, 0, 0, 0, 0, 0]
+    let g2: [UInt64] = [0, 1, 0, 0, 0, 0, 0, 0, 0]
+    #expect(PerceptualHash.combinedHash(g1) != PerceptualHash.combinedHash(g2))
+}
+
 // MARK: - AX/OCR text merge
 
 @Test

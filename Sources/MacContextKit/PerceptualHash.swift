@@ -111,6 +111,21 @@ public enum PerceptualHash {
         return hashes
     }
 
+    /// Folds the per-region grid hashes into one 64-bit frame signature, reusing
+    /// the grid's single downscale instead of paying for a second whole-frame
+    /// `dHash` pass on the hot path. Stored as a moment's `frameHash`; dedup keys
+    /// off the grid itself, so this fold only needs to be stable and well-
+    /// distributed (the per-index rotation keeps two frames that differ only in
+    /// *which* region changed from XOR-cancelling to the same value).
+    public static func combinedHash(_ grid: [UInt64]) -> UInt64 {
+        var result: UInt64 = 0
+        for (index, hash) in grid.enumerated() {
+            let r = UInt64((index * 7) % 64)
+            result ^= (r == 0 ? hash : (hash << r) | (hash >> (64 - r)))
+        }
+        return result
+    }
+
     /// Duplicate only when EVERY region is within threshold — one changed
     /// region (a new message, a fresh dialog) is enough to keep the frame.
     public static func isDuplicateGrid(

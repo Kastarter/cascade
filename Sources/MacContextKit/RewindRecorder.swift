@@ -6,6 +6,7 @@ import CoreVideo
 import Foundation
 import OSLog
 import ScreenCaptureKit
+import Vision
 
 // Continuous, always-on screen recorder. Replaces the old 4s Timer with an
 // SCStream at ~1fps, gated and deduped so only *changed* frames become moments:
@@ -105,7 +106,9 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
             return // Every region near-identical to the last stored frame — drop.
         }
         lastGrid = grid
-        let hash = PerceptualHash.dHash(cgImage)
+        // Frame signature folded from the grid we just computed — no second
+        // whole-frame downscale. (Dedup above keys off `grid`, not this value.)
+        let hash = PerceptualHash.combinedHash(grid)
 
         guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
             .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
@@ -199,13 +202,24 @@ actor RewindEngine {
         // (Thread-safe C API; this actor serializes the walks.)
         let axText = snapshot.processIdentifier.map { AXTextHarvester.text(forWindowOfPID: $0) } ?? ""
 
+        // OCR carries the frame only where AX can't. When AX already owns the
+        // window's text (native apps), a full `.accurate` pass every second is
+        // wasted CPU — the merge keeps only OCR lines AX didn't already cover,
+        // usually icon/menu labels. So run a cheap `.fast` insurance pass there
+        // (still catches text living only in images/canvas), and reserve the
+        // `.accurate` pass + native-res rescue for sparse-AX (web/canvas)
+        // windows where OCR is the load-bearing channel.
+        let axRich = axText.count >= Self.sparseAXThreshold
+
         // `recognize(inPNG:)` decodes via ImageIO, which handles JPEG bytes too.
-        var ocrText = await ScreenTextRecognizer.recognize(inPNG: frame.jpeg)
+        var ocrText = await ScreenTextRecognizer.recognize(
+            inPNG: frame.jpeg, level: axRich ? .fast : .accurate
+        )
 
         // Canvas/web window with little AX text → OCR is the only channel, so
         // do one native-resolution pass (rate-limited) for the focused window
         // instead of trusting the 1920px-capped stream frame with small text.
-        if axText.count < Self.sparseAXThreshold,
+        if !axRich,
            Date().timeIntervalSince(lastNativeOCRAt) >= Self.nativeOCRInterval,
            let pid = snapshot.processIdentifier,
            let windowRect = await MainActor.run(body: { ScreenCaptureUtility.focusedWindowNormalizedRect(pid: pid) }),

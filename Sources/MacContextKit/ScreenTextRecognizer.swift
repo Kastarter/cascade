@@ -17,20 +17,26 @@ public enum ScreenTextRecognizer {
     /// `await` this so the CPU-bound Vision pass runs off the main thread and the
     /// UI stays smooth. Returns recognized lines joined by newlines, or `""` when
     /// nothing is read.
-    public static func recognize(inPNG data: Data) async -> String {
+    public static func recognize(inPNG data: Data, level: VNRequestTextRecognitionLevel = .accurate) async -> String {
         guard let cgImage = decode(png: data) else {
             logger.error("OCR skipped — could not decode PNG frame.")
             return ""
         }
-        return recognize(in: cgImage)
+        return recognize(in: cgImage, level: level)
     }
 
     /// Synchronous Vision recognition over a `CGImage`. Safe to call from any
     /// thread; the request handler holds no shared state.
-    public static func recognize(in cgImage: CGImage) -> String {
+    ///
+    /// `level` lets the always-on recorder pick the cheap `.fast` model for the
+    /// common case where the Accessibility channel already owns the text, and
+    /// reserve the slow `.accurate` model for frames where OCR is load-bearing.
+    public static func recognize(in cgImage: CGImage, level: VNRequestTextRecognitionLevel = .accurate) -> String {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
+        request.recognitionLevel = level
+        // Language correction is an extra NLP pass that mostly helps the slower
+        // `.accurate` model; on the cheap `.fast` insurance pass it's wasted cost.
+        request.usesLanguageCorrection = (level == .accurate)
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
