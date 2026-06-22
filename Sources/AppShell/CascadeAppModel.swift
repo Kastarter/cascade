@@ -2200,7 +2200,7 @@ public final class CascadeAppModel: ObservableObject {
         // Let the always-on recorder's 1s drain flush the bracketed events AND attach
         // AX click labels before we read them — the drain defers unlabeled clicks
         // <0.35s old, and those labels are the strongest replay anchor, so a forced
-        // immediate flush would lose them. Two drain cycles is a safe settle.
+        // immediate flush would lose them. ~1.5s is a safe settle.
         try? await Task.sleep(for: .milliseconds(1500))
         do {
             let curated = try await orchestrator.curateRange(
