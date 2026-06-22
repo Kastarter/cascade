@@ -5,6 +5,7 @@ import Testing
 import UniformTypeIdentifiers
 
 @testable import AppShell
+@testable import ComputerUseKit
 @testable import MacContextKit
 
 /// Pins the "no state change after an action" engine — the cheapest universal
@@ -67,5 +68,48 @@ struct NoEffectDetectionTests {
     /// Undecodable data yields nil — no-effect detection then safely skips.
     @Test func garbageDataYieldsNil() {
         #expect(CascadeAppModel.gridHashes(ofJPEG: Data([0x01, 0x02, 0x03])) == nil)
+    }
+
+    // Coordinate-level grounding push: AX CG-global center -> model pixel space.
+    // A wrong number here clicks empty space, so pin the mapping exactly.
+    @Test func modelPixelMapsDisplayCenter() {
+        let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let p = CascadeAppModel.modelPixel(forCGGlobal: CGPoint(x: 720, y: 450), in: display, resW: 1280, resH: 800)
+        #expect(p?.x == 640)   // 0.5 * 1280
+        #expect(p?.y == 400)   // 0.5 * 800
+    }
+
+    @Test func modelPixelMapsCornersAndOffsetDisplay() {
+        let primary = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        #expect(CascadeAppModel.modelPixel(forCGGlobal: .zero, in: primary, resW: 1280, resH: 800) == CGPoint(x: 0, y: 0))
+        // A second display offset to the right: a point local to it maps by the
+        // SAME subtract-and-scale once you pass that display's bounds.
+        let secondary = CGRect(x: 1440, y: 0, width: 1280, height: 800)
+        let p = CascadeAppModel.modelPixel(forCGGlobal: CGPoint(x: 1440 + 640, y: 400), in: secondary, resW: 1280, resH: 800)
+        #expect(p?.x == 640)
+        #expect(p?.y == 400)
+    }
+
+    @Test func modelPixelRejectsOffDisplayPoints() {
+        let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        // A control on another monitor must NOT be pushed — its coordinate isn't
+        // in this screenshot.
+        #expect(CascadeAppModel.modelPixel(forCGGlobal: CGPoint(x: 2000, y: 450), in: display, resW: 1280, resH: 800) == nil)
+        #expect(CascadeAppModel.modelPixel(forCGGlobal: CGPoint(x: 720, y: -50), in: display, resW: 1280, resH: 800) == nil)
+    }
+
+    @Test func groundingControlsFormatsLabelRoleAndCoordinate() {
+        let display = CGRect(x: 0, y: 0, width: 1280, height: 800)
+        let controls = [
+            AXElementResolver.Match(center: CGPoint(x: 640, y: 400), role: "AXButton", title: "Save", score: 0),
+        ]
+        let summary = CascadeAppModel.groundingControls(controls, display: display, resW: 1280, resH: 800)
+        #expect(summary == "“Save” (button) at 640,400")
+    }
+
+    @Test func groundingControlsDropsOffDisplayAndReturnsNilWhenEmpty() {
+        let display = CGRect(x: 0, y: 0, width: 1280, height: 800)
+        let offscreen = [AXElementResolver.Match(center: CGPoint(x: 5000, y: 5000), role: "AXButton", title: "Ghost", score: 0)]
+        #expect(CascadeAppModel.groundingControls(offscreen, display: display, resW: 1280, resH: 800) == nil)
     }
 }

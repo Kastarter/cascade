@@ -115,6 +115,17 @@ clicks and zooms on one checkbox). Otherwise, screenshot and classify:
   placeholder ON THE CANVAS — `fill_field` it (`click:double`,
   `submit:cmd_return`), which double-clicks, selects, types, and exits in one
   turn.
+- Subtitle / second / third placeholder — DON'T guess its coordinates (an
+  empty placeholder is easy to miss, and a double-click on bare canvas does
+  nothing). After the title's `cmd+return` leaves its box SELECTED, press
+  `Tab` to select the NEXT placeholder on the slide, then type to replace it
+  (Tab cycles canvas objects in order; typing onto a selected box replaces its
+  whole content). Repeat `Tab` → type for each remaining placeholder. This
+  reaches every placeholder reliably without hunting pixels. If a `Tab` selects
+  something that is NOT the box you meant (read the screenshot), `Tab` again to
+  the next; if the layout has no such placeholder, there is nothing to fill —
+  don't force one. Only fall back to clicking a placeholder directly when Tab
+  cycling clearly isn't landing on text boxes.
   Go to the sidebar ONLY if the canvas truly shows no title box: click empty
   canvas (deselect all) → Format sidebar `Slide` tab shows `Title` / `Body`
   checkboxes → check `Title` ONCE; the next screenshot must show a title box

@@ -1373,9 +1373,16 @@ public final class CascadeAppModel: ObservableObject {
                     // ARE actually on screen so it re-grounds on real elements
                     // instead of re-guessing the same dead pixel.
                     let controls = AXElementResolver.interactables()
-                    if let summary = AXElementResolver.interactableSummary(controls) {
+                    if let located = Self.groundingControls(controls, display: Self.displayBounds(of: screen), resW: size.width, resH: size.height) {
+                        // Coordinate-level grounding: the model is poor at producing
+                        // click coordinates but fine choosing from given ones (the
+                        // GUI-agent grounding>reasoning finding) — so hand it the
+                        // exact x,y of each real control to click directly.
+                        nudge! += " The controls actually on screen right now, with their click coordinates, are: \(located). Click one of THESE coordinates directly instead of guessing — if what you wanted isn't listed, it isn't a clickable control here, so open the right menu/panel or take another route."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) controls w/ coords"))
+                    } else if let summary = AXElementResolver.interactableSummary(controls) {
                         nudge! += " The controls actually clickable on screen right now are: \(summary). Aim for one of these by sight — if what you wanted isn't in this list, it isn't clickable here, so open the right menu/panel or take another route."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) on-screen controls"))
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) controls (labels only)"))
                     } else {
                         nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
@@ -1515,6 +1522,44 @@ public final class CascadeAppModel: ObservableObject {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
         return PerceptualHash.gridHashes(image)
+    }
+
+    /// Maps an element's CG-global center (top-left origin, from AX) into the
+    /// model's screenshot-pixel space (resW×resH, top-left). AX positions and
+    /// `CGDisplayBounds` share the same CG-global coordinate system, so this is a
+    /// plain subtract-and-scale — no AppKit Y-flip. Returns nil when the element
+    /// is off the captured display (so we never push a coordinate the model's
+    /// screenshot doesn't actually contain). Pure + unit-tested: a wrong number
+    /// here would send the agent clicking into empty space.
+    nonisolated static func modelPixel(forCGGlobal point: CGPoint, in display: CGRect, resW: Int, resH: Int) -> CGPoint? {
+        guard display.width > 0, display.height > 0 else { return nil }
+        let fx = (point.x - display.minX) / display.width
+        let fy = (point.y - display.minY) / display.height
+        guard fx >= -0.002, fx <= 1.002, fy >= -0.002, fy <= 1.002 else { return nil }
+        return CGPoint(x: min(max(fx, 0), 1) * Double(resW), y: min(max(fy, 0), 1) * Double(resH))
+    }
+
+    /// The flail-moment grounding push WITH coordinates: each on-screen control
+    /// rendered as `"label" (role) at x,y` in the model's pixel space, so it can
+    /// click the exact spot instead of guessing. Drops controls off the captured
+    /// display. nil when nothing maps (caller falls back to labels-only, then a
+    /// plain nudge). Pure given the harvested matches + display geometry.
+    nonisolated static func groundingControls(
+        _ matches: [AXElementResolver.Match], display: CGRect, resW: Int, resH: Int, limit: Int = 40
+    ) -> String? {
+        let entries = matches.prefix(limit).compactMap { match -> String? in
+            guard let pixel = modelPixel(forCGGlobal: match.center, in: display, resW: resW, resH: resH) else { return nil }
+            let role = match.role.hasPrefix("AX") ? String(match.role.dropFirst(2)).lowercased() : match.role.lowercased()
+            return "“\(match.title)” (\(role)) at \(Int(pixel.x.rounded())),\(Int(pixel.y.rounded()))"
+        }
+        return entries.isEmpty ? nil : entries.joined(separator: "; ")
+    }
+
+    /// CG-global bounds (top-left origin) of the display a screen represents —
+    /// the coordinate system AX element positions live in.
+    nonisolated static func displayBounds(of screen: NSScreen) -> CGRect {
+        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        return CGDisplayBounds(id ?? CGMainDisplayID())
     }
 
     private func executeCU(_ action: CUAction, on screen: NSScreen) async -> Bool {
