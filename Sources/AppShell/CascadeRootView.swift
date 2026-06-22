@@ -2011,6 +2011,13 @@ private struct SettingsScreen: View {
             Spacer()
             Button("Preview cursors") { model.previewAgentCursors() }
                 .buttonStyle(CascadeQuietButtonStyle())
+            Button("Test bg agent") {
+                model.launchBackgroundNativeAgent(
+                    goal: "Create a new note and type: hello from a background agent",
+                    appName: "Notes"
+                )
+            }
+            .buttonStyle(CascadeQuietButtonStyle())
             Button("Setup guide") { model.showOnboarding = true }
                 .buttonStyle(CascadeQuietButtonStyle())
             Button {

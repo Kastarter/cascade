@@ -186,7 +186,11 @@ public final class CascadeAppModel: ObservableObject {
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
     /// instructions plus runtime policies, matched against the frontmost app.
     /// User files at App Support/Cascade/Skills override the bundled ones.
-    private var appSkills = AppSkillRegistry.load()
+    var appSkills = AppSkillRegistry.load()
+    /// Running background-native agents (parallel on-screen agents driving native
+    /// apps via pid-posted events), keyed by their companion-cursor id — for STOP
+    /// and concurrency tracking. See BackgroundNativeAgent.swift.
+    var backgroundNativeRuns: [String: AgentRunState] = [:]
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -745,10 +749,18 @@ public final class CascadeAppModel: ObservableObject {
             showSettings = true
             return
         }
-        // "create an agent that … in the background" → run it in the isolated web
-        // sandbox instead of taking over the screen.
+        // "do X in the background" → run it without taking over the screen. A task
+        // that names a NATIVE app (Notes, Keynote, …) runs as a background-native
+        // agent driving that app via pid-posted events; web/research tasks go to
+        // the isolated web sandbox.
         if Self.isBackgroundRequest(q) {
-            createSandboxAgent(task: Self.backgroundTask(from: q))
+            let task = Self.backgroundTask(from: q)
+            if let app = appSkills.appNamed(inGoal: task), !Self.runsInBackground(apps: [app]) {
+                launchBackgroundNativeAgent(goal: task, appName: app)
+                teachMessage = "Running in the background in \(app): \(task)"
+            } else {
+                createSandboxAgent(task: task)
+            }
             return
         }
         // Every new turn supersedes whatever an earlier turn is still doing. The
@@ -2731,7 +2743,7 @@ public final class CascadeAppModel: ObservableObject {
     /// the name through LaunchServices — handles apps that aren't running yet and
     /// localized names, unlike a runningApplications scan. Returns whether `open`
     /// accepted the name.
-    private static func openApp(named name: String) async -> Bool {
+    static func openApp(named name: String) async -> Bool {
         await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
