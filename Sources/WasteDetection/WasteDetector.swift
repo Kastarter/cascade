@@ -151,11 +151,17 @@ public struct WasteDetector: Sendable {
             }
         }
 
+        // H5: merge near-duplicate VARIANTS of the same routine (done slightly
+        // differently across runs) into one process — summing their occurrences. This
+        // both rescues a real routine whose runs split across variants (neither variant
+        // reaching the bar alone) and stops the feed showing the same task several times.
+        let deduped = Self.mergeVariants(results)
+
         // Rank by a composite score, not raw total-seconds: a frequent, time-saving,
         // long-and-cohesive, recent routine beats a loose or stale one. `now` is read
         // once so the ordering is internally consistent.
         let now = Date()
-        return results
+        return deduped
             .sorted { lhs, rhs in
                 let l = Self.rankingScore(lhs, now: now), r = Self.rankingScore(rhs, now: now)
                 if l != r { return l > r }
@@ -186,6 +192,79 @@ public struct WasteDetector: Sendable {
         let recency = 1.0 / (1.0 + ageDays / 7.0)            // ~half weight at one week
         let transferBoost = hasCrossAppCopyPaste(waste.recipe.steps) ? 1.5 : 1.0
         return roi * lengthBoost * recency * transferBoost
+    }
+
+    /// Single-link clusters detected workflows whose signatures are near-duplicates
+    /// (token-sequence similarity ≥ `threshold`) and collapses each cluster to ONE
+    /// process: the most-complete variant as the representative, with the cluster's
+    /// occurrences SUMMED (the task happened that many times, in variant forms) and
+    /// evidence/last-seen combined. Fixes both the "same task surfaces as several
+    /// cards" and the "real routine missed because its runs split across variants that
+    /// each fell short of the bar" failures. Pure; order-stable input → stable output.
+    static func mergeVariants(_ wastes: [DetectedWaste], threshold: Double = 0.8) -> [DetectedWaste] {
+        var clusters: [[DetectedWaste]] = []
+        for waste in wastes {
+            let tokens = waste.signature.components(separatedBy: "|")
+            if let index = clusters.firstIndex(where: { cluster in
+                cluster.contains { sequenceSimilarity($0.signature.components(separatedBy: "|"), tokens) >= threshold }
+            }) {
+                clusters[index].append(waste)
+            } else {
+                clusters.append([waste])
+            }
+        }
+        return clusters.map(mergeCluster)
+    }
+
+    /// Collapses a variant cluster into one `DetectedWaste`: representative = the
+    /// longest signature (most complete), ties to most occurrences; occurrences summed.
+    private static func mergeCluster(_ cluster: [DetectedWaste]) -> DetectedWaste {
+        guard cluster.count > 1 else { return cluster[0] }
+        let representative = cluster.max { lhs, rhs in
+            let l = lhs.signature.components(separatedBy: "|").count
+            let r = rhs.signature.components(separatedBy: "|").count
+            return l != r ? l < r : lhs.occurrences < rhs.occurrences
+        }!
+        let totalOccurrences = cluster.reduce(0) { $0 + $1.occurrences }
+        return DetectedWaste(
+            id: representative.id,
+            title: representative.title,
+            apps: representative.apps,
+            occurrences: totalOccurrences,
+            estimatedSecondsPerRun: representative.estimatedSecondsPerRun,
+            estimatedTotalSeconds: representative.estimatedSecondsPerRun * totalOccurrences,
+            recipe: representative.recipe,
+            evidence: cluster.flatMap(\.evidence),
+            confidence: min(0.95, 0.5 + Double(totalOccurrences) * 0.12),
+            signature: representative.signature,
+            lastSeenAt: cluster.map(\.lastSeenAt).max() ?? representative.lastSeenAt
+        )
+    }
+
+    /// 1 − normalized Levenshtein over two token sequences: 1 = identical, 0 = fully
+    /// different. The variant-merge similarity metric.
+    static func sequenceSimilarity(_ a: [String], _ b: [String]) -> Double {
+        if a.isEmpty && b.isEmpty { return 1 }
+        let longest = max(a.count, b.count)
+        guard longest > 0 else { return 1 }
+        return 1.0 - Double(levenshtein(a, b)) / Double(longest)
+    }
+
+    /// Classic edit-distance DP over token arrays (insert/delete/substitute = 1).
+    static func levenshtein(_ a: [String], _ b: [String]) -> Int {
+        if a.isEmpty { return b.count }
+        if b.isEmpty { return a.count }
+        var previous = Array(0...b.count)
+        var current = [Int](repeating: 0, count: b.count + 1)
+        for i in 1...a.count {
+            current[0] = i
+            for j in 1...b.count {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                current[j] = Swift.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            }
+            swap(&previous, &current)
+        }
+        return previous[b.count]
     }
 
     /// True when the recipe copies in one app and pastes in another — the strongest

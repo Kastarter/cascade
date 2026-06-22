@@ -122,6 +122,35 @@ func patternStraddlingAnIdleGapIsNotCounted() {
     #expect(waste?.occurrences == 3) // the gap-straddling 4th pair is not counted
 }
 
+// MARK: - H5 variant merging
+
+@Test
+func sequenceSimilarityScoresEditDistance() {
+    #expect(WasteDetector.sequenceSimilarity(["a", "b", "c"], ["a", "b", "c"]) == 1)
+    #expect(abs(WasteDetector.sequenceSimilarity(["a", "b", "c"], ["a", "x", "c"]) - 2.0 / 3.0) < 1e-9) // one substitution
+    #expect(WasteDetector.sequenceSimilarity(["a", "b"], ["x", "y"]) == 0)
+    #expect(WasteDetector.levenshtein(["a", "b", "c"], ["a", "c"]) == 1) // one deletion
+}
+
+@Test
+func mergeVariantsCollapsesNearDuplicatesAndSumsOccurrences() {
+    // Two variants of one routine differing by a single step (4-token sigs, 1 diff →
+    // 0.75 sim... use 5-token so one diff = 0.8 ≥ threshold) merge; occurrences sum.
+    let a = rankWaste(occ: 2, steps: [], sig: "click:open@A|key:command+c@A|click:row@A|key:command+v@B|key:command+s@B")
+    let b = rankWaste(occ: 2, steps: [], sig: "click:open@A|key:command+c@A|click:cell@A|key:command+v@B|key:command+s@B")
+    let merged = WasteDetector.mergeVariants([a, b])
+    #expect(merged.count == 1)
+    #expect(merged[0].occurrences == 4) // 2 + 2 — now clears the ≥3 bar
+}
+
+@Test
+func mergeVariantsKeepsGenuinelyDifferentRoutinesApart() {
+    let mail = rankWaste(occ: 3, steps: [], sig: "click:reply@Mail|key:command+v@Mail")
+    let sheet = rankWaste(occ: 3, steps: [], sig: "click:cell@Numbers|type@Numbers|key:command+s@Numbers")
+    let merged = WasteDetector.mergeVariants([mail, sheet])
+    #expect(merged.count == 2) // dissimilar → not merged
+}
+
 // MARK: - H2 composite ranking
 
 private func rankWaste(occ: Int = 3, perRun: Int = 30, steps: [RecipeStep], lastSeen: Date = base, sig: String = "s") -> DetectedWaste {
