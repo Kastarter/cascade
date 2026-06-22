@@ -202,6 +202,12 @@ public struct RecipeStep: Codable, Equatable, Sendable {
     /// cascade ranks live candidates on this before falling back to the `ocrAnchor`
     /// label and finally the recorded pixel. Optional — old recipes decode without it.
     public let targetDescriptor: String?
+    /// A `.type` step whose recorded value VARIED across the workflow's occurrences —
+    /// i.e. a parameter (the order number that changes each run), not fixed content
+    /// (AWM-style placeholder abstraction). The deployed agent must supply the
+    /// CURRENT value, never blindly retype the recorded one; the curator goal is
+    /// written parameter-aware so it does. `false` for fixed steps and old recipes.
+    public let isParameter: Bool
 
     public init(
         order: Int,
@@ -215,7 +221,8 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         bundleIdentifier: String? = nil,
         windowTitleHint: String? = nil,
         ocrAnchor: String? = nil,
-        targetDescriptor: String? = nil
+        targetDescriptor: String? = nil,
+        isParameter: Bool = false
     ) {
         self.order = order
         self.kind = kind
@@ -229,6 +236,7 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         self.windowTitleHint = windowTitleHint
         self.ocrAnchor = ocrAnchor
         self.targetDescriptor = targetDescriptor
+        self.isParameter = isParameter
     }
 }
 

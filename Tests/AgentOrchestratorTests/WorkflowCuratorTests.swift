@@ -213,6 +213,26 @@ func curatorPromptCarriesOnScreenContentPerCandidate() async {
 }
 
 @Test
+func curatorPromptFlagsParametersThatChangeEachRun() async {
+    // B5: a recipe with a varying typed value must tell the curator so the goal is
+    // written to supply the CURRENT value, not bake in the recorded one.
+    let capture = PromptCapture()
+    let parameterized = DetectedWaste(
+        title: "Save the report", apps: ["TextEdit"], occurrences: 3,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 60,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .click, x: 1, y: 1, appName: "TextEdit"),
+            RecipeStep(order: 1, kind: .type, text: "report-q1", appName: "TextEdit", isParameter: true),
+        ]),
+        evidence: [1], confidence: 0.7, signature: "param-sig"
+    )
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
+    _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture)).curate([parameterized])
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("1 value(s) change each run"))
+}
+
+@Test
 func curateOnePassesOnScreenContentToThePrompt() async {
     let capture = PromptCapture()
     let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
