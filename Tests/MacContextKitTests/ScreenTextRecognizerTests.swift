@@ -3,7 +3,7 @@ import CoreGraphics
 import CoreText
 import Foundation
 import ImageIO
-import MacContextKit
+@testable import MacContextKit
 import Testing
 import UniformTypeIdentifiers
 import Vision
@@ -28,6 +28,47 @@ func fastLevelStillRecognizesText() async {
 func emptyDataRecognizesNothing() async {
     let result = await ScreenTextRecognizer.recognize(inPNG: Data())
     #expect(result.isEmpty)
+}
+
+// MARK: - B4 on-device OCR grounding
+
+private func box(_ text: String, _ rect: CGRect = CGRect(x: 0, y: 0, width: 0.1, height: 0.1)) -> ScreenTextRecognizer.TextBox {
+    ScreenTextRecognizer.TextBox(text: text, boundingBox: rect)
+}
+
+@Test
+func bestMatchPicksExactOverPartialAndRejectsNoise() {
+    let boxes = [box("Delete"), box("Send Message"), box("Send"), box("Reply All")]
+    // Exact label beats the containing "Send Message".
+    #expect(ScreenTextRecognizer.bestMatch(anchor: "Send", in: boxes)?.text == "Send")
+    // No credible match → nil, so the caller falls through to Claude vision / pixel
+    // rather than letting vague text hijack the click.
+    #expect(ScreenTextRecognizer.bestMatch(anchor: "Compose", in: boxes) == nil)
+    #expect(ScreenTextRecognizer.bestMatch(anchor: "", in: boxes) == nil)
+}
+
+@Test
+func ocrMatchScoreMirrorsAXTiers() {
+    #expect(ScreenTextRecognizer.matchScore(needle: "send", candidate: "send") == 3)
+    #expect(ScreenTextRecognizer.matchScore(needle: "send", candidate: "send message") == 2)
+    #expect(ScreenTextRecognizer.matchScore(needle: "send", candidate: "delete") == 0)
+}
+
+@Test
+func recognizeBoxesReturnsTextWithNormalizedBoundingBox() async {
+    // The perception half of the grounder: rendered text must come back WITH a usable
+    // normalized box, and bestMatch must locate it (no real screen capture needed).
+    let png = renderPNG(text: "INVOICE 4821", width: 640, height: 200)
+    let boxes = await Task.detached { ScreenTextRecognizer.recognizeBoxes(inImageData: png) }.value
+    #expect(!boxes.isEmpty)
+    let match = ScreenTextRecognizer.bestMatch(anchor: "INVOICE", in: boxes)
+    let found = try? #require(match)
+    if let found {
+        // Vision boxes are normalized 0…1; a real match sits inside the frame.
+        #expect(found.boundingBox.minX >= 0 && found.boundingBox.maxX <= 1)
+        #expect(found.boundingBox.minY >= 0 && found.boundingBox.maxY <= 1)
+        #expect(found.boundingBox.width > 0 && found.boundingBox.height > 0)
+    }
 }
 
 /// Renders high-contrast text into a PNG so the OCR pass has a deterministic,

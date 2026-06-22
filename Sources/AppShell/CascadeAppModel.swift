@@ -2516,15 +2516,21 @@ public final class CascadeAppModel: ObservableObject {
                     // AX tier and fingerprint verification instead of false-pausing.
                     let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
                     let axUnreliable = stepSkill?.axUnreliable == true
-                    // Tier 1: re-find the element by its recorded AX label in the
-                    // live tree. Tier 2: Claude vision via the OCR anchor. Tier 3:
-                    // the recorded pixel. The tier lands in the step's audit row so
-                    // a drifting recipe is diagnosable from the log.
+                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
+                    // recorded AX label in the live tree. Tier 2 (ocr): B4's ON-DEVICE
+                    // OCR grounder — find the recorded target's text on the live frame
+                    // via Apple Vision, no model round-trip, and it sees canvas/Electron
+                    // text the AX tree can't. Tier 3 (vision): Claude vision via the OCR
+                    // anchor. Tier 4 (recorded): the recorded pixel. The tier lands in
+                    // the step's audit row so a drifting recipe is diagnosable.
                     let target: CGPoint
                     let tier: String
                     if !axUnreliable, let axTarget = await Self.resolveByAX(step: step, recorded: recorded) {
                         target = axTarget
                         tier = "ax"
+                    } else if let ocrTarget = await regroundedByOCR(anchor: step.ocrAnchor ?? step.text) {
+                        target = ocrTarget
+                        tier = "ocr"
                     } else {
                         // Falls back to `recorded` itself when there's no anchor/key.
                         target = await regroundedTarget(anchor: step.ocrAnchor, recorded: recorded)
@@ -2750,6 +2756,32 @@ public final class CascadeAppModel: ObservableObject {
             displayHeightPoints: Int(screen.frame.height)
         )
         guard let local = guidance.point else { return recorded }
+        let appKitGlobal = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
+        return Self.toCGGlobal(appKitGlobal)
+    }
+
+    /// B4 on-device OCR grounder: re-locate a click target by finding its recorded
+    /// text on the live screen via Apple Vision — NO model round-trip and NO
+    /// Accessibility, so it grounds canvas/Electron text the AX tier is blind to, and
+    /// spares the Claude-vision tier (the freeze) when the target carries text.
+    /// Returns nil (caller falls through to Claude vision, then the recorded pixel)
+    /// when there's no anchor or no confident text match. The coordinate conversion
+    /// mirrors `regroundedTarget` EXACTLY: a Vision bounding box is normalized
+    /// lower-left, the same origin as the AppKit display points `local` uses, so the
+    /// box centre maps straight through with no Y-flip.
+    private func regroundedByOCR(anchor: String?) async -> CGPoint? {
+        guard let anchor, !anchor.trimmingCharacters(in: .whitespaces).isEmpty,
+              let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main else {
+            return nil
+        }
+        let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return nil }
+        let boxes = await Task.detached(priority: .userInitiated) {
+            ScreenTextRecognizer.recognizeBoxes(inImageData: shot)
+        }.value
+        guard let match = ScreenTextRecognizer.bestMatch(anchor: anchor, in: boxes) else { return nil }
+        let local = CGPoint(x: match.boundingBox.midX * screen.frame.width,
+                            y: match.boundingBox.midY * screen.frame.height)
         let appKitGlobal = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
         return Self.toCGGlobal(appKitGlobal)
     }
