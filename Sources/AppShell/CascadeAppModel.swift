@@ -2467,6 +2467,11 @@ public final class CascadeAppModel: ObservableObject {
         var unverifiedStreak = 0
         var verifyUnavailableLogged = false
         var skillVerifySkipLogged = false
+        // Pre-replay state gate (JARVIS-1): before the FIRST click we confirm we're
+        // actually in the app the recipe expects. If not, escalate to the goal-driven
+        // assist loop immediately rather than clicking blind into the wrong screen
+        // until two dead clicks trip the drift guard.
+        var startStateChecked = false
         for (index, step) in steps.enumerated() {
             if driver.runState.isStopRequested {
                 agentMessage = "Stopped. Control returned to you."
@@ -2483,12 +2488,25 @@ public final class CascadeAppModel: ObservableObject {
                 // A sheet/dialog the recording never saw is up — recorded
                 // coordinates would click straight into it (tiptour's modal
                 // pause). Hand control back instead of plowing on.
-                if step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick,
-                   let modalTitle = await Self.unexpectedModal() {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
-                    await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
-                    stoppedEarly = true
-                    break
+                if step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
+                    // One-time pre-flight: are we even in the right app before the first
+                    // click? Catches activate-failed / wrong-app-stole-focus before we
+                    // click into the void (activateAndConfirm gives up silently).
+                    if !startStateChecked {
+                        startStateChecked = true
+                        if let reason = Self.startStateMismatch(step: step) {
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.wrongstate", detail: reason))
+                            await escalateRecipeToAssist(agent, reason: reason)
+                            stoppedEarly = true
+                            break
+                        }
+                    }
+                    if let modalTitle = await Self.unexpectedModal() {
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
+                        await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
+                        stoppedEarly = true
+                        break
+                    }
                 }
                 if let x = step.x, let y = step.y,
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
@@ -2645,6 +2663,32 @@ public final class CascadeAppModel: ObservableObject {
     /// Tier-1 target resolution: the element matching the step's recorded AX label
     /// (stored in `text` for click steps), nearest to the recorded point. Runs off
     /// the main actor — AX tree walks take tens of milliseconds.
+    /// Whether the frontmost app is the one a recipe step expects. Bundle id match
+    /// wins outright; otherwise display-name containment EITHER direction — a recorded
+    /// "Keynote" must still match a live "Keynote Creator Studio" (the exact-equality
+    /// blind spot in `activateAndConfirm`). Pure + unit-pinned.
+    nonisolated static func appMatches(frontmostName: String?, frontmostBundle: String?, expectedName: String, expectedBundle: String?) -> Bool {
+        if let expectedBundle, !expectedBundle.isEmpty, let frontmostBundle, !frontmostBundle.isEmpty,
+           expectedBundle == frontmostBundle {
+            return true
+        }
+        guard let frontmostName, !frontmostName.isEmpty, !expectedName.isEmpty else { return false }
+        let live = frontmostName.lowercased(), expected = expectedName.lowercased()
+        return live == expected || live.contains(expected) || expected.contains(live)
+    }
+
+    /// The reason the live screen doesn't match a click step's expected app, or nil
+    /// when it does. The pre-replay state gate (JARVIS-1): escalate to goal-driven
+    /// assist rather than click blind on the wrong screen.
+    private static func startStateMismatch(step: RecipeStep) -> String? {
+        let front = NSWorkspace.shared.frontmostApplication
+        if appMatches(frontmostName: front?.localizedName, frontmostBundle: front?.bundleIdentifier,
+                      expectedName: step.appName, expectedBundle: step.bundleIdentifier) {
+            return nil
+        }
+        return "expected “\(step.appName)” in front but “\(front?.localizedName ?? "no app")” is — the screen isn’t where the recording started"
+    }
+
     private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> CGPoint? {
         let label = (step.text ?? step.ocrAnchor) ?? ""
         let (role, identifier, container) = AXTargetDescriptor.decode(step.targetDescriptor)
@@ -2679,7 +2723,11 @@ public final class CascadeAppModel: ObservableObject {
             if driver.runState.isStopRequested { return }
             try? await Task.sleep(for: .milliseconds(250))
             let front = NSWorkspace.shared.frontmostApplication
-            if front?.bundleIdentifier == bundle || front?.localizedName == name { return }
+            // Containment, not equality: a recorded "Keynote" must confirm against a
+            // live "Keynote Creator Studio" instead of burning the full 2s poll (and
+            // then the B3 state gate would needlessly escalate). Shared matcher.
+            if Self.appMatches(frontmostName: front?.localizedName, frontmostBundle: front?.bundleIdentifier,
+                               expectedName: name, expectedBundle: bundle) { return }
         }
     }
 

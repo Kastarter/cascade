@@ -236,6 +236,25 @@ private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> Detect
 }
 
 @Test
+func startStateGateMatchesAppByBundleOrNameContainment() {
+    // B3 pre-replay state gate. Bundle id match wins outright.
+    #expect(CascadeAppModel.appMatches(frontmostName: "Anything", frontmostBundle: "com.apple.Keynote",
+                                        expectedName: "Keynote", expectedBundle: "com.apple.Keynote"))
+    // Display-name containment EITHER direction — recorded "Keynote" matches a live
+    // "Keynote Creator Studio" (the equality blind spot activateAndConfirm has).
+    #expect(CascadeAppModel.appMatches(frontmostName: "Keynote Creator Studio", frontmostBundle: nil,
+                                        expectedName: "Keynote", expectedBundle: nil))
+    #expect(CascadeAppModel.appMatches(frontmostName: "Word", frontmostBundle: nil,
+                                        expectedName: "Microsoft Word", expectedBundle: nil))
+    // A genuinely different app in front is a mismatch → the gate escalates.
+    #expect(!CascadeAppModel.appMatches(frontmostName: "Finder", frontmostBundle: "com.apple.finder",
+                                        expectedName: "Keynote", expectedBundle: "com.apple.Keynote"))
+    // No app in front (nil) is never a match.
+    #expect(!CascadeAppModel.appMatches(frontmostName: nil, frontmostBundle: nil,
+                                        expectedName: "Keynote", expectedBundle: nil))
+}
+
+@Test
 func repetitionBarNeedsThreeRepeats() {
     // The detector recalls anything seen twice; promoting to a reviewable agent
     // demands a genuine habit — three or more.
