@@ -151,6 +151,24 @@ func mergeVariantsKeepsGenuinelyDifferentRoutinesApart() {
     #expect(merged.count == 2) // dissimilar → not merged
 }
 
+// MARK: - H6 noisy-app exclusion
+
+@Test
+func noisyMeetingAppsAreExcludedFromDetection() {
+    #expect(WasteDetector.isNoisyApp(appName: "zoom.us", bundleIdentifier: "us.zoom.xos"))
+    #expect(WasteDetector.isNoisyApp(appName: "Microsoft Teams", bundleIdentifier: nil))
+    #expect(!WasteDetector.isNoisyApp(appName: "Slack", bundleIdentifier: "com.tinyspeck.slackmacgap")) // chat ≠ excluded
+    #expect(!WasteDetector.isNoisyApp(appName: "Mail", bundleIdentifier: "com.apple.mail"))
+    // A repeated action sequence inside a meeting app produces no workflow.
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<3 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: "Mute", appName: "zoom.us", bundleIdentifier: "us.zoom.xos")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "a", modifiers: ["command"], appName: "zoom.us", bundleIdentifier: "us.zoom.xos")); i += 1
+    }
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+}
+
 // MARK: - H2 composite ranking
 
 private func rankWaste(occ: Int = 3, perRun: Int = 30, steps: [RecipeStep], lastSeen: Date = base, sig: String = "s") -> DetectedWaste {
