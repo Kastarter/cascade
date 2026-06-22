@@ -70,18 +70,26 @@ public struct WasteDetector: Sendable {
         // BURSTS collapse to one gesture first — eight wheel ticks while reading
         // are one movement, not eight automatable steps (they were inflating both
         // the detected "workflows" and the minutes-saved math).
-        let events = Self.collapsingScrollBursts(
+        let collapsed = Self.collapsingScrollBursts(
             inputEvents
                 .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
                 .sorted { $0.capturedAt < $1.capturedAt }
         )
-        guard events.count >= minRunLength * 2 else { return [] }
+        guard collapsed.count >= minRunLength * 2 else { return [] }
 
         // The "surface" an event happened on: the web app inside the browser when one
         // is identifiable (Gmail, Notion…), else the macOS app. Detecting by surface
         // is what makes two web apps in the SAME browser distinct workflows instead of
         // both collapsing into "Chrome". Default (nil resolver) = the app itself.
         let surface: (InputEvent) -> String = { webAppIdentity?($0) ?? $0.appName }
+        // H3 noise pre-filter: drop events whose token appears too few times to be part
+        // of ANY repeated routine. A token seen < minSupport times can't belong to a
+        // pattern with support ≥ minSupport, so this is LOSSLESS for repetition — but it
+        // removes one-off strays (a misclick, an interruption) that sit BETWEEN real
+        // steps, turning an interrupted routine back into a contiguous one the miner can
+        // catch. (van Zelst infrequent-behavior / Tax chaotic-activity filtering.)
+        let events = Self.keepingRepeatableTokens(collapsed, surface: surface, minSupport: 2)
+        guard events.count >= minRunLength * 2 else { return [] }
         let tokens = events.map { Self.token($0, surface: surface($0)) }
         let n = events.count
         var consumed = Set<Int>()
@@ -329,6 +337,18 @@ public struct WasteDetector: Sendable {
         case .scroll:
             return "scroll@\(surface)"
         }
+    }
+
+    /// Drops events whose token appears fewer than `minSupport` times in the stream.
+    /// PROVABLY lossless for repetition: a pattern with support ≥ minSupport needs each
+    /// of its tokens present in ≥ minSupport occurrences, so a token below that count
+    /// cannot be part of any such pattern — only one-off noise (a misclick, a stray
+    /// interruption) is removed, which lets an interrupted routine close back up into a
+    /// contiguous one. Pure given `surface`.
+    static func keepingRepeatableTokens(_ events: [InputEvent], surface: (InputEvent) -> String, minSupport: Int = 2) -> [InputEvent] {
+        var counts: [String: Int] = [:]
+        for event in events { counts[token(event, surface: surface(event)), default: 0] += 1 }
+        return events.filter { (counts[token($0, surface: surface($0))] ?? 0) >= minSupport }
     }
 
     /// Lowercased, whitespace-collapsed, bounded element label — so trivial casing or
