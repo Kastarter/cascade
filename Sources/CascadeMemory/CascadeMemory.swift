@@ -89,6 +89,12 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
     public let appName: String
     public let bundleIdentifier: String?
     public let windowTitle: String?
+    /// For clicks: a stable AX descriptor of the clicked element (encoded
+    /// `role`+`identifier` via `AXTargetDescriptor`), captured live at record time.
+    /// `text` carries the human label; this carries the locator the replay cascade
+    /// ranks on so a moved/renamed control is still re-found. `nil` for keys/scrolls
+    /// and for clicks whose element exposed neither a role nor an identifier.
+    public let targetDescriptor: String?
 
     public init(
         id: Int64 = 0,
@@ -101,7 +107,8 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
         modifiers: [String] = [],
         appName: String,
         bundleIdentifier: String? = nil,
-        windowTitle: String? = nil
+        windowTitle: String? = nil,
+        targetDescriptor: String? = nil
     ) {
         self.id = id
         self.capturedAt = capturedAt
@@ -114,6 +121,35 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
         self.appName = appName
         self.bundleIdentifier = bundleIdentifier
         self.windowTitle = windowTitle
+        self.targetDescriptor = targetDescriptor
+    }
+}
+
+/// Canonical encoding for the stable AX locator recorded with a click — `role` and
+/// `identifier` packed into one string so the replay cascade can rank candidates by
+/// identity (XCUIAutomation-style: identifier is the most stable locator, role
+/// disambiguates equal labels). One source of truth shared by the recorder (write)
+/// and the replay path (read); pure and unit-pinned. Backward compatible: a string
+/// without the separator decodes to `(nil, nil)` and old rows are simply `nil`.
+public enum AXTargetDescriptor {
+    /// U+001F UNIT SEPARATOR — a control char that never appears in a UI label.
+    static let separator = "\u{1F}"
+
+    /// Packs role+identifier; `nil` when both are empty (nothing worth recording).
+    public static func encode(role: String?, identifier: String?) -> String? {
+        let r = (role ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let i = (identifier ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !r.isEmpty || !i.isEmpty else { return nil }
+        return r + separator + i
+    }
+
+    /// Unpacks an encoded descriptor; tolerant of `nil`/legacy unseparated strings.
+    public static func decode(_ encoded: String?) -> (role: String?, identifier: String?) {
+        guard let encoded, encoded.contains(separator) else { return (nil, nil) }
+        let parts = encoded.components(separatedBy: separator)
+        let role = parts.indices.contains(0) ? parts[0] : ""
+        let identifier = parts.indices.contains(1) ? parts[1] : ""
+        return (role.isEmpty ? nil : role, identifier.isEmpty ? nil : identifier)
     }
 }
 
@@ -144,6 +180,11 @@ public struct RecipeStep: Codable, Equatable, Sendable {
     public let bundleIdentifier: String?
     public let windowTitleHint: String?
     public let ocrAnchor: String?
+    /// Stable AX locator of a click target (encoded `role`+`identifier` via
+    /// `AXTargetDescriptor`), carried from the recorded `InputEvent`. The replay
+    /// cascade ranks live candidates on this before falling back to the `ocrAnchor`
+    /// label and finally the recorded pixel. Optional — old recipes decode without it.
+    public let targetDescriptor: String?
 
     public init(
         order: Int,
@@ -156,7 +197,8 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         appName: String,
         bundleIdentifier: String? = nil,
         windowTitleHint: String? = nil,
-        ocrAnchor: String? = nil
+        ocrAnchor: String? = nil,
+        targetDescriptor: String? = nil
     ) {
         self.order = order
         self.kind = kind
@@ -169,6 +211,7 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         self.bundleIdentifier = bundleIdentifier
         self.windowTitleHint = windowTitleHint
         self.ocrAnchor = ocrAnchor
+        self.targetDescriptor = targetDescriptor
     }
 }
 
@@ -649,8 +692,8 @@ public actor CascadeStore {
         do {
             let sql = """
             INSERT INTO input_event
-                (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             for event in events {
                 try withStatement(sql) { statement in
@@ -664,6 +707,7 @@ public actor CascadeStore {
                     bind(event.appName, at: 8, in: statement)
                     bind(event.bundleIdentifier, at: 9, in: statement)
                     bind(event.windowTitle, at: 10, in: statement)
+                    bind(event.targetDescriptor, at: 11, in: statement)
                     try stepDone(statement)
                 }
             }
@@ -677,7 +721,7 @@ public actor CascadeStore {
     /// Most recent input events (newest first).
     public func recentInputEvents(limit: Int = 1000) throws -> [InputEvent] {
         let sql = """
-        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
         ORDER BY captured_at DESC, id DESC
         LIMIT ?;
@@ -698,7 +742,7 @@ public actor CascadeStore {
     /// what `WasteDetector` expects, so the bracketed events feed it directly.
     public func inputEvents(between start: Date, and end: Date, limit: Int = 2000) throws -> [InputEvent] {
         let sql = """
-        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
         WHERE captured_at >= ? AND captured_at <= ?
         ORDER BY captured_at ASC, id ASC
@@ -904,6 +948,7 @@ public actor CascadeStore {
         try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN goal TEXT;", db: db)
+        try? execute("ALTER TABLE input_event ADD COLUMN target_descriptor TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
@@ -945,7 +990,8 @@ public actor CascadeStore {
             modifiers TEXT,
             app_name TEXT NOT NULL,
             bundle_identifier TEXT,
-            window_title TEXT
+            window_title TEXT,
+            target_descriptor TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_input_event_captured_at
             ON input_event(captured_at DESC);
@@ -1076,7 +1122,8 @@ public actor CascadeStore {
             modifiers: text(statement, 7).map { $0.split(separator: ",").map(String.init) } ?? [],
             appName: text(statement, 8) ?? "Unknown",
             bundleIdentifier: text(statement, 9),
-            windowTitle: text(statement, 10)
+            windowTitle: text(statement, 10),
+            targetDescriptor: text(statement, 11)
         )
     }
 

@@ -2646,10 +2646,13 @@ public final class CascadeAppModel: ObservableObject {
     /// (stored in `text` for click steps), nearest to the recorded point. Runs off
     /// the main actor — AX tree walks take tens of milliseconds.
     private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> CGPoint? {
-        let label = step.text ?? step.ocrAnchor
-        guard let label, !label.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        let label = (step.text ?? step.ocrAnchor) ?? ""
+        let (role, identifier) = AXTargetDescriptor.decode(step.targetDescriptor)
+        // Need a label or a stable identifier to re-find the element by identity.
+        guard !label.trimmingCharacters(in: .whitespaces).isEmpty || (identifier?.isEmpty == false) else { return nil }
+        let descriptor = AXElementResolver.Descriptor(label: label, role: role, identifier: identifier)
         return await Task.detached(priority: .userInitiated) {
-            AXElementResolver.find(label: label, near: recorded)?.center
+            AXElementResolver.find(descriptor: descriptor, near: recorded)?.center
         }.value
     }
 
@@ -2715,7 +2718,8 @@ public final class CascadeAppModel: ObservableObject {
             appName: step.appName,
             bundleIdentifier: step.bundleIdentifier,
             windowTitleHint: step.windowTitleHint,
-            ocrAnchor: step.ocrAnchor
+            ocrAnchor: step.ocrAnchor,
+            targetDescriptor: step.targetDescriptor
         )
     }
 

@@ -18,6 +18,22 @@ public enum AXElementResolver {
         public let score: Double
     }
 
+    /// A recorded click target as a ranked tuple of coordinate-free locators
+    /// (XCUIAutomation model): the accessibility `identifier` is the most stable
+    /// (survives move/rename/localization), `role` disambiguates equal labels, and
+    /// the `label` text is the base signal. Replay re-finds the element by ranking
+    /// live candidates on these, falling back to label-only, then the recorded pixel.
+    public struct Descriptor: Sendable {
+        public let label: String
+        public let role: String?
+        public let identifier: String?
+        public init(label: String, role: String? = nil, identifier: String? = nil) {
+            self.label = label
+            self.role = role
+            self.identifier = identifier
+        }
+    }
+
     /// Roles worth clicking — tiptour's "pointable" set.
     private static let pointableRoles: Set<String> = [
         "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
@@ -30,11 +46,23 @@ public enum AXElementResolver {
     private static let maxDepth = 16
 
     /// Finds the best element matching `label` in the frontmost app's windows.
-    /// `near` (CG global top-left) breaks ties toward where the click was recorded.
-    /// Returns nil when Accessibility is unavailable or nothing scores well enough.
+    /// Thin wrapper over `find(descriptor:)` for callers that only have a label —
+    /// behaviour is identical to the original label-only matcher (no role/identifier
+    /// signal means `rank` reduces to the text score).
     public static func find(label: String, near recorded: CGPoint? = nil) -> Match? {
-        let needle = normalize(label)
-        guard !needle.isEmpty, AXIsProcessTrusted(),
+        find(descriptor: Descriptor(label: label), near: recorded)
+    }
+
+    /// Finds the best element matching a recorded `descriptor` in the frontmost app's
+    /// windows, ranking live candidates by identity (identifier > role-confirmed label
+    /// > label) so a moved or renamed control is still re-found. `near` (CG global
+    /// top-left) breaks ties toward where the click was recorded. Returns nil when
+    /// Accessibility is unavailable or nothing scores above zero.
+    public static func find(descriptor: Descriptor, near recorded: CGPoint? = nil) -> Match? {
+        // An identifier can match with no label, so don't require a non-empty label
+        // up front — `rank` decides per candidate.
+        guard !descriptor.label.isEmpty || !(descriptor.identifier ?? "").isEmpty,
+              AXIsProcessTrusted(),
               let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.3)
@@ -44,17 +72,19 @@ public enum AXElementResolver {
         var visited = 0
         for window in windows(of: app) {
             walk(window, depth: 0, visited: &visited) { element, role in
-                guard pointableRoles.contains(role), let text = labelText(of: element) else { return }
-                let score = matchScore(needle: needle, candidate: normalize(text))
+                guard pointableRoles.contains(role) else { return }
+                let text = labelText(of: element)
+                let candidate = Descriptor(label: text ?? "", role: role, identifier: identifier(of: element))
+                let score = rank(recorded: descriptor, candidate: candidate)
                 guard score > 0 else { return }
                 guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
                 let center = CGPoint(x: frame.midX, y: frame.midY)
-                // Distance only breaks ties between equal text scores.
+                // Distance only breaks ties between equally-scored candidates.
                 let distance = recorded.map { hypot(center.x - $0.x, center.y - $0.y) } ?? 0
-                let rank = score * 10_000 - min(distance, 9_999)
-                if best == nil || rank > bestRank {
-                    best = Match(center: center, role: role, title: text, score: score)
-                    bestRank = rank
+                let combined = score * 10_000 - min(distance, 9_999)
+                if best == nil || combined > bestRank {
+                    best = Match(center: center, role: role, title: text ?? "", score: score)
+                    bestRank = combined
                 }
             }
         }
@@ -168,6 +198,32 @@ public enum AXElementResolver {
 
     // MARK: - Matching
 
+    /// Ranks a live `candidate` against the recorded `descriptor`. 0 = no match (must
+    /// never hijack a click). A matching accessibility identifier dominates — it is
+    /// unique and survives moves/renames/localization. Otherwise the label text score
+    /// is the base, with role agreement nudging same-role candidates above
+    /// different-role ones (a menu "Save" vs a button "Save"). Pure + unit-pinned:
+    /// label-only descriptors (role/identifier nil, e.g. legacy recipes) reduce
+    /// exactly to `matchScore`, so the wrapper preserves the old behaviour.
+    static func rank(recorded: Descriptor, candidate: Descriptor) -> Double {
+        if let rid = recorded.identifier, !rid.isEmpty,
+           let cid = candidate.identifier, !cid.isEmpty, rid == cid {
+            return 100
+        }
+        let labelScore = matchScore(needle: normalize(recorded.label), candidate: normalize(candidate.label))
+        guard labelScore > 0 else { return 0 }
+        // Role is a TIEBREAKER, not an override: ±0.25 (spread 0.5) keeps the nudge
+        // strictly inside one integer label-score tier, so a same-role candidate wins
+        // among equal labels but never beats a clearly-better label match in another role.
+        let roleBonus: Double
+        if let rr = recorded.role, !rr.isEmpty, let cr = candidate.role, !cr.isEmpty {
+            roleBonus = (rr == cr) ? 0.25 : -0.25
+        } else {
+            roleBonus = 0
+        }
+        return labelScore + roleBonus
+    }
+
     /// 3 = exact, 2 = one contains the other, 1+overlap = shared words. Below 1 is
     /// no match — vague labels must not hijack a click.
     static func matchScore(needle: String, candidate: String) -> Double {
@@ -221,6 +277,14 @@ public enum AXElementResolver {
             }
         }
         return nil
+    }
+
+    /// The element's accessibility identifier (`kAXIdentifierAttribute`) — the most
+    /// stable locator when an app sets one (many Mac apps don't, hence the cascade).
+    private static func identifier(of element: AXUIElement) -> String? {
+        guard let id = string(of: element, kAXIdentifierAttribute as String),
+              !id.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return id
     }
 
     private static func string(of element: AXUIElement, _ attribute: String) -> String? {

@@ -25,6 +25,46 @@ func inputEventsRoundTrip() async throws {
 }
 
 @Test
+func inputEventTargetDescriptorRoundTrips() async throws {
+    // B1: the stable AX locator recorded with a click must survive insert→read so the
+    // replay cascade can rank on it (proves the column + migration + decode).
+    let store = try makeAgentStore()
+    let descriptor = AXTargetDescriptor.encode(role: "AXButton", identifier: "composeSend")
+    try await store.insertInputEvents([
+        InputEvent(kind: .click, x: 5, y: 6, text: "Send", appName: "Mail", targetDescriptor: descriptor),
+        InputEvent(kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+    ])
+
+    let events = try await store.recentInputEvents(limit: 10)
+    let click = try #require(events.first { $0.kind == .click })
+    #expect(click.targetDescriptor == descriptor)
+    let (role, identifier) = AXTargetDescriptor.decode(click.targetDescriptor)
+    #expect(role == "AXButton")
+    #expect(identifier == "composeSend")
+    // Non-click events carry no descriptor.
+    #expect(events.first { $0.kind == .key }?.targetDescriptor == nil)
+}
+
+@Test
+func axTargetDescriptorEncodesDecodesAndToleratesLegacy() {
+    // Round-trip both fields, role-only, and the legacy/empty cases.
+    let both = AXTargetDescriptor.encode(role: "AXButton", identifier: "send")
+    #expect(AXTargetDescriptor.decode(both).role == "AXButton")
+    #expect(AXTargetDescriptor.decode(both).identifier == "send")
+
+    let roleOnly = AXTargetDescriptor.encode(role: "AXMenuItem", identifier: nil)
+    #expect(AXTargetDescriptor.decode(roleOnly).role == "AXMenuItem")
+    #expect(AXTargetDescriptor.decode(roleOnly).identifier == nil)
+
+    // Both empty → nothing worth recording.
+    #expect(AXTargetDescriptor.encode(role: nil, identifier: nil) == nil)
+    #expect(AXTargetDescriptor.encode(role: "  ", identifier: "") == nil)
+    // Legacy unseparated string / nil decode to (nil, nil), never crash.
+    #expect(AXTargetDescriptor.decode("just a label").role == nil)
+    #expect(AXTargetDescriptor.decode(nil).identifier == nil)
+}
+
+@Test
 func prunePurgesOldInputEvents() async throws {
     let store = try makeAgentStore()
     try await store.insertInputEvents([

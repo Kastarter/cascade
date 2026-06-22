@@ -195,7 +195,8 @@ public struct WasteDetector: Sendable {
                 appName: event.appName,
                 bundleIdentifier: event.bundleIdentifier,
                 windowTitleHint: event.windowTitle,
-                ocrAnchor: Self.ocrAnchor(for: event, contexts: contexts)
+                ocrAnchor: Self.ocrAnchor(for: event, contexts: contexts),
+                targetDescriptor: event.targetDescriptor
             ))
             order += 1
         }
