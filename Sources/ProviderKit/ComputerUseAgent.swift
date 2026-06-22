@@ -89,6 +89,10 @@ public final class ComputerUseAgent {
     private var resH = 800
     private var displayW = 0
     private var displayH = 0
+    /// The most recent FULL-screen frame sent to the model (resized to resW×resH),
+    /// kept so `fill_target` can ground a named target against exactly what the
+    /// model is looking at. Zoom crops never overwrite it.
+    private var lastFrameJPEG: Data?
 
     private let effort: String
     /// Extra environment context appended to the system prompt (e.g. "you're in a web
@@ -117,6 +121,12 @@ public final class ComputerUseAgent {
     /// provider owns auditing and gating. Off for surfaces with no record (the
     /// web sandbox), so their behaviour is unchanged.
     private let recallEnabled: Bool
+    /// Grounding split (Phase 1): when set, the on-screen agent is offered
+    /// `fill_target`, where the model NAMES a target and the RUNTIME locates it via
+    /// this grounder (local UI-TARS or Claude) and acts on it — the model never has
+    /// to pin pixels. nil = feature off (the web sandbox and every existing caller),
+    /// so behaviour is unchanged. See [[cascade-cu-downgrade-research]].
+    private let grounder: VisualGrounder?
 
     /// Mid-stream delivery: when set, each completed text block and screen action
     /// is handed over the moment it finishes generating, so the caller acts while
@@ -282,7 +292,8 @@ public final class ComputerUseAgent {
         harnessTier: HarnessTier = .off,
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
         extraTools: [[String: Any]] = [],
-        recallEnabled: Bool = false
+        recallEnabled: Bool = false,
+        grounder: VisualGrounder? = nil
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -296,6 +307,7 @@ public final class ComputerUseAgent {
         // Recall needs the same in-process provider the harness uses; without it
         // there is nothing to route the calls to.
         self.recallEnabled = recallEnabled && harnessProvider != nil
+        self.grounder = grounder
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -332,6 +344,7 @@ public final class ComputerUseAgent {
         guard let jpeg = resize(screenshot, resW, resH) else {
             return CUStep(actions: [], text: "I couldn't read the screen.", done: true)
         }
+        lastFrameJPEG = jpeg
         for turn in conversation {
             messages.append(["role": "user", "content": turn.user])
             messages.append(["role": "assistant", "content": turn.assistant])
@@ -351,6 +364,9 @@ public final class ComputerUseAgent {
         guard !pendingToolIDs.isEmpty, let jpeg else {
             return CUStep(actions: [], text: "", done: true)
         }
+        // A zoom crop is not the full screen — never let it become the frame
+        // fill_target grounds against.
+        if !zoomResult { lastFrameJPEG = jpeg }
         var results: [[String: Any]] = []
         // The screenshot answers the last tool call that wasn't already resolved
         // in-process (use_skill); resolved ids get their text instead of "done".
@@ -464,6 +480,13 @@ public final class ComputerUseAgent {
         if extraTools.isEmpty {
             tools.insert(Self.fillFieldToolDefinition(), at: tools.count - 1)
         }
+        // Grounding split: when a grounder is injected, offer fill_target — the
+        // model NAMES the target in words and the runtime grounds + acts. Only
+        // offered when a grounder exists, so the model is never shown a tool whose
+        // backend isn't running. On-screen agent only (web sandbox has DOM tools).
+        if grounder != nil, extraTools.isEmpty {
+            tools.insert(Self.fillTargetToolDefinition(), at: tools.count - 1)
+        }
         if skillProvider != nil {
             tools.insert([
                 "name": "use_skill",
@@ -557,6 +580,17 @@ public final class ComputerUseAgent {
                     // THIS turn's batch (one screenshot after) — not streamed, so
                     // the chain runs together rather than one block at a time.
                     if let expanded = parseFillField(input) { actions.append(contentsOf: expanded) }
+                case "fill_target":
+                    // The runtime grounds the named target (UI-TARS/Claude) and
+                    // expands to the same click → cmd+a → type → submit batch. On a
+                    // grounding miss, tell the model so it re-describes or clicks
+                    // directly — answered inline (no wasted screenshot turn).
+                    if let expanded = await expandFillTarget(input) {
+                        actions.append(contentsOf: expanded)
+                    } else if let id = block["id"] as? String {
+                        let target = input["target"] as? String ?? "that"
+                        toolResultOverrides[id] = "Couldn't locate “\(target)” on the screen. Describe it more specifically, or click it directly with the computer tool."
+                    }
                 case let name? where AgentHarness.isHarnessTool(name)
                     || (recallEnabled && RecordRecall.isRecallTool(name))
                     || extraToolNames.contains(name):
@@ -655,26 +689,73 @@ public final class ComputerUseAgent {
 
     /// Expands a `fill_field` call into the click → select-all → type → submit
     /// chain it stands for. Returns nil if the call is malformed (no coordinate
-    /// or text) so the turn falls through rather than acting on garbage.
+    /// or text) so the turn falls through rather than acting on garbage. The model
+    /// supplies coordinates here, so they are `scale`d from screenshot pixels.
     func parseFillField(_ input: [String: Any]) -> [CUAction]? {
         guard let coord = input["coordinate"] as? [NSNumber], coord.count == 2,
               let text = input["text"] as? String else { return nil }
         let p = scale(CGPoint(x: coord[0].doubleValue, y: coord[1].doubleValue))
-        var actions: [CUAction] = []
-        if (input["click"] as? String) == "double" {
-            actions.append(.doubleClick(x: p.x, y: p.y))
-        } else {
-            actions.append(.click(x: p.x, y: p.y))
-        }
-        actions.append(.key("cmd+a"))
-        actions.append(.type(text))
-        switch (input["submit"] as? String) ?? "return" {
+        return Self.fillActions(at: p, text: text, double: (input["click"] as? String) == "double", submit: input["submit"] as? String)
+    }
+
+    /// The shared click → cmd+a → type → submit expansion. `point` is already in
+    /// display-local AppKit points (fill_field scales the model's pixels into this
+    /// space; fill_target's grounder returns it directly). Pure + pinned.
+    static func fillActions(at point: CGPoint, text: String, double: Bool, submit: String?) -> [CUAction] {
+        var actions: [CUAction] = [
+            double ? .doubleClick(x: point.x, y: point.y) : .click(x: point.x, y: point.y),
+            .key("cmd+a"),
+            .type(text),
+        ]
+        switch submit ?? "return" {
         case "none": break
         case "tab": actions.append(.key("tab"))
         case "cmd_return": actions.append(.key("cmd+return"))
         default: actions.append(.key("return"))
         }
         return actions
+    }
+
+    /// `fill_target` — the structural grounding split. The model NAMES the target
+    /// (no coordinate) and the runtime grounds it. Offered only when a grounder is
+    /// injected.
+    private static func fillTargetToolDefinition() -> [String: Any] {
+        [
+            "name": "fill_target",
+            "description": "Put text into ONE spot you DESCRIBE in words instead of pinpointing pixels: name the target (e.g. \"the subtitle placeholder\", \"the search box\", \"the To field\") and Cascade locates it, clicks it, selects any existing content, types your text (replacing it), and presses the finishing key — all in one turn. Prefer this over fill_field whenever you can describe the target more reliably than you can pin its exact pixel coordinates — especially on canvases (Keynote/Pages slides, design tools) where placeholders are hard to hit by coordinate.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "target": ["type": "string", "description": "What to fill, described so it can be found on screen — its label, role, or the visible placeholder text"],
+                    "text": ["type": "string", "description": "The text to enter (replaces any existing content)"],
+                    "click": [
+                        "type": "string", "enum": ["single", "double"],
+                        "description": "single click for normal fields, search boxes, and cells; double for a placeholder that needs a double-click to start editing (e.g. a Keynote title placeholder). Default single.",
+                    ],
+                    "submit": [
+                        "type": "string", "enum": ["return", "cmd_return", "tab", "none"],
+                        "description": "key pressed after typing: return confirms (default); cmd_return finishes editing a Keynote/Pages text box without adding a newline; tab moves to the next field; none leaves the cursor in place.",
+                    ],
+                ],
+                "required": ["target", "text"],
+            ],
+        ]
+    }
+
+    /// Grounds the named target against the last full frame and expands to the
+    /// fill batch. Returns nil when there's no grounder, no frame, the call is
+    /// malformed, or the grounder finds nothing — the caller then tells the model.
+    /// `frame` defaults to the live frame; tests inject one to exercise the glue.
+    func expandFillTarget(_ input: [String: Any], frame: Data? = nil) async -> [CUAction]? {
+        guard let grounder, let frame = frame ?? lastFrameJPEG,
+              let target = (input["target"] as? String), !target.isEmpty,
+              let text = input["text"] as? String else { return nil }
+        guard let point = await grounder.ground(
+            screenshot: frame, target: target,
+            displayWidthPoints: displayW, displayHeightPoints: displayH
+        ) else { return nil }
+        // The grounder returns display-local AppKit points already — do NOT scale.
+        return Self.fillActions(at: point, text: text, double: (input["click"] as? String) == "double", submit: input["submit"] as? String)
     }
 
     /// Tool definitions for the direct-Mac harness. Read-only tools ride every

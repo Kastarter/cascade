@@ -1095,8 +1095,32 @@ public final class CascadeAppModel: ObservableObject {
             // Let the agent recall what the user already saw on screen — the whole
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
-            recallEnabled: true
+            recallEnabled: true,
+            // Grounding split (Phase 1): when enabled, offer fill_target backed by
+            // a grounder. Defaulted OFF — Opus stays the only thing that runs until
+            // the user opts in, so this is a no-op for existing behaviour.
+            grounder: Self.assistGrounder()
         )
+    }
+
+    /// Builds the on-screen grounder from gated UserDefaults config, or nil when
+    /// off (the default). Backend "claude" uses the proven cloud ElementLocator
+    /// (verify the fill_target wiring end-to-end before standing up a local model);
+    /// "uitars" uses a locally-served UI-TARS-1.5-7B (the cost + latency win).
+    /// Mirrors the powerHarness opt-in pattern: never offer a tool whose backend
+    /// isn't there. See [[cascade-cu-downgrade-research]].
+    static func assistGrounder() -> VisualGrounder? {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: "cascade.visualGrounder") else { return nil }
+        switch d.string(forKey: "cascade.visualGrounder.backend") {
+        case "uitars":
+            let url = d.string(forKey: "cascade.visualGrounder.uitarsURL").flatMap(URL.init(string:))
+                ?? URL(string: "http://localhost:8000/v1/chat/completions")!
+            let model = d.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "ui-tars-1.5-7b"
+            return UITARSGrounder(baseURL: url, model: model)
+        default:
+            return ClaudeVisualGrounder()
+        }
     }
 
     private func runAssistEpisode(
@@ -1247,8 +1271,18 @@ public final class CascadeAppModel: ObservableObject {
                 }
             }
             if step.done {
+                let claimed = step.text.isEmpty ? "Done." : step.text
+                // Validator stage: a run that DID work and claims done is checked
+                // against fresh on-screen evidence (gated off by default → nil, no
+                // overhead). A clear mismatch is reported honestly instead of a
+                // false "done".
+                if acted, let missing = await validateAssistCompletion(goal: goal, claimed: claimed, screen: screen) {
+                    auditTiming(outcome: "incomplete")
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: "INCOMPLETE: \(missing.prefix(80))"))
+                    return .stalled("I'm not sure that finished — \(missing)")
+                }
                 auditTiming(outcome: "finished")
-                return .finished(step.text.isEmpty ? "Done." : step.text, acted: acted)
+                return .finished(claimed, acted: acted)
             }
 
             // A turn that only LOOKED — screenshot/wait requests, nothing else —
@@ -1495,6 +1529,57 @@ public final class CascadeAppModel: ObservableObject {
     private func episodeNote(_ nudge: String?) -> String? {
         guard let nudge else { return groundingNote() }
         return [groundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    /// Validator stage (Phase 1) — a fresh-evidence second opinion on the model's
+    /// "done", ported from the background agent's `verifyCompletion`. The model's
+    /// claim is NOT trusted on its own (the audited "declared done but didn't"
+    /// case); a fresh screenshot is OCR'd and a cheap verifier judges ONLY that
+    /// evidence — never the agent's narration (narration-judges over-report). On a
+    /// CLEAR mismatch the run is downgraded to `.stalled` and the user is told what's
+    /// missing; doubt leans accept so genuine wins still pass.
+    ///
+    /// Gated OFF by default (`cascade.assistValidator`): it adds a capture + OCR +
+    /// model round trip to the END of a finished run, which is latency on the
+    /// watched success path Opus rarely needs. It is the reliability net for a
+    /// downgraded thinker (Phase 3), which false-completes far more — build it now,
+    /// switch it on then. See [[cascade-cu-downgrade-research]].
+    private func validateAssistCompletion(goal: String, claimed: String, screen: NSScreen) async -> String? {
+        guard UserDefaults.standard.bool(forKey: "cascade.assistValidator"), hasAnthropicKey else { return nil }
+        let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return nil }
+        let onScreen = await ScreenTextRecognizer.recognize(inPNG: shot)
+        // Can't judge a screen we couldn't read (sparse OCR / canvas app) → accept
+        // rather than false-fail a real win.
+        if onScreen.trimmingCharacters(in: .whitespacesAndNewlines).count < 8 { return nil }
+        let user = """
+        An on-screen assistant was asked to: \(goal)
+        When it claimed DONE it said: \(claimed)
+        The text now visible on the user's screen:
+        \(onScreen.prefix(2800))
+
+        Judging ONLY by what's on screen, did it ACTUALLY accomplish the task — is the \
+        result the task wanted genuinely there (the slide built and filled, the message \
+        sent, the value entered, the file shown)? If yes, or if you're not sure, reply \
+        exactly: VERIFIED. Only if the screen CLEARLY shows it is not done reply: \
+        INCOMPLETE: <one short line on what's missing>
+        """
+        guard let reply = try? await AnthropicClient().complete(
+            system: "You verify whether an on-screen assistant truly finished its task, judging only by what is visible on screen now. Lean VERIFIED unless it's clearly not done.",
+            user: user, model: AnthropicModel.haiku, maxTokens: 120
+        ) else { return nil }  // verifier unavailable → never block a completion
+        return Self.parseAssistVerdict(reply)
+    }
+
+    /// Parses the validator's reply: an INCOMPLETE reason, or nil to accept
+    /// (VERIFIED / unclear / empty all accept). Pure + pinned. Mirrors the
+    /// background agent's verdict parse.
+    nonisolated static func parseAssistVerdict(_ reply: String) -> String? {
+        let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.uppercased().hasPrefix("INCOMPLETE") else { return nil }
+        let reason = trimmed.dropFirst("INCOMPLETE".count)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
+        return reason.isEmpty ? "the screen doesn't show the task was completed" : reason
     }
 
     /// One line of text grounding sent with every frame: which app and window are
@@ -2484,6 +2569,15 @@ public final class CascadeAppModel: ObservableObject {
                 await activateAndConfirm(name: step.appName, bundle: step.bundleIdentifier)
                 continue
             }
+            // Per-step precondition: a parameter (per-run-varying) value can't be
+            // replayed from the recording. Hand the rest to the assist runtime,
+            // which supplies the current value — never retype the stale one.
+            if Self.recipeStepNeedsLiveValue(step) {
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.parameter", detail: Self.recipeLabel(step)))
+                await escalateRecipeToAssist(agent, reason: "this step enters a value that changes each run, and I need the current one")
+                stoppedEarly = true
+                break
+            }
             do {
                 // A sheet/dialog the recording never saw is up — recorded
                 // coordinates would click straight into it (tiptour's modal
@@ -2673,6 +2767,19 @@ public final class CascadeAppModel: ObservableObject {
     /// wins outright; otherwise display-name containment EITHER direction — a recorded
     /// "Keynote" must still match a live "Keynote Creator Studio" (the exact-equality
     /// blind spot in `activateAndConfirm`). Pure + unit-pinned.
+    /// Per-step precondition for parameterized replay (Phase 1, AWM-style). A
+    /// `.type` step flagged `isParameter` typed a value that VARIED across the
+    /// recorded occurrences — an order number, a date, a name that changes each
+    /// run. Deterministic replay only has the STALE recorded value, so its
+    /// precondition ("I have the current value") fails: replay must hand off to the
+    /// assist runtime, whose deploy goal is written parameter-aware and supplies
+    /// the right value from context — never blindly retype last run's. Fixed steps
+    /// and pre-`isParameter` recipes return false and replay normally. Pure +
+    /// pinned. See [[cascade-cu-downgrade-research]].
+    nonisolated static func recipeStepNeedsLiveValue(_ step: RecipeStep) -> Bool {
+        step.kind == .type && step.isParameter
+    }
+
     nonisolated static func appMatches(frontmostName: String?, frontmostBundle: String?, expectedName: String, expectedBundle: String?) -> Bool {
         if let expectedBundle, !expectedBundle.isEmpty, let frontmostBundle, !frontmostBundle.isEmpty,
            expectedBundle == frontmostBundle {

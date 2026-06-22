@@ -236,6 +236,40 @@ private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> Detect
 }
 
 @Test
+func parameterTypeStepEscalatesInsteadOfReplayingStaleValue() {
+    // Phase 1 parameterized replay: a .type step whose value varied across the
+    // recorded runs (an order #, a date) is a parameter — replay can't supply the
+    // current value, so its precondition fails and it hands off to the assist
+    // runtime. Fixed steps and non-type steps replay normally.
+    #expect(CascadeAppModel.recipeStepNeedsLiveValue(
+        RecipeStep(order: 2, kind: .type, text: "order #4471", appName: "Mail", isParameter: true)))
+    // A fixed .type step (same content every run) replays its recorded text.
+    #expect(!CascadeAppModel.recipeStepNeedsLiveValue(
+        RecipeStep(order: 2, kind: .type, text: "Best regards", appName: "Mail", isParameter: false)))
+    // Old recipes predate isParameter (defaults false) → replay unchanged.
+    #expect(!CascadeAppModel.recipeStepNeedsLiveValue(
+        RecipeStep(order: 2, kind: .type, text: "anything", appName: "Mail")))
+    // Only .type carries a typed value; a click never needs a live value.
+    #expect(!CascadeAppModel.recipeStepNeedsLiveValue(
+        RecipeStep(order: 1, kind: .click, x: 1, y: 1, appName: "Mail", isParameter: true)))
+}
+
+@Test
+func assistValidatorAcceptsUnlessClearlyIncomplete() {
+    // Phase 1 validator stage: judge by fresh evidence, lean accept. VERIFIED,
+    // unclear, and empty all accept (nil); only a clear INCOMPLETE downgrades the
+    // run and carries the "what's missing" reason.
+    #expect(CascadeAppModel.parseAssistVerdict("VERIFIED") == nil)
+    #expect(CascadeAppModel.parseAssistVerdict("  verified — the slide has a title and subtitle ") == nil)
+    #expect(CascadeAppModel.parseAssistVerdict("I'm not sure, looks done-ish") == nil)  // doubt → accept
+    #expect(CascadeAppModel.parseAssistVerdict("") == nil)
+    #expect(CascadeAppModel.parseAssistVerdict("INCOMPLETE: the subtitle placeholder is still empty")
+        == "the subtitle placeholder is still empty")
+    // Bare INCOMPLETE with no reason still downgrades, with a default reason.
+    #expect(CascadeAppModel.parseAssistVerdict("INCOMPLETE") == "the screen doesn't show the task was completed")
+}
+
+@Test
 func startStateGateMatchesAppByBundleOrNameContainment() {
     // B3 pre-replay state gate. Bundle id match wins outright.
     #expect(CascadeAppModel.appMatches(frontmostName: "Anything", frontmostBundle: "com.apple.Keynote",
