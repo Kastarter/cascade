@@ -1105,25 +1105,27 @@ public final class CascadeAppModel: ObservableObject {
 
     /// Builds the on-screen grounder that backs `fill_target`. ON by default (no
     /// Settings UI yet) — opt out with `cascade.visualGrounder = false`. Backend
-    /// defaults to "claude" (the proven cloud ElementLocator) so the grounding
-    /// split works with zero local setup; set `cascade.visualGrounder.backend =
-    /// "uitars"` AND serve a local UI-TARS-1.5-7B for the free, on-device grounder
-    /// (the cost + latency win). When uitars is selected but no model is serving,
-    /// each ground call fails fast and the agent falls back to the computer tool —
-    /// degraded, never broken. See [[cascade-cu-downgrade-research]].
+    /// defaults to "uitars" (the free, on-device UI-TARS-1.5-7B — the cost +
+    /// latency win): serve `mlx-community/UI-TARS-1.5-7B-4bit` locally and it's
+    /// used automatically. Until a model is serving, each ground call fails fast
+    /// and the agent falls back to the computer tool — degraded, never broken. Set
+    /// `cascade.visualGrounder.backend = "claude"` to use the proven cloud
+    /// ElementLocator instead (works with zero local setup, but costs a cloud call
+    /// per locate). See [[cascade-cu-downgrade-research]].
     static func assistGrounder() -> VisualGrounder? {
         let d = UserDefaults.standard
         // Default ON: unset → enabled; explicit false → disabled.
         let enabled = (d.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
         guard enabled else { return nil }
         switch d.string(forKey: "cascade.visualGrounder.backend") {
-        case "uitars":
+        case "claude":
+            return ClaudeVisualGrounder()
+        default:
+            // Default (and explicit "uitars"): the free local grounder.
             let url = d.string(forKey: "cascade.visualGrounder.uitarsURL").flatMap(URL.init(string:))
                 ?? URL(string: "http://localhost:8000/v1/chat/completions")!
             let model = d.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "ui-tars-1.5-7b"
             return UITARSGrounder(baseURL: url, model: model)
-        default:
-            return ClaudeVisualGrounder()
         }
     }
 
