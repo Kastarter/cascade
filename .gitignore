@@ -36,3 +36,7 @@ secrets/
 # Logs
 *.log
 logs/
+
+# Local demo video projects (Remotion + node_modules + rendered output — ~1GB)
+agent-demo/
+demo-remotion/

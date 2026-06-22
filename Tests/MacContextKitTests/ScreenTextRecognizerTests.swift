@@ -6,11 +6,21 @@ import ImageIO
 import MacContextKit
 import Testing
 import UniformTypeIdentifiers
+import Vision
 
 @Test
 func recognizesRenderedText() async {
     let png = renderPNG(text: "CASCADE OCR 2026", width: 640, height: 200)
     let result = await ScreenTextRecognizer.recognize(inPNG: png)
+    #expect(result.uppercased().contains("CASCADE"))
+}
+
+@Test
+func fastLevelStillRecognizesText() async {
+    // The recorder runs `.fast` on rich-AX frames as a cheap insurance pass;
+    // it must still read high-contrast on-screen text.
+    let png = renderPNG(text: "CASCADE FAST", width: 640, height: 200)
+    let result = await ScreenTextRecognizer.recognize(inPNG: png, level: .fast)
     #expect(result.uppercased().contains("CASCADE"))
 }
 

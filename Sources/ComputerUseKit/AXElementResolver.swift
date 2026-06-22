@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CascadeMemory
 import Foundation
 
 // Accessibility-tree target resolution for replaying recorded recipes.
@@ -18,6 +19,27 @@ public enum AXElementResolver {
         public let score: Double
     }
 
+    /// A recorded click target as a ranked tuple of coordinate-free locators
+    /// (XCUIAutomation model): the accessibility `identifier` is the most stable
+    /// (survives move/rename/localization), `role` disambiguates equal labels, and
+    /// the `label` text is the base signal. Replay re-finds the element by ranking
+    /// live candidates on these, falling back to label-only, then the recorded pixel.
+    public struct Descriptor: Sendable {
+        public let label: String
+        public let role: String?
+        public let identifier: String?
+        /// The element's structural container (parent role+title) — disambiguates
+        /// identical labels by where they sit (Healenium-style), e.g. the "Save" in
+        /// dialog A vs B, or a cell by its row. `nil` when not recorded/available.
+        public let container: String?
+        public init(label: String, role: String? = nil, identifier: String? = nil, container: String? = nil) {
+            self.label = label
+            self.role = role
+            self.identifier = identifier
+            self.container = container
+        }
+    }
+
     /// Roles worth clicking — tiptour's "pointable" set.
     private static let pointableRoles: Set<String> = [
         "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
@@ -30,11 +52,23 @@ public enum AXElementResolver {
     private static let maxDepth = 16
 
     /// Finds the best element matching `label` in the frontmost app's windows.
-    /// `near` (CG global top-left) breaks ties toward where the click was recorded.
-    /// Returns nil when Accessibility is unavailable or nothing scores well enough.
+    /// Thin wrapper over `find(descriptor:)` for callers that only have a label —
+    /// behaviour is identical to the original label-only matcher (no role/identifier
+    /// signal means `rank` reduces to the text score).
     public static func find(label: String, near recorded: CGPoint? = nil) -> Match? {
-        let needle = normalize(label)
-        guard !needle.isEmpty, AXIsProcessTrusted(),
+        find(descriptor: Descriptor(label: label), near: recorded)
+    }
+
+    /// Finds the best element matching a recorded `descriptor` in the frontmost app's
+    /// windows, ranking live candidates by identity (identifier > role-confirmed label
+    /// > label) so a moved or renamed control is still re-found. `near` (CG global
+    /// top-left) breaks ties toward where the click was recorded. Returns nil when
+    /// Accessibility is unavailable or nothing scores above zero.
+    public static func find(descriptor: Descriptor, near recorded: CGPoint? = nil) -> Match? {
+        // An identifier can match with no label, so don't require a non-empty label
+        // up front — `rank` decides per candidate.
+        guard !descriptor.label.isEmpty || !(descriptor.identifier ?? "").isEmpty,
+              AXIsProcessTrusted(),
               let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.3)
@@ -44,21 +78,85 @@ public enum AXElementResolver {
         var visited = 0
         for window in windows(of: app) {
             walk(window, depth: 0, visited: &visited) { element, role in
-                guard pointableRoles.contains(role), let text = labelText(of: element) else { return }
-                let score = matchScore(needle: needle, candidate: normalize(text))
+                guard pointableRoles.contains(role) else { return }
+                let text = labelText(of: element)
+                let id = identifier(of: element)
+                // The container read climbs to the parent — do it lazily, only for
+                // candidates that already self-match and only when the recorded target
+                // HAS a container, so a heavy tree walk stays cheap.
+                let preMatch = (descriptor.identifier.map { !$0.isEmpty && $0 == id } ?? false)
+                    || matchScore(needle: normalize(descriptor.label), candidate: normalize(text ?? "")) > 0
+                guard preMatch else { return }
+                let container = descriptor.container == nil ? nil : containerLabel(of: element)
+                let candidate = Descriptor(label: text ?? "", role: role, identifier: id, container: container)
+                let score = rank(recorded: descriptor, candidate: candidate)
                 guard score > 0 else { return }
                 guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
                 let center = CGPoint(x: frame.midX, y: frame.midY)
-                // Distance only breaks ties between equal text scores.
+                // Distance only breaks ties between equally-scored candidates.
                 let distance = recorded.map { hypot(center.x - $0.x, center.y - $0.y) } ?? 0
-                let rank = score * 10_000 - min(distance, 9_999)
-                if best == nil || rank > bestRank {
-                    best = Match(center: center, role: role, title: text, score: score)
-                    bestRank = rank
+                let combined = score * 10_000 - min(distance, 9_999)
+                if best == nil || combined > bestRank {
+                    best = Match(center: center, role: role, title: text ?? "", score: score)
+                    bestRank = combined
                 }
             }
         }
         return best
+    }
+
+    /// Roles that are genuinely actionable controls — the `pointable` set minus
+    /// passive things (static text, images, tab groups) that would flood the
+    /// "what's clickable" list pushed at a flail moment.
+    private static let actionableRoles: Set<String> = [
+        "AXButton", "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTextField",
+        "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton", "AXCheckBox",
+        "AXRadioButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider",
+    ]
+
+    /// The labeled, actionable controls in the frontmost app's windows — the live
+    /// "what is actually on screen right now" list. Pushed into the agent's
+    /// context ONLY at a flail moment (an action that changed nothing), so it
+    /// re-grounds on real controls instead of re-guessing pixels. This is
+    /// Cascade's hard-won "push at flail, never a pull tool" lesson married to the
+    /// GUI-agent literature's core finding (grounding, not reasoning, is the
+    /// bottleneck). Empty when Accessibility is off or the app draws its own UI
+    /// (Blender/Electron canvases) — the caller then degrades to a plain nudge.
+    /// Reuses the same bounded walk as `find` (≤1400 nodes, 0.3s timeout), so it
+    /// can't run away on a huge tree.
+    public static func interactables(limit: Int = 40) -> [Match] {
+        guard AXIsProcessTrusted(),
+              let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+
+        var out: [Match] = []
+        var seen = Set<String>()
+        var visited = 0
+        for window in windows(of: app) {
+            walk(window, depth: 0, visited: &visited) { element, role in
+                guard out.count < limit, actionableRoles.contains(role),
+                      let text = labelText(of: element) else { return }
+                let key = normalize(text)
+                guard !key.isEmpty, key.count <= 60 else { return }
+                let dedupe = role + "|" + key
+                guard !seen.contains(dedupe) else { return }
+                guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
+                seen.insert(dedupe)
+                out.append(Match(center: CGPoint(x: frame.midX, y: frame.midY), role: role, title: String(text.prefix(60)), score: 0))
+            }
+        }
+        return out
+    }
+
+    /// Compact, LLM-readable list of clickable controls — pushed at a flail moment.
+    /// Pure (testable); nil when there's nothing to push so the caller can degrade.
+    public static func interactableSummary(_ matches: [Match], limit: Int = 40) -> String? {
+        let items = matches.prefix(limit).map { match -> String in
+            let role = match.role.hasPrefix("AX") ? String(match.role.dropFirst(2)).lowercased() : match.role.lowercased()
+            return "“\(match.title)” (\(role))"
+        }
+        return items.isEmpty ? nil : items.joined(separator: ", ")
     }
 
     /// A cheap signature of the frontmost app's UI — focused element + the shape of
@@ -114,6 +212,41 @@ public enum AXElementResolver {
 
     // MARK: - Matching
 
+    /// Ranks a live `candidate` against the recorded `descriptor`. 0 = no match (must
+    /// never hijack a click). A matching accessibility identifier dominates — it is
+    /// unique and survives moves/renames/localization. Otherwise the label text score
+    /// is the base, with role agreement nudging same-role candidates above
+    /// different-role ones (a menu "Save" vs a button "Save"). Pure + unit-pinned:
+    /// label-only descriptors (role/identifier nil, e.g. legacy recipes) reduce
+    /// exactly to `matchScore`, so the wrapper preserves the old behaviour.
+    static func rank(recorded: Descriptor, candidate: Descriptor) -> Double {
+        if let rid = recorded.identifier, !rid.isEmpty,
+           let cid = candidate.identifier, !cid.isEmpty, rid == cid {
+            return 100
+        }
+        let labelScore = matchScore(needle: normalize(recorded.label), candidate: normalize(candidate.label))
+        guard labelScore > 0 else { return 0 }
+        // Role is a TIEBREAKER, not an override: ±0.25 (spread 0.5) keeps the nudge
+        // strictly inside one integer label-score tier, so a same-role candidate wins
+        // among equal labels but never beats a clearly-better label match in another role.
+        let roleBonus: Double
+        if let rr = recorded.role, !rr.isEmpty, let cr = candidate.role, !cr.isEmpty {
+            roleBonus = (rr == cr) ? 0.25 : -0.25
+        } else {
+            roleBonus = 0
+        }
+        // Container is a SUB-tiebreak under role (±0.1): among identical label+role
+        // candidates (grid cells, repeated buttons), prefer the one in the recorded
+        // structural container. Role+container spread (0.7) still stays inside a tier.
+        let containerBonus: Double
+        if let rc = recorded.container, !rc.isEmpty, let cc = candidate.container, !cc.isEmpty {
+            containerBonus = (normalize(rc) == normalize(cc)) ? 0.1 : -0.1
+        } else {
+            containerBonus = 0
+        }
+        return labelScore + roleBonus + containerBonus
+    }
+
     /// 3 = exact, 2 = one contains the other, 1+overlap = shared words. Below 1 is
     /// no match — vague labels must not hijack a click.
     static func matchScore(needle: String, candidate: String) -> Double {
@@ -167,6 +300,24 @@ public enum AXElementResolver {
             }
         }
         return nil
+    }
+
+    /// The element's accessibility identifier (`kAXIdentifierAttribute`) — the most
+    /// stable locator when an app sets one (many Mac apps don't, hence the cascade).
+    private static func identifier(of element: AXUIElement) -> String? {
+        guard let id = string(of: element, kAXIdentifierAttribute as String),
+              !id.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return id
+    }
+
+    /// The element's structural container — its parent's "role: title" via the shared
+    /// `AXTargetDescriptor.container` formatter (so it compares equal to what the
+    /// recorder captured). `nil` when there's no parent or it carries no signal.
+    static func containerLabel(of element: AXUIElement) -> String? {
+        guard let parent = self.element(of: element, attribute: kAXParentAttribute) else { return nil }
+        let role = string(of: parent, kAXRoleAttribute) ?? ""
+        let title = labelText(of: parent) ?? ""
+        return AXTargetDescriptor.container(role: role, title: title)
     }
 
     private static func string(of element: AXUIElement, _ attribute: String) -> String? {

@@ -75,7 +75,7 @@ public final class InputRecorder: @unchecked Sendable {
     // re-find its target by identity instead of trusting a stale pixel (the
     // tiptour-macos pattern — see docs/THIRD_PARTY_NOTICES.md).
     private let labelLock = NSLock()
-    private var clickLabels: [(at: Date, x: Double, y: Double, label: String)] = []
+    private var clickLabels: [(at: Date, x: Double, y: Double, label: String, descriptor: String?)] = []
 
     private var tap: CFMachPort?
     private var thread: Thread?
@@ -246,10 +246,10 @@ public final class InputRecorder: @unchecked Sendable {
     /// smuggle a sensitive phrase out of an otherwise unflagged window.
     private func resolveClickLabel(at point: CGPoint, when: Date) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, let label = Self.axClickLabel(atCG: point),
-                  !PrivacyRules.isSensitiveText(label) else { return }
+            guard let self, let hit = Self.axClickTarget(atCG: point),
+                  !PrivacyRules.isSensitiveText(hit.label) else { return }
             self.labelLock.lock()
-            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: label))
+            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: hit.label, descriptor: hit.descriptor))
             if self.clickLabels.count > 64 { self.clickLabels.removeFirst(self.clickLabels.count - 64) }
             self.labelLock.unlock()
         }
@@ -264,18 +264,25 @@ public final class InputRecorder: @unchecked Sendable {
         }
     }
 
-    /// The resolved label for a click at (time, point), consuming it on match.
-    private func takeClickLabel(at: Date, x: Double, y: Double) -> String? {
+    /// The resolved label + stable AX descriptor for a click at (time, point),
+    /// consuming it on match.
+    private func takeClickTarget(at: Date, x: Double, y: Double) -> (label: String, descriptor: String?)? {
         labelLock.lock(); defer { labelLock.unlock() }
         guard let index = clickLabels.firstIndex(where: {
             abs($0.at.timeIntervalSince(at)) < 0.5 && abs($0.x - x) < 2 && abs($0.y - y) < 2
         }) else { return nil }
-        return clickLabels.remove(at: index).label
+        let hit = clickLabels.remove(at: index)
+        return (hit.label, hit.descriptor)
     }
 
-    /// Compact title of the clicked element (climbing to the nearest labeled,
-    /// actionable ancestor — hit-tests often land on an unlabeled leaf).
-    private static func axClickLabel(atCG point: CGPoint) -> String? {
+    /// The clicked element's human label PLUS a stable AX descriptor (role +
+    /// accessibility identifier), climbing to the nearest labeled, actionable
+    /// ancestor — hit-tests often land on an unlabeled leaf. The label titles the
+    /// recipe and seeds OCR re-grounding; the descriptor is what the replay cascade
+    /// ranks on so a moved/renamed control is still re-found (XCUIAutomation-style:
+    /// identifier first, then role to disambiguate equal labels). `descriptor` is
+    /// `nil` when the matched ancestor exposes neither a usable role nor identifier.
+    private static func axClickTarget(atCG point: CGPoint) -> (label: String, descriptor: String?)? {
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.3)
         var ref: AXUIElement?
@@ -296,7 +303,12 @@ public final class InputRecorder: @unchecked Sendable {
                     if AXUIElementCopyAttributeValue(element, attribute as CFString, &textRef) == .success,
                        let text = textRef as? String,
                        !text.trimmingCharacters(in: .whitespaces).isEmpty {
-                        return String(text.prefix(80))
+                        var identifierRef: CFTypeRef?
+                        let identifier = AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &identifierRef) == .success
+                            ? (identifierRef as? String) : nil
+                        let descriptor = AXTargetDescriptor.encode(
+                            role: role, identifier: identifier, container: Self.containerLabel(of: element))
+                        return (String(text.prefix(80)), descriptor)
                     }
                 }
             }
@@ -306,6 +318,33 @@ public final class InputRecorder: @unchecked Sendable {
             element = (parent as! AXUIElement)
         }
         return nil
+    }
+
+    /// The clicked element's structural container — its parent's "role: title" via the
+    /// shared `AXTargetDescriptor.container` formatter, so it compares equal to what
+    /// the replay resolver reads. Lets the cascade disambiguate identical labels by
+    /// where they sit (Healenium-style). `nil` when there's no parent / no signal.
+    private static func containerLabel(of element: AXUIElement) -> String? {
+        var parentRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
+              let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return nil }
+        let parentElement = parent as! AXUIElement
+        var roleRef: CFTypeRef?
+        let role = AXUIElementCopyAttributeValue(parentElement, kAXRoleAttribute as CFString, &roleRef) == .success
+            ? (roleRef as? String ?? "") : ""
+        var title = ""
+        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+            var textRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(parentElement, attribute as CFString, &textRef) == .success,
+               let text = textRef as? String, !text.trimmingCharacters(in: .whitespaces).isEmpty {
+                // A parent's title can smuggle a sensitive phrase (a row reading
+                // "Password: …") past the label gate — drop the title (keep the
+                // structural role) when it trips the privacy rules.
+                title = PrivacyRules.isSensitiveText(text) ? "" : text
+                break
+            }
+        }
+        return AXTargetDescriptor.container(role: role, title: title)
     }
 
     private func snapshotContext() -> AppContext {
@@ -386,16 +425,17 @@ public final class InputRecorder: @unchecked Sendable {
                 events.append(InputEvent(capturedAt: at, kind: .key, key: key, modifiers: modifiers, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
             case .click(let x, let y, let double, let at, let location):
                 flushTyped()
-                // For clicks, `text` carries the clicked element's AX label so the
-                // replay can re-find the target by identity.
-                let label = takeClickLabel(at: at, x: x, y: y)
-                if label == nil { logger.debug("click stored without AX label in \(location.app, privacy: .public)") }
-                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                // For clicks, `text` carries the clicked element's AX label and
+                // `targetDescriptor` its stable role+identifier locator so the replay
+                // cascade can re-find the target by identity, not stale pixels.
+                let hit = takeClickTarget(at: at, x: x, y: y)
+                if hit == nil { logger.debug("click stored without AX label in \(location.app, privacy: .public)") }
+                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
             case .rightClick(let x, let y, let at, let location):
                 flushTyped()
-                let label = takeClickLabel(at: at, x: x, y: y)
-                if label == nil { logger.debug("right-click stored without AX label in \(location.app, privacy: .public)") }
-                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                let hit = takeClickTarget(at: at, x: x, y: y)
+                if hit == nil { logger.debug("right-click stored without AX label in \(location.app, privacy: .public)") }
+                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
             case .scroll(let x, let y, let dx, let dy, let at, let location):
                 flushTyped()
                 let modifiers = ["\(Int(dx))", "\(Int(dy))"]

@@ -557,9 +557,13 @@ final class SandboxBoxController: NSObject, NSTextFieldDelegate {
         )
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = false
-        panel.level = .floating
+        // Same recipe as the guide cursor (GuidanceOverlayWindow): the shielding
+        // level draws above the menu bar and over *another* app's native full-screen
+        // Space, and `.stationary` keeps the chip pinned across Space transitions —
+        // without these the chip vanished on other tabs/Spaces and in full screen.
+        panel.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.isOpaque = false
         panel.backgroundColor = .clear

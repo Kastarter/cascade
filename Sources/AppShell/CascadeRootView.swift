@@ -2086,6 +2086,20 @@ private struct HarnessCard: View {
                             .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
                     }
                 }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cursor agent speed").font(.cascadeSans(15, .semibold))
+                        Text("Thinking effort for the on-screen agent. Medium is Anthropic's benchmarked computer-use default; Low trades some accuracy for faster turns — flip it and compare on your own tasks.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Picker("", selection: $model.cuEffort) {
+                        Text("Medium").tag("medium")
+                        Text("Low").tag("low")
+                    }
+                    .labelsHidden().pickerStyle(.segmented).frame(width: 150)
+                }
             }
         }
     }

@@ -33,6 +33,43 @@ Issued:  2026-01-15
 Due:     2026-02-15  (PAID 2026-02-11)
 EOF
 
+# Two more OPEN invoices in the SAME field layout as Falcon, so logging each one
+# is the identical copy→paste rhythm — the "boring AP entry" loop Demo 2 teaches.
+cat > "$ROOT/Invoices/meridian-invoice-2026-0608.txt" <<'EOF'
+INVOICE  MER-2026-0608
+From: Meridian Office Supplies
+To:   Humain — Operations
+
+Service: Office furniture & supplies, Q2 2026
+Amount due: 4,820.00 USD
+Issued:  2026-06-05
+Due:     2026-07-05
+Payment: wire transfer, reference MER-2026-0608
+
+Contact: billing@meridian.example
+EOF
+
+cat > "$ROOT/Invoices/vertex-invoice-2026-0611.txt" <<'EOF'
+INVOICE  VTX-2026-0611
+From: Vertex Consulting
+To:   Humain — Strategy
+
+Service: Advisory retainer, June 2026
+Amount due: 9,600.00 USD
+Issued:  2026-06-10
+Due:     2026-07-10
+Payment: wire transfer, reference VTX-2026-0611
+
+Contact: ar@vertex.example
+EOF
+
+# The AP tracker the invoices get logged into (open it in Numbers). One row is
+# already filled so it reads as an ongoing ledger — you add the next rows by hand.
+cat > "$ROOT/Invoices/invoice-tracker.csv" <<'EOF'
+Vendor,Invoice #,Amount USD,Due date,Status
+Orbit Media,ORB-2026-0512,3300.00,2026-05-30,Logged
+EOF
+
 cat > "$ROOT/Reports/quarterly-report-Q1-2026.csv" <<'EOF'
 month,revenue_usd,new_customers,churned
 January,128400,23,4
@@ -80,3 +117,5 @@ echo "month,signups\nJanuary,210\nFebruary,198"                            > "$R
 echo "Demo fixtures ready at $ROOT"
 echo "Manual props still needed: one email in Mail you can reply to,"
 echo "and Settings → Agent harness → Power harness ON."
+echo "Demo 2 (Teach once): open Invoices/invoice-tracker.csv in Numbers,"
+echo "and have an invoice .txt open beside it (Falcon / Meridian / Vertex)."

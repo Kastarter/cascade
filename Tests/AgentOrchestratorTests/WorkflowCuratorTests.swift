@@ -191,6 +191,46 @@ func curatorReturnsEmptyForNoCandidates() async {
     #expect(result.isEmpty)
 }
 
+// MARK: - On-screen content reaches the curator (change (a): OCR-grounded curation)
+
+@Test
+func curatorPromptCarriesOnScreenContentPerCandidate() async {
+    // The text visible while each workflow happened, keyed by signature, must land in
+    // the prompt as an "on screen" sub-line so the goal can name the real subject.
+    let capture = PromptCapture()
+    let candidates = [
+        waste("Repeated in Mail", apps: ["Mail"], signature: "sig-a"),
+        waste("Repeated in Numbers", apps: ["Numbers"], signature: "sig-b"),
+    ]
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
+    _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture))
+        .curate(candidates, onScreen: ["sig-a": "Refund request for order #4821"])
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("on screen"))
+    #expect(prompt.contains("Refund request for order #4821"))
+    // Only the candidate with content gets the sub-line; the other is untouched.
+    #expect(prompt.components(separatedBy: "on screen").count == 2)
+}
+
+@Test
+func curateOnePassesOnScreenContentToThePrompt() async {
+    let capture = PromptCapture()
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
+    _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture))
+        .curateOne(taughtWaste(), onScreen: "Q2 pipeline sheet — total 469,100")
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("on screen"))
+    #expect(prompt.contains("Q2 pipeline sheet — total 469,100"))
+}
+
+@Test
+func curatorOmitsOnScreenLineWhenNoneGiven() async {
+    // Default behaviour (no OCR) must be byte-for-byte the old prompt — no stray line.
+    let candidates = [waste("Repeated in Mail", apps: ["Mail"], signature: "sig-a")]
+    let prompt = WorkflowCurator.userPrompt(candidates)
+    #expect(!prompt.contains("on screen"))
+}
+
 // MARK: - End-to-end through the orchestrator (detect → curate → approve)
 
 // MARK: - curateOne (Teach-once: a single demonstrated recipe)
@@ -259,6 +299,31 @@ func curateRangeTurnsABracketedRangeIntoACuratedAgent() async throws {
     #expect(agents.count == 1)
     #expect(agents[0].name == "Copy totals into Numbers")
     #expect(!agents[0].recipe.steps.isEmpty)
+}
+
+@Test
+func curateRangeFeedsRecordedOCRToTheCurator() async throws {
+    // The whole point of change (a): real recorded on-screen text from the moments
+    // around the workflow reaches the curator so the goal is content-aware. The
+    // recipe span is base…base+7, so a moment at base+2 sits inside the resolved window.
+    let store = try makeStore()
+    try await store.insertInputEvents(copyPasteEvents())
+    _ = try await store.insert(RecordedContext(
+        capturedAt: base.addingTimeInterval(2),
+        source: .screen,
+        appName: "Mail",
+        ocrText: "Refund request for order #4821 — see policy link below"
+    ))
+    let capture = PromptCapture()
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.7}]}"#
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        curator: WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture))
+    )
+    _ = try await orchestrator.curateRange(from: base, to: base.addingTimeInterval(100))
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("on screen"))
+    #expect(prompt.contains("Refund request for order #4821"))
 }
 
 @Test

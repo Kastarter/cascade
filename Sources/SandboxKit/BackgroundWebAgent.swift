@@ -269,6 +269,14 @@ public final class BackgroundWebAgent {
         onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
 
         var acted = false
+        // Per-turn count of STATE-CHANGING actions (clicks/fills/navigation) — NOT
+        // reads. Both efficiency guards key off it: a turn with zero state changes
+        // is the model narrating or only reading (stall guard); a turn that DID
+        // change state but left the page identical did nothing (no-effect guard).
+        // Read-only DOM tools deliberately don't count, so a read never false-fires
+        // no-effect. Incremented in the sink/harness/leftover sites, read + reset
+        // once per loop iteration.
+        var turnStateChanges = 0
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
             skillProvider: { WebSkills.content(named: $0) },
@@ -276,6 +284,7 @@ public final class BackgroundWebAgent {
                 // Using any tool IS acting (reading/clicking/filling) — not the model
                 // narrating instead of working, so it must clear the firmer-retry guard.
                 acted = true
+                if name == "click_text" || name == "fill_field" { turnStateChanges += 1 }
                 let result = await WebHarness.run(name, input, sandbox: sandbox)
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
@@ -300,9 +309,17 @@ public final class BackgroundWebAgent {
                 await self.apply(action)
                 if let pt = self.sandbox.consumeActionPoint() { self.onCursor?(pt) }
                 acted = true
+                if Self.isStateChanging(action) { turnStateChanges += 1 }
                 return true
             }
         }
+        // Structural efficiency circuit-breakers (parity with the on-screen agent):
+        // a page signature for no-effect detection and an idle-turn counter for the
+        // stall guard, so a stuck run ends early instead of spinning to the 80-step
+        // cap. lastSignature is the page BEFORE this episode's first actions.
+        var lastSignature = await pageSignature()
+        var noEffectTurns = 0
+        var idleTurns = 0
         var step = await agent.begin(
             goal: AgentTaskPlanner.goal(for: sub, index: index, total: total, job: originalTask, findings: findings, firmer: firmer),
             screenshot: shot,
@@ -349,9 +366,51 @@ public final class BackgroundWebAgent {
                 await apply(action)
                 if let pt = sandbox.consumeActionPoint() { onCursor?(pt) }
                 acted = true
+                if Self.isStateChanging(action) { turnStateChanges += 1 }
             }
+
+            // Did this turn change anything (clicks/fills/nav), or only read/talk?
+            let turnActed = turnStateChanges > 0
+            turnStateChanges = 0
+            var nudge: String?
+            // Stall guard: turns that only read or narrate without changing the page.
+            // Tolerate one, nudge the second, stop the third — never spin to the cap.
+            if turnActed {
+                idleTurns = 0
+            } else if !step.done {
+                idleTurns += 1
+                if idleTurns >= 3 {
+                    audit("sandbox.stalled", String(step.text.prefix(80)))
+                    return (.failed("I kept looking without making progress, so I stopped."), acted)
+                }
+                if idleTurns == 2 {
+                    nudge = "You've spent two turns without changing anything. Use click_text / fill_field / open_url to actually do the work NOW, or if it's already done or impossible, say so and stop."
+                }
+            }
+
             try? await Task.sleep(for: .milliseconds(300))
             shot = await sandbox.snapshotPNG() ?? shot
+
+            // No-effect: an acting turn that left the page identical (same URL +
+            // text) did nothing — don't let it repeat the dead action. The DOM tools
+            // already report "no element found"; this catches the subtler case of a
+            // click that "succeeded" but changed nothing.
+            if turnActed {
+                let signature = await pageSignature()
+                if signature == lastSignature {
+                    noEffectTurns += 1
+                    if noEffectTurns >= 3 {
+                        audit("sandbox.noeffect", "3rd no-effect — stopping")
+                        return (.failed("My actions stopped changing the page, so I stopped."), acted)
+                    }
+                    audit("sandbox.noeffect", "page unchanged after acting")
+                    let extra = "Your last action did NOT change the page — it had no effect. Do NOT repeat it; try a different element or route (list_interactives shows what's actually clickable)."
+                    nudge = nudge.map { $0 + " " + extra } ?? extra
+                } else {
+                    noEffectTurns = 0
+                }
+                lastSignature = signature
+            }
             // Deliver any message the user typed into the box this turn. It is
             // AUTHORITATIVE. Crucially it may EXTEND the job ("after that, make a notion
             // page") — so we QUEUE it as the next subtask (carrying the findings so far),
@@ -377,10 +436,30 @@ public final class BackgroundWebAgent {
                 }
                 plan.append(AgentSubtask(task: steer, web: true))
             }
-            step = await agent.proceed(screenshot: shot, note: steerNote)
+            // A user steer is authoritative; a stall/no-effect nudge rides alongside it.
+            let note = [steerNote, nudge].compactMap { $0 }.joined(separator: "\n\n")
+            step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
             count += 1
         }
         return (stopped ? .stopped : .stepLimit, acted)
+    }
+
+    /// Cheap "did the page change" signature for no-effect detection — URL + a
+    /// prefix of the readable text. A dead DOM action leaves it unchanged;
+    /// navigation/content changes move it. Web-native (no pixel churn from
+    /// cursors/ads), the structural analog of the on-screen frame diff.
+    private func pageSignature() async -> String {
+        let text = await sandbox.readPageText()
+        return sandbox.currentURL + "\u{1}" + String(text.prefix(4000))
+    }
+
+    /// Whether a built-in action changes page state (so it counts toward acting),
+    /// vs an observation that doesn't (screenshot/wait/zoom/highlight).
+    nonisolated static func isStateChanging(_ action: CUAction) -> Bool {
+        switch action {
+        case .screenshot, .wait, .zoom, .highlight: return false
+        default: return true
+        }
     }
 
     static let sandboxNote = """

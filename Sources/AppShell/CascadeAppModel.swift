@@ -5,6 +5,7 @@ import CascadeMemory
 import Combine
 import ComputerUseKit
 import Foundation
+import ImageIO
 import MacContextKit
 import ProviderKit
 import SandboxKit
@@ -143,6 +144,24 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let powerHarnessKey = "cascade.powerHarness"
 
+    /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
+    /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
+    /// the long-deferred low-vs-medium A/B is one switch in Settings; the new
+    /// TTFT + assist.timing telemetry is what makes that A/B measurable. Default
+    /// "medium" → zero behaviour change until the user flips it.
+    @Published public var cuEffort: String {
+        didSet { defaultsStore.set(cuEffort, forKey: Self.cuEffortKey) }
+    }
+    private static let cuEffortKey = "cascade.cuEffort"
+
+    /// Per-region Hamming threshold for "this action changed nothing on screen" —
+    /// much tighter than the recorder's blink-tolerant dedup (`regionSkipThreshold`
+    /// = 5). A dead click yields a near byte-identical frame; any real change
+    /// shifts many bits, so a tight bound keeps a small SUCCESSFUL change from
+    /// being mislabeled no-effect (the false positive that would make the agent
+    /// undo/redo a step that actually worked).
+    static let noEffectThreshold = 2
+
     public let store: CascadeStore
     public let driver: LocalMacDriver
     public let recorder: ContextRecorder
@@ -210,6 +229,7 @@ public final class CascadeAppModel: ObservableObject {
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
+        cuEffort = defaults.string(forKey: Self.cuEffortKey) ?? "medium"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)
@@ -265,8 +285,11 @@ public final class CascadeAppModel: ObservableObject {
         pushToTalk.onPress = { [weak self] in
             self?.voice.beginTalking()
             // The user is about to ask for something on screen — warm the capture
-            // pipeline now so the screenshot is cheap when they finish speaking.
+            // pipeline AND the TLS connection to the API now, so neither the
+            // screenshot nor the first model request pays a cold start when they
+            // finish speaking.
             ScreenCaptureUtility.prewarm()
+            AnthropicWarmup.prewarm()
         }
         pushToTalk.onRelease = { [weak self] in self?.voice.endTalking() }
         if startsSubsystems {
@@ -1026,13 +1049,15 @@ public final class CascadeAppModel: ObservableObject {
     /// Steps one Computer Use episode through a single part: observe → act →
     /// re-observe until the model finishes, the user stops it, or the step budget
     /// runs out. Returns the model's closing line plus whether it acted at all.
-    private func runAssistEpisode(
-        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
-    ) async -> AssistEpisodeOutcome {
-        // Pull-based skills: the agent gets a one-line index and fetches a
-        // skill's full instructions itself via the use_skill tool. Content
-        // never rides the prompt (token cost stays flat as the library grows).
-        let agent = ComputerUseAgent(
+    /// Builds an on-screen assist agent at a given model. Factored out of
+    /// `runAssistEpisode` so drift can rebuild on a stronger model mid-episode
+    /// without duplicating the skill/harness/recall wiring. Handlers
+    /// (streamSink / onThinkingPulse / onActionRefused) are set by the caller —
+    /// they capture episode-local state.
+    private func makeAssistAgent(model: String, goal: String, gen: Int) -> ComputerUseAgent {
+        ComputerUseAgent(
+            model: model,
+            effort: cuEffort,
             environmentNote: ComputerUseAgent.foregroundBrowserNote,
             skillProvider: { [appSkills, store] name in
                 guard let skill = appSkills.skill(named: name) else { return nil }
@@ -1060,9 +1085,35 @@ public final class CascadeAppModel: ObservableObject {
             harnessTier: powerHarnessEnabled ? .full : .readOnly,
             harnessProvider: { [weak self] name, input in
                 guard let self else { return "Cascade is shutting down — stop." }
+                // Recall over the recorded screen history is read-only memory —
+                // it skips the file/shell gating performHarness applies.
+                if RecordRecall.isRecallTool(name) {
+                    return await self.performRecall(name: name, input: input, gen: gen)
+                }
                 return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
-            }
+            },
+            // Let the agent recall what the user already saw on screen — the whole
+            // point of a context recorder. The same in-process tools the Ask panel
+            // hunts the record with, so a retrospective goal resolves before acting.
+            recallEnabled: true
         )
+    }
+
+    private func runAssistEpisode(
+        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
+    ) async -> AssistEpisodeOutcome {
+        // Pull-based skills: the agent gets a one-line index and fetches a
+        // skill's full instructions itself via the use_skill tool. Content
+        // never rides the prompt (token cost stays flat as the library grows).
+        //
+        // On-screen assist runs on Opus 4.8 (the most capable model that still
+        // supports the computer-use-2025-11-24 beta). Slower per turn than Sonnet,
+        // but its stronger planning does the work in far fewer turns — and the
+        // 2026-06-22 audit confirmed turns, not per-turn latency, dominate
+        // wall-clock (Sonnet-first ballooned the same Keynote task from ~10 turns
+        // to 15 and over-thought; reverted). Effort stays medium — CU default.
+        let cuModel = AnthropicModel.opus
+        let agent = makeAssistAgent(model: cuModel, goal: goal, gen: gen)
         // Runaway backstop, not a budget. The episode's real terminators are the
         // model finishing, STOP / barge-in, stall detection, or a newer turn
         // superseding this one — a low cap here just killed long honest tasks.
@@ -1081,50 +1132,58 @@ public final class CascadeAppModel: ObservableObject {
         var streamFailed = false              // executeCU refused — episode is over
         var streamActionTime = Duration.zero  // this turn's in-stream action time
         var pendingNarration: String?         // clause buffered until the turn proves it has actions
-        agent.onActionRefused = { [weak self] detail in
-            guard let self else { return }
-            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.action.refused", detail: detail)) }
-        }
-        // A long think used to look like a hang — the dock kept showing the
-        // previous turn's line for 30+ seconds. The pulse carries the thinking
-        // summary's tail, so the user watches the deliberation happen instead.
-        agent.onThinkingPulse = { [weak self] tail in
-            guard let self, self.assistGeneration == gen else { return }
-            self.dock.show(title: "Cascade is thinking…", detail: tail)
-        }
-        agent.streamSink = { [weak self] item in
-            guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else { return false }
-            switch item {
-            case .text(let line):
-                self.teachMessage = prefix + line
-                // Buffer instead of speaking: a turn that ends with no actions
-                // is the model's closing or idle line, and those are narrated by
-                // the episode's own paths (final summary, stall handling) —
-                // voicing them here too would say everything twice at task end.
-                pendingNarration = line
-                return true
-            case .action(let action):
-                if let line = pendingNarration {
-                    pendingNarration = nil
-                    // Same head start the batch path gave: the user hears
-                    // "writing the poem now" BEFORE the typing starts.
-                    if self.narrateProgress(line) {
-                        try? await Task.sleep(for: .milliseconds(450))
+        // Wiring captures the episode-local state above, so escalation re-applies
+        // it to the rebuilt Opus agent by calling this again.
+        func wire(_ agent: ComputerUseAgent) {
+            agent.onActionRefused = { [weak self] detail in
+                guard let self else { return }
+                Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.action.refused", detail: detail)) }
+            }
+            // A long think used to look like a hang — the dock kept showing the
+            // previous turn's line for 30+ seconds. The pulse carries the thinking
+            // summary's tail, so the user watches the deliberation happen instead.
+            agent.onThinkingPulse = { [weak self] tail in
+                guard let self, self.assistGeneration == gen else { return }
+                // Keep the companion cursor visibly alive (sonar pulse) through the
+                // round-trip freeze, not just the dock text.
+                self.guidanceOverlay.setThinking(true)
+                self.dock.show(title: "Cascade is thinking…", detail: tail)
+            }
+            agent.streamSink = { [weak self] item in
+                guard let self, self.assistGeneration == gen, !self.driver.runState.isStopRequested else { return false }
+                switch item {
+                case .text(let line):
+                    self.teachMessage = prefix + line
+                    // Buffer instead of speaking: a turn that ends with no actions
+                    // is the model's closing or idle line, and those are narrated by
+                    // the episode's own paths (final summary, stall handling) —
+                    // voicing them here too would say everything twice at task end.
+                    pendingNarration = line
+                    return true
+                case .action(let action):
+                    if let line = pendingNarration {
+                        pendingNarration = nil
+                        // Same head start the batch path gave: the user hears
+                        // "writing the poem now" BEFORE the typing starts.
+                        if self.narrateProgress(line) {
+                            try? await Task.sleep(for: .milliseconds(450))
+                        }
                     }
+                    if streamActed { try? await Task.sleep(for: .milliseconds(120)) }  // pace gap between actions
+                    let start = ContinuousClock.now
+                    guard await self.executeCU(action, on: screen) else {
+                        streamFailed = true
+                        return false
+                    }
+                    let spent = start.duration(to: .now)
+                    streamActionTime += spent
+                    actionTime += spent
+                    streamActed = true
+                    return true
                 }
-                if streamActed { try? await Task.sleep(for: .milliseconds(120)) }  // pace gap between actions
-                let start = ContinuousClock.now
-                guard await self.executeCU(action, on: screen) else {
-                    streamFailed = true
-                    return false
-                }
-                let spent = start.duration(to: .now)
-                streamActionTime += spent
-                actionTime += spent
-                streamActed = true
-                return true
             }
         }
+        wire(agent)
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
@@ -1144,9 +1203,21 @@ public final class CascadeAppModel: ObservableObject {
         // the step cap repeating the same line.
         var idleTurns = 0
         var nudge: String?
+        // "No state change after an action" — the cheapest, most universal failure
+        // signal in the GUI-agent literature (WILBUR / VeriGUI / AgentRR check
+        // functions): if an acting turn leaves EVERY screen region unchanged, the
+        // action had no effect (a dead/disabled control, a missed target, a click
+        // that hit nothing). The stall guard can't catch this — a dead click is a
+        // real action, so it resets idleTurns and the agent re-clicks the same
+        // point forever (the audited 657,675 ×2 and 569→570→572 loops). We diff
+        // frames with the recorder's existing grid hash (zero extra model calls)
+        // and tell the model to change approach. `lastFrameHashes` is the
+        // fingerprint of the frame the current `step` was generated from.
+        var noEffectTurns = 0
+        var lastFrameHashes = Self.gridHashes(ofJPEG: firstScreenshotPNG)
         func auditTiming(outcome: String) {
             let total = episodeStart.duration(to: .now)
-            let detail = "\(outcome) · \(count + 1) turns · total \(Int(total / .milliseconds(1)))ms · model \(Int(modelTime / .milliseconds(1)))ms · actions \(Int(actionTime / .milliseconds(1)))ms"
+            let detail = "\(outcome) · \(count + 1) turns · total \(Int(total / .milliseconds(1)))ms · model \(Int(modelTime / .milliseconds(1)))ms · actions \(Int(actionTime / .milliseconds(1)))ms · effort \(cuEffort) · \(cuModel)"
             Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: detail)) }
         }
         while count < maxSteps {
@@ -1264,16 +1335,95 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
+            // No-effect detection (hardened against false positives): an acting
+            // turn whose every screen region is unchanged did nothing — don't let
+            // the model re-click the dead spot. Two guards keep a SUCCESSFUL action
+            // from being mislabeled "no effect": (1) `noEffectThreshold` is far
+            // tighter than the recorder's blink dedup — a dead click is near
+            // byte-identical, a real change shifts many bits; (2) a delayed
+            // RE-CHECK — a theme still downloading, an app still launching, or an
+            // animation can finish AFTER the 260ms settle, so on a suspected
+            // no-effect we wait and re-capture once before concluding (and use that
+            // fresher frame). The extra wait costs time only on the rare flail path.
+            var observedShot = nextShot
+            var observedHashes = Self.gridHashes(ofJPEG: nextShot)
+            if actedThisTurn, !observationOnly, let last = lastFrameHashes, let first = observedHashes,
+               PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
+                try? await Task.sleep(for: .milliseconds(400))
+                if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) {
+                    observedShot = recheck
+                    observedHashes = Self.gridHashes(ofJPEG: recheck)
+                }
+                if let confirmed = observedHashes,
+                   !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
+                    // The effect just rendered late — the action DID work.
+                    noEffectTurns = 0
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) re-check cleared (slow render)"))
+                } else {
+                    noEffectTurns += 1
+                    if noEffectTurns >= 3 {
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) — 3rd no-effect, stopping"))
+                        auditTiming(outcome: "stalled-noeffect")
+                        return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
+                    }
+                    nudge = "Your last action did NOT change the screen at all — it had no effect (the control isn't where you clicked, is disabled, or needs a different gesture). Do NOT repeat that same click."
+                    // Flail-moment grounding push (Cascade's "push elements at a
+                    // flail moment, never a pull tool" lesson + the literature's
+                    // grounding>reasoning finding): hand the model the controls that
+                    // ARE actually on screen so it re-grounds on real elements
+                    // instead of re-guessing the same dead pixel.
+                    let controls = AXElementResolver.interactables()
+                    if let located = Self.groundingControls(controls, display: Self.displayBounds(of: screen), resW: size.width, resH: size.height) {
+                        // Coordinate-level grounding: the model is poor at producing
+                        // click coordinates but fine choosing from given ones (the
+                        // GUI-agent grounding>reasoning finding) — so hand it the
+                        // exact x,y of each real control to click directly.
+                        nudge! += " The controls actually on screen right now, with their click coordinates, are: \(located). Click one of THESE coordinates directly instead of guessing — if what you wanted isn't listed, it isn't a clickable control here, so open the right menu/panel or take another route."
+                        // Diagnostic: log the VERBATIM controls (labels + coords),
+                        // not just the count — so the audit reveals whether canvas
+                        // placeholders (e.g. a Keynote subtitle box) are actually in
+                        // the AX list, which decides whether structural snap-on-no-
+                        // effect is viable or the canvas needs a real visual grounder.
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) w/ coords: \(String(located.prefix(700)))"))
+                    } else if let summary = AXElementResolver.interactableSummary(controls) {
+                        nudge! += " The controls actually clickable on screen right now are: \(summary). Aim for one of these by sight — if what you wanted isn't in this list, it isn't clickable here, so open the right menu/panel or take another route."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) labels: \(String(summary.prefix(700)))"))
+                    } else {
+                        nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
+                    }
+                }
+            } else if actedThisTurn, !observationOnly {
+                noEffectTurns = 0
+            }
+            if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
             streamActionTime = .zero
             pendingNarration = nil
             let modelStart = ContinuousClock.now
-            step = await agent.proceed(screenshot: nextShot, note: episodeNote(nudge))
+            step = await agent.proceed(screenshot: observedShot, note: episodeNote(nudge))
             modelTime += modelStart.duration(to: .now) - streamActionTime
             count += 1
         }
         auditTiming(outcome: "step-limit")
         return .stepLimit
+    }
+
+    /// Runs one recall tool call for the assist agent: STOP/supersession gate,
+    /// an audit row with the verbatim query/timeframe/id, then the read-only
+    /// lookup against the local record via the shared `RecordRecall`. No
+    /// file/shell deny-list or one-lane gate applies — this only reads what the
+    /// user already saw on screen, the same surface the Ask panel searches.
+    private func performRecall(name: String, input: [String: Any], gen: Int) async -> String {
+        guard assistGeneration == gen, !driver.runState.isStopRequested else {
+            return "The user stopped this task. Do not continue — end now."
+        }
+        // Parse the Sendable call HERE (on the main actor) so the untyped
+        // dictionary never crosses into RecordRecall's nonisolated executor.
+        let call = RecordRecall.Call(name: name, input: input)
+        dock.show(title: "Cascade is remembering", detail: call.auditDetail)
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.recall", detail: call.auditDetail))
+        return await RecordRecall(store: store).perform(call)
     }
 
     /// Runs one harness tool call for the assist agent: STOP/supersession gate
@@ -1370,7 +1520,57 @@ public final class CascadeAppModel: ObservableObject {
     /// targets first. Returns `false` (and surfaces why) if the actuator is blocked
     /// — e.g. Accessibility / Input Monitoring not granted — so the loop can stop.
     @discardableResult
+    /// Grid perceptual hash of a JPEG frame — the recorder's change-aware
+    /// fingerprint, reused to tell whether an acting turn changed the screen.
+    /// nil if the frame can't be decoded (then no-effect detection is skipped).
+    nonisolated static func gridHashes(ofJPEG data: Data) -> [UInt64]? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return PerceptualHash.gridHashes(image)
+    }
+
+    /// Maps an element's CG-global center (top-left origin, from AX) into the
+    /// model's screenshot-pixel space (resW×resH, top-left). AX positions and
+    /// `CGDisplayBounds` share the same CG-global coordinate system, so this is a
+    /// plain subtract-and-scale — no AppKit Y-flip. Returns nil when the element
+    /// is off the captured display (so we never push a coordinate the model's
+    /// screenshot doesn't actually contain). Pure + unit-tested: a wrong number
+    /// here would send the agent clicking into empty space.
+    nonisolated static func modelPixel(forCGGlobal point: CGPoint, in display: CGRect, resW: Int, resH: Int) -> CGPoint? {
+        guard display.width > 0, display.height > 0 else { return nil }
+        let fx = (point.x - display.minX) / display.width
+        let fy = (point.y - display.minY) / display.height
+        guard fx >= -0.002, fx <= 1.002, fy >= -0.002, fy <= 1.002 else { return nil }
+        return CGPoint(x: min(max(fx, 0), 1) * Double(resW), y: min(max(fy, 0), 1) * Double(resH))
+    }
+
+    /// The flail-moment grounding push WITH coordinates: each on-screen control
+    /// rendered as `"label" (role) at x,y` in the model's pixel space, so it can
+    /// click the exact spot instead of guessing. Drops controls off the captured
+    /// display. nil when nothing maps (caller falls back to labels-only, then a
+    /// plain nudge). Pure given the harvested matches + display geometry.
+    nonisolated static func groundingControls(
+        _ matches: [AXElementResolver.Match], display: CGRect, resW: Int, resH: Int, limit: Int = 40
+    ) -> String? {
+        let entries = matches.prefix(limit).compactMap { match -> String? in
+            guard let pixel = modelPixel(forCGGlobal: match.center, in: display, resW: resW, resH: resH) else { return nil }
+            let role = match.role.hasPrefix("AX") ? String(match.role.dropFirst(2)).lowercased() : match.role.lowercased()
+            return "“\(match.title)” (\(role)) at \(Int(pixel.x.rounded())),\(Int(pixel.y.rounded()))"
+        }
+        return entries.isEmpty ? nil : entries.joined(separator: "; ")
+    }
+
+    /// CG-global bounds (top-left origin) of the display a screen represents —
+    /// the coordinate system AX element positions live in.
+    nonisolated static func displayBounds(of screen: NSScreen) -> CGRect {
+        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        return CGDisplayBounds(id ?? CGMainDisplayID())
+    }
+
     private func executeCU(_ action: CUAction, on screen: NSScreen) async -> Bool {
+        // An action means the thinking freeze is over — drop the sonar pulse so the
+        // cursor's flight/press reads cleanly (the next turn re-arms it).
+        guidanceOverlay.setThinking(false)
         func globalAppKit(_ x: Double, _ y: Double) -> CGPoint {
             CGPoint(x: screen.frame.minX + x, y: screen.frame.minY + y)
         }
@@ -2267,6 +2467,11 @@ public final class CascadeAppModel: ObservableObject {
         var unverifiedStreak = 0
         var verifyUnavailableLogged = false
         var skillVerifySkipLogged = false
+        // Pre-replay state gate (JARVIS-1): before the FIRST click we confirm we're
+        // actually in the app the recipe expects. If not, escalate to the goal-driven
+        // assist loop immediately rather than clicking blind into the wrong screen
+        // until two dead clicks trip the drift guard.
+        var startStateChecked = false
         for (index, step) in steps.enumerated() {
             if driver.runState.isStopRequested {
                 agentMessage = "Stopped. Control returned to you."
@@ -2283,12 +2488,25 @@ public final class CascadeAppModel: ObservableObject {
                 // A sheet/dialog the recording never saw is up — recorded
                 // coordinates would click straight into it (tiptour's modal
                 // pause). Hand control back instead of plowing on.
-                if step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick,
-                   let modalTitle = await Self.unexpectedModal() {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
-                    await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
-                    stoppedEarly = true
-                    break
+                if step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
+                    // One-time pre-flight: are we even in the right app before the first
+                    // click? Catches activate-failed / wrong-app-stole-focus before we
+                    // click into the void (activateAndConfirm gives up silently).
+                    if !startStateChecked {
+                        startStateChecked = true
+                        if let reason = Self.startStateMismatch(step: step) {
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.wrongstate", detail: reason))
+                            await escalateRecipeToAssist(agent, reason: reason)
+                            stoppedEarly = true
+                            break
+                        }
+                    }
+                    if let modalTitle = await Self.unexpectedModal() {
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
+                        await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
+                        stoppedEarly = true
+                        break
+                    }
                 }
                 if let x = step.x, let y = step.y,
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
@@ -2445,11 +2663,40 @@ public final class CascadeAppModel: ObservableObject {
     /// Tier-1 target resolution: the element matching the step's recorded AX label
     /// (stored in `text` for click steps), nearest to the recorded point. Runs off
     /// the main actor — AX tree walks take tens of milliseconds.
+    /// Whether the frontmost app is the one a recipe step expects. Bundle id match
+    /// wins outright; otherwise display-name containment EITHER direction — a recorded
+    /// "Keynote" must still match a live "Keynote Creator Studio" (the exact-equality
+    /// blind spot in `activateAndConfirm`). Pure + unit-pinned.
+    nonisolated static func appMatches(frontmostName: String?, frontmostBundle: String?, expectedName: String, expectedBundle: String?) -> Bool {
+        if let expectedBundle, !expectedBundle.isEmpty, let frontmostBundle, !frontmostBundle.isEmpty,
+           expectedBundle == frontmostBundle {
+            return true
+        }
+        guard let frontmostName, !frontmostName.isEmpty, !expectedName.isEmpty else { return false }
+        let live = frontmostName.lowercased(), expected = expectedName.lowercased()
+        return live == expected || live.contains(expected) || expected.contains(live)
+    }
+
+    /// The reason the live screen doesn't match a click step's expected app, or nil
+    /// when it does. The pre-replay state gate (JARVIS-1): escalate to goal-driven
+    /// assist rather than click blind on the wrong screen.
+    private static func startStateMismatch(step: RecipeStep) -> String? {
+        let front = NSWorkspace.shared.frontmostApplication
+        if appMatches(frontmostName: front?.localizedName, frontmostBundle: front?.bundleIdentifier,
+                      expectedName: step.appName, expectedBundle: step.bundleIdentifier) {
+            return nil
+        }
+        return "expected “\(step.appName)” in front but “\(front?.localizedName ?? "no app")” is — the screen isn’t where the recording started"
+    }
+
     private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> CGPoint? {
-        let label = step.text ?? step.ocrAnchor
-        guard let label, !label.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        let label = (step.text ?? step.ocrAnchor) ?? ""
+        let (role, identifier, container) = AXTargetDescriptor.decode(step.targetDescriptor)
+        // Need a label or a stable identifier to re-find the element by identity.
+        guard !label.trimmingCharacters(in: .whitespaces).isEmpty || (identifier?.isEmpty == false) else { return nil }
+        let descriptor = AXElementResolver.Descriptor(label: label, role: role, identifier: identifier, container: container)
         return await Task.detached(priority: .userInitiated) {
-            AXElementResolver.find(label: label, near: recorded)?.center
+            AXElementResolver.find(descriptor: descriptor, near: recorded)?.center
         }.value
     }
 
@@ -2476,7 +2723,11 @@ public final class CascadeAppModel: ObservableObject {
             if driver.runState.isStopRequested { return }
             try? await Task.sleep(for: .milliseconds(250))
             let front = NSWorkspace.shared.frontmostApplication
-            if front?.bundleIdentifier == bundle || front?.localizedName == name { return }
+            // Containment, not equality: a recorded "Keynote" must confirm against a
+            // live "Keynote Creator Studio" instead of burning the full 2s poll (and
+            // then the B3 state gate would needlessly escalate). Shared matcher.
+            if Self.appMatches(frontmostName: front?.localizedName, frontmostBundle: front?.bundleIdentifier,
+                               expectedName: name, expectedBundle: bundle) { return }
         }
     }
 
@@ -2515,7 +2766,8 @@ public final class CascadeAppModel: ObservableObject {
             appName: step.appName,
             bundleIdentifier: step.bundleIdentifier,
             windowTitleHint: step.windowTitleHint,
-            ocrAnchor: step.ocrAnchor
+            ocrAnchor: step.ocrAnchor,
+            targetDescriptor: step.targetDescriptor
         )
     }
 

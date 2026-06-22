@@ -89,6 +89,12 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
     public let appName: String
     public let bundleIdentifier: String?
     public let windowTitle: String?
+    /// For clicks: a stable AX descriptor of the clicked element (encoded
+    /// `role`+`identifier` via `AXTargetDescriptor`), captured live at record time.
+    /// `text` carries the human label; this carries the locator the replay cascade
+    /// ranks on so a moved/renamed control is still re-found. `nil` for keys/scrolls
+    /// and for clicks whose element exposed neither a role nor an identifier.
+    public let targetDescriptor: String?
 
     public init(
         id: Int64 = 0,
@@ -101,7 +107,8 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
         modifiers: [String] = [],
         appName: String,
         bundleIdentifier: String? = nil,
-        windowTitle: String? = nil
+        windowTitle: String? = nil,
+        targetDescriptor: String? = nil
     ) {
         self.id = id
         self.capturedAt = capturedAt
@@ -114,6 +121,52 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
         self.appName = appName
         self.bundleIdentifier = bundleIdentifier
         self.windowTitle = windowTitle
+        self.targetDescriptor = targetDescriptor
+    }
+}
+
+/// Canonical encoding for the stable AX locator recorded with a click — `role`,
+/// `identifier`, and the structural `container` (parent role+title) packed into one
+/// string so the replay cascade can rank candidates by identity (XCUIAutomation-style:
+/// identifier most stable, role disambiguates equal labels) and, when labels are
+/// identical (grid cells, repeated buttons), by their structural container
+/// (Healenium-style). One source of truth shared by the recorder (write) and the
+/// replay path (read); pure and unit-pinned. Backward compatible: a string without
+/// the separator decodes to all-`nil`, a 2-field (pre-B2) string yields a `nil`
+/// container, and old rows are simply `nil`.
+public enum AXTargetDescriptor {
+    /// U+001F UNIT SEPARATOR — a control char that never appears in a UI label.
+    static let separator = "\u{1F}"
+
+    /// Packs role+identifier+container; `nil` when all are empty (nothing to record).
+    public static func encode(role: String?, identifier: String?, container: String? = nil) -> String? {
+        let r = (role ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let i = (identifier ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let c = (container ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !r.isEmpty || !i.isEmpty || !c.isEmpty else { return nil }
+        return [r, i, c].joined(separator: separator)
+    }
+
+    /// Canonical "role: title" container string — the single shared shape so a
+    /// recorder-captured container (MacContextKit) and a replay-read one (ComputerUseKit)
+    /// compare equal after normalization. `nil` when both parts are empty.
+    public static func container(role: String, title: String) -> String? {
+        let r = role.trimmingCharacters(in: .whitespaces)
+        let t = title.trimmingCharacters(in: .whitespaces)
+        guard !r.isEmpty || !t.isEmpty else { return nil }
+        return "\(r): \(String(t.prefix(60)))"
+    }
+
+    /// Unpacks an encoded descriptor; tolerant of `nil`/legacy unseparated/2-field strings.
+    public static func decode(_ encoded: String?) -> (role: String?, identifier: String?, container: String?) {
+        guard let encoded, encoded.contains(separator) else { return (nil, nil, nil) }
+        let parts = encoded.components(separatedBy: separator)
+        func field(_ i: Int) -> String? {
+            guard parts.indices.contains(i) else { return nil }
+            let v = parts[i]
+            return v.isEmpty ? nil : v
+        }
+        return (field(0), field(1), field(2))
     }
 }
 
@@ -144,6 +197,11 @@ public struct RecipeStep: Codable, Equatable, Sendable {
     public let bundleIdentifier: String?
     public let windowTitleHint: String?
     public let ocrAnchor: String?
+    /// Stable AX locator of a click target (encoded `role`+`identifier` via
+    /// `AXTargetDescriptor`), carried from the recorded `InputEvent`. The replay
+    /// cascade ranks live candidates on this before falling back to the `ocrAnchor`
+    /// label and finally the recorded pixel. Optional — old recipes decode without it.
+    public let targetDescriptor: String?
 
     public init(
         order: Int,
@@ -156,7 +214,8 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         appName: String,
         bundleIdentifier: String? = nil,
         windowTitleHint: String? = nil,
-        ocrAnchor: String? = nil
+        ocrAnchor: String? = nil,
+        targetDescriptor: String? = nil
     ) {
         self.order = order
         self.kind = kind
@@ -169,6 +228,7 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         self.bundleIdentifier = bundleIdentifier
         self.windowTitleHint = windowTitleHint
         self.ocrAnchor = ocrAnchor
+        self.targetDescriptor = targetDescriptor
     }
 }
 
@@ -536,6 +596,50 @@ public actor CascadeStore {
         }
     }
 
+    /// Hybrid recall — the recommended search entry point. Runs the keyword lane
+    /// (FTS5/BM25) and the semantic lane (cosine over embeddings) in PARALLEL and
+    /// fuses their rankings with Reciprocal Rank Fusion, rather than falling back
+    /// one lane to the next. A moment the keyword lane missed but meaning ranked
+    /// highly now surfaces even when keyword search also returned hits — the lanes
+    /// cover each other's blind spots instead of one pre-empting the other.
+    ///
+    /// `candidatePool` is how deep each lane is read before fusing (wider than
+    /// `limit` so a moment ranked, say, #20 in keyword but #2 in meaning can still
+    /// win the fused top-N). Only the fused top-`limit` is hydrated to rows.
+    public func hybridContexts(matching query: String, limit: Int = 12, candidatePool: Int = 40) throws -> [RecordedContext] {
+        let keyword = try lexicalRankedIDs(matching: query, limit: candidatePool)
+        let semantic = try semanticRankedIDs(matching: query, limit: candidatePool)
+        // Both empty → no match; one empty → RRF degenerates to the other lane's
+        // order (still correct, no special-casing). Fuse and hydrate the winners.
+        let fused = RankFusion.reciprocalRankFusion([keyword, semantic], limit: limit)
+        return try fused.compactMap { try context(id: $0) }
+    }
+
+    /// The keyword lane's ranking as bare moment ids, best BM25 match first, for
+    /// `hybridContexts` to fuse. Uses the any-token (OR) match for recall — BM25
+    /// still floats moments matching more query terms to the top, so precision
+    /// survives the fusion without a separate AND lane.
+    private func lexicalRankedIDs(matching query: String, limit: Int) throws -> [Int64] {
+        let match = Self.ftsAnyQuery(from: query)
+        guard !match.isEmpty else { return [] }
+        let sql = """
+        SELECT rewind_fts.rowid
+        FROM rewind_fts
+        WHERE rewind_fts MATCH ?
+        ORDER BY bm25(rewind_fts)
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(match, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(limit))
+            var ids: [Int64] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                ids.append(sqlite3_column_int64(statement, 0))
+            }
+            return ids
+        }
+    }
+
     /// Enforces local retention: drops moments older than `maxAge`, then trims the
     /// oldest remaining moments whose frames push total frame-file size over
     /// `maxTotalBytes`. Deleting the rows fires the FTS `_ad` trigger so the search
@@ -605,8 +709,8 @@ public actor CascadeStore {
         do {
             let sql = """
             INSERT INTO input_event
-                (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             for event in events {
                 try withStatement(sql) { statement in
@@ -620,6 +724,7 @@ public actor CascadeStore {
                     bind(event.appName, at: 8, in: statement)
                     bind(event.bundleIdentifier, at: 9, in: statement)
                     bind(event.windowTitle, at: 10, in: statement)
+                    bind(event.targetDescriptor, at: 11, in: statement)
                     try stepDone(statement)
                 }
             }
@@ -633,7 +738,7 @@ public actor CascadeStore {
     /// Most recent input events (newest first).
     public func recentInputEvents(limit: Int = 1000) throws -> [InputEvent] {
         let sql = """
-        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
         ORDER BY captured_at DESC, id DESC
         LIMIT ?;
@@ -654,7 +759,7 @@ public actor CascadeStore {
     /// what `WasteDetector` expects, so the bracketed events feed it directly.
     public func inputEvents(between start: Date, and end: Date, limit: Int = 2000) throws -> [InputEvent] {
         let sql = """
-        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
         WHERE captured_at >= ? AND captured_at <= ?
         ORDER BY captured_at ASC, id ASC
@@ -860,6 +965,7 @@ public actor CascadeStore {
         try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN goal TEXT;", db: db)
+        try? execute("ALTER TABLE input_event ADD COLUMN target_descriptor TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
@@ -901,7 +1007,8 @@ public actor CascadeStore {
             modifiers TEXT,
             app_name TEXT NOT NULL,
             bundle_identifier TEXT,
-            window_title TEXT
+            window_title TEXT,
+            target_descriptor TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_input_event_captured_at
             ON input_event(captured_at DESC);
@@ -1032,7 +1139,8 @@ public actor CascadeStore {
             modifiers: text(statement, 7).map { $0.split(separator: ",").map(String.init) } ?? [],
             appName: text(statement, 8) ?? "Unknown",
             bundleIdentifier: text(statement, 9),
-            windowTitle: text(statement, 10)
+            windowTitle: text(statement, 10),
+            targetDescriptor: text(statement, 11)
         )
     }
 
