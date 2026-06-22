@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CascadeMemory
 import Foundation
 
 // Accessibility-tree target resolution for replaying recorded recipes.
@@ -27,10 +28,15 @@ public enum AXElementResolver {
         public let label: String
         public let role: String?
         public let identifier: String?
-        public init(label: String, role: String? = nil, identifier: String? = nil) {
+        /// The element's structural container (parent role+title) — disambiguates
+        /// identical labels by where they sit (Healenium-style), e.g. the "Save" in
+        /// dialog A vs B, or a cell by its row. `nil` when not recorded/available.
+        public let container: String?
+        public init(label: String, role: String? = nil, identifier: String? = nil, container: String? = nil) {
             self.label = label
             self.role = role
             self.identifier = identifier
+            self.container = container
         }
     }
 
@@ -74,7 +80,15 @@ public enum AXElementResolver {
             walk(window, depth: 0, visited: &visited) { element, role in
                 guard pointableRoles.contains(role) else { return }
                 let text = labelText(of: element)
-                let candidate = Descriptor(label: text ?? "", role: role, identifier: identifier(of: element))
+                let id = identifier(of: element)
+                // The container read climbs to the parent — do it lazily, only for
+                // candidates that already self-match and only when the recorded target
+                // HAS a container, so a heavy tree walk stays cheap.
+                let preMatch = (descriptor.identifier.map { !$0.isEmpty && $0 == id } ?? false)
+                    || matchScore(needle: normalize(descriptor.label), candidate: normalize(text ?? "")) > 0
+                guard preMatch else { return }
+                let container = descriptor.container == nil ? nil : containerLabel(of: element)
+                let candidate = Descriptor(label: text ?? "", role: role, identifier: id, container: container)
                 let score = rank(recorded: descriptor, candidate: candidate)
                 guard score > 0 else { return }
                 guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
@@ -221,7 +235,16 @@ public enum AXElementResolver {
         } else {
             roleBonus = 0
         }
-        return labelScore + roleBonus
+        // Container is a SUB-tiebreak under role (±0.1): among identical label+role
+        // candidates (grid cells, repeated buttons), prefer the one in the recorded
+        // structural container. Role+container spread (0.7) still stays inside a tier.
+        let containerBonus: Double
+        if let rc = recorded.container, !rc.isEmpty, let cc = candidate.container, !cc.isEmpty {
+            containerBonus = (normalize(rc) == normalize(cc)) ? 0.1 : -0.1
+        } else {
+            containerBonus = 0
+        }
+        return labelScore + roleBonus + containerBonus
     }
 
     /// 3 = exact, 2 = one contains the other, 1+overlap = shared words. Below 1 is
@@ -285,6 +308,16 @@ public enum AXElementResolver {
         guard let id = string(of: element, kAXIdentifierAttribute as String),
               !id.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
         return id
+    }
+
+    /// The element's structural container — its parent's "role: title" via the shared
+    /// `AXTargetDescriptor.container` formatter (so it compares equal to what the
+    /// recorder captured). `nil` when there's no parent or it carries no signal.
+    static func containerLabel(of element: AXUIElement) -> String? {
+        guard let parent = self.element(of: element, attribute: kAXParentAttribute) else { return nil }
+        let role = string(of: parent, kAXRoleAttribute) ?? ""
+        let title = labelText(of: parent) ?? ""
+        return AXTargetDescriptor.container(role: role, title: title)
     }
 
     private static func string(of element: AXUIElement, _ attribute: String) -> String? {

@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 import Testing
 
@@ -33,8 +34,8 @@ struct AXElementResolverTests {
 
     // MARK: - B1 ranked locator: rank(recorded:candidate:)
 
-    private func desc(_ label: String, role: String? = nil, id: String? = nil) -> AXElementResolver.Descriptor {
-        AXElementResolver.Descriptor(label: label, role: role, identifier: id)
+    private func desc(_ label: String, role: String? = nil, id: String? = nil, container: String? = nil) -> AXElementResolver.Descriptor {
+        AXElementResolver.Descriptor(label: label, role: role, identifier: id, container: container)
     }
 
     @Test func labelOnlyRankReducesToTextScore() {
@@ -91,6 +92,44 @@ struct AXElementResolverTests {
             recorded: desc("Save", role: "AXButton"),
             candidate: desc("Save Document", role: "AXButton")) // 2 + 0.25 = 2.25
         #expect(exactWrongRole > partialRightRole)
+    }
+
+    // MARK: - B2 structural heal: container disambiguates identical labels
+
+    @Test func containerDisambiguatesIdenticalLabelAndRole() {
+        // Two identical "OK" buttons; the recorded one lived in the "Export" sheet.
+        // Same label + same role tie; the container breaks it toward the right sheet.
+        let recorded = desc("OK", role: "AXButton", container: "AXSheet: Export")
+        let inExport = AXElementResolver.rank(recorded: recorded,
+            candidate: desc("OK", role: "AXButton", container: "AXSheet: Export"))
+        let inOther = AXElementResolver.rank(recorded: recorded,
+            candidate: desc("OK", role: "AXButton", container: "AXSheet: Print"))
+        #expect(inExport > inOther)
+    }
+
+    @Test func containerComparesAfterNormalization() {
+        // Recorder and replay may format casing/whitespace slightly differently;
+        // normalization must bridge them so the container still matches.
+        let score = AXElementResolver.rank(
+            recorded: desc("OK", role: "AXButton", container: "AXSheet: Export"),
+            candidate: desc("OK", role: "AXButton", container: "axsheet:  export "))
+        #expect(score == 3 + 0.25 + 0.1) // exact label + same role + same container
+    }
+
+    @Test func containerIsASubTiebreakUnderRole() {
+        // Container (±0.1) must not outweigh role (±0.25): a same-ROLE candidate in the
+        // wrong container still beats a different-role candidate in the right container.
+        let recorded = desc("Item", role: "AXButton", container: "AXGroup: A")
+        let rightRoleWrongContainer = AXElementResolver.rank(recorded: recorded,
+            candidate: desc("Item", role: "AXButton", container: "AXGroup: B"))   // 3 +0.25 -0.1 = 3.15
+        let wrongRoleRightContainer = AXElementResolver.rank(recorded: recorded,
+            candidate: desc("Item", role: "AXMenuItem", container: "AXGroup: A")) // 3 -0.25 +0.1 = 2.85
+        #expect(rightRoleWrongContainer > wrongRoleRightContainer)
+    }
+
+    @Test func containerFormatterIsNilWhenEmpty() {
+        #expect(AXTargetDescriptor.container(role: "  ", title: "") == nil)
+        #expect(AXTargetDescriptor.container(role: "AXRow", title: "Overdue") == "AXRow: Overdue")
     }
 
     // The flail-moment grounding push: turn live AX controls into the compact

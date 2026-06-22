@@ -306,7 +306,8 @@ public final class InputRecorder: @unchecked Sendable {
                         var identifierRef: CFTypeRef?
                         let identifier = AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &identifierRef) == .success
                             ? (identifierRef as? String) : nil
-                        let descriptor = AXTargetDescriptor.encode(role: role, identifier: identifier)
+                        let descriptor = AXTargetDescriptor.encode(
+                            role: role, identifier: identifier, container: Self.containerLabel(of: element))
                         return (String(text.prefix(80)), descriptor)
                     }
                 }
@@ -317,6 +318,33 @@ public final class InputRecorder: @unchecked Sendable {
             element = (parent as! AXUIElement)
         }
         return nil
+    }
+
+    /// The clicked element's structural container — its parent's "role: title" via the
+    /// shared `AXTargetDescriptor.container` formatter, so it compares equal to what
+    /// the replay resolver reads. Lets the cascade disambiguate identical labels by
+    /// where they sit (Healenium-style). `nil` when there's no parent / no signal.
+    private static func containerLabel(of element: AXUIElement) -> String? {
+        var parentRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
+              let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return nil }
+        let parentElement = parent as! AXUIElement
+        var roleRef: CFTypeRef?
+        let role = AXUIElementCopyAttributeValue(parentElement, kAXRoleAttribute as CFString, &roleRef) == .success
+            ? (roleRef as? String ?? "") : ""
+        var title = ""
+        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+            var textRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(parentElement, attribute as CFString, &textRef) == .success,
+               let text = textRef as? String, !text.trimmingCharacters(in: .whitespaces).isEmpty {
+                // A parent's title can smuggle a sensitive phrase (a row reading
+                // "Password: …") past the label gate — drop the title (keep the
+                // structural role) when it trips the privacy rules.
+                title = PrivacyRules.isSensitiveText(text) ? "" : text
+                break
+            }
+        }
+        return AXTargetDescriptor.container(role: role, title: title)
     }
 
     private func snapshotContext() -> AppContext {

@@ -125,31 +125,48 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
-/// Canonical encoding for the stable AX locator recorded with a click — `role` and
-/// `identifier` packed into one string so the replay cascade can rank candidates by
-/// identity (XCUIAutomation-style: identifier is the most stable locator, role
-/// disambiguates equal labels). One source of truth shared by the recorder (write)
-/// and the replay path (read); pure and unit-pinned. Backward compatible: a string
-/// without the separator decodes to `(nil, nil)` and old rows are simply `nil`.
+/// Canonical encoding for the stable AX locator recorded with a click — `role`,
+/// `identifier`, and the structural `container` (parent role+title) packed into one
+/// string so the replay cascade can rank candidates by identity (XCUIAutomation-style:
+/// identifier most stable, role disambiguates equal labels) and, when labels are
+/// identical (grid cells, repeated buttons), by their structural container
+/// (Healenium-style). One source of truth shared by the recorder (write) and the
+/// replay path (read); pure and unit-pinned. Backward compatible: a string without
+/// the separator decodes to all-`nil`, a 2-field (pre-B2) string yields a `nil`
+/// container, and old rows are simply `nil`.
 public enum AXTargetDescriptor {
     /// U+001F UNIT SEPARATOR — a control char that never appears in a UI label.
     static let separator = "\u{1F}"
 
-    /// Packs role+identifier; `nil` when both are empty (nothing worth recording).
-    public static func encode(role: String?, identifier: String?) -> String? {
+    /// Packs role+identifier+container; `nil` when all are empty (nothing to record).
+    public static func encode(role: String?, identifier: String?, container: String? = nil) -> String? {
         let r = (role ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let i = (identifier ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !r.isEmpty || !i.isEmpty else { return nil }
-        return r + separator + i
+        let c = (container ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !r.isEmpty || !i.isEmpty || !c.isEmpty else { return nil }
+        return [r, i, c].joined(separator: separator)
     }
 
-    /// Unpacks an encoded descriptor; tolerant of `nil`/legacy unseparated strings.
-    public static func decode(_ encoded: String?) -> (role: String?, identifier: String?) {
-        guard let encoded, encoded.contains(separator) else { return (nil, nil) }
+    /// Canonical "role: title" container string — the single shared shape so a
+    /// recorder-captured container (MacContextKit) and a replay-read one (ComputerUseKit)
+    /// compare equal after normalization. `nil` when both parts are empty.
+    public static func container(role: String, title: String) -> String? {
+        let r = role.trimmingCharacters(in: .whitespaces)
+        let t = title.trimmingCharacters(in: .whitespaces)
+        guard !r.isEmpty || !t.isEmpty else { return nil }
+        return "\(r): \(String(t.prefix(60)))"
+    }
+
+    /// Unpacks an encoded descriptor; tolerant of `nil`/legacy unseparated/2-field strings.
+    public static func decode(_ encoded: String?) -> (role: String?, identifier: String?, container: String?) {
+        guard let encoded, encoded.contains(separator) else { return (nil, nil, nil) }
         let parts = encoded.components(separatedBy: separator)
-        let role = parts.indices.contains(0) ? parts[0] : ""
-        let identifier = parts.indices.contains(1) ? parts[1] : ""
-        return (role.isEmpty ? nil : role, identifier.isEmpty ? nil : identifier)
+        func field(_ i: Int) -> String? {
+            guard parts.indices.contains(i) else { return nil }
+            let v = parts[i]
+            return v.isEmpty ? nil : v
+        }
+        return (field(0), field(1), field(2))
     }
 }
 

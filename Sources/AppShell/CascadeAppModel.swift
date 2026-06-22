@@ -2647,10 +2647,10 @@ public final class CascadeAppModel: ObservableObject {
     /// the main actor — AX tree walks take tens of milliseconds.
     private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> CGPoint? {
         let label = (step.text ?? step.ocrAnchor) ?? ""
-        let (role, identifier) = AXTargetDescriptor.decode(step.targetDescriptor)
+        let (role, identifier, container) = AXTargetDescriptor.decode(step.targetDescriptor)
         // Need a label or a stable identifier to re-find the element by identity.
         guard !label.trimmingCharacters(in: .whitespaces).isEmpty || (identifier?.isEmpty == false) else { return nil }
-        let descriptor = AXElementResolver.Descriptor(label: label, role: role, identifier: identifier)
+        let descriptor = AXElementResolver.Descriptor(label: label, role: role, identifier: identifier, container: container)
         return await Task.detached(priority: .userInitiated) {
             AXElementResolver.find(descriptor: descriptor, near: recorded)?.center
         }.value

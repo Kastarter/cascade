@@ -29,7 +29,7 @@ func inputEventTargetDescriptorRoundTrips() async throws {
     // B1: the stable AX locator recorded with a click must survive insert→read so the
     // replay cascade can rank on it (proves the column + migration + decode).
     let store = try makeAgentStore()
-    let descriptor = AXTargetDescriptor.encode(role: "AXButton", identifier: "composeSend")
+    let descriptor = AXTargetDescriptor.encode(role: "AXButton", identifier: "composeSend", container: "AXSheet: Export")
     try await store.insertInputEvents([
         InputEvent(kind: .click, x: 5, y: 6, text: "Send", appName: "Mail", targetDescriptor: descriptor),
         InputEvent(kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
@@ -38,9 +38,10 @@ func inputEventTargetDescriptorRoundTrips() async throws {
     let events = try await store.recentInputEvents(limit: 10)
     let click = try #require(events.first { $0.kind == .click })
     #expect(click.targetDescriptor == descriptor)
-    let (role, identifier) = AXTargetDescriptor.decode(click.targetDescriptor)
-    #expect(role == "AXButton")
-    #expect(identifier == "composeSend")
+    let decoded = AXTargetDescriptor.decode(click.targetDescriptor)
+    #expect(decoded.role == "AXButton")
+    #expect(decoded.identifier == "composeSend")
+    #expect(decoded.container == "AXSheet: Export")
     // Non-click events carry no descriptor.
     #expect(events.first { $0.kind == .key }?.targetDescriptor == nil)
 }
