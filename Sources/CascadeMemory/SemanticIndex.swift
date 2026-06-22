@@ -73,6 +73,14 @@ public extension CascadeStore {
     /// Moments semantically closest to `query`, best first — recall without
     /// keyword overlap. Scans all stored vectors (cheap at rewind scale).
     func semanticContexts(matching query: String, limit: Int = 8) throws -> [RecordedContext] {
+        try semanticRankedIDs(matching: query, limit: limit).compactMap { try context(id: $0) }
+    }
+
+    /// The semantic lane's ranking as bare moment ids (best cosine first), for
+    /// RankFusion to merge with the keyword lane in `hybridContexts`. Same scan
+    /// and 0.55 cosine floor as `semanticContexts`; returning ids (not hydrated
+    /// rows) keeps the fusion cheap — only the fused top-N is hydrated.
+    func semanticRankedIDs(matching query: String, limit: Int) throws -> [Int64] {
         guard let queryVector = SemanticEmbedder.vector(for: query) else { return [] }
         var scored: [(id: Int64, score: Float)] = []
         try withStatement("SELECT context_id, vector FROM context_embedding;") { statement in
@@ -85,7 +93,6 @@ public extension CascadeStore {
                 if score > 0.55 { scored.append((id, score)) }
             }
         }
-        let top = scored.sorted { $0.score > $1.score }.prefix(limit)
-        return try top.compactMap { try context(id: $0.id) }
+        return scored.sorted { $0.score > $1.score }.prefix(limit).map(\.id)
     }
 }

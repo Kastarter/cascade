@@ -123,18 +123,12 @@ public struct RecordRecall: Sendable {
         switch call {
         case .search(let query):
             guard !query.isEmpty else { return "search_record needs a query." }
-            // AND-search first (precise), then any-token (recall), then the
-            // semantic index (no keyword overlap needed) — the model shouldn't
-            // have to know our retrieval quirks.
-            var hits = (try? await store.searchContexts(query: query, limit: 12)) ?? []
-            if hits.isEmpty {
-                hits = (try? await store.relevantContexts(to: query, limit: 12)) ?? []
-            }
-            if hits.count < 4 {
-                let semantic = (try? await store.semanticContexts(matching: query, limit: 12 - hits.count)) ?? []
-                let known = Set(hits.map(\.id))
-                hits += semantic.filter { !known.contains($0.id) }
-            }
+            // Run the keyword (BM25) and semantic (cosine) lanes in parallel and
+            // fuse with Reciprocal Rank Fusion — NOT a fallback chain. A moment the
+            // keyword lane missed but meaning ranked highly surfaces even when
+            // keyword search also returned hits; the model shouldn't have to know
+            // our retrieval quirks.
+            let hits = (try? await store.hybridContexts(matching: query, limit: 12)) ?? []
             let visible = hits.filter { !PrivacyRules.isSensitive($0) }
             guard !visible.isEmpty else { return "No recorded moments match “\(query)”. Try different words or a timeframe." }
             return visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n")

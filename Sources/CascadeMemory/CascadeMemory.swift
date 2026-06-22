@@ -536,6 +536,50 @@ public actor CascadeStore {
         }
     }
 
+    /// Hybrid recall — the recommended search entry point. Runs the keyword lane
+    /// (FTS5/BM25) and the semantic lane (cosine over embeddings) in PARALLEL and
+    /// fuses their rankings with Reciprocal Rank Fusion, rather than falling back
+    /// one lane to the next. A moment the keyword lane missed but meaning ranked
+    /// highly now surfaces even when keyword search also returned hits — the lanes
+    /// cover each other's blind spots instead of one pre-empting the other.
+    ///
+    /// `candidatePool` is how deep each lane is read before fusing (wider than
+    /// `limit` so a moment ranked, say, #20 in keyword but #2 in meaning can still
+    /// win the fused top-N). Only the fused top-`limit` is hydrated to rows.
+    public func hybridContexts(matching query: String, limit: Int = 12, candidatePool: Int = 40) throws -> [RecordedContext] {
+        let keyword = try lexicalRankedIDs(matching: query, limit: candidatePool)
+        let semantic = try semanticRankedIDs(matching: query, limit: candidatePool)
+        // Both empty → no match; one empty → RRF degenerates to the other lane's
+        // order (still correct, no special-casing). Fuse and hydrate the winners.
+        let fused = RankFusion.reciprocalRankFusion([keyword, semantic], limit: limit)
+        return try fused.compactMap { try context(id: $0) }
+    }
+
+    /// The keyword lane's ranking as bare moment ids, best BM25 match first, for
+    /// `hybridContexts` to fuse. Uses the any-token (OR) match for recall — BM25
+    /// still floats moments matching more query terms to the top, so precision
+    /// survives the fusion without a separate AND lane.
+    private func lexicalRankedIDs(matching query: String, limit: Int) throws -> [Int64] {
+        let match = Self.ftsAnyQuery(from: query)
+        guard !match.isEmpty else { return [] }
+        let sql = """
+        SELECT rewind_fts.rowid
+        FROM rewind_fts
+        WHERE rewind_fts MATCH ?
+        ORDER BY bm25(rewind_fts)
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(match, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(limit))
+            var ids: [Int64] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                ids.append(sqlite3_column_int64(statement, 0))
+            }
+            return ids
+        }
+    }
+
     /// Enforces local retention: drops moments older than `maxAge`, then trims the
     /// oldest remaining moments whose frames push total frame-file size over
     /// `maxTotalBytes`. Deleting the rows fires the FTS `_ad` trigger so the search
