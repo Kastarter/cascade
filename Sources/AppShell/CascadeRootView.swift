@@ -2009,6 +2009,8 @@ private struct SettingsScreen: View {
                     .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
             }
             Spacer()
+            Button("Preview cursors") { model.previewAgentCursors() }
+                .buttonStyle(CascadeQuietButtonStyle())
             Button("Setup guide") { model.showOnboarding = true }
                 .buttonStyle(CascadeQuietButtonStyle())
             Button {

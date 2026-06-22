@@ -2976,6 +2976,12 @@ public final class CascadeAppModel: ObservableObject {
         statusLine = recorder.status.message
     }
 
+    /// Shows the multiple-companion-cursor preview — several translucent agent
+    /// cursors flying, clicking, and pulsing on screen at once.
+    public func previewAgentCursors() {
+        guidanceOverlay.previewCompanions()
+    }
+
     /// Prepends a freshly recorded moment to the Reel, newest-first, capped so the
     /// in-memory list stays bounded.
     private func ingestLiveMoment(_ context: RecordedContext) {
