@@ -31,6 +31,7 @@ public protocol RecordAnswering: Sendable {
 /// it used and the final answer returns them as structured citations.
 public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     private let store: CascadeStore
+    private let recall: RecordRecall
     private let keyStore: AnthropicKeyStore
     private let model: String
     private let maxHops: Int
@@ -43,6 +44,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         maxHops: Int = 6
     ) {
         self.store = store
+        self.recall = RecordRecall(store: store)
         self.keyStore = keyStore
         self.model = model
         self.maxHops = maxHops
@@ -94,59 +96,10 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
 
     // MARK: - Tools (resolve in-process against the local store)
 
+    /// Delegates to the shared `RecordRecall` so the Ask panel and the on-screen
+    /// cursor agent run byte-identical retrieval against the record.
     private func perform(tool: String, input: [String: Any]) async -> String {
-        switch tool {
-        case "search_record":
-            let query = (input["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !query.isEmpty else { return "search_record needs a query." }
-            // AND-search first (precise), then any-token (recall), then the
-            // semantic index (no keyword overlap needed) — the model shouldn't
-            // have to know our retrieval quirks.
-            var hits = (try? await store.searchContexts(query: query, limit: 12)) ?? []
-            if hits.isEmpty {
-                hits = (try? await store.relevantContexts(to: query, limit: 12)) ?? []
-            }
-            if hits.count < 4 {
-                let semantic = (try? await store.semanticContexts(matching: query, limit: 12 - hits.count)) ?? []
-                let known = Set(hits.map(\.id))
-                hits += semantic.filter { !known.contains($0.id) }
-            }
-            let visible = hits.filter { !PrivacyRules.isSensitive($0) }
-            guard !visible.isEmpty else { return "No recorded moments match “\(query)”. Try different words or a timeframe." }
-            return visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n")
-
-        case "get_timeframe":
-            guard let start = Self.date(from: input["start_iso"]),
-                  let end = Self.date(from: input["end_iso"]), end > start else {
-                return "get_timeframe needs start_iso and end_iso (ISO-8601, end after start)."
-            }
-            let rows = ((try? await store.contexts(between: start, and: end, limit: 60)) ?? [])
-                .filter { !PrivacyRules.isSensitive($0) }
-            guard !rows.isEmpty else { return "Nothing recorded in that window." }
-            return rows.map { Self.line(for: $0, textCap: 160) }.joined(separator: "\n")
-
-        case "inspect_moment":
-            guard let id = (input["id"] as? NSNumber)?.int64Value ?? (input["id"] as? Int).map(Int64.init) else {
-                return "inspect_moment needs a numeric id."
-            }
-            guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
-                return "No accessible moment #\(id)."
-            }
-            var out = Self.line(for: moment, textCap: 2_000)
-            // Neighbors give the model the surrounding story without another hop.
-            let neighbors = ((try? await store.contexts(
-                between: moment.capturedAt.addingTimeInterval(-90),
-                and: moment.capturedAt.addingTimeInterval(90),
-                limit: 8
-            )) ?? []).filter { $0.id != id && !PrivacyRules.isSensitive($0) }
-            if !neighbors.isEmpty {
-                out += "\nNearby: " + neighbors.map { "[#\($0.id)] \(Self.time($0.capturedAt)) \($0.appName)" }.joined(separator: ", ")
-            }
-            return out
-
-        default:
-            return "Unknown tool \(tool)."
-        }
+        await recall.perform(tool: tool, input: input)
     }
 
     // MARK: - Request plumbing
@@ -166,7 +119,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             "messages": messages,
         ]
         if toolsAllowed {
-            var tools = Self.toolDefinitions()
+            var tools = RecordRecall.toolDefinitions()
             // Cache the static prefix (system + tools) across hops.
             tools[tools.count - 1]["cache_control"] = ["type": "ephemeral"]
             body["tools"] = tools
@@ -186,41 +139,6 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         return json
     }
 
-    // A function, not a stored static — [[String: Any]] isn't Sendable, so a
-    // global constant trips strict concurrency.
-    private static func toolDefinitions() -> [[String: Any]] { [
-        [
-            "name": "search_record",
-            "description": "Full-text search over everything the user has seen on screen (app names, window titles, on-screen text). Returns matching moments as [#id] time app — title | text. Search again with different words if the first try misses.",
-            "input_schema": [
-                "type": "object",
-                "properties": ["query": ["type": "string", "description": "Keywords to search for"]],
-                "required": ["query"],
-            ],
-        ],
-        [
-            "name": "get_timeframe",
-            "description": "Everything recorded between two times, oldest first — for 'what was I doing around 2pm' style questions.",
-            "input_schema": [
-                "type": "object",
-                "properties": [
-                    "start_iso": ["type": "string", "description": "ISO-8601 start, e.g. 2026-06-10T14:00:00Z"],
-                    "end_iso": ["type": "string", "description": "ISO-8601 end"],
-                ],
-                "required": ["start_iso", "end_iso"],
-            ],
-        ],
-        [
-            "name": "inspect_moment",
-            "description": "The full recorded text of one moment by its id, plus its immediate neighbors — use after a search hit to read the details.",
-            "input_schema": [
-                "type": "object",
-                "properties": ["id": ["type": "integer", "description": "Moment id from a search result"]],
-                "required": ["id"],
-            ],
-        ],
-    ] }
-
     private static func systemPrompt() -> String {
         let formatter = ISO8601DateFormatter()
         return """
@@ -239,30 +157,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         """
     }
 
-    // MARK: - Formatting
-
-    /// "[#42] 14:03 Mail — Inbox | text…" — the id the model cites back.
-    private static func line(for context: RecordedContext, textCap: Int) -> String {
-        let title = context.windowTitle.map { " — \($0)" } ?? ""
-        let text = (context.ocrText ?? "").replacingOccurrences(of: "\n", with: " · ")
-        let trimmed = text.isEmpty ? "" : " | \(String(text.prefix(textCap)))"
-        return "[#\(context.id)] \(time(context.capturedAt)) \(context.appName)\(title)\(trimmed)"
-    }
-
-    private static func time(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "HH:mm"
-        return formatter.string(from: date)
-    }
-
-    private static func date(from value: Any?) -> Date? {
-        guard let string = value as? String else { return nil }
-        let formatter = ISO8601DateFormatter()
-        if let date = formatter.date(from: string) { return date }
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: string)
-    }
+    // MARK: - Citation parsing
 
     /// Splits "answer …\nSOURCES: #12, #87" into clean text + cited ids.
     /// Tolerates inline "[#12]" citations too. Public for tests.

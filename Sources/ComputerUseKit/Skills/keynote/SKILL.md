@@ -26,9 +26,12 @@ you can already predict from the current screenshot is ONE chained turn, and
 the NEXT turn's screenshot is the check — no look-only turns in between:
 double-click a placeholder → `cmd+a` → type is one turn; click a field →
 `cmd+a` → type → `Return` is one turn; `cmd+shift+n` → double-click the new
-slide's title → type is one turn. Go one-action-solo only when the next step
-depends on what appears: the theme chooser, a just-inserted table or chart,
-an unfamiliar dialog, Edit Chart Data.
+slide's title → type is one turn. For ANY text entry, the `fill_field` tool IS
+that one turn — it clicks the spot, selects what's there, types, and presses
+the finisher in a single call (`click:double`, `submit:cmd_return` for a title
+or body placeholder; `submit:return` for a sidebar field). Go one-action-solo
+only when the next step depends on what appears: the theme chooser, a
+just-inserted table or chart, an unfamiliar dialog, Edit Chart Data.
 
 ## Documents and themes
 
@@ -86,12 +89,13 @@ clicks and zooms on one checkbox). Otherwise, screenshot and classify:
 
 ## Set values in fields — don't mash keys
 
-- Font size: select the text or box → Format sidebar > `Text` tab → click
-  the size field, `cmd+a`, type the number, `Return`. NEVER hammer
+- Font size: select the text or box → Format sidebar > `Text` tab →
+  `fill_field` the size field with the number (`submit:return`). NEVER hammer
   `cmd+plus` repeatedly.
 - Position and size: Format > `Arrange` tab → Position X/Y (the object's
-  upper-LEFT corner) and Size W/H — same dance: click the field, `cmd+a`,
-  type, `Return`. This is how you "move the title up": set Y once.
+  upper-LEFT corner) and Size W/H — `fill_field` each (`submit:return`, or
+  `submit:tab` to jump to the next field). This is how you "move the title
+  up": set Y once.
 - One key event per key ACTION (several key actions still chain in the same
   turn); modifiers are only cmd/shift/option/ctrl. To press a key N times
   send N separate actions — and if N would exceed ~3, stop: there is a
@@ -108,7 +112,9 @@ clicks and zooms on one checkbox). Otherwise, screenshot and classify:
   re-send the font size. A small `+` badge at a box's bottom edge means
   clipped overflow text, NOT failed typing.
 - Writing the title: the slide's layout almost always ALREADY has a title
-  placeholder ON THE CANVAS — double-click it, `cmd+a`, type, all one turn.
+  placeholder ON THE CANVAS — `fill_field` it (`click:double`,
+  `submit:cmd_return`), which double-clicks, selects, types, and exits in one
+  turn.
   Go to the sidebar ONLY if the canvas truly shows no title box: click empty
   canvas (deselect all) → Format sidebar `Slide` tab shows `Title` / `Body`
   checkboxes → check `Title` ONCE; the next screenshot must show a title box

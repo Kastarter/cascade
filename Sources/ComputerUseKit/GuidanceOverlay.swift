@@ -206,6 +206,20 @@ public final class GuidanceOverlayController {
         state.pressTrigger &+= 1
     }
 
+    /// Toggles the "thinking" sonar pulse. The model round trip is 90%+ of every
+    /// assist turn's wall-clock, and during it the cursor used to sit dead still —
+    /// reading as a hang. Pulsing while the model generates keeps the freeze→act
+    /// cadence feeling continuous. Turned on as the model's thinking streams (the
+    /// pulse arrives via `onThinkingPulse`), off the instant an action executes.
+    public func setThinking(_ on: Bool) {
+        if on {
+            startFollowing()
+            orderFront()
+        }
+        guard state.thinking != on else { return }
+        state.thinking = on
+    }
+
     /// Returns the companion to following the cursor (clears any pointing/label) but
     /// keeps it visible. Used when a question matched no element.
     public func hide() {
@@ -214,6 +228,7 @@ public final class GuidanceOverlayController {
         flightTask?.cancel()
         flightTask = nil
         state.pointing = false
+        state.thinking = false
         state.label = ""
     }
 
@@ -407,6 +422,9 @@ final class GuidanceState: ObservableObject {
     @Published var label: String = ""
     @Published var pointing = false
     @Published var visible = false
+    /// True while the model is generating its next turn — the companion shows a
+    /// calm sonar pulse so a long "freeze" reads as Cascade thinking, not a hang.
+    @Published var thinking = false
     /// Bumped on every press so the overlay can fire a one-shot tap ripple.
     @Published var pressTrigger = 0
     /// Dashed marquee that frames a region for "where do I find/do X" answers.
@@ -491,9 +509,16 @@ struct GuidanceOverlayView: View {
                         .offset(x: point.x - 28, y: point.y - 28)
                         .transaction { $0.animation = nil }
                 }
+                // Sonar pulse while the model thinks — the parked cursor stays
+                // visibly alive through the round-trip "freeze".
+                if state.thinking {
+                    ThinkingPulse(color: state.theme.core)
+                        .offset(x: point.x - 24, y: point.y - 24)
+                        .transaction { $0.animation = nil }
+                }
                 PressRipple(trigger: state.pressTrigger, color: state.theme.core)
                     .offset(x: point.x - 17, y: point.y - 17)
-                GuideCursor(theme: state.theme, label: state.pointing ? state.label : "", pointing: state.pointing, pressTrigger: state.pressTrigger)
+                GuideCursor(theme: state.theme, label: state.pointing ? state.label : "", pointing: state.pointing, thinking: state.thinking, pressTrigger: state.pressTrigger)
                     .offset(x: point.x, y: point.y)
                     // Rides the same spring the offset uses, sampling each interpolated
                     // position into the trail buffer. Only records while pointing/flying.
@@ -716,6 +741,31 @@ private struct TargetRing: View {
     }
 }
 
+/// A calm sonar pulse shown at the cursor tip while the model is generating its
+/// next turn — concentric rings in the theme colour expand and fade outward, so a
+/// multi-second "freeze" reads as Cascade thinking instead of a frozen cursor.
+private struct ThinkingPulse: View {
+    let color: Color
+    @State private var animate = false
+
+    var body: some View {
+        ZStack {
+            ForEach(0..<2, id: \.self) { ring in
+                Circle()
+                    .stroke(color.opacity(0.5), lineWidth: 2)
+                    .frame(width: 28, height: 28)
+                    .scaleEffect(animate ? 2.4 : 0.55)
+                    .opacity(animate ? 0 : 0.65)
+                    .animation(
+                        .easeOut(duration: 1.7).repeatForever(autoreverses: false).delay(Double(ring) * 0.85),
+                        value: animate
+                    )
+            }
+        }
+        .onAppear { animate = true }
+    }
+}
+
 /// One-shot click bloom centred on the cursor tip — a soft glow flash plus a
 /// crisp expanding ring, so a press reads as a little burst of light.
 private struct PressRipple: View {
@@ -772,6 +822,7 @@ struct GuideCursor: View {
     var theme: CursorTheme = .green
     let label: String
     var pointing: Bool = false
+    var thinking: Bool = false
     var pressTrigger: Int = 0
     @State private var pressed = false
     @State private var breathing = false
@@ -822,6 +873,14 @@ struct GuideCursor: View {
             .frame(width: 92, height: 92)
     }
 
+    private func setBreathing(_ on: Bool) {
+        if on {
+            withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) { breathing = true }
+        } else {
+            withAnimation(.easeOut(duration: 0.25)) { breathing = false }
+        }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 7) {
             arrow
@@ -831,15 +890,11 @@ struct GuideCursor: View {
                     pressed = true
                     withAnimation(.spring(response: 0.22, dampingFraction: 0.55)) { pressed = false }
                 }
-                .onChange(of: pointing) { _, isPointing in
-                    if isPointing {
-                        withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) {
-                            breathing = true
-                        }
-                    } else {
-                        withAnimation(.easeOut(duration: 0.25)) { breathing = false }
-                    }
-                }
+                // Breathe while flying to a target OR thinking — both mean the
+                // companion is alive and working, not parked.
+                .onChange(of: pointing) { _, isPointing in setBreathing(isPointing || thinking) }
+                .onChange(of: thinking) { _, isThinking in setBreathing(pointing || isThinking) }
+                .onAppear { if pointing || thinking { setBreathing(true) } }
 
             if !label.isEmpty {
                 Text(label)

@@ -305,3 +305,91 @@ func completionMessageIsHonestAboutTheOutcome() {
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stoppedUpdate()) == "Stopped.")
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stepLimitUpdate("Ran out of steps — ask again.")) == "Ran out of steps — ask again.")
 }
+
+// MARK: - Teach-once (demonstrate a task → agent, over the shared spine)
+
+/// A single cross-app copy/paste demonstration timestamped INSIDE the bracket
+/// `[now, now+offsets]`, increasing 1ms apart so the recipe order is deterministic.
+private func taughtCopyPasteEvents(at now: Date) -> [InputEvent] {
+    [
+        InputEvent(id: 0, capturedAt: now.addingTimeInterval(0.000), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail"),
+        InputEvent(id: 1, capturedAt: now.addingTimeInterval(0.001), kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        InputEvent(id: 2, capturedAt: now.addingTimeInterval(0.002), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers"),
+        InputEvent(id: 3, capturedAt: now.addingTimeInterval(0.003), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
+    ]
+}
+
+/// A taught proposal built directly, so the create/review paths can be tested without
+/// driving a live demonstration.
+private func taughtCurated(signature: String = "sig-taught", name: String = "My taught task") -> CuratedAgent {
+    let waste = DetectedWaste(
+        title: "Mail → Numbers: copy", apps: ["Mail", "Numbers"], occurrences: 1,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 20,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .activateApp, appName: "Mail"),
+            RecipeStep(order: 1, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        ]),
+        evidence: [1], confidence: 0.7, signature: signature
+    )
+    return CuratedAgent(source: waste, name: name, why: "You showed me once.", goal: "Do the taught task.", value: 0.8)
+}
+
+@MainActor @Test
+func teachOnceBracketsTheDemonstrationIntoAPreview() async throws {
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    model.beginTeaching()
+    #expect(model.teachingMode)
+
+    let now = Date()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: now))
+    // endTeaching insets the bracket end by ~0.3s (to drop the finishing hotkey), so
+    // the demonstration events must sit comfortably before that inset window.
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+    #expect(!model.teachingMode)
+
+    // buildTaughtAgent settles ~1.5s (drain + AX labels) then curates → preview.
+    try await waitUntil({ model.teachPreview != nil }, maxTries: 500)
+    #expect(model.teachPreview?.name == "Reply to refund emails with the policy link")
+    #expect(model.teachPreview?.apps == ["Mail", "Numbers"])
+}
+
+@MainActor @Test
+func teachingGatesNarrationIntoIntentNotAnAssistRun() throws {
+    let (model, _) = try makeModel()
+    model.beginTeaching()
+    // A spoken phrase during a demonstration is INTENT, not a command — it must not
+    // launch an assist run (which, with no key, would force open Settings).
+    model.teach(question: "pulling the weekly numbers into the Monday report")
+    #expect(model.teachingMode)             // still demonstrating
+    #expect(!model.showSettings)            // the no-key assist path never ran
+    #expect(model.teachStatus?.contains("heard") == true)
+}
+
+@MainActor @Test
+func createTaughtAgentLandsInYourAgents() async throws {
+    let (model, _) = try makeModel()
+    model.teachPreview = taughtCurated()
+
+    model.createTaughtAgent(taughtCurated())
+
+    try await waitUntil({ !model.agents.isEmpty }, maxTries: 500)
+    #expect(model.agents.first?.name == "My taught task")
+    #expect(model.selectedTab == .cascades)
+    #expect(model.teachPreview == nil)
+}
+
+@MainActor @Test
+func sendTaughtAgentToManagerSurfacesInTheReviewQueue() throws {
+    let (model, _) = try makeModel()
+    let curated = taughtCurated()
+    model.sendTaughtAgentToManager(curated)
+
+    // It joins the manager's review queue (no auto-create) and clears the sheet.
+    #expect(model.pendingCuratedAgents.contains { $0.signature == "sig-taught" })
+    #expect(model.teachPreview == nil)
+
+    // Declining drops it back out of the queue immediately.
+    model.declineCurated(curated)
+    #expect(!model.pendingCuratedAgents.contains { $0.signature == "sig-taught" })
+}

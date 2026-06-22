@@ -127,14 +127,9 @@ public struct WasteDetector: Sendable {
                 // Plain typing, bare editing keys (Delete, Return, arrows), and
                 // scrolling are content editing — "Delete · Delete · type" is
                 // someone fixing a sentence, and nobody wants an agent that
-                // re-presses Delete for them. Demand two structural actions
-                // plus one intent marker: a click on a *named* element, a real
-                // shortcut, or a cross-app flow. Two anonymous clicks in a
-                // browser are reading, not a workflow.
-                let structuralCount = instance.count(where: Self.isStructural)
-                let hasIntentMarker = instance.contains(where: Self.isIntentMarker)
-                    || Set(instance.map(\.appName)).count >= 2
-                guard structuralCount >= 2, hasIntentMarker else { continue }
+                // re-presses Delete for them. The same bar gates the intentional
+                // `waste(fromInstance:)` path — one rule, one place.
+                guard Self.isAutomatableInstance(instance) else { continue }
                 results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts, surface: surface))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
@@ -151,6 +146,30 @@ public struct WasteDetector: Sendable {
             }
             .prefix(maxResults)
             .map { $0 }
+    }
+
+    /// Turns ONE recorded instance — an arbitrary bracketed time range — into a
+    /// `DetectedWaste`, the reusable entry point behind every *intentional*
+    /// agent-creation front door (Teach-once, a Reel selection). It filters
+    /// sensitive apps, collapses scroll bursts, and applies the SAME
+    /// intent/structural guard `detect` uses, so a range that is only scrolling or
+    /// typing returns `nil` ("nothing repeatable here yet") instead of a junk
+    /// recipe. `occurrences` is 1 for a single demonstration; `surface` defaults to
+    /// the app itself (pass a web-identity resolver to name by web app).
+    public func waste(
+        fromInstance events: [InputEvent],
+        contexts: [RecordedContext],
+        occurrences: Int = 1,
+        surface: (@Sendable (InputEvent) -> String?)? = nil
+    ) -> DetectedWaste? {
+        let instance = Self.collapsingScrollBursts(
+            events
+                .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+                .sorted { $0.capturedAt < $1.capturedAt }
+        )
+        guard Self.isAutomatableInstance(instance) else { return nil }
+        let resolve: (InputEvent) -> String = { surface?($0) ?? $0.appName }
+        return makeWaste(instance: instance, occurrences: max(1, occurrences), contexts: contexts, surface: resolve)
     }
 
     // MARK: - Recipe construction
@@ -251,6 +270,20 @@ public struct WasteDetector: Sendable {
         case .key: .key
         case .scroll: .scroll
         }
+    }
+
+    /// The bar a recorded instance must clear to become an automatable workflow:
+    /// ≥2 structural actions (clicks / command shortcuts) AND one intent marker —
+    /// a click on a *named* element, a real shortcut, or a cross-app flow. Two
+    /// anonymous clicks in a browser are reading, not a workflow. `detect` and the
+    /// intentional `waste(fromInstance:)` path both gate on this — one rule, one
+    /// place — so the "what's worth automating" definition can never drift between
+    /// the automatic and the demonstrated routes.
+    static func isAutomatableInstance(_ instance: [InputEvent]) -> Bool {
+        let structuralCount = instance.count(where: isStructural)
+        let hasIntentMarker = instance.contains(where: isIntentMarker)
+            || Set(instance.map(\.appName)).count >= 2
+        return structuralCount >= 2 && hasIntentMarker
     }
 
     /// Clicks and modifier shortcuts give a repetition automatable structure.

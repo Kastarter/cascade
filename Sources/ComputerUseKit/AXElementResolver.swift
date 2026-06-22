@@ -61,6 +61,60 @@ public enum AXElementResolver {
         return best
     }
 
+    /// Roles that are genuinely actionable controls — the `pointable` set minus
+    /// passive things (static text, images, tab groups) that would flood the
+    /// "what's clickable" list pushed at a flail moment.
+    private static let actionableRoles: Set<String> = [
+        "AXButton", "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTextField",
+        "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton", "AXCheckBox",
+        "AXRadioButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider",
+    ]
+
+    /// The labeled, actionable controls in the frontmost app's windows — the live
+    /// "what is actually on screen right now" list. Pushed into the agent's
+    /// context ONLY at a flail moment (an action that changed nothing), so it
+    /// re-grounds on real controls instead of re-guessing pixels. This is
+    /// Cascade's hard-won "push at flail, never a pull tool" lesson married to the
+    /// GUI-agent literature's core finding (grounding, not reasoning, is the
+    /// bottleneck). Empty when Accessibility is off or the app draws its own UI
+    /// (Blender/Electron canvases) — the caller then degrades to a plain nudge.
+    /// Reuses the same bounded walk as `find` (≤1400 nodes, 0.3s timeout), so it
+    /// can't run away on a huge tree.
+    public static func interactables(limit: Int = 40) -> [Match] {
+        guard AXIsProcessTrusted(),
+              let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+
+        var out: [Match] = []
+        var seen = Set<String>()
+        var visited = 0
+        for window in windows(of: app) {
+            walk(window, depth: 0, visited: &visited) { element, role in
+                guard out.count < limit, actionableRoles.contains(role),
+                      let text = labelText(of: element) else { return }
+                let key = normalize(text)
+                guard !key.isEmpty, key.count <= 60 else { return }
+                let dedupe = role + "|" + key
+                guard !seen.contains(dedupe) else { return }
+                guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
+                seen.insert(dedupe)
+                out.append(Match(center: CGPoint(x: frame.midX, y: frame.midY), role: role, title: String(text.prefix(60)), score: 0))
+            }
+        }
+        return out
+    }
+
+    /// Compact, LLM-readable list of clickable controls — pushed at a flail moment.
+    /// Pure (testable); nil when there's nothing to push so the caller can degrade.
+    public static func interactableSummary(_ matches: [Match], limit: Int = 40) -> String? {
+        let items = matches.prefix(limit).map { match -> String in
+            let role = match.role.hasPrefix("AX") ? String(match.role.dropFirst(2)).lowercased() : match.role.lowercased()
+            return "“\(match.title)” (\(role))"
+        }
+        return items.isEmpty ? nil : items.joined(separator: ", ")
+    }
+
     /// A cheap signature of the frontmost app's UI — focused element + the shape of
     /// the focused window's tree. Compare before/after an action: if it didn't
     /// change, the action almost certainly didn't land (tiptour's post-click check).

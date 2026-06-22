@@ -110,6 +110,13 @@ public final class ComputerUseAgent {
     /// the on-screen cursor agent, so its behaviour is unchanged.
     private let extraTools: [[String: Any]]
     private let extraToolNames: Set<String>
+    /// Recall over the user's recorded screen history (search_record /
+    /// get_timeframe / inspect_moment). When on, those tool defs are offered and
+    /// the recall note is appended to the system prompt; the calls route to
+    /// `harnessProvider` in-process (zero screenshots), like use_skill. The
+    /// provider owns auditing and gating. Off for surfaces with no record (the
+    /// web sandbox), so their behaviour is unchanged.
+    private let recallEnabled: Bool
 
     /// Mid-stream delivery: when set, each completed text block and screen action
     /// is handed over the moment it finishes generating, so the caller acts while
@@ -174,11 +181,14 @@ public final class ComputerUseAgent {
     available, and a plan is allowed to be wrong because the next screenshot corrects \
     it. Pick the next direct step and ACT. Never open an app, window, or menu just to \
     verify something the screenshot already shows, and never redo a step the screen \
-    proves succeeded. To REPLACE \
-    what a field already contains (a value, a name, a hex color), click the field, \
-    select all with cmd+a, then use the type action with the new value — chained in one \
-    turn. Typing into a field that still holds its old text APPENDS to it, and clearing \
-    character-by-character with repeated Delete presses is never the way. The type \
+    proves succeeded. To put text into a specific spot — a field, a placeholder, a \
+    search box, a cell — use the fill_field tool: it clicks the target, selects any \
+    existing content, types your text (replacing what was there), and presses the \
+    finishing key ALL in one turn. Reach for it instead of spending separate turns on a \
+    click, then cmd+a, then the type action, then Return — that four-turn ping-pong is \
+    the single biggest waste of the user's time. Typing into a field that still holds \
+    its old text APPENDS to it, and clearing character-by-character with repeated Delete \
+    presses is never the way. The type \
     action delivers its text reliably by itself (using the clipboard internally when \
     needed) — NEVER press cmd+v or ctrl+v as a key action to enter content: you do not \
     control the clipboard, and that key pastes whatever the USER last copied, corrupting \
@@ -238,6 +248,22 @@ public final class ComputerUseAgent {
     twice, fall back to doing it on screen.
     """
 
+    /// Recall guidance — appended only when `recallEnabled`, so the model is
+    /// never told about tools it doesn't have. Recall surfaces the PAST, which
+    /// the current screenshot cannot show, so the model reaches for it exactly
+    /// when the goal points at earlier work.
+    private static let recallNote = """
+    You can also recall the user's recorded screen history — everything they have \
+    already seen and done on this Mac — with three instant tools that need no \
+    screenshot: search_record (search past app names, window titles, and on-screen \
+    text), get_timeframe (everything seen between two times), and inspect_moment \
+    (one recorded moment's full text plus its neighbors). Reach for these whenever \
+    the task refers to something that is NOT on the screen right now — "reply to the \
+    email I was reading earlier", "finish the doc from this morning", "what was that \
+    figure I had open" — recall it first, then act on what you find. This is the \
+    user's own past, not the live screen; for what is on screen now, just look.
+    """
+
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
     /// a tab bar. Not used by the single-view web sandbox.
     public static let foregroundBrowserNote = """
@@ -255,7 +281,8 @@ public final class ComputerUseAgent {
         skillProvider: ((String) -> String?)? = nil,
         harnessTier: HarnessTier = .off,
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
-        extraTools: [[String: Any]] = []
+        extraTools: [[String: Any]] = [],
+        recallEnabled: Bool = false
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -266,6 +293,9 @@ public final class ComputerUseAgent {
         self.harnessProvider = harnessProvider
         self.extraTools = extraTools
         self.extraToolNames = Set(extraTools.compactMap { $0["name"] as? String })
+        // Recall needs the same in-process provider the harness uses; without it
+        // there is nothing to route the calls to.
+        self.recallEnabled = recallEnabled && harnessProvider != nil
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -403,7 +433,13 @@ public final class ComputerUseAgent {
                 "type": "computer_20251124", "name": "computer",
                 "display_width_px": resW, "display_height_px": resH,
                 "enable_zoom": true,
-                "cache_control": ["type": "ephemeral"],
+                // 1h TTL on the static system+tools prefix: a new episode started
+                // within the hour replays it as a cache HIT instead of cold-
+                // prefilling the whole block. 1h writes cost 2× base (vs 1.25× for
+                // 5m), paid once and amortized across a working session. The 1h
+                // TTL is GA — no extra beta header beyond computer-use's. The
+                // moving user-turn breakpoints stay at the 5m default below.
+                "cache_control": ["type": "ephemeral", "ttl": "1h"],
             ],
         ]
         // Harness tools sit before the computer tool so its cache breakpoint
@@ -412,8 +448,21 @@ public final class ComputerUseAgent {
         if harnessTier != .off {
             tools.insert(contentsOf: Self.harnessToolDefinitions(tier: harnessTier), at: tools.count - 1)
         }
+        if recallEnabled {
+            tools.insert(contentsOf: RecordRecall.toolDefinitions(), at: tools.count - 1)
+        }
         if !extraTools.isEmpty {
             tools.insert(contentsOf: extraTools, at: tools.count - 1)
+        }
+        // Coordinate batch-entry for the on-screen cursor agent only — the web
+        // sandbox carries its own DOM `fill_field` in extraTools (collision
+        // otherwise). Collapses the click → select-all → type → submit
+        // ping-pong (4 screenshot-gated turns) into ONE turn. The model still
+        // decides the target and the text; only the forced re-observation
+        // between a click and the keystrokes that always follow it is removed —
+        // it makes the agent faster, not less capable.
+        if extraTools.isEmpty {
+            tools.insert(Self.fillFieldToolDefinition(), at: tools.count - 1)
         }
         if skillProvider != nil {
             tools.insert([
@@ -432,6 +481,7 @@ public final class ComputerUseAgent {
         case .readOnly: system += "\n\n" + Self.harnessReadOnlyNote
         case .full: system += "\n\n" + Self.harnessReadOnlyNote + "\n\n" + Self.harnessPowerNote
         }
+        if recallEnabled { system += "\n\n" + Self.recallNote }
         if let environmentNote { system += "\n\n" + environmentNote }
         // Adaptive thinking is Anthropic's benchmarked setup for computer use on
         // Sonnet 4.6: the model plans before acting, and fewer wrong clicks means
@@ -502,10 +552,17 @@ public final class ComputerUseAgent {
                     }
                 case "highlight":
                     if let action = parseHighlight(input) { actions.append(action) }
-                case let name? where AgentHarness.isHarnessTool(name) || extraToolNames.contains(name):
-                    // Resolved in-process like use_skill — search/read/run and the
-                    // sandbox's DOM tools never touch the screenshot loop. The provider
-                    // owns audit, gating, and STOP.
+                case "fill_field":
+                    // Expands to click → cmd+a → type → submit, all executed in
+                    // THIS turn's batch (one screenshot after) — not streamed, so
+                    // the chain runs together rather than one block at a time.
+                    if let expanded = parseFillField(input) { actions.append(contentsOf: expanded) }
+                case let name? where AgentHarness.isHarnessTool(name)
+                    || (recallEnabled && RecordRecall.isRecallTool(name))
+                    || extraToolNames.contains(name):
+                    // Resolved in-process like use_skill — search/read/run, recall
+                    // over the record, and the sandbox's DOM tools never touch the
+                    // screenshot loop. The provider owns audit, gating, and STOP.
                     if let id = block["id"] as? String {
                         toolResultOverrides[id] = await harnessProvider?(name, input)
                             ?? "The \(name) tool isn't available in this run."
@@ -565,6 +622,59 @@ public final class ComputerUseAgent {
             done: done,
             streamedActions: streamed.deliveredActions
         )
+    }
+
+    /// One-turn text entry into a specific spot — the structural fix for the
+    /// chronic one-action-per-turn pattern (a vision-located click followed by
+    /// coordinate-free keys the model splits across 4 screenshot-gated turns).
+    private static func fillFieldToolDefinition() -> [String: Any] {
+        [
+            "name": "fill_field",
+            "description": "Put text into ONE specific spot in a single turn: it clicks the target, selects any existing content (cmd+a), types your text (replacing what was there), and presses the finishing key — all before the next screenshot. Use this instead of separate left_click + key cmd+a + type + key Return turns WHENEVER you are entering text into a field, placeholder, search box, or cell: it is one turn instead of four. Coordinates are in screenshot pixels, same as the computer tool.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "coordinate": [
+                        "type": "array", "items": ["type": "number"],
+                        "description": "[x, y] of the field or placeholder to fill, in screenshot pixels",
+                    ],
+                    "text": ["type": "string", "description": "The text to enter (replaces any existing content)"],
+                    "click": [
+                        "type": "string", "enum": ["single", "double"],
+                        "description": "single click for normal fields, search boxes, and cells; double for a placeholder that needs a double-click to start editing (e.g. a Keynote title placeholder). Default single.",
+                    ],
+                    "submit": [
+                        "type": "string", "enum": ["return", "cmd_return", "tab", "none"],
+                        "description": "key pressed after typing: return confirms (default); cmd_return finishes editing a Keynote/Pages text box without adding a newline; tab moves to the next field; none leaves the cursor in place.",
+                    ],
+                ],
+                "required": ["coordinate", "text"],
+            ],
+        ]
+    }
+
+    /// Expands a `fill_field` call into the click → select-all → type → submit
+    /// chain it stands for. Returns nil if the call is malformed (no coordinate
+    /// or text) so the turn falls through rather than acting on garbage.
+    func parseFillField(_ input: [String: Any]) -> [CUAction]? {
+        guard let coord = input["coordinate"] as? [NSNumber], coord.count == 2,
+              let text = input["text"] as? String else { return nil }
+        let p = scale(CGPoint(x: coord[0].doubleValue, y: coord[1].doubleValue))
+        var actions: [CUAction] = []
+        if (input["click"] as? String) == "double" {
+            actions.append(.doubleClick(x: p.x, y: p.y))
+        } else {
+            actions.append(.click(x: p.x, y: p.y))
+        }
+        actions.append(.key("cmd+a"))
+        actions.append(.type(text))
+        switch (input["submit"] as? String) ?? "return" {
+        case "none": break
+        case "tab": actions.append(.key("tab"))
+        case "cmd_return": actions.append(.key("cmd+return"))
+        default: actions.append(.key("return"))
+        }
+        return actions
     }
 
     /// Tool definitions for the direct-Mac harness. Read-only tools ride every
@@ -686,6 +796,12 @@ public final class ComputerUseAgent {
     }
 
     private func attemptStream(_ request: URLRequest, canRetry: Bool) async -> StreamOutcome {
+        // TTFT instrumentation: time-to-first-token isolates the lever effort:low
+        // and the TLS prewarm move. Without it the only signals are tokens
+        // (logUsage) and whole-episode model ms (assist.timing) — neither shows
+        // where a turn's latency actually goes.
+        let requestStart = ContinuousClock.now
+        var firstByteMs: Int?
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do {
@@ -709,6 +825,9 @@ public final class ComputerUseAgent {
         var open: [Int: OpenBlock] = [:]
         do {
             for try await line in bytes.lines {
+                if firstByteMs == nil {
+                    firstByteMs = Int(requestStart.duration(to: .now) / .milliseconds(1))
+                }
                 guard line.hasPrefix("data:") else { continue }
                 let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
                 guard let data = payload.data(using: .utf8),
@@ -765,6 +884,8 @@ public final class ComputerUseAgent {
                         message.usage.merge(usage) { _, new in new }
                     }
                 case "message_stop":
+                    let total = Int(requestStart.duration(to: .now) / .milliseconds(1))
+                    Self.logger.notice("step ttft — first byte \(firstByteMs ?? -1)ms, total \(total)ms")
                     return .success(message)
                 case "error":
                     Self.logger.error("stream error event: \(payload, privacy: .public)")

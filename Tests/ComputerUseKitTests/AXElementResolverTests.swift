@@ -30,4 +30,29 @@ struct AXElementResolverTests {
     @Test func normalizeCollapsesWhitespaceAndCase() {
         #expect(AXElementResolver.normalize("  Send\n  Message ") == "send message")
     }
+
+    // The flail-moment grounding push: turn live AX controls into the compact
+    // list handed to the model when its action changed nothing on screen.
+    private func match(_ title: String, _ role: String) -> AXElementResolver.Match {
+        AXElementResolver.Match(center: .zero, role: role, title: title, score: 0)
+    }
+
+    @Test func interactableSummaryFormatsLabelAndShortRole() {
+        let summary = AXElementResolver.interactableSummary([
+            match("Save", "AXButton"), match("Bold", "AXCheckBox"),
+        ])
+        #expect(summary == "“Save” (button), “Bold” (checkbox)")
+    }
+
+    @Test func interactableSummaryIsNilWhenEmpty() {
+        // Canvas/Electron apps expose no AX controls — caller must degrade to a
+        // plain nudge, so an empty harvest yields nil, not "".
+        #expect(AXElementResolver.interactableSummary([]) == nil)
+    }
+
+    @Test func interactableSummaryRespectsLimit() {
+        let many = (0..<10).map { match("Item \($0)", "AXButton") }
+        let summary = AXElementResolver.interactableSummary(many, limit: 3)
+        #expect(summary?.components(separatedBy: ", ").count == 3)
+    }
 }

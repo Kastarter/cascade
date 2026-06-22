@@ -55,6 +55,21 @@ private struct FailingCompleter: MessageCompleting {
     }
 }
 
+/// Captures the user prompt the curator sent — to prove the spoken intent reaches it.
+private actor PromptCapture {
+    private(set) var lastUser = ""
+    func record(_ user: String) { lastUser = user }
+}
+
+private struct CapturingCompleter: MessageCompleting {
+    let canned: String
+    let capture: PromptCapture
+    func complete(system: String?, user: String, model: String, maxTokens: Int) async throws -> String {
+        await capture.record(user)
+        return canned
+    }
+}
+
 private func waste(
     _ title: String, apps: [String], signature: String,
     occurrences: Int = 3, perRun: Int = 30, confidence: Double = 0.7
@@ -177,6 +192,88 @@ func curatorReturnsEmptyForNoCandidates() async {
 }
 
 // MARK: - End-to-end through the orchestrator (detect → curate → approve)
+
+// MARK: - curateOne (Teach-once: a single demonstrated recipe)
+
+private func taughtWaste() -> DetectedWaste {
+    waste("Mail → Numbers: copy", apps: ["Mail", "Numbers"], signature: "taught-sig", occurrences: 1, perRun: 20)
+}
+
+@Test
+func curateOneNamesASingleRecipeFromTheModel() async {
+    let canned = #"{"agents":[{"index":0,"name":"Copy invoice totals into Numbers","why":"You just showed me.","goal":"Copy the latest invoice totals from Mail into the Numbers tracker.","value":0.9}]}"#
+    let result = await WorkflowCurator(client: FakeCompleter(canned: canned)).curateOne(taughtWaste())
+    #expect(result.name == "Copy invoice totals into Numbers")
+    #expect(result.goal.contains("Numbers"))
+    #expect(result.signature == "taught-sig") // carries the recorded recipe through
+}
+
+@Test
+func curateOnePassesSpokenIntentToThePrompt() async {
+    // The user narrated while demonstrating — that text must reach the curator as the
+    // strongest naming signal.
+    let capture = PromptCapture()
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
+    _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture))
+        .curateOne(taughtWaste(), statedIntent: "pulling the weekly numbers into the Monday report")
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("pulling the weekly numbers into the Monday report"))
+}
+
+@Test
+func curateOneAlwaysReturnsAnAgentEvenWhenTheModelFails() async {
+    // A deliberate demonstration is something the user WANTS — on a dead key/network
+    // it degrades to the detector's own naming, never to nothing.
+    let result = await WorkflowCurator(client: FailingCompleter()).curateOne(taughtWaste())
+    #expect(result.name == "Mail → Numbers: copy") // fallback uses the detector title
+    #expect(!result.goal.isEmpty)
+    #expect(result.signature == "taught-sig")
+}
+
+@Test
+func curateOneFallsBackWhenTheModelKeepsNone() async {
+    // Unlike the batch curator, a single demonstration must not vanish on an empty
+    // "keep none" reply — it falls back to detector naming.
+    let result = await WorkflowCurator(client: FakeCompleter(canned: #"{"agents":[]}"#)).curateOne(taughtWaste())
+    #expect(result.name == "Mail → Numbers: copy")
+}
+
+// MARK: - curateRange (the shared spine: a time range → one curated agent)
+
+@Test
+func curateRangeTurnsABracketedRangeIntoACuratedAgent() async throws {
+    let store = try makeStore()
+    try await store.insertInputEvents(copyPasteEvents())
+    let canned = #"{"agents":[{"index":0,"name":"Copy totals into Numbers","why":"shown once","goal":"Copy the totals from Mail into Numbers.","value":0.8}]}"#
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: canned)))
+
+    // The whole intentional spine: a [start, end] range → DetectedWaste → curateOne.
+    let curated = try await orchestrator.curateRange(from: base, to: base.addingTimeInterval(100))
+    let agent = try #require(curated)
+    #expect(agent.name == "Copy totals into Numbers")
+    #expect(agent.apps == ["Mail", "Numbers"])
+
+    // …and approving it runs the SAME createAgent the automatic pipeline uses.
+    _ = try await orchestrator.createAgent(from: agent)
+    let agents = try await orchestrator.agents()
+    #expect(agents.count == 1)
+    #expect(agents[0].name == "Copy totals into Numbers")
+    #expect(!agents[0].recipe.steps.isEmpty)
+}
+
+@Test
+func curateRangeReturnsNilForAJunkRange() async throws {
+    // A range of only scrolling/typing has nothing automatable — the spine refuses it.
+    let store = try makeStore()
+    var events: [InputEvent] = []
+    for i in 0..<8 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .scroll, appName: "Safari"))
+    }
+    try await store.insertInputEvents(events)
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FailingCompleter()))
+    let curated = try await orchestrator.curateRange(from: base, to: base.addingTimeInterval(100))
+    #expect(curated == nil)
+}
 
 @Test
 func curateThenApprovePersistsCuratedNameAndGoal() async throws {

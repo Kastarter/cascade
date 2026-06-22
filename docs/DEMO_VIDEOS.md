@@ -50,28 +50,43 @@ Any of: `"create/make/build … agent"`, `"in the background"`, `"background age
 ---
 
 ## Demo 2 — Teach once (~40s)
-**One line:** "I did the boring task once. Now it's an agent I can deploy."
+**One line:** "I logged one invoice into the ledger by hand. Now it's an agent that does the whole stack."
+
+This is the task every AP clerk / accountant does dozens of times a day: open an
+invoice, copy the vendor, amount, and due date into a tracking sheet, next invoice,
+repeat. You do it **once** on camera and Cascade turns the copy→paste rhythm into a
+reusable agent.
 
 ### Setup
-- Pick a short, obviously-repetitive task with a clear shape. Good choice: **rename + file a screenshot**, or **compose a templated email**. Below uses the email template (reads instantly on camera).
-- Have Mail (or your editor) ready with the compose shortcut working.
+- Run `./scripts/demo-setup.sh` — it creates the open invoices (**Falcon 18,450 / Meridian 4,820 / Vertex 9,600**) and `Invoices/invoice-tracker.csv` with one row already filled (so it reads as an ongoing ledger).
+- Open **`invoice-tracker.csv` in Numbers** on the right; open an invoice **`.txt`** (TextEdit/Preview) on the left, side by side. Both visible in frame.
+- **Critical:** copy and paste with the **⌘C / ⌘V keyboard shortcuts** — *not* the Edit menu or right-click. The keyboard ⌘C-in-one-app→⌘V-in-another is exactly what Cascade names **"Copy from … into Numbers"**; menu copies don't fire that.
 
 ### Script
 | t | On screen | Audio / caption |
 |---|---|---|
-| 0–4s | Press **⌥⌃T**. A banner appears. | Banner: **"Teaching — do the task, narrate if you like, then press ⌥⌃T to finish."** Caption: *"Watch me do it once."* |
-| 4–18s | You perform the task **by hand**: open compose, type the standard greeting + body + sign-off. Narrate as you go (your words become the agent's name). | Speak while doing it: **"This is the weekly status email I send every Monday."** |
-| 18–22s | Press **⌥⌃T** again. | Banner: **"Saving your demonstration…"** |
-| 22–30s | Cascade analyzes the bracketed recording → a **preview sheet** slides up showing the learned recipe: a title (your narration) + the numbered steps it captured (open → compose → type → send). | Caption: *"It pulled out the repeatable steps."* |
-| 30–36s | Click **"Add to my agents."** App jumps to the **Cascades** tab; the new agent card **flashes**. | Status: **"Added "…" to your agents."** |
-| 36–40s | On the agent card, click **Deploy** → it replays the same steps on a fresh compose window. | Caption: *"Taught once. Now it runs itself."* |
+| 0–4s | Press **⌥⌃T**. A banner appears. | Banner: **"Teaching — do the task, narrate if you like, then press ⌥⌃T to finish."** Caption: *"Watch me log one invoice."* |
+| 4–20s | You do it **by hand**: in the invoice, select the vendor → **⌘C** → click into Numbers' next empty row → **⌘V** → **Tab** → back to the invoice, select the amount → **⌘C** → Numbers → **⌘V** → **Tab** → same for the due date. Then start the **next** invoice's row to show the loop. Narrate once — your words name the agent. | Speak: **"This is my daily invoice entry — I copy each vendor, amount, and due date into the AP tracker."** |
+| 20–24s | Press **⌥⌃T** again. | Banner: **"Saving your demonstration…"** |
+| 24–32s | A **preview sheet** slides up: header **"You taught Cascade a task"**, an **ON SCREEN** tag, the title from your narration, an app chip row, and a **"WHEN DEPLOYED, CASCADE WILL"** line describing the copy→paste flow. A provenance chip links back to the recorded moment. | Caption: *"It understood the repeatable steps — not just pixels."* |
+| 32–37s | Click **"Add to my agents  →"**. App jumps to the **Cascades** tab; the new agent card **flashes** (3s ring). | Status: **"Added "…" to your agents."** |
+| 37–40s | On the agent card, click **"Deploy  →"** → it replays the same copy→paste steps to log the next invoice's row. | Caption: *"Taught once. Now it runs itself."* |
 
 ### Money shot
-The preview sheet: a freeform, hand-done demonstration turned into a clean numbered recipe — proof it *understood* the task, not just recorded pixels. (If the demo had nothing repeatable you'd get *"Nothing repeatable in that demonstration yet — try the task again"* — rehearse so you don't hit that.)
+The preview sheet: a freeform, hand-done copy/paste turned into a named, grounded
+agent with a "when deployed, Cascade will…" plan and a chip back to the exact
+moment you did it — proof it *understood* the AP task, not just recorded pixels.
+(If you used menu copy/paste or did too little, you'll get *"Nothing repeatable in
+that demonstration yet — try the task again"* — so use **⌘C/⌘V** and log at least
+one full invoice. A cross-app copy→paste pair is the minimum that passes.)
 
 ### Notes
-- Alternative ending instead of "Add to my agents": **"Send to manager"** routes it to an approval queue — use that cut if your story is about a team/manager workflow.
-- Detection variant (no teaching): do the same action twice and open **Cascades** — Cascade *auto-detects* the repeat and offers the card with a rewind thumbnail. Either path lands the same agent; "teach once" is the deliberate version.
+- Narration is optional but it **names the agent** — speak one clean sentence (the `VoiceFragmentGate` drops half-words, so don't trail off). With no narration Cascade auto-names it **"Copy from TextEdit into Numbers."**
+- Alternative ending instead of "Add to my agents": **"Send to manager"** routes it to the Manager approval queue — use that cut for a team/manager story.
+- Detection variant (no teaching): just log two invoices the normal way and open **Cascades** — Cascade *auto-detects* the repeat and offers the same card with a rewind thumbnail. Either path lands the same agent; "teach once" is the deliberate version.
+
+### Trigger reference
+Teach hotkey is **⌥⌃T** (start and finish). The recipe is built only if the demonstration clears the bar: **≥2 structural actions** (clicks / ⌘- or ⌃-shortcuts) **and an intent marker** (a named-element click, a real shortcut, or a cross-app flow). One ⌘C-in-invoice → ⌘V-in-Numbers pair satisfies both.
 
 ---
 

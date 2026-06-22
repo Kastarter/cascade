@@ -177,12 +177,135 @@ public struct CascadeRootView: View {
                 OnboardingScreen(model: model)
                     .transition(.opacity)
             }
+            if model.teachingMode || model.teachStatus != nil {
+                TeachBanner(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 70)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            if model.teachPreview != nil {
+                TeachPreviewSheet(model: model)
+                    .transition(.opacity)
+            }
         }
         .foregroundStyle(Color.cascadeText)
         .frame(minWidth: 1040, minHeight: 720)
         .preferredColorScheme(model.prefersDark ? .dark : .light)
         .animation(.easeOut(duration: 0.18), value: model.dock.visible)
         .animation(.easeOut(duration: 0.22), value: model.showOnboarding)
+        .animation(.easeOut(duration: 0.2), value: model.teachingMode)
+        .animation(.easeOut(duration: 0.2), value: model.teachStatus)
+        .animation(.easeOut(duration: 0.2), value: model.teachPreview?.id)
+    }
+}
+
+// MARK: - Teach-once (banner + preview sheet)
+
+/// The live demonstration banner: a floating pill at the top of the window while
+/// the user is teaching (or showing the terminal result of the last demo).
+private struct TeachBanner: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        HStack(spacing: CascadeMetrics.s3) {
+            Image(systemName: model.teachingMode ? "record.circle.fill" : "sparkles")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(model.teachingMode ? Color.cascadeRecText : Color.cascadeAgent)
+            Text(model.teachStatus ?? "Teaching…")
+                .font(.cascadeSans(13, .semibold))
+                .foregroundStyle(Color.cascadeText)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.teachingMode {
+                Button("Finish  ⌥⌃T") { model.toggleTeaching() }
+                    .buttonStyle(CascadeAccentButtonStyle())
+            } else if model.teachStatus != nil {
+                Button { model.dismissTeachStatus() } label: {
+                    Image(systemName: "xmark").font(.system(size: 11, weight: .bold))
+                }
+                .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+            }
+        }
+        .padding(.leading, CascadeMetrics.s4)
+        .padding(.trailing, CascadeMetrics.s3)
+        .padding(.vertical, CascadeMetrics.s3)
+        .background(Color.cascadePanel, in: Capsule())
+        .overlay(Capsule().stroke(model.teachingMode ? Color.cascadeRecText.opacity(0.5) : Color.cascadeBorderHi, lineWidth: 1))
+        .shadow(color: .black.opacity(0.32), radius: 16, y: 6)
+    }
+}
+
+/// After a demonstration, the curated agent to review before it's created — its
+/// human name, the goal a deployed agent will run, where it will run, and a chip
+/// back to the recording it was built from. The user picks "Add to my agents"
+/// (self-serve into Cascades) or "Send to manager" (into the review queue).
+private struct TeachPreviewSheet: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.45).ignoresSafeArea()
+                .onTapGesture { model.teachPreview = nil }
+            if let curated = model.teachPreview {
+                card(curated)
+                    .frame(maxWidth: 540)
+                    .padding(CascadeMetrics.s6)
+            }
+        }
+    }
+
+    private func card(_ curated: CuratedAgent) -> some View {
+        let goal = curated.goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        let background = CascadeAppModel.runsInBackground(apps: curated.apps)
+        return CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s4) {
+                HStack(spacing: CascadeMetrics.s2) {
+                    Image(systemName: "hand.raised.fill").font(.system(size: 12)).foregroundStyle(Color.cascadeAgent)
+                    Text("You taught Cascade a task").font(.cascadeSans(12, .semibold)).foregroundStyle(Color.cascadeText3)
+                    Spacer()
+                    CascadeTag(background ? "BACKGROUND" : "ON SCREEN", tone: background ? .cascadeAgent : .cascadeAccentWarm)
+                }
+                Text(curated.name).font(.cascadeSerif(24)).fixedSize(horizontal: false, vertical: true)
+                if !curated.why.isEmpty {
+                    Text(curated.why).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !curated.apps.isEmpty { AppChips(apps: curated.apps) }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("WHEN DEPLOYED, CASCADE WILL")
+                        .font(.cascadeMono(9, .semibold)).tracking(0.7).foregroundStyle(Color.cascadeText4)
+                    Text(goal.isEmpty ? curated.name : goal)
+                        .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                provenance(curated)
+                HStack(spacing: CascadeMetrics.s2) {
+                    Button("Cancel") { model.teachPreview = nil }
+                        .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                    Spacer()
+                    Button("Send to manager") { model.sendTaughtAgentToManager(curated) }
+                        .buttonStyle(.plain).foregroundStyle(Color.cascadeText)
+                    Button("Add to my agents  →") { model.createTaughtAgent(curated) }
+                        .buttonStyle(CascadeAccentButtonStyle())
+                }
+            }
+        }
+    }
+
+    /// A chip back to the recording this was built from — the proof it's grounded in
+    /// what the user actually did, not invented.
+    private func provenance(_ curated: CuratedAgent) -> some View {
+        Button {
+            model.teachPreview = nil
+            model.jumpToReel(at: curated.source.lastSeenAt)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "film").font(.system(size: 10))
+                Text("Built from your recording · \(curated.source.lastSeenAt.formatted(date: .omitted, time: .shortened))")
+                    .font(.cascadeMono(11))
+            }
+            .foregroundStyle(Color.cascadeAgent)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1220,6 +1343,7 @@ private struct CascadesScreen: View {
                         Text("Cascade catches what you repeat and your manager reviews it. Once approved, it lands here as an agent that runs the task for you — in the background for web work, on-screen for everything else.")
                             .font(.cascadeSans(14)).foregroundStyle(Color.cascadeText2)
                     }
+                    teachPrompt
                     pipelineStrip
                     agentsSection.id(Self.agentsAnchor)
                     learnedSkillsSection
@@ -1246,6 +1370,25 @@ private struct CascadesScreen: View {
     }
 
     private static let agentsAnchor = "your-agents"
+
+    /// The front door to Teach-once: do the task once by hand and Cascade builds the
+    /// agent. Mirrors the ⌥⌃T hotkey so it's discoverable without knowing the chord.
+    private var teachPrompt: some View {
+        HStack(spacing: CascadeMetrics.s3) {
+            Image(systemName: "hand.raised.fill").font(.system(size: 15)).foregroundStyle(Color.cascadeAgent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Teach Cascade a task").font(.cascadeSans(14, .semibold))
+                Text("Do it once by hand — narrate if you like — and Cascade turns the recording into an agent.")
+                    .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+            }
+            Spacer()
+            Button(model.teachingMode ? "Finish  ⌥⌃T" : "Teach a task  ⌥⌃T") { model.toggleTeaching() }
+                .buttonStyle(CascadeAccentButtonStyle())
+        }
+        .padding(CascadeMetrics.s4)
+        .background(Color.cascadePanel2.opacity(0.5), in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.radiusPanel, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
 
     /// The page's mental model in one strip: manager-approved → ready → runs.
     private var pipelineStrip: some View {
@@ -1943,6 +2086,20 @@ private struct HarnessCard: View {
                             .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
                     }
                 }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cursor agent speed").font(.cascadeSans(15, .semibold))
+                        Text("Thinking effort for the on-screen agent. Medium is Anthropic's benchmarked computer-use default; Low trades some accuracy for faster turns — flip it and compare on your own tasks.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Picker("", selection: $model.cuEffort) {
+                        Text("Medium").tag("medium")
+                        Text("Low").tag("low")
+                    }
+                    .labelsHidden().pickerStyle(.segmented).frame(width: 150)
+                }
             }
         }
     }
@@ -1957,6 +2114,11 @@ private struct HotkeysCard: View {
                     keys: ["hold right ⌘"],
                     name: "Talk to Cascade",
                     detail: "Push-to-talk: hold, speak, release. Ask the rewind or point Cascade at something on screen."
+                )
+                HotkeyRow(
+                    keys: ["⌃", "⌥", "T"],
+                    name: "Teach a task",
+                    detail: "Press to start, do the task by hand (narrate if you like), press again to finish — Cascade turns the recording into an agent."
                 )
                 HotkeyRow(
                     keys: ["⇧", "⌘", "R"],
