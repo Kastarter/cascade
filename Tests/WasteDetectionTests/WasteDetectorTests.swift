@@ -18,6 +18,80 @@ private func event(_ i: Int, _ kind: InputEventKind, app: String, key: String? =
     )
 }
 
+// MARK: - H1 element-identity token
+
+@Test
+func tokenEncodesClickedElementIdentity() {
+    let reply = InputEvent(kind: .click, text: "Reply All", appName: "Mail")
+    let archive = InputEvent(kind: .click, text: "Archive", appName: "Mail")
+    let unlabeled = InputEvent(kind: .click, appName: "Mail")
+    // Distinct buttons → distinct tokens (the detector can now tell routines apart).
+    #expect(WasteDetector.token(reply, surface: "Mail") != WasteDetector.token(archive, surface: "Mail"))
+    // Casing/whitespace don't fork the token.
+    let replyMessy = InputEvent(kind: .click, text: "  reply   all ", appName: "Mail")
+    #expect(WasteDetector.token(reply, surface: "Mail") == WasteDetector.token(replyMessy, surface: "Mail"))
+    // An unlabeled click degrades to the old coarse token (no regression).
+    #expect(WasteDetector.token(unlabeled, surface: "Mail") == "click@Mail")
+}
+
+@Test
+func distinctButtonSequencesAreDistinctWorkflows() {
+    // Two repeated single-app routines that differ ONLY by which buttons are clicked —
+    // before H1 both tokenized to "click@App,click@App" and false-merged; now distinct.
+    func runs(_ a: String, _ b: String, app: String, start: Int) -> [InputEvent] {
+        var out: [InputEvent] = []; var i = start
+        for _ in 0..<3 {
+            out.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: a, appName: app)); i += 1
+            out.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: app)); i += 1
+            out.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 2, y: 2, text: b, appName: app)); i += 1
+        }
+        return out
+    }
+    let events = runs("Open Invoice", "Mark Paid", app: "Books", start: 0)
+    let sig = WasteDetector().detect(contexts: [], inputEvents: events).first?.signature ?? ""
+    #expect(sig.contains("open invoice"))
+    #expect(sig.contains("mark paid"))
+}
+
+// MARK: - H2 composite ranking
+
+private func rankWaste(occ: Int = 3, perRun: Int = 30, steps: [RecipeStep], lastSeen: Date = base, sig: String = "s") -> DetectedWaste {
+    DetectedWaste(title: "t", apps: ["A"], occurrences: occ, estimatedSecondsPerRun: perRun,
+                  estimatedTotalSeconds: occ * perRun, recipe: AgentRecipe(steps: steps),
+                  evidence: [], confidence: 0.7, signature: sig, lastSeenAt: lastSeen)
+}
+
+@Test
+func rankingScoreRewardsFrequencyRecencyAndLength() {
+    let now = base.addingTimeInterval(100)
+    let clicks = (0..<3).map { RecipeStep(order: $0, kind: .click, appName: "A") }
+    let baseW = rankWaste(occ: 3, steps: clicks, lastSeen: now)
+    // More occurrences ranks higher (all else equal).
+    #expect(WasteDetector.rankingScore(rankWaste(occ: 9, steps: clicks, lastSeen: now), now: now)
+          > WasteDetector.rankingScore(baseW, now: now))
+    // More recent ranks higher.
+    #expect(WasteDetector.rankingScore(baseW, now: now)
+          > WasteDetector.rankingScore(rankWaste(occ: 3, steps: clicks, lastSeen: now.addingTimeInterval(-30 * 86_400)), now: now))
+    // Longer (more cohesive) ranks higher.
+    let longer = (0..<7).map { RecipeStep(order: $0, kind: .click, appName: "A") }
+    #expect(WasteDetector.rankingScore(rankWaste(occ: 3, steps: longer, lastSeen: now), now: now)
+          > WasteDetector.rankingScore(baseW, now: now))
+}
+
+@Test
+func crossAppCopyPasteIsDetectedAndBoosted() {
+    let transfer = [RecipeStep(order: 0, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+                    RecipeStep(order: 1, kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")]
+    let sameApp = [RecipeStep(order: 0, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+                   RecipeStep(order: 1, kind: .key, key: "v", modifiers: ["command"], appName: "Mail")]
+    #expect(WasteDetector.hasCrossAppCopyPaste(transfer))
+    #expect(!WasteDetector.hasCrossAppCopyPaste(sameApp))
+    // The data-transfer routine outranks an otherwise-identical same-app one.
+    let now = base.addingTimeInterval(100)
+    #expect(WasteDetector.rankingScore(rankWaste(steps: transfer, lastSeen: now), now: now)
+          > WasteDetector.rankingScore(rankWaste(steps: sameApp, lastSeen: now), now: now))
+}
+
 // MARK: - B5 parameter extraction
 
 private func typeEvent(_ i: Int, app: String, text: String) -> InputEvent {
@@ -296,7 +370,8 @@ func overlappingWorkflowsAreNotDoubleCounted() {
     ]
     let results = WasteDetector().detect(contexts: [], inputEvents: events)
     #expect(results.count == 1)
-    #expect(results.first?.signature == "click@Mail|key:command+c@Mail")
+    // H1: the click token now carries the element identity ("Inbox").
+    #expect(results.first?.signature == "click:inbox@Mail|key:command+c@Mail")
     // The hard invariant: no event id is ever counted into two workflows.
     let allEvidence = results.flatMap(\.evidence)
     #expect(Set(allEvidence).count == allEvidence.count)

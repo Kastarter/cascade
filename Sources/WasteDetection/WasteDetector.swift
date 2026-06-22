@@ -138,15 +138,50 @@ public struct WasteDetector: Sendable {
             }
         }
 
+        // Rank by a composite score, not raw total-seconds: a frequent, time-saving,
+        // long-and-cohesive, recent routine beats a loose or stale one. `now` is read
+        // once so the ordering is internally consistent.
+        let now = Date()
         return results
             .sorted { lhs, rhs in
-                if lhs.estimatedTotalSeconds != rhs.estimatedTotalSeconds {
-                    return lhs.estimatedTotalSeconds > rhs.estimatedTotalSeconds
-                }
+                let l = Self.rankingScore(lhs, now: now), r = Self.rankingScore(rhs, now: now)
+                if l != r { return l > r }
                 return lhs.signature < rhs.signature
             }
             .prefix(maxResults)
             .map { $0 }
+    }
+
+    /// Orders detected workflows by genuine worth, replacing a raw total-seconds sort
+    /// (which ignored length, recency, and routine quality). Combines the signals the
+    /// RPM/task-mining literature converges on:
+    ///   • ROI        = occurrences × seconds-per-run  (frequency × time saved)
+    ///   • cohesion   = meaningful-step count          (Leno: the best single ranker;
+    ///                  with contiguous mining this is length — it sharpens once
+    ///                  gap-tolerant mining lands and the gap term becomes non-zero)
+    ///   • recency    = hyperbolic decay on `lastSeenAt` (this morning > last week;
+    ///                  hyperbolic, not exponential, so an old routine fades without
+    ///                  underflowing to an unordered zero)
+    ///   • data-transfer boost: a copy in one app pasted into another is the canonical
+    ///                  automatable routine (Leno) — nudge it up.
+    /// Pure + unit-pinned (asserts the ordering properties, not magic numbers).
+    static func rankingScore(_ waste: DetectedWaste, now: Date) -> Double {
+        let roi = Double(waste.occurrences) * Double(max(1, waste.estimatedSecondsPerRun))
+        let cohesion = Double(waste.recipe.steps.count { $0.kind != .activateApp && $0.kind != .scroll })
+        let lengthBoost = 1.0 + 0.15 * cohesion
+        let ageDays = max(0, now.timeIntervalSince(waste.lastSeenAt) / 86_400)
+        let recency = 1.0 / (1.0 + ageDays / 7.0)            // ~half weight at one week
+        let transferBoost = hasCrossAppCopyPaste(waste.recipe.steps) ? 1.5 : 1.0
+        return roi * lengthBoost * recency * transferBoost
+    }
+
+    /// True when the recipe copies in one app and pastes in another — the strongest
+    /// "this is a real, automatable routine" signal in the literature.
+    static func hasCrossAppCopyPaste(_ steps: [RecipeStep]) -> Bool {
+        guard let copy = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "c" && ($0.modifiers.contains("command") || $0.modifiers.contains("control")) }),
+              let paste = steps.first(where: { $0.kind == .key && $0.key?.lowercased() == "v" && ($0.modifiers.contains("command") || $0.modifiers.contains("control")) })
+        else { return false }
+        return copy.order < paste.order && copy.appName != paste.appName
     }
 
     /// Turns ONE recorded instance — an arbitrary bracketed time range — into a
@@ -271,18 +306,41 @@ public struct WasteDetector: Sendable {
     // MARK: - Helpers
 
     /// The token used to compare actions for repetition. Coordinates and typed
-    /// content are intentionally ignored — what repeats is the *shape* (kind +
-    /// app + shortcut), not the exact pixels or text.
-    private static func token(_ event: InputEvent, surface: String) -> String {
+    /// content are intentionally ignored, but a click now carries the clicked
+    /// element's IDENTITY (its AX label) — clicking the same "Reply All" button
+    /// across runs shares a token; clicking different buttons doesn't. This is
+    /// Leno's normalized-UI model: keep CONTEXT params (element identity), drop DATA
+    /// params (typed text). Before, every click in an app was the same token, so the
+    /// detector couldn't tell one routine from another in that app. The label is
+    /// already recorded in `InputEvent.text`; an unlabeled click degrades to the old
+    /// coarse `click@app` token.
+    static func token(_ event: InputEvent, surface: String) -> String {
         switch event.kind {
         case .key:
             let mods = event.modifiers.sorted().joined(separator: "+")
             return "key:\(mods)+\(event.key ?? "")@\(surface)"
         case .type:
             return "type@\(surface)"
-        default:
-            return "\(event.kind.rawValue)@\(surface)"
+        case .click, .doubleClick, .rightClick:
+            let label = normalizedLabel(event.text)
+            return label.isEmpty
+                ? "\(event.kind.rawValue)@\(surface)"
+                : "\(event.kind.rawValue):\(label)@\(surface)"
+        case .scroll:
+            return "scroll@\(surface)"
         }
+    }
+
+    /// Lowercased, whitespace-collapsed, bounded element label — so trivial casing or
+    /// spacing differences don't fork the token, but distinct controls stay distinct.
+    static func normalizedLabel(_ text: String?) -> String {
+        guard let text else { return "" }
+        return String(
+            text.lowercased()
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(40)
+        )
     }
 
     private static func recipeKind(_ kind: InputEventKind) -> RecipeStepKind {
