@@ -23,8 +23,8 @@ public struct RecordRecall: Sendable {
         self.store = store
     }
 
-    /// The three recall tool names, for routing a tool call to `perform`.
-    public static let toolNames: Set<String> = ["search_record", "get_timeframe", "inspect_moment"]
+    /// The recall tool names, for routing a tool call to `perform`.
+    public static let toolNames: Set<String> = ["search_record", "get_timeframe", "inspect_moment", "list_sessions"]
 
     public static func isRecallTool(_ name: String) -> Bool { toolNames.contains(name) }
 
@@ -37,6 +37,7 @@ public struct RecordRecall: Sendable {
         case search(query: String)
         case timeframe(startISO: String?, endISO: String?)
         case inspect(id: Int64?)
+        case sessions(startISO: String?, endISO: String?)
         case unknown(String)
 
         public init(name: String, input: [String: Any]) {
@@ -48,6 +49,8 @@ public struct RecordRecall: Sendable {
                 self = .timeframe(startISO: input["start_iso"] as? String, endISO: input["end_iso"] as? String)
             case "inspect_moment":
                 self = .inspect(id: (input["id"] as? NSNumber)?.int64Value ?? (input["id"] as? Int).map(Int64.init))
+            case "list_sessions":
+                self = .sessions(startISO: input["start_iso"] as? String, endISO: input["end_iso"] as? String)
             default:
                 self = .unknown(name)
             }
@@ -60,6 +63,7 @@ public struct RecordRecall: Sendable {
             case .search(let query): detail = "search_record: \(query)"
             case .timeframe(let start, let end): detail = "get_timeframe: \(start ?? "?") → \(end ?? "?")"
             case .inspect(let id): detail = "inspect_moment: #\(id.map(String.init) ?? "?")"
+            case .sessions(let start, let end): detail = "list_sessions: \(start ?? "?") → \(end ?? "?")"
             case .unknown(let name): detail = name
             }
             return String(detail.prefix(240))
@@ -102,6 +106,18 @@ public struct RecordRecall: Sendable {
                 "type": "object",
                 "properties": ["id": ["type": "integer", "description": "Moment id from a search result"]],
                 "required": ["id"],
+            ],
+        ],
+        [
+            "name": "list_sessions",
+            "description": "The user's work SESSIONS between two times — each session is a contiguous stretch in one app, with its duration and what was open, instead of individual frames. Use this for \"what did I work on this morning / between 2 and 4\" style questions: it returns [#id] start–end (duration) app — title · N moments. Then inspect_moment or search_record to drill into one.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "start_iso": ["type": "string", "description": "ISO-8601 start, e.g. 2026-06-10T09:00:00Z"],
+                    "end_iso": ["type": "string", "description": "ISO-8601 end"],
+                ],
+                "required": ["start_iso", "end_iso"],
             ],
         ],
     ] }
@@ -160,6 +176,21 @@ public struct RecordRecall: Sendable {
             }
             return out
 
+        case .sessions(let startISO, let endISO):
+            guard let start = Self.date(from: startISO),
+                  let end = Self.date(from: endISO), end > start else {
+                return "list_sessions needs start_iso and end_iso (ISO-8601, end after start)."
+            }
+            // Pull every visible moment in the window, then group into work
+            // sessions — privacy filtering happens here (the recall boundary),
+            // same as the other tools, so a sensitive moment can't anchor or pad
+            // a session.
+            let moments = ((try? await store.contexts(between: start, and: end, limit: 5_000)) ?? [])
+                .filter { !PrivacyRules.isSensitive($0) }
+            let episodes = SessionSegmenter.segment(moments)
+            guard !episodes.isEmpty else { return "No sessions recorded in that window." }
+            return episodes.map { Self.sessionLine(for: $0) }.joined(separator: "\n")
+
         case .unknown(let name):
             return "Unknown recall tool \(name)."
         }
@@ -173,6 +204,23 @@ public struct RecordRecall: Sendable {
         let text = (context.ocrText ?? "").replacingOccurrences(of: "\n", with: " · ")
         let trimmed = text.isEmpty ? "" : " | \(String(text.prefix(textCap)))"
         return "[#\(context.id)] \(time(context.capturedAt)) \(context.appName)\(title)\(trimmed)"
+    }
+
+    /// "[#42] 09:12–09:48 (36m) Keynote — Q1 Deck · 42 moments" — the anchor id
+    /// the model can inspect or the Reel can jump to.
+    static func sessionLine(for episode: Episode) -> String {
+        let title = episode.title.map { " — \($0)" } ?? ""
+        return "[#\(episode.id)] \(time(episode.startedAt))–\(time(episode.endedAt)) "
+            + "(\(duration(episode.duration))) \(episode.appName)\(title) · \(episode.momentCount) moments"
+    }
+
+    /// Human session length: "<1m", "36m", "1h 04m".
+    static func duration(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        guard total >= 60 else { return "<1m" }
+        let minutes = total / 60
+        let hours = minutes / 60
+        return hours > 0 ? "\(hours)h \(String(format: "%02dm", minutes % 60))" : "\(minutes)m"
     }
 
     static func time(_ date: Date) -> String {
