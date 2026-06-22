@@ -154,6 +154,14 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let cuEffortKey = "cascade.cuEffort"
 
+    /// Per-region Hamming threshold for "this action changed nothing on screen" —
+    /// much tighter than the recorder's blink-tolerant dedup (`regionSkipThreshold`
+    /// = 5). A dead click yields a near byte-identical frame; any real change
+    /// shifts many bits, so a tight bound keeps a small SUCCESSFUL change from
+    /// being mislabeled no-effect (the false positive that would make the agent
+    /// undo/redo a step that actually worked).
+    static let noEffectThreshold = 2
+
     public let store: CascadeStore
     public let driver: LocalMacDriver
     public let recorder: ContextRecorder
@@ -1327,41 +1335,61 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = "I lost sight of the screen — try again."
                 return .failed
             }
-            // No-effect detection: an acting turn whose every screen region is
-            // unchanged did nothing. Don't let the model re-click the dead spot —
-            // nudge it to a different approach, and after 3 in a row, stop.
-            let nextHashes = Self.gridHashes(ofJPEG: nextShot)
-            if actedThisTurn, !observationOnly, let last = lastFrameHashes, let nextHashes,
-               PerceptualHash.isDuplicateGrid(nextHashes, of: last) {
-                noEffectTurns += 1
-                if noEffectTurns >= 3 {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) — 3rd no-effect, stopping"))
-                    auditTiming(outcome: "stalled-noeffect")
-                    return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
+            // No-effect detection (hardened against false positives): an acting
+            // turn whose every screen region is unchanged did nothing — don't let
+            // the model re-click the dead spot. Two guards keep a SUCCESSFUL action
+            // from being mislabeled "no effect": (1) `noEffectThreshold` is far
+            // tighter than the recorder's blink dedup — a dead click is near
+            // byte-identical, a real change shifts many bits; (2) a delayed
+            // RE-CHECK — a theme still downloading, an app still launching, or an
+            // animation can finish AFTER the 260ms settle, so on a suspected
+            // no-effect we wait and re-capture once before concluding (and use that
+            // fresher frame). The extra wait costs time only on the rare flail path.
+            var observedShot = nextShot
+            var observedHashes = Self.gridHashes(ofJPEG: nextShot)
+            if actedThisTurn, !observationOnly, let last = lastFrameHashes, let first = observedHashes,
+               PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
+                try? await Task.sleep(for: .milliseconds(400))
+                if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) {
+                    observedShot = recheck
+                    observedHashes = Self.gridHashes(ofJPEG: recheck)
                 }
-                nudge = "Your last action did NOT change the screen at all — it had no effect (the control isn't where you clicked, is disabled, or needs a different gesture). Do NOT repeat that same click."
-                // Flail-moment grounding push (Cascade's "push elements at a flail
-                // moment, never a pull tool" lesson + the literature's grounding>
-                // reasoning finding): hand the model the controls that ARE actually
-                // on screen so it re-grounds on real elements instead of re-guessing
-                // the same dead pixel. Zero cost on healthy turns — only fires here.
-                let controls = AXElementResolver.interactables()
-                if let summary = AXElementResolver.interactableSummary(controls) {
-                    nudge! += " The controls actually clickable on screen right now are: \(summary). Aim for one of these by sight — if what you wanted isn't in this list, it isn't clickable here, so open the right menu/panel or take another route."
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) on-screen controls"))
+                if let confirmed = observedHashes,
+                   !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
+                    // The effect just rendered late — the action DID work.
+                    noEffectTurns = 0
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) re-check cleared (slow render)"))
                 } else {
-                    nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
+                    noEffectTurns += 1
+                    if noEffectTurns >= 3 {
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) — 3rd no-effect, stopping"))
+                        auditTiming(outcome: "stalled-noeffect")
+                        return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
+                    }
+                    nudge = "Your last action did NOT change the screen at all — it had no effect (the control isn't where you clicked, is disabled, or needs a different gesture). Do NOT repeat that same click."
+                    // Flail-moment grounding push (Cascade's "push elements at a
+                    // flail moment, never a pull tool" lesson + the literature's
+                    // grounding>reasoning finding): hand the model the controls that
+                    // ARE actually on screen so it re-grounds on real elements
+                    // instead of re-guessing the same dead pixel.
+                    let controls = AXElementResolver.interactables()
+                    if let summary = AXElementResolver.interactableSummary(controls) {
+                        nudge! += " The controls actually clickable on screen right now are: \(summary). Aim for one of these by sight — if what you wanted isn't in this list, it isn't clickable here, so open the right menu/panel or take another route."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) on-screen controls"))
+                    } else {
+                        nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
+                    }
                 }
             } else if actedThisTurn, !observationOnly {
                 noEffectTurns = 0
             }
-            if let nextHashes { lastFrameHashes = nextHashes }
+            if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
             streamActionTime = .zero
             pendingNarration = nil
             let modelStart = ContinuousClock.now
-            step = await agent.proceed(screenshot: nextShot, note: episodeNote(nudge))
+            step = await agent.proceed(screenshot: observedShot, note: episodeNote(nudge))
             modelTime += modelStart.duration(to: .now) - streamActionTime
             count += 1
         }
