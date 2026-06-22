@@ -117,15 +117,18 @@ clicks and zooms on one checkbox). Otherwise, screenshot and classify:
   turn.
 - Subtitle / second / third placeholder — DON'T guess its coordinates (an
   empty placeholder is easy to miss, and a double-click on bare canvas does
-  nothing). After the title's `cmd+return` leaves its box SELECTED, press
-  `Tab` to select the NEXT placeholder on the slide, then type to replace it
-  (Tab cycles canvas objects in order; typing onto a selected box replaces its
-  whole content). Repeat `Tab` → type for each remaining placeholder. This
-  reaches every placeholder reliably without hunting pixels. If a `Tab` selects
-  something that is NOT the box you meant (read the screenshot), `Tab` again to
-  the next; if the layout has no such placeholder, there is nothing to fill —
-  don't force one. Only fall back to clicking a placeholder directly when Tab
-  cycling clearly isn't landing on text boxes.
+  nothing; the slide canvas is NOT in the accessibility tree, so guessed
+  coordinates routinely miss). Two reliable ways, in order:
+  1. After the title's `cmd+return` leaves its box SELECTED, press `Tab` to
+     select the NEXT placeholder on the slide, then type to replace it (Tab
+     cycles canvas objects in order; typing onto a selected box replaces its
+     whole content). Repeat `Tab` → type for each remaining placeholder.
+  2. If Tab doesn't land on the box you mean, call `find_element` with a short
+     description ("the subtitle text placeholder") to get its exact coordinate,
+     then `fill_field` at that coordinate. This is the dependable way to hit a
+     placeholder you can see but can't select by guessing.
+  If the layout has no such placeholder, there is nothing to fill — don't force
+  one.
   Go to the sidebar ONLY if the canvas truly shows no title box: click empty
   canvas (deselect all) → Format sidebar `Slide` tab shows `Title` / `Body`
   checkboxes → check `Title` ONCE; the next screenshot must show a title box
