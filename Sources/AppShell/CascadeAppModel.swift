@@ -1379,10 +1379,15 @@ public final class CascadeAppModel: ObservableObject {
                         // GUI-agent grounding>reasoning finding) — so hand it the
                         // exact x,y of each real control to click directly.
                         nudge! += " The controls actually on screen right now, with their click coordinates, are: \(located). Click one of THESE coordinates directly instead of guessing — if what you wanted isn't listed, it isn't a clickable control here, so open the right menu/panel or take another route."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) controls w/ coords"))
+                        // Diagnostic: log the VERBATIM controls (labels + coords),
+                        // not just the count — so the audit reveals whether canvas
+                        // placeholders (e.g. a Keynote subtitle box) are actually in
+                        // the AX list, which decides whether structural snap-on-no-
+                        // effect is viable or the canvas needs a real visual grounder.
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) w/ coords: \(String(located.prefix(700)))"))
                     } else if let summary = AXElementResolver.interactableSummary(controls) {
                         nudge! += " The controls actually clickable on screen right now are: \(summary). Aim for one of these by sight — if what you wanted isn't in this list, it isn't clickable here, so open the right menu/panel or take another route."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) unchanged — pushed \(controls.count) controls (labels only)"))
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) labels: \(String(summary.prefix(700)))"))
                     } else {
                         nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
