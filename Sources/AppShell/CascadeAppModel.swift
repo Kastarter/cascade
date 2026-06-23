@@ -156,6 +156,38 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let cuEffortKey = "cascade.cuEffort"
 
+    /// On-screen agent backend: "claude" (Opus computer-use) or "scout" (Llama 4
+    /// Scout via Groq + the grounder). Read by `onScreenBackendIsScout()`.
+    @Published public var onScreenBackend: String {
+        didSet { defaultsStore.set(onScreenBackend, forKey: "cascade.onScreenBackend") }
+    }
+    /// Grounder for clicks/fills/highlight: "uitars" (local, free), "claude"
+    /// (cloud ElementLocator), or "off". Drives the two keys `assistGrounder()`
+    /// reads — the enable flag and the backend.
+    @Published public var grounderChoice: String {
+        didSet {
+            switch grounderChoice {
+            case "off":
+                defaultsStore.set(false, forKey: "cascade.visualGrounder")
+            case "claude":
+                defaultsStore.set(true, forKey: "cascade.visualGrounder")
+                defaultsStore.set("claude", forKey: "cascade.visualGrounder.backend")
+            default:
+                defaultsStore.set(true, forKey: "cascade.visualGrounder")
+                defaultsStore.set("uitars", forKey: "cascade.visualGrounder.backend")
+            }
+        }
+    }
+    /// UI-TARS endpoint + served model id, editable so the user can point at their
+    /// own server (mlx-vlm on :8000, LM Studio on :1234, vLLM, …) without `defaults
+    /// write`.
+    @Published public var uitarsURL: String {
+        didSet { defaultsStore.set(uitarsURL, forKey: "cascade.visualGrounder.uitarsURL") }
+    }
+    @Published public var uitarsModel: String {
+        didSet { defaultsStore.set(uitarsModel, forKey: "cascade.visualGrounder.uitarsModel") }
+    }
+
     /// Per-region Hamming threshold for "this action changed nothing on screen" —
     /// much tighter than the recorder's blink-tolerant dedup (`regionSkipThreshold`
     /// = 5). A dead click yields a near byte-identical frame; any real change
@@ -233,6 +265,11 @@ public final class CascadeAppModel: ObservableObject {
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
         cuEffort = defaults.string(forKey: Self.cuEffortKey) ?? "medium"
+        onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
+        let grounderOn = (defaults.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
+        grounderChoice = grounderOn ? (defaults.string(forKey: "cascade.visualGrounder.backend") ?? "uitars") : "off"
+        uitarsURL = defaults.string(forKey: "cascade.visualGrounder.uitarsURL") ?? "http://localhost:8000/v1/chat/completions"
+        uitarsModel = defaults.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "ui-tars-1.5-7b"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)

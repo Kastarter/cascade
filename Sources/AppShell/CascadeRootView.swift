@@ -2101,8 +2101,63 @@ private struct HarnessCard: View {
                     }
                     .labelsHidden().pickerStyle(.segmented).frame(width: 150)
                 }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("On-screen engine").font(.cascadeSans(15, .semibold))
+                        Text("Which model drives the on-screen agent. Claude is the proven Opus computer-use loop; Scout runs the cheap Llama 4 Scout planner on Groq, with the grounder below doing the clicks.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                        if model.onScreenBackend == "scout" && !model.hasGroqKey {
+                            Text("Add a Groq key above to use Scout.").font(.cascadeSans(11)).foregroundStyle(Color.cascadeWarn)
+                        }
+                    }
+                    Spacer()
+                    Picker("", selection: $model.onScreenBackend) {
+                        Text("Claude").tag("claude")
+                        Text("Scout").tag("scout")
+                    }
+                    .labelsHidden().pickerStyle(.segmented).frame(width: 150)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Grounding").font(.cascadeSans(15, .semibold))
+                        Text("How the agent turns a named target into a click point (fill-by-name and the where-is-X highlight). UI-TARS runs locally and free; Claude uses the cloud locator; Off disables it.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Picker("", selection: $model.grounderChoice) {
+                        Text("UI-TARS").tag("uitars")
+                        Text("Claude").tag("claude")
+                        Text("Off").tag("off")
+                    }
+                    .labelsHidden().pickerStyle(.segmented).frame(width: 200)
+                }
+                if model.grounderChoice == "uitars" {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("UI-TARS server URL").font(.cascadeSans(12, .semibold)).foregroundStyle(Color.cascadeText2)
+                        groundField(placeholder: "http://localhost:8000/v1/chat/completions", text: $model.uitarsURL)
+                        Text("Model id").font(.cascadeSans(12, .semibold)).foregroundStyle(Color.cascadeText2).padding(.top, 2)
+                        groundField(placeholder: "ui-tars-1.5-7b", text: $model.uitarsModel)
+                        HStack(alignment: .top, spacing: CascadeMetrics.s2) {
+                            Image(systemName: "info.circle").font(.system(size: 11)).foregroundStyle(Color.cascadeText3)
+                            Text("Serve it locally, e.g.  pip install mlx-vlm  then  python -m mlx_vlm.server --model mlx-community/UI-TARS-1.5-7B-4bit --port 8000 . The Model id must match what your server expects. If a target can't be located, the agent falls back to Claude.")
+                                .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
+                        }
+                    }
+                }
             }
         }
+    }
+
+    private func groundField(placeholder: String, text: Binding<String>) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .font(.cascadeMono(11))
+            .padding(.horizontal, CascadeMetrics.s3)
+            .padding(.vertical, CascadeMetrics.s2)
+            .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
     }
 }
 
