@@ -86,6 +86,26 @@ struct VisualGrounderTests {
         #expect(p.y == 900)   // y clamped to 0 (top) → displayH
     }
 
+    // MARK: boxAround — region framing for the highlight
+
+    @Test func boxAroundCentersAndSizesToDisplayFraction() {
+        let r = UITARSGrounder.boxAround(point: CGPoint(x: 720, y: 450), displayW: 1440, displayH: 900)
+        #expect(r.width == 1440 * 0.12)
+        #expect(r.height == 900 * 0.08)
+        #expect(r.midX == 720)
+        #expect(r.midY == 450)
+    }
+
+    @Test func boxAroundClampsToScreenEdges() {
+        // A point in the corner produces a box fully on screen, never off-edge.
+        let r = UITARSGrounder.boxAround(point: .zero, displayW: 1000, displayH: 1000)
+        #expect(r.minX == 0)
+        #expect(r.minY == 0)
+        let far = UITARSGrounder.boxAround(point: CGPoint(x: 1000, y: 1000), displayW: 1000, displayH: 1000)
+        #expect(far.maxX == 1000)
+        #expect(far.maxY == 1000)
+    }
+
     // MARK: extractContent — OpenAI chat-completions reply
 
     @Test func extractsStringContent() {

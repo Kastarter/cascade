@@ -33,6 +33,26 @@ public protocol VisualGrounder: Sendable {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> CGPoint?
+
+    /// Locates a target as a REGION to frame (the "where is X" marching-ants
+    /// highlight) — display-local AppKit rect + a short spoken line. Returns nil
+    /// when this grounder can't produce one (unreachable, or not implemented), so
+    /// the caller falls back to the proven Claude region locator.
+    func groundRegion(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> ElementRegion?
+}
+
+public extension VisualGrounder {
+    /// Default: no region grounding (the caller falls back to ElementLocator). The
+    /// Claude grounder uses this default on purpose — the fallback IS its engine,
+    /// at full quality (tight box + spoken line + conversation context).
+    func groundRegion(
+        screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
+    ) async -> ElementRegion? { nil }
 }
 
 // MARK: - Claude-backed grounder (the proven engine, as a fallback)
@@ -120,6 +140,31 @@ public struct UITARSGrounder: VisualGrounder {
             imageW: res.w, imageH: res.h,
             displayW: displayWidthPoints, displayH: displayHeightPoints
         )
+    }
+
+    /// Region grounding for the highlight: locate the target's click point, then
+    /// frame a box around it. UI-TARS grounds to a point; a box around it is plenty
+    /// for "show me where X is" (the marquee frames the area). Returns nil on any
+    /// miss (unreachable OR not found) so the caller falls back to Claude.
+    public func groundRegion(
+        screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
+    ) async -> ElementRegion? {
+        guard let point = await ground(
+            screenshot: screenshot, target: target,
+            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        ) else { return nil }
+        let rect = Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints)
+        return ElementRegion(rect: rect, speech: "Here — it's in this area.")
+    }
+
+    /// A display-local AppKit rect framing a located point — ~12%×8% of the
+    /// display, clamped on screen. Pure + pinned (a bad rect frames empty space).
+    static func boxAround(point: CGPoint, displayW: Int, displayH: Int) -> CGRect {
+        let w = CGFloat(displayW) * 0.12
+        let h = CGFloat(displayH) * 0.08
+        let x = max(0, min(point.x - w / 2, CGFloat(displayW) - w))
+        let y = max(0, min(point.y - h / 2, CGFloat(displayH) - h))
+        return CGRect(x: x, y: y, width: w, height: h)
     }
 
     /// The grounding instruction. Kept minimal and tunable — UI-TARS is trained to

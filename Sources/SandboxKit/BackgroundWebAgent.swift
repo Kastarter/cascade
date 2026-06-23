@@ -45,6 +45,7 @@ public final class BackgroundWebAgent {
     private let planner: AgentTaskPlanner
     /// Cheap second opinion that checks a claimed completion against the actual page.
     private let verifier: any MessageCompleting
+    private let verifierModel: String
     private var stopped = false
     /// A mid-run correction the user typed into the watch box. Injected into the next
     /// turn as a prominent note, then cleared — the agent's "cursor for agents".
@@ -92,11 +93,13 @@ public final class BackgroundWebAgent {
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
         self.model = model
-        // The planner only splits a job into ≤5 subtasks + picks start URLs — a
-        // structurally simple task. Run it on haiku so the up-front round trip (pure
-        // latency before any visible progress) is cheap; the agent loop stays on `model`.
-        self.planner = AgentTaskPlanner(client: AnthropicClient(keyStore: keyStore), model: AnthropicModel.haiku)
-        self.verifier = AnthropicClient(keyStore: keyStore)
+        // The planner (≤5 subtasks + start URLs) and the completion verifier are
+        // structurally simple TEXT tasks — downgraded to Groq llama-3.3-70b when a
+        // Groq key is set (else Anthropic haiku). The agent loop stays on `model`.
+        let h = TextHelperModel.resolve(anthropicKeyStore: keyStore)
+        self.planner = AgentTaskPlanner(client: h.client, model: h.model)
+        self.verifier = h.client
+        self.verifierModel = h.model
     }
 
     public func stop() { stopped = true }
@@ -226,7 +229,7 @@ public final class BackgroundWebAgent {
         """
         guard let reply = try? await verifier.complete(
             system: "You verify whether a web agent truly finished its task, judging only by the page it ended on. Lean VERIFIED unless it's clearly not done.",
-            user: user, model: AnthropicModel.haiku, maxTokens: 120
+            user: user, model: verifierModel, maxTokens: 120
         ) else { return nil } // verifier unavailable → don't block the completion
         let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.uppercased().hasPrefix("INCOMPLETE") else { return nil } // VERIFIED / unclear → accept

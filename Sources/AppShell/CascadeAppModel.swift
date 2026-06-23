@@ -808,7 +808,7 @@ public final class CascadeAppModel: ObservableObject {
             lastTeachRoute = .locate
 
             // "Where do I find/do X" → frame the region with the dashed marquee.
-            let region = await elementLocator.locateRegion(
+            let region = await locateRegionGrounded(
                 screenshot: shot,
                 question: q,
                 displayWidthPoints: Int(screen.frame.width),
@@ -929,7 +929,10 @@ public final class CascadeAppModel: ObservableObject {
         if Self.isSinglePartCommand(goal) {
             plan = [AgentSubtask(task: goal)]
         } else {
-            plan = await AgentTaskPlanner(model: AnthropicModel.haiku).plan(
+            // Downgraded helper task: Groq llama-3.3-70b when a key is set, else
+            // Anthropic haiku. Planning is text-only, so no Claude needed.
+            let h = TextHelperModel.resolve()
+            plan = await AgentTaskPlanner(client: h.client, model: h.model).plan(
                 for: goal, in: .onScreen, conversationContext: assistMemory.contextMemo()
             )
         }
@@ -1127,6 +1130,30 @@ public final class CascadeAppModel: ObservableObject {
             let model = d.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "ui-tars-1.5-7b"
             return UITARSGrounder(baseURL: url, model: model)
         }
+    }
+
+    /// Region locator for the "where is X" highlight: the configured grounder
+    /// (UI-TARS — free/local) first, falling back to the proven Claude
+    /// ElementLocator on any miss (grounder off, unreachable, or not found). So the
+    /// highlight stops paying for Claude whenever UI-TARS is serving, and never
+    /// breaks when it isn't. See [[cascade-cu-downgrade-research]].
+    private func locateRegionGrounded(
+        screenshot: Data, question: String,
+        displayWidthPoints: Int, displayHeightPoints: Int,
+        conversation: [(user: String, assistant: String)]
+    ) async -> ElementRegion {
+        if let grounder = Self.assistGrounder(),
+           let region = await grounder.groundRegion(
+               screenshot: screenshot, target: question,
+               displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+           ) {
+            return region
+        }
+        return await elementLocator.locateRegion(
+            screenshot: screenshot, question: question,
+            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints,
+            conversation: conversation
+        )
     }
 
     private func runAssistEpisode(
@@ -1570,9 +1597,12 @@ public final class CascadeAppModel: ObservableObject {
         exactly: VERIFIED. Only if the screen CLEARLY shows it is not done reply: \
         INCOMPLETE: <one short line on what's missing>
         """
-        guard let reply = try? await AnthropicClient().complete(
+        // Downgraded helper task: Groq llama-3.3-70b when a key is set, else
+        // Anthropic haiku. The validator judges OCR TEXT, so no vision is needed.
+        let h = TextHelperModel.resolve()
+        guard let reply = try? await h.client.complete(
             system: "You verify whether an on-screen assistant truly finished its task, judging only by what is visible on screen now. Lean VERIFIED unless it's clearly not done.",
-            user: user, model: AnthropicModel.haiku, maxTokens: 120
+            user: user, model: h.model, maxTokens: 120
         ) else { return nil }  // verifier unavailable → never block a completion
         return Self.parseAssistVerdict(reply)
     }
@@ -2106,7 +2136,7 @@ public final class CascadeAppModel: ObservableObject {
             // Detection (is it visible now?) and the next nav step fire concurrently, so
             // each loop turn costs ONE round-trip of wall-clock instead of two. If found,
             // the speculative nav step is just discarded.
-            async let regionTask = elementLocator.locateRegion(
+            async let regionTask = locateRegionGrounded(
                 screenshot: shot, question: question, displayWidthPoints: dw, displayHeightPoints: dh,
                 conversation: assistMemory.historyForAPI()
             )
