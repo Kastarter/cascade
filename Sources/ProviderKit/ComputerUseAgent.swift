@@ -701,7 +701,7 @@ public final class ComputerUseAgent {
     /// The shared click → cmd+a → type → submit expansion. `point` is already in
     /// display-local AppKit points (fill_field scales the model's pixels into this
     /// space; fill_target's grounder returns it directly). Pure + pinned.
-    static func fillActions(at point: CGPoint, text: String, double: Bool, submit: String?) -> [CUAction] {
+    nonisolated static func fillActions(at point: CGPoint, text: String, double: Bool, submit: String?) -> [CUAction] {
         var actions: [CUAction] = [
             double ? .doubleClick(x: point.x, y: point.y) : .click(x: point.x, y: point.y),
             .key("cmd+a"),

@@ -1156,9 +1156,92 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
+    /// Tier 2 on-screen backend: "scout" runs the downgraded Scout-plan +
+    /// UI-TARS-ground loop; anything else (default) runs the Opus computer-use
+    /// loop. Opt in with `cascade.onScreenBackend = scout`.
+    static func onScreenBackendIsScout() -> Bool {
+        UserDefaults.standard.string(forKey: "cascade.onScreenBackend") == "scout"
+    }
+
+    /// The Tier 2 on-screen loop: Scout (Groq, vision) plans the next action and
+    /// names its target; UI-TARS grounds the target to a coordinate; the result is
+    /// the same CUAction batch the Opus path produces, executed by the same
+    /// `executeCU` under the same generation/STOP gates. A leaner loop than the
+    /// Opus path (no SSE streaming, no skills/harness) — additive, opt-in, so the
+    /// Opus loop is untouched. RUNTIME-UNVERIFIED (needs Scout + UI-TARS serving).
+    private func runScoutEpisode(
+        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
+    ) async -> AssistEpisodeOutcome {
+        // Scout can't click without a grounder; force one even if the grounder
+        // toggle is off (Scout mode implies UI-TARS).
+        let grounder = Self.assistGrounder() ?? UITARSGrounder()
+        let agent = ScoutAgent(grounder: grounder)
+        let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
+        let res = AgentResolution.best(forWidth: dw, height: dh)
+        let maxSteps = 60
+        var acted = false
+        var idleTurns = 0
+
+        var step = await agent.begin(goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh)
+        for _ in 0..<maxSteps {
+            if assistGeneration != gen { return .stopped }           // a newer turn superseded us
+            if driver.runState.isStopRequested {
+                agentMessage = "Stopped. Control returned to you."
+                dock.show(title: "Stopped", detail: agentMessage)
+                return .stopped
+            }
+            if step.failed { return .failed }
+            if !step.text.isEmpty {
+                teachMessage = prefix + step.text
+                dock.show(title: "Scout", detail: String(step.text.prefix(80)))
+            }
+            if step.done {
+                let claimed = step.text.isEmpty ? "Done." : step.text
+                if acted, let missing = await validateAssistCompletion(goal: goal, claimed: claimed, screen: screen) {
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: "INCOMPLETE: \(missing.prefix(80))"))
+                    return .stalled("I'm not sure that finished — \(missing)")
+                }
+                return .finished(claimed, acted: acted)
+            }
+
+            // A turn with no executable actions (grounding miss or unparseable
+            // plan) is idle — three in a row ends the episode (the stall guard).
+            if step.actions.isEmpty {
+                idleTurns += 1
+                if idleTurns >= 3 {
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
+                    return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
+                }
+            } else {
+                idleTurns = 0
+                for action in step.actions {
+                    if assistGeneration != gen { return .stopped }
+                    if driver.runState.isStopRequested { return .stopped }
+                    let ok = await executeCU(action, on: screen)
+                    if !ok { return .failed }                        // executeCU surfaced the reason
+                    acted = true
+                    try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
+                }
+                try? await Task.sleep(for: .milliseconds(260))       // let the UI settle before re-observing
+            }
+
+            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return .failed }
+            if assistGeneration != gen { return .stopped }
+            step = await agent.proceed(screenshot: shot)
+        }
+        return .stepLimit
+    }
+
     private func runAssistEpisode(
         goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
+        // Tier 2 downgrade: when selected, the cheap on-screen brain (Scout plans,
+        // UI-TARS grounds) replaces the Opus computer-use loop. This guard is the
+        // ONLY change to the Opus path — default is Claude, so behaviour is
+        // unchanged unless the user opts in. See [[cascade-cu-downgrade-research]].
+        if Self.onScreenBackendIsScout() {
+            return await runScoutEpisode(goal: goal, prefix: prefix, screen: screen, firstScreenshotPNG: firstScreenshotPNG, gen: gen)
+        }
         // Pull-based skills: the agent gets a one-line index and fetches a
         // skill's full instructions itself via the use_skill tool. Content
         // never rides the prompt (token cost stays flat as the library grows).
