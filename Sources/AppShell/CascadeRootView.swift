@@ -1991,6 +1991,7 @@ private struct SettingsScreen: View {
                 section("MODEL KEYS", trailing: "stored in macOS Keychain") {
                     ClaudeKeyCard(model: model)
                     OpenAIKeyCard(model: model)
+                    GroqKeyCard(model: model)
                 }
             }
             .padding(.horizontal, CascadeMetrics.s6)
@@ -2360,6 +2361,39 @@ private struct OpenAIKeyCard: View {
                     Button("Clear") { model.clearOpenAIKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
                 Text("Stored in macOS Keychain. Powers talk-to-Cascade and spoken replies via OpenAI GPT-Realtime-2. Claude still does the thinking.")
+                    .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+            }
+        }
+    }
+}
+
+private struct GroqKeyCard: View {
+    @ObservedObject var model: CascadeAppModel
+    @State private var key = ""
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Groq key · cheaper models").font(.cascadeSans(16, .semibold))
+                        Text(model.groqKeyMessage).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    CascadeTag(model.hasGroqKey ? "Connected" : "Groq off", tone: model.hasGroqKey ? .cascadeGood : .cascadeWarn)
+                }
+                SecureField("gsk_…", text: $key)
+                    .textFieldStyle(.plain)
+                    .font(.cascadeMono(12))
+                    .padding(.horizontal, CascadeMetrics.s3)
+                    .padding(.vertical, CascadeMetrics.s2 + 1)
+                    .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                HStack {
+                    Button("Save key") { model.saveGroqKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
+                    Button("Clear") { model.clearGroqKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
+                }
+                Text("Stored in macOS Keychain. Runs the downgraded models: the task planner and completion validators on Llama 3.3 70B, and the on-screen agent on Llama 4 Scout (with UI-TARS grounding). Falls back to Claude when absent.")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
         }

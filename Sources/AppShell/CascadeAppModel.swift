@@ -96,6 +96,8 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var keyMessage = "Claude key is not connected."
     @Published public private(set) var hasOpenAIKey = false
     @Published public private(set) var openAIKeyMessage = "OpenAI key is not connected (for GPT-Realtime voice)."
+    @Published public private(set) var hasGroqKey = false
+    @Published public private(set) var groqKeyMessage = "Groq key is not connected (for the cheaper Groq models)."
     @Published public private(set) var permissionDiagnostics = PermissionProbe.diagnostics()
     @Published public private(set) var screenAgentReady = false
     @Published public private(set) var screenAgentMessage = "Checking real-screen driver health."
@@ -173,6 +175,7 @@ public final class CascadeAppModel: ObservableObject {
     private let orchestrator: CascadeOrchestrator
     private let keyStore = AnthropicKeyStore()
     private let openAIKeyStore = OpenAIKeyStore()
+    private let groqKeyStore = GroqKeyStore()
     public let guidanceOverlay = GuidanceOverlayController()
     public let voice = RealtimeVoice()
     public let pushToTalk = PushToTalkMonitor()
@@ -3242,6 +3245,10 @@ public final class CascadeAppModel: ObservableObject {
         openAIKeyMessage = hasOpenAIKey
             ? "OpenAI key connected — GPT-Realtime voice enabled."
             : "Paste your OpenAI API key to enable the GPT-Realtime voice (talk + spoken replies)."
+        hasGroqKey = groqKeyStore.hasKey()
+        groqKeyMessage = hasGroqKey
+            ? "Groq key connected — planner, validators, and the Scout on-screen agent can run on Groq."
+            : "Paste your Groq API key to run the cheap models (Llama 3.3 70B planner/validators, Llama 4 Scout agent)."
     }
 
     public func saveAnthropicKey(_ key: String) {
@@ -3277,6 +3284,24 @@ public final class CascadeAppModel: ObservableObject {
             refreshKeyStatus()
         } catch {
             openAIKeyMessage = error.localizedDescription
+        }
+    }
+
+    public func saveGroqKey(_ key: String) {
+        do {
+            try groqKeyStore.save(key)
+            refreshKeyStatus()
+        } catch {
+            groqKeyMessage = error.localizedDescription
+        }
+    }
+
+    public func clearGroqKey() {
+        do {
+            try groqKeyStore.delete()
+            refreshKeyStatus()
+        } catch {
+            groqKeyMessage = error.localizedDescription
         }
     }
 
