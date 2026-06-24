@@ -1230,7 +1230,7 @@ public final class CascadeAppModel: ObservableObject {
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
             conversation: assistMemory.historyForAPI(), note: scoutGroundingNote(),
-            skill: frontmostSkill()?.promptBlock
+            skill: scoutSkillPush(goal: goal)
         )
         for _ in 0..<maxSteps {
             if assistGeneration != gen { return .stopped }           // a newer turn superseded us
@@ -1342,7 +1342,7 @@ public final class CascadeAppModel: ObservableObject {
             step = await agent.proceed(
                 screenshot: observedShot,
                 note: turnNote.isEmpty ? nil : turnNote,
-                skill: frontmostSkill()?.promptBlock
+                skill: scoutSkillPush(goal: goal)
             )
         }
         return .stepLimit
@@ -2139,6 +2139,26 @@ public final class CascadeAppModel: ObservableObject {
     private func frontmostSkill() -> AppSkill? {
         let front = NSWorkspace.shared.frontmostApplication
         return appSkills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+    }
+
+    /// The full skill text to PUSH into Scout this turn: the frontmost app's skill
+    /// PLUS its related task/recipe skills. The Opus path reaches the recipe skills
+    /// (e.g. `keynote-consulting` — how to actually build a good deck) via the
+    /// use_skill tool; Scout has no pull, so they must be pushed. Related skills are
+    /// found by the `<app>-<task>` naming convention (the app skill's name is their
+    /// prefix), so it generalizes to any app pack without hardcoding. Scripting
+    /// playbooks (`explicitAskOnly`) are included only when the goal asks for a
+    /// script — the same gate the Opus skillProvider applies. nil when no app skill
+    /// matches (so applySkill leaves the prompt unchanged). See [[cascade-cu-downgrade-research]].
+    private func scoutSkillPush(goal: String) -> String? {
+        guard let app = frontmostSkill() else { return nil }
+        let asksScript = AppSkill.goalAsksForScript(goal)
+        let related = appSkills.skills.filter { skill in
+            (skill.name == app.name || skill.name.hasPrefix(app.name + "-"))
+                && (!skill.explicitAskOnly || asksScript)
+        }
+        let blocks = related.map(\.promptBlock)
+        return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n---\n\n")
     }
 
     /// Pointer-routed apps (Blender) send hotkeys to the editor at the position
