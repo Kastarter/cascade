@@ -1142,7 +1142,7 @@ public final class CascadeAppModel: ObservableObject {
         // the runtime grounds each — the model never emits pixel coordinates. The
         // proven coordinate computer-tool path runs whenever no grounder is present
         // (no OpenRouter key) or the user opts out, so existing behaviour is intact.
-        let grounder = Self.assistGrounder()
+        let grounder = assistGrounder()
         let mode: ComputerUseAgent.GroundingMode =
             (grounder != nil && Self.structuralGroundingEnabled()) ? .structural : .coordinate
         return ComputerUseAgent(
@@ -1185,21 +1185,32 @@ public final class CascadeAppModel: ObservableObject {
     /// stale `cascade.visualGrounder.uitarsURL` default (from old local-mlx builds)
     /// once silently hijacked the grounder to a dead localhost endpoint and stalled
     /// every run — hosting is OpenRouter-only. See [[cascade-cu-downgrade-research]].
-    static func assistGrounder() -> VisualGrounder? {
+    ///
+    /// The chosen visual grounder is wrapped in a `MixtureGrounder` (AX-first, ON by
+    /// default; `cascade.mixtureGrounding = false` to disable) so labeled chrome
+    /// controls resolve structurally — free, exact, no transport flakiness — and only
+    /// canvas/custom elements fall through to the visual model. Instance method so it
+    /// can pass the live `appSkills` registry (the mixture grounder skips AX on the
+    /// apps that registry flags `axUnreliable`).
+    func assistGrounder() -> VisualGrounder? {
         let d = UserDefaults.standard
         // Default ON: unset → enabled; explicit false → disabled.
         let enabled = (d.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
         guard enabled else { return nil }
+        let base: VisualGrounder
         switch d.string(forKey: "cascade.visualGrounder.backend") {
         case "claude":
-            return ClaudeVisualGrounder()
+            base = ClaudeVisualGrounder()
         default:
             // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
             // Requires the key; without it return nil → coordinate fallback.
             guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
             let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
-            return UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
+            base = UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
         }
+        // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
+        let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
+        return mixture ? MixtureGrounder(base: base, skills: appSkills) : base
     }
 
     /// Region locator for the "where is X" highlight: the configured grounder
@@ -1212,7 +1223,7 @@ public final class CascadeAppModel: ObservableObject {
         displayWidthPoints: Int, displayHeightPoints: Int,
         conversation: [(user: String, assistant: String)]
     ) async -> ElementRegion {
-        if let grounder = Self.assistGrounder(),
+        if let grounder = assistGrounder(),
            let region = await grounder.groundRegion(
                screenshot: screenshot, target: question,
                displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
@@ -1245,7 +1256,7 @@ public final class CascadeAppModel: ObservableObject {
         // Scout grounds EVERY click, so it can't run without a working grounder.
         // Fail clearly rather than fall back to a dead localhost endpoint (the old
         // `?? UITARSGrounder()` silently pointed at :8000 and every click missed).
-        guard let grounder = Self.assistGrounder() else {
+        guard let grounder = assistGrounder() else {
             teachMessage = "The Scout backend needs a grounder — connect an OpenRouter key in Settings → Model Keys to use it."
             dock.show(title: "Scout needs a grounder", detail: "Add an OpenRouter key in Settings.")
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: "no-grounder · scout · 0 turns"))
@@ -1294,7 +1305,7 @@ public final class CascadeAppModel: ObservableObject {
         var modelStart = ContinuousClock.now
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
-            conversation: assistMemory.historyForAPI(), note: scoutGroundingNote(),
+            conversation: assistMemory.historyForAPI(), note: scoutContextNote(),
             skill: scoutSkillPush(goal: goal)
         )
         modelTime += modelStart.duration(to: .now); count += 1
@@ -1379,37 +1390,36 @@ public final class CascadeAppModel: ObservableObject {
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout — 3rd no-effect, stopping"))
                         return await scoutEnd(.stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way."), "noeffect-stall")
                     }
-                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action."
-                    // Flail push: hand Scout the controls actually on screen so it
-                    // re-grounds on a real element by NAME instead of the dead spot.
-                    let controls = AXElementResolver.interactables()
-                    if let summary = AXElementResolver.interactableSummary(controls) {
-                        nudge! += " The controls actually on screen now are: \(summary). Target one of THESE by name (or open the right menu/panel). If it truly can't be done, set action to \"done\" and say so."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout pushed \(controls.count) labels: \(String(summary.prefix(500)))"))
-                    } else {
-                        nudge! += " Choose a DIFFERENT control, menu, or approach — or set action to \"done\" if it can't be done."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout left screen unchanged (no AX controls)"))
-                    }
+                    // The controls list is PUSHED proactively into turnNote below
+                    // (harvested once), so the nudge just steers — no second AX walk.
+                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout no-effect turn \(count)"))
                 }
             } else if actedThisTurn {
                 noEffectTurns = 0
             }
             if let observedHashes { lastFrameHashes = observedHashes }
+            // Proactive Set-of-Marks push (the literature's grounding>reasoning
+            // finding + Cascade's "push controls, never a pull tool" lesson): harvest
+            // the controls actually on screen ONCE per turn and PUSH them to the weak
+            // planner EVERY turn — not only on a failure — so it names targets that
+            // exist and the grounder (AX-first, then visual) hits them. Bounded AX
+            // walk (≤24, ≤0.3s); empty on canvas/Electron apps that expose nothing.
+            let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
             // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
             // a partially-grounded batch (where step.actions is non-empty so the idle
             // path above is skipped). Tells Scout to re-describe instead of silently
             // re-naming an un-findable target, and audits what was actually on screen.
             if let missed = agent.lastGroundMiss {
-                let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
                 let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
-                var missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
-                if let summary { missNote += " Controls on screen now: \(summary)." }
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((controlSummary ?? "(no AX controls)").prefix(200)))"))
+                let missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name a VISIBLE field, button, or placeholder from the controls listed below (or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
                 nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
             }
-            // Refresh the grounding line + app skill every turn (the frontmost app
-            // changes once Scout opens the target), merged with any nudge above.
-            let turnNote = [scoutGroundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+            // Refresh the grounding line + the proactive controls list + app skill
+            // every turn (the frontmost app changes once Scout opens the target),
+            // merged with any nudge above.
+            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             step = await agent.proceed(
                 screenshot: observedShot,
@@ -1934,6 +1944,22 @@ public final class CascadeAppModel: ObservableObject {
             return "Frontmost app: \(snapshot.appName) — “\(title)”"
         }
         return "Frontmost app: \(snapshot.appName)"
+    }
+
+    /// Formats the proactive Set-of-Marks controls push from a harvested summary.
+    /// nil when there's nothing on screen (canvas/Electron). Shared by the first
+    /// turn (`scoutContextNote`) and each subsequent turn so the listing is identical.
+    private func scoutControlsLine(_ summary: String?) -> String? {
+        summary.map { "Controls on screen now (name one of these to click or fill, or open a menu/panel to reveal others): \($0)" }
+    }
+
+    /// The first turn's pushed context for Scout: frontmost app/window + the controls
+    /// actually on screen. Subsequent turns rebuild the same shape inline (reusing a
+    /// single AX harvest alongside the no-effect/miss feedback).
+    private func scoutContextNote() -> String? {
+        let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
+        let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer

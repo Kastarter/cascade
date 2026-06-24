@@ -70,6 +70,33 @@ struct StructuralGroundingTests {
         #expect(await none.groundedClick(["target": "x"], frame: dummyFrame) == nil)
     }
 
+    // MARK: concurrent grounding cache — the pre-grounded point is used as-is
+
+    @Test func groundedClickPrefersCacheOverGrounder() async {
+        // The pre-pass grounds all targets concurrently into a cache; a cache HIT
+        // must be used instead of re-calling the grounder. Grounder says (1,1),
+        // cache says (42,43) → cache wins.
+        let agent = ComputerUseAgent(grounder: StubGrounder(point: CGPoint(x: 1, y: 1)), groundingMode: .structural)
+        let action = await agent.groundedClick(["target": "Save"], frame: dummyFrame, cache: ["Save": CGPoint(x: 42, y: 43)])
+        #expect(action == .click(x: 42, y: 43))
+    }
+
+    @Test func groundedClickCacheMissFallsToGrounder() async {
+        // A target absent from the cache grounds live (single-target turns, or a
+        // target the pre-pass didn't cover).
+        let agent = ComputerUseAgent(grounder: StubGrounder(point: CGPoint(x: 1, y: 1)), groundingMode: .structural)
+        let action = await agent.groundedClick(["target": "Save"], frame: dummyFrame, cache: ["Other": CGPoint(x: 9, y: 9)])
+        #expect(action == .click(x: 1, y: 1))
+    }
+
+    @Test func groundedClickCachedMissReturnsNil() async {
+        // A cached MISS (the pre-pass grounded it and found nothing) returns nil
+        // without re-grounding — behaviour-identical to a live miss.
+        let agent = ComputerUseAgent(grounder: StubGrounder(point: CGPoint(x: 1, y: 1)), groundingMode: .structural)
+        let action = await agent.groundedClick(["target": "Save"], frame: dummyFrame, cache: ["Save": Optional<CGPoint>.none])
+        #expect(action == nil)
+    }
+
     // MARK: groundedScroll — scroll over a named area (or the screen center)
 
     @Test func scrollOverNamedTargetUsesGrounderPoint() async {
