@@ -1308,7 +1308,15 @@ public final class CascadeAppModel: ObservableObject {
             if step.failed { return await scoutEnd(.failed, "planner-failed: \(step.text.prefix(90))") }
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
-                dock.show(title: "Scout", detail: String(step.text.prefix(80)))
+                // Speak the turn's intent aloud like the Opus path, so the agent is
+                // audibly alive during the run instead of silent — a silent Scout
+                // reads as "stopped" even while it's working. When it actually spoke
+                // AND this turn acts, give the voice a 450ms head start before the
+                // actions land (mirrors runAssistEpisode's batch narration). The
+                // done turn is skipped here — its summary is spoken by the caller.
+                if !step.done, narrateProgress(step.text), !step.actions.isEmpty {
+                    try? await Task.sleep(for: .milliseconds(450))
+                }
             }
             if step.done {
                 let claimed = step.text.isEmpty ? "Done." : step.text
