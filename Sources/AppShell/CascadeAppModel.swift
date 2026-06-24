@@ -1072,6 +1072,40 @@ public final class CascadeAppModel: ObservableObject {
     /// without duplicating the skill/harness/recall wiring. Handlers
     /// (streamSink / onThinkingPulse / onActionRefused) are set by the caller —
     /// they capture episode-local state.
+    /// Skill provider shared by the Opus + Scout on-screen paths: resolve a skill by
+    /// name, deny scripting playbooks unless the goal asks (the structural gate), and
+    /// audit each pull.
+    private func assistSkillProvider(goal: String) -> (String) -> String? {
+        { [appSkills, store] name in
+            guard let skill = appSkills.skill(named: name) else { return nil }
+            if skill.explicitAskOnly && !AppSkill.goalAsksForScript(goal) {
+                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: name)) }
+                return """
+                Skill \(skill.name) is unavailable for this task: it is a scripting \
+                playbook and the user did not ask for a script. Do the work on \
+                screen in the app's own UI — pull the app's other listed skills \
+                instead. Do not write or run any script for this task: no script \
+                editors, no shell, no writing files to open in the app.
+                """
+            }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
+            return skill.promptBlock
+        }
+    }
+
+    /// Harness + recall provider shared by both on-screen paths: recall tools route
+    /// to performRecall (read-only memory); everything else to performHarness
+    /// (file/shell, gated + audited).
+    private func assistHarnessProvider(goal: String, gen: Int) -> @MainActor (String, [String: Any]) async -> String {
+        { [weak self] name, input in
+            guard let self else { return "Cascade is shutting down — stop." }
+            if RecordRecall.isRecallTool(name) {
+                return await self.performRecall(name: name, input: input, gen: gen)
+            }
+            return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
+        }
+    }
+
     private func makeAssistAgent(model: String, goal: String, gen: Int) -> ComputerUseAgent {
         // Structural grounding split: when a grounder is configured (hosted UI-TARS
         // via OpenRouter, or Claude), Opus drives the screen by NAMING targets and
@@ -1085,39 +1119,11 @@ public final class CascadeAppModel: ObservableObject {
             model: model,
             effort: cuEffort,
             environmentNote: ComputerUseAgent.foregroundBrowserNote,
-            skillProvider: { [appSkills, store] name in
-                guard let skill = appSkills.skill(named: name) else { return nil }
-                // Scripting playbooks open only on the user's explicit ask.
-                // Prompt-level qualifiers ("10+ repeated parts") get read as
-                // policy and every real build qualifies — so the gate is here,
-                // structural, keyed to the user's own words in the goal.
-                if skill.explicitAskOnly && !AppSkill.goalAsksForScript(goal) {
-                    Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: name)) }
-                    return """
-                    Skill \(skill.name) is unavailable for this task: it is a scripting \
-                    playbook and the user did not ask for a script. Do the work on \
-                    screen in the app's own UI — pull the app's other listed skills \
-                    instead. Do not write or run any script for this task: no script \
-                    editors, no shell, no writing files to open in the app.
-                    """
-                }
-                // Skill text entering the agent's context is an auditable event,
-                // same as every action it takes.
-                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
-                return skill.promptBlock
-            },
+            skillProvider: assistSkillProvider(goal: goal),
             // Direct-Mac tools beside the computer tool: find/read is always on;
             // run/script/write only with the user's Power harness opt-in.
             harnessTier: powerHarnessEnabled ? .full : .readOnly,
-            harnessProvider: { [weak self] name, input in
-                guard let self else { return "Cascade is shutting down — stop." }
-                // Recall over the recorded screen history is read-only memory —
-                // it skips the file/shell gating performHarness applies.
-                if RecordRecall.isRecallTool(name) {
-                    return await self.performRecall(name: name, input: input, gen: gen)
-                }
-                return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
-            },
+            harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
             // Let the agent recall what the user already saw on screen — the whole
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
@@ -1209,7 +1215,17 @@ public final class CascadeAppModel: ObservableObject {
         // Scout can't click without a grounder; force one even if the grounder
         // toggle is off (Scout mode implies UI-TARS).
         let grounder = Self.assistGrounder() ?? UITARSGrounder()
-        let agent = ScoutAgent(grounder: grounder)
+        // Same in-process tool harness as the Opus path: use_skill (pull), the
+        // file/shell harness, and record recall — shared providers, so Scout can
+        // reach for them too (it may underuse pull-tools, but the capability is here).
+        let agent = ScoutAgent(
+            grounder: grounder,
+            skillProvider: assistSkillProvider(goal: goal),
+            skillIndex: appSkills.indexText,
+            harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
+            harnessTier: powerHarnessEnabled ? .full : .readOnly,
+            recallEnabled: true
+        )
         let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
         let res = AgentResolution.best(forWidth: dw, height: dh)
         let maxSteps = 60

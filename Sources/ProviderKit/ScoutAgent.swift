@@ -14,6 +14,11 @@ import Foundation
 ///
 /// RUNTIME-UNVERIFIED end to end (no Scout/UI-TARS/live screen in CI). The action
 /// parser is pure + pinned; the live loop needs a dry run once both models serve.
+///
+/// `@MainActor` (like ComputerUseAgent) because it now calls the @MainActor harness
+/// provider with non-Sendable input; the pure static parsers are `nonisolated` so
+/// tests + the parse contract stay callable off the actor.
+@MainActor
 public final class ScoutAgent {
     /// One parsed instruction from Scout. The model picks exactly one next action
     /// and names the target; the runtime grounds + executes it.
@@ -42,18 +47,52 @@ public final class ScoutAgent {
     /// goal is explicitly about the clipboard.
     private var episodeCopied = false
     private var goalAsksForPaste = false
-    /// System prompt for the episode — the base prompt plus any pushed app skill
-    /// (Scout has no use_skill tool, so the matched skill is PUSHED, not pulled).
+    /// In-process tools (resolved without a screen action, like the Opus inline
+    /// hop): use_skill PULLS a skill by name; the harness/recall providers run
+    /// file/shell/record-history tools. nil = that capability off.
+    private let skillProvider: ((String) -> String?)?
+    private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
+    private let harnessTier: HarnessTier
+    private let recallEnabled: Bool
+    /// One-line-per-skill catalogue for use_skill (so Scout knows what it CAN pull).
+    private let skillIndex: String?
+    /// System prompt for the episode — base prompt + tool catalogue + any pushed
+    /// app skill. Rebuilt by `applySkill`; `pushedSkill` survives a transient nil.
     private var episodeSystem = ScoutAgent.systemPrompt
+    private var pushedSkill: String?
 
     public init(
         vision: GroqVisionClient = GroqVisionClient(),
         grounder: VisualGrounder,
-        model: String = GroqModel.llama4Scout
+        model: String = GroqModel.llama4Scout,
+        skillProvider: ((String) -> String?)? = nil,
+        skillIndex: String? = nil,
+        harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
+        harnessTier: HarnessTier = .off,
+        recallEnabled: Bool = false
     ) {
         self.vision = vision
         self.grounder = grounder
         self.model = model
+        self.skillProvider = skillProvider
+        self.skillIndex = skillIndex
+        self.harnessProvider = harnessProvider
+        self.harnessTier = harnessProvider == nil ? .off : harnessTier
+        self.recallEnabled = recallEnabled && harnessProvider != nil
+        rebuildSystem()
+    }
+
+    /// Tools available this run, by name — drives both the prompt catalogue and the
+    /// in-process resolver. Mirrors the Opus path's tiers.
+    private var availableTools: Set<String> {
+        var s = Set<String>()
+        if skillProvider != nil { s.insert("use_skill") }
+        if harnessProvider != nil {
+            if harnessTier != .off { s.formUnion(["search_files", "read_file", "list_folder"]) }
+            if harnessTier == .full { s.formUnion(["run_command", "run_applescript", "write_file"]) }
+            if recallEnabled { s.formUnion(["search_record", "get_timeframe", "inspect_moment"]) }
+        }
+        return s
     }
 
     /// Resolution screenshots are captured + sent at — same contract as
@@ -91,22 +130,53 @@ public final class ScoutAgent {
         return await step(screenshot: screenshot, note: note)
     }
 
-    /// Folds the matched app skill into the system prompt. PUSH (Scout has no
-    /// use_skill), framed as approach because Scout acts by NAMING targets — not
-    /// fill_field / coordinates. A nil skill leaves the current prompt unchanged so
-    /// a momentary "no frontmost skill" transition doesn't wipe a pushed playbook.
+    /// Updates the pushed app playbook (a nil skill leaves the last one in place, so
+    /// a transient "no frontmost skill" doesn't wipe it) and rebuilds the prompt.
     private func applySkill(_ skill: String?) {
-        guard let skill, !skill.isEmpty else { return }
-        episodeSystem = Self.systemPrompt + """
+        if let skill, !skill.isEmpty { pushedSkill = skill }
+        rebuildSystem()
+    }
+
+    /// episodeSystem = base prompt + tool catalogue + the pushed app playbook.
+    private func rebuildSystem() {
+        var s = Self.systemPrompt + toolsPrompt
+        if let pushedSkill, !pushedSkill.isEmpty {
+            s += """
 
 
-        App playbook for the app you are working in — follow its approach and \
-        recipes, but carry each step out with YOUR actions (name the target to \
-        click or type into; ignore any references to coordinates, fill_field, or a \
-        computer tool — those are not your tools):
+            App playbook for the app you are working in — follow its approach and \
+            recipes, but carry each step out with YOUR actions (name the target to \
+            click or type into; ignore any references to coordinates, fill_field, or a \
+            computer tool — those are not your tools):
 
-        \(skill)
-        """
+            \(pushedSkill)
+            """
+        }
+        episodeSystem = s
+    }
+
+    /// The in-process tool catalogue injected into the system prompt — only the
+    /// tools actually available this run, expressed as the JSON actions Scout emits
+    /// (they resolve instantly with no screen action, like the Opus inline hop).
+    private var toolsPrompt: String {
+        let t = availableTools
+        guard !t.isEmpty else { return "" }
+        var lines = ["", "",
+            "INSTANT TOOLS — emit these like any action; they return a result WITHOUT touching the screen, so use them BEFORE acting when relevant:"]
+        if t.contains("use_skill") {
+            lines.append("- use_skill: fetch a playbook's full instructions — {\"action\":\"use_skill\",\"name\":\"<exact skill name>\"}.")
+            if let skillIndex, !skillIndex.isEmpty { lines.append("  Available skills:\n\(skillIndex)") }
+        }
+        if t.contains("search_files") {
+            lines.append("- search_files {\"action\":\"search_files\",\"query\":\"…\",\"folder\":\"~/Desktop\"} · read_file {\"action\":\"read_file\",\"path\":\"…\"} · list_folder {\"action\":\"list_folder\",\"path\":\"…\"} — find/read files instead of clicking through Finder (folder optional).")
+        }
+        if t.contains("run_command") {
+            lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
+        }
+        if t.contains("search_record") {
+            lines.append("- search_record {\"action\":\"search_record\",\"query\":\"…\"} · get_timeframe · inspect_moment {\"action\":\"inspect_moment\",\"id\":<n>} — recall what the user already saw on screen EARLIER (use when the goal refers to something not on screen now).")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// The target Scout named this turn but the grounder could NOT locate — read by
@@ -118,10 +188,11 @@ public final class ScoutAgent {
     /// click landed (or that it found nothing), the visibility we were missing.
     public private(set) var lastGroundLog: String?
 
-    private func step(screenshot: Data, note: String? = nil) async -> CUStep {
+    private func step(screenshot: Data, note: String? = nil, carried: String? = nil, hop: Int = 0) async -> CUStep {
         lastGroundMiss = nil
         lastGroundLog = nil
         var user = "Goal: \(goal)\n\nDecide the next action(s) and reply with the JSON object only."
+        if let carried, !carried.isEmpty { user += "\n\nResults of your tool calls:\n" + carried }
         if let note, !note.isEmpty { user += "\n\n" + note }
         let reply: String
         do {
@@ -132,10 +203,31 @@ public final class ScoutAgent {
         } catch {
             return CUStep(actions: [], text: "I couldn't reach the planner.", done: true, failed: true)
         }
-        let plan = Self.parseScoutActions(reply)
-        guard !plan.isEmpty else {
+        let raw = Self.parseRawActions(reply)
+        guard !raw.isEmpty else {
             // Unparseable → an empty, non-done turn; the runner's stall guard
             // ends the episode if this repeats.
+            return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
+        }
+        // In-process tool calls (use_skill / harness / recall) resolve WITHOUT a
+        // screen action — the Scout analog of the Opus inline hop. Resolve them, feed
+        // results back, and re-prompt the SAME screenshot (hop-capped); a tool turn
+        // never touches the cursor. A reply mixing tools + screen actions is treated
+        // as tools-first (the screen actions were decided before the results existed).
+        let tools = availableTools
+        let toolCalls = raw.filter { ($0["action"] as? String).map(tools.contains) ?? false }
+        if !toolCalls.isEmpty, hop < 6 {
+            var results = carried ?? ""
+            for call in toolCalls {
+                guard let name = call["action"] as? String else { continue }
+                let r = await resolveTool(name: name, input: call)
+                results += "[\(name)] \(String(r.prefix(2000)))\n\n"
+            }
+            history.append((user: user, assistant: String(reply.prefix(400))))
+            return await step(screenshot: screenshot, note: note, carried: results, hop: hop + 1)
+        }
+        let plan = raw.compactMap { Self.parseOne($0) }
+        guard !plan.isEmpty else {
             return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
         }
         history.append((user: user, assistant: plan.map(Self.historyLine).joined(separator: " ; ")))
@@ -159,6 +251,17 @@ public final class ScoutAgent {
             return CUStep(actions: [], text: spoken.isEmpty && sawDone ? "Done." : spoken, done: sawDone)
         }
         return CUStep(actions: cuActions, text: spoken, done: false)
+    }
+
+    /// Resolves one in-process tool call to a text result. use_skill goes through
+    /// the skill provider (name OR target); everything else (harness + recall) goes
+    /// through the harness provider, which routes recall vs file/shell itself.
+    private func resolveTool(name: String, input: [String: Any]) async -> String {
+        if name == "use_skill" {
+            let skillName = (input["name"] as? String) ?? (input["target"] as? String) ?? ""
+            return skillProvider?(skillName) ?? "No skill named “\(skillName)”."
+        }
+        return await harnessProvider?(name, input) ?? "The \(name) tool isn't available."
     }
 
     /// Maps a parsed action to executable `CUAction`s, grounding named targets via
@@ -212,7 +315,7 @@ public final class ScoutAgent {
         return point
     }
 
-    private static func historyLine(_ a: ScoutAction) -> String {
+    nonisolated private static func historyLine(_ a: ScoutAction) -> String {
         var parts = [a.kind.rawValue]
         if let t = a.target { parts.append("→ \(t)") }
         if let text = a.text { parts.append("\"\(text.prefix(40))\"") }
@@ -222,7 +325,7 @@ public final class ScoutAgent {
 
     /// Parses ONE action from a reply (tolerating prose / ``` fences). Kept for the
     /// single-action contract + tests; `parseScoutActions` handles batches.
-    public static func parseScoutAction(_ text: String) -> ScoutAction? {
+    nonisolated public static func parseScoutAction(_ text: String) -> ScoutAction? {
         guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"),
               start < end,
               let data = String(text[start...end]).data(using: .utf8),
@@ -230,29 +333,34 @@ public final class ScoutAgent {
         return parseOne(json)
     }
 
-    /// Parses one OR several actions. Scout may batch predictable steps as
-    /// `{"thought":"…","actions":[{…},{…}]}`; a single `{action:…}` object still
-    /// works (back-compat). The outer "thought" is carried onto any element that
-    /// lacks its own. Pure + pinned — the brain's contract with the runtime.
-    public static func parseScoutActions(_ text: String) -> [ScoutAction] {
+    /// Raw action dicts from a reply — the source of truth for BOTH tool calls
+    /// (which need arbitrary input fields like path/command) and screen actions.
+    /// Handles a batch `{"actions":[…]}` (outer "thought" carried onto elements
+    /// lacking their own) or a single `{action:…}` object. A stray non-object
+    /// element in the batch is skipped, not fatal.
+    nonisolated static func parseRawActions(_ text: String) -> [[String: Any]] {
         guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"),
               start < end,
               let data = String(text[start...end]).data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
         if let arr = json["actions"] as? [Any] {
             let outerThought = json["thought"] as? String
-            // Per-element cast (not a whole-array cast) so one stray non-object
-            // element doesn't discard the entire batch.
             return arr.compactMap { element in
                 guard var e = element as? [String: Any] else { return nil }
                 if e["thought"] == nil, let outerThought { e["thought"] = outerThought }
-                return parseOne(e)
+                return e
             }
         }
-        return parseOne(json).map { [$0] } ?? []
+        return [json]
     }
 
-    private static func parseOne(_ json: [String: Any]) -> ScoutAction? {
+    /// Parses one OR several SCREEN actions (back-compat + tests). Built on
+    /// `parseRawActions`; non-action dicts (e.g. tool calls) drop out via parseOne.
+    nonisolated public static func parseScoutActions(_ text: String) -> [ScoutAction] {
+        parseRawActions(text).compactMap { parseOne($0) }
+    }
+
+    nonisolated private static func parseOne(_ json: [String: Any]) -> ScoutAction? {
         guard let rawAction = (json["action"] as? String)?.lowercased(),
               let kind = mapKind(rawAction) else { return nil }
         return ScoutAction(
@@ -266,7 +374,7 @@ public final class ScoutAgent {
         )
     }
 
-    private static func mapKind(_ raw: String) -> ScoutAction.Kind? {
+    nonisolated private static func mapKind(_ raw: String) -> ScoutAction.Kind? {
         switch raw {
         case "click", "left_click": return .click
         case "double_click", "doubleclick": return .doubleClick
@@ -281,7 +389,7 @@ public final class ScoutAgent {
         }
     }
 
-    private static func nonEmpty(_ s: String?) -> String? {
+    nonisolated private static func nonEmpty(_ s: String?) -> String? {
         guard let s = s?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
         return s
     }
