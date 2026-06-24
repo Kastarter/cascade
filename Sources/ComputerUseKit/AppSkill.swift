@@ -156,11 +156,10 @@ public struct AppSkill: Sendable {
 
     /// Whether the user's own words ask for a script — the only key that opens
     /// an `explicitAskOnly` skill. Whole-word match so "description" or
-    /// "encode" never count. Arabic tokens included: voice goals arrive in
-    /// Arabic too (سكربت/بايثون/كود = script/python/code).
+    /// "encode" never count.
     public static func goalAsksForScript(_ goal: String) -> Bool {
         goal.range(
-            of: #"(?i)\b(scripts?|scripting|scripted|applescript|osascript|python|bpy|code|coding|macros?|سكربت|سكريبت|بايثون|كود)\b"#,
+            of: #"(?i)\b(scripts?|scripting|scripted|applescript|osascript|python|bpy|code|coding|macros?)\b"#,
             options: .regularExpression
         ) != nil
     }
