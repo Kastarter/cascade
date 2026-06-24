@@ -37,6 +37,11 @@ public final class ScoutAgent {
     private var displayH = 0
     private var history: [(user: String, assistant: String)] = []
     private var goal = ""
+    /// Paste-gate state (mirrors ComputerUseAgent): a bare cmd+v pastes the USER's
+    /// clipboard, so it's allowed only when Scout itself copied this episode, or the
+    /// goal is explicitly about the clipboard.
+    private var episodeCopied = false
+    private var goalAsksForPaste = false
     /// System prompt for the episode — the base prompt plus any pushed app skill
     /// (Scout has no use_skill tool, so the matched skill is PUSHED, not pulled).
     private var episodeSystem = ScoutAgent.systemPrompt
@@ -70,6 +75,8 @@ public final class ScoutAgent {
         displayW = displayWidthPoints
         displayH = displayHeightPoints
         history = conversation
+        episodeCopied = false
+        goalAsksForPaste = ComputerUseAgent.goalMentionsClipboard(goal)
         applySkill(skill)
         return await step(screenshot: screenshot, note: note)
     }
@@ -161,11 +168,13 @@ public final class ScoutAgent {
         case .openURL: return a.target.map { [.openURL($0)] } ?? []
         case .key:
             guard let key = a.key else { return [] }
-            // Paste gate (Scout has no downstream pasteRefusal like the Opus path):
-            // a bare cmd+v / ctrl+v pastes the USER's clipboard, corrupting the
-            // field — the documented incident. Scout's `type` delivers text itself,
-            // so refuse bare paste keys outright.
-            if ComputerUseAgent.isPasteCombo(key) { return [] }
+            // Copy-aware paste gate (mirrors the Opus path's pasteRefusal). A bare
+            // cmd+v / ctrl+v pastes the USER's clipboard and corrupts the field —
+            // allow it ONLY when Scout copied something itself this episode (a real
+            // copy→paste workflow) or the goal is about the clipboard. Otherwise
+            // drop it; Scout's `type` delivers text itself.
+            if ComputerUseAgent.isCopyCombo(key) { episodeCopied = true; return [.key(key)] }
+            if ComputerUseAgent.isPasteCombo(key), !(episodeCopied || goalAsksForPaste) { return [] }
             return [.key(key)]
         case .wait: return [.wait]
         case .done: return []
