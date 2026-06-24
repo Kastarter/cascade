@@ -1382,14 +1382,14 @@ public final class ComputerUseAgent {
 
     /// A key combo that pastes the clipboard: V with cmd/ctrl held, regardless of
     /// extra modifiers (shift+cmd+v is paste-and-match-style — same clipboard).
-    nonisolated static func isPasteCombo(_ combo: String) -> Bool {
+    nonisolated public static func isPasteCombo(_ combo: String) -> Bool {
         let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
         guard parts.last == "v" else { return false }
         return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])
     }
 
     /// A key combo that fills the clipboard: C or X with cmd/ctrl held.
-    nonisolated static func isCopyCombo(_ combo: String) -> Bool {
+    nonisolated public static func isCopyCombo(_ combo: String) -> Bool {
         let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
         guard let key = parts.last, key == "c" || key == "x" else { return false }
         return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])

@@ -1345,36 +1345,51 @@ public final class CascadeAppModel: ObservableObject {
             }
             // Fresh nudge each turn; the idle / no-effect branches below may set it.
             nudge = nil
-            // A turn with no executable actions (grounding miss or unparseable
-            // plan) is idle — three in a row ends the episode (the stall guard).
+            // Stall guard with observation-only accounting (parity with the Opus
+            // path): a turn with NO executable actions (grounding miss / unparseable
+            // plan) OR one that only waits is the planner staring, not working — count
+            // it toward the guard. (A wait-only turn no longer trips no-effect after
+            // the predicted-effect gate, so without this it could loop unchecked.)
+            // Tolerate 1, nudge at 2, stop at 3.
             var actedThisTurn = false
-            if step.actions.isEmpty {
+            let observationOnly = !step.actions.isEmpty && step.actions.allSatisfy {
+                if case .wait = $0 { return true } else { return false }
+            }
+            if step.actions.isEmpty || observationOnly {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
                     return await scoutEnd(.stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text), "idle-stall")
                 }
+                if idleTurns == 2 {
+                    nudge = "You've now spent two turns without acting on the screen. Act NOW — name a control to click or fill — or, if the task is already done or can't be done, set action to \"done\" and say why. Do not just narrate."
+                }
             } else {
                 idleTurns = 0
-                for action in step.actions {
-                    if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
-                    if driver.runState.isStopRequested { return await scoutEnd(.stopped, "user-stop") }
-                    let ok = await executeCU(action, on: screen)
-                    if !ok { return await scoutEnd(.failed, "action-failed") }  // executeCU surfaced why
-                    acted = true
-                    actedThisTurn = true
-                    try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
-                }
-                try? await Task.sleep(for: .milliseconds(260))       // let the UI settle before re-observing
             }
+            // Execute whatever the turn produced (a lone wait still settles the UI);
+            // an idle/empty turn simply has nothing to run.
+            for action in step.actions {
+                if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
+                if driver.runState.isStopRequested { return await scoutEnd(.stopped, "user-stop") }
+                let ok = await executeCU(action, on: screen)
+                if !ok { return await scoutEnd(.failed, "action-failed") }  // executeCU surfaced why
+                acted = true
+                actedThisTurn = true
+                try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
+            }
+            if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }   // let the UI settle before re-observing
 
             guard let shot0 = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return await scoutEnd(.failed, "capture-failed") }
             if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
 
             // No-effect check (with the same slow-render re-check the Opus path uses).
+            // Predicted-effect gate (VeriGUI): a turn that only copied or waited
+            // legitimately leaves the screen unchanged — don't charge it as a failure.
+            let expectsChange = Self.turnExpectsVisibleChange(step.actions)
             var observedShot = shot0
             var observedHashes = Self.gridHashes(ofJPEG: shot0)
-            if actedThisTurn, let last = lastFrameHashes, let first = observedHashes,
+            if actedThisTurn, expectsChange, let last = lastFrameHashes, let first = observedHashes,
                PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
                 try? await Task.sleep(for: .milliseconds(400))
                 if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) {
@@ -1395,9 +1410,11 @@ public final class CascadeAppModel: ObservableObject {
                     nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout no-effect turn \(count)"))
                 }
-            } else if actedThisTurn {
+            } else if actedThisTurn, expectsChange {
                 noEffectTurns = 0
             }
+            // A copy-only/wait-only turn (acted but expectsChange == false) leaves
+            // noEffectTurns untouched: it neither failed nor proved progress.
             if let observedHashes { lastFrameHashes = observedHashes }
             // Proactive Set-of-Marks push (the literature's grounding>reasoning
             // finding + Cascade's "push controls, never a pull tool" lesson): harvest
@@ -1474,6 +1491,7 @@ public final class CascadeAppModel: ObservableObject {
         var streamActed = false               // an action ran mid-stream this turn
         var streamFailed = false              // executeCU refused — episode is over
         var streamActionTime = Duration.zero  // this turn's in-stream action time
+        var streamExpectedChange = false      // a streamed action this turn expected a visible change
         var pendingNarration: String?         // clause buffered until the turn proves it has actions
         // Wiring captures the episode-local state above, so escalation re-applies
         // it to the rebuilt Opus agent by calling this again.
@@ -1522,6 +1540,7 @@ public final class CascadeAppModel: ObservableObject {
                     streamActionTime += spent
                     actionTime += spent
                     streamActed = true
+                    if Self.expectsVisibleChange(action) { streamExpectedChange = true }
                     return true
                 }
             }
@@ -1669,6 +1688,7 @@ public final class CascadeAppModel: ObservableObject {
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
                     streamActed = false
                     streamActionTime = .zero
+                    streamExpectedChange = false
                     pendingNarration = nil
                     let modelStart = ContinuousClock.now
                     step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
@@ -1698,9 +1718,13 @@ public final class CascadeAppModel: ObservableObject {
             // animation can finish AFTER the 260ms settle, so on a suspected
             // no-effect we wait and re-capture once before concluding (and use that
             // fresher frame). The extra wait costs time only on the rare flail path.
+            // Predicted-effect gate (VeriGUI): a turn whose only acting was a
+            // clipboard copy or a wait legitimately changed nothing — exempt it so an
+            // honest no-op doesn't accrue toward the no-effect stall.
+            let expectsChange = streamExpectedChange || Self.turnExpectsVisibleChange(step.actions)
             var observedShot = nextShot
             var observedHashes = Self.gridHashes(ofJPEG: nextShot)
-            if actedThisTurn, !observationOnly, let last = lastFrameHashes, let first = observedHashes,
+            if actedThisTurn, !observationOnly, expectsChange, let last = lastFrameHashes, let first = observedHashes,
                PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
                 try? await Task.sleep(for: .milliseconds(400))
                 if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) {
@@ -1757,12 +1781,14 @@ public final class CascadeAppModel: ObservableObject {
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
                     }
                 }
-            } else if actedThisTurn, !observationOnly {
+            } else if actedThisTurn, !observationOnly, expectsChange {
                 noEffectTurns = 0
             }
+            // A copy-only/wait-only acting turn leaves noEffectTurns untouched.
             if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
             streamActionTime = .zero
+            streamExpectedChange = false
             pendingNarration = nil
             let modelStart = ContinuousClock.now
             step = await agent.proceed(screenshot: observedShot, note: episodeNote(nudge))
@@ -1973,6 +1999,30 @@ public final class CascadeAppModel: ObservableObject {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
         return PerceptualHash.gridHashes(image)
+    }
+
+    /// Whether an action is EXPECTED to change what's visible on screen — the
+    /// predicted-effect signal (VeriGUI's Thinking-Verification-Action-Expectation
+    /// cycle). No-effect detection rests on "an action that changed nothing failed",
+    /// but a few actions legitimately leave the screen unchanged: a clipboard copy
+    /// (cmd+c / cmd+x), an explicit wait, or a pure observation. A turn made ONLY of
+    /// those must NOT be charged as a no-effect failure, or the agent stalls on
+    /// honest no-ops. Made STRUCTURAL (the runtime classifies by action kind) rather
+    /// than model-reported on purpose — a self-declared "no change expected" would
+    /// let a weak planner switch OFF its own safety net by mislabelling a dead click.
+    nonisolated static func expectsVisibleChange(_ action: CUAction) -> Bool {
+        switch action {
+        case .wait, .screenshot, .zoom: return false
+        case .key(let combo): return !ComputerUseAgent.isCopyCombo(combo)
+        default: return true
+        }
+    }
+
+    /// A turn is expected to change the screen if ANY of its acting actions is — so a
+    /// mixed turn (copy THEN click) still expects change, but a copy-only or
+    /// wait-only turn is exempt from no-effect counting.
+    nonisolated static func turnExpectsVisibleChange(_ actions: [CUAction]) -> Bool {
+        actions.contains(where: expectsVisibleChange)
     }
 
     /// Maps an element's CG-global center (top-left origin, from AX) into the
