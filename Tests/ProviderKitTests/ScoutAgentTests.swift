@@ -97,6 +97,13 @@ struct ScoutAgentTests {
         #expect(ScoutAgent.parseScoutActions(r).isEmpty)
     }
 
+    @Test func parsesDoubleClickFillForPlaceholder() {
+        let a = ScoutAgent.parseScoutAction(#"{"action":"type","target":"the title placeholder","text":"Hi","click":"double"}"#)
+        #expect(a?.kind == .type && a?.click == "double")
+        // Plain field fill carries no click.
+        #expect(ScoutAgent.parseScoutAction(#"{"action":"type","target":"search","text":"x"}"#)?.click == nil)
+    }
+
     @Test func rawActionsBatchSkipsNonObjectElements() {
         let r = #"{"actions":[{"action":"click","target":"Save"}, 5, "x"]}"#
         let raw = ScoutAgent.parseRawActions(r)
