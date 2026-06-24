@@ -98,6 +98,8 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var openAIKeyMessage = "OpenAI key is not connected (for GPT-Realtime voice)."
     @Published public private(set) var hasGroqKey = false
     @Published public private(set) var groqKeyMessage = "Groq key is not connected (for the cheaper Groq models)."
+    @Published public private(set) var hasOpenRouterKey = false
+    @Published public private(set) var openRouterKeyMessage = "OpenRouter key is not connected (for hosted UI-TARS grounding)."
     @Published public private(set) var permissionDiagnostics = PermissionProbe.diagnostics()
     @Published public private(set) var screenAgentReady = false
     @Published public private(set) var screenAgentMessage = "Checking real-screen driver health."
@@ -208,6 +210,7 @@ public final class CascadeAppModel: ObservableObject {
     private let keyStore = AnthropicKeyStore()
     private let openAIKeyStore = OpenAIKeyStore()
     private let groqKeyStore = GroqKeyStore()
+    private let openRouterKeyStore = OpenRouterKeyStore()
     public let guidanceOverlay = GuidanceOverlayController()
     public let voice = RealtimeVoice()
     public let pushToTalk = PushToTalkMonitor()
@@ -1098,7 +1101,15 @@ public final class CascadeAppModel: ObservableObject {
     /// (streamSink / onThinkingPulse / onActionRefused) are set by the caller —
     /// they capture episode-local state.
     private func makeAssistAgent(model: String, goal: String, gen: Int) -> ComputerUseAgent {
-        ComputerUseAgent(
+        // Structural grounding split: when a grounder is configured (hosted UI-TARS
+        // via OpenRouter, or Claude), Opus drives the screen by NAMING targets and
+        // the runtime grounds each — the model never emits pixel coordinates. The
+        // proven coordinate computer-tool path runs whenever no grounder is present
+        // (no OpenRouter key) or the user opts out, so existing behaviour is intact.
+        let grounder = Self.assistGrounder()
+        let mode: ComputerUseAgent.GroundingMode =
+            (grounder != nil && Self.structuralGroundingEnabled()) ? .structural : .coordinate
+        return ComputerUseAgent(
             model: model,
             effort: cuEffort,
             environmentNote: ComputerUseAgent.foregroundBrowserNote,
@@ -1139,22 +1150,32 @@ public final class CascadeAppModel: ObservableObject {
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
             recallEnabled: true,
-            // Grounding split (Phase 1): when enabled, offer fill_target backed by
-            // a grounder. Defaulted OFF — Opus stays the only thing that runs until
-            // the user opts in, so this is a no-op for existing behaviour.
-            grounder: Self.assistGrounder()
+            // Grounding split: the grounder locates named targets. In structural
+            // mode it backs click_target/fill_target/scroll (the model never emits
+            // coordinates); in coordinate mode it backs the optional fill_target aid.
+            grounder: grounder,
+            groundingMode: mode
         )
     }
 
-    /// Builds the on-screen grounder that backs `fill_target`. ON by default (no
-    /// Settings UI yet) — opt out with `cascade.visualGrounder = false`. Backend
-    /// defaults to "uitars" (the free, on-device UI-TARS-1.5-7B — the cost +
-    /// latency win): serve `mlx-community/UI-TARS-1.5-7B-4bit` locally and it's
-    /// used automatically. Until a model is serving, each ground call fails fast
-    /// and the agent falls back to the computer tool — degraded, never broken. Set
-    /// `cascade.visualGrounder.backend = "claude"` to use the proven cloud
-    /// ElementLocator instead (works with zero local setup, but costs a cloud call
-    /// per locate). See [[cascade-cu-downgrade-research]].
+    /// Whether the structural grounding split is the active on-screen mode. ON by
+    /// default whenever a grounder is configured (Opus names targets, the grounder
+    /// locates) — opt out with `cascade.onScreenGrounding = "coordinate"` to A/B
+    /// against the proven computer-tool path. See [[cascade-cu-downgrade-research]].
+    static func structuralGroundingEnabled() -> Bool {
+        UserDefaults.standard.string(forKey: "cascade.onScreenGrounding") != "coordinate"
+    }
+
+    /// Builds the on-screen grounder. ON by default — opt out with
+    /// `cascade.visualGrounder = false`. Backend defaults to "uitars": **hosted
+    /// UI-TARS-1.5-7B over OpenRouter** (OpenAI-compatible), so end users never run
+    /// a 7B model locally. Authenticates with the OpenRouter key in the Keychain;
+    /// with no key (and no local URL override) it returns nil — the agent then runs
+    /// the proven coordinate computer-tool path, never broken. A
+    /// `cascade.visualGrounder.uitarsURL` override (e.g. a local mlx/vLLM server)
+    /// skips the key requirement. Set `cascade.visualGrounder.backend = "claude"`
+    /// to ground with the cloud ElementLocator instead (zero setup, costs a Claude
+    /// call per locate). See [[cascade-cu-downgrade-research]].
     static func assistGrounder() -> VisualGrounder? {
         let d = UserDefaults.standard
         // Default ON: unset → enabled; explicit false → disabled.
@@ -1164,11 +1185,17 @@ public final class CascadeAppModel: ObservableObject {
         case "claude":
             return ClaudeVisualGrounder()
         default:
-            // Default (and explicit "uitars"): the free local grounder.
-            let url = d.string(forKey: "cascade.visualGrounder.uitarsURL").flatMap(URL.init(string:))
-                ?? URL(string: "http://localhost:8000/v1/chat/completions")!
-            let model = d.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "ui-tars-1.5-7b"
-            return UITARSGrounder(baseURL: url, model: model)
+            // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
+            let model = d.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "bytedance/ui-tars-1.5-7b"
+            let key = OpenRouterKeyStore().readKey()
+            // A custom endpoint (local mlx/vLLM) is used as-is, key optional.
+            if let override = d.string(forKey: "cascade.visualGrounder.uitarsURL").flatMap(URL.init(string:)) {
+                return UITARSGrounder(baseURL: override, model: model, apiKey: key)
+            }
+            // Hosted OpenRouter default needs a key — nothing to call without it.
+            guard let key, !key.isEmpty else { return nil }
+            let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+            return UITARSGrounder(baseURL: url, model: model, apiKey: key)
         }
     }
 
@@ -1221,8 +1248,23 @@ public final class CascadeAppModel: ObservableObject {
         let maxSteps = 60
         var acted = false
         var idleTurns = 0
+        // No-effect detection — ported from the Opus path (`runAssistEpisode`). Scout
+        // is cheap and weak at perceiving change, so without this it re-clicks/
+        // re-pastes the same dead spot (audited: the SAME 20 chars pasted 7× at one
+        // point). Diff the frame with the recorder's grid hash (zero extra model
+        // calls); on a no-op acting turn, nudge with the controls actually on screen,
+        // and stop after 3 in a row. This is the single biggest harness Scout lacked.
+        var noEffectTurns = 0
+        var lastFrameHashes = Self.gridHashes(ofJPEG: firstScreenshotPNG)
+        var nudge: String?
 
-        var step = await agent.begin(goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh)
+        // Parity with the Opus path's harness: seed cross-turn memory, push the
+        // frontmost app's skill (Scout can't pull), and pass the grounding note.
+        var step = await agent.begin(
+            goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
+            conversation: assistMemory.historyForAPI(), note: scoutGroundingNote(),
+            skill: frontmostSkill()?.promptBlock
+        )
         for _ in 0..<maxSteps {
             if assistGeneration != gen { return .stopped }           // a newer turn superseded us
             if driver.runState.isStopRequested {
@@ -1244,10 +1286,33 @@ public final class CascadeAppModel: ObservableObject {
                 return .finished(claimed, acted: acted)
             }
 
+            // Grounding visibility: log where each grounded click landed (or that it
+            // found nothing) so the audit shows the WHERE-to-click decisions.
+            if let g = agent.lastGroundLog {
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground", detail: String(g.prefix(100))))
+            }
+            // Fresh nudge each turn; the idle / no-effect branches below may set it.
+            nudge = nil
             // A turn with no executable actions (grounding miss or unparseable
             // plan) is idle — three in a row ends the episode (the stall guard).
+            var actedThisTurn = false
             if step.actions.isEmpty {
                 idleTurns += 1
+                // A grounding miss (Scout named a target UI-TARS couldn't find) is
+                // the usual idle cause. Tell it what's on screen so it RE-DESCRIBES,
+                // instead of silently repeating the same target until it stalls — the
+                // same re-describe feedback the Opus path gives on a fill_target miss.
+                if let missed = agent.lastGroundMiss {
+                    let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
+                    // Audit WHAT was on screen when the target wasn't found — frontmost
+                    // app + visible controls — so the log proves whether the expected
+                    // window was even present (e.g. "New Document" missing because the
+                    // app never opened / the wrong app is frontmost).
+                    let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
+                    nudge = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target — it types into whatever is focused."
+                    if let summary { nudge! += " Controls on screen now: \(summary)." }
+                }
                 if idleTurns >= 3 {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
                     return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
@@ -1260,14 +1325,58 @@ public final class CascadeAppModel: ObservableObject {
                     let ok = await executeCU(action, on: screen)
                     if !ok { return .failed }                        // executeCU surfaced the reason
                     acted = true
+                    actedThisTurn = true
                     try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
                 }
                 try? await Task.sleep(for: .milliseconds(260))       // let the UI settle before re-observing
             }
 
-            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return .failed }
+            guard let shot0 = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return .failed }
             if assistGeneration != gen { return .stopped }
-            step = await agent.proceed(screenshot: shot)
+
+            // No-effect check (with the same slow-render re-check the Opus path uses).
+            var observedShot = shot0
+            var observedHashes = Self.gridHashes(ofJPEG: shot0)
+            if actedThisTurn, let last = lastFrameHashes, let first = observedHashes,
+               PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
+                try? await Task.sleep(for: .milliseconds(400))
+                if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) {
+                    observedShot = recheck
+                    observedHashes = Self.gridHashes(ofJPEG: recheck)
+                }
+                if let confirmed = observedHashes,
+                   !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
+                    noEffectTurns = 0  // the effect just rendered late — it DID work
+                } else {
+                    noEffectTurns += 1
+                    if noEffectTurns >= 3 {
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout — 3rd no-effect, stopping"))
+                        return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
+                    }
+                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action."
+                    // Flail push: hand Scout the controls actually on screen so it
+                    // re-grounds on a real element by NAME instead of the dead spot.
+                    let controls = AXElementResolver.interactables()
+                    if let summary = AXElementResolver.interactableSummary(controls) {
+                        nudge! += " The controls actually on screen now are: \(summary). Target one of THESE by name (or open the right menu/panel). If it truly can't be done, set action to \"done\" and say so."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout pushed \(controls.count) labels: \(String(summary.prefix(500)))"))
+                    } else {
+                        nudge! += " Choose a DIFFERENT control, menu, or approach — or set action to \"done\" if it can't be done."
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout left screen unchanged (no AX controls)"))
+                    }
+                }
+            } else if actedThisTurn {
+                noEffectTurns = 0
+            }
+            if let observedHashes { lastFrameHashes = observedHashes }
+            // Refresh the grounding line + app skill every turn (the frontmost app
+            // changes once Scout opens the target), merged with any no-effect nudge.
+            let turnNote = [scoutGroundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+            step = await agent.proceed(
+                screenshot: observedShot,
+                note: turnNote.isEmpty ? nil : turnNote,
+                skill: frontmostSkill()?.promptBlock
+            )
         }
         return .stepLimit
     }
@@ -1294,6 +1403,10 @@ public final class CascadeAppModel: ObservableObject {
         // to 15 and over-thought; reverted). Effort stays medium — CU default.
         let cuModel = AnthropicModel.opus
         let agent = makeAssistAgent(model: cuModel, goal: goal, gen: gen)
+        // Structural mode: the model names targets and the grounder locates them —
+        // it emits NO coordinates, so the flail nudge below must push target NAMES
+        // (to re-describe via click_target), never click coordinates it can't use.
+        let structuralGrounding = agent.isStructural
         // Runaway backstop, not a budget. The episode's real terminators are the
         // model finishing, STOP / barge-in, stall detection, or a newer turn
         // superseding this one — a low cap here just killed long honest tasks.
@@ -1563,7 +1676,18 @@ public final class CascadeAppModel: ObservableObject {
                     // ARE actually on screen so it re-grounds on real elements
                     // instead of re-guessing the same dead pixel.
                     let controls = AXElementResolver.interactables()
-                    if let located = Self.groundingControls(controls, display: Self.displayBounds(of: screen), resW: size.width, resH: size.height) {
+                    if structuralGrounding {
+                        // Structural mode names targets — pushing coordinates would be
+                        // useless (it can't emit them). Push the control LABELS and
+                        // tell it to re-aim with click_target by name.
+                        if let summary = AXElementResolver.interactableSummary(controls) {
+                            nudge! += " The controls actually on screen right now are: \(summary). Name one of THESE with click_target (by its label or role) — if what you wanted isn't listed, it isn't a clickable control here, so open the right menu/panel or take another route."
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) labels (structural): \(String(summary.prefix(700)))"))
+                        } else {
+                            nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls, structural)"))
+                        }
+                    } else if let located = Self.groundingControls(controls, display: Self.displayBounds(of: screen), resW: size.width, resH: size.height) {
                         // Coordinate-level grounding: the model is poor at producing
                         // click coordinates but fine choosing from given ones (the
                         // GUI-agent grounding>reasoning finding) — so hand it the
@@ -1758,6 +1882,18 @@ public final class CascadeAppModel: ObservableObject {
             note += "\nSkill “\(skill.name)” covers this app — pull it with use_skill before acting here, if you haven't already."
         }
         return note
+    }
+
+    /// Frontmost app + window line for the Scout path. Unlike `groundingNote()` it
+    /// omits the use_skill nudge — Scout has no use_skill tool (its matched skill is
+    /// PUSHED into the prompt), and dangling "use_skill" text would waste a turn.
+    private func scoutGroundingNote() -> String? {
+        let snapshot = AppWindowObserver.snapshot()
+        guard snapshot.appName != "Unknown app" else { return nil }
+        if let title = snapshot.windowTitle, !title.isEmpty {
+            return "Frontmost app: \(snapshot.appName) — “\(title)”"
+        }
+        return "Frontmost app: \(snapshot.appName)"
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer
@@ -3286,6 +3422,10 @@ public final class CascadeAppModel: ObservableObject {
         groqKeyMessage = hasGroqKey
             ? "Groq key connected — planner, validators, and the Scout on-screen agent can run on Groq."
             : "Paste your Groq API key to run the cheap models (Llama 3.3 70B planner/validators, Llama 4 Scout agent)."
+        hasOpenRouterKey = openRouterKeyStore.hasKey()
+        openRouterKeyMessage = hasOpenRouterKey
+            ? "OpenRouter key connected — the on-screen agent grounds clicks with hosted UI-TARS."
+            : "Paste your OpenRouter API key to ground the on-screen agent with hosted UI-TARS (Opus plans, UI-TARS locates)."
     }
 
     public func saveAnthropicKey(_ key: String) {
@@ -3339,6 +3479,24 @@ public final class CascadeAppModel: ObservableObject {
             refreshKeyStatus()
         } catch {
             groqKeyMessage = error.localizedDescription
+        }
+    }
+
+    public func saveOpenRouterKey(_ key: String) {
+        do {
+            try openRouterKeyStore.save(key)
+            refreshKeyStatus()
+        } catch {
+            openRouterKeyMessage = error.localizedDescription
+        }
+    }
+
+    public func clearOpenRouterKey() {
+        do {
+            try openRouterKeyStore.delete()
+            refreshKeyStatus()
+        } catch {
+            openRouterKeyMessage = error.localizedDescription
         }
     }
 

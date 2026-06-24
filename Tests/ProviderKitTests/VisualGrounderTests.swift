@@ -86,6 +86,29 @@ struct VisualGrounderTests {
         #expect(p.y == 900)   // y clamped to 0 (top) → displayH
     }
 
+    // MARK: smartResize — Qwen2.5-VL image-processor space (where UI-TARS coords live)
+
+    @Test func smartResizeRoundsToFactorMultiple() {
+        // Live-verified: UI-TARS coords for a 1280×800 send come back in 1288×812.
+        let r = UITARSGrounder.smartResize(width: 1280, height: 800)
+        #expect(r.w == 1288 && r.h == 812)
+    }
+
+    @Test func smartResizeIdempotentOnFactorMultiples() {
+        let r = UITARSGrounder.smartResize(width: 1288, height: 812)
+        #expect(r.w == 1288 && r.h == 812)
+    }
+
+    @Test func smartResizeUpscalesTinyToMinPixels() {
+        let r = UITARSGrounder.smartResize(width: 28, height: 28)
+        #expect(r.w * r.h >= 100 * 28 * 28)
+    }
+
+    @Test func smartResizeDownscalesHugeToMaxPixels() {
+        let r = UITARSGrounder.smartResize(width: 8000, height: 8000)
+        #expect(r.w * r.h <= 16384 * 28 * 28)
+    }
+
     // MARK: boxAround — region framing for the highlight
 
     @Test func boxAroundCentersAndSizesToDisplayFraction() {

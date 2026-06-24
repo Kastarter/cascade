@@ -1992,6 +1992,7 @@ private struct SettingsScreen: View {
                     ClaudeKeyCard(model: model)
                     OpenAIKeyCard(model: model)
                     GroqKeyCard(model: model)
+                    OpenRouterKeyCard(model: model)
                 }
             }
             .padding(.horizontal, CascadeMetrics.s6)
@@ -2090,20 +2091,6 @@ private struct HarnessCard: View {
                 Divider().overlay(Color.cascadeBorder)
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Cursor agent speed").font(.cascadeSans(15, .semibold))
-                        Text("Thinking effort for the on-screen agent. Medium is Anthropic's benchmarked computer-use default; Low trades some accuracy for faster turns — flip it and compare on your own tasks.")
-                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
-                    }
-                    Spacer()
-                    Picker("", selection: $model.cuEffort) {
-                        Text("Medium").tag("medium")
-                        Text("Low").tag("low")
-                    }
-                    .labelsHidden().pickerStyle(.segmented).frame(width: 150)
-                }
-                Divider().overlay(Color.cascadeBorder)
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
                         Text("On-screen engine").font(.cascadeSans(15, .semibold))
                         Text("Which model drives the on-screen agent. Claude is the proven Opus computer-use loop; Scout runs the cheap Llama 4 Scout planner on Groq, with the grounder below doing the clicks.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
@@ -2118,46 +2105,8 @@ private struct HarnessCard: View {
                     }
                     .labelsHidden().pickerStyle(.segmented).frame(width: 150)
                 }
-                Divider().overlay(Color.cascadeBorder)
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Grounding").font(.cascadeSans(15, .semibold))
-                        Text("How the agent turns a named target into a click point (fill-by-name and the where-is-X highlight). UI-TARS runs locally and free; Claude uses the cloud locator; Off disables it.")
-                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
-                    }
-                    Spacer()
-                    Picker("", selection: $model.grounderChoice) {
-                        Text("UI-TARS").tag("uitars")
-                        Text("Claude").tag("claude")
-                        Text("Off").tag("off")
-                    }
-                    .labelsHidden().pickerStyle(.segmented).frame(width: 200)
-                }
-                if model.grounderChoice == "uitars" {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("UI-TARS server URL").font(.cascadeSans(12, .semibold)).foregroundStyle(Color.cascadeText2)
-                        groundField(placeholder: "http://localhost:8000/v1/chat/completions", text: $model.uitarsURL)
-                        Text("Model id").font(.cascadeSans(12, .semibold)).foregroundStyle(Color.cascadeText2).padding(.top, 2)
-                        groundField(placeholder: "ui-tars-1.5-7b", text: $model.uitarsModel)
-                        HStack(alignment: .top, spacing: CascadeMetrics.s2) {
-                            Image(systemName: "info.circle").font(.system(size: 11)).foregroundStyle(Color.cascadeText3)
-                            Text("Serve it locally, e.g.  pip install mlx-vlm  then  python -m mlx_vlm.server --model mlx-community/UI-TARS-1.5-7B-4bit --port 8000 . The Model id must match what your server expects. If a target can't be located, the agent falls back to Claude.")
-                                .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
-                        }
-                    }
-                }
             }
         }
-    }
-
-    private func groundField(placeholder: String, text: Binding<String>) -> some View {
-        TextField(placeholder, text: text)
-            .textFieldStyle(.plain)
-            .font(.cascadeMono(11))
-            .padding(.horizontal, CascadeMetrics.s3)
-            .padding(.vertical, CascadeMetrics.s2)
-            .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
     }
 }
 
@@ -2449,6 +2398,39 @@ private struct GroqKeyCard: View {
                     Button("Clear") { model.clearGroqKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
                 Text("Stored in macOS Keychain. Runs the downgraded models: the task planner and completion validators on Llama 3.3 70B, and the on-screen agent on Llama 4 Scout (with UI-TARS grounding). Falls back to Claude when absent.")
+                    .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+            }
+        }
+    }
+}
+
+private struct OpenRouterKeyCard: View {
+    @ObservedObject var model: CascadeAppModel
+    @State private var key = ""
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("OpenRouter key · UI-TARS grounding").font(.cascadeSans(16, .semibold))
+                        Text(model.openRouterKeyMessage).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    CascadeTag(model.hasOpenRouterKey ? "Connected" : "Grounder off", tone: model.hasOpenRouterKey ? .cascadeGood : .cascadeWarn)
+                }
+                SecureField("sk-or-…", text: $key)
+                    .textFieldStyle(.plain)
+                    .font(.cascadeMono(12))
+                    .padding(.horizontal, CascadeMetrics.s3)
+                    .padding(.vertical, CascadeMetrics.s2 + 1)
+                    .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                HStack {
+                    Button("Save key") { model.saveOpenRouterKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
+                    Button("Clear") { model.clearOpenRouterKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
+                }
+                Text("Stored in macOS Keychain. Hosts UI-TARS-1.5-7B for the on-screen agent: Opus 4.8 names the target, hosted UI-TARS locates it (no local 7B model). When connected, the on-screen agent grounds every click through it; without it, Opus places its own coordinates.")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
         }

@@ -37,6 +37,9 @@ public final class ScoutAgent {
     private var displayH = 0
     private var history: [(user: String, assistant: String)] = []
     private var goal = ""
+    /// System prompt for the episode — the base prompt plus any pushed app skill
+    /// (Scout has no use_skill tool, so the matched skill is PUSHED, not pulled).
+    private var episodeSystem = ScoutAgent.systemPrompt
 
     public init(
         vision: GroqVisionClient = GroqVisionClient(),
@@ -55,24 +58,68 @@ public final class ScoutAgent {
         return (res.w, res.h)
     }
 
-    public func begin(goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int) async -> CUStep {
+    /// `conversation` seeds cross-turn memory (the shared assist history, so Scout
+    /// resolves "it"/"the first one"); `skill` is the frontmost app's playbook,
+    /// PUSHED into the system prompt (Scout won't pull); `note` is the first turn's
+    /// grounding line (frontmost app + window). Parity with the Opus path's harness.
+    public func begin(
+        goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int,
+        conversation: [(user: String, assistant: String)] = [], note: String? = nil, skill: String? = nil
+    ) async -> CUStep {
         self.goal = goal
         displayW = displayWidthPoints
         displayH = displayHeightPoints
-        history = []
-        return await step(screenshot: screenshot)
+        history = conversation
+        applySkill(skill)
+        return await step(screenshot: screenshot, note: note)
     }
 
-    public func proceed(screenshot: Data) async -> CUStep {
-        await step(screenshot: screenshot)
+    /// `note` is an optional runtime nudge (e.g. a no-effect warning + the controls
+    /// actually on screen) appended to this turn's instruction — the structural way
+    /// to steer a cheap planner that can't otherwise tell its last action did nothing.
+    /// `skill` is the playbook for the app frontmost THIS turn — refreshed every
+    /// turn so it tracks the app actually in focus (e.g. once Scout opens Keynote).
+    public func proceed(screenshot: Data, note: String? = nil, skill: String? = nil) async -> CUStep {
+        applySkill(skill)
+        return await step(screenshot: screenshot, note: note)
     }
 
-    private func step(screenshot: Data) async -> CUStep {
-        let user = "Goal: \(goal)\n\nDecide the single next action and reply with the JSON object only."
+    /// Folds the matched app skill into the system prompt. PUSH (Scout has no
+    /// use_skill), framed as approach because Scout acts by NAMING targets — not
+    /// fill_field / coordinates. A nil skill leaves the current prompt unchanged so
+    /// a momentary "no frontmost skill" transition doesn't wipe a pushed playbook.
+    private func applySkill(_ skill: String?) {
+        guard let skill, !skill.isEmpty else { return }
+        episodeSystem = Self.systemPrompt + """
+
+
+        App playbook for the app you are working in — follow its approach and \
+        recipes, but carry each step out with YOUR actions (name the target to \
+        click or type into; ignore any references to coordinates, fill_field, or a \
+        computer tool — those are not your tools):
+
+        \(skill)
+        """
+    }
+
+    /// The target Scout named this turn but the grounder could NOT locate — read by
+    /// the runner so it can tell Scout to re-describe (instead of silently going
+    /// idle and stalling). nil when the last turn grounded fine or named no target.
+    public private(set) var lastGroundMiss: String?
+    /// Human-readable grounding outcome for the audit log — e.g. `hit "Save" @
+    /// (450,438)` or `miss "New Document"`. Lets the audit show WHERE each grounded
+    /// click landed (or that it found nothing), the visibility we were missing.
+    public private(set) var lastGroundLog: String?
+
+    private func step(screenshot: Data, note: String? = nil) async -> CUStep {
+        lastGroundMiss = nil
+        lastGroundLog = nil
+        var user = "Goal: \(goal)\n\nDecide the single next action and reply with the JSON object only."
+        if let note, !note.isEmpty { user += "\n\n" + note }
         let reply: String
         do {
             reply = try await vision.complete(
-                system: Self.systemPrompt, user: user, imageJPEG: screenshot,
+                system: episodeSystem, user: user, imageJPEG: screenshot,
                 model: model, maxTokens: 600, prior: history
             )
         } catch {
@@ -120,10 +167,17 @@ public final class ScoutAgent {
 
     private func groundedPoint(_ target: String?, screenshot: Data) async -> CGPoint? {
         guard let target, !target.isEmpty else { return nil }
-        return await grounder.ground(
+        let point = await grounder.ground(
             screenshot: screenshot, target: target,
             displayWidthPoints: displayW, displayHeightPoints: displayH
         )
+        if let point {
+            lastGroundLog = "hit \"\(target)\" @ (\(Int(point.x)),\(Int(point.y)))"
+        } else {
+            lastGroundMiss = target
+            lastGroundLog = "miss \"\(target)\""
+        }
+        return point
     }
 
     private static func historyLine(_ a: ScoutAction) -> String {

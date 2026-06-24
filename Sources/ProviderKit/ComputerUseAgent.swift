@@ -128,6 +128,23 @@ public final class ComputerUseAgent {
     /// so behaviour is unchanged. See [[cascade-cu-downgrade-research]].
     private let grounder: VisualGrounder?
 
+    /// How the model points at things on screen.
+    /// - `.coordinate`: the proven default — the model drives the screen with
+    ///   Anthropic's computer tool and emits pixel coordinates (`fill_target` is
+    ///   offered as an optional grounding aid when a grounder exists).
+    /// - `.structural`: the grounding split — the computer tool is WITHHELD, so the
+    ///   model can ONLY name targets and the runtime grounds every one via the
+    ///   grounder. Withholding the coordinate tool is what makes grounding
+    ///   structural rather than advisory (no coordinate click to defect to — the
+    ///   3×-proven failure mode of advisory grounding). Requires a grounder; falls
+    ///   back to `.coordinate` if none is injected. See [[cascade-cu-downgrade-research]].
+    public enum GroundingMode: Sendable { case coordinate, structural }
+    private let groundingMode: GroundingMode
+    /// True when the structural split is actually active (mode selected AND a
+    /// grounder is present). The caller reads this to adapt its own flail nudges
+    /// (push target NAMES to re-describe, not coordinates the model can't emit).
+    public var isStructural: Bool { groundingMode == .structural && grounder != nil }
+
     /// Mid-stream delivery: when set, each completed text block and screen action
     /// is handed over the moment it finishes generating, so the caller acts while
     /// the rest of the reply streams in (the round-trip wait stops being idle
@@ -216,6 +233,62 @@ public final class ComputerUseAgent {
     first one" — they are context, not new work.
     """
 
+    /// System prompt for STRUCTURAL grounding mode. The computer tool is withheld:
+    /// the model drives the screen by NAMING targets and the runtime grounds each
+    /// via the visual grounder (hosted UI-TARS). Plays to the model's strength
+    /// (reading the screen, deciding what to do) and delegates its weakness (exact
+    /// pixel coordinates) to the grounder. See [[cascade-cu-downgrade-research]].
+    static let structuralSystemPrompt = """
+    You are Cascade, operating this Mac to carry out the user's request. You drive the \
+    screen by DESCRIBING what you want to act on in plain words — you NEVER give pixel \
+    coordinates. A dedicated grounding model locates whatever you name and acts on it, so \
+    name targets precisely by their visible label, role, or the text beside them ("the \
+    Save button", "the search field", "the subtitle placeholder", "the Reply All button in \
+    the toolbar"). Your tools:
+    • click_target — click something you can see; set click to "double" to open or start \
+    editing, "right" for a context menu.
+    • fill_target — put text into a field, placeholder, search box, or cell in ONE step: it \
+    locates the target, clicks it, selects any existing content, types your text (replacing \
+    it), and presses the finishing key. PREFER this for ANY text entry — one step instead \
+    of four.
+    • type_text — type into whatever already has focus (no target needed).
+    • press_key — a key or shortcut ("return", "tab", "escape", "cmd+s", "cmd+a", arrows). \
+    NEVER press cmd+v/ctrl+v to enter content: type_text and fill_target deliver text \
+    themselves; that key pastes whatever the USER last copied and corrupts the field.
+    • scroll — scroll the view (optionally over a named area).
+    • open_app / open_url — launch an app or open a website INSTANTLY; always use these \
+    instead of hunting for an icon in the Dock/Spotlight or typing an address by hand.
+    • wait — let the screen settle.
+    Describe ONE target per click_target/fill_target. If the grounder can't find what you \
+    named, you are told — re-describe it more specifically or name a different visible \
+    landmark; never repeat the identical description, and never fall back to guessing \
+    coordinates (you have no way to give them). \
+    Creative and hands-on work is YOURS to do: when asked to design, draw, write, build, or \
+    edit something, carry it out yourself inside the app the task names, through its own UI \
+    — never tell the user to do it and never merely describe the steps. Do that work inside \
+    the app; never detour to Terminal, shell, or scripts unless the task itself is about \
+    them or the user asked for a script. An app's built-in scripting surface — Blender's \
+    Python editor, an Office macro pane — IS a script: build with clicks, fields, and \
+    shortcuts no matter how big the job, unless the user asked for code. \
+    Every turn costs the user seconds, so make turns COUNT: when the next steps are all \
+    predictable from the current screen, chain them as multiple tool calls in ONE turn \
+    (e.g. fill_target the title, then fill_target the subtitle). Re-observe only when the \
+    next action depends on something the screen has not shown yet. Take the most direct \
+    route you know — a shortcut beats a menu, a menu beats clicking through panels, a \
+    skill's recipe beats improvising — but do NOT stop to plan the whole job before acting: \
+    pick the next direct step and act; the next screenshot corrects a wrong guess. Never \
+    open an app, window, or menu just to verify what the screenshot already shows, and \
+    never redo a step the screen proves succeeded. After launching an app, the first frame \
+    may still show a splash or template screen — wait for it to settle, and never repeat a \
+    new-document action until the screen proves the previous one didn't work. Narrate in \
+    ONE short clause (eight words max) when you start a distinct phase — "opening the \
+    reply", "writing the poem now" — placed BEFORE that turn's tool calls; the user hears \
+    these, so keep them human (no tools, targets, or coordinates). When the whole task is \
+    finished, reply with a short confirmation. Earlier exchanges from this session may \
+    precede the task; use them to resolve references like "it", "that one", or "the first \
+    one" — they are context, not new work.
+    """
+
     /// What the harness tools are and when to reach for them — appended to the
     /// system prompt only when the matching tier is active, so the model is
     /// never told about tools it doesn't have.
@@ -293,7 +366,8 @@ public final class ComputerUseAgent {
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
         extraTools: [[String: Any]] = [],
         recallEnabled: Bool = false,
-        grounder: VisualGrounder? = nil
+        grounder: VisualGrounder? = nil,
+        groundingMode: GroundingMode = .coordinate
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -308,6 +382,9 @@ public final class ComputerUseAgent {
         // there is nothing to route the calls to.
         self.recallEnabled = recallEnabled && harnessProvider != nil
         self.grounder = grounder
+        // Structural grounding needs a grounder to act on named targets; without
+        // one, fall back to the coordinate computer tool so the agent still works.
+        self.groundingMode = (groundingMode == .structural && grounder != nil) ? .structural : .coordinate
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -409,58 +486,50 @@ public final class ComputerUseAgent {
 
         // Cache the static prefix (system + tool defs) and the most recent turn, so the
         // growing screenshot history is re-read from cache instead of reprocessed.
-        // The instant tools come first; the breakpoint on the last (computer) tool
-        // caches all of them together.
-        var tools: [[String: Any]] = [
-            [
-                "name": "open_app",
-                "description": "Instantly launch or switch to a macOS app by its exact name (e.g. \"Safari\", \"Notes\"). Call this whenever an app needs to be opened or focused — it is far faster than finding the app on screen.",
-                "input_schema": [
-                    "type": "object",
-                    "properties": ["name": ["type": "string", "description": "The app's exact name"]],
-                    "required": ["name"],
+        // The instant tools come first; the breakpoint on the LAST tool caches all
+        // of them together.
+        //
+        // The tool set depends on the grounding mode. COORDINATE mode (default)
+        // gives the model Anthropic's computer tool — it emits pixel coordinates.
+        // STRUCTURAL mode WITHHOLDS the computer tool: the model can only NAME
+        // targets (click_target / fill_target / scroll) and the runtime grounds each
+        // via the injected grounder. There is then no coordinate click to defect to
+        // — which is the whole point, since advisory grounding the model must choose
+        // is ignored (3× proven). See [[cascade-cu-downgrade-research]].
+        var tools: [[String: Any]]
+        if isStructural {
+            tools = [
+                Self.openAppToolDefinition(),
+                Self.openURLToolDefinition(),
+                Self.clickTargetToolDefinition(),
+                Self.fillTargetToolDefinition(),
+                Self.typeTextToolDefinition(),
+                Self.pressKeyToolDefinition(),
+                Self.scrollTargetToolDefinition(),
+                Self.waitToolDefinition(),
+            ]
+        } else {
+            tools = [
+                Self.openAppToolDefinition(),
+                Self.openURLToolDefinition(),
+                Self.highlightToolDefinition(),
+                [
+                    "type": "computer_20251124", "name": "computer",
+                    "display_width_px": resW, "display_height_px": resH,
+                    "enable_zoom": true,
+                    // 1h TTL on the static system+tools prefix: a new episode started
+                    // within the hour replays it as a cache HIT instead of cold-
+                    // prefilling the whole block. 1h writes cost 2× base (vs 1.25× for
+                    // 5m), paid once and amortized across a working session. The 1h
+                    // TTL is GA — no extra beta header beyond computer-use's. The
+                    // moving user-turn breakpoints stay at the 5m default below.
+                    "cache_control": ["type": "ephemeral", "ttl": "1h"],
                 ],
-            ],
-            [
-                "name": "open_url",
-                "description": "Instantly open a web address. Call this whenever a website needs to be reached — it is far faster than typing an address or searching for the site.",
-                "input_schema": [
-                    "type": "object",
-                    "properties": ["url": ["type": "string", "description": "Full https:// URL"]],
-                    "required": ["url"],
-                ],
-            ],
-            [
-                "name": "highlight",
-                "description": "Draw a glowing highlight box on the user's screen over one region, to visually SHOW them something they asked about. Works over any app — this is YOUR overlay, not an app feature. Call it whenever the user asks to highlight, mark, point out, or show where something is. Coordinates are in screenshot pixels. Call again for a different region; the latest box stays visible.",
-                "input_schema": [
-                    "type": "object",
-                    "properties": [
-                        "region": [
-                            "type": "array", "items": ["type": "number"],
-                            "description": "[x1, y1, x2, y2] — top-left and bottom-right corners of the region, in screenshot pixels",
-                        ],
-                        "label": ["type": "string", "description": "2-4 word label for what's highlighted"],
-                    ],
-                    "required": ["region"],
-                ],
-            ],
-            [
-                "type": "computer_20251124", "name": "computer",
-                "display_width_px": resW, "display_height_px": resH,
-                "enable_zoom": true,
-                // 1h TTL on the static system+tools prefix: a new episode started
-                // within the hour replays it as a cache HIT instead of cold-
-                // prefilling the whole block. 1h writes cost 2× base (vs 1.25× for
-                // 5m), paid once and amortized across a working session. The 1h
-                // TTL is GA — no extra beta header beyond computer-use's. The
-                // moving user-turn breakpoints stay at the 5m default below.
-                "cache_control": ["type": "ephemeral", "ttl": "1h"],
-            ],
-        ]
-        // Harness tools sit before the computer tool so its cache breakpoint
-        // covers them. Definitions are fixed per episode — zero ongoing token
-        // cost beyond the one-time cache write.
+            ]
+        }
+        // Harness / recall / extra / batch tools sit before the LAST tool so its
+        // cache breakpoint covers them. Definitions are fixed per episode — zero
+        // ongoing token cost beyond the one-time cache write.
         if harnessTier != .off {
             tools.insert(contentsOf: Self.harnessToolDefinitions(tier: harnessTier), at: tools.count - 1)
         }
@@ -470,21 +539,18 @@ public final class ComputerUseAgent {
         if !extraTools.isEmpty {
             tools.insert(contentsOf: extraTools, at: tools.count - 1)
         }
-        // Coordinate batch-entry for the on-screen cursor agent only — the web
-        // sandbox carries its own DOM `fill_field` in extraTools (collision
-        // otherwise). Collapses the click → select-all → type → submit
-        // ping-pong (4 screenshot-gated turns) into ONE turn. The model still
-        // decides the target and the text; only the forced re-observation
-        // between a click and the keystrokes that always follow it is removed —
-        // it makes the agent faster, not less capable.
-        if extraTools.isEmpty {
+        // Coordinate batch-entry (fill_field) is COORDINATE-mode only — structural
+        // mode fills via the grounded fill_target in its base set. The web sandbox
+        // carries its own DOM `fill_field` in extraTools (collision otherwise).
+        // Collapses the click → select-all → type → submit ping-pong (4
+        // screenshot-gated turns) into ONE turn; the model still decides target+text.
+        if !isStructural, extraTools.isEmpty {
             tools.insert(Self.fillFieldToolDefinition(), at: tools.count - 1)
         }
-        // Grounding split: when a grounder is injected, offer fill_target — the
-        // model NAMES the target in words and the runtime grounds + acts. Only
-        // offered when a grounder exists, so the model is never shown a tool whose
-        // backend isn't running. On-screen agent only (web sandbox has DOM tools).
-        if grounder != nil, extraTools.isEmpty {
+        // Coordinate-mode grounding aid: when a grounder is injected, offer
+        // fill_target as an optional describe-don't-pin tool. Structural mode
+        // already carries it in the base set (and grounds ALL fills through it).
+        if !isStructural, grounder != nil, extraTools.isEmpty {
             tools.insert(Self.fillTargetToolDefinition(), at: tools.count - 1)
         }
         if skillProvider != nil {
@@ -498,7 +564,13 @@ public final class ComputerUseAgent {
                 ],
             ], at: 2)
         }
-        var system = Self.systemPrompt
+        // Structural mode has no computer tool to carry the cache breakpoint, so put
+        // it on whatever ended up last (after the inserts above).
+        if isStructural, var last = tools.last {
+            last["cache_control"] = ["type": "ephemeral", "ttl": "1h"]
+            tools[tools.count - 1] = last
+        }
+        var system = isStructural ? Self.structuralSystemPrompt : Self.systemPrompt
         switch harnessTier {
         case .off: break
         case .readOnly: system += "\n\n" + Self.harnessReadOnlyNote
@@ -591,6 +663,38 @@ public final class ComputerUseAgent {
                         let target = input["target"] as? String ?? "that"
                         toolResultOverrides[id] = "Couldn't locate “\(target)” on the screen. Describe it more specifically, or click it directly with the computer tool."
                     }
+                case "click_target":
+                    // Structural grounding (structural mode only): the runtime locates
+                    // the named target and clicks it. On a miss, tell the model so it
+                    // re-describes — answered inline (no wasted screenshot turn).
+                    if let action = await groundedClick(input) {
+                        actions.append(action)
+                    } else if let id = block["id"] as? String {
+                        let target = input["target"] as? String ?? "that"
+                        toolResultOverrides[id] = "Couldn't locate “\(target)” on the screen. Describe it more specifically — its visible label, role, or the text next to it — or name a different on-screen landmark. Do not repeat the same description."
+                    }
+                case "type_text":
+                    if let text = input["text"] as? String { actions.append(.type(text)) }
+                case "press_key":
+                    // Same structural paste gate as the computer tool's key action:
+                    // a bare cmd+v pastes the USER's clipboard, not the agent's.
+                    if let combo = input["key"] as? String {
+                        let action = CUAction.key(combo)
+                        noteCopy(action)
+                        if let id = block["id"] as? String, let refusal = pasteRefusal(for: action) {
+                            toolResultOverrides[id] = refusal
+                            onActionRefused?("key blocked — clipboard not owned by agent")
+                            Self.logger.info("refused bare paste key action")
+                        } else {
+                            actions.append(action)
+                        }
+                    }
+                case "scroll":
+                    // Scroll over a named target (grounded) or, with no target, the
+                    // center of the screen.
+                    if let action = await groundedScroll(input) { actions.append(action) }
+                case "wait":
+                    actions.append(.wait)
                 case let name? where AgentHarness.isHarnessTool(name)
                     || (recallEnabled && RecordRecall.isRecallTool(name))
                     || extraToolNames.contains(name):
@@ -756,6 +860,161 @@ public final class ComputerUseAgent {
         ) else { return nil }
         // The grounder returns display-local AppKit points already — do NOT scale.
         return Self.fillActions(at: point, text: text, double: (input["click"] as? String) == "double", submit: input["submit"] as? String)
+    }
+
+    /// Grounds a `click_target` call (structural mode) into a click action. The
+    /// model NAMES the target; the runtime locates it and clicks. `frame` defaults
+    /// to the live frame; tests inject one. Returns nil with no grounder/frame/
+    /// target or on a grounding miss — the caller then tells the model.
+    func groundedClick(_ input: [String: Any], frame: Data? = nil) async -> CUAction? {
+        guard let grounder, let frame = frame ?? lastFrameJPEG,
+              let target = (input["target"] as? String), !target.isEmpty else { return nil }
+        guard let point = await grounder.ground(
+            screenshot: frame, target: target,
+            displayWidthPoints: displayW, displayHeightPoints: displayH
+        ) else { return nil }
+        // The grounder returns display-local AppKit points already — do NOT scale.
+        switch input["click"] as? String {
+        case "double": return .doubleClick(x: point.x, y: point.y)
+        case "right": return .rightClick(x: point.x, y: point.y)
+        default: return .click(x: point.x, y: point.y)
+        }
+    }
+
+    /// Grounds a `scroll` call (structural mode). A named target scrolls over that
+    /// element; with no target (or a miss) it scrolls over the center of the
+    /// display. Never returns nil — a scroll always has a fallback point.
+    func groundedScroll(_ input: [String: Any], frame: Data? = nil) async -> CUAction? {
+        let direction = (input["direction"] as? String) ?? "down"
+        let amount = (input["amount"] as? NSNumber)?.intValue ?? 3
+        var point = CGPoint(x: CGFloat(displayW) / 2, y: CGFloat(displayH) / 2)
+        if let grounder, let frame = frame ?? lastFrameJPEG,
+           let target = (input["target"] as? String), !target.isEmpty,
+           let located = await grounder.ground(
+               screenshot: frame, target: target,
+               displayWidthPoints: displayW, displayHeightPoints: displayH
+           ) {
+            point = located  // grounder returns display-local AppKit points already
+        }
+        return .scroll(x: point.x, y: point.y, direction: direction, amount: amount)
+    }
+
+    // MARK: - Tool definitions (shared + structural)
+    //
+    // The shared instant tools are extracted so both grounding modes render the
+    // SAME JSON for them (prompt-cache prefix stability). The structural tools
+    // replace the computer tool when the grounding split is active.
+
+    static func openAppToolDefinition() -> [String: Any] {
+        [
+            "name": "open_app",
+            "description": "Instantly launch or switch to a macOS app by its exact name (e.g. \"Safari\", \"Notes\"). Call this whenever an app needs to be opened or focused — it is far faster than finding the app on screen.",
+            "input_schema": [
+                "type": "object",
+                "properties": ["name": ["type": "string", "description": "The app's exact name"]],
+                "required": ["name"],
+            ],
+        ]
+    }
+
+    static func openURLToolDefinition() -> [String: Any] {
+        [
+            "name": "open_url",
+            "description": "Instantly open a web address. Call this whenever a website needs to be reached — it is far faster than typing an address or searching for the site.",
+            "input_schema": [
+                "type": "object",
+                "properties": ["url": ["type": "string", "description": "Full https:// URL"]],
+                "required": ["url"],
+            ],
+        ]
+    }
+
+    static func highlightToolDefinition() -> [String: Any] {
+        [
+            "name": "highlight",
+            "description": "Draw a glowing highlight box on the user's screen over one region, to visually SHOW them something they asked about. Works over any app — this is YOUR overlay, not an app feature. Call it whenever the user asks to highlight, mark, point out, or show where something is. Coordinates are in screenshot pixels. Call again for a different region; the latest box stays visible.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "region": [
+                        "type": "array", "items": ["type": "number"],
+                        "description": "[x1, y1, x2, y2] — top-left and bottom-right corners of the region, in screenshot pixels",
+                    ],
+                    "label": ["type": "string", "description": "2-4 word label for what's highlighted"],
+                ],
+                "required": ["region"],
+            ],
+        ]
+    }
+
+    /// `click_target` — structural-mode click by description. The model NAMES what
+    /// to click; the runtime grounds it. No coordinate ever leaves the model.
+    static func clickTargetToolDefinition() -> [String: Any] {
+        [
+            "name": "click_target",
+            "description": "Click something you can see by NAMING it — do NOT give coordinates. Describe the target by its visible label, role, or the text next to it (e.g. \"the Save button\", \"the New Message toolbar button\", \"the Inbox row from Jane\", \"the subtitle placeholder\"). Cascade locates it on screen and clicks it for you.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "target": ["type": "string", "description": "What to click, described so it can be found on screen — its visible label, role, or nearby text"],
+                    "click": [
+                        "type": "string", "enum": ["single", "double", "right"],
+                        "description": "single click (default); double to open or start editing (a file, a placeholder that needs a double-click); right for a context menu.",
+                    ],
+                ],
+                "required": ["target"],
+            ],
+        ]
+    }
+
+    static func typeTextToolDefinition() -> [String: Any] {
+        [
+            "name": "type_text",
+            "description": "Type text into whatever already has keyboard focus (e.g. right after you clicked into a field, or in an app already ready for input). To put text into a SPECIFIC field, prefer fill_target — it clicks the field, replaces its contents, and submits in one step. This types the text itself — never paste with cmd+v.",
+            "input_schema": [
+                "type": "object",
+                "properties": ["text": ["type": "string", "description": "The text to type"]],
+                "required": ["text"],
+            ],
+        ]
+    }
+
+    static func pressKeyToolDefinition() -> [String: Any] {
+        [
+            "name": "press_key",
+            "description": "Press a key or keyboard shortcut: e.g. \"return\", \"tab\", \"escape\", \"cmd+s\", \"cmd+a\", \"cmd+return\", \"up\", \"down\". Use it for shortcuts, confirming, navigating, and editing. NEVER press cmd+v / ctrl+v to enter content — type_text and fill_target deliver text themselves; that key pastes whatever the USER last copied.",
+            "input_schema": [
+                "type": "object",
+                "properties": ["key": ["type": "string", "description": "The key or combo, e.g. \"cmd+s\" or \"return\""]],
+                "required": ["key"],
+            ],
+        ]
+    }
+
+    /// Named `scroll` (not `scroll_target`) so the verb reads naturally to the
+    /// model; an optional `target` grounds the scroll point.
+    static func scrollTargetToolDefinition() -> [String: Any] {
+        [
+            "name": "scroll",
+            "description": "Scroll the view up or down. Optionally NAME an area to scroll over (e.g. \"the message list\", \"the sidebar\"); with no target it scrolls over the center of the screen.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "direction": ["type": "string", "enum": ["up", "down"], "description": "Scroll direction (default down)"],
+                    "amount": ["type": "integer", "description": "Number of scroll clicks (default 3)"],
+                    "target": ["type": "string", "description": "Optional: the area to scroll over, named in words"],
+                ],
+                "required": ["direction"],
+            ],
+        ]
+    }
+
+    static func waitToolDefinition() -> [String: Any] {
+        [
+            "name": "wait",
+            "description": "Pause briefly to let the screen settle (e.g. while an app launches or a page loads) before the next screenshot.",
+            "input_schema": ["type": "object", "properties": [String: String]()],
+        ]
     }
 
     /// Tool definitions for the direct-Mac harness. Read-only tools ride every

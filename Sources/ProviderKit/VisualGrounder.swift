@@ -135,11 +135,47 @@ public struct UITARSGrounder: VisualGrounder {
             return nil
         }
         guard let imagePoint = Self.parseBox(content) else { return nil }
+        // UI-TARS (Qwen2.5-VL) returns ABSOLUTE coords in the SMART-RESIZED image
+        // space — NOT the space of the JPEG we sent. Map back through smart_resize
+        // before scaling to the display, or every click carries the resize offset
+        // (worst on small targets). Live-verified: a 1280×800 send yields coords in
+        // 1288×812, and mapping through it lands on target to the pixel. See
+        // bytedance/UI-TARS README_coordinates.md.
+        let resized = Self.smartResize(width: res.w, height: res.h)
         return Self.toDisplayPoint(
             imagePoint: imagePoint,
-            imageW: res.w, imageH: res.h,
+            imageW: resized.w, imageH: resized.h,
             displayW: displayWidthPoints, displayH: displayHeightPoints
         )
+    }
+
+    /// Reproduces Qwen2.5-VL's `smart_resize` (UI-TARS's image processor): each
+    /// dimension is rounded to a multiple of `factor`, and the total pixel count is
+    /// kept within [minPixels, maxPixels] at a fixed aspect ratio. UI-TARS emits
+    /// click coordinates in THIS resized space, so `ground` maps them back through
+    /// it. Pure + pinned — a wrong size offsets every click. Defaults match the
+    /// official processor (factor 28, min 100·28², max 16384·28²); a live probe
+    /// confirmed a 1280×800 send returns coords in the 1288×812 it produces.
+    static func smartResize(
+        width: Int, height: Int,
+        factor: Int = 28, minPixels: Int = 100 * 28 * 28, maxPixels: Int = 16384 * 28 * 28
+    ) -> (w: Int, h: Int) {
+        let w = Double(max(1, width)), h = Double(max(1, height)), f = Double(factor)
+        func roundTo(_ v: Double) -> Int { Int((v / f).rounded()) * factor }
+        func floorTo(_ v: Double) -> Int { Int((v / f).rounded(.down)) * factor }
+        func ceilTo(_ v: Double) -> Int { Int((v / f).rounded(.up)) * factor }
+        var wb = max(factor, roundTo(w))
+        var hb = max(factor, roundTo(h))
+        if wb * hb > maxPixels {
+            let beta = (w * h / Double(maxPixels)).squareRoot()
+            wb = max(factor, floorTo(w / beta))
+            hb = max(factor, floorTo(h / beta))
+        } else if wb * hb < minPixels {
+            let beta = (Double(minPixels) / (w * h)).squareRoot()
+            wb = ceilTo(w * beta)
+            hb = ceilTo(h * beta)
+        }
+        return (wb, hb)
     }
 
     /// Region grounding for the highlight: locate the target's click point, then
@@ -183,8 +219,16 @@ public struct UITARSGrounder: VisualGrounder {
     private func callModel(jpeg: Data, target: String, declaredW: Int, declaredH: Int) async -> String? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 20
+        // Short per-attempt cap: grounding normally returns in ~1s, so a connection
+        // that hasn't answered in 12s is dead — fail fast and recycle on the next
+        // attempt rather than hang the whole turn.
+        request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "content-type")
+        // Don't reuse a pooled keep-alive connection: Parasail drops idle ones, and
+        // reusing a dead socket is the "broken pipe / SSL bad record mac" failure
+        // class. A fresh connection per call sidesteps it (the cost is one TLS
+        // handshake — negligible next to inference, and worth it for reliability).
+        request.setValue("close", forHTTPHeaderField: "Connection")
         if let apiKey, !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "authorization")
         }
@@ -203,11 +247,31 @@ public struct UITARSGrounder: VisualGrounder {
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         request.httpBody = bodyData
-        guard let (data, response) = try? await session.data(for: request),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            return nil
+        // Hosted UI-TARS over OpenRouter hits transient TLS/connection failures
+        // (broken pipe, "SSL bad record mac", 429/5xx) on a variable fraction of
+        // calls — measured 0–20% in live probes. Treating those as "element not
+        // found" produced spurious grounding misses that stacked into a stall. So
+        // RETRY transient failures; only a clean 2xx (parsed downstream) or a
+        // non-retryable 4xx ends it. A wrong nil here = a dead agent. 5 attempts so
+        // a bad patch (each call mostly failing) still resolves before the stall
+        // guard trips; failures are fast (immediate reset, not the 12s timeout).
+        for attempt in 0..<5 {
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else { return nil }
+                if (200..<300).contains(http.statusCode) { return Self.extractContent(data) }
+                // 4xx won't improve on retry (bad request / auth), except the
+                // throttle / request-timeout codes which are transient.
+                if (400..<500).contains(http.statusCode), http.statusCode != 408, http.statusCode != 429 {
+                    return nil
+                }
+                // 5xx / 408 / 429 → fall through and retry.
+            } catch {
+                // Transport error (TLS / connection reset / timeout) → retry.
+            }
+            if attempt < 4 { try? await Task.sleep(for: .milliseconds(300)) }
         }
-        return Self.extractContent(data)
+        return nil
     }
 
     /// Pulls `choices[0].message.content` out of an OpenAI chat-completions reply.
