@@ -332,7 +332,7 @@ public final class BackgroundWebAgent {
         // once per loop iteration.
         var turnStateChanges = 0
         let agent = ComputerUseAgent(
-            keyStore: keyStore, model: model, environmentNote: Self.sandboxNote,
+            keyStore: keyStore, model: model, environmentNote: Self.sandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
             harnessProvider: { [weak self, sandbox] name, input in
                 // Using any tool IS acting (reading/clicking/filling) — not the model
@@ -550,7 +550,7 @@ public final class BackgroundWebAgent {
         let agent = ScoutAgent(
             vision: groqVision,
             grounder: grounder,
-            environmentNote: Self.scoutSandboxNote,
+            environmentNote: Self.scoutSandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
             skillIndex: WebSkills.index(),
             harnessProvider: wrappedHarness,

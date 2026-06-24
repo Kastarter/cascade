@@ -50,6 +50,9 @@ public struct MixtureGrounder: VisualGrounder {
     /// roles `AXElementResolver.find` will also match (AXStaticText, AXImage) — a
     /// label of static text is almost never the thing to click, and trusting it
     /// would let "the title" grab a chrome label instead of the canvas placeholder.
+    /// Cascade's own bundle id — its UI must never be an AX grounding target.
+    static let cascadeBundleID = "com.humain.cascade"
+
     static let clickableRoles: Set<String> = [
         "AXButton", "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTextField",
         "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton", "AXCheckBox",
@@ -102,8 +105,15 @@ public struct MixtureGrounder: VisualGrounder {
         // backstop). Such targets go straight to the visual grounder. General, not
         // app-specific: these words denote a drawn surface in any app.
         if Self.namesCanvasConcept(target) { return nil }
-        // Distrusted-AX apps (canvas/Electron) are the visual grounder's domain.
         let front = NSWorkspace.shared.frontmostApplication
+        // NEVER ground Cascade's OWN UI. When Cascade's window is frontmost, AX-first
+        // reads ITS tree and matches Cascade's buttons/fields (the audited
+        // "Agents"/"Create new…" hijack) — the agent then clicks and types into
+        // Cascade instead of the target app behind it (the "can't type" report). The
+        // captured screenshot excludes Cascade's own windows, so the visual grounder
+        // sees the real target — defer to it.
+        if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
+        // Distrusted-AX apps (canvas/Electron) are the visual grounder's domain.
         if let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier),
            skill.axUnreliable {
             return nil

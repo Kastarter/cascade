@@ -1163,7 +1163,7 @@ public final class CascadeAppModel: ObservableObject {
         return ComputerUseAgent(
             model: model,
             effort: cuEffort,
-            environmentNote: ComputerUseAgent.foregroundBrowserNote,
+            environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             // Direct-Mac tools beside the computer tool: find/read is always on;
             // run/script/write only with the user's Power harness opt-in.
@@ -1289,6 +1289,7 @@ public final class CascadeAppModel: ObservableObject {
         // reach for them too (it may underuse pull-tools, but the capability is here).
         let agent = ScoutAgent(
             grounder: grounder,
+            environmentNote: AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             skillIndex: appSkills.indexText,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
@@ -2465,7 +2466,12 @@ public final class CascadeAppModel: ObservableObject {
     /// docs/THIRD_PARTY_NOTICES.md). Returns false when there's no focused,
     /// settable text element — the caller falls back to synthetic keystrokes.
     private static func axInsertText(_ text: String) -> Bool {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              // Never AX-insert into Cascade's OWN focused element — if Cascade is
+              // frontmost the insert "succeeds" silently and the text never reaches
+              // the target app (the audited phantom "can't type"). Fall through to
+              // paste / keystrokes, which follow real keyboard focus.
+              app.bundleIdentifier != "com.humain.cascade" else { return false }
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(appRef, 0.3)
         var focusedRef: CFTypeRef?
