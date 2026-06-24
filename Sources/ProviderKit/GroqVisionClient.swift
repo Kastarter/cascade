@@ -32,27 +32,46 @@ public struct GroqVisionClient: Sendable {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 60
+        request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue("Bearer \(key)", forHTTPHeaderField: "authorization")
+        // Fresh connection per planner call — a stale keep-alive socket is the
+        // usual source of the "network connection lost" / TLS errors that used
+        // to kill the whole Scout run on the very first turn.
+        request.setValue("close", forHTTPHeaderField: "connection")
         guard let body = try? JSONSerialization.data(
             withJSONObject: Self.requestBody(model: model, system: system, user: user, imageJPEG: imageJPEG, maxTokens: maxTokens, prior: prior)
         ) else { throw GroqError.transport("Couldn't encode the request.") }
         request.httpBody = body
 
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw GroqError.transport(error.localizedDescription)
+        // Retry transient transport failures (network lost / TLS / 5xx / 408 / 429):
+        // a single blip used to throw straight through to step.failed and end the
+        // Scout run silently — which is exactly why Scout "stopped suddenly" while
+        // Claude (a more reliable connection, no such death) kept going. Mirrors
+        // UITARSGrounder's retry: 4 attempts, 400ms backoff, non-retryable 4xx give up.
+        var lastError = GroqError.transport("unreachable")
+        for attempt in 0..<4 {
+            do {
+                let (data, response) = try await session.data(for: request)
+                let http = response as? HTTPURLResponse
+                if let http, (200..<300).contains(http.statusCode) {
+                    guard let text = GroqClient.parseContent(data), !text.isEmpty else { throw GroqError.emptyResponse }
+                    return text
+                }
+                // Client errors (bad request / auth) won't improve on retry — surface now.
+                if let http, (400..<500).contains(http.statusCode), http.statusCode != 408, http.statusCode != 429 {
+                    throw GroqError.http(http.statusCode, GroqClient.errorMessage(from: data, status: http.statusCode))
+                }
+                lastError = http.map { GroqError.http($0.statusCode, GroqClient.errorMessage(from: data, status: $0.statusCode)) }
+                    ?? .transport("No HTTP response.")
+            } catch let e as GroqError {
+                throw e  // emptyResponse / non-retryable 4xx — surface immediately
+            } catch {
+                lastError = .transport(error.localizedDescription)  // URLSession transport error — retry
+            }
+            if attempt < 3 { try? await Task.sleep(for: .milliseconds(400)) }
         }
-        guard let http = response as? HTTPURLResponse else { throw GroqError.transport("No HTTP response.") }
-        guard (200..<300).contains(http.statusCode) else {
-            throw GroqError.http(http.statusCode, GroqClient.errorMessage(from: data, status: http.statusCode))
-        }
-        guard let text = GroqClient.parseContent(data), !text.isEmpty else { throw GroqError.emptyResponse }
-        return text
+        throw lastError
     }
 
     /// OpenAI multimodal request body: optional system message, prior text turns,
