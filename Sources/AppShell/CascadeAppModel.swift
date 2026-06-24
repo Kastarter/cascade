@@ -766,6 +766,17 @@ public final class CascadeAppModel: ObservableObject {
             createSandboxAgent(task: Self.backgroundTask(from: q))
             return
         }
+        // A re-fired identical/near-identical command while a run is in flight is the
+        // voice re-triggering the SAME goal — it must NOT supersede (kill) the run.
+        // (Stop is handled above; a genuinely different command still supersedes.)
+        // The audit showed the same "Open Keynote and design…" task re-firing ~4s in
+        // and restarting the run at the chooser every time.
+        if assistTaskRunning, let active = assistTaskGoal, Self.isSameGoal(q, active) {
+            teachMessage = "Already on it — “\(active.prefix(40))”."
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "voice.duplicate.ignored", detail: String(q.prefix(80)))) }
+            voice.done()
+            return
+        }
         // Every new turn supersedes whatever an earlier turn is still doing. The
         // token is captured HERE, synchronously, so a stale task suspended in an
         // await can never pick up the newer generation after resuming.
@@ -905,6 +916,24 @@ public final class CascadeAppModel: ObservableObject {
     /// non-goals (acknowledgments) from superseding it and to route spoken
     /// stop requests to STOP instead of a new task.
     private var assistTaskRunning = false
+    /// The goal of the in-flight run, so a re-fired identical command (the voice
+    /// re-triggering the SAME task) doesn't supersede and restart it.
+    private var assistTaskGoal: String?
+
+    /// Whether two goals are the same command (a voice re-fire), by word-set
+    /// overlap. Jaccard ≥ 0.8 catches an identical re-fire and minor transcription
+    /// variance, while a genuinely different command (a new step or a steer) scores
+    /// low and is allowed to supersede. Both need ≥3 words so short utterances never
+    /// false-match. Pure + pinned.
+    nonisolated static func isSameGoal(_ a: String, _ b: String) -> Bool {
+        func words(_ s: String) -> Set<String> {
+            Set(s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
+        }
+        let sa = words(a), sb = words(b)
+        guard sa.count >= 3, sb.count >= 3 else { return false }
+        let union = sa.union(sb).count
+        return union > 0 && Double(sa.intersection(sb).count) / Double(union) >= 0.8
+    }
 
     /// Utterances that mean "halt the run", never a goal.
     private static let stopPhrases: Set<String> = [
@@ -930,7 +959,8 @@ public final class CascadeAppModel: ObservableObject {
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
         driver.runState.reset()
         assistTaskRunning = true
-        defer { assistTaskRunning = false }
+        assistTaskGoal = goal
+        defer { assistTaskRunning = false; assistTaskGoal = nil }
         agentDidHighlight = false
         episodeAppActions = [:]
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
