@@ -90,7 +90,10 @@ public final class ScoutAgent {
         if harnessProvider != nil {
             if harnessTier != .off { s.formUnion(["search_files", "read_file", "list_folder"]) }
             if harnessTier == .full { s.formUnion(["run_command", "run_applescript", "write_file"]) }
-            if recallEnabled { s.formUnion(["search_record", "get_timeframe", "inspect_moment"]) }
+            // Resolve ALL recall tools (so a list_sessions/get_timeframe emitted from
+            // the shared history still routes), even though toolsPrompt only
+            // advertises the two a weak planner can use without an ISO time window.
+            if recallEnabled { s.formUnion(RecordRecall.toolNames) }
         }
         return s
     }
@@ -174,7 +177,7 @@ public final class ScoutAgent {
             lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
         }
         if t.contains("search_record") {
-            lines.append("- search_record {\"action\":\"search_record\",\"query\":\"…\"} · get_timeframe · inspect_moment {\"action\":\"inspect_moment\",\"id\":<n>} — recall what the user already saw on screen EARLIER (use when the goal refers to something not on screen now).")
+            lines.append("- search_record {\"action\":\"search_record\",\"query\":\"…\"} · inspect_moment {\"action\":\"inspect_moment\",\"id\":<n>} — recall what the user already saw on screen EARLIER (use when the goal refers to something not on screen now).")
         }
         return lines.joined(separator: "\n")
     }
@@ -210,23 +213,31 @@ public final class ScoutAgent {
             return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
         }
         // In-process tool calls (use_skill / harness / recall) resolve WITHOUT a
-        // screen action — the Scout analog of the Opus inline hop. Resolve them, feed
-        // results back, and re-prompt the SAME screenshot (hop-capped); a tool turn
-        // never touches the cursor. A reply mixing tools + screen actions is treated
-        // as tools-first (the screen actions were decided before the results existed).
+        // screen action — the Scout analog of the Opus inline hop. Resolve any in the
+        // reply, append the results to history. Then: if the reply ALSO had screen
+        // actions, execute them THIS turn (don't re-prompt — that would re-run the
+        // model up to the hop cap per turn); only a tools-ONLY reply re-prompts the
+        // same screenshot for the next decision (hop-capped). The cursor never moves
+        // on a tools-only hop.
         let tools = availableTools
         let toolCalls = raw.filter { ($0["action"] as? String).map(tools.contains) ?? false }
-        if !toolCalls.isEmpty, hop < 6 {
+        let plan = raw.compactMap { Self.parseOne($0) }
+        if !toolCalls.isEmpty {
             var results = carried ?? ""
             for call in toolCalls {
                 guard let name = call["action"] as? String else { continue }
                 let r = await resolveTool(name: name, input: call)
                 results += "[\(name)] \(String(r.prefix(2000)))\n\n"
             }
-            history.append((user: user, assistant: String(reply.prefix(400))))
-            return await step(screenshot: screenshot, note: note, carried: results, hop: hop + 1)
+            // Compact history (the results travel via `carried`, not in history, so a
+            // multi-hop turn doesn't duplicate them across entries).
+            history.append((user: "(tool call)", assistant: String(reply.prefix(300))))
+            if plan.isEmpty, hop < 6 {
+                return await step(screenshot: screenshot, note: note, carried: results, hop: hop + 1)
+            }
+            // Screen actions present (or hop cap hit): fall through to run them; the
+            // tool results are in history for the model's next turn.
         }
-        let plan = raw.compactMap { Self.parseOne($0) }
         guard !plan.isEmpty else {
             return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
         }
