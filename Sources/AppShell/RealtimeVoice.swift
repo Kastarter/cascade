@@ -185,7 +185,10 @@ public final class RealtimeVoice: ObservableObject {
                     "input": [
                         "format": ["type": "audio/pcm", "rate": 24_000],
                         "turn_detection": NSNull(),
-                        "transcription": ["model": "gpt-4o-transcribe"],
+                        // Lock transcription to English — without it the model
+                        // mis-rendered English speech as Arabic phonetics, spawning
+                        // garbled assist.task goals that superseded live runs.
+                        "transcription": ["model": "gpt-4o-transcribe", "language": "en"],
                     ],
                     "output": [
                         "format": ["type": "audio/pcm", "rate": 24_000],

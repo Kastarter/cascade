@@ -8,7 +8,7 @@ import Testing
 struct VoiceFragmentGateTests {
     @Test func realFragmentCorpusIsNoise() {
         for fragment in [
-            "Iii!", "Hi", "Hi.", "Hello", "so.", "مريم.", "はあ", "。\"",
+            "Iii!", "Hi", "Hi.", "Hello", "so.", "はあ", "。\"",
             "Okay, thank you.", "Ok, thank you.", "Hmm.", "Yeah, cool.",
         ] {
             #expect(VoiceFragmentGate.classify(fragment) == .noise, "should be noise: \(fragment)")

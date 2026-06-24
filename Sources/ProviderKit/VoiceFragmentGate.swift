@@ -4,7 +4,7 @@ import Foundation
 ///
 /// The transcriber hands over EVERYTHING the mic hears, and the audit log shows
 /// what that did to real sessions (2026-06-11): one-word interjections ("Iii!",
-/// "Hi", "はあ", "مريم."), punctuation shards ("。""), and filler sentences
+/// "Hi", "はあ"), punctuation shards ("。""), and filler sentences
 /// ("Okay, thank you.") each spawned a full screen-control run — and because
 /// every new goal supersedes the live one, each fragment KILLED whatever real
 /// task was running. Set-based acknowledgment matching didn't hold (internal

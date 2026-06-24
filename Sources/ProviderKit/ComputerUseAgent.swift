@@ -1355,10 +1355,10 @@ public final class ComputerUseAgent {
 
     /// The user's own words make this task clipboard work ("paste it", "what I
     /// copied") — the one case a bare paste key is legitimate without the agent
-    /// copying first. Arabic terms included (voice goals arrive in both).
+    /// copying first.
     nonisolated static func goalMentionsClipboard(_ goal: String) -> Bool {
         goal.range(
-            of: #"(?i)\b(paste|pasted|pasting|clipboard|copy|copied)\b|الصق|لصق|انسخ|نسخ"#,
+            of: #"(?i)\b(paste|pasted|pasting|clipboard|copy|copied)\b"#,
             options: .regularExpression
         ) != nil
     }

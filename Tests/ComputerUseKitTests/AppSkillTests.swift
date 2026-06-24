@@ -302,7 +302,6 @@ struct AppSkillTests {
             "Use AppleScript to retitle the slides",
             "can you script this in blender",
             "generate the bpy code for a donut",
-            "اكتب سكربت بايثون في بلندر",
         ] {
             #expect(AppSkill.goalAsksForScript(asking), "should open the gate: \(asking)")
         }
