@@ -58,4 +58,48 @@ struct ScoutAgentTests {
         #expect(ScoutAgent.parseScoutAction(#"{"thought":"no action here"}"#) == nil)
         #expect(ScoutAgent.parseScoutAction("not json at all") == nil)
     }
+
+    // MARK: parseScoutActions — batched turns
+
+    @Test func parsesBatchedActionsWithCarriedThought() {
+        let r = #"{"thought":"fill the slide","actions":[{"action":"type","target":"title","text":"Hi"},{"action":"type","target":"subtitle","text":"Yo"}]}"#
+        let a = ScoutAgent.parseScoutActions(r)
+        #expect(a.count == 2)
+        #expect(a[0].kind == .type && a[0].target == "title" && a[0].text == "Hi")
+        #expect(a[1].target == "subtitle" && a[1].text == "Yo")
+        // The outer thought is carried onto an element that lacks its own.
+        #expect(a[0].thought == "fill the slide")
+    }
+
+    @Test func parseActionsHandlesSingleObject() {
+        let a = ScoutAgent.parseScoutActions(#"{"action":"click","target":"Save"}"#)
+        #expect(a.count == 1 && a[0].kind == .click && a[0].target == "Save")
+    }
+
+    @Test func perElementThoughtWinsOverOuter() {
+        let r = #"{"thought":"outer","actions":[{"action":"key","key":"return","thought":"inner"}]}"#
+        #expect(ScoutAgent.parseScoutActions(r).first?.thought == "inner")
+    }
+
+    @Test func parseActionsEmptyOnGarbage() {
+        #expect(ScoutAgent.parseScoutActions("nope").isEmpty)
+    }
+
+    // MARK: parseRawActions — tool calls keep arbitrary input; tools aren't screen actions
+
+    @Test func rawActionsKeepToolInputFields() {
+        let r = #"{"action":"read_file","path":"~/x.txt"}"#
+        let raw = ScoutAgent.parseRawActions(r)
+        #expect(raw.count == 1)
+        #expect(raw[0]["action"] as? String == "read_file")
+        #expect(raw[0]["path"] as? String == "~/x.txt")
+        // A tool call is NOT a screen action, so parseScoutActions drops it.
+        #expect(ScoutAgent.parseScoutActions(r).isEmpty)
+    }
+
+    @Test func rawActionsBatchSkipsNonObjectElements() {
+        let r = #"{"actions":[{"action":"click","target":"Save"}, 5, "x"]}"#
+        let raw = ScoutAgent.parseRawActions(r)
+        #expect(raw.count == 1 && raw[0]["target"] as? String == "Save")
+    }
 }

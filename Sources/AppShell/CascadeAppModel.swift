@@ -1072,6 +1072,40 @@ public final class CascadeAppModel: ObservableObject {
     /// without duplicating the skill/harness/recall wiring. Handlers
     /// (streamSink / onThinkingPulse / onActionRefused) are set by the caller —
     /// they capture episode-local state.
+    /// Skill provider shared by the Opus + Scout on-screen paths: resolve a skill by
+    /// name, deny scripting playbooks unless the goal asks (the structural gate), and
+    /// audit each pull.
+    private func assistSkillProvider(goal: String) -> (String) -> String? {
+        { [appSkills, store] name in
+            guard let skill = appSkills.skill(named: name) else { return nil }
+            if skill.explicitAskOnly && !AppSkill.goalAsksForScript(goal) {
+                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: name)) }
+                return """
+                Skill \(skill.name) is unavailable for this task: it is a scripting \
+                playbook and the user did not ask for a script. Do the work on \
+                screen in the app's own UI — pull the app's other listed skills \
+                instead. Do not write or run any script for this task: no script \
+                editors, no shell, no writing files to open in the app.
+                """
+            }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
+            return skill.promptBlock
+        }
+    }
+
+    /// Harness + recall provider shared by both on-screen paths: recall tools route
+    /// to performRecall (read-only memory); everything else to performHarness
+    /// (file/shell, gated + audited).
+    private func assistHarnessProvider(goal: String, gen: Int) -> @MainActor (String, [String: Any]) async -> String {
+        { [weak self] name, input in
+            guard let self else { return "Cascade is shutting down — stop." }
+            if RecordRecall.isRecallTool(name) {
+                return await self.performRecall(name: name, input: input, gen: gen)
+            }
+            return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
+        }
+    }
+
     private func makeAssistAgent(model: String, goal: String, gen: Int) -> ComputerUseAgent {
         // Structural grounding split: when a grounder is configured (hosted UI-TARS
         // via OpenRouter, or Claude), Opus drives the screen by NAMING targets and
@@ -1085,39 +1119,11 @@ public final class CascadeAppModel: ObservableObject {
             model: model,
             effort: cuEffort,
             environmentNote: ComputerUseAgent.foregroundBrowserNote,
-            skillProvider: { [appSkills, store] name in
-                guard let skill = appSkills.skill(named: name) else { return nil }
-                // Scripting playbooks open only on the user's explicit ask.
-                // Prompt-level qualifiers ("10+ repeated parts") get read as
-                // policy and every real build qualifies — so the gate is here,
-                // structural, keyed to the user's own words in the goal.
-                if skill.explicitAskOnly && !AppSkill.goalAsksForScript(goal) {
-                    Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: name)) }
-                    return """
-                    Skill \(skill.name) is unavailable for this task: it is a scripting \
-                    playbook and the user did not ask for a script. Do the work on \
-                    screen in the app's own UI — pull the app's other listed skills \
-                    instead. Do not write or run any script for this task: no script \
-                    editors, no shell, no writing files to open in the app.
-                    """
-                }
-                // Skill text entering the agent's context is an auditable event,
-                // same as every action it takes.
-                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
-                return skill.promptBlock
-            },
+            skillProvider: assistSkillProvider(goal: goal),
             // Direct-Mac tools beside the computer tool: find/read is always on;
             // run/script/write only with the user's Power harness opt-in.
             harnessTier: powerHarnessEnabled ? .full : .readOnly,
-            harnessProvider: { [weak self] name, input in
-                guard let self else { return "Cascade is shutting down — stop." }
-                // Recall over the recorded screen history is read-only memory —
-                // it skips the file/shell gating performHarness applies.
-                if RecordRecall.isRecallTool(name) {
-                    return await self.performRecall(name: name, input: input, gen: gen)
-                }
-                return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
-            },
+            harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
             // Let the agent recall what the user already saw on screen — the whole
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
@@ -1206,10 +1212,25 @@ public final class CascadeAppModel: ObservableObject {
     private func runScoutEpisode(
         goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
-        // Scout can't click without a grounder; force one even if the grounder
-        // toggle is off (Scout mode implies UI-TARS).
-        let grounder = Self.assistGrounder() ?? UITARSGrounder()
-        let agent = ScoutAgent(grounder: grounder)
+        // Scout grounds EVERY click, so it can't run without a working grounder.
+        // Fail clearly rather than fall back to a dead localhost endpoint (the old
+        // `?? UITARSGrounder()` silently pointed at :8000 and every click missed).
+        guard let grounder = Self.assistGrounder() else {
+            teachMessage = "The Scout backend needs a grounder — connect an OpenRouter key in Settings → Model Keys to use it."
+            dock.show(title: "Scout needs a grounder", detail: "Add an OpenRouter key in Settings.")
+            return .stalled("The Scout backend needs a grounder — connect an OpenRouter key (Settings → Model Keys), or switch the on-screen engine back to Claude.")
+        }
+        // Same in-process tool harness as the Opus path: use_skill (pull), the
+        // file/shell harness, and record recall — shared providers, so Scout can
+        // reach for them too (it may underuse pull-tools, but the capability is here).
+        let agent = ScoutAgent(
+            grounder: grounder,
+            skillProvider: assistSkillProvider(goal: goal),
+            skillIndex: appSkills.indexText,
+            harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
+            harnessTier: powerHarnessEnabled ? .full : .readOnly,
+            recallEnabled: true
+        )
         let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
         let res = AgentResolution.best(forWidth: dw, height: dh)
         let maxSteps = 60
@@ -1230,7 +1251,7 @@ public final class CascadeAppModel: ObservableObject {
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
             conversation: assistMemory.historyForAPI(), note: scoutGroundingNote(),
-            skill: frontmostSkill()?.promptBlock
+            skill: scoutSkillPush(goal: goal)
         )
         for _ in 0..<maxSteps {
             if assistGeneration != gen { return .stopped }           // a newer turn superseded us
@@ -1265,21 +1286,6 @@ public final class CascadeAppModel: ObservableObject {
             var actedThisTurn = false
             if step.actions.isEmpty {
                 idleTurns += 1
-                // A grounding miss (Scout named a target UI-TARS couldn't find) is
-                // the usual idle cause. Tell it what's on screen so it RE-DESCRIBES,
-                // instead of silently repeating the same target until it stalls — the
-                // same re-describe feedback the Opus path gives on a fill_target miss.
-                if let missed = agent.lastGroundMiss {
-                    let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
-                    // Audit WHAT was on screen when the target wasn't found — frontmost
-                    // app + visible controls — so the log proves whether the expected
-                    // window was even present (e.g. "New Document" missing because the
-                    // app never opened / the wrong app is frontmost).
-                    let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
-                    nudge = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target — it types into whatever is focused."
-                    if let summary { nudge! += " Controls on screen now: \(summary)." }
-                }
                 if idleTurns >= 3 {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
                     return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
@@ -1336,13 +1342,25 @@ public final class CascadeAppModel: ObservableObject {
                 noEffectTurns = 0
             }
             if let observedHashes { lastFrameHashes = observedHashes }
+            // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
+            // a partially-grounded batch (where step.actions is non-empty so the idle
+            // path above is skipped). Tells Scout to re-describe instead of silently
+            // re-naming an un-findable target, and audits what was actually on screen.
+            if let missed = agent.lastGroundMiss {
+                let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
+                let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
+                var missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
+                if let summary { missNote += " Controls on screen now: \(summary)." }
+                nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
+            }
             // Refresh the grounding line + app skill every turn (the frontmost app
-            // changes once Scout opens the target), merged with any no-effect nudge.
+            // changes once Scout opens the target), merged with any nudge above.
             let turnNote = [scoutGroundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
             step = await agent.proceed(
                 screenshot: observedShot,
                 note: turnNote.isEmpty ? nil : turnNote,
-                skill: frontmostSkill()?.promptBlock
+                skill: scoutSkillPush(goal: goal)
             )
         }
         return .stepLimit
@@ -2139,6 +2157,26 @@ public final class CascadeAppModel: ObservableObject {
     private func frontmostSkill() -> AppSkill? {
         let front = NSWorkspace.shared.frontmostApplication
         return appSkills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+    }
+
+    /// The full skill text to PUSH into Scout this turn: the frontmost app's skill
+    /// PLUS its related task/recipe skills. The Opus path reaches the recipe skills
+    /// (e.g. `keynote-consulting` — how to actually build a good deck) via the
+    /// use_skill tool; Scout has no pull, so they must be pushed. Related skills are
+    /// found by the `<app>-<task>` naming convention (the app skill's name is their
+    /// prefix), so it generalizes to any app pack without hardcoding. Scripting
+    /// playbooks (`explicitAskOnly`) are included only when the goal asks for a
+    /// script — the same gate the Opus skillProvider applies. nil when no app skill
+    /// matches (so applySkill leaves the prompt unchanged). See [[cascade-cu-downgrade-research]].
+    private func scoutSkillPush(goal: String) -> String? {
+        guard let app = frontmostSkill() else { return nil }
+        let asksScript = AppSkill.goalAsksForScript(goal)
+        let related = appSkills.skills.filter { skill in
+            (skill.name == app.name || skill.name.hasPrefix(app.name + "-"))
+                && (!skill.explicitAskOnly || asksScript)
+        }
+        let blocks = related.map(\.promptBlock)
+        return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n---\n\n")
     }
 
     /// Pointer-routed apps (Blender) send hotkeys to the editor at the position
