@@ -661,7 +661,9 @@ public final class ComputerUseAgent {
                         actions.append(contentsOf: expanded)
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
-                        toolResultOverrides[id] = "Couldn't locate “\(target)” on the screen. Describe it more specifically, or click it directly with the computer tool."
+                        toolResultOverrides[id] = isStructural
+                            ? "Couldn't locate “\(target)” on the screen. Describe it more specifically — its visible label, role, or the text next to it — or name a different on-screen landmark."
+                            : "Couldn't locate “\(target)” on the screen. Describe it more specifically, or click it directly with the computer tool."
                     }
                 case "click_target":
                     // Structural grounding (structural mode only): the runtime locates

@@ -1212,9 +1212,14 @@ public final class CascadeAppModel: ObservableObject {
     private func runScoutEpisode(
         goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
-        // Scout can't click without a grounder; force one even if the grounder
-        // toggle is off (Scout mode implies UI-TARS).
-        let grounder = Self.assistGrounder() ?? UITARSGrounder()
+        // Scout grounds EVERY click, so it can't run without a working grounder.
+        // Fail clearly rather than fall back to a dead localhost endpoint (the old
+        // `?? UITARSGrounder()` silently pointed at :8000 and every click missed).
+        guard let grounder = Self.assistGrounder() else {
+            teachMessage = "The Scout backend needs a grounder — connect an OpenRouter key in Settings → Model Keys to use it."
+            dock.show(title: "Scout needs a grounder", detail: "Add an OpenRouter key in Settings.")
+            return .stalled("The Scout backend needs a grounder — connect an OpenRouter key (Settings → Model Keys), or switch the on-screen engine back to Claude.")
+        }
         // Same in-process tool harness as the Opus path: use_skill (pull), the
         // file/shell harness, and record recall — shared providers, so Scout can
         // reach for them too (it may underuse pull-tools, but the capability is here).
