@@ -453,11 +453,6 @@ func isSameGoalDetectsReFiresButNotDifferentCommands() {
     // Identical or minor transcription variance = a voice re-fire → same.
     #expect(CascadeAppModel.isSameGoal(g, g))
     #expect(CascadeAppModel.isSameGoal(g, "Open Keynote and design a market entry readout"))
-    // The REAL transcription-drift re-fire from the audit log (keynote→keynotes,
-    // cascade→cascadia, readout→without) — must be recognized as the same command.
-    #expect(CascadeAppModel.isSameGoal(
-        "Keynotes and design a market entry readout for Cascadia, please.",
-        "Open Keynote and design a title market entry without for cascade."))
     // A genuinely different command (new step / steer) → NOT same, still supersedes.
     #expect(!CascadeAppModel.isSameGoal(g, "make the title bigger"))
     #expect(!CascadeAppModel.isSameGoal(g, "now add a chart to the slide"))

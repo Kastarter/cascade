@@ -920,29 +920,19 @@ public final class CascadeAppModel: ObservableObject {
     /// re-triggering the SAME task) doesn't supersede and restart it.
     private var assistTaskGoal: String?
 
-    /// Whether two goals are the same command (a voice re-fire), tolerant of
-    /// transcription drift. The transcriber re-renders the SAME utterance with heavy
-    /// variance ("keynote"→"keynotes", "cascade"→"cascadia", even "readout"→
-    /// "without"), so exact word overlap misses re-fires. We FUZZY-match words (equal,
-    /// or a shared ≥4-char prefix) and call it the same goal when ≥60% of the larger
-    /// word set matches. A genuinely different command (a new step or a steer) shares
-    /// almost nothing and scores far below, so it still supersedes. Both need ≥3
-    /// words so short utterances never false-match. Pure + pinned; no app- or
-    /// goal-specific terms.
+    /// Whether two goals are the SAME command (an exact-ish voice re-fire of a
+    /// running task), by word-set overlap. Only guards against a literally-identical
+    /// command re-firing while a run is in flight; transcription-drift variants are
+    /// NOT treated as the same (that "wording" approach was the wrong lever — the
+    /// sudden stops aren't a re-fire problem). Both need ≥3 words. Pure + pinned.
     nonisolated static func isSameGoal(_ a: String, _ b: String) -> Bool {
         func words(_ s: String) -> Set<String> {
             Set(s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
         }
-        func fuzzy(_ x: String, _ y: String) -> Bool {
-            if x == y { return true }
-            guard min(x.count, y.count) >= 4 else { return false }   // short words: exact only
-            return zip(x, y).prefix(while: ==).count >= 4            // shared ≥4-char prefix
-        }
         let sa = words(a), sb = words(b)
         guard sa.count >= 3, sb.count >= 3 else { return false }
-        let matches = sa.filter { x in sb.contains { fuzzy(x, $0) } }.count
-        let denom = max(sa.count, sb.count)
-        return denom > 0 && Double(matches) / Double(denom) >= 0.6
+        let union = sa.union(sb).count
+        return union > 0 && Double(sa.intersection(sb).count) / Double(union) >= 0.8
     }
 
     /// Utterances that mean "halt the run", never a goal.
@@ -1258,6 +1248,7 @@ public final class CascadeAppModel: ObservableObject {
         guard let grounder = Self.assistGrounder() else {
             teachMessage = "The Scout backend needs a grounder — connect an OpenRouter key in Settings → Model Keys to use it."
             dock.show(title: "Scout needs a grounder", detail: "Add an OpenRouter key in Settings.")
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: "no-grounder · scout · 0 turns"))
             return .stalled("The Scout backend needs a grounder — connect an OpenRouter key (Settings → Model Keys), or switch the on-screen engine back to Claude.")
         }
         // Same in-process tool harness as the Opus path: use_skill (pull), the
@@ -1276,6 +1267,18 @@ public final class CascadeAppModel: ObservableObject {
         let maxSteps = 60
         var acted = false
         var idleTurns = 0
+        // Observability: the Scout loop used to return from many paths (failed,
+        // superseded, capture-fail, step-limit) with NO audit, so a sudden stop left
+        // nothing in the log to explain it. Track timing and log EVERY exit + reason.
+        let episodeStart = ContinuousClock.now
+        var count = 0
+        var modelTime = Duration.zero
+        func scoutEnd(_ outcome: AssistEpisodeOutcome, _ why: String) async -> AssistEpisodeOutcome {
+            let total = episodeStart.duration(to: .now)
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing",
+                detail: "\(why) · scout · \(count) turns · total \(Int(total / .milliseconds(1)))ms · model \(Int(modelTime / .milliseconds(1)))ms"))
+            return outcome
+        }
         // No-effect detection — ported from the Opus path (`runAssistEpisode`). Scout
         // is cheap and weak at perceiving change, so without this it re-clicks/
         // re-pastes the same dead spot (audited: the SAME 20 chars pasted 7× at one
@@ -1288,19 +1291,21 @@ public final class CascadeAppModel: ObservableObject {
 
         // Parity with the Opus path's harness: seed cross-turn memory, push the
         // frontmost app's skill (Scout can't pull), and pass the grounding note.
+        var modelStart = ContinuousClock.now
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
             conversation: assistMemory.historyForAPI(), note: scoutGroundingNote(),
             skill: scoutSkillPush(goal: goal)
         )
+        modelTime += modelStart.duration(to: .now); count += 1
         for _ in 0..<maxSteps {
-            if assistGeneration != gen { return .stopped }           // a newer turn superseded us
+            if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
             if driver.runState.isStopRequested {
                 agentMessage = "Stopped. Control returned to you."
                 dock.show(title: "Stopped", detail: agentMessage)
-                return .stopped
+                return await scoutEnd(.stopped, "user-stop")
             }
-            if step.failed { return .failed }
+            if step.failed { return await scoutEnd(.failed, "planner-failed: \(step.text.prefix(90))") }
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
                 dock.show(title: "Scout", detail: String(step.text.prefix(80)))
@@ -1309,9 +1314,9 @@ public final class CascadeAppModel: ObservableObject {
                 let claimed = step.text.isEmpty ? "Done." : step.text
                 if acted, let missing = await validateAssistCompletion(goal: goal, claimed: claimed, screen: screen) {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: "INCOMPLETE: \(missing.prefix(80))"))
-                    return .stalled("I'm not sure that finished — \(missing)")
+                    return await scoutEnd(.stalled("I'm not sure that finished — \(missing)"), "validate-incomplete")
                 }
-                return .finished(claimed, acted: acted)
+                return await scoutEnd(.finished(claimed, acted: acted), "finished")
             }
 
             // Grounding visibility: log where each grounded click landed (or that it
@@ -1328,15 +1333,15 @@ public final class CascadeAppModel: ObservableObject {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
-                    return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
+                    return await scoutEnd(.stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text), "idle-stall")
                 }
             } else {
                 idleTurns = 0
                 for action in step.actions {
-                    if assistGeneration != gen { return .stopped }
-                    if driver.runState.isStopRequested { return .stopped }
+                    if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
+                    if driver.runState.isStopRequested { return await scoutEnd(.stopped, "user-stop") }
                     let ok = await executeCU(action, on: screen)
-                    if !ok { return .failed }                        // executeCU surfaced the reason
+                    if !ok { return await scoutEnd(.failed, "action-failed") }  // executeCU surfaced why
                     acted = true
                     actedThisTurn = true
                     try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
@@ -1344,8 +1349,8 @@ public final class CascadeAppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(260))       // let the UI settle before re-observing
             }
 
-            guard let shot0 = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return .failed }
-            if assistGeneration != gen { return .stopped }
+            guard let shot0 = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return await scoutEnd(.failed, "capture-failed") }
+            if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
 
             // No-effect check (with the same slow-render re-check the Opus path uses).
             var observedShot = shot0
@@ -1364,7 +1369,7 @@ public final class CascadeAppModel: ObservableObject {
                     noEffectTurns += 1
                     if noEffectTurns >= 3 {
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout — 3rd no-effect, stopping"))
-                        return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
+                        return await scoutEnd(.stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way."), "noeffect-stall")
                     }
                     nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action."
                     // Flail push: hand Scout the controls actually on screen so it
@@ -1397,13 +1402,15 @@ public final class CascadeAppModel: ObservableObject {
             // Refresh the grounding line + app skill every turn (the frontmost app
             // changes once Scout opens the target), merged with any nudge above.
             let turnNote = [scoutGroundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+            modelStart = ContinuousClock.now
             step = await agent.proceed(
                 screenshot: observedShot,
                 note: turnNote.isEmpty ? nil : turnNote,
                 skill: scoutSkillPush(goal: goal)
             )
+            modelTime += modelStart.duration(to: .now); count += 1
         }
-        return .stepLimit
+        return await scoutEnd(.stepLimit, "step-limit")
     }
 
     private func runAssistEpisode(
