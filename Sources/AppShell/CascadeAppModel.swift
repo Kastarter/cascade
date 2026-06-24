@@ -567,6 +567,21 @@ public final class CascadeAppModel: ObservableObject {
             guard let self else { return }
             Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: action, detail: String(detail.prefix(240)))) }
         }
+        // Give the background Scout the SAME in-process harness the on-screen agent
+        // has — file/shell tools + record recall — so a background run can reach the
+        // user's local files and recorded screen history, not just the web. Pure
+        // execution here; the agent applies its own STOP gate + audit. Power tools
+        // stay behind the user's Power-harness opt-in; recall is read-only.
+        runtime.harnessTier = powerHarnessEnabled ? .full : .readOnly
+        runtime.recallEnabled = true
+        runtime.harnessProvider = { [weak self] name, input in
+            guard let self else { return "Cascade is shutting down — stop." }
+            if RecordRecall.isRecallTool(name) {
+                return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
+            }
+            guard let call = HarnessCall(name: name, input: input) else { return "Unknown harness tool “\(name)”." }
+            return await AgentHarness.perform(call, powerEnabled: self.powerHarnessEnabled)
+        }
         backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")

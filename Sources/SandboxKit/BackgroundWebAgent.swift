@@ -86,6 +86,22 @@ public final class BackgroundWebAgent {
     /// what made the multi-run audit window impossible to read back. Set by the owner.
     public var auditTag: String = ""
 
+    /// The in-process tool harness the on-screen agent has, injected by the owner:
+    /// file/shell tools (search_files / read_file / list_folder + run_command /
+    /// run_applescript / write_file → AgentHarness) and record recall (search_record
+    /// / get_timeframe / inspect_moment → RecordRecall). Wired into the Scout brain so
+    /// a background run can bridge the web with the user's local files and recorded
+    /// screen history — parity with the on-screen Scout. nil → Scout runs with
+    /// use_skill + web grounding only. The run's STOP gate + tagged audit are applied
+    /// here (the owner's closure is pure execution).
+    public var harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
+    /// Read-only (search/read) vs full (also run/script/write) — mirrors the user's
+    /// Power-harness opt-in. Ignored when `harnessProvider` is nil.
+    public var harnessTier: HarnessTier = .readOnly
+    /// Whether record-recall tools are offered (needs the owner to inject a store via
+    /// `harnessProvider`).
+    public var recallEnabled = false
+
     /// Emits an audit row through `onAudit`, prefixing the run tag so the row stays
     /// attributable to this run even when several agents log into the same stream.
     private func audit(_ action: String, _ detail: String) {
@@ -518,12 +534,28 @@ public final class BackgroundWebAgent {
         // DOM-first grounder (UI-TARS snapshot fallback only if an OpenRouter key is
         // set). Scout pulls web skills the same way the Claude path does.
         let grounder = WebDOMGrounder(sandbox: sandbox, fallback: Self.snapshotFallbackGrounder())
+        // The on-screen harness (file/shell + recall), wrapped with this run's STOP
+        // gate + tagged audit so a background file/shell/recall call is supervised
+        // exactly like a click. The owner's closure is pure execution.
+        let wrappedHarness: (@MainActor (String, [String: Any]) async -> String)?
+        if let injectedHarness = harnessProvider {
+            wrappedHarness = { [weak self] name, input in
+                guard let self, !self.stopped else { return "The user stopped this task. Do not continue — end now." }
+                self.audit("sandbox.harness", "\(name) \(Self.argSummary(input))")
+                return await injectedHarness(name, input)
+            }
+        } else {
+            wrappedHarness = nil
+        }
         let agent = ScoutAgent(
             vision: groqVision,
             grounder: grounder,
             environmentNote: Self.scoutSandboxNote,
             skillProvider: { WebSkills.content(named: $0) },
-            skillIndex: WebSkills.index()
+            skillIndex: WebSkills.index(),
+            harnessProvider: wrappedHarness,
+            harnessTier: harnessTier,
+            recallEnabled: recallEnabled
         )
 
         var acted = false
