@@ -62,10 +62,16 @@ public final class ScoutAgent {
     private var episodeSystem = ScoutAgent.systemPrompt
     private var pushedSkill: String?
 
+    /// Fixed environment guidance appended to the system prompt — the per-surface
+    /// rules that aren't a per-app skill (e.g. the web sandbox: no tabs, use
+    /// open_url, NEEDS_LOGIN/INCOMPLETE protocol). nil for the on-screen agent.
+    private let environmentNote: String?
+
     public init(
         vision: GroqVisionClient = GroqVisionClient(),
         grounder: VisualGrounder,
         model: String = GroqModel.llama4Scout,
+        environmentNote: String? = nil,
         skillProvider: ((String) -> String?)? = nil,
         skillIndex: String? = nil,
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
@@ -75,6 +81,7 @@ public final class ScoutAgent {
         self.vision = vision
         self.grounder = grounder
         self.model = model
+        self.environmentNote = environmentNote
         self.skillProvider = skillProvider
         self.skillIndex = skillIndex
         self.harnessProvider = harnessProvider
@@ -144,6 +151,9 @@ public final class ScoutAgent {
     /// episodeSystem = base prompt + tool catalogue + the pushed app playbook.
     private func rebuildSystem() {
         var s = Self.systemPrompt + toolsPrompt
+        if let environmentNote, !environmentNote.isEmpty {
+            s += "\n\n" + environmentNote
+        }
         if let pushedSkill, !pushedSkill.isEmpty {
             s += """
 

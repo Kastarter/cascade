@@ -42,6 +42,13 @@ public final class BackgroundWebAgent {
 
     private let keyStore: AnthropicKeyStore
     private let model: String
+    /// The Scout planner stack (one brain with the on-screen agent): Llama-4 Scout
+    /// via Groq, grounded DOM-first in the sandbox. Used instead of the Claude
+    /// `model` loop whenever a Groq key is present (`usesScout`); the Claude path
+    /// remains the fallback when there's no Groq key.
+    private let groqKeyStore: GroqKeyStore
+    private let groqVision: GroqVisionClient
+    private let usesScout: Bool
     private let planner: AgentTaskPlanner
     /// Cheap second opinion that checks a claimed completion against the actual page.
     private let verifier: any MessageCompleting
@@ -90,9 +97,16 @@ public final class BackgroundWebAgent {
         tag.isEmpty ? detail : "[\(tag)] \(detail)"
     }
 
-    public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
+    public init(
+        keyStore: AnthropicKeyStore = AnthropicKeyStore(),
+        groqKeyStore: GroqKeyStore = GroqKeyStore(),
+        model: String = AnthropicModel.sonnet
+    ) {
         self.keyStore = keyStore
+        self.groqKeyStore = groqKeyStore
+        self.groqVision = GroqVisionClient(keyStore: groqKeyStore)
         self.model = model
+        self.usesScout = Self.backgroundUsesScout(groqKeyStore: groqKeyStore)
         // The planner (≤5 subtasks + start URLs) and the completion verifier are
         // structurally simple TEXT tasks — downgraded to Groq llama-3.3-70b when a
         // Groq key is set (else Anthropic haiku). The agent loop stays on `model`.
@@ -100,6 +114,15 @@ public final class BackgroundWebAgent {
         self.planner = AgentTaskPlanner(client: h.client, model: h.model)
         self.verifier = h.client
         self.verifierModel = h.model
+    }
+
+    /// One brain: the background agent runs on Scout (Groq) by default whenever a
+    /// Groq key is present, matching the on-screen agent. Opt out with
+    /// `cascade.backgroundBackend = "claude"`. With no Groq key it falls back to the
+    /// Claude (`model`) loop, so a keyless setup still works.
+    nonisolated static func backgroundUsesScout(groqKeyStore: GroqKeyStore) -> Bool {
+        guard groqKeyStore.hasKey() else { return false }
+        return UserDefaults.standard.string(forKey: "cascade.backgroundBackend") != "claude"
     }
 
     public func stop() { stopped = true }
@@ -188,9 +211,9 @@ public final class BackgroundWebAgent {
         _ sub: AgentSubtask, index: Int, total: Int,
         onUpdate: @escaping @MainActor (Update) -> Void
     ) async -> EpisodeOutcome {
-        var attempt = await episodeOnce(sub, index: index, total: total, firmer: false, onUpdate: onUpdate)
+        var attempt = await episodeAttempt(sub, index: index, total: total, firmer: false, onUpdate: onUpdate)
         if case .finished = attempt.outcome, !attempt.acted, !stopped {
-            attempt = await episodeOnce(sub, index: index, total: total, firmer: true, onUpdate: onUpdate)
+            attempt = await episodeAttempt(sub, index: index, total: total, firmer: true, onUpdate: onUpdate)
         }
         // The model's "done" is not enough — verify the outcome against the actual page
         // before trusting it (the false-completion the user kept hitting). Only a CLEAR
@@ -236,6 +259,18 @@ public final class BackgroundWebAgent {
         let reason = trimmed.dropFirst("INCOMPLETE".count)
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
         return reason.isEmpty ? "the page doesn't show the task was completed" : reason
+    }
+
+    /// Dispatches one episode attempt to the active brain: Scout (Groq + DOM-first
+    /// grounding) when `usesScout`, else the Claude (`model`) Computer-Use loop. Both
+    /// return the same (outcome, acted) so the verify/retry wrapper is brain-agnostic.
+    private func episodeAttempt(
+        _ sub: AgentSubtask, index: Int, total: Int, firmer: Bool,
+        onUpdate: @escaping @MainActor (Update) -> Void
+    ) async -> (outcome: EpisodeOutcome, acted: Bool) {
+        usesScout
+            ? await scoutEpisodeOnce(sub, index: index, total: total, firmer: firmer, onUpdate: onUpdate)
+            : await episodeOnce(sub, index: index, total: total, firmer: firmer, onUpdate: onUpdate)
     }
 
     private func episodeOnce(
@@ -447,6 +482,223 @@ public final class BackgroundWebAgent {
         return (stopped ? .stopped : .stepLimit, acted)
     }
 
+    /// One part as a SCOUT episode — the same brain as the on-screen agent (Llama-4
+    /// Scout via Groq), grounded DOM-first in the sandbox. Mirrors `episodeOnce`'s
+    /// scaffolding and efficiency harness (stall guard, no-effect, steer, verify via
+    /// the shared `runEpisode` wrapper) but drives `ScoutAgent` instead of the Claude
+    /// computer-use loop. Scout names targets; `WebDOMGrounder` resolves them against
+    /// the live DOM (free, exact, sees contenteditable), so most actions need no
+    /// network grounding round trip — the efficiency parity the on-screen path has.
+    private func scoutEpisodeOnce(
+        _ sub: AgentSubtask, index: Int, total: Int, firmer: Bool,
+        onUpdate: @escaping @MainActor (Update) -> Void
+    ) async -> (outcome: EpisodeOutcome, acted: Bool) {
+        let prefix = total > 1 ? "Part \(index + 1)/\(total) — " : ""
+        var startURL = sub.startURL
+        if startURL.isEmpty, sandbox.webView.url == nil {
+            startURL = AgentTaskPlanner.searchURL(for: sub.task)
+        }
+        if !startURL.isEmpty {
+            let host = URL(string: startURL)?.host() ?? startURL
+            onUpdate(Update(status: "\(prefix)Opening \(host)…", snapshotPNG: nil, url: startURL, done: false, result: nil))
+            await sandbox.navigate(to: startURL)
+        }
+        var shotData = await sandbox.snapshotPNG()
+        var snapTries = 0
+        while shotData == nil, snapTries < 3, !stopped {
+            try? await Task.sleep(for: .milliseconds(400))
+            shotData = await sandbox.snapshotPNG()
+            snapTries += 1
+        }
+        guard var shot = shotData else {
+            return (stopped ? .stopped : .failed("Couldn't open the sandbox browser."), false)
+        }
+        onUpdate(Update(status: "\(prefix)Working: \(sub.task)", snapshotPNG: shot, url: sandbox.currentURL, done: false, result: nil))
+
+        // DOM-first grounder (UI-TARS snapshot fallback only if an OpenRouter key is
+        // set). Scout pulls web skills the same way the Claude path does.
+        let grounder = WebDOMGrounder(sandbox: sandbox, fallback: Self.snapshotFallbackGrounder())
+        let agent = ScoutAgent(
+            vision: groqVision,
+            grounder: grounder,
+            environmentNote: Self.scoutSandboxNote,
+            skillProvider: { WebSkills.content(named: $0) },
+            skillIndex: WebSkills.index()
+        )
+
+        var acted = false
+        var lastSignature = await pageSignature()
+        var noEffectTurns = 0
+        var idleTurns = 0
+        var step = await agent.begin(
+            goal: AgentTaskPlanner.goal(for: sub, index: index, total: total, job: originalTask, findings: findings, firmer: firmer),
+            screenshot: shot,
+            displayWidthPoints: Int(WebSandbox.width),
+            displayHeightPoints: Int(WebSandbox.height),
+            note: await scoutWebContext()
+        )
+
+        let maxSteps = 80
+        var count = 0
+        while count < maxSteps, !stopped {
+            if step.failed {
+                audit("sandbox.done", "scout planner error (acted=\(acted)): \(step.text.prefix(70))")
+                return (.failed("I couldn't reach the Scout model just now — ask again and I'll continue."), acted)
+            }
+            if step.done {
+                switch Self.classifyDone(rawText: step.text, failed: false) {
+                case .transportFailure:
+                    return (.failed("I couldn't reach the model just now — ask again."), acted)
+                case .needsLogin(let site):
+                    audit("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                    return (.needsLogin(site), acted)
+                case .incomplete(let reason):
+                    audit("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                    return (.failed("Couldn't finish — \(reason)"), acted)
+                case .finished(let raw):
+                    audit("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
+                    return (.finished(raw), acted)
+                }
+            }
+            if !step.text.isEmpty {
+                audit("sandbox.turn", String(step.text.prefix(90)))
+                onUpdate(Update(status: prefix + step.text, snapshotPNG: nil, url: sandbox.currentURL, done: false, result: nil))
+            }
+            // Scout's actions are already batch-safe + pre-grounded; execute them.
+            var turnStateChanges = 0
+            for action in step.actions {
+                if pendingSteer != nil || stopped { break }
+                await apply(action)
+                if let pt = sandbox.consumeActionPoint() { onCursor?(pt) }
+                acted = true
+                if Self.isStateChanging(action) { turnStateChanges += 1 }
+            }
+            var nudge: String?
+            // Grounding visibility — where each named target resolved (or missed) —
+            // plus a re-describe nudge on a miss, so Scout renames from the pushed
+            // list instead of silently going idle on an un-findable target.
+            if let g = agent.lastGroundLog { audit("sandbox.ground", String(g.prefix(100))) }
+            if let missed = agent.lastGroundMiss {
+                audit("sandbox.ground.miss", String(missed.prefix(80)))
+                nudge = "Couldn't find “\(missed)” on the page — name a target EXACTLY as it appears in the clickable/fillable list below, or use type with NO target if you've already clicked into the field."
+            }
+
+            let turnActed = turnStateChanges > 0
+            if turnActed {
+                idleTurns = 0
+            } else if !step.done {
+                idleTurns += 1
+                if idleTurns >= 3 {
+                    audit("sandbox.stalled", String(step.text.prefix(80)))
+                    return (.failed("I kept looking without making progress, so I stopped."), acted)
+                }
+                if idleTurns == 2 {
+                    let extra = "You've spent two turns without changing anything. Name a button or field from the clickable list to click or fill NOW, or if it's already done or impossible, set action to \"done\" and say so."
+                    nudge = nudge.map { $0 + " " + extra } ?? extra
+                }
+            }
+
+            try? await Task.sleep(for: .milliseconds(300))
+            shot = await sandbox.snapshotPNG() ?? shot
+
+            if turnActed {
+                let signature = await pageSignature()
+                if signature == lastSignature {
+                    noEffectTurns += 1
+                    if noEffectTurns >= 3 {
+                        audit("sandbox.noeffect", "3rd no-effect — stopping")
+                        return (.failed("My actions stopped changing the page, so I stopped."), acted)
+                    }
+                    audit("sandbox.noeffect", "page unchanged after acting")
+                    let extra = "Your last action did NOT change the page — it had no effect. Do NOT repeat it; name a DIFFERENT element from the clickable list, or take another route."
+                    nudge = nudge.map { $0 + " " + extra } ?? extra
+                } else {
+                    noEffectTurns = 0
+                }
+                lastSignature = signature
+            }
+
+            // Steer handling — identical contract to the Claude path.
+            var steerNote: String?
+            if let steer = pendingSteer {
+                pendingSteer = nil
+                steerNote = """
+                ⚠️ The user just sent you this, and it's the priority now: \(steer)
+                If it's a FOLLOW-UP ("after that", "also", "then"), finish your current \
+                task first — a queued step will carry this out next with your findings. \
+                If it REPLACES your current task, wrap up now so that step takes over. \
+                Either way, do NOT ignore it.
+                """
+                if !droppedOriginalPlanForSteer {
+                    plan = Array(plan.prefix(index + 1))
+                    droppedOriginalPlanForSteer = true
+                }
+                plan.append(AgentSubtask(task: steer, web: true))
+            }
+
+            // Proactive context (the web Set-of-Marks push): the page text + the
+            // clickable/fillable elements, every turn, so the weak planner names
+            // targets that exist and the DOM grounder hits them.
+            let note = [steerNote, nudge, await scoutWebContext()].compactMap { $0 }.joined(separator: "\n\n")
+            step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
+            count += 1
+        }
+        return (stopped ? .stopped : .stepLimit, acted)
+    }
+
+    /// The page's text + clickable/fillable elements, pushed to Scout each turn
+    /// (the web analog of the on-screen AX-label push) so it names real targets.
+    private func scoutWebContext() async -> String? {
+        let page = await sandbox.readPageText()
+        let interactives = await sandbox.listInteractives()
+        var parts: [String] = []
+        if !page.hasPrefix("Couldn't read") { parts.append("PAGE NOW:\n" + String(page.prefix(1600))) }
+        if !interactives.hasPrefix("No interactive"), !interactives.hasPrefix("Couldn't") {
+            parts.append("CLICKABLE / FILLABLE NOW (name one of these to click or fill):\n" + String(interactives.prefix(1200)))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    /// Optional visual fallback for the web grounder: hosted UI-TARS over OpenRouter,
+    /// only when a key is set and the grounder isn't disabled. nil → DOM-only
+    /// grounding (which needs no key and handles the vast majority of web targets).
+    private static func snapshotFallbackGrounder() -> (any VisualGrounder)? {
+        let enabled = (UserDefaults.standard.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
+        guard enabled, let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
+        let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+        return UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
+    }
+
+    /// Web-surface rules for the Scout brain (the analog of `sandboxNote`, phrased for
+    /// Scout's name-a-target vocabulary and its done-action signalling).
+    static let scoutSandboxNote = """
+    You are inside ONE web view in a sandboxed browser — there are NO tabs, no "+" \
+    button, no address bar, and no other apps (open_app does nothing here). To go to a \
+    site or known URL, use open_url — it loads in this same view. Never try to open a \
+    tab or an app.
+
+    Actually CARRY OUT the task on the real website(s). Do NOT search for tutorials or \
+    "how to" guides, and do NOT go to ChatGPT to ask how — just do the task itself.
+
+    Each turn you are given the page's text and its clickable/fillable elements. Name \
+    targets from what you SEE there (a button's label, a field's placeholder, a link's \
+    text); naming one acts on the real element — you never need coordinates.
+
+    If the page is a sign-in / login wall and you do NOT have credentials, do NOT guess \
+    or type anything. Set action to "done" with the thought EXACTLY: NEEDS_LOGIN <site>.
+
+    Before you say done, confirm the result actually exists on the page (the text you \
+    typed is there, the form submitted). Taking an action is not the same as finishing.
+
+    If you genuinely CANNOT finish — a control won't accept input, the thing doesn't \
+    exist — do NOT pretend. Set action to "done" with the thought starting EXACTLY: \
+    INCOMPLETE: <one line on what blocked you>.
+
+    When TRULY finished, set action to "done" with a thought stating the concrete \
+    outcome and key facts you found or produced — names, prices, dates, links — because \
+    later parts of the job rely on that line.
+    """
+
     /// Cheap "did the page change" signature for no-effect detection — URL + a
     /// prefix of the readable text. A dead DOM action leaves it unchanged;
     /// navigation/content changes move it. Web-native (no pixel churn from
@@ -457,10 +709,13 @@ public final class BackgroundWebAgent {
     }
 
     /// Whether a built-in action changes page state (so it counts toward acting),
-    /// vs an observation that doesn't (screenshot/wait/zoom/highlight).
+    /// vs one that doesn't: an observation (screenshot/wait/zoom/highlight) or a
+    /// clipboard copy (predicted-effect — a copy legitimately leaves the page
+    /// unchanged, so a copy-only turn must not trip the no-effect / stall guards).
     nonisolated static func isStateChanging(_ action: CUAction) -> Bool {
         switch action {
         case .screenshot, .wait, .zoom, .highlight: return false
+        case .key(let combo): return !ComputerUseAgent.isCopyCombo(combo)
         default: return true
         }
     }
