@@ -220,9 +220,10 @@ public struct UITARSGrounder: VisualGrounder {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         // Short per-attempt cap: grounding normally returns in ~1s, so a connection
-        // that hasn't answered in 12s is dead — fail fast and recycle on the next
-        // attempt rather than hang the whole turn.
-        request.timeoutInterval = 12
+        // that hasn't answered in 8s is dead — fail fast and recycle on the next
+        // attempt rather than hang the whole turn. Most failures are immediate
+        // resets (not timeouts), so this only bounds the rare true-hang case.
+        request.timeoutInterval = 8
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         // Don't reuse a pooled keep-alive connection: Parasail drops idle ones, and
         // reusing a dead socket is the "broken pipe / SSL bad record mac" failure

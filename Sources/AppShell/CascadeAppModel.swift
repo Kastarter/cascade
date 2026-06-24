@@ -240,7 +240,10 @@ public final class CascadeAppModel: ObservableObject {
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
-        cuEffort = defaults.string(forKey: Self.cuEffortKey) ?? "medium"
+        // The "Cursor agent speed" picker was removed and CLAUDE.md puts effort:low
+        // "off the table" (it makes the agent dumb), so pin medium — ignoring any
+        // stale `cascade.cuEffort = "low"` a prior build's picker may have persisted.
+        cuEffort = "medium"
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
