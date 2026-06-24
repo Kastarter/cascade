@@ -307,13 +307,16 @@ public final class ScoutAgent {
         case .type:
             guard let text = a.text else { return [] }
             // Target named → click into it and replace (the fill batch); no target
-            // → type into whatever's focused. A "double" click ENTERS text editing
-            // first (e.g. a Keynote/Pages placeholder): without it a single click
-            // only SELECTS the object, so the cmd+a in the fill becomes Select-All-
-            // Objects and the paste drops a stray text box instead of replacing.
+            // → type into whatever's focused. DEFAULT to a DOUBLE click: it enters
+            // text editing on a canvas placeholder (Keynote/Pages title/subtitle),
+            // where a single click only SELECTS the box and the fill's cmd+a then
+            // becomes Select-All-Objects + a stray paste — the audited flail. The
+            // weak planner won't reliably ask for double itself, so we default to it
+            // (harmless on a plain field: cmd+a still replaces). Force single with
+            // click:"single" only for a field where a double-click misbehaves.
             guard let target = a.target, !target.isEmpty else { return [.type(text)] }
             guard let point = await groundedPoint(target, screenshot: screenshot) else { return [] }
-            return ComputerUseAgent.fillActions(at: point, text: text, double: a.click == "double", submit: "return")
+            return ComputerUseAgent.fillActions(at: point, text: text, double: a.click != "single", submit: "return")
         }
     }
 
@@ -432,12 +435,12 @@ public final class ScoutAgent {
       described by its visible label, role, or nearby text (e.g. "the Save button", \
       "the search field", "the subtitle placeholder"). DO NOT output coordinates — \
       naming the target is enough; the system locates it for you.
-    - "type": enter text. "text" is what to type; "target" (optional) is the field \
-      to type into — given a target, it is clicked and its contents replaced. For a \
-      CANVAS PLACEHOLDER that needs a double-click to start editing (a Keynote/Pages \
-      title, subtitle, or body), add "click":"double" — a single click only SELECTS \
-      the box, so the text would land in the wrong place. Plain fields/search boxes \
-      need no "click".
+    - "type": enter text. "text" is what to type; "target" (optional) is the field, \
+      DESCRIBED BY WHAT YOU SEE (its visible label or placeholder text) — never the \
+      text you intend to type. Given a target it is double-clicked (to enter editing), \
+      its contents selected, and replaced with "text". For the rare plain field where \
+      a double-click misbehaves, add "click":"single". With no target, the text goes \
+      to whatever already has focus.
     - "key": press a key or combo in "key" (e.g. "return", "cmd+s", "tab", "escape").
     - "scroll": "direction" up/down, optional "target" to scroll over, "amount" clicks.
     - "open_app": launch/focus an app named in "target". "open_url": open "target" URL.
