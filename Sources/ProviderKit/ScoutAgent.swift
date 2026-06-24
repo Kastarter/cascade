@@ -32,6 +32,7 @@ public final class ScoutAgent {
         public let key: String?      // e.g. "cmd+s", "return"
         public let direction: String? // scroll: "up"/"down"
         public let amount: Int?      // scroll clicks
+        public let click: String?    // "single"/"double" for a type/click target
         public let thought: String   // short narration / done reason
     }
 
@@ -304,10 +305,13 @@ public final class ScoutAgent {
         case .type:
             guard let text = a.text else { return [] }
             // Target named → click into it and replace (the fill batch); no target
-            // → type into whatever's focused.
+            // → type into whatever's focused. A "double" click ENTERS text editing
+            // first (e.g. a Keynote/Pages placeholder): without it a single click
+            // only SELECTS the object, so the cmd+a in the fill becomes Select-All-
+            // Objects and the paste drops a stray text box instead of replacing.
             guard let target = a.target, !target.isEmpty else { return [.type(text)] }
             guard let point = await groundedPoint(target, screenshot: screenshot) else { return [] }
-            return ComputerUseAgent.fillActions(at: point, text: text, double: false, submit: "return")
+            return ComputerUseAgent.fillActions(at: point, text: text, double: a.click == "double", submit: "return")
         }
     }
 
@@ -381,6 +385,7 @@ public final class ScoutAgent {
             key: nonEmpty(json["key"] as? String),
             direction: nonEmpty(json["direction"] as? String),
             amount: (json["amount"] as? NSNumber)?.intValue,
+            click: nonEmpty(json["click"] as? String),
             thought: (json["thought"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
@@ -426,7 +431,11 @@ public final class ScoutAgent {
       "the search field", "the subtitle placeholder"). DO NOT output coordinates — \
       naming the target is enough; the system locates it for you.
     - "type": enter text. "text" is what to type; "target" (optional) is the field \
-      to type into — given a target, it is clicked and its contents replaced.
+      to type into — given a target, it is clicked and its contents replaced. For a \
+      CANVAS PLACEHOLDER that needs a double-click to start editing (a Keynote/Pages \
+      title, subtitle, or body), add "click":"double" — a single click only SELECTS \
+      the box, so the text would land in the wrong place. Plain fields/search boxes \
+      need no "click".
     - "key": press a key or combo in "key" (e.g. "return", "cmd+s", "tab", "escape").
     - "scroll": "direction" up/down, optional "target" to scroll over, "amount" clicks.
     - "open_app": launch/focus an app named in "target". "open_url": open "target" URL.
