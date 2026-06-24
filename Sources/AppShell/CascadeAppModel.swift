@@ -2480,8 +2480,20 @@ public final class CascadeAppModel: ObservableObject {
         let element = focused as! AXUIElement
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
-              settable.boolValue else { return false }
-        return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+              settable.boolValue,
+              AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+        else { return false }
+        // VERIFY the insert actually took. Web <input>/combobox elements (Google
+        // Flights, most sites) ACCEPT the set and report .success while the value
+        // never changes — the phantom write behind the audited "can't type"
+        // (computer.type.ax → no-effect, while the SAME field+text via paste worked).
+        // Read the value back; only claim success if it now reflects the text, else
+        // return false so the caller falls to paste/keystrokes, which DO land. A
+        // field that doesn't expose its value reads nil → also falls through (paste
+        // is reliable, so an occasional unnecessary paste is harmless).
+        let after = axString(element, kAXValueAttribute as String)
+            ?? axString(element, kAXSelectedTextAttribute as String)
+        return after?.contains(text) ?? false
     }
 
     private nonisolated static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
