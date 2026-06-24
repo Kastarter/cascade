@@ -446,3 +446,16 @@ func sendTaughtAgentToManagerSurfacesInTheReviewQueue() throws {
     model.declineCurated(curated)
     #expect(!model.pendingCuratedAgents.contains { $0.signature == "sig-taught" })
 }
+
+@Test
+func isSameGoalDetectsReFiresButNotDifferentCommands() {
+    let g = "Open Keynote and design a market entry readout for Cascade."
+    // Identical or minor transcription variance = a voice re-fire → same.
+    #expect(CascadeAppModel.isSameGoal(g, g))
+    #expect(CascadeAppModel.isSameGoal(g, "Open Keynote and design a market entry readout"))
+    // A genuinely different command (new step / steer) → NOT same, still supersedes.
+    #expect(!CascadeAppModel.isSameGoal(g, "make the title bigger"))
+    #expect(!CascadeAppModel.isSameGoal(g, "now add a chart to the slide"))
+    // Short utterances never match (need ≥3 words).
+    #expect(!CascadeAppModel.isSameGoal("open it", "open it"))
+}
