@@ -145,7 +145,14 @@ public final class ScoutAgent {
         switch a.kind {
         case .openApp: return a.target.map { [.openApp($0)] } ?? []
         case .openURL: return a.target.map { [.openURL($0)] } ?? []
-        case .key: return a.key.map { [.key($0)] } ?? []
+        case .key:
+            guard let key = a.key else { return [] }
+            // Paste gate (Scout has no downstream pasteRefusal like the Opus path):
+            // a bare cmd+v / ctrl+v pastes the USER's clipboard, corrupting the
+            // field — the documented incident. Scout's `type` delivers text itself,
+            // so refuse bare paste keys outright.
+            if ComputerUseAgent.isPasteCombo(key) { return [] }
+            return [.key(key)]
         case .wait: return [.wait]
         case .done: return []
         case .scroll:

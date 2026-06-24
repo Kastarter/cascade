@@ -163,33 +163,6 @@ public final class CascadeAppModel: ObservableObject {
     @Published public var onScreenBackend: String {
         didSet { defaultsStore.set(onScreenBackend, forKey: "cascade.onScreenBackend") }
     }
-    /// Grounder for clicks/fills/highlight: "uitars" (local, free), "claude"
-    /// (cloud ElementLocator), or "off". Drives the two keys `assistGrounder()`
-    /// reads — the enable flag and the backend.
-    @Published public var grounderChoice: String {
-        didSet {
-            switch grounderChoice {
-            case "off":
-                defaultsStore.set(false, forKey: "cascade.visualGrounder")
-            case "claude":
-                defaultsStore.set(true, forKey: "cascade.visualGrounder")
-                defaultsStore.set("claude", forKey: "cascade.visualGrounder.backend")
-            default:
-                defaultsStore.set(true, forKey: "cascade.visualGrounder")
-                defaultsStore.set("uitars", forKey: "cascade.visualGrounder.backend")
-            }
-        }
-    }
-    /// UI-TARS endpoint + served model id, editable so the user can point at their
-    /// own server (mlx-vlm on :8000, LM Studio on :1234, vLLM, …) without `defaults
-    /// write`.
-    @Published public var uitarsURL: String {
-        didSet { defaultsStore.set(uitarsURL, forKey: "cascade.visualGrounder.uitarsURL") }
-    }
-    @Published public var uitarsModel: String {
-        didSet { defaultsStore.set(uitarsModel, forKey: "cascade.visualGrounder.uitarsModel") }
-    }
-
     /// Per-region Hamming threshold for "this action changed nothing on screen" —
     /// much tighter than the recorder's blink-tolerant dedup (`regionSkipThreshold`
     /// = 5). A dead click yields a near byte-identical frame; any real change
@@ -269,10 +242,6 @@ public final class CascadeAppModel: ObservableObject {
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
         cuEffort = defaults.string(forKey: Self.cuEffortKey) ?? "medium"
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
-        let grounderOn = (defaults.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
-        grounderChoice = grounderOn ? (defaults.string(forKey: "cascade.visualGrounder.backend") ?? "uitars") : "off"
-        uitarsURL = defaults.string(forKey: "cascade.visualGrounder.uitarsURL") ?? "http://localhost:8000/v1/chat/completions"
-        uitarsModel = defaults.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "ui-tars-1.5-7b"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(store: store)
@@ -1170,12 +1139,13 @@ public final class CascadeAppModel: ObservableObject {
     /// `cascade.visualGrounder = false`. Backend defaults to "uitars": **hosted
     /// UI-TARS-1.5-7B over OpenRouter** (OpenAI-compatible), so end users never run
     /// a 7B model locally. Authenticates with the OpenRouter key in the Keychain;
-    /// with no key (and no local URL override) it returns nil — the agent then runs
-    /// the proven coordinate computer-tool path, never broken. A
-    /// `cascade.visualGrounder.uitarsURL` override (e.g. a local mlx/vLLM server)
-    /// skips the key requirement. Set `cascade.visualGrounder.backend = "claude"`
-    /// to ground with the cloud ElementLocator instead (zero setup, costs a Claude
-    /// call per locate). See [[cascade-cu-downgrade-research]].
+    /// with no key it returns nil — the agent then runs the proven coordinate
+    /// computer-tool path, never broken. Set `cascade.visualGrounder.backend =
+    /// "claude"` to ground with the cloud ElementLocator instead (zero setup, costs
+    /// a Claude call per locate). There is deliberately NO local-URL override: a
+    /// stale `cascade.visualGrounder.uitarsURL` default (from old local-mlx builds)
+    /// once silently hijacked the grounder to a dead localhost endpoint and stalled
+    /// every run — hosting is OpenRouter-only. See [[cascade-cu-downgrade-research]].
     static func assistGrounder() -> VisualGrounder? {
         let d = UserDefaults.standard
         // Default ON: unset → enabled; explicit false → disabled.
@@ -1186,16 +1156,10 @@ public final class CascadeAppModel: ObservableObject {
             return ClaudeVisualGrounder()
         default:
             // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
-            let model = d.string(forKey: "cascade.visualGrounder.uitarsModel") ?? "bytedance/ui-tars-1.5-7b"
-            let key = OpenRouterKeyStore().readKey()
-            // A custom endpoint (local mlx/vLLM) is used as-is, key optional.
-            if let override = d.string(forKey: "cascade.visualGrounder.uitarsURL").flatMap(URL.init(string:)) {
-                return UITARSGrounder(baseURL: override, model: model, apiKey: key)
-            }
-            // Hosted OpenRouter default needs a key — nothing to call without it.
-            guard let key, !key.isEmpty else { return nil }
+            // Requires the key; without it return nil → coordinate fallback.
+            guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
             let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
-            return UITARSGrounder(baseURL: url, model: model, apiKey: key)
+            return UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
         }
     }
 
