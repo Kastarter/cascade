@@ -1237,11 +1237,18 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
-    /// Tier 2 on-screen backend: "scout" runs the downgraded Scout-plan +
-    /// UI-TARS-ground loop; anything else (default) runs the Opus computer-use
-    /// loop. Opt in with `cascade.onScreenBackend = scout`.
+    /// On-screen backend: Scout (Groq plan + grounder) vs the Opus computer-use loop.
+    /// ONE BRAIN: Scout is the DEFAULT whenever it's fully set up — a Groq key (the
+    /// planner) AND an OpenRouter key (the grounder) are both present — matching the
+    /// background agent. Force either way with `cascade.onScreenBackend` = "scout" /
+    /// "opus"; with the keys missing it falls back to the proven Opus path, so a
+    /// keyless setup is never broken.
     static func onScreenBackendIsScout() -> Bool {
-        UserDefaults.standard.string(forKey: "cascade.onScreenBackend") == "scout"
+        switch UserDefaults.standard.string(forKey: "cascade.onScreenBackend") {
+        case "scout": return true
+        case "opus", "claude": return false
+        default: return GroqKeyStore().hasKey() && OpenRouterKeyStore().hasKey()
+        }
     }
 
     /// The Tier 2 on-screen loop: Scout (Groq, vision) plans the next action and
