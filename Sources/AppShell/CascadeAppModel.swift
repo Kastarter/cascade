@@ -920,19 +920,29 @@ public final class CascadeAppModel: ObservableObject {
     /// re-triggering the SAME task) doesn't supersede and restart it.
     private var assistTaskGoal: String?
 
-    /// Whether two goals are the same command (a voice re-fire), by word-set
-    /// overlap. Jaccard ≥ 0.8 catches an identical re-fire and minor transcription
-    /// variance, while a genuinely different command (a new step or a steer) scores
-    /// low and is allowed to supersede. Both need ≥3 words so short utterances never
-    /// false-match. Pure + pinned.
+    /// Whether two goals are the same command (a voice re-fire), tolerant of
+    /// transcription drift. The transcriber re-renders the SAME utterance with heavy
+    /// variance ("keynote"→"keynotes", "cascade"→"cascadia", even "readout"→
+    /// "without"), so exact word overlap misses re-fires. We FUZZY-match words (equal,
+    /// or a shared ≥4-char prefix) and call it the same goal when ≥60% of the larger
+    /// word set matches. A genuinely different command (a new step or a steer) shares
+    /// almost nothing and scores far below, so it still supersedes. Both need ≥3
+    /// words so short utterances never false-match. Pure + pinned; no app- or
+    /// goal-specific terms.
     nonisolated static func isSameGoal(_ a: String, _ b: String) -> Bool {
         func words(_ s: String) -> Set<String> {
             Set(s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
         }
+        func fuzzy(_ x: String, _ y: String) -> Bool {
+            if x == y { return true }
+            guard min(x.count, y.count) >= 4 else { return false }   // short words: exact only
+            return zip(x, y).prefix(while: ==).count >= 4            // shared ≥4-char prefix
+        }
         let sa = words(a), sb = words(b)
         guard sa.count >= 3, sb.count >= 3 else { return false }
-        let union = sa.union(sb).count
-        return union > 0 && Double(sa.intersection(sb).count) / Double(union) >= 0.8
+        let matches = sa.filter { x in sb.contains { fuzzy(x, $0) } }.count
+        let denom = max(sa.count, sb.count)
+        return denom > 0 && Double(matches) / Double(denom) >= 0.6
     }
 
     /// Utterances that mean "halt the run", never a goal.
