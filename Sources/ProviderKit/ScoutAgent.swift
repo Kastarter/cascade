@@ -114,7 +114,7 @@ public final class ScoutAgent {
     private func step(screenshot: Data, note: String? = nil) async -> CUStep {
         lastGroundMiss = nil
         lastGroundLog = nil
-        var user = "Goal: \(goal)\n\nDecide the single next action and reply with the JSON object only."
+        var user = "Goal: \(goal)\n\nDecide the next action(s) and reply with the JSON object only."
         if let note, !note.isEmpty { user += "\n\n" + note }
         let reply: String
         do {
@@ -125,17 +125,31 @@ public final class ScoutAgent {
         } catch {
             return CUStep(actions: [], text: "I couldn't reach the planner.", done: true, failed: true)
         }
-        guard let action = Self.parseScoutAction(reply) else {
+        let plan = Self.parseScoutActions(reply)
+        guard !plan.isEmpty else {
             // Unparseable → an empty, non-done turn; the runner's stall guard
             // ends the episode if this repeats.
             return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
         }
-        history.append((user: user, assistant: Self.historyLine(action)))
-        if action.kind == .done {
-            return CUStep(actions: [], text: action.thought.isEmpty ? "Done." : action.thought, done: true)
+        history.append((user: user, assistant: plan.map(Self.historyLine).joined(separator: " ; ")))
+        // Expand the batch. All actions ground against THIS turn's screenshot, so
+        // the model is told to only batch steps predictable from the current screen
+        // (the no-effect guard catches a batch that ran past a screen change). Stop
+        // at the first "done" — anything after it can't be planned from this frame.
+        var cuActions: [CUAction] = []
+        var sawDone = false
+        for a in plan {
+            if a.kind == .done { sawDone = true; break }
+            cuActions.append(contentsOf: await actions(for: a, screenshot: screenshot))
         }
-        let actions = await actions(for: action, screenshot: screenshot)
-        return CUStep(actions: actions, text: action.thought, done: false)
+        let spoken = plan.first(where: { !$0.thought.isEmpty })?.thought ?? ""
+        // The runner returns on `done` BEFORE executing actions, so only finish when
+        // there's nothing to run this turn; a [fill, done] batch runs the fill now
+        // and the model confirms done next turn.
+        if cuActions.isEmpty {
+            return CUStep(actions: [], text: spoken.isEmpty && sawDone ? "Done." : spoken, done: sawDone)
+        }
+        return CUStep(actions: cuActions, text: spoken, done: false)
     }
 
     /// Maps a parsed action to executable `CUAction`s, grounding named targets via
@@ -195,16 +209,39 @@ public final class ScoutAgent {
         return parts.joined(separator: " ")
     }
 
-    /// Parses Scout's JSON action out of a reply (tolerating prose / ``` fences).
-    /// Pure + pinned — the brain's contract with the runtime. Returns nil when no
-    /// usable action object is present.
+    /// Parses ONE action from a reply (tolerating prose / ``` fences). Kept for the
+    /// single-action contract + tests; `parseScoutActions` handles batches.
     public static func parseScoutAction(_ text: String) -> ScoutAction? {
         guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"),
               start < end,
               let data = String(text[start...end]).data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rawAction = (json["action"] as? String)?.lowercased() else { return nil }
-        guard let kind = mapKind(rawAction) else { return nil }
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return parseOne(json)
+    }
+
+    /// Parses one OR several actions. Scout may batch predictable steps as
+    /// `{"thought":"…","actions":[{…},{…}]}`; a single `{action:…}` object still
+    /// works (back-compat). The outer "thought" is carried onto any element that
+    /// lacks its own. Pure + pinned — the brain's contract with the runtime.
+    public static func parseScoutActions(_ text: String) -> [ScoutAction] {
+        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"),
+              start < end,
+              let data = String(text[start...end]).data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        if let arr = json["actions"] as? [[String: Any]] {
+            let outerThought = json["thought"] as? String
+            return arr.compactMap { element in
+                var e = element
+                if e["thought"] == nil, let outerThought { e["thought"] = outerThought }
+                return parseOne(e)
+            }
+        }
+        return parseOne(json).map { [$0] } ?? []
+    }
+
+    private static func parseOne(_ json: [String: Any]) -> ScoutAction? {
+        guard let rawAction = (json["action"] as? String)?.lowercased(),
+              let kind = mapKind(rawAction) else { return nil }
         return ScoutAction(
             kind: kind,
             target: nonEmpty(json["target"] as? String),
@@ -238,12 +275,18 @@ public final class ScoutAgent {
 
     static let systemPrompt = """
     You are an on-screen computer-use agent. You see the user's screen and drive it \
-    to accomplish their goal, ONE action at a time.
+    to accomplish their goal.
 
-    Reply with ONLY a single JSON object — no prose, no code fences — of this shape:
+    Reply with ONLY JSON — no prose, no code fences. For ONE action:
     {"thought": "<one short clause on what you're doing>", "action": "<one action>", \
     "target": "<the on-screen element, named in plain words>", "text": "<text to type>", \
     "key": "<key combo>", "direction": "<up|down>", "amount": <int>}
+    To do several PREDICTABLE steps in one turn, batch them:
+    {"thought": "<clause>", "actions": [{"action": …}, {"action": …}]}
+    Only batch steps you can predict from the CURRENT screen (e.g. fill the title, \
+    then fill the subtitle). If the next step depends on something not yet visible (a \
+    menu about to open, a dialog that may appear), do ONE action and look again — \
+    never batch past an action that changes what's on screen.
 
     Actions:
     - "click" / "double_click": press an element. Put what to click in "target", \
