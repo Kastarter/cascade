@@ -393,7 +393,11 @@ public final class CascadeAppModel: ObservableObject {
             var answered = true
             do {
                 let recordAnswer = try await orchestrator.askRecord(trimmed, conversation: Array(history))
-                result = Self.brief(recordAnswer.text)
+                // Show the FULL answer in the text thread. brief() is the ~280-char
+                // SPOKEN cap (voice replies stay short) — applying it here chopped
+                // multi-item summaries mid-word ("2. **Keyn…") even though the chat
+                // bubble is scrollable and has no line limit.
+                result = recordAnswer.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 citations = await orchestrator.citedMoments(recordAnswer.citedMomentIDs).map {
                     CitedMoment(id: $0.id, appName: $0.appName, capturedAt: $0.capturedAt, imagePath: $0.imagePath)
                 }
