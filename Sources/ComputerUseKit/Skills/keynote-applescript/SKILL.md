@@ -2,6 +2,7 @@
 name: keynote-applescript
 description: AppleScript fallback for Keynote — PDF/PowerPoint exports and batch edits over existing decks (presenter notes, retitles, skipping) via osascript.
 useWhen: ONLY when the user asks for a script, or for PDF/PowerPoint exports and batch passes over an EXISTING deck (presenter notes, retitles across many slides) — building decks happens in Keynote's UI
+explicitAskOnly: true
 ---
 
 # Keynote — AppleScript for exports and batch edits

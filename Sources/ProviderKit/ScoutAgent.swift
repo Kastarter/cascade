@@ -146,7 +146,9 @@ public final class ScoutAgent {
         var cuActions: [CUAction] = []
         var sawDone = false
         for a in plan {
-            if a.kind == .done { sawDone = true; break }
+            // Skip (don't break on) a "done" so a [done, action] ordering still runs
+            // the action; done only takes effect when nothing executable remains.
+            if a.kind == .done { sawDone = true; continue }
             cuActions.append(contentsOf: await actions(for: a, screenshot: screenshot))
         }
         let spoken = plan.first(where: { !$0.thought.isEmpty })?.thought ?? ""
@@ -237,10 +239,12 @@ public final class ScoutAgent {
               start < end,
               let data = String(text[start...end]).data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
-        if let arr = json["actions"] as? [[String: Any]] {
+        if let arr = json["actions"] as? [Any] {
             let outerThought = json["thought"] as? String
+            // Per-element cast (not a whole-array cast) so one stray non-object
+            // element doesn't discard the entire batch.
             return arr.compactMap { element in
-                var e = element
+                guard var e = element as? [String: Any] else { return nil }
                 if e["thought"] == nil, let outerThought { e["thought"] = outerThought }
                 return parseOne(e)
             }

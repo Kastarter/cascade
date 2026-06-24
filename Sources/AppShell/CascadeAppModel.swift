@@ -1265,21 +1265,6 @@ public final class CascadeAppModel: ObservableObject {
             var actedThisTurn = false
             if step.actions.isEmpty {
                 idleTurns += 1
-                // A grounding miss (Scout named a target UI-TARS couldn't find) is
-                // the usual idle cause. Tell it what's on screen so it RE-DESCRIBES,
-                // instead of silently repeating the same target until it stalls — the
-                // same re-describe feedback the Opus path gives on a fill_target miss.
-                if let missed = agent.lastGroundMiss {
-                    let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
-                    // Audit WHAT was on screen when the target wasn't found — frontmost
-                    // app + visible controls — so the log proves whether the expected
-                    // window was even present (e.g. "New Document" missing because the
-                    // app never opened / the wrong app is frontmost).
-                    let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
-                    nudge = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target — it types into whatever is focused."
-                    if let summary { nudge! += " Controls on screen now: \(summary)." }
-                }
                 if idleTurns >= 3 {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
                     return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
@@ -1336,8 +1321,20 @@ public final class CascadeAppModel: ObservableObject {
                 noEffectTurns = 0
             }
             if let observedHashes { lastFrameHashes = observedHashes }
+            // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
+            // a partially-grounded batch (where step.actions is non-empty so the idle
+            // path above is skipped). Tells Scout to re-describe instead of silently
+            // re-naming an un-findable target, and audits what was actually on screen.
+            if let missed = agent.lastGroundMiss {
+                let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
+                let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
+                var missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
+                if let summary { missNote += " Controls on screen now: \(summary)." }
+                nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
+            }
             // Refresh the grounding line + app skill every turn (the frontmost app
-            // changes once Scout opens the target), merged with any no-effect nudge.
+            // changes once Scout opens the target), merged with any nudge above.
             let turnNote = [scoutGroundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
             step = await agent.proceed(
                 screenshot: observedShot,
