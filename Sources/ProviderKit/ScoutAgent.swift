@@ -192,7 +192,7 @@ public final class ScoutAgent {
     /// click landed (or that it found nothing), the visibility we were missing.
     public private(set) var lastGroundLog: String?
 
-    private func step(screenshot: Data, note: String? = nil, carried: String? = nil, hop: Int = 0) async -> CUStep {
+    private func step(screenshot: Data, note: String? = nil, carried: String? = nil, hop: Int = 0, parseRetry: Bool = false) async -> CUStep {
         lastGroundMiss = nil
         lastGroundLog = nil
         var user = "Goal: \(goal)\n\nDecide the next action(s) and reply with the JSON object only."
@@ -201,8 +201,10 @@ public final class ScoutAgent {
         let reply: String
         do {
             reply = try await vision.complete(
+                // Headroom for a batched reply with thoughts: 600 truncated ambitious
+                // batches mid-JSON, which then failed to parse and wasted the turn.
                 system: episodeSystem, user: user, imageJPEG: screenshot,
-                model: model, maxTokens: 600, prior: history
+                model: model, maxTokens: 1200, prior: history
             )
         } catch {
             // Surface the real reason (Groq rate-limit / transport / empty) so the
@@ -211,6 +213,14 @@ public final class ScoutAgent {
         }
         let raw = Self.parseRawActions(reply)
         guard !raw.isEmpty else {
+            // A non-empty reply that didn't parse is usually a cut-off batch (JSON
+            // truncated) or prose. Rather than burn an idle turn toward the stall
+            // guard, re-prompt ONCE for a compact valid action; only then go idle.
+            if !reply.isEmpty, !parseRetry {
+                history.append((user: "(unparseable reply)", assistant: String(reply.prefix(200))))
+                let recover = "Your previous reply was not valid JSON (it may have been cut off). Reply with ONLY a single compact JSON action object — no prose, no code fences. If you meant several steps, send FEWER this turn."
+                return await step(screenshot: screenshot, note: recover, parseRetry: true)
+            }
             // Unparseable → an empty, non-done turn; the runner's stall guard
             // ends the episode if this repeats.
             return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
@@ -244,20 +254,55 @@ public final class ScoutAgent {
         guard !plan.isEmpty else {
             return CUStep(actions: [], text: reply.isEmpty ? "" : String(reply.prefix(120)), done: false)
         }
-        history.append((user: user, assistant: plan.map(Self.historyLine).joined(separator: " ; ")))
-        // Expand the batch. All actions ground against THIS turn's screenshot, so
-        // the model is told to only batch steps predictable from the current screen
-        // (the no-effect guard catches a batch that ran past a screen change). Stop
-        // at the first "done" — anything after it can't be planned from this frame.
+        // Batch safety (VeriGUI's screen-idempotency lesson): every target in a batch
+        // grounds against THIS frame, so a grounded action that runs after the screen
+        // already changed this turn would aim at a stale layout. The weak planner
+        // can't be trusted to honour the prompt's "don't batch past a screen change",
+        // so the runtime TRUNCATES the plan at the first grounded action that would
+        // follow a navigation (or a submitting fill) — the dropped tail re-grounds
+        // next turn against the fresh screen. Multiple fills of placeholders that
+        // coexist on one frame (title + subtitle) still chain. Append only what we
+        // actually run to history, so the model doesn't think it did the dropped tail.
+        let batch = Self.safeBatchPrefix(plan)
+        history.append((user: user, assistant: batch.map(Self.historyLine).joined(separator: " ; ")))
+        // Ground every named target in the safe prefix CONCURRENTLY against this one
+        // frame — the lookups are independent, so a two-fill turn pays one grounding
+        // latency, not two in series. Results are recorded in plan order so the
+        // miss/log the runner reads is deterministic. (Capture isolated locals; the
+        // task closures can't touch actor state.)
+        let g = grounder, dw = displayW, dh = displayH
+        var groundResults: [(idx: Int, target: String, point: CGPoint?)] = []
+        await withTaskGroup(of: (Int, String, CGPoint?).self) { group in
+            for (i, a) in batch.enumerated() {
+                guard let target = Self.groundTarget(of: a) else { continue }
+                group.addTask {
+                    (i, target, await g.ground(screenshot: screenshot, target: target, displayWidthPoints: dw, displayHeightPoints: dh))
+                }
+            }
+            for await r in group { groundResults.append(r) }
+        }
+        var grounded: [Int: CGPoint] = [:]
+        var logs: [String] = []
+        for r in groundResults.sorted(by: { $0.idx < $1.idx }) {
+            if let p = r.point {
+                grounded[r.idx] = p
+                logs.append("hit \"\(r.target)\" @ (\(Int(p.x)),\(Int(p.y)))")
+            } else {
+                if lastGroundMiss == nil { lastGroundMiss = r.target }
+                logs.append("miss \"\(r.target)\"")
+            }
+        }
+        lastGroundLog = logs.isEmpty ? nil : logs.joined(separator: "; ")
+        // Expand the (pre-grounded) plan into executable actions. Stop counting at
+        // "done" but still run any action — done only takes effect when nothing
+        // executable remains.
         var cuActions: [CUAction] = []
         var sawDone = false
-        for a in plan {
-            // Skip (don't break on) a "done" so a [done, action] ordering still runs
-            // the action; done only takes effect when nothing executable remains.
+        for (i, a) in batch.enumerated() {
             if a.kind == .done { sawDone = true; continue }
-            cuActions.append(contentsOf: await actions(for: a, screenshot: screenshot))
+            cuActions.append(contentsOf: expand(a, groundedPoint: grounded[i]))
         }
-        let spoken = plan.first(where: { !$0.thought.isEmpty })?.thought ?? ""
+        let spoken = batch.first(where: { !$0.thought.isEmpty })?.thought ?? ""
         // The runner returns on `done` BEFORE executing actions, so only finish when
         // there's nothing to run this turn; a [fill, done] batch runs the fill now
         // and the model confirms done next turn.
@@ -278,10 +323,57 @@ public final class ScoutAgent {
         return await harnessProvider?(name, input) ?? "The \(name) tool isn't available."
     }
 
-    /// Maps a parsed action to executable `CUAction`s, grounding named targets via
-    /// the grounder. An empty result (grounding miss) makes the turn idle — the
-    /// runner re-observes and the model tries again.
-    private func actions(for a: ScoutAction, screenshot: Data) async -> [CUAction] {
+    /// The on-screen target a parsed action must ground, or nil when it needs no
+    /// grounding (keys, waits, open_app/url, a scroll/type with no named target). Pure
+    /// — drives both the concurrent grounding pass and `safeBatchPrefix`.
+    nonisolated static func groundTarget(of a: ScoutAction) -> String? {
+        switch a.kind {
+        case .click, .doubleClick: return a.target
+        case .scroll: return a.target
+        case .type: return (a.target?.isEmpty == false) ? a.target : nil
+        case .openApp, .openURL, .key, .wait, .done: return nil
+        }
+    }
+
+    /// True when an action changes the on-screen LAYOUT (navigation), so a grounded
+    /// action batched AFTER it would aim at a stale frame. Typing/fills change pixels
+    /// but not the position of other visible controls, so they aren't counted here
+    /// (their submit-navigation risk is handled by the fill rule in `safeBatchPrefix`).
+    nonisolated static func mutatesLayout(_ a: ScoutAction) -> Bool {
+        switch a.kind {
+        case .click, .doubleClick, .scroll, .openApp, .openURL, .key: return true
+        case .type, .wait, .done: return false
+        }
+    }
+
+    /// The leading run of a batch that is safe to execute against ONE screenshot: a
+    /// grounded action may not follow a navigation (which moved the layout) or a
+    /// fill (which can submit and navigate) unless it is itself a fill of a
+    /// co-visible placeholder. The dropped tail re-grounds next turn on the fresh
+    /// screen. Pure + pinned — this is the structural batch-safety guard.
+    nonisolated static func safeBatchPrefix(_ plan: [ScoutAction]) -> [ScoutAction] {
+        var out: [ScoutAction] = []
+        var navigated = false
+        var sawFill = false
+        for a in plan {
+            let needsGround = groundTarget(of: a) != nil
+            let isFill = a.kind == .type && (a.target?.isEmpty == false)
+            if needsGround {
+                if navigated { break }            // grounds against a navigated-away frame
+                if sawFill && !isFill { break }   // e.g. fill a search box → click a result
+            }
+            out.append(a)
+            if isFill { sawFill = true }
+            if mutatesLayout(a) { navigated = true }
+        }
+        return out
+    }
+
+    /// Expands a parsed action (with its target already grounded, if any) into
+    /// executable `CUAction`s. A grounding miss (`groundedPoint == nil` for an action
+    /// that needed one) yields no actions, making the turn idle so the runner
+    /// re-observes and the model tries again.
+    private func expand(_ a: ScoutAction, groundedPoint: CGPoint?) -> [CUAction] {
         switch a.kind {
         case .openApp: return a.target.map { [.openApp($0)] } ?? []
         case .openURL: return a.target.map { [.openURL($0)] } ?? []
@@ -298,11 +390,10 @@ public final class ScoutAgent {
         case .wait: return [.wait]
         case .done: return []
         case .scroll:
-            let point = await groundedPoint(a.target, screenshot: screenshot)
-                ?? CGPoint(x: CGFloat(displayW) / 2, y: CGFloat(displayH) / 2)
+            let point = groundedPoint ?? CGPoint(x: CGFloat(displayW) / 2, y: CGFloat(displayH) / 2)
             return [.scroll(x: point.x, y: point.y, direction: a.direction ?? "down", amount: a.amount ?? 3)]
         case .click, .doubleClick:
-            guard let point = await groundedPoint(a.target, screenshot: screenshot) else { return [] }
+            guard let point = groundedPoint else { return [] }
             return [a.kind == .doubleClick ? .doubleClick(x: point.x, y: point.y) : .click(x: point.x, y: point.y)]
         case .type:
             guard let text = a.text else { return [] }
@@ -315,24 +406,9 @@ public final class ScoutAgent {
             // (harmless on a plain field: cmd+a still replaces). Force single with
             // click:"single" only for a field where a double-click misbehaves.
             guard let target = a.target, !target.isEmpty else { return [.type(text)] }
-            guard let point = await groundedPoint(target, screenshot: screenshot) else { return [] }
+            guard let point = groundedPoint else { return [] }
             return ComputerUseAgent.fillActions(at: point, text: text, double: a.click != "single", submit: "return")
         }
-    }
-
-    private func groundedPoint(_ target: String?, screenshot: Data) async -> CGPoint? {
-        guard let target, !target.isEmpty else { return nil }
-        let point = await grounder.ground(
-            screenshot: screenshot, target: target,
-            displayWidthPoints: displayW, displayHeightPoints: displayH
-        )
-        if let point {
-            lastGroundLog = "hit \"\(target)\" @ (\(Int(point.x)),\(Int(point.y)))"
-        } else {
-            lastGroundMiss = target
-            lastGroundLog = "miss \"\(target)\""
-        }
-        return point
     }
 
     nonisolated private static func historyLine(_ a: ScoutAction) -> String {

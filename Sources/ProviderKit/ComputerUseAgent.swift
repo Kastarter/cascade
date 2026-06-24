@@ -617,6 +617,14 @@ public final class ComputerUseAgent {
         var texts: [String] = []
         var actions: [CUAction] = []
         pendingToolIDs = []
+        // Concurrent grounding (structural): when this turn NAMES more than one
+        // target, ground them all at once against the frame the turn was generated
+        // from, instead of one network round trip per target in series (a title +
+        // subtitle + author turn paid three grounding latencies back to back).
+        // Behaviour-identical to the sequential path — same frame → same point — so
+        // this is purely latency. The cache is consulted by the grounded* helpers
+        // below; a single-target turn skips it and grounds inline as before.
+        let groundCache = await pregroundTargets(in: content)
         for (index, block) in content.enumerated() {
             switch block["type"] as? String {
             case "text":
@@ -657,7 +665,7 @@ public final class ComputerUseAgent {
                     // expands to the same click → cmd+a → type → submit batch. On a
                     // grounding miss, tell the model so it re-describes or clicks
                     // directly — answered inline (no wasted screenshot turn).
-                    if let expanded = await expandFillTarget(input) {
+                    if let expanded = await expandFillTarget(input, cache: groundCache) {
                         actions.append(contentsOf: expanded)
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
@@ -669,7 +677,7 @@ public final class ComputerUseAgent {
                     // Structural grounding (structural mode only): the runtime locates
                     // the named target and clicks it. On a miss, tell the model so it
                     // re-describes — answered inline (no wasted screenshot turn).
-                    if let action = await groundedClick(input) {
+                    if let action = await groundedClick(input, cache: groundCache) {
                         actions.append(action)
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
@@ -694,7 +702,7 @@ public final class ComputerUseAgent {
                 case "scroll":
                     // Scroll over a named target (grounded) or, with no target, the
                     // center of the screen.
-                    if let action = await groundedScroll(input) { actions.append(action) }
+                    if let action = await groundedScroll(input, cache: groundCache) { actions.append(action) }
                 case "wait":
                     actions.append(.wait)
                 case let name? where AgentHarness.isHarnessTool(name)
@@ -852,29 +860,66 @@ public final class ComputerUseAgent {
     /// fill batch. Returns nil when there's no grounder, no frame, the call is
     /// malformed, or the grounder finds nothing — the caller then tells the model.
     /// `frame` defaults to the live frame; tests inject one to exercise the glue.
-    func expandFillTarget(_ input: [String: Any], frame: Data? = nil) async -> [CUAction]? {
-        guard let grounder, let frame = frame ?? lastFrameJPEG,
+    func expandFillTarget(_ input: [String: Any], frame: Data? = nil, cache: [String: CGPoint?]? = nil) async -> [CUAction]? {
+        guard grounder != nil, let frame = frame ?? lastFrameJPEG,
               let target = (input["target"] as? String), !target.isEmpty,
               let text = input["text"] as? String else { return nil }
-        guard let point = await grounder.ground(
-            screenshot: frame, target: target,
-            displayWidthPoints: displayW, displayHeightPoints: displayH
-        ) else { return nil }
+        guard let point = await groundCached(target, frame: frame, cache: cache) else { return nil }
         // The grounder returns display-local AppKit points already — do NOT scale.
         return Self.fillActions(at: point, text: text, double: (input["click"] as? String) == "double", submit: input["submit"] as? String)
+    }
+
+    /// Names every structural target in a turn's content and grounds them all
+    /// concurrently against the current frame, returning a target→point cache the
+    /// per-block grounding reads. Returns an empty cache (no pre-pass) unless the
+    /// turn is structural AND names MORE THAN ONE distinct target — a single target
+    /// gains nothing from a task group and just grounds inline. The grounding kinds
+    /// are the three that take a "target": click_target, fill_target, scroll.
+    func pregroundTargets(in content: [[String: Any]]) async -> [String: CGPoint?] {
+        guard isStructural, let frame = lastFrameJPEG, let g = grounder else { return [:] }
+        let targets = Set(content.compactMap { block -> String? in
+            guard block["type"] as? String == "tool_use",
+                  let name = block["name"] as? String,
+                  name == "click_target" || name == "fill_target" || name == "scroll",
+                  let input = block["input"] as? [String: Any],
+                  let t = input["target"] as? String, !t.isEmpty else { return nil }
+            return t
+        })
+        guard targets.count > 1 else { return [:] }
+        let dw = displayW, dh = displayH
+        var cache: [String: CGPoint?] = [:]
+        await withTaskGroup(of: (String, CGPoint?).self) { group in
+            for t in targets {
+                group.addTask {
+                    (t, await g.ground(screenshot: frame, target: t, displayWidthPoints: dw, displayHeightPoints: dh))
+                }
+            }
+            for await r in group { cache[r.0] = r.1 }
+        }
+        return cache
+    }
+
+    /// Ground a named target, consulting the per-turn concurrent-grounding `cache`
+    /// first (populated by `step`'s pre-pass when a turn names several targets) and
+    /// grounding live only on a cache miss. The cache stores the SAME frame's result
+    /// the live call would return, so this is behaviour-identical to a direct ground
+    /// — purely a latency win when multiple targets share one frame.
+    private func groundCached(_ target: String, frame: Data, cache: [String: CGPoint?]?) async -> CGPoint? {
+        if let cache, let cached = cache[target] { return cached }
+        return await grounder?.ground(
+            screenshot: frame, target: target,
+            displayWidthPoints: displayW, displayHeightPoints: displayH
+        )
     }
 
     /// Grounds a `click_target` call (structural mode) into a click action. The
     /// model NAMES the target; the runtime locates it and clicks. `frame` defaults
     /// to the live frame; tests inject one. Returns nil with no grounder/frame/
     /// target or on a grounding miss — the caller then tells the model.
-    func groundedClick(_ input: [String: Any], frame: Data? = nil) async -> CUAction? {
-        guard let grounder, let frame = frame ?? lastFrameJPEG,
+    func groundedClick(_ input: [String: Any], frame: Data? = nil, cache: [String: CGPoint?]? = nil) async -> CUAction? {
+        guard grounder != nil, let frame = frame ?? lastFrameJPEG,
               let target = (input["target"] as? String), !target.isEmpty else { return nil }
-        guard let point = await grounder.ground(
-            screenshot: frame, target: target,
-            displayWidthPoints: displayW, displayHeightPoints: displayH
-        ) else { return nil }
+        guard let point = await groundCached(target, frame: frame, cache: cache) else { return nil }
         // The grounder returns display-local AppKit points already — do NOT scale.
         switch input["click"] as? String {
         case "double": return .doubleClick(x: point.x, y: point.y)
@@ -886,16 +931,13 @@ public final class ComputerUseAgent {
     /// Grounds a `scroll` call (structural mode). A named target scrolls over that
     /// element; with no target (or a miss) it scrolls over the center of the
     /// display. Never returns nil — a scroll always has a fallback point.
-    func groundedScroll(_ input: [String: Any], frame: Data? = nil) async -> CUAction? {
+    func groundedScroll(_ input: [String: Any], frame: Data? = nil, cache: [String: CGPoint?]? = nil) async -> CUAction? {
         let direction = (input["direction"] as? String) ?? "down"
         let amount = (input["amount"] as? NSNumber)?.intValue ?? 3
         var point = CGPoint(x: CGFloat(displayW) / 2, y: CGFloat(displayH) / 2)
-        if let grounder, let frame = frame ?? lastFrameJPEG,
+        if grounder != nil, let frame = frame ?? lastFrameJPEG,
            let target = (input["target"] as? String), !target.isEmpty,
-           let located = await grounder.ground(
-               screenshot: frame, target: target,
-               displayWidthPoints: displayW, displayHeightPoints: displayH
-           ) {
+           let located = await groundCached(target, frame: frame, cache: cache) {
             point = located  // grounder returns display-local AppKit points already
         }
         return .scroll(x: point.x, y: point.y, direction: direction, amount: amount)
@@ -1340,14 +1382,14 @@ public final class ComputerUseAgent {
 
     /// A key combo that pastes the clipboard: V with cmd/ctrl held, regardless of
     /// extra modifiers (shift+cmd+v is paste-and-match-style — same clipboard).
-    nonisolated static func isPasteCombo(_ combo: String) -> Bool {
+    nonisolated public static func isPasteCombo(_ combo: String) -> Bool {
         let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
         guard parts.last == "v" else { return false }
         return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])
     }
 
     /// A key combo that fills the clipboard: C or X with cmd/ctrl held.
-    nonisolated static func isCopyCombo(_ combo: String) -> Bool {
+    nonisolated public static func isCopyCombo(_ combo: String) -> Bool {
         let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
         guard let key = parts.last, key == "c" || key == "x" else { return false }
         return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])

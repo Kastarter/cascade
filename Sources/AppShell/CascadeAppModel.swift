@@ -1142,7 +1142,7 @@ public final class CascadeAppModel: ObservableObject {
         // the runtime grounds each — the model never emits pixel coordinates. The
         // proven coordinate computer-tool path runs whenever no grounder is present
         // (no OpenRouter key) or the user opts out, so existing behaviour is intact.
-        let grounder = Self.assistGrounder()
+        let grounder = assistGrounder()
         let mode: ComputerUseAgent.GroundingMode =
             (grounder != nil && Self.structuralGroundingEnabled()) ? .structural : .coordinate
         return ComputerUseAgent(
@@ -1185,21 +1185,32 @@ public final class CascadeAppModel: ObservableObject {
     /// stale `cascade.visualGrounder.uitarsURL` default (from old local-mlx builds)
     /// once silently hijacked the grounder to a dead localhost endpoint and stalled
     /// every run — hosting is OpenRouter-only. See [[cascade-cu-downgrade-research]].
-    static func assistGrounder() -> VisualGrounder? {
+    ///
+    /// The chosen visual grounder is wrapped in a `MixtureGrounder` (AX-first, ON by
+    /// default; `cascade.mixtureGrounding = false` to disable) so labeled chrome
+    /// controls resolve structurally — free, exact, no transport flakiness — and only
+    /// canvas/custom elements fall through to the visual model. Instance method so it
+    /// can pass the live `appSkills` registry (the mixture grounder skips AX on the
+    /// apps that registry flags `axUnreliable`).
+    func assistGrounder() -> VisualGrounder? {
         let d = UserDefaults.standard
         // Default ON: unset → enabled; explicit false → disabled.
         let enabled = (d.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
         guard enabled else { return nil }
+        let base: VisualGrounder
         switch d.string(forKey: "cascade.visualGrounder.backend") {
         case "claude":
-            return ClaudeVisualGrounder()
+            base = ClaudeVisualGrounder()
         default:
             // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
             // Requires the key; without it return nil → coordinate fallback.
             guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
             let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
-            return UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
+            base = UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
         }
+        // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
+        let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
+        return mixture ? MixtureGrounder(base: base, skills: appSkills) : base
     }
 
     /// Region locator for the "where is X" highlight: the configured grounder
@@ -1212,7 +1223,7 @@ public final class CascadeAppModel: ObservableObject {
         displayWidthPoints: Int, displayHeightPoints: Int,
         conversation: [(user: String, assistant: String)]
     ) async -> ElementRegion {
-        if let grounder = Self.assistGrounder(),
+        if let grounder = assistGrounder(),
            let region = await grounder.groundRegion(
                screenshot: screenshot, target: question,
                displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
@@ -1245,7 +1256,7 @@ public final class CascadeAppModel: ObservableObject {
         // Scout grounds EVERY click, so it can't run without a working grounder.
         // Fail clearly rather than fall back to a dead localhost endpoint (the old
         // `?? UITARSGrounder()` silently pointed at :8000 and every click missed).
-        guard let grounder = Self.assistGrounder() else {
+        guard let grounder = assistGrounder() else {
             teachMessage = "The Scout backend needs a grounder — connect an OpenRouter key in Settings → Model Keys to use it."
             dock.show(title: "Scout needs a grounder", detail: "Add an OpenRouter key in Settings.")
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: "no-grounder · scout · 0 turns"))
@@ -1294,7 +1305,7 @@ public final class CascadeAppModel: ObservableObject {
         var modelStart = ContinuousClock.now
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
-            conversation: assistMemory.historyForAPI(), note: scoutGroundingNote(),
+            conversation: assistMemory.historyForAPI(), note: scoutContextNote(),
             skill: scoutSkillPush(goal: goal)
         )
         modelTime += modelStart.duration(to: .now); count += 1
@@ -1334,36 +1345,51 @@ public final class CascadeAppModel: ObservableObject {
             }
             // Fresh nudge each turn; the idle / no-effect branches below may set it.
             nudge = nil
-            // A turn with no executable actions (grounding miss or unparseable
-            // plan) is idle — three in a row ends the episode (the stall guard).
+            // Stall guard with observation-only accounting (parity with the Opus
+            // path): a turn with NO executable actions (grounding miss / unparseable
+            // plan) OR one that only waits is the planner staring, not working — count
+            // it toward the guard. (A wait-only turn no longer trips no-effect after
+            // the predicted-effect gate, so without this it could loop unchecked.)
+            // Tolerate 1, nudge at 2, stop at 3.
             var actedThisTurn = false
-            if step.actions.isEmpty {
+            let observationOnly = !step.actions.isEmpty && step.actions.allSatisfy {
+                if case .wait = $0 { return true } else { return false }
+            }
+            if step.actions.isEmpty || observationOnly {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
                     return await scoutEnd(.stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text), "idle-stall")
                 }
+                if idleTurns == 2 {
+                    nudge = "You've now spent two turns without acting on the screen. Act NOW — name a control to click or fill — or, if the task is already done or can't be done, set action to \"done\" and say why. Do not just narrate."
+                }
             } else {
                 idleTurns = 0
-                for action in step.actions {
-                    if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
-                    if driver.runState.isStopRequested { return await scoutEnd(.stopped, "user-stop") }
-                    let ok = await executeCU(action, on: screen)
-                    if !ok { return await scoutEnd(.failed, "action-failed") }  // executeCU surfaced why
-                    acted = true
-                    actedThisTurn = true
-                    try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
-                }
-                try? await Task.sleep(for: .milliseconds(260))       // let the UI settle before re-observing
             }
+            // Execute whatever the turn produced (a lone wait still settles the UI);
+            // an idle/empty turn simply has nothing to run.
+            for action in step.actions {
+                if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
+                if driver.runState.isStopRequested { return await scoutEnd(.stopped, "user-stop") }
+                let ok = await executeCU(action, on: screen)
+                if !ok { return await scoutEnd(.failed, "action-failed") }  // executeCU surfaced why
+                acted = true
+                actedThisTurn = true
+                try? await Task.sleep(for: .milliseconds(120))   // pace gap between actions
+            }
+            if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }   // let the UI settle before re-observing
 
             guard let shot0 = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return await scoutEnd(.failed, "capture-failed") }
             if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
 
             // No-effect check (with the same slow-render re-check the Opus path uses).
+            // Predicted-effect gate (VeriGUI): a turn that only copied or waited
+            // legitimately leaves the screen unchanged — don't charge it as a failure.
+            let expectsChange = Self.turnExpectsVisibleChange(step.actions)
             var observedShot = shot0
             var observedHashes = Self.gridHashes(ofJPEG: shot0)
-            if actedThisTurn, let last = lastFrameHashes, let first = observedHashes,
+            if actedThisTurn, expectsChange, let last = lastFrameHashes, let first = observedHashes,
                PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
                 try? await Task.sleep(for: .milliseconds(400))
                 if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) {
@@ -1379,37 +1405,38 @@ public final class CascadeAppModel: ObservableObject {
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout — 3rd no-effect, stopping"))
                         return await scoutEnd(.stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way."), "noeffect-stall")
                     }
-                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action."
-                    // Flail push: hand Scout the controls actually on screen so it
-                    // re-grounds on a real element by NAME instead of the dead spot.
-                    let controls = AXElementResolver.interactables()
-                    if let summary = AXElementResolver.interactableSummary(controls) {
-                        nudge! += " The controls actually on screen now are: \(summary). Target one of THESE by name (or open the right menu/panel). If it truly can't be done, set action to \"done\" and say so."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout pushed \(controls.count) labels: \(String(summary.prefix(500)))"))
-                    } else {
-                        nudge! += " Choose a DIFFERENT control, menu, or approach — or set action to \"done\" if it can't be done."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout left screen unchanged (no AX controls)"))
-                    }
+                    // The controls list is PUSHED proactively into turnNote below
+                    // (harvested once), so the nudge just steers — no second AX walk.
+                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout no-effect turn \(count)"))
                 }
-            } else if actedThisTurn {
+            } else if actedThisTurn, expectsChange {
                 noEffectTurns = 0
             }
+            // A copy-only/wait-only turn (acted but expectsChange == false) leaves
+            // noEffectTurns untouched: it neither failed nor proved progress.
             if let observedHashes { lastFrameHashes = observedHashes }
+            // Proactive Set-of-Marks push (the literature's grounding>reasoning
+            // finding + Cascade's "push controls, never a pull tool" lesson): harvest
+            // the controls actually on screen ONCE per turn and PUSH them to the weak
+            // planner EVERY turn — not only on a failure — so it names targets that
+            // exist and the grounder (AX-first, then visual) hits them. Bounded AX
+            // walk (≤24, ≤0.3s); empty on canvas/Electron apps that expose nothing.
+            let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
             // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
             // a partially-grounded batch (where step.actions is non-empty so the idle
             // path above is skipped). Tells Scout to re-describe instead of silently
             // re-naming an un-findable target, and audits what was actually on screen.
             if let missed = agent.lastGroundMiss {
-                let summary = AXElementResolver.interactableSummary(AXElementResolver.interactables())
                 let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((summary ?? "(no AX controls)").prefix(200)))"))
-                var missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name the visible field, button, or placeholder you SEE (its label, or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
-                if let summary { missNote += " Controls on screen now: \(summary)." }
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((controlSummary ?? "(no AX controls)").prefix(200)))"))
+                let missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name a VISIBLE field, button, or placeholder from the controls listed below (or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
                 nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
             }
-            // Refresh the grounding line + app skill every turn (the frontmost app
-            // changes once Scout opens the target), merged with any nudge above.
-            let turnNote = [scoutGroundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+            // Refresh the grounding line + the proactive controls list + app skill
+            // every turn (the frontmost app changes once Scout opens the target),
+            // merged with any nudge above.
+            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             step = await agent.proceed(
                 screenshot: observedShot,
@@ -1464,6 +1491,7 @@ public final class CascadeAppModel: ObservableObject {
         var streamActed = false               // an action ran mid-stream this turn
         var streamFailed = false              // executeCU refused — episode is over
         var streamActionTime = Duration.zero  // this turn's in-stream action time
+        var streamExpectedChange = false      // a streamed action this turn expected a visible change
         var pendingNarration: String?         // clause buffered until the turn proves it has actions
         // Wiring captures the episode-local state above, so escalation re-applies
         // it to the rebuilt Opus agent by calling this again.
@@ -1512,6 +1540,7 @@ public final class CascadeAppModel: ObservableObject {
                     streamActionTime += spent
                     actionTime += spent
                     streamActed = true
+                    if Self.expectsVisibleChange(action) { streamExpectedChange = true }
                     return true
                 }
             }
@@ -1659,6 +1688,7 @@ public final class CascadeAppModel: ObservableObject {
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
                     streamActed = false
                     streamActionTime = .zero
+                    streamExpectedChange = false
                     pendingNarration = nil
                     let modelStart = ContinuousClock.now
                     step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
@@ -1688,9 +1718,13 @@ public final class CascadeAppModel: ObservableObject {
             // animation can finish AFTER the 260ms settle, so on a suspected
             // no-effect we wait and re-capture once before concluding (and use that
             // fresher frame). The extra wait costs time only on the rare flail path.
+            // Predicted-effect gate (VeriGUI): a turn whose only acting was a
+            // clipboard copy or a wait legitimately changed nothing — exempt it so an
+            // honest no-op doesn't accrue toward the no-effect stall.
+            let expectsChange = streamExpectedChange || Self.turnExpectsVisibleChange(step.actions)
             var observedShot = nextShot
             var observedHashes = Self.gridHashes(ofJPEG: nextShot)
-            if actedThisTurn, !observationOnly, let last = lastFrameHashes, let first = observedHashes,
+            if actedThisTurn, !observationOnly, expectsChange, let last = lastFrameHashes, let first = observedHashes,
                PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
                 try? await Task.sleep(for: .milliseconds(400))
                 if let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height) {
@@ -1747,12 +1781,14 @@ public final class CascadeAppModel: ObservableObject {
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
                     }
                 }
-            } else if actedThisTurn, !observationOnly {
+            } else if actedThisTurn, !observationOnly, expectsChange {
                 noEffectTurns = 0
             }
+            // A copy-only/wait-only acting turn leaves noEffectTurns untouched.
             if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
             streamActionTime = .zero
+            streamExpectedChange = false
             pendingNarration = nil
             let modelStart = ContinuousClock.now
             step = await agent.proceed(screenshot: observedShot, note: episodeNote(nudge))
@@ -1936,6 +1972,22 @@ public final class CascadeAppModel: ObservableObject {
         return "Frontmost app: \(snapshot.appName)"
     }
 
+    /// Formats the proactive Set-of-Marks controls push from a harvested summary.
+    /// nil when there's nothing on screen (canvas/Electron). Shared by the first
+    /// turn (`scoutContextNote`) and each subsequent turn so the listing is identical.
+    private func scoutControlsLine(_ summary: String?) -> String? {
+        summary.map { "Controls on screen now (name one of these to click or fill, or open a menu/panel to reveal others): \($0)" }
+    }
+
+    /// The first turn's pushed context for Scout: frontmost app/window + the controls
+    /// actually on screen. Subsequent turns rebuild the same shape inline (reusing a
+    /// single AX harvest alongside the no-effect/miss feedback).
+    private func scoutContextNote() -> String? {
+        let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
+        let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
     /// Performs one Computer Use action, flying the companion cursor to pointer
     /// targets first. Returns `false` (and surfaces why) if the actuator is blocked
     /// — e.g. Accessibility / Input Monitoring not granted — so the loop can stop.
@@ -1947,6 +1999,30 @@ public final class CascadeAppModel: ObservableObject {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
         return PerceptualHash.gridHashes(image)
+    }
+
+    /// Whether an action is EXPECTED to change what's visible on screen — the
+    /// predicted-effect signal (VeriGUI's Thinking-Verification-Action-Expectation
+    /// cycle). No-effect detection rests on "an action that changed nothing failed",
+    /// but a few actions legitimately leave the screen unchanged: a clipboard copy
+    /// (cmd+c / cmd+x), an explicit wait, or a pure observation. A turn made ONLY of
+    /// those must NOT be charged as a no-effect failure, or the agent stalls on
+    /// honest no-ops. Made STRUCTURAL (the runtime classifies by action kind) rather
+    /// than model-reported on purpose — a self-declared "no change expected" would
+    /// let a weak planner switch OFF its own safety net by mislabelling a dead click.
+    nonisolated static func expectsVisibleChange(_ action: CUAction) -> Bool {
+        switch action {
+        case .wait, .screenshot, .zoom: return false
+        case .key(let combo): return !ComputerUseAgent.isCopyCombo(combo)
+        default: return true
+        }
+    }
+
+    /// A turn is expected to change the screen if ANY of its acting actions is — so a
+    /// mixed turn (copy THEN click) still expects change, but a copy-only or
+    /// wait-only turn is exempt from no-effect counting.
+    nonisolated static func turnExpectsVisibleChange(_ actions: [CUAction]) -> Bool {
+        actions.contains(where: expectsVisibleChange)
     }
 
     /// Maps an element's CG-global center (top-left origin, from AX) into the

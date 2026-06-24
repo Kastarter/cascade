@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 @testable import AppShell
 @testable import ComputerUseKit
 @testable import MacContextKit
+@testable import ProviderKit
 
 /// Pins the "no state change after an action" engine — the cheapest universal
 /// failure signal in the GUI-agent literature (WILBUR / VeriGUI / AgentRR), used
@@ -68,6 +69,31 @@ struct NoEffectDetectionTests {
     /// Undecodable data yields nil — no-effect detection then safely skips.
     @Test func garbageDataYieldsNil() {
         #expect(CascadeAppModel.gridHashes(ofJPEG: Data([0x01, 0x02, 0x03])) == nil)
+    }
+
+    // MARK: predicted-effect gate (VeriGUI) — a copy/wait-only turn isn't a failure
+
+    @Test func clipboardAndWaitDoNotExpectChange() {
+        #expect(!CascadeAppModel.expectsVisibleChange(.wait))
+        #expect(!CascadeAppModel.expectsVisibleChange(.key("cmd+c")))
+        #expect(!CascadeAppModel.expectsVisibleChange(.key("cmd+x")))
+        #expect(!CascadeAppModel.expectsVisibleChange(.screenshot))
+        #expect(!CascadeAppModel.expectsVisibleChange(.zoom(nx: 0, ny: 0, nw: 1, nh: 1)))
+    }
+
+    @Test func actingKeysAndClicksExpectChange() {
+        #expect(CascadeAppModel.expectsVisibleChange(.click(x: 1, y: 1)))
+        #expect(CascadeAppModel.expectsVisibleChange(.type("hi")))
+        #expect(CascadeAppModel.expectsVisibleChange(.key("return")))
+        #expect(CascadeAppModel.expectsVisibleChange(.key("cmd+a")))   // select-all changes the selection
+        #expect(CascadeAppModel.expectsVisibleChange(.key("cmd+v")))   // paste changes content
+    }
+
+    @Test func turnExemptOnlyWhenEveryActionIsInvisible() {
+        // A copy-only turn is exempt; a copy followed by a real click is NOT.
+        #expect(!CascadeAppModel.turnExpectsVisibleChange([.key("cmd+c"), .wait]))
+        #expect(CascadeAppModel.turnExpectsVisibleChange([.key("cmd+c"), .click(x: 5, y: 5)]))
+        #expect(!CascadeAppModel.turnExpectsVisibleChange([]))   // nothing acted → no charge
     }
 
     // Coordinate-level grounding push: AX CG-global center -> model pixel space.

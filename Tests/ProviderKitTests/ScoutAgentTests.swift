@@ -109,4 +109,53 @@ struct ScoutAgentTests {
         let raw = ScoutAgent.parseRawActions(r)
         #expect(raw.count == 1 && raw[0]["target"] as? String == "Save")
     }
+
+    // MARK: safeBatchPrefix — never ground a batched action past a screen change
+
+    /// Build a ScoutAction from a compact spec for the batch-safety tests.
+    private func act(_ kind: ScoutAgent.ScoutAction.Kind, target: String? = nil, text: String? = nil, key: String? = nil) -> ScoutAgent.ScoutAction {
+        ScoutAgent.ScoutAction(kind: kind, target: target, text: text, key: key, direction: nil, amount: nil, click: nil, thought: "")
+    }
+
+    @Test func coexistingFillsChainTogether() {
+        // Two placeholders visible on one frame — both keep (the design's good batch).
+        let plan = [act(.type, target: "title", text: "Hi"), act(.type, target: "subtitle", text: "Yo")]
+        #expect(ScoutAgent.safeBatchPrefix(plan).count == 2)
+    }
+
+    @Test func groundedClickAfterNavigationIsDropped() {
+        // click a menu (navigation) → click an item revealed by it: the second
+        // grounds against the stale pre-menu frame, so it's truncated.
+        let plan = [act(.click, target: "File menu"), act(.click, target: "New")]
+        let safe = ScoutAgent.safeBatchPrefix(plan)
+        #expect(safe.count == 1)
+        #expect(safe.first?.target == "File menu")
+    }
+
+    @Test func groundedClickAfterFillIsDropped() {
+        // fill a search box (submits) → click a result: the result grounds against
+        // the pre-search frame, so it waits for a fresh observation.
+        let plan = [act(.type, target: "search box", text: "swift"), act(.click, target: "first result")]
+        #expect(ScoutAgent.safeBatchPrefix(plan).count == 1)
+    }
+
+    @Test func nonGroundedActionsSurviveAfterNavigation() {
+        // A keystroke / type-into-focus doesn't ground, so it can follow a click
+        // (e.g. click a field, then type into the focus it produced).
+        let plan = [act(.click, target: "the name field"), act(.type, text: "Ada"), act(.key, key: "return")]
+        #expect(ScoutAgent.safeBatchPrefix(plan).count == 3)
+    }
+
+    @Test func openAppThenGroundedClickIsDropped() {
+        let plan = [act(.openApp, target: "Keynote"), act(.click, target: "New Document")]
+        #expect(ScoutAgent.safeBatchPrefix(plan).count == 1)
+    }
+
+    @Test func groundTargetOnlyForGroundingKinds() {
+        #expect(ScoutAgent.groundTarget(of: act(.click, target: "X")) == "X")
+        #expect(ScoutAgent.groundTarget(of: act(.type, target: "field", text: "y")) == "field")
+        #expect(ScoutAgent.groundTarget(of: act(.type, text: "y")) == nil)       // focus type
+        #expect(ScoutAgent.groundTarget(of: act(.key, key: "return")) == nil)
+        #expect(ScoutAgent.groundTarget(of: act(.openApp, target: "Mail")) == nil)
+    }
 }
