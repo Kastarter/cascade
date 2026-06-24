@@ -205,7 +205,9 @@ public final class ScoutAgent {
                 model: model, maxTokens: 600, prior: history
             )
         } catch {
-            return CUStep(actions: [], text: "I couldn't reach the planner.", done: true, failed: true)
+            // Surface the real reason (Groq rate-limit / transport / empty) so the
+            // runner can audit WHY the run failed instead of stopping silently.
+            return CUStep(actions: [], text: "planner error: \(error)", done: true, failed: true)
         }
         let raw = Self.parseRawActions(reply)
         guard !raw.isEmpty else {
