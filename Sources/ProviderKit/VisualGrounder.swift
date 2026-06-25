@@ -82,6 +82,22 @@ public struct ClaudeVisualGrounder: VisualGrounder {
     }
 }
 
+/// Hosted GUI-grounder model ids for `cascade.visualGrounder.model` (swap the
+/// grounder WITHOUT a rebuild). UI-TARS is the proven default, served on OpenRouter.
+/// UI-Venus-1.5 / Holo1.5 are the newer SOTA open grounders (Apache-2.0, ~10–19pp
+/// better on ScreenSpot-Pro; see docs/AGENT_FAILURE_RATE_RESEARCH.md) — but as of
+/// 2026-06 they are NOT on OpenRouter, so reaching them needs
+/// `cascade.visualGrounder.endpoint` pointed at a host that serves them (or
+/// UI-Venus-1.5-2B run locally via MLX). They are Qwen3-VL based, so they most
+/// likely need `cascade.visualGrounder.coordSpace = "sent"` rather than UI-TARS's
+/// smart-resized space — confirm with a live probe (a wrong space misses every click).
+public enum GUIGrounderModel {
+    public static let uiTars15_7b = "bytedance/ui-tars-1.5-7b"
+    public static let uiVenus15_8b = "inclusionAI/UI-Venus-1.5-8B"
+    public static let uiVenus15_30bA3b = "inclusionAI/UI-Venus-1.5-30B-A3B"
+    public static let holo15_7b = "Hcompany/Holo1.5-7B"
+}
+
 // MARK: - UI-TARS local grounder (the cost + latency win)
 
 /// Grounds against a locally-served **UI-TARS-1.5-7B** (Apache-2.0, Qwen2.5-VL
@@ -97,9 +113,23 @@ public struct ClaudeVisualGrounder: VisualGrounder {
 /// parser and scaling math are unit-pinned (a wrong number clicks empty space);
 /// the live request/response shape needs a dry run once a model is serving.
 public struct UITARSGrounder: VisualGrounder {
+    /// How the served model encodes the coordinates it returns. A swapped grounder
+    /// read in the wrong space misses every click, so this is explicit + unit-pinned.
+    public enum CoordSpace: String, Sendable {
+        /// UI-TARS / Qwen2.5-VL: absolute pixels in the SMART-RESIZED image space
+        /// (the proven default — coords come back in `smartResize(sent)` space).
+        case smartResize
+        /// Absolute pixels in the exact image we SENT (no smart-resize remap) — the
+        /// likely space for Qwen3-VL grounders like UI-Venus-1.5 / Holo1.5.
+        case sent
+        /// Normalized to 0–1000 (the Qwen-VL convention), scaled by the sent size.
+        case normalized
+    }
+
     private let endpoint: URL
     private let model: String
     private let apiKey: String?
+    private let coordSpace: CoordSpace
     private let session: URLSession
 
     /// - Parameters:
@@ -111,11 +141,13 @@ public struct UITARSGrounder: VisualGrounder {
         baseURL: URL = URL(string: "http://localhost:8000/v1/chat/completions")!,
         model: String = "ui-tars-1.5-7b",
         apiKey: String? = nil,
+        coordSpace: CoordSpace = .smartResize,
         session: URLSession = .shared
     ) {
         self.endpoint = baseURL
         self.model = model
         self.apiKey = apiKey
+        self.coordSpace = coordSpace
         self.session = session
     }
 
@@ -135,18 +167,38 @@ public struct UITARSGrounder: VisualGrounder {
             return nil
         }
         guard let imagePoint = Self.parseBox(content) else { return nil }
-        // UI-TARS (Qwen2.5-VL) returns ABSOLUTE coords in the SMART-RESIZED image
-        // space — NOT the space of the JPEG we sent. Map back through smart_resize
-        // before scaling to the display, or every click carries the resize offset
-        // (worst on small targets). Live-verified: a 1280×800 send yields coords in
-        // 1288×812, and mapping through it lands on target to the pixel. See
-        // bytedance/UI-TARS README_coordinates.md.
-        let resized = Self.smartResize(width: res.w, height: res.h)
+        // Map the model's coordinate into the sent image's pixel space per its coord
+        // convention, THEN scale to the display. UI-TARS (Qwen2.5-VL) emits in the
+        // SMART-RESIZED space (live-verified: a 1280×800 send yields coords in
+        // 1288×812; mapping through it lands to the pixel — bytedance/UI-TARS
+        // README_coordinates.md). A swapped Qwen3-VL grounder (UI-Venus-1.5 / Holo1.5)
+        // may emit in the sent space or 0–1000 instead — `coordSpace` selects which.
+        let space = Self.resolveImageSpace(
+            parsed: imagePoint, sentW: res.w, sentH: res.h, space: coordSpace
+        )
         return Self.toDisplayPoint(
-            imagePoint: imagePoint,
-            imageW: resized.w, imageH: resized.h,
+            imagePoint: space.point,
+            imageW: space.imageW, imageH: space.imageH,
             displayW: displayWidthPoints, displayH: displayHeightPoints
         )
+    }
+
+    /// Maps a model-emitted coordinate into (pixel point, image size) for the
+    /// grounder's coord convention, so `ground` and the tests share one source of
+    /// truth. Pure + pinned — the wrong space offsets or wildly misses every click.
+    static func resolveImageSpace(
+        parsed: CGPoint, sentW: Int, sentH: Int, space: CoordSpace
+    ) -> (point: CGPoint, imageW: Int, imageH: Int) {
+        switch space {
+        case .smartResize:
+            let r = smartResize(width: sentW, height: sentH)
+            return (parsed, r.w, r.h)
+        case .sent:
+            return (parsed, sentW, sentH)
+        case .normalized:
+            let p = CGPoint(x: parsed.x / 1000 * CGFloat(sentW), y: parsed.y / 1000 * CGFloat(sentH))
+            return (p, sentW, sentH)
+        }
     }
 
     /// Reproduces Qwen2.5-VL's `smart_resize` (UI-TARS's image processor): each

@@ -1214,10 +1214,14 @@ public final class CascadeAppModel: ObservableObject {
     /// with no key it returns nil — the agent then runs the proven coordinate
     /// computer-tool path, never broken. Set `cascade.visualGrounder.backend =
     /// "claude"` to ground with the cloud ElementLocator instead (zero setup, costs
-    /// a Claude call per locate). There is deliberately NO local-URL override: a
-    /// stale `cascade.visualGrounder.uitarsURL` default (from old local-mlx builds)
-    /// once silently hijacked the grounder to a dead localhost endpoint and stalled
-    /// every run — hosting is OpenRouter-only. See [[cascade-cu-downgrade-research]].
+    /// a Claude call per locate). The grounder MODEL is swappable without a rebuild
+    /// via `cascade.visualGrounder.model` (e.g. UI-Venus-1.5 / Holo1.5 once a host
+    /// serves them — see docs/AGENT_FAILURE_RATE_RESEARCH.md), with an explicit
+    /// `…endpoint` (a NEW key — the old `…uitarsURL` once inherited a stale
+    /// dead-localhost value and stalled every run) and a `…coordSpace`
+    /// (smartResize | sent | normalized) for models that don't share UI-TARS's
+    /// Qwen2.5-VL space. All default to the proven hosted UI-TARS over OpenRouter.
+    /// See [[cascade-cu-downgrade-research]].
     ///
     /// The chosen visual grounder is wrapped in a `MixtureGrounder` (AX-first, ON by
     /// default; `cascade.mixtureGrounding = false` to disable) so labeled chrome
@@ -1238,8 +1242,21 @@ public final class CascadeAppModel: ObservableObject {
             // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
             // Requires the key; without it return nil → coordinate fallback.
             guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
-            let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
-            base = UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
+            // The grounder is SWAPPABLE without a rebuild — point `…model` at
+            // UI-Venus-1.5 / Holo1.5 the moment a host serves them (OpenRouter doesn't
+            // yet; UI-TARS is the proven default). A swapped Qwen3-VL model emits in a
+            // different coord space → set `…coordSpace = "sent"` (or "normalized") and
+            // confirm with a live probe; a wrong space misses every click. The endpoint
+            // override is a NEW key, deliberately set: the old `…uitarsURL` once
+            // inherited a stale dead-localhost value and stalled every run.
+            let model = d.string(forKey: "cascade.visualGrounder.model") ?? GUIGrounderModel.uiTars15_7b
+            let endpoint = d.string(forKey: "cascade.visualGrounder.endpoint")
+                .flatMap { $0.isEmpty ? nil : $0 } ?? "https://openrouter.ai/api/v1/chat/completions"
+            guard let url = URL(string: endpoint) else { return nil }
+            let space = UITARSGrounder.CoordSpace(
+                rawValue: d.string(forKey: "cascade.visualGrounder.coordSpace") ?? ""
+            ) ?? .smartResize
+            base = UITARSGrounder(baseURL: url, model: model, apiKey: key, coordSpace: space)
         }
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
