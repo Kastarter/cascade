@@ -100,6 +100,10 @@ func observationActionsDoNotCountAsStateChange() {
     #expect(BackgroundWebAgent.isStateChanging(.wait) == false)
     #expect(BackgroundWebAgent.isStateChanging(.zoom(nx: 0, ny: 0, nw: 1, nh: 1)) == false)
     #expect(BackgroundWebAgent.isStateChanging(.highlight(x: 0, y: 0, width: 1, height: 1, label: "x")) == false)
+    // A clipboard copy leaves the page unchanged by design (predicted-effect), so a
+    // copy-only turn must not be charged as a no-effect failure.
+    #expect(BackgroundWebAgent.isStateChanging(.key("cmd+c")) == false)
+    #expect(BackgroundWebAgent.isStateChanging(.key("cmd+x")) == false)
 }
 
 @Test

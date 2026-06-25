@@ -393,7 +393,11 @@ public final class CascadeAppModel: ObservableObject {
             var answered = true
             do {
                 let recordAnswer = try await orchestrator.askRecord(trimmed, conversation: Array(history))
-                result = Self.brief(recordAnswer.text)
+                // Show the FULL answer in the text thread. brief() is the ~280-char
+                // SPOKEN cap (voice replies stay short) — applying it here chopped
+                // multi-item summaries mid-word ("2. **Keyn…") even though the chat
+                // bubble is scrollable and has no line limit.
+                result = recordAnswer.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 citations = await orchestrator.citedMoments(recordAnswer.citedMomentIDs).map {
                     CitedMoment(id: $0.id, appName: $0.appName, capturedAt: $0.capturedAt, imagePath: $0.imagePath)
                 }
@@ -566,6 +570,21 @@ public final class CascadeAppModel: ObservableObject {
         runtime.onAudit = { [weak self] action, detail in
             guard let self else { return }
             Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: action, detail: String(detail.prefix(240)))) }
+        }
+        // Give the background Scout the SAME in-process harness the on-screen agent
+        // has — file/shell tools + record recall — so a background run can reach the
+        // user's local files and recorded screen history, not just the web. Pure
+        // execution here; the agent applies its own STOP gate + audit. Power tools
+        // stay behind the user's Power-harness opt-in; recall is read-only.
+        runtime.harnessTier = powerHarnessEnabled ? .full : .readOnly
+        runtime.recallEnabled = true
+        runtime.harnessProvider = { [weak self] name, input in
+            guard let self else { return "Cascade is shutting down — stop." }
+            if RecordRecall.isRecallTool(name) {
+                return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
+            }
+            guard let call = HarnessCall(name: name, input: input) else { return "Unknown harness tool “\(name)”." }
+            return await AgentHarness.perform(call, powerEnabled: self.powerHarnessEnabled)
         }
         backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
@@ -1148,7 +1167,7 @@ public final class CascadeAppModel: ObservableObject {
         return ComputerUseAgent(
             model: model,
             effort: cuEffort,
-            environmentNote: ComputerUseAgent.foregroundBrowserNote,
+            environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             // Direct-Mac tools beside the computer tool: find/read is always on;
             // run/script/write only with the user's Power harness opt-in.
@@ -1237,11 +1256,18 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
-    /// Tier 2 on-screen backend: "scout" runs the downgraded Scout-plan +
-    /// UI-TARS-ground loop; anything else (default) runs the Opus computer-use
-    /// loop. Opt in with `cascade.onScreenBackend = scout`.
+    /// On-screen backend: Scout (Groq plan + grounder) vs the Opus computer-use loop.
+    /// ONE BRAIN: Scout is the DEFAULT whenever it's fully set up — a Groq key (the
+    /// planner) AND an OpenRouter key (the grounder) are both present — matching the
+    /// background agent. Force either way with `cascade.onScreenBackend` = "scout" /
+    /// "opus"; with the keys missing it falls back to the proven Opus path, so a
+    /// keyless setup is never broken.
     static func onScreenBackendIsScout() -> Bool {
-        UserDefaults.standard.string(forKey: "cascade.onScreenBackend") == "scout"
+        switch UserDefaults.standard.string(forKey: "cascade.onScreenBackend") {
+        case "scout": return true
+        case "opus", "claude": return false
+        default: return GroqKeyStore().hasKey() && OpenRouterKeyStore().hasKey()
+        }
     }
 
     /// The Tier 2 on-screen loop: Scout (Groq, vision) plans the next action and
@@ -1267,6 +1293,7 @@ public final class CascadeAppModel: ObservableObject {
         // reach for them too (it may underuse pull-tools, but the capability is here).
         let agent = ScoutAgent(
             grounder: grounder,
+            environmentNote: AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             skillIndex: appSkills.indexText,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
@@ -2443,7 +2470,12 @@ public final class CascadeAppModel: ObservableObject {
     /// docs/THIRD_PARTY_NOTICES.md). Returns false when there's no focused,
     /// settable text element — the caller falls back to synthetic keystrokes.
     private static func axInsertText(_ text: String) -> Bool {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              // Never AX-insert into Cascade's OWN focused element — if Cascade is
+              // frontmost the insert "succeeds" silently and the text never reaches
+              // the target app (the audited phantom "can't type"). Fall through to
+              // paste / keystrokes, which follow real keyboard focus.
+              app.bundleIdentifier != "com.humain.cascade" else { return false }
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(appRef, 0.3)
         var focusedRef: CFTypeRef?
@@ -2452,8 +2484,20 @@ public final class CascadeAppModel: ObservableObject {
         let element = focused as! AXUIElement
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
-              settable.boolValue else { return false }
-        return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+              settable.boolValue,
+              AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+        else { return false }
+        // VERIFY the insert actually took. Web <input>/combobox elements (Google
+        // Flights, most sites) ACCEPT the set and report .success while the value
+        // never changes — the phantom write behind the audited "can't type"
+        // (computer.type.ax → no-effect, while the SAME field+text via paste worked).
+        // Read the value back; only claim success if it now reflects the text, else
+        // return false so the caller falls to paste/keystrokes, which DO land. A
+        // field that doesn't expose its value reads nil → also falls through (paste
+        // is reliable, so an occasional unnecessary paste is harmless).
+        let after = axString(element, kAXValueAttribute as String)
+            ?? axString(element, kAXSelectedTextAttribute as String)
+        return after?.contains(text) ?? false
     }
 
     private nonisolated static func axString(_ element: AXUIElement, _ attribute: String) -> String? {

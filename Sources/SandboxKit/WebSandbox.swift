@@ -191,8 +191,13 @@ public final class WebSandbox: NSObject {
           }
           var proto = el.tagName==='TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
           var desc = Object.getOwnPropertyDescriptor(proto,'value');
-          var next = (el.value||'') + t;
+          // Replace the SELECTED range (so a preceding cmd+a/select makes type
+          // REPLACE), falling back to append when there's no selection — identical
+          // to the old behaviour when the caret sits at the end.
+          var cur = el.value||''; var s=el.selectionStart, e2=el.selectionEnd;
+          var next = (s!=null && e2!=null) ? (cur.slice(0,s)+t+cur.slice(e2)) : (cur+t);
           if (desc && desc.set) desc.set.call(el, next); else el.value = next;
+          if (s!=null) { try { var caret=s+t.length; el.selectionStart=el.selectionEnd=caret; } catch(e){} }
           el.dispatchEvent(new Event('input',{bubbles:true}));
           el.dispatchEvent(new Event('change',{bubbles:true}));
           return pt+'ok';
@@ -204,6 +209,22 @@ public final class WebSandbox: NSObject {
     /// Presses a key on the focused element (Enter submits its form).
     public func pressKey(_ key: String) async {
         let normalized = key.lowercased()
+        // Select-all (cmd+a / ctrl+a): the native fill pattern is click → cmd+a →
+        // type → return, which only REPLACES if cmd+a actually selects the field
+        // first. The bare key dispatch below can't do that, so handle it directly:
+        // select the focused field's contents (input/textarea or contenteditable).
+        if Self.isSelectAll(normalized) {
+            _ = await runJS("""
+            (function(){
+              var el=document.activeElement; if(!el) return 'noactive';
+              if(el.isContentEditable){ try{var s=window.getSelection();s.removeAllRanges();var r=document.createRange();r.selectNodeContents(el);s.addRange(r);}catch(e){} return 'ce'; }
+              if(el.select){ try{el.select();}catch(e){} return 'sel'; }
+              try{document.execCommand('selectAll');}catch(e){}
+              return 'ok';
+            })();
+            """)
+            return
+        }
         let keyName: String
         let code: Int
         switch normalized {
@@ -255,18 +276,23 @@ public final class WebSandbox: NSObject {
     public func listInteractives() async -> String {
         let js = """
         (function(){
-          var sel = 'a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link]';
+          // Include contenteditable + role=textbox so rich editors (Notion, Google
+          // Docs, ProseMirror) — which are NOT <input>/<textarea> — appear as fields
+          // instead of being invisible to the agent.
+          var sel = 'a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [contenteditable=""], [contenteditable="true"], [role=textbox]';
           var els = Array.prototype.slice.call(document.querySelectorAll(sel));
           var out = [];
           for (var i=0;i<els.length && out.length<60;i++){
             var e=els[i]; var r=e.getBoundingClientRect();
             if (r.width<=0 || r.height<=0) continue;
             var tag=e.tagName.toLowerCase();
-            var label=((e.getAttribute('aria-label')||e.placeholder||e.value||e.innerText||e.getAttribute('title')||'')+'').trim().replace(/\\s+/g,' ');
+            var ce=e.isContentEditable;
+            // data-placeholder is how Notion/ProseMirror label an empty editable.
+            var label=((e.getAttribute('aria-label')||e.placeholder||e.getAttribute('data-placeholder')||e.value||e.innerText||e.getAttribute('title')||'')+'').trim().replace(/\\s+/g,' ');
             if (label.length>80) label=label.slice(0,80);
-            var field=(tag==='input'||tag==='textarea'||tag==='select');
+            var field=(tag==='input'||tag==='textarea'||tag==='select'||ce);
             if (!label && !field) continue;
-            out.push((out.length+1)+'. ['+(field?'field':(tag==='a'?'link':'button'))+'] '+(label||'(unlabeled '+tag+')'));
+            out.push((out.length+1)+'. ['+(field?'field':(tag==='a'?'link':'button'))+'] '+(label||'(unlabeled '+(ce?'editable':tag)+')'));
           }
           return out.length ? out.join('\\n') : 'No interactive elements found.';
         })();
@@ -306,8 +332,10 @@ public final class WebSandbox: NSObject {
         let js = """
         (function(q,val){
           q=(q||'').toLowerCase();
-          var els=Array.prototype.slice.call(document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]), textarea'));
-          function labelFor(e){var l=(e.getAttribute('aria-label')||e.placeholder||e.name||'')+'';
+          // Rich editors (Notion/Docs) are contenteditable, not <input>/<textarea> —
+          // include them so a fill can target a page title or doc body.
+          var els=Array.prototype.slice.call(document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, [contenteditable=""], [contenteditable="true"], [role=textbox]'));
+          function labelFor(e){var l=(e.getAttribute('aria-label')||e.placeholder||e.getAttribute('data-placeholder')||e.name||'')+'';
             if(e.id){var lab=document.querySelector('label[for="'+e.id+'"]'); if(lab) l+=' '+lab.innerText;} return l.toLowerCase();}
           var best=null;
           for(var i=0;i<els.length;i++){var e=els[i];var r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)continue; if(labelFor(e).indexOf(q)!==-1){best=e;break;}}
@@ -316,15 +344,79 @@ public final class WebSandbox: NSObject {
           best.scrollIntoView({block:'center'});
           var fr=best.getBoundingClientRect(); var cx=fr.left+12, cy=fr.top+fr.height/2;
           best.focus();
-          var proto=best.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
-          var desc=Object.getOwnPropertyDescriptor(proto,'value');
-          if(desc&&desc.set) desc.set.call(best,val); else best.value=val;
-          best.dispatchEvent(new Event('input',{bubbles:true}));
-          best.dispatchEvent(new Event('change',{bubbles:true}));
-          return '@@'+Math.round(cx)+','+Math.round(cy)+'@@FILLED: '+((best.getAttribute('aria-label')||best.placeholder||best.name||'field')+'').slice(0,60)+' = '+(val+'').slice(0,60);
+          if(best.isContentEditable){
+            // Select all then insert so existing content is REPLACED (not appended)
+            // and ProseMirror/Notion see the right beforeinput/input events.
+            try{ var sel=window.getSelection(); sel.removeAllRanges(); var rng=document.createRange(); rng.selectNodeContents(best); sel.addRange(rng); }catch(e){}
+            var ok=false; try{ ok=document.execCommand('insertText',false,val); }catch(e){}
+            if(!ok){ try{ best.textContent=val; }catch(e){} best.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:val})); }
+          } else {
+            var proto=best.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+            var desc=Object.getOwnPropertyDescriptor(proto,'value');
+            if(desc&&desc.set) desc.set.call(best,val); else best.value=val;
+            best.dispatchEvent(new Event('input',{bubbles:true}));
+            best.dispatchEvent(new Event('change',{bubbles:true}));
+          }
+          return '@@'+Math.round(cx)+','+Math.round(cy)+'@@FILLED: '+((best.getAttribute('aria-label')||best.placeholder||best.getAttribute('data-placeholder')||best.name||'field')+'').slice(0,60)+' = '+(val+'').slice(0,60);
         })(\(jsString(field)),\(jsString(value)));
         """
         return captureActionPoint(await runJS(js)) ?? "Fill failed."
+    }
+
+    /// Resolves a NAMED target to its on-page click point via the DOM — the web's
+    /// structural "AX": free, exact, and able to see contenteditable editors a
+    /// snapshot grounder struggles with. Scores visible candidates by how well their
+    /// label/text matches `target` (after stripping role-word fillers), preferring an
+    /// exact/containment match and the smallest (most specific) element. Returns the
+    /// match's viewport-center in display-local AppKit points (bottom-left origin —
+    /// the executor's space), or nil if nothing matches confidently (caller then
+    /// falls back to a visual grounder). Only IN-viewport elements are returned, so a
+    /// click never lands off-screen.
+    public func domGround(target: String, viewportHeight: CGFloat) async -> CGPoint? {
+        let js = """
+        (function(query){
+          var raw=(query||'').toLowerCase().trim();
+          var fillers={'the':1,'a':1,'an':1,'button':1,'field':1,'box':1,'icon':1,'link':1,'menu':1,'item':1,'placeholder':1,'input':1,'tab':1};
+          var q=raw.split(/\\s+/).filter(function(w){return w && !fillers[w];}).join(' ');
+          if(!q) q=raw;
+          var sel='a[href],button,input:not([type=hidden]),textarea,select,[role=button],[role=link],[role=textbox],[role=tab],[role=menuitem],[role=checkbox],[contenteditable=""],[contenteditable="true"],[aria-label],[placeholder],[data-placeholder]';
+          var els=Array.prototype.slice.call(document.querySelectorAll(sel));
+          function labelOf(e){return ((e.getAttribute('aria-label')||e.placeholder||e.getAttribute('data-placeholder')||e.value||e.getAttribute('title')||e.innerText||'')+'').toLowerCase().trim().replace(/\\s+/g,' ');}
+          function score(l){ if(!l) return 0; if(l===q) return 3; if(l.indexOf(q)!==-1||q.indexOf(l)!==-1) return 2;
+            var qw=q.split(' '),lw=l.split(' '),hit=0; for(var i=0;i<qw.length;i++){if(lw.indexOf(qw[i])!==-1)hit++;}
+            return (qw.length && hit/qw.length>=0.6)?1:0; }
+          var best=null,bestScore=0,bestArea=1e12;
+          for(var i=0;i<els.length;i++){var e=els[i];var r=e.getBoundingClientRect();
+            if(r.width<=0||r.height<=0) continue;
+            if(r.bottom<=0||r.top>=window.innerHeight||r.right<=0||r.left>=window.innerWidth) continue; // in-viewport only
+            var s=score(labelOf(e)); if(s<2) continue; // require exact/containment, never weak overlap
+            var area=r.width*r.height;
+            if(s>bestScore||(s===bestScore&&area<bestArea)){best=e;bestScore=s;bestArea=area;}}
+          if(!best) return '';
+          var rr=best.getBoundingClientRect();
+          return Math.round(rr.left+rr.width/2)+','+Math.round(rr.top+rr.height/2);
+        })(\(jsString(target)));
+        """
+        guard let res = await runJS(js) else { return nil }
+        return Self.parseGroundResult(res, viewportHeight: viewportHeight)
+    }
+
+    /// Parses the DOM resolver's "cx,cy" (top-left CSS px) into a display-local
+    /// AppKit point (bottom-left). Pure + pinned — a wrong flip clicks empty space.
+    nonisolated static func parseGroundResult(_ res: String, viewportHeight: CGFloat) -> CGPoint? {
+        let parts = res.split(separator: ",")
+        guard parts.count == 2,
+              let cx = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+              let cy = Double(parts[1].trimmingCharacters(in: .whitespaces)) else { return nil }
+        return CGPoint(x: cx, y: viewportHeight - cy)
+    }
+
+    /// A select-all combo (cmd+a / ctrl+a) — the key the native fill pattern presses
+    /// between focusing a field and typing its replacement. Pure + pinned.
+    nonisolated static func isSelectAll(_ combo: String) -> Bool {
+        let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.last == "a" else { return false }
+        return !Set(parts.dropLast()).isDisjoint(with: ["cmd", "command", "ctrl", "control", "super", "meta"])
     }
 
     private func jsString(_ s: String) -> String {
