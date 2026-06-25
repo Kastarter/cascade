@@ -115,6 +115,40 @@ public enum ScreenTextRecognizer {
         return overlap >= 0.6 ? 1 + overlap : 0
     }
 
+    // MARK: - OCR Set-of-Marks (perception for the planner on canvas/non-AX surfaces)
+
+    /// Turns the OCR boxes into a compact "set of marks" the PLANNER can name — the
+    /// OCR analog of the AX control summary, for canvas / non-AX surfaces (Keynote
+    /// slide canvas, Blender) where the accessibility tree is blind, so the weak
+    /// planner stops ASSUMING what's on the page and names text that actually exists.
+    /// Reading order (top→bottom, then left→right), deduped, single-char noise
+    /// dropped, capped. Pure + unit-pinned. Returns nil when there's no real text.
+    public static func setOfMarks(_ boxes: [TextBox], limit: Int = 24) -> String? {
+        let cleaned = boxes
+            .map { (text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), box: $0.boundingBox) }
+            .filter { $0.text.count >= 2 }
+        guard !cleaned.isEmpty else { return nil }
+        var seen = Set<String>()
+        let ordered = cleaned
+            // Vision y is bottom-up, so a higher midY sits higher on screen → first.
+            .sorted { a, b in
+                if abs(a.box.midY - b.box.midY) > 0.04 { return a.box.midY > b.box.midY }
+                return a.box.midX < b.box.midX
+            }
+            .filter { seen.insert($0.text.lowercased()).inserted }
+            .prefix(limit)
+        let items = ordered.map { "\"\($0.text)\" (\(position(of: $0.box)))" }.joined(separator: "; ")
+        return "Text actually on screen now — these are REAL on-screen elements; name one EXACTLY to click or fill it, and do not invent targets that aren't listed: \(items)"
+    }
+
+    /// Coarse 3×3 human position of a Vision-normalized box (0…1, LOWER-LEFT origin)
+    /// — enough to disambiguate duplicate labels without precise coordinates.
+    static func position(of box: CGRect) -> String {
+        let vertical = box.midY > 0.66 ? "top" : (box.midY < 0.33 ? "bottom" : "middle")
+        let horizontal = box.midX < 0.33 ? "left" : (box.midX > 0.66 ? "right" : "center")
+        return "\(vertical) \(horizontal)"
+    }
+
     private static func decode(imageData data: Data) -> CGImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {

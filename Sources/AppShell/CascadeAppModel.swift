@@ -1480,7 +1480,8 @@ public final class CascadeAppModel: ObservableObject {
             // planner EVERY turn — not only on a failure — so it names targets that
             // exist and the grounder (AX-first, then visual) hits them. Bounded AX
             // walk (≤24, ≤0.3s); empty on canvas/Electron apps that expose nothing.
-            let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
+            let controls = AXElementResolver.interactables(limit: 24)
+            let controlSummary = AXElementResolver.interactableSummary(controls)
             // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
             // a partially-grounded batch (where step.actions is non-empty so the idle
             // path above is skipped). Tells Scout to re-describe instead of silently
@@ -1494,7 +1495,12 @@ public final class CascadeAppModel: ObservableObject {
             // Refresh the grounding line + the proactive controls list + app skill
             // every turn (the frontmost app changes once Scout opens the target),
             // merged with any nudge above.
-            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), nudge].compactMap { $0 }.joined(separator: "\n")
+            // Canvas perception: when AX is sparse (Keynote slide canvas, Blender),
+            // OCR the live frame and hand Scout the on-screen text as nameable targets
+            // so it stops ASSUMING what's on the page. Mirrors the AX controls push —
+            // structural, gated to sparse-AX turns, off-main so it doesn't stall the loop.
+            let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count)
+            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             step = await agent.proceed(
                 screenshot: observedShot,
@@ -2044,6 +2050,30 @@ public final class CascadeAppModel: ObservableObject {
         let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
         let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
+    /// OCR Set-of-Marks for the planner on canvas / sparse-AX surfaces. When the AX
+    /// walk found few controls (Keynote slide canvas, Blender, design tools), OCR the
+    /// current frame OFF-MAIN and hand Scout the on-screen TEXT as nameable targets —
+    /// the structural fix for "the planner assumes what's on the page". ON by default
+    /// (it fires only where AX is blind, so it's purely additive there); disable with
+    /// `cascade.ocrSetOfMarks = false`. Audited as `scout.ocr.marks`.
+    private func ocrSetOfMarks(forFrame frame: Data, axControlCount: Int) async -> String? {
+        guard (UserDefaults.standard.object(forKey: "cascade.ocrSetOfMarks") as? Bool) ?? true,
+              Self.axIsSparse(controlCount: axControlCount) else { return nil }
+        let boxes = await Task.detached { ScreenTextRecognizer.recognizeBoxes(inImageData: frame) }.value
+        guard let marks = ScreenTextRecognizer.setOfMarks(boxes) else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent", action: "scout.ocr.marks",
+            detail: "AX sparse (\(axControlCount) controls) → \(boxes.count) OCR lines: \(String(marks.prefix(360)))"))
+        return marks
+    }
+
+    /// AX is "sparse" — a canvas / non-AX surface where the accessibility tree
+    /// exposed almost nothing to name, so the planner needs OCR text marks instead
+    /// of assuming. Pure + pinned.
+    nonisolated static func axIsSparse(controlCount: Int, threshold: Int = 8) -> Bool {
+        controlCount < threshold
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer
