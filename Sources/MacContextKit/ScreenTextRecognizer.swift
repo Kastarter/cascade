@@ -126,7 +126,9 @@ public enum ScreenTextRecognizer {
     public static func setOfMarks(_ boxes: [TextBox], limit: Int = 24) -> String? {
         let cleaned = boxes
             .map { (text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), box: $0.boundingBox) }
-            .filter { $0.text.count >= 2 }
+            // Label-like text only: drop single-char noise AND long lines (body text /
+            // paragraphs), so the marks stay a list of NAMEABLE targets, not page prose.
+            .filter { $0.text.count >= 2 && $0.text.count <= 60 }
         guard !cleaned.isEmpty else { return nil }
         var seen = Set<String>()
         let ordered = cleaned

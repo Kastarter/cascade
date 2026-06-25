@@ -16,4 +16,14 @@ struct OcrSetOfMarksTests {
         #expect(!CascadeAppModel.axIsSparse(controlCount: 8))
         #expect(!CascadeAppModel.axIsSparse(controlCount: 40))
     }
+
+    @Test func ocrFiresOnCanvasNotBrowser() {
+        // Sparse-AX NATIVE canvas (Keynote slide canvas, Blender): supplement w/ OCR.
+        #expect(CascadeAppModel.shouldOcrSetOfMarks(axControlCount: 3, isBrowser: false))
+        // Sparse-AX BROWSER page: OCR would dump page text as noise; the DOM-native
+        // background agent owns the web — so don't.
+        #expect(!CascadeAppModel.shouldOcrSetOfMarks(axControlCount: 3, isBrowser: true))
+        // Rich-AX app: the AX controls push already covers it.
+        #expect(!CascadeAppModel.shouldOcrSetOfMarks(axControlCount: 20, isBrowser: false))
+    }
 }

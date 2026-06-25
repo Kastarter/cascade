@@ -2059,8 +2059,13 @@ public final class CascadeAppModel: ObservableObject {
     /// (it fires only where AX is blind, so it's purely additive there); disable with
     /// `cascade.ocrSetOfMarks = false`. Audited as `scout.ocr.marks`.
     private func ocrSetOfMarks(forFrame frame: Data, axControlCount: Int) async -> String? {
+        // Browsers are text-heavy and DOM-native (the background agent owns the web),
+        // so OCR there dumps page text as noise. Fire only on canvas / non-AX NATIVE
+        // surfaces (Keynote slide canvas, Blender) where the planner is truly blind.
+        let front = NSWorkspace.shared.frontmostApplication?.localizedName
+        let isBrowser = front.map { Self.runsInBackground(apps: [$0]) } ?? false
         guard (UserDefaults.standard.object(forKey: "cascade.ocrSetOfMarks") as? Bool) ?? true,
-              Self.axIsSparse(controlCount: axControlCount) else { return nil }
+              Self.shouldOcrSetOfMarks(axControlCount: axControlCount, isBrowser: isBrowser) else { return nil }
         let boxes = await Task.detached { ScreenTextRecognizer.recognizeBoxes(inImageData: frame) }.value
         guard let marks = ScreenTextRecognizer.setOfMarks(boxes) else { return nil }
         _ = try? await store.appendAudit(AuditEvent(
@@ -2074,6 +2079,14 @@ public final class CascadeAppModel: ObservableObject {
     /// of assuming. Pure + pinned.
     nonisolated static func axIsSparse(controlCount: Int, threshold: Int = 8) -> Bool {
         controlCount < threshold
+    }
+
+    /// Whether to supplement the planner with OCR text marks this turn: AX is sparse
+    /// (canvas / non-AX surface) AND the frontmost app is NOT a browser. Browsers are
+    /// text-heavy and DOM-native (the background agent owns the web), so OCR there is
+    /// page-text noise, not nameable targets. Pure + pinned.
+    nonisolated static func shouldOcrSetOfMarks(axControlCount: Int, isBrowser: Bool) -> Bool {
+        axIsSparse(controlCount: axControlCount) && !isBrowser
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer

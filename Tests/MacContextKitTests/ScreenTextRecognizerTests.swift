@@ -108,6 +108,21 @@ func setOfMarksIsNilWhenNoRealText() {
     #expect(ScreenTextRecognizer.setOfMarks([box(" "), box("a")]) == nil)  // blank + single char
 }
 
+@Test
+func setOfMarksDropsLongBodyTextKeepsLabels() {
+    let paragraph = "This is a long line of body text that is clearly prose, not a clickable label, and must be dropped"
+    let boxes = [
+        box("Title", CGRect(x: 0.4, y: 0.70, width: 0.2, height: 0.05)),
+        box(paragraph, CGRect(x: 0.4, y: 0.30, width: 0.5, height: 0.1)),
+    ]
+    let marks = ScreenTextRecognizer.setOfMarks(boxes)
+    let s = try? #require(marks)
+    if let s {
+        #expect(s.contains("\"Title\""))             // short label kept
+        #expect(!s.contains("body text"))            // long prose dropped
+    }
+}
+
 /// Renders high-contrast text into a PNG so the OCR pass has a deterministic,
 /// permission-free input — no real screen capture required in tests.
 private func renderPNG(text: String, width: Int, height: Int) -> Data {
