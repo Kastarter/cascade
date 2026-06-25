@@ -1,6 +1,7 @@
 import AppKit
 import ComputerUseKit
 import Foundation
+import MacContextKit
 import ProviderKit
 
 // MARK: - Mixture-of-grounding (Agent-S2's specialist routing)
@@ -85,9 +86,46 @@ public struct MixtureGrounder: VisualGrounder {
     public func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? {
-        await base.groundRegion(
+        // On-screen TEXT (a document heading/section, a labeled link) is exactly what
+        // the visual grounder misses — it's trained on UI CONTROLS, so "the student
+        // evaluation section" in a PDF resolved to a toolbar button (the audited
+        // ■ square next to Download). Match the literal text by OCR FIRST; fall back to
+        // the visual grounder for icons / canvas / non-text targets.
+        if let region = await Self.ocrTextRegion(
             screenshot: screenshot, target: target,
             displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        ) {
+            return region
+        }
+        return await base.groundRegion(
+            screenshot: screenshot, target: target,
+            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        )
+    }
+
+    /// Locate a target that is literal ON-SCREEN TEXT (document content, a heading, a
+    /// labeled link) by OCR — the case a UI-control grounder misses. Frames the matched
+    /// text; nil when nothing matches confidently (→ visual grounder). OCR runs off-main.
+    static func ocrTextRegion(
+        screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
+    ) async -> ElementRegion? {
+        let boxes = await Task.detached { ScreenTextRecognizer.recognizeBoxes(inImageData: screenshot) }.value
+        guard let match = ScreenTextRecognizer.bestMatch(anchor: target, in: boxes) else { return nil }
+        let rect = rectFromVisionBox(
+            match.boundingBox, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        )
+        return ElementRegion(rect: rect, speech: "Here — “\(match.text)”.")
+    }
+
+    /// Vision-normalized box (0…1, LOWER-LEFT origin) → display-local AppKit rect
+    /// (bottom-left origin too, so NO Y flip). Pure + pinned — a wrong number frames
+    /// empty space.
+    nonisolated static func rectFromVisionBox(
+        _ box: CGRect, displayWidthPoints w: Int, displayHeightPoints h: Int
+    ) -> CGRect {
+        CGRect(
+            x: box.minX * CGFloat(w), y: box.minY * CGFloat(h),
+            width: box.width * CGFloat(w), height: box.height * CGFloat(h)
         )
     }
 
