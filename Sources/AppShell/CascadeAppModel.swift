@@ -1324,9 +1324,9 @@ public final class CascadeAppModel: ObservableObject {
         // reach for them too (it may underuse pull-tools, but the capability is here).
         let agent = ScoutAgent(
             grounder: grounder,
-            // A SMARTER planner than the default Scout (Maverick / Qwen3-32B), kept
-            // fast by staying on Groq — `cascade.scoutModel`. Unset → Scout default.
-            model: GroqModel.plannerModel(for: UserDefaults.standard.string(forKey: "cascade.scoutModel")),
+            // Planner is Llama-4 Scout (the default) — Groq's only capable MULTIMODAL
+            // model. Maverick was removed from Groq and the smarter Groq models are
+            // text-only, so there's no smarter drop-in vision planner here right now.
             // The SAME environment context Opus gets — foreground-browser behavior note
             // + today's date — so the planner is told everything Opus is told (parity).
             environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),

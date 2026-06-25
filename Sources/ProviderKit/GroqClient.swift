@@ -9,23 +9,12 @@ public enum GroqModel {
     public static let llama33_70b = "llama-3.3-70b-versatile"
     /// Multimodal (accepts images) — the vision thinker (Tier 2).
     public static let llama4Scout = "meta-llama/llama-4-scout-17b-16e-instruct"
+    /// NOTE: Llama-4 Maverick was REMOVED from Groq (a 404 — "model does not exist"),
+    /// so it is not a usable planner. Groq's only capable MULTIMODAL model (the planner
+    /// sees the screenshot) is Llama-4 Scout; the smarter Groq models (`qwen/qwen3-32b`,
+    /// `openai/gpt-oss-120b`) are TEXT-ONLY and cannot drive the vision planner as-is.
+    /// Kept for reference only — do not route the planner here.
     public static let llama4Maverick = "meta-llama/llama-4-maverick-17b-128e-instruct"
-    /// Qwen3-32B (dense, strong reasoning) — a smarter cross-family planner option,
-    /// kept fast by staying on Groq. See docs/AGENT_FAILURE_RATE_RESEARCH.md.
-    public static let qwen3_32b = "qwen/qwen3-32b"
-
-    /// Resolves the on-screen PLANNER model from the `cascade.scoutModel` setting —
-    /// a SMARTER brain than the default Llama-4 Scout (Maverick, same family; or
-    /// Qwen3-32B), kept fast by staying on Groq. Pure + pinned; unknown / unset →
-    /// the proven Scout default, so a bad value can never break a run.
-    public static func plannerModel(for setting: String?) -> String {
-        switch setting?.lowercased() {
-        case "maverick", "llama4maverick", "llama-4-maverick": return llama4Maverick
-        case "qwen", "qwen3", "qwen3-32b", "qwen3_32b": return qwen3_32b
-        case "scout", "llama4scout", "llama-4-scout": return llama4Scout
-        default: return llama4Scout
-        }
-    }
 }
 
 /// Picks the (client, model) for the downgraded helper tasks — the task planner
