@@ -1164,7 +1164,7 @@ public final class CascadeAppModel: ObservableObject {
         let grounder = assistGrounder()
         let mode: ComputerUseAgent.GroundingMode =
             (grounder != nil && Self.structuralGroundingEnabled()) ? .structural : .coordinate
-        return ComputerUseAgent(
+        let agent = ComputerUseAgent(
             model: model,
             effort: cuEffort,
             environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
@@ -1183,6 +1183,11 @@ public final class CascadeAppModel: ObservableObject {
             grounder: grounder,
             groundingMode: mode
         )
+        // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
+        // unless the goal asks. Set here so it re-applies when escalation rebuilds
+        // the agent on Opus. Opt in via `cascade.guardIrreversibleActions`.
+        agent.guardIrreversibleActions = Self.guardIrreversibleEnabled()
+        return agent
     }
 
     /// Whether the structural grounding split is the active on-screen mode. ON by
@@ -1191,6 +1196,15 @@ public final class CascadeAppModel: ObservableObject {
     /// against the proven computer-tool path. See [[cascade-cu-downgrade-research]].
     static func structuralGroundingEnabled() -> Bool {
         UserDefaults.standard.string(forKey: "cascade.onScreenGrounding") != "coordinate"
+    }
+
+    /// Whether the pre-action irreversible-key gate is armed — refuse quit /
+    /// force-quit / log-out / empty-Trash keys (unless the goal itself asks for
+    /// them). OFF by default; opt in with `cascade.guardIrreversibleActions = true`.
+    /// Best suited to unattended / scheduled runs where no one is watching to hit
+    /// STOP and a stray cmd+Q silently abandons the task. See `irreversibleRefusal`.
+    static func guardIrreversibleEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: "cascade.guardIrreversibleActions")
     }
 
     /// Builds the on-screen grounder. ON by default — opt out with
