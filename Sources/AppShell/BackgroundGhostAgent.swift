@@ -202,8 +202,19 @@ extension CascadeAppModel {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: ok ? "ghost.bg.type" : "ghost.bg.miss", detail: "chars=\(text.count)"))
             return ok
         case .key(let combo):
+            // App-command shortcuts (⌘N, ⌘S, ⌘F…) are pressed via the AX MENU BAR —
+            // reliable on a background window, where a posted ⌘-key usually doesn't
+            // land (the exact "create a new note" failure in the audit). Bare keys
+            // (Return/Tab/Escape) have no menu item, so they fall to a posted key.
+            let parts = combo.split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let key = parts.last ?? combo
+            let mods = Array(parts.dropLast())
+            if GhostActuator.isCommandShortcut(mods), GhostActuator.pressMenuShortcut(key: key, modifiers: mods, pid: pid) {
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.bg.menu", detail: combo))
+                return true
+            }
             let ok = GhostActuator.postKey(combo, pid: pid)
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.bg.key", detail: combo))
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: ok ? "ghost.bg.key" : "ghost.bg.miss", detail: combo))
             return ok
         case .move:
             return false  // companion already flew there; no real effect needed

@@ -118,10 +118,16 @@ defaults write com.humain.cascade cascade.ghostBackground -bool YES
 **Extra limits specific to background mode (honest):**
 - **The target app must already be running** (we never launch+position a window
   behind yours — too surprising). Open it first.
-- **Keys to a background window are best-effort.** `Enter`/`Tab`/shortcuts go via
-  `CGEvent.postToPid`, which some apps ignore when they're not frontmost. The agent
-  is told to prefer clicking buttons over pressing Return; drag and scroll are
-  skipped. So background mode is strongest for **click + type into fields** tasks.
+- **App-command shortcuts (⌘N, ⌘S, ⌘F…) are pressed via the AX MENU BAR**, not
+  posted as keys — `GhostActuator.pressMenuShortcut` walks the app's menu bar, matches
+  the item's command-key equivalent, and AXPresses it. This works reliably on a
+  background window — it's why "create a new note" = ⌘N → File ▸ New Note now lands;
+  a raw posted ⌘N did not. Audited as `ghost.bg.menu`.
+- **Bare keys (Enter/Tab/Escape/arrows) remain best-effort** — no menu item exists,
+  so they fall to `CGEvent.postToPid`, which some apps ignore when not frontmost. The
+  agent is told to prefer clicking buttons over pressing Return; drag and scroll are
+  skipped. So background mode is strongest for **click, type into fields, and menu
+  commands**.
 - **AX-blind apps** (canvas, Electron-not-opted-in) expose nothing to press, so a
   background run on them will mostly miss — use a native app.
 - Still the **single** agent — one task at a time, not N parallel.
@@ -133,9 +139,10 @@ Foreground ghost mode: `ghost.press` (AX press/focus landed), `ghost.type` (AX
 insert landed), `ghost.fallback` (AX missed → real cursor-restoring click).
 
 Background mode: `ghost.bg.start` / `ghost.bg.done`, `ghost.bg.press` (AX press
-landed on the hidden window), `ghost.bg.type`, `ghost.bg.key` (best-effort key),
-`ghost.bg.miss` (AX couldn't reach it — no fallback, the no-effect detector
-re-grounds), `ghost.bg.skip` (drag/scroll), `ghost.bg.stalled` / `ghost.bg.noeffect`.
+landed on the hidden window), `ghost.bg.type`, `ghost.bg.menu` (app command pressed
+via the menu bar), `ghost.bg.key` (best-effort posted bare key), `ghost.bg.miss` (AX
+couldn't reach it — no fallback, the no-effect detector re-grounds), `ghost.bg.skip`
+(drag/scroll), `ghost.bg.stalled` / `ghost.bg.noeffect`.
 
 ```
 sqlite3 "$HOME/Library/Application Support/Cascade/Cascade.sqlite" \

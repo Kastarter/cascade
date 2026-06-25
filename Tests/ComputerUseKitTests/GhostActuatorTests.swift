@@ -51,6 +51,34 @@ struct GhostActuatorTests {
         #expect(!GhostActuator.textRoles.contains("AXButton"))
     }
 
+    @Test func menuModifierBitmaskDecodes() {
+        // Apple's AX encoding: ⌘ present unless bit 3 (8); bit0=⇧, bit1=⌥, bit2=⌃.
+        #expect(GhostActuator.menuModifierSet(0) == ["command"])            // ⌘N
+        #expect(GhostActuator.menuModifierSet(1) == ["command", "shift"])   // ⌘⇧N
+        #expect(GhostActuator.menuModifierSet(2) == ["command", "option"])  // ⌘⌥N
+        #expect(GhostActuator.menuModifierSet(4) == ["command", "control"]) // ⌘⌃N
+        #expect(GhostActuator.menuModifierSet(8) == [])                     // bare key, no ⌘
+        #expect(GhostActuator.menuModifierSet(9) == ["shift"])             // ⇧ only (8|1)
+    }
+
+    @Test func requestedModifiersNormalizeToMenuEncoding() {
+        // ⌘N typed as "command" must equal the menu item's decoded set for 0.
+        #expect(GhostActuator.normalizedModifierSet(["command"]) == GhostActuator.menuModifierSet(0))
+        #expect(GhostActuator.normalizedModifierSet(["cmd"]) == ["command"])
+        #expect(GhostActuator.normalizedModifierSet(["command", "shift"]) == GhostActuator.menuModifierSet(1))
+        #expect(GhostActuator.normalizedModifierSet(["⌘", "⌥"]) == GhostActuator.menuModifierSet(2))
+    }
+
+    @Test func commandShortcutsRouteToTheMenuBar() {
+        // ⌘/⌃ combos go through the menu bar (reliable in the background); a bare
+        // Return/Tab does not (no menu item) and falls to a posted key.
+        #expect(GhostActuator.isCommandShortcut(["command"]))
+        #expect(GhostActuator.isCommandShortcut(["control"]))
+        #expect(GhostActuator.isCommandShortcut(["cmd", "shift"]))
+        #expect(!GhostActuator.isCommandShortcut([]))
+        #expect(!GhostActuator.isCommandShortcut(["shift"]))
+    }
+
     @Test func ghostSupportsClickTypeKeyButNotComplexGestures() {
         // Single + right click, typing, keys have cursor-free AX / pid equivalents.
         #expect(GhostActuator.supportsGhost(.click))

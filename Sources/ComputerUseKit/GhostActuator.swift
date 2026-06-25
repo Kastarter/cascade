@@ -134,6 +134,66 @@ public enum GhostActuator {
         return true
     }
 
+    /// Invokes an app COMMAND (New, Save, Find…) by pressing the matching menu-bar
+    /// item via AX — the RELIABLE way to fire a ⌘-shortcut on a BACKGROUND window,
+    /// where a posted key often doesn't land. Walks `pid`'s menu bar, matches an
+    /// enabled item whose command-key equivalent equals `key`+`modifiers`, and
+    /// AXPresses it. Returns false if no menu item has that shortcut (caller falls
+    /// back to `postKey`). e.g. ⌘N in Notes → File ▸ New Note, no cursor, no focus.
+    public static func pressMenuShortcut(key: String, modifiers: [String], pid: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.4)
+        guard let menuBar = axElement(app, kAXMenuBarAttribute) else { return false }
+        return pressMatchingMenuItem(in: menuBar, key: key.lowercased(),
+                                     mods: normalizedModifierSet(modifiers), depth: 0)
+    }
+
+    private static func pressMatchingMenuItem(in element: AXUIElement, key: String, mods: Set<String>, depth: Int) -> Bool {
+        guard depth < 7 else { return false }
+        for child in axChildren(element) {
+            if let cmdChar = axString(child, kAXMenuItemCmdCharAttribute as String)?.lowercased(), cmdChar == key,
+               menuModifierSet(axInt(child, kAXMenuItemCmdModifiersAttribute as String) ?? 0) == mods,
+               AXUIElementPerformAction(child, kAXPressAction as CFString) == .success {
+                return true
+            }
+            if pressMatchingMenuItem(in: child, key: key, mods: mods, depth: depth + 1) { return true }
+        }
+        return false
+    }
+
+    /// AX menu-item modifier bitmask → modifier-name set. Apple's encoding: ⌘ is
+    /// present UNLESS bit 3 (8) is set; bit 0 = ⇧, bit 1 = ⌥, bit 2 = ⌃. Pure +
+    /// unit-pinned — a wrong decode would fire the wrong command.
+    static func menuModifierSet(_ raw: Int) -> Set<String> {
+        var set = Set<String>()
+        if raw & 8 == 0 { set.insert("command") }
+        if raw & 1 != 0 { set.insert("shift") }
+        if raw & 2 != 0 { set.insert("option") }
+        if raw & 4 != 0 { set.insert("control") }
+        return set
+    }
+
+    /// Normalizes user modifier tokens (cmd/⌘/ctrl/opt/alt…) to the canonical set
+    /// `menuModifierSet` produces, so the two compare equal.
+    static func normalizedModifierSet(_ modifiers: [String]) -> Set<String> {
+        Set(modifiers.compactMap { token in
+            switch token.lowercased() {
+            case "cmd", "command", "⌘": "command"
+            case "shift", "⇧": "shift"
+            case "opt", "option", "alt", "⌥": "option"
+            case "ctrl", "control", "⌃": "control"
+            default: nil
+            }
+        })
+    }
+
+    /// True when a combo carries a ⌘ or ⌃ modifier — i.e. it's an app command worth
+    /// routing through the menu bar rather than posting as a raw key.
+    public static func isCommandShortcut(_ modifiers: [String]) -> Bool {
+        let m = normalizedModifierSet(modifiers)
+        return m.contains("command") || m.contains("control")
+    }
+
     /// Inserts text at the caret of `pid`'s focused element via kAXSelectedText —
     /// no clipboard, no keystrokes, no cursor. Verified by reading the value back
     /// (web inputs accept the set and report success while the value never changes).
@@ -161,6 +221,19 @@ public enum GhostActuator {
         var ref: CFArray?
         guard AXUIElementCopyActionNames(element, &ref) == .success, let names = ref as? [String] else { return [] }
         return names
+    }
+
+    private static func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &ref) == .success,
+              let children = ref as? [AXUIElement] else { return [] }
+        return children
+    }
+
+    private static func axInt(_ element: AXUIElement, _ attribute: String) -> Int? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success else { return nil }
+        return (ref as? NSNumber)?.intValue
     }
 
     private static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
