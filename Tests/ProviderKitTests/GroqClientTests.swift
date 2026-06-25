@@ -45,4 +45,16 @@ struct GroqClientTests {
         let msg = GroqClient.errorMessage(from: Data(#"{"error":{"message":"rate limited"}}"#.utf8), status: 429)
         #expect(msg == "rate limited")
     }
+
+    @Test func plannerModelResolvesSmarterBrainsAndDefaultsToScout() {
+        // A smarter planner than Scout, selectable via `cascade.scoutModel`.
+        #expect(GroqModel.plannerModel(for: "maverick") == GroqModel.llama4Maverick)
+        #expect(GroqModel.plannerModel(for: "Maverick") == GroqModel.llama4Maverick)
+        #expect(GroqModel.plannerModel(for: "qwen3-32b") == GroqModel.qwen3_32b)
+        #expect(GroqModel.plannerModel(for: "qwen") == GroqModel.qwen3_32b)
+        #expect(GroqModel.plannerModel(for: "scout") == GroqModel.llama4Scout)
+        // Unknown / unset → the proven Scout default, so a typo can't break a run.
+        #expect(GroqModel.plannerModel(for: nil) == GroqModel.llama4Scout)
+        #expect(GroqModel.plannerModel(for: "gpt-9") == GroqModel.llama4Scout)
+    }
 }

@@ -1324,7 +1324,12 @@ public final class CascadeAppModel: ObservableObject {
         // reach for them too (it may underuse pull-tools, but the capability is here).
         let agent = ScoutAgent(
             grounder: grounder,
-            environmentNote: AgentDateContext.line(),
+            // A SMARTER planner than the default Scout (Maverick / Qwen3-32B), kept
+            // fast by staying on Groq — `cascade.scoutModel`. Unset → Scout default.
+            model: GroqModel.plannerModel(for: UserDefaults.standard.string(forKey: "cascade.scoutModel")),
+            // The SAME environment context Opus gets — foreground-browser behavior note
+            // + today's date — so the planner is told everything Opus is told (parity).
+            environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             skillIndex: appSkills.indexText,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
