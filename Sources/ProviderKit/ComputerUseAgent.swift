@@ -173,6 +173,14 @@ public final class ComputerUseAgent {
     private var goalAsksForPaste = false
     private var episodeCopied = false
 
+    /// Pre-action gate on irreversible system/app keys — quit, force-quit, log
+    /// out, empty Trash (see `irreversibleRefusal`). OFF by default; the caller
+    /// arms it (e.g. for unattended / scheduled runs, where a stray cmd+Q silently
+    /// abandons the task mid-flight) via `cascade.guardIrreversibleActions`. Stands
+    /// down when the goal's own words sanction the action.
+    public var guardIrreversibleActions = false
+    private var goalAsksForDestruction = false
+
     /// Keeps the model terse and decisive: no narration (fewer output tokens → faster
     /// turns and short text-to-speech), confident action chains batched into one turn
     /// (fewer round trips), brief confirmation only at the end.
@@ -412,6 +420,7 @@ public final class ComputerUseAgent {
         pendingToolIDs = []
         toolResultOverrides = [:]
         goalAsksForPaste = Self.goalMentionsClipboard(goal)
+        goalAsksForDestruction = Self.goalMentionsDestruction(goal)
         episodeCopied = false
         displayW = displayWidthPoints
         displayH = displayHeightPoints
@@ -691,10 +700,10 @@ public final class ComputerUseAgent {
                     if let combo = input["key"] as? String {
                         let action = CUAction.key(combo)
                         noteCopy(action)
-                        if let id = block["id"] as? String, let refusal = pasteRefusal(for: action) {
-                            toolResultOverrides[id] = refusal
-                            onActionRefused?("key blocked — clipboard not owned by agent")
-                            Self.logger.info("refused bare paste key action")
+                        if let id = block["id"] as? String, let refusal = actionRefusal(for: action) {
+                            toolResultOverrides[id] = refusal.text
+                            onActionRefused?(refusal.audit)
+                            Self.logger.info("refused action: \(refusal.audit)")
                         } else {
                             actions.append(action)
                         }
@@ -721,10 +730,10 @@ public final class ComputerUseAgent {
                     // Structural paste gate (the Keynote title-page incident,
                     // 2026-06-11): the prompt ban on bare cmd+v didn't hold —
                     // refuse it here and teach via the tool_result instead.
-                    if let id = block["id"] as? String, let refusal = pasteRefusal(for: action) {
-                        toolResultOverrides[id] = refusal
-                        onActionRefused?("key blocked — clipboard not owned by agent")
-                        Self.logger.info("refused bare paste key action")
+                    if let id = block["id"] as? String, let refusal = actionRefusal(for: action) {
+                        toolResultOverrides[id] = refusal.text
+                        onActionRefused?(refusal.audit)
+                        Self.logger.info("refused action: \(refusal.audit)")
                     } else {
                         actions.append(action)
                     }
@@ -1349,9 +1358,10 @@ public final class ComputerUseAgent {
             guard let action else { return .skipped }
             if case .zoom = action { return .skipped }
             if case .screenshot = action { return .skipped }
-            // Gated paste keys must not execute mid-stream — skipping hands them
-            // to step()'s post-pass, which answers with the teaching refusal.
-            if pasteRefusal(for: action) != nil { return .skipped }
+            // Gated keys (paste, or — when armed — an irreversible quit/trash key)
+            // must not execute mid-stream — skipping hands them to step()'s
+            // post-pass, which answers with the teaching refusal.
+            if actionRefusal(for: action) != nil { return .skipped }
             noteCopy(action)
             return await sink(.action(action)) ? .delivered : .aborted
         default:
@@ -1401,6 +1411,71 @@ public final class ComputerUseAgent {
     nonisolated static func goalMentionsClipboard(_ goal: String) -> Bool {
         goal.range(
             of: #"(?i)\b(paste|pasted|pasting|clipboard|copy|copied)\b"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    /// Any structural pre-action gate blocking one of the model's OWN actions: a
+    /// paste key the agent doesn't own, or — when `guardIrreversibleActions` is
+    /// armed — an irreversible quit / force-quit / log-out / empty-Trash key.
+    /// `.text` is delivered as that call's tool_result so the model learns from
+    /// the refusal; `.audit` is the short line the caller records. STRUCTURAL: the
+    /// runtime refuses, it doesn't merely prompt against it (the 2026-06-11 lesson
+    /// — a prompt ban on cmd+v didn't hold; the gate did).
+    private func actionRefusal(for action: CUAction) -> (text: String, audit: String)? {
+        if let paste = pasteRefusal(for: action) {
+            return (paste, "key blocked — clipboard not owned by agent")
+        }
+        if let irreversible = irreversibleRefusal(for: action), case .key(let combo) = action {
+            return (irreversible, "irreversible \(combo) blocked")
+        }
+        return nil
+    }
+
+    /// The teaching refusal for an irreversible system/app key — quitting the app
+    /// mid-task (abandoning the work surface and any unsaved state), force-quit,
+    /// logging out, or emptying the Trash. None can be undone with cmd+z, so a
+    /// stray one is an outright task abandonment, not a recoverable misstep. OFF
+    /// unless `guardIrreversibleActions` is armed; stands down when the goal's own
+    /// words sanction it, exactly as a clipboard goal unlocks paste.
+    private func irreversibleRefusal(for action: CUAction) -> String? {
+        guard guardIrreversibleActions,
+              case .key(let combo) = action, Self.isIrreversibleCombo(combo),
+              !goalAsksForDestruction else { return nil }
+        return """
+        Blocked \(combo): that's irreversible — quitting the app, force-quitting, \
+        logging out, or emptying the Trash abandons the task you're in the middle \
+        of, and cmd+z can't undo it. If the task is finished, end with the done \
+        action instead of quitting; to dismiss a dialog use Escape or its Cancel \
+        button. Only take this action if the task itself explicitly asked for it.
+        """
+    }
+
+    /// A key combo that performs an IRREVERSIBLE system/app action cmd+z cannot
+    /// undo: quit (cmd+Q), log out (cmd+shift+Q), force-quit (cmd+option+esc), or
+    /// empty Trash (cmd+shift+Delete). Deliberately NARROW — in-document deletes
+    /// (a bare Delete, cmd+Delete to a line) are reversible and stay ungated so the
+    /// gate never false-fires on normal editing.
+    nonisolated public static func isIrreversibleCombo(_ combo: String) -> Bool {
+        let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let key = parts.last else { return false }
+        let mods = Set(parts.dropLast())
+        // Force-quit (cmd+option+esc) still holds cmd, so cmd is required throughout.
+        guard !mods.isDisjoint(with: ["cmd", "command", "super", "meta"]) else { return false }
+        if key == "q" { return true }                                          // quit / log out
+        if !mods.isDisjoint(with: ["option", "opt", "alt"]),
+           key == "esc" || key == "escape" { return true }                     // force quit
+        if mods.contains("shift"),
+           key == "delete" || key == "backspace" { return true }               // empty Trash
+        return false
+    }
+
+    /// The user's own words sanction an irreversible action ("quit Slack when
+    /// done", "close that window", "empty the trash", "log me out") — the gate
+    /// stands down, exactly as a clipboard goal unlocks paste.
+    nonisolated static func goalMentionsDestruction(_ goal: String) -> Bool {
+        goal.range(
+            of: #"(?i)(\b(quit|close|delete|trash|empty|remove|erase)\b|\bsign\s?out\b|\blog(?:ged|ging)?\b.{0,15}?\bout\b|force[\s-]?quit)"#,
             options: .regularExpression
         ) != nil
     }

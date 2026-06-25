@@ -60,4 +60,50 @@ struct ActionGateTests {
         #expect(AgentHarness.scriptedAppTargets(in: "ls -la ~/Desktop").isEmpty)
         #expect(AgentHarness.scriptedAppTargets(in: "textutil -convert docx /tmp/t.txt").isEmpty)
     }
+
+    // MARK: - Irreversible-action gate (default-off "look before you leap")
+
+    @Test func irreversibleCombosAreRecognizedAcrossSpellings() {
+        // Quit / log out (cmd+Q, cmd+shift+Q) — abandons the running task surface.
+        #expect(ComputerUseAgent.isIrreversibleCombo("cmd+q"))
+        #expect(ComputerUseAgent.isIrreversibleCombo("command+q"))
+        #expect(ComputerUseAgent.isIrreversibleCombo("CMD+Q"))
+        #expect(ComputerUseAgent.isIrreversibleCombo("cmd+shift+q"))
+        // Force quit (cmd+option+esc), every option/esc spelling.
+        #expect(ComputerUseAgent.isIrreversibleCombo("cmd+option+esc"))
+        #expect(ComputerUseAgent.isIrreversibleCombo("cmd+alt+escape"))
+        #expect(ComputerUseAgent.isIrreversibleCombo("cmd+opt+esc"))
+        // Empty Trash (cmd+shift+Delete / Backspace) — no cmd+z.
+        #expect(ComputerUseAgent.isIrreversibleCombo("cmd+shift+delete"))
+        #expect(ComputerUseAgent.isIrreversibleCombo("command+shift+backspace"))
+    }
+
+    @Test func reversibleEditingKeysAreNeverGated() {
+        // The gate is deliberately narrow — cmd+z covers in-document edits, and a
+        // false positive here would block normal work.
+        #expect(!ComputerUseAgent.isIrreversibleCombo("delete"))        // backspace while typing
+        #expect(!ComputerUseAgent.isIrreversibleCombo("backspace"))
+        #expect(!ComputerUseAgent.isIrreversibleCombo("cmd+delete"))    // delete-line / move-to-Trash (recoverable)
+        #expect(!ComputerUseAgent.isIrreversibleCombo("cmd+w"))         // close window/tab — usually a dialog
+        #expect(!ComputerUseAgent.isIrreversibleCombo("cmd+a"))
+        #expect(!ComputerUseAgent.isIrreversibleCombo("cmd+s"))
+        #expect(!ComputerUseAgent.isIrreversibleCombo("q"))             // a bare keystroke, not a quit
+        #expect(!ComputerUseAgent.isIrreversibleCombo("shift+delete"))  // forward-delete, no cmd
+        #expect(!ComputerUseAgent.isIrreversibleCombo("esc"))           // bare escape just dismisses
+        #expect(!ComputerUseAgent.isIrreversibleCombo("option+esc"))    // no cmd — not force-quit
+    }
+
+    @Test func destructionGoalsStandTheGateDown() {
+        // The user's own words sanction the action — the gate must stand down, just
+        // as a clipboard goal unlocks a bare paste.
+        #expect(ComputerUseAgent.goalMentionsDestruction("quit Slack when you're done"))
+        #expect(ComputerUseAgent.goalMentionsDestruction("close the extra windows"))
+        #expect(ComputerUseAgent.goalMentionsDestruction("empty the trash"))
+        #expect(ComputerUseAgent.goalMentionsDestruction("delete the old screenshots"))
+        #expect(ComputerUseAgent.goalMentionsDestruction("log me out of every account"))
+        // Ordinary build/edit goals carry no such sanction — the gate stays armed.
+        #expect(!ComputerUseAgent.goalMentionsDestruction("title page for the market entry readout"))
+        #expect(!ComputerUseAgent.goalMentionsDestruction("make a donut in Blender"))
+        #expect(!ComputerUseAgent.goalMentionsDestruction("summarize today's meetings into Notes"))
+    }
 }

@@ -71,6 +71,58 @@ func recognizeBoxesReturnsTextWithNormalizedBoundingBox() async {
     }
 }
 
+// MARK: - OCR Set-of-Marks (planner perception on canvas / sparse-AX surfaces)
+
+@Test
+func positionBucketsMapVisionBoxToHumanQuadrant() {
+    // Vision boxes are 0…1, LOWER-LEFT origin → a high midY sits at the TOP.
+    #expect(ScreenTextRecognizer.position(of: CGRect(x: 0.45, y: 0.45, width: 0.1, height: 0.1)) == "middle center")
+    #expect(ScreenTextRecognizer.position(of: CGRect(x: 0.0, y: 0.9, width: 0.1, height: 0.05)) == "top left")
+    #expect(ScreenTextRecognizer.position(of: CGRect(x: 0.9, y: 0.0, width: 0.1, height: 0.05)) == "bottom right")
+}
+
+@Test
+func setOfMarksListsTextTopToBottomDedupedAndDropsNoise() {
+    let boxes = [
+        box("Subtitle", CGRect(x: 0.4, y: 0.40, width: 0.2, height: 0.05)),
+        box("Presentation Title", CGRect(x: 0.4, y: 0.70, width: 0.2, height: 0.05)),
+        box("Subtitle", CGRect(x: 0.4, y: 0.39, width: 0.2, height: 0.05)),  // duplicate text
+        box("x", CGRect(x: 0.1, y: 0.10, width: 0.02, height: 0.02)),         // single-char noise
+    ]
+    let marks = ScreenTextRecognizer.setOfMarks(boxes)
+    let s = try? #require(marks)
+    if let s {
+        // Title (higher on screen) is listed before Subtitle.
+        let title = s.range(of: "Presentation Title")
+        let sub = s.range(of: "Subtitle")
+        #expect(title != nil && sub != nil)
+        if let title, let sub { #expect(title.lowerBound < sub.lowerBound) }
+        #expect(!s.contains("\"x\""))                                          // 1-char dropped
+        #expect(s.components(separatedBy: "\"Subtitle\"").count - 1 == 1)      // deduped
+    }
+}
+
+@Test
+func setOfMarksIsNilWhenNoRealText() {
+    #expect(ScreenTextRecognizer.setOfMarks([]) == nil)
+    #expect(ScreenTextRecognizer.setOfMarks([box(" "), box("a")]) == nil)  // blank + single char
+}
+
+@Test
+func setOfMarksDropsLongBodyTextKeepsLabels() {
+    let paragraph = "This is a long line of body text that is clearly prose, not a clickable label, and must be dropped"
+    let boxes = [
+        box("Title", CGRect(x: 0.4, y: 0.70, width: 0.2, height: 0.05)),
+        box(paragraph, CGRect(x: 0.4, y: 0.30, width: 0.5, height: 0.1)),
+    ]
+    let marks = ScreenTextRecognizer.setOfMarks(boxes)
+    let s = try? #require(marks)
+    if let s {
+        #expect(s.contains("\"Title\""))             // short label kept
+        #expect(!s.contains("body text"))            // long prose dropped
+    }
+}
+
 /// Renders high-contrast text into a PNG so the OCR pass has a deterministic,
 /// permission-free input — no real screen capture required in tests.
 private func renderPNG(text: String, width: Int, height: Int) -> Data {

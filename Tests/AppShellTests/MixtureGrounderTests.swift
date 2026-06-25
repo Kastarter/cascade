@@ -86,4 +86,19 @@ struct MixtureGrounderTests {
         #expect(!MixtureGrounder.clickableRoles.contains("AXStaticText"))
         #expect(!MixtureGrounder.clickableRoles.contains("AXImage"))
     }
+
+    @Test func ocrTextBoxMapsToDisplayRectWithoutYFlip() {
+        // OCR text grounding (the fix for "point at document text"): a Vision box
+        // (normalized 0…1, LOWER-LEFT origin) → display-local AppKit rect (also
+        // bottom-left), so it scales with NO Y flip. A box at (0.2,0.6) sized
+        // 0.3×0.05 on a 1280×800 display → (256,480) sized 384×40.
+        let r = MixtureGrounder.rectFromVisionBox(
+            CGRect(x: 0.2, y: 0.6, width: 0.3, height: 0.05),
+            displayWidthPoints: 1280, displayHeightPoints: 800
+        )
+        #expect(r.minX == 256)
+        #expect(r.minY == 480)
+        #expect(r.width == 384)
+        #expect(r.height == 40)
+    }
 }

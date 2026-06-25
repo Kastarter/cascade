@@ -1164,7 +1164,7 @@ public final class CascadeAppModel: ObservableObject {
         let grounder = assistGrounder()
         let mode: ComputerUseAgent.GroundingMode =
             (grounder != nil && Self.structuralGroundingEnabled()) ? .structural : .coordinate
-        return ComputerUseAgent(
+        let agent = ComputerUseAgent(
             model: model,
             effort: cuEffort,
             environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
@@ -1183,6 +1183,11 @@ public final class CascadeAppModel: ObservableObject {
             grounder: grounder,
             groundingMode: mode
         )
+        // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
+        // unless the goal asks. Set here so it re-applies when escalation rebuilds
+        // the agent on Opus. Opt in via `cascade.guardIrreversibleActions`.
+        agent.guardIrreversibleActions = Self.guardIrreversibleEnabled()
+        return agent
     }
 
     /// Whether the structural grounding split is the active on-screen mode. ON by
@@ -1193,6 +1198,15 @@ public final class CascadeAppModel: ObservableObject {
         UserDefaults.standard.string(forKey: "cascade.onScreenGrounding") != "coordinate"
     }
 
+    /// Whether the pre-action irreversible-key gate is armed — refuse quit /
+    /// force-quit / log-out / empty-Trash keys (unless the goal itself asks for
+    /// them). OFF by default; opt in with `cascade.guardIrreversibleActions = true`.
+    /// Best suited to unattended / scheduled runs where no one is watching to hit
+    /// STOP and a stray cmd+Q silently abandons the task. See `irreversibleRefusal`.
+    static func guardIrreversibleEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: "cascade.guardIrreversibleActions")
+    }
+
     /// Builds the on-screen grounder. ON by default — opt out with
     /// `cascade.visualGrounder = false`. Backend defaults to "uitars": **hosted
     /// UI-TARS-1.5-7B over OpenRouter** (OpenAI-compatible), so end users never run
@@ -1200,10 +1214,14 @@ public final class CascadeAppModel: ObservableObject {
     /// with no key it returns nil — the agent then runs the proven coordinate
     /// computer-tool path, never broken. Set `cascade.visualGrounder.backend =
     /// "claude"` to ground with the cloud ElementLocator instead (zero setup, costs
-    /// a Claude call per locate). There is deliberately NO local-URL override: a
-    /// stale `cascade.visualGrounder.uitarsURL` default (from old local-mlx builds)
-    /// once silently hijacked the grounder to a dead localhost endpoint and stalled
-    /// every run — hosting is OpenRouter-only. See [[cascade-cu-downgrade-research]].
+    /// a Claude call per locate). The grounder MODEL is swappable without a rebuild
+    /// via `cascade.visualGrounder.model` (e.g. UI-Venus-1.5 / Holo1.5 once a host
+    /// serves them — see docs/AGENT_FAILURE_RATE_RESEARCH.md), with an explicit
+    /// `…endpoint` (a NEW key — the old `…uitarsURL` once inherited a stale
+    /// dead-localhost value and stalled every run) and a `…coordSpace`
+    /// (smartResize | sent | normalized) for models that don't share UI-TARS's
+    /// Qwen2.5-VL space. All default to the proven hosted UI-TARS over OpenRouter.
+    /// See [[cascade-cu-downgrade-research]].
     ///
     /// The chosen visual grounder is wrapped in a `MixtureGrounder` (AX-first, ON by
     /// default; `cascade.mixtureGrounding = false` to disable) so labeled chrome
@@ -1224,8 +1242,21 @@ public final class CascadeAppModel: ObservableObject {
             // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
             // Requires the key; without it return nil → coordinate fallback.
             guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
-            let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
-            base = UITARSGrounder(baseURL: url, model: "bytedance/ui-tars-1.5-7b", apiKey: key)
+            // The grounder is SWAPPABLE without a rebuild — point `…model` at
+            // UI-Venus-1.5 / Holo1.5 the moment a host serves them (OpenRouter doesn't
+            // yet; UI-TARS is the proven default). A swapped Qwen3-VL model emits in a
+            // different coord space → set `…coordSpace = "sent"` (or "normalized") and
+            // confirm with a live probe; a wrong space misses every click. The endpoint
+            // override is a NEW key, deliberately set: the old `…uitarsURL` once
+            // inherited a stale dead-localhost value and stalled every run.
+            let model = d.string(forKey: "cascade.visualGrounder.model") ?? GUIGrounderModel.uiTars15_7b
+            let endpoint = d.string(forKey: "cascade.visualGrounder.endpoint")
+                .flatMap { $0.isEmpty ? nil : $0 } ?? "https://openrouter.ai/api/v1/chat/completions"
+            guard let url = URL(string: endpoint) else { return nil }
+            let space = UITARSGrounder.CoordSpace(
+                rawValue: d.string(forKey: "cascade.visualGrounder.coordSpace") ?? ""
+            ) ?? .smartResize
+            base = UITARSGrounder(baseURL: url, model: model, apiKey: key, coordSpace: space)
         }
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
@@ -1293,7 +1324,12 @@ public final class CascadeAppModel: ObservableObject {
         // reach for them too (it may underuse pull-tools, but the capability is here).
         let agent = ScoutAgent(
             grounder: grounder,
-            environmentNote: AgentDateContext.line(),
+            // Planner is Llama-4 Scout (the default) — Groq's only capable MULTIMODAL
+            // model. Maverick was removed from Groq and the smarter Groq models are
+            // text-only, so there's no smarter drop-in vision planner here right now.
+            // The SAME environment context Opus gets — foreground-browser behavior note
+            // + today's date — so the planner is told everything Opus is told (parity).
+            environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             skillIndex: appSkills.indexText,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
@@ -1449,7 +1485,8 @@ public final class CascadeAppModel: ObservableObject {
             // planner EVERY turn — not only on a failure — so it names targets that
             // exist and the grounder (AX-first, then visual) hits them. Bounded AX
             // walk (≤24, ≤0.3s); empty on canvas/Electron apps that expose nothing.
-            let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
+            let controls = AXElementResolver.interactables(limit: 24)
+            let controlSummary = AXElementResolver.interactableSummary(controls)
             // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
             // a partially-grounded batch (where step.actions is non-empty so the idle
             // path above is skipped). Tells Scout to re-describe instead of silently
@@ -1463,7 +1500,12 @@ public final class CascadeAppModel: ObservableObject {
             // Refresh the grounding line + the proactive controls list + app skill
             // every turn (the frontmost app changes once Scout opens the target),
             // merged with any nudge above.
-            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), nudge].compactMap { $0 }.joined(separator: "\n")
+            // Canvas perception: when AX is sparse (Keynote slide canvas, Blender),
+            // OCR the live frame and hand Scout the on-screen text as nameable targets
+            // so it stops ASSUMING what's on the page. Mirrors the AX controls push —
+            // structural, gated to sparse-AX turns, off-main so it doesn't stall the loop.
+            let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count)
+            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             step = await agent.proceed(
                 screenshot: observedShot,
@@ -1807,6 +1849,13 @@ public final class CascadeAppModel: ObservableObject {
                         nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
                     }
+                    // Canvas perception parity with Scout: when AX is blind (Keynote
+                    // slide canvas, Blender), OCR the frame and hand Opus the on-screen
+                    // TEXT as nameable targets too — gated to sparse-AX NATIVE surfaces
+                    // (browsers excluded) inside ocrSetOfMarks.
+                    if let ocr = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count) {
+                        nudge! += "\n" + ocr
+                    }
                 }
             } else if actedThisTurn, !observationOnly, expectsChange {
                 noEffectTurns = 0
@@ -2013,6 +2062,43 @@ public final class CascadeAppModel: ObservableObject {
         let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
         let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
+    /// OCR Set-of-Marks for the planner on canvas / sparse-AX surfaces. When the AX
+    /// walk found few controls (Keynote slide canvas, Blender, design tools), OCR the
+    /// current frame OFF-MAIN and hand Scout the on-screen TEXT as nameable targets —
+    /// the structural fix for "the planner assumes what's on the page". ON by default
+    /// (it fires only where AX is blind, so it's purely additive there); disable with
+    /// `cascade.ocrSetOfMarks = false`. Audited as `scout.ocr.marks`.
+    private func ocrSetOfMarks(forFrame frame: Data, axControlCount: Int) async -> String? {
+        // Browsers are text-heavy and DOM-native (the background agent owns the web),
+        // so OCR there dumps page text as noise. Fire only on canvas / non-AX NATIVE
+        // surfaces (Keynote slide canvas, Blender) where the planner is truly blind.
+        let front = NSWorkspace.shared.frontmostApplication?.localizedName
+        let isBrowser = front.map { Self.runsInBackground(apps: [$0]) } ?? false
+        guard (UserDefaults.standard.object(forKey: "cascade.ocrSetOfMarks") as? Bool) ?? true,
+              Self.shouldOcrSetOfMarks(axControlCount: axControlCount, isBrowser: isBrowser) else { return nil }
+        let boxes = await Task.detached { ScreenTextRecognizer.recognizeBoxes(inImageData: frame) }.value
+        guard let marks = ScreenTextRecognizer.setOfMarks(boxes) else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent", action: "scout.ocr.marks",
+            detail: "AX sparse (\(axControlCount) controls) → \(boxes.count) OCR lines: \(String(marks.prefix(360)))"))
+        return marks
+    }
+
+    /// AX is "sparse" — a canvas / non-AX surface where the accessibility tree
+    /// exposed almost nothing to name, so the planner needs OCR text marks instead
+    /// of assuming. Pure + pinned.
+    nonisolated static func axIsSparse(controlCount: Int, threshold: Int = 8) -> Bool {
+        controlCount < threshold
+    }
+
+    /// Whether to supplement the planner with OCR text marks this turn: AX is sparse
+    /// (canvas / non-AX surface) AND the frontmost app is NOT a browser. Browsers are
+    /// text-heavy and DOM-native (the background agent owns the web), so OCR there is
+    /// page-text noise, not nameable targets. Pure + pinned.
+    nonisolated static func shouldOcrSetOfMarks(axControlCount: Int, isBrowser: Bool) -> Bool {
+        axIsSparse(controlCount: axControlCount) && !isBrowser
     }
 
     /// Performs one Computer Use action, flying the companion cursor to pointer
@@ -2656,7 +2742,7 @@ public final class CascadeAppModel: ObservableObject {
     /// something (point only)? Imperatives ACT by default — a whitelist of verbs
     /// kept failing open-ended requests ("design me a landing page" was coached
     /// instead of done). Only clearly question-shaped asks stay point-only.
-    private static func isActionRequest(_ text: String) -> Bool {
+    nonisolated static func isActionRequest(_ text: String) -> Bool {
         let t = text.lowercased()
         // Highlight/mark requests go to the acting agent — it owns the highlight
         // tool and can navigate/scroll to surface the target first. This wins even
@@ -2664,7 +2750,12 @@ public final class CascadeAppModel: ObservableObject {
         if t.contains("highlight") || t.contains("point out") || t.contains(" mark ") || t.hasPrefix("mark ") {
             return true
         }
-        let teachy = ["where", "how do i", "how can i", "show me", "find ", "what is", "what's",
+        // The find-vs-where-is split: "where is X" / "where can I find X" / "show me X"
+        // POINT at the target (highlight); a bare imperative "find X" / "find it for me"
+        // means GO DO IT — navigate / open / surface it. So "find" is NOT a point
+        // trigger; only the locational "where…" is (which still catches "where can I
+        // find X"). Previously "find " sat here and sent every "find …" to point-only.
+        let teachy = ["where", "how do i", "how can i", "show me", "what is", "what's",
                       "which ", "who ", "is there", "are there", "can i ", "does "]
         if teachy.contains(where: { t.contains($0) }) { return false }
         return true
