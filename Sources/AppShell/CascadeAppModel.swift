@@ -1844,6 +1844,13 @@ public final class CascadeAppModel: ObservableObject {
                         nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
                         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
                     }
+                    // Canvas perception parity with Scout: when AX is blind (Keynote
+                    // slide canvas, Blender), OCR the frame and hand Opus the on-screen
+                    // TEXT as nameable targets too — gated to sparse-AX NATIVE surfaces
+                    // (browsers excluded) inside ocrSetOfMarks.
+                    if let ocr = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count) {
+                        nudge! += "\n" + ocr
+                    }
                 }
             } else if actedThisTurn, !observationOnly, expectsChange {
                 noEffectTurns = 0
