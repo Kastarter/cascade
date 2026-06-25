@@ -2091,6 +2091,17 @@ private struct HarnessCard: View {
                 Divider().overlay(Color.cascadeBorder)
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
+                        Text("Ghost mode (work alongside me)").font(.cascadeSans(15, .semibold))
+                        Text("The agent presses buttons and types through the Accessibility API instead of grabbing your mouse — your cursor and keyboard stay yours, so you can keep working while the translucent companion cursor does the job. Best when the agent works in a different app than you; it falls back to a normal click on controls it can't reach this way (canvas / some web apps).")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $model.ghostModeOn)
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text("On-screen engine").font(.cascadeSans(15, .semibold))
                         Text("Which model drives the on-screen agent. Claude is the proven Opus computer-use loop; Scout runs the cheap Llama 4 Scout planner on Groq, with the grounder below doing the clicks.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)

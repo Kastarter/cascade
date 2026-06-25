@@ -230,6 +230,7 @@ public final class GuidanceOverlayController {
         state.pointing = false
         state.thinking = false
         state.label = ""
+        state.ghost = false
     }
 
     /// Frames a region of the screen with the dashed golden marquee (for "where do I
@@ -259,6 +260,14 @@ public final class GuidanceOverlayController {
     /// Recolors the whole guidance overlay (cursor, trail, ripple, marquee).
     public func setTheme(_ theme: CursorTheme) {
         state.theme = theme
+    }
+
+    /// Toggles the translucent "ghost" look for non-blocking (ghost) mode — the
+    /// companion fades to ~0.6 opacity so the user sees the agent working without
+    /// mistaking it for their own cursor. Off restores full opacity.
+    public func setGhost(_ on: Bool) {
+        guard state.ghost != on else { return }
+        withAnimation(.easeInOut(duration: 0.2)) { state.ghost = on }
     }
 
     /// Fully removes the companion (used if the assistant is turned off).
@@ -427,6 +436,10 @@ final class GuidanceState: ObservableObject {
     @Published var thinking = false
     /// Bumped on every press so the overlay can fire a one-shot tap ripple.
     @Published var pressTrigger = 0
+    /// Translucent "ghost" rendering: in non-blocking (ghost) mode the companion is
+    /// drawn semi-transparent so it reads clearly as the AGENT's cursor working
+    /// alongside the user's own — present and visible, but unmistakably not theirs.
+    @Published var ghost = false
     /// Dashed marquee that frames a region for "where do I find/do X" answers.
     @Published var highlightRect: CGRect = .zero    // global AppKit (bottom-left)
     @Published var highlightScreen: CGRect = .zero
@@ -518,7 +531,7 @@ struct GuidanceOverlayView: View {
                 }
                 PressRipple(trigger: state.pressTrigger, color: state.theme.core)
                     .offset(x: point.x - 17, y: point.y - 17)
-                GuideCursor(theme: state.theme, label: state.pointing ? state.label : "", pointing: state.pointing, thinking: state.thinking, pressTrigger: state.pressTrigger)
+                GuideCursor(theme: state.theme, label: state.pointing ? state.label : "", pointing: state.pointing, thinking: state.thinking, pressTrigger: state.pressTrigger, ghost: state.ghost)
                     .offset(x: point.x, y: point.y)
                     // Rides the same spring the offset uses, sampling each interpolated
                     // position into the trail buffer. Only records while pointing/flying.
@@ -824,6 +837,9 @@ struct GuideCursor: View {
     var pointing: Bool = false
     var thinking: Bool = false
     var pressTrigger: Int = 0
+    /// Drawn semi-transparent in non-blocking ghost mode so it reads as the agent's
+    /// cursor working next to the user's, not a hijack of their own pointer.
+    var ghost: Bool = false
     @State private var pressed = false
     @State private var breathing = false
 
@@ -910,6 +926,7 @@ struct GuideCursor: View {
                     .transition(.scale(scale: 0.7).combined(with: .opacity))
             }
         }
+        .opacity(ghost ? 0.6 : 1.0)
         .animation(.easeOut(duration: 0.18), value: label)
     }
 }

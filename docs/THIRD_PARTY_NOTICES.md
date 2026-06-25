@@ -8,6 +8,8 @@ The following repositories are approved reference sources for future ports:
 - `jasonkneen/openclicky` — MIT License.
 - `milind-soni/tiptour-macos` — MIT License.
 - `shujanshaikh/glide` — MIT License.
+- `steipete/AXorcist` — MIT License (AX-press-by-pid actuation pattern).
+- `ghostwright/ghost-os` — AX-first actuation cascade reference (built on AXorcist).
 
 When source is copied or substantially adapted, add the original repository, file path, copyright/license header, and local destination here.
 
@@ -51,3 +53,13 @@ When source is copied or substantially adapted, add the original repository, fil
   rewritten for Cascade's computer-use agent.
 
 Do not copy TipTour Neko sprite assets unless their separate BSD 2-Clause license is included and the product actually needs them.
+
+- `steipete/AXorcist` (MIT) and `ghostwright/ghost-os` (built on AXorcist) —
+  the **AX-press-by-pid actuation pattern** that `Sources/ComputerUseKit/GhostActuator.swift`
+  follows: hit-test with `AXUIElementCopyElementAtPosition` against an
+  application element from `AXUIElementCreateApplication(pid)` (NOT the
+  system-wide element, which hit-tests whatever window is topmost), then
+  actuate with `AXUIElementPerformAction(kAXPressAction)` for a background,
+  cursor-free, focus-preserving press. Pattern/approach only — no code copied;
+  the AX plumbing is Cascade's own, mirroring its existing `axActivate` /
+  `axInsertText` helpers. See `docs/GHOST_MODE.md`.

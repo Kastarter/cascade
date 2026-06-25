@@ -148,6 +148,15 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let powerHarnessKey = "cascade.powerHarness"
 
+    /// Non-blocking "ghost" actuation, Settings opt-in, default OFF. ON ⇒ the
+    /// on-screen agent presses controls and types through the Accessibility API
+    /// (zero cursor movement, no focus steal) so you can keep working while the
+    /// translucent companion cursor does the job. Read at action time via
+    /// `Self.ghostModeEnabled()`; this published mirror just drives the toggle UI.
+    @Published public var ghostModeOn: Bool {
+        didSet { defaultsStore.set(ghostModeOn, forKey: "cascade.ghostMode") }
+    }
+
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
     /// the long-deferred low-vs-medium A/B is one switch in Settings; the new
@@ -240,6 +249,7 @@ public final class CascadeAppModel: ObservableObject {
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
+        ghostModeOn = defaults.bool(forKey: "cascade.ghostMode")
         // The "Cursor agent speed" picker was removed and CLAUDE.md puts effort:low
         // "off the table" (it makes the agent dumb), so pin medium — ignoring any
         // stale `cascade.cuEffort = "low"` a prior build's picker may have persisted.
@@ -1207,6 +1217,27 @@ public final class CascadeAppModel: ObservableObject {
         UserDefaults.standard.bool(forKey: "cascade.guardIrreversibleActions")
     }
 
+    /// Whether non-blocking "ghost" actuation is armed. ON ⇒ clicks/right-clicks
+    /// press the target control through the Accessibility API (zero cursor movement,
+    /// no focus steal) and typing lands via AX insertion — so the user can keep
+    /// working while the agent acts, watching the translucent companion cursor do
+    /// the work. OFF by default; opt in with `cascade.ghostMode = true`. Falls back
+    /// to the proven cursor-restoring CGEvent path whenever AX can't press a target,
+    /// so a stuck point degrades instead of stalling. See `GhostActuator`.
+    static func ghostModeEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: "cascade.ghostMode")
+    }
+
+    /// The PID ghost actuation targets: the frontmost app the agent is working in,
+    /// never Cascade itself (AX-pressing into our own window would act on our UI, not
+    /// the target — the audited phantom "can't type"). Returns nil when only Cascade
+    /// is frontmost, so the caller keeps the standard path that follows real focus.
+    private func ghostTargetPID() -> pid_t? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != "com.humain.cascade" else { return nil }
+        return app.processIdentifier
+    }
+
     /// Builds the on-screen grounder. ON by default — opt out with
     /// `cascade.visualGrounder = false`. Backend defaults to "uitars": **hosted
     /// UI-TARS-1.5-7B over OpenRouter** (OpenAI-compatible), so end users never run
@@ -2122,6 +2153,13 @@ public final class CascadeAppModel: ObservableObject {
         // instead of being restored to the user's parked position.
         let skill = frontmostSkill()
         let keepPointer = skill?.keysFollowPointer == true
+        // Non-blocking ghost actuation: press/type through the Accessibility API by
+        // PID so the user's cursor and focus are never touched. Disabled for
+        // pointer-routed (Blender) and AX-unreliable canvas apps (Figma/Photoshop) —
+        // their controls aren't AX-pressable, so they keep the proven CGEvent path.
+        let ghostPID: pid_t? = (Self.ghostModeEnabled() && !keepPointer && skill?.axUnreliable != true)
+            ? ghostTargetPID() : nil
+        guidanceOverlay.setGhost(ghostPID != nil)
         do {
             switch action {
             case .move(let x, let y):
@@ -2148,6 +2186,18 @@ public final class CascadeAppModel: ObservableObject {
                     // learned position stays at p because warps emit no events.
                     lastPointerRoutedPoint = p
                     try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
+                } else if let ghostPID {
+                    // Ghost mode: press the control in the target app's own AX tree —
+                    // zero cursor movement, the user keeps working. On an AX miss
+                    // (canvas/unlabeled leaf), degrade to a real click that restores
+                    // the cursor, so the task still progresses.
+                    switch GhostActuator.press(atCG: p, pid: ghostPID) {
+                    case .pressed, .focused:
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.press", detail: "click"))
+                    case .missed:
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.fallback", detail: "click"))
+                        try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
+                    }
                 } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
                 }
@@ -2193,6 +2243,14 @@ public final class CascadeAppModel: ObservableObject {
                 if keepPointer {
                     lastPointerRoutedPoint = p
                     try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
+                } else if let ghostPID {
+                    switch GhostActuator.press(atCG: p, pid: ghostPID, showMenu: true) {
+                    case .pressed, .focused:
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.press", detail: "rightClick"))
+                    case .missed:
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.fallback", detail: "rightClick"))
+                        try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
+                    }
                 } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p, showMenu: true) {
                     try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
                 }
@@ -2205,7 +2263,11 @@ public final class CascadeAppModel: ObservableObject {
                 if driver.runState.isStopRequested { throw ComputerUseError.stopped }
                 // Audit the mechanism and size only — never the text itself (the
                 // agent may type sensitive content the user dictated).
-                if let skill, skill.shouldTypePhysicalKeys(text),
+                if let ghostPID, GhostActuator.insertText(text, pid: ghostPID) {
+                    // Ghost mode: insert at the target's caret via AX — no clipboard,
+                    // no keystrokes, nothing the user's focus can intercept.
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "ghost.type", detail: "chars=\(text.count)"))
+                } else if let skill, skill.shouldTypePhysicalKeys(text),
                    let keys = AppSkillRegistry.physicalKeySequence(for: text) {
                     // Modal numeric input (Blender): the app ignores AX insertion,
                     // paste, and unicode-string events — only real per-key events
