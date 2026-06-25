@@ -144,4 +144,50 @@ struct VisualGrounderTests {
     @Test func missingChoicesReturnsNil() {
         #expect(UITARSGrounder.extractContent(Data(#"{"error":"nope"}"#.utf8)) == nil)
     }
+
+    // MARK: resolveImageSpace — coord-space convention for a swapped grounder
+
+    @Test func smartResizeSpaceKeepsPointAndUsesResizedImageSize() {
+        // UI-TARS default: coords already live in smartResize space; the image size
+        // used for scaling is the resized one (1280×800 → 1288×812), point unchanged.
+        let r = UITARSGrounder.resolveImageSpace(
+            parsed: CGPoint(x: 644, y: 406), sentW: 1280, sentH: 800, space: .smartResize
+        )
+        #expect(r.point == CGPoint(x: 644, y: 406))
+        #expect(r.imageW == 1288 && r.imageH == 812)
+    }
+
+    @Test func sentSpaceUsesTheExactSentImageSize() {
+        // A Qwen3-VL grounder (UI-Venus / Holo1.5) emitting in the sent space: no
+        // smart-resize remap, scale against the exact dimensions we sent.
+        let r = UITARSGrounder.resolveImageSpace(
+            parsed: CGPoint(x: 640, y: 400), sentW: 1280, sentH: 800, space: .sent
+        )
+        #expect(r.point == CGPoint(x: 640, y: 400))
+        #expect(r.imageW == 1280 && r.imageH == 800)
+    }
+
+    @Test func normalizedSpaceScalesThousandthsToSentPixels() {
+        // 0–1000 convention: (500,500) is the center → (640,400) on a 1280×800 send.
+        let r = UITARSGrounder.resolveImageSpace(
+            parsed: CGPoint(x: 500, y: 500), sentW: 1280, sentH: 800, space: .normalized
+        )
+        #expect(r.point == CGPoint(x: 640, y: 400))
+        #expect(r.imageW == 1280 && r.imageH == 800)
+    }
+
+    @Test func coordSpacesLandTheSameModelOutputOnDifferentDisplayPoints() {
+        // The same raw model output maps to DIFFERENT display points depending on the
+        // convention — proof the space must match the model, or every click drifts.
+        let raw = CGPoint(x: 1280, y: 800)
+        let smart = UITARSGrounder.resolveImageSpace(parsed: raw, sentW: 1280, sentH: 800, space: .smartResize)
+        let sent = UITARSGrounder.resolveImageSpace(parsed: raw, sentW: 1280, sentH: 800, space: .sent)
+        let pSmart = UITARSGrounder.toDisplayPoint(
+            imagePoint: smart.point, imageW: smart.imageW, imageH: smart.imageH, displayW: 1280, displayH: 800
+        )
+        let pSent = UITARSGrounder.toDisplayPoint(
+            imagePoint: sent.point, imageW: sent.imageW, imageH: sent.imageH, displayW: 1280, displayH: 800
+        )
+        #expect(pSmart != pSent)
+    }
 }
