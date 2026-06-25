@@ -2742,7 +2742,7 @@ public final class CascadeAppModel: ObservableObject {
     /// something (point only)? Imperatives ACT by default — a whitelist of verbs
     /// kept failing open-ended requests ("design me a landing page" was coached
     /// instead of done). Only clearly question-shaped asks stay point-only.
-    private static func isActionRequest(_ text: String) -> Bool {
+    nonisolated static func isActionRequest(_ text: String) -> Bool {
         let t = text.lowercased()
         // Highlight/mark requests go to the acting agent — it owns the highlight
         // tool and can navigate/scroll to surface the target first. This wins even
@@ -2750,7 +2750,12 @@ public final class CascadeAppModel: ObservableObject {
         if t.contains("highlight") || t.contains("point out") || t.contains(" mark ") || t.hasPrefix("mark ") {
             return true
         }
-        let teachy = ["where", "how do i", "how can i", "show me", "find ", "what is", "what's",
+        // The find-vs-where-is split: "where is X" / "where can I find X" / "show me X"
+        // POINT at the target (highlight); a bare imperative "find X" / "find it for me"
+        // means GO DO IT — navigate / open / surface it. So "find" is NOT a point
+        // trigger; only the locational "where…" is (which still catches "where can I
+        // find X"). Previously "find " sat here and sent every "find …" to point-only.
+        let teachy = ["where", "how do i", "how can i", "show me", "what is", "what's",
                       "which ", "who ", "is there", "are there", "can i ", "does "]
         if teachy.contains(where: { t.contains($0) }) { return false }
         return true
