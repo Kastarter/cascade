@@ -2099,6 +2099,28 @@ private struct HarnessCard: View {
                     Toggle("", isOn: $model.ghostModeOn)
                         .labelsHidden().toggleStyle(.switch)
                 }
+                if model.ghostModeOn {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("…behind my window").font(.cascadeSans(13, .semibold))
+                            Text("Go further: when a task names an app that's already open, the agent works in that app's window even while it's hidden behind yours — captured without bringing it forward. You keep your window on top; glance at the ghost cursor when you want. Native apps (Notes, Mail, Reminders) work best; web/canvas apps fall back. Esc stops it.")
+                                .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
+                        }
+                        Spacer()
+                        Toggle("", isOn: $model.ghostBackgroundOn)
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    .padding(.leading, CascadeMetrics.s3)
+                    if model.ghostBackgroundOn {
+                        HStack {
+                            Spacer()
+                            Button("Try it on Notes") { model.runBackgroundGhostTest(app: "Notes") }
+                                .font(.cascadeSans(11))
+                            Text("(open Notes first)").font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
+                        }
+                        .padding(.leading, CascadeMetrics.s3)
+                    }
+                }
                 Divider().overlay(Color.cascadeBorder)
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {

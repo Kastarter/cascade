@@ -115,6 +115,25 @@ public enum GhostActuator {
         return .missed
     }
 
+    /// Posts a key combo ("cmd+a", "return", "tab") to a specific PID via
+    /// `CGEvent.postToPid` — the only keyboard path that doesn't require the target
+    /// to be frontmost. BEST-EFFORT: some apps/keys ignore pid-posted keys to a
+    /// background window (documented macOS limitation), so callers must treat a
+    /// `true` return as "sent", not "guaranteed landed" — the no-effect detector is
+    /// the backstop. Returns false only when the key name is unknown.
+    public static func postKey(_ combo: String, pid: pid_t) -> Bool {
+        let parts = combo.split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard let keyName = parts.last, let code = KeyCodes.code(for: keyName) else { return false }
+        let flags = KeyCodes.flags(for: Array(parts.dropLast()))
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return false }
+        down.flags = flags
+        up.flags = flags
+        down.postToPid(pid)
+        up.postToPid(pid)
+        return true
+    }
+
     /// Inserts text at the caret of `pid`'s focused element via kAXSelectedText —
     /// no clipboard, no keystrokes, no cursor. Verified by reading the value back
     /// (web inputs accept the set and report success while the value never changes).

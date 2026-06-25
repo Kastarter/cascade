@@ -157,6 +157,14 @@ public final class CascadeAppModel: ObservableObject {
         didSet { defaultsStore.set(ghostModeOn, forKey: "cascade.ghostMode") }
     }
 
+    /// Background ghost mode, Settings opt-in, default OFF. ON ⇒ an action task that
+    /// names a native app runs BEHIND the user's window: Cascade captures that app's
+    /// window even when it's hidden and acts via AX by PID, so the user keeps working
+    /// on top. Requires ghost mode (`ghostModeOn`). Read via `ghostBackgroundEnabled()`.
+    @Published public var ghostBackgroundOn: Bool {
+        didSet { defaultsStore.set(ghostBackgroundOn, forKey: "cascade.ghostBackground") }
+    }
+
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
     /// the long-deferred low-vs-medium A/B is one switch in Settings; the new
@@ -206,7 +214,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
     /// instructions plus runtime policies, matched against the frontmost app.
     /// User files at App Support/Cascade/Skills override the bundled ones.
-    private var appSkills = AppSkillRegistry.load()
+    var appSkills = AppSkillRegistry.load()
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -218,7 +226,10 @@ public final class CascadeAppModel: ObservableObject {
     /// iteration and stand down when superseded — without this, the new turn's
     /// `runState.reset()` could revive a loop the barge-in just stopped, leaving
     /// two loops fighting over the same cursor.
-    private var assistGeneration = 0
+    var assistGeneration = 0
+    /// STOP signal for a running background ghost agent (work-behind-my-window).
+    /// nil when none is running. Set in `runBackgroundGhostAgent`, tripped by Esc.
+    var backgroundGhostRun: AgentRunState?
     /// Set when the agent used its highlight tool during the current run, so the
     /// end-of-task cleanup doesn't erase the box the user asked to see (it fades
     /// on the overlay's own timer instead).
@@ -250,6 +261,7 @@ public final class CascadeAppModel: ObservableObject {
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
         ghostModeOn = defaults.bool(forKey: "cascade.ghostMode")
+        ghostBackgroundOn = defaults.bool(forKey: "cascade.ghostBackground")
         // The "Cursor agent speed" picker was removed and CLAUDE.md puts effort:low
         // "off the table" (it makes the agent dumb), so pin medium — ignoring any
         // stale `cascade.cuEffort = "low"` a prior build's picker may have persisted.
@@ -305,6 +317,7 @@ public final class CascadeAppModel: ObservableObject {
         // Barge-in: the user talking over the agent halts whatever it's doing.
         voice.onInterrupt = { [weak self] in
             self?.driver.runState.requestStop()
+            self?.backgroundGhostRun?.requestStop()
             self?.guidanceOverlay.hide()
         }
         pushToTalk.onPress = { [weak self] in
@@ -324,6 +337,7 @@ public final class CascadeAppModel: ObservableObject {
         dock.onStop = { [weak self] in
             guard let self else { return }
             self.driver.runState.requestStop()
+            self.backgroundGhostRun?.requestStop()
             self.agentMessage = "Stopped. Control returned to you."
             Task { await self.driver.stop() }
         }
@@ -857,6 +871,16 @@ public final class CascadeAppModel: ObservableObject {
             // ("where / how / show me X") stay single-shot: point and explain.
             if wantsAction {
                 lastTeachRoute = .action
+                // Background ghost mode: if the task names a native app that's already
+                // running, drive it BEHIND the user's window instead of foregrounding
+                // it. Falls through to the normal on-screen flow when no app is named
+                // (we can't background what we can't target) or it isn't running.
+                if Self.ghostModeEnabled(), Self.ghostBackgroundEnabled(),
+                   let named = appSkills.appNamed(inGoal: q), runningApp(matching: named) != nil {
+                    teachMessage = "Working in \(named) behind your window…"
+                    launchBackgroundGhostAgent(goal: q, appName: named, gen: gen)
+                    return
+                }
                 await runAssistTask(goal: q, screen: screen, firstScreenshotPNG: shot, gen: gen)
                 return
             }

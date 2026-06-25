@@ -120,6 +120,63 @@ public enum ScreenCaptureUtility {
         }
     }
 
+    /// A captured app window: its JPEG pixels plus the window's current global CG
+    /// frame (top-left origin) so the caller can map the model's window-local
+    /// coordinates back to global screen points.
+    public struct CapturedWindow: Sendable {
+        public let jpeg: Data
+        public let frame: CGRect
+        public init(jpeg: Data, frame: CGRect) {
+            self.jpeg = jpeg
+            self.frame = frame
+        }
+    }
+
+    /// The current global CG frame of `pid`'s main window, or nil if it has none
+    /// on screen. FAIL-CLOSED on missing Screen Recording.
+    public static func mainWindowFrame(forPid pid: pid_t) async -> CGRect? {
+        guard CGPreflightScreenCaptureAccess(), let content = try? await shareableContent() else { return nil }
+        return mainWindow(forPid: pid, in: content)?.frame
+    }
+
+    /// Captures JUST the main window of `pid` — even when it's BEHIND the user's
+    /// active window (`SCContentFilter(desktopIndependentWindow:)`) — at the given
+    /// size, plus its current global frame. This is how a background agent "sees"
+    /// its app without the user's foreground window in the way.
+    /// FAIL-CLOSED on missing Screen Recording.
+    public static func captureWindowJPEG(
+        pid: pid_t, width: Int, height: Int, compression: Double = 0.7
+    ) async -> CapturedWindow? {
+        guard CGPreflightScreenCaptureAccess() else { return nil }
+        do {
+            let content = try await shareableContent()
+            guard let window = mainWindow(forPid: pid, in: content) else { return nil }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let configuration = SCStreamConfiguration()
+            configuration.width = max(1, width)
+            configuration.height = max(1, height)
+            configuration.showsCursor = false
+            configuration.ignoreShadowsSingleWindow = true
+            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            guard let jpeg = jpegData(from: cgImage, compression: compression) else { return nil }
+            return CapturedWindow(jpeg: jpeg, frame: window.frame)
+        } catch {
+            logger.error("Window capture failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    /// The app's biggest on-screen window — its main window. Ignores tiny helper
+    /// windows (palettes, tooltips) so the agent works the real document window.
+    private static func mainWindow(forPid pid: pid_t, in content: SCShareableContent) -> SCWindow? {
+        content.windows
+            .filter {
+                $0.owningApplication?.processID == pid && $0.isOnScreen
+                    && $0.frame.width * $0.frame.height > 40_000
+            }
+            .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+    }
+
     /// Captures the cursor display at NATIVE resolution and returns just the given
     /// normalized region (top-left origin, [0,1]) as JPEG — the agent's zoom: full
     /// pixel detail for small text that is illegible at the loop resolution. The

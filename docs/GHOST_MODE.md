@@ -84,10 +84,63 @@ This is the new piece. When ghost mode is on, `executeCU` routes actions through
 - **True background capture** (act on an app that is fully occluded behind yours)
   needs occluded-window screenshotting — the larger piece noted in CLAUDE.md.
 
+## Background mode — work *behind* your window
+
+Plain ghost mode stops the agent from stealing your cursor/keyboard, but it still
+works in the **foreground** (the target app is on top), because the agent screenshots
+the visible screen each turn to decide what to do. **Background mode** closes that
+last gap: the agent captures the target window's pixels **even when it's hidden
+behind your window**, so it never has to come forward.
+
+Turn it on in **Settings → Ghost mode → "…behind my window"** (requires ghost mode),
+or:
+```
+defaults write com.humain.cascade cascade.ghostMode -bool YES
+defaults write com.humain.cascade cascade.ghostBackground -bool YES
+```
+
+**How it works**
+- **Perception:** `ScreenCaptureUtility.captureWindowJPEG(pid:)` captures just the
+  target app's main window via `SCContentFilter(desktopIndependentWindow:)` — it
+  works on an occluded window, so the agent sees the app without it being frontmost.
+  (Recovered from the 2026-06-22 revert; that part was always sound.)
+- **Coordinates:** the window is treated as the agent's "display"; the model's
+  window-local points are mapped to global screen points by `NativeWindowMapping`
+  (pure + unit-pinned — a wrong flip presses the wrong row).
+- **Action:** the same `GhostActuator` AX-press / AX-insert by PID. AX hit-testing by
+  position reaches the target's controls even fully occluded (Apple's `AXUIElement.h`:
+  passing an app element restricts the hit-test to that app).
+- **Trigger:** an action task that names a running native app (e.g. *"in Notes,
+  make a checklist…"*) routes here automatically; if no app is named or it isn't
+  running, it falls back to the normal foreground flow. There's also a **"Try it on
+  Notes"** button in Settings for a one-click test.
+
+**Extra limits specific to background mode (honest):**
+- **The target app must already be running** (we never launch+position a window
+  behind yours — too surprising). Open it first.
+- **Keys to a background window are best-effort.** `Enter`/`Tab`/shortcuts go via
+  `CGEvent.postToPid`, which some apps ignore when they're not frontmost. The agent
+  is told to prefer clicking buttons over pressing Return; drag and scroll are
+  skipped. So background mode is strongest for **click + type into fields** tasks.
+- **AX-blind apps** (canvas, Electron-not-opted-in) expose nothing to press, so a
+  background run on them will mostly miss — use a native app.
+- Still the **single** agent — one task at a time, not N parallel.
+
 ## Audit signals
-Every ghost action is audited so a run is debuggable:
-`ghost.press` (AX press/focus landed), `ghost.type` (AX insert landed),
-`ghost.fallback` (AX missed → real cursor-restoring click).
+Every ghost action is audited so a run is debuggable.
+
+Foreground ghost mode: `ghost.press` (AX press/focus landed), `ghost.type` (AX
+insert landed), `ghost.fallback` (AX missed → real cursor-restoring click).
+
+Background mode: `ghost.bg.start` / `ghost.bg.done`, `ghost.bg.press` (AX press
+landed on the hidden window), `ghost.bg.type`, `ghost.bg.key` (best-effort key),
+`ghost.bg.miss` (AX couldn't reach it — no fallback, the no-effect detector
+re-grounds), `ghost.bg.skip` (drag/scroll), `ghost.bg.stalled` / `ghost.bg.noeffect`.
+
+```
+sqlite3 "$HOME/Library/Application Support/Cascade/Cascade.sqlite" \
+  "select created_at, action, detail from audit_event where action like 'ghost.%' order by id desc limit 30;"
+```
 
 ## Prior art (validated by research; see `docs/THIRD_PARTY_NOTICES.md`)
 The AX-press-by-pid-first / CGEvent-fallback architecture is what the leading
