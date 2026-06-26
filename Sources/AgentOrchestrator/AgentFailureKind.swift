@@ -66,7 +66,23 @@ public enum AgentFailureKind: String, Sendable, Equatable, CaseIterable, Codable
         case "agent.action.refused": self = .unsafeActionRefused
         case "agent.ground.miss", "sandbox.ground.miss": self = .groundingMiss
         case "agent.stop", "sandbox.stopped": self = .userStop
+        case "agent.secure_input": self = .secureInput
         default: return nil
+        }
+    }
+
+    /// Detail-aware mapping for audit actions that are emitted for BOTH success and
+    /// failure and can only be classified by their detail. `assist.validate` /
+    /// `sandbox.verify` carry an `INCOMPLETE: …` detail on failure and `verified: …`
+    /// on success; the latter is not a failure. Falls back to the action-only map.
+    public init?(auditAction: String, detail: String) {
+        switch auditAction {
+        case "assist.validate", "sandbox.verify":
+            guard detail.uppercased().hasPrefix("INCOMPLETE") else { return nil }
+            self = .validatorIncomplete
+        default:
+            guard let kind = AgentFailureKind(auditAction: auditAction) else { return nil }
+            self = kind
         }
     }
 }

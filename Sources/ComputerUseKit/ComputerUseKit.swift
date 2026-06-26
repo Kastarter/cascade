@@ -173,12 +173,14 @@ public protocol ComputerUseActuator: Sendable {
 public enum ComputerUseError: Error, LocalizedError {
     case notReady(String)
     case unsupported(String)
+    case secureInput(String)
     case stopped
 
     public var errorDescription: String? {
         switch self {
         case .notReady(let message): message
         case .unsupported(let message): message
+        case .secureInput(let message): message
         case .stopped: "Stopped by the user before the action ran."
         }
     }
@@ -413,7 +415,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
 
     private func pressKey(_ key: String, modifiers: [String], pid: pid_t?) throws {
         if let reason = SecureInputGuard.refusalReason(secureInputActive: SecureInputGuard.isActive()) {
-            throw ComputerUseError.unsupported(reason)
+            throw ComputerUseError.secureInput(reason)
         }
         guard let code = KeyCodes.code(for: key) else {
             throw ComputerUseError.unsupported("Unknown key: \(key)")
@@ -434,7 +436,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     /// keys "press" but nothing lands in the field.
     private func typeText(_ text: String, pid: pid_t?) async throws {
         if let reason = SecureInputGuard.refusalReason(secureInputActive: SecureInputGuard.isActive()) {
-            throw ComputerUseError.unsupported(reason)
+            throw ComputerUseError.secureInput(reason)
         }
         // Grapheme-safe chunks: a raw UTF-16 window can cut a surrogate pair (emoji)
         // in half and inject a broken glyph.

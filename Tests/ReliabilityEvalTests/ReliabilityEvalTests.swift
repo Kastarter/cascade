@@ -19,6 +19,21 @@ func auditActionsMapToFailureKinds() {
 }
 
 @Test
+func detailAwareMappingClassifiesValidatorAndSecureInput() {
+    // Validator events are emitted for both success and failure — only INCOMPLETE
+    // is a failure.
+    #expect(AgentFailureKind(auditAction: "assist.validate", detail: "INCOMPLETE: missing total") == .validatorIncomplete)
+    #expect(AgentFailureKind(auditAction: "sandbox.verify", detail: "INCOMPLETE: form not submitted") == .validatorIncomplete)
+    #expect(AgentFailureKind(auditAction: "sandbox.verify", detail: "verified: order placed") == nil)
+    // Detail-aware mapper still falls back to the action-only map.
+    #expect(AgentFailureKind(auditAction: "recipe.pause.modal", detail: "x") == .unexpectedModal)
+    #expect(AgentFailureKind(auditAction: "agent.run.completed", detail: "ok") == nil)
+    // Secure Input now has an emitted action that classifies.
+    #expect(AgentFailureKind(auditAction: "agent.secure_input") == .secureInput)
+    #expect(AgentFailureKind.secureInput.category == .environment)
+}
+
+@Test
 func safetyAndUserStopAreDesirableTerminals() {
     #expect(AgentFailureKind.unsafeActionRefused.isDesirableTerminal)
     #expect(AgentFailureKind.userStop.isDesirableTerminal)

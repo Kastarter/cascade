@@ -2371,6 +2371,15 @@ public final class CascadeAppModel: ObservableObject {
             return true
         } catch ComputerUseError.stopped {
             return false
+        } catch ComputerUseError.secureInput(let reason) {
+            // Distinct from a permission failure: keystrokes are being dropped by
+            // macOS Secure Input, not by missing Accessibility. Surface the real
+            // reason and record it under its own audit action so the reliability
+            // taxonomy can classify it as `.secureInput`.
+            teachMessage = reason
+            voice.speak("Secure input is on, so I can't type that. Enter it yourself and I'll continue.")
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.secure_input", detail: reason))
+            return false
         } catch {
             teachMessage = "I need Accessibility + Input Monitoring to control the Mac."
             voice.speak("I need Accessibility and Input Monitoring permission to do that.")

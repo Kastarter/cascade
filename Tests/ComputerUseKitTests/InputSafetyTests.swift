@@ -12,6 +12,12 @@ func secureInputRefusalOnlyWhenActive() {
     #expect(reason?.contains("Secure Input") == true)
 }
 
+@Test
+func secureInputErrorCarriesItsReason() {
+    let error = ComputerUseError.secureInput("macOS Secure Input is active")
+    #expect(error.errorDescription?.contains("Secure Input") == true)
+}
+
 // MARK: - Grapheme-safe chunking
 
 private func reconstruct(_ chunks: [[UInt16]]) -> String {
