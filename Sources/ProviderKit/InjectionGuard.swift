@@ -28,10 +28,13 @@ public enum InjectionGuard {
     }
 
     private static let patterns: [(Marker, String)] = [
-        (.instructionOverride, #"(?i)\b(ignore|disregard|forget)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all)\b[^.\n]{0,24}\b(instruction|prompt|direction|context|message|rule)s?\b"#),
+        (.instructionOverride, #"(?i)\b(ignore|disregard|forget)\b[^.\n]{0,48}\b(previous|prior|above|earlier|all|current|existing|original|developer|system)\b[^.\n]{0,32}\b(instruction|prompt|direction|context|message|rule)s?\b"#),
+        (.instructionOverride, #"(?i)\b(override|replace|supersede|bypass)\b[^.\n]{0,48}\b(previous|prior|above|earlier|all|current|existing|original|developer|system)\b[^.\n]{0,32}\b(instruction|prompt|direction|context|message|rule)s?\b"#),
+        (.instructionOverride, #"(?i)\b(previous|prior|above|earlier|current|existing|original|developer|system)\b[^.\n]{0,32}\b(instruction|prompt|direction|context|message|rule)s?\b[^.\n]{0,40}\b(no\s+longer\s+apply|do\s+not\s+apply|are\s+(obsolete|void|invalid|cancell?ed))\b"#),
         (.instructionOverride, #"(?i)\b(new|updated|real|actual|true)\s+(instruction|task|objective|goal|directive)s?\s*[:\-]"#),
         (.instructionOverride, #"(?i)\byou\s+are\s+now\b|\bfrom\s+now\s+on\b|\byour\s+(real|true|actual)\s+(task|goal|job)\b"#),
         (.roleConfusion, #"(?im)^\s*(system|assistant|developer)\s*[:>]"#),
+        (.roleConfusion, #"(?i)\b(current|existing|original|new|updated)\s+(system|assistant|developer)\s+(message|prompt|instruction)s?\s*[:\-]"#),
         (.roleConfusion, #"(?i)\b(act\s+as|you\s+are)\s+(the\s+)?(system|developer|administrator|admin)\b"#),
         (.toolOrCommand, #"(?i)\b(run|execute|invoke)\b[^.\n]{0,30}\b(the\s+following|this)\b[^.\n]{0,24}\b(command|shell|script|code|terminal)\b"#),
         (.toolOrCommand, #"(?i)\b(run_command|run_applescript|write_file)\b"#),
