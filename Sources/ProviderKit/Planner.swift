@@ -84,6 +84,8 @@ public protocol SingleStepPlanner: Sendable {
 public struct ClaudeSingleStepPlanner: SingleStepPlanner {
     private let client: any MessageCompleting
     private let model: String
+    static let promptVersion = "claude-single-step-planner.prompt.v1"
+    static let schemaVersion = "claude-single-step-planner.schema.v1"
 
     public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.opus) {
         self.client = client
@@ -95,7 +97,12 @@ public struct ClaudeSingleStepPlanner: SingleStepPlanner {
             system: Self.systemPrompt,
             user: Self.userPrompt(goal: goal, contexts: contexts),
             model: model,
-            maxTokens: 700
+            maxTokens: 700,
+            options: .deterministic(
+                promptVersion: Self.promptVersion,
+                schemaVersion: Self.schemaVersion,
+                callsite: "ClaudeSingleStepPlanner.proposeNextStep"
+            )
         )
         return try Self.parse(raw)
     }

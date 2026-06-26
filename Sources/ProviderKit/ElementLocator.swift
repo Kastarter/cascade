@@ -39,6 +39,10 @@ public struct ElementLocator: Sendable {
     private let keyStore: AnthropicKeyStore
     private let model: String
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    static let guidePromptVersion = "element-locator.guide.prompt.v1"
+    static let regionPromptVersion = "element-locator.region.prompt.v1"
+    static let guideSchemaVersion = "element-locator.guide.schema.v1"
+    static let regionSchemaVersion = "element-locator.region.schema.v1"
 
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
@@ -160,8 +164,13 @@ public struct ElementLocator: Sendable {
         request.httpMethod = "POST"
         request.timeoutInterval = 20
         request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.regionPromptVersion,
+            schemaVersion: Self.regionSchemaVersion,
+            callsite: "ElementLocator.locateRegion"
+        )
 
         let prompt = """
         The user asked: "\(question)". Their screen is in the attached screenshot \
@@ -184,6 +193,7 @@ public struct ElementLocator: Sendable {
             // and plenty accurate for framing, so the find loop isn't bottlenecked on it.
             "model": AnthropicModel.haiku,
             "max_tokens": 400,
+            "temperature": options.temperature ?? 0,
             // Instruction BEFORE the image — measurably better localization.
             "messages": Self.historyMessages(conversation) + [[
                 "role": "user",
@@ -194,6 +204,7 @@ public struct ElementLocator: Sendable {
             ]],
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        _ = try? options.cacheRequest(model: AnthropicModel.haiku, maxTokens: 400, body: bodyData)
         request.httpBody = bodyData
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
@@ -227,9 +238,14 @@ public struct ElementLocator: Sendable {
         request.httpMethod = "POST"
         request.timeoutInterval = 20
         request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue("computer-use-2025-11-24", forHTTPHeaderField: "anthropic-beta")
+        request.setValue(AnthropicRequestVersions.computerUseBeta, forHTTPHeaderField: "anthropic-beta")
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.guidePromptVersion,
+            schemaVersion: Self.guideSchemaVersion,
+            callsite: "ElementLocator.guide"
+        )
 
         let prompt = """
         The user said: "\(question)". Their current screen is in the attached screenshot.
@@ -243,6 +259,7 @@ public struct ElementLocator: Sendable {
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 1024,
+            "temperature": options.temperature ?? 0,
             "tools": [[
                 "type": "computer_20251124",
                 "name": "computer",
@@ -261,6 +278,12 @@ public struct ElementLocator: Sendable {
         ]
 
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        _ = try? options.cacheRequest(
+            model: model,
+            maxTokens: 1024,
+            body: bodyData,
+            betaVersion: AnthropicRequestVersions.computerUseBeta
+        )
         request.httpBody = bodyData
 
         guard let (data, response) = try? await URLSession.shared.data(for: request),

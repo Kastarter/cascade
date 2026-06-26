@@ -8,6 +8,8 @@ import Foundation
 public struct ClaudeGroundedAnswerer: ContextQuestionAnswering {
     private let client: any MessageCompleting
     private let model: String
+    static let promptVersion = "claude-grounded-answerer.prompt.v1"
+    static let schemaVersion = "claude-grounded-answerer.schema.v1"
 
     public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.opus) {
         self.client = client
@@ -39,7 +41,12 @@ public struct ClaudeGroundedAnswerer: ContextQuestionAnswering {
             system: Self.systemPrompt,
             user: sections.joined(separator: "\n\n"),
             model: model,
-            maxTokens: 300
+            maxTokens: 300,
+            options: .deterministic(
+                promptVersion: Self.promptVersion,
+                schemaVersion: Self.schemaVersion,
+                callsite: "ClaudeGroundedAnswerer.answer"
+            )
         )
     }
 

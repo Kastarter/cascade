@@ -47,6 +47,8 @@ public struct AgentTaskPlanner: Sendable {
 
     private let client: any MessageCompleting
     private let model: String
+    static let promptVersion = "agent-task-planner.prompt.v1"
+    static let schemaVersion = "agent-task-planner.schema.v1"
 
     public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet) {
         self.client = client
@@ -69,7 +71,12 @@ public struct AgentTaskPlanner: Sendable {
             system: Self.systemPrompt(for: environment),
             user: user,
             model: model,
-            maxTokens: 700
+            maxTokens: 700,
+            options: .deterministic(
+                promptVersion: Self.promptVersion,
+                schemaVersion: Self.schemaVersion,
+                callsite: "AgentTaskPlanner.plan"
+            )
         )
         if let raw, let parsed = Self.parse(raw) {
             return Array(parsed.prefix(Self.maxSubtasks))

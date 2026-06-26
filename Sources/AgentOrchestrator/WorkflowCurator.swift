@@ -46,6 +46,9 @@ public struct CuratedAgent: Identifiable, Sendable, Equatable {
 public struct WorkflowCurator: Sendable {
     private let client: any MessageCompleting
     private let model: String
+    static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
+    static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v1"
+    static let schemaVersion = "workflow-curator.schema.v1"
 
     public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet) {
         self.client = client
@@ -67,7 +70,12 @@ public struct WorkflowCurator: Sendable {
             system: Self.systemPrompt,
             user: Self.userPrompt(candidates, onScreen: onScreen),
             model: model,
-            maxTokens: 900
+            maxTokens: 900,
+            options: .deterministic(
+                promptVersion: Self.curatePromptVersion,
+                schemaVersion: Self.schemaVersion,
+                callsite: "WorkflowCurator.curate"
+            )
         )
         if let raw, let picked = Self.parse(raw, candidates: candidates) {
             return picked
@@ -90,7 +98,12 @@ public struct WorkflowCurator: Sendable {
             system: Self.curateOneSystemPrompt,
             user: Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil, onScreen: onScreen),
             model: model,
-            maxTokens: 400
+            maxTokens: 400,
+            options: .deterministic(
+                promptVersion: Self.curateOnePromptVersion,
+                schemaVersion: Self.schemaVersion,
+                callsite: "WorkflowCurator.curateOne"
+            )
         )
         if let raw, let picked = Self.parse(raw, candidates: [waste])?.first {
             return picked
