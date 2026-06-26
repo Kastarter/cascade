@@ -2092,10 +2092,10 @@ private struct HarnessCard: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("On-screen engine").font(.cascadeSans(15, .semibold))
-                        Text("Which model drives the on-screen agent. Claude is the proven Opus computer-use loop; Scout runs the cheap Llama 4 Scout planner on Groq, with the grounder below doing the clicks.")
+                        Text("Which model drives the on-screen agent. Claude is the proven Opus computer-use loop; Scout runs the cheap Qwen3.7 Plus planner (a multimodal GUI model — it sees the screen plus AX/OCR text marks), with the OpenRouter grounder below doing the clicks.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
-                        if model.onScreenBackend == "scout" && !model.hasGroqKey {
-                            Text("Add a Groq key above to use Scout.").font(.cascadeSans(11)).foregroundStyle(Color.cascadeWarn)
+                        if model.onScreenBackend == "scout" && !model.hasOpenRouterKey {
+                            Text("Add an OpenRouter key above to use Scout.").font(.cascadeSans(11)).foregroundStyle(Color.cascadeWarn)
                         }
                     }
                     Spacer()
@@ -2397,7 +2397,7 @@ private struct GroqKeyCard: View {
                     Button("Save key") { model.saveGroqKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
                     Button("Clear") { model.clearGroqKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
-                Text("Stored in macOS Keychain. Runs the downgraded models: the task planner and completion validators on Llama 3.3 70B, and the on-screen agent on Llama 4 Scout (with UI-TARS grounding). Falls back to Claude when absent.")
+                Text("Stored in macOS Keychain. Runs the cheap TEXT helpers — the task planner and completion validators on Llama 3.3 70B — and falls back to Claude when absent. (The Scout agent itself now runs on Qwen3.7 Plus via the OpenRouter key below.)")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
         }
@@ -2413,7 +2413,7 @@ private struct OpenRouterKeyCard: View {
             VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("OpenRouter key · UI-TARS grounding").font(.cascadeSans(16, .semibold))
+                        Text("OpenRouter key · Qwen3.7 Plus Scout + UI-TARS grounding").font(.cascadeSans(16, .semibold))
                         Text(model.openRouterKeyMessage).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()
@@ -2430,7 +2430,7 @@ private struct OpenRouterKeyCard: View {
                     Button("Save key") { model.saveOpenRouterKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
                     Button("Clear") { model.clearOpenRouterKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
-                Text("Stored in macOS Keychain. Hosts UI-TARS-1.5-7B for the on-screen agent: Opus 4.8 names the target, hosted UI-TARS locates it (no local 7B model). When connected, the on-screen agent grounds every click through it; without it, Opus places its own coordinates.")
+                Text("Stored in macOS Keychain. Powers the Scout brain end-to-end: Qwen3.7 Plus (multimodal) sees the screen plus AX/OCR text marks and names a target, hosted UI-TARS-1.5-7B locates it (no local model). When connected, Scout is the default on-screen + background agent; without it, the agent runs on Claude (Opus).")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
         }

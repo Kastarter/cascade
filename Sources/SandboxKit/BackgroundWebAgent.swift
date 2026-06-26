@@ -42,12 +42,13 @@ public final class BackgroundWebAgent {
 
     private let keyStore: AnthropicKeyStore
     private let model: String
-    /// The Scout planner stack (one brain with the on-screen agent): Llama-4 Scout
-    /// via Groq, grounded DOM-first in the sandbox. Used instead of the Claude
-    /// `model` loop whenever a Groq key is present (`usesScout`); the Claude path
-    /// remains the fallback when there's no Groq key.
-    private let groqKeyStore: GroqKeyStore
-    private let groqVision: GroqVisionClient
+    /// The Scout planner stack (one brain with the on-screen agent): Qwen3.7 Plus via
+    /// OpenRouter — a multimodal GUI-agent model that SEES the sandbox snapshot AND
+    /// gets the page text + interactives, grounded DOM-first in the sandbox. Used
+    /// instead of the Claude `model` loop whenever an OpenRouter key is present
+    /// (`usesScout`); the Claude path remains the fallback when there's no key.
+    private let openRouterKeyStore: OpenRouterKeyStore
+    private let scoutPlanner: ScoutPlannerClient
     private let usesScout: Bool
     private let planner: AgentTaskPlanner
     /// Cheap second opinion that checks a claimed completion against the actual page.
@@ -115,14 +116,14 @@ public final class BackgroundWebAgent {
 
     public init(
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
-        groqKeyStore: GroqKeyStore = GroqKeyStore(),
+        openRouterKeyStore: OpenRouterKeyStore = OpenRouterKeyStore(),
         model: String = AnthropicModel.sonnet
     ) {
         self.keyStore = keyStore
-        self.groqKeyStore = groqKeyStore
-        self.groqVision = GroqVisionClient(keyStore: groqKeyStore)
+        self.openRouterKeyStore = openRouterKeyStore
+        self.scoutPlanner = ScoutPlannerClient(keyStore: openRouterKeyStore, endpoint: ScoutPlannerClient.scoutEndpoint())
         self.model = model
-        self.usesScout = Self.backgroundUsesScout(groqKeyStore: groqKeyStore)
+        self.usesScout = Self.backgroundUsesScout(openRouterKeyStore: openRouterKeyStore)
         // The planner (≤5 subtasks + start URLs) and the completion verifier are
         // structurally simple TEXT tasks — downgraded to Groq llama-3.3-70b when a
         // Groq key is set (else Anthropic haiku). The agent loop stays on `model`.
@@ -132,12 +133,12 @@ public final class BackgroundWebAgent {
         self.verifierModel = h.model
     }
 
-    /// One brain: the background agent runs on Scout (Groq) by default whenever a
-    /// Groq key is present, matching the on-screen agent. Opt out with
-    /// `cascade.backgroundBackend = "claude"`. With no Groq key it falls back to the
-    /// Claude (`model`) loop, so a keyless setup still works.
-    nonisolated static func backgroundUsesScout(groqKeyStore: GroqKeyStore) -> Bool {
-        guard groqKeyStore.hasKey() else { return false }
+    /// One brain: the background agent runs on Scout (Qwen3.7 Plus over OpenRouter) by
+    /// default whenever an OpenRouter key is present, matching the on-screen agent.
+    /// Opt out with `cascade.backgroundBackend = "claude"`. With no key it falls back
+    /// to the Claude (`model`) loop, so a keyless setup still works.
+    nonisolated static func backgroundUsesScout(openRouterKeyStore: OpenRouterKeyStore) -> Bool {
+        guard openRouterKeyStore.hasKey() else { return false }
         return UserDefaults.standard.string(forKey: "cascade.backgroundBackend") != "claude"
     }
 
@@ -277,8 +278,8 @@ public final class BackgroundWebAgent {
         return reason.isEmpty ? "the page doesn't show the task was completed" : reason
     }
 
-    /// Dispatches one episode attempt to the active brain: Scout (Groq + DOM-first
-    /// grounding) when `usesScout`, else the Claude (`model`) Computer-Use loop. Both
+    /// Dispatches one episode attempt to the active brain: Scout (Qwen3.7 Plus +
+    /// DOM-first grounding) when `usesScout`, else the Claude (`model`) loop. Both
     /// return the same (outcome, acted) so the verify/retry wrapper is brain-agnostic.
     private func episodeAttempt(
         _ sub: AgentSubtask, index: Int, total: Int, firmer: Bool,
@@ -498,8 +499,9 @@ public final class BackgroundWebAgent {
         return (stopped ? .stopped : .stepLimit, acted)
     }
 
-    /// One part as a SCOUT episode — the same brain as the on-screen agent (Llama-4
-    /// Scout via Groq), grounded DOM-first in the sandbox. Mirrors `episodeOnce`'s
+    /// One part as a SCOUT episode — the same brain as the on-screen agent (Qwen3.7
+    /// Plus over OpenRouter; it sees the sandbox snapshot plus the page text),
+    /// grounded DOM-first in the sandbox. Mirrors `episodeOnce`'s
     /// scaffolding and efficiency harness (stall guard, no-effect, steer, verify via
     /// the shared `runEpisode` wrapper) but drives `ScoutAgent` instead of the Claude
     /// computer-use loop. Scout names targets; `WebDOMGrounder` resolves them against
@@ -548,8 +550,10 @@ public final class BackgroundWebAgent {
             wrappedHarness = nil
         }
         let agent = ScoutAgent(
-            vision: groqVision,
+            planner: scoutPlanner,
             grounder: grounder,
+            model: ScoutPlannerClient.scoutModel(),
+            visionCapable: ScoutPlannerClient.visionEnabled(),
             environmentNote: Self.scoutSandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
             skillIndex: WebSkills.index(),
@@ -567,7 +571,7 @@ public final class BackgroundWebAgent {
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height),
-            note: await scoutWebContext()
+            screenText: await scoutWebContext()
         )
 
         let maxSteps = 80
@@ -612,7 +616,7 @@ public final class BackgroundWebAgent {
             if let g = agent.lastGroundLog { audit("sandbox.ground", String(g.prefix(100))) }
             if let missed = agent.lastGroundMiss {
                 audit("sandbox.ground.miss", String(missed.prefix(80)))
-                nudge = "Couldn't find “\(missed)” on the page — name a target EXACTLY as it appears in the clickable/fillable list below, or use type with NO target if you've already clicked into the field."
+                nudge = "Couldn't find “\(missed)” on the page — name a target EXACTLY as it appears in the clickable/fillable list above, or use type with NO target if you've already clicked into the field."
             }
 
             let turnActed = turnStateChanges > 0
@@ -669,10 +673,14 @@ public final class BackgroundWebAgent {
             }
 
             // Proactive context (the web Set-of-Marks push): the page text + the
-            // clickable/fillable elements, every turn, so the weak planner names
-            // targets that exist and the DOM grounder hits them.
-            let note = [steerNote, nudge, await scoutWebContext()].compactMap { $0 }.joined(separator: "\n\n")
-            step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
+            // clickable/fillable elements, every turn, are the planner's VIEW (it has
+            // no image) — passed as screenText; the steer/nudge is separate steering.
+            let note = [steerNote, nudge].compactMap { $0 }.joined(separator: "\n\n")
+            step = await agent.proceed(
+                screenshot: shot,
+                screenText: await scoutWebContext(),
+                note: note.isEmpty ? nil : note
+            )
             count += 1
         }
         return (stopped ? .stopped : .stepLimit, acted)

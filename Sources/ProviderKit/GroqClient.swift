@@ -1,20 +1,14 @@
 import Foundation
 
 /// Groq-hosted model ids (OpenAI-compatible inference). Part of the model-
-/// downgrade work — cheap, fast models for the pieces that don't need Claude:
-/// the task planner and completion validators (text), and the on-screen thinker
-/// (Scout, multimodal). See [[cascade-cu-downgrade-research]].
+/// downgrade work — cheap, fast models for the pieces that don't need Claude: the
+/// task planner and the completion validators (both TEXT). The on-screen / web
+/// "Scout" thinker no longer runs here — it moved to `ScoutPlannerClient` (Qwen3.7
+/// Plus over OpenRouter, a multimodal GUI-agent model). See
+/// [[cascade-cu-downgrade-research]].
 public enum GroqModel {
     /// Text-only, 128K ctx, ~$0.59/$0.79 per MTok. The planner + validators run here.
     public static let llama33_70b = "llama-3.3-70b-versatile"
-    /// Multimodal (accepts images) — the vision thinker (Tier 2).
-    public static let llama4Scout = "meta-llama/llama-4-scout-17b-16e-instruct"
-    /// NOTE: Llama-4 Maverick was REMOVED from Groq (a 404 — "model does not exist"),
-    /// so it is not a usable planner. Groq's only capable MULTIMODAL model (the planner
-    /// sees the screenshot) is Llama-4 Scout; the smarter Groq models (`qwen/qwen3-32b`,
-    /// `openai/gpt-oss-120b`) are TEXT-ONLY and cannot drive the vision planner as-is.
-    /// Kept for reference only — do not route the planner here.
-    public static let llama4Maverick = "meta-llama/llama-4-maverick-17b-128e-instruct"
 }
 
 /// Picks the (client, model) for the downgraded helper tasks — the task planner

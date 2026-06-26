@@ -48,6 +48,20 @@ func bestMatchPicksExactOverPartialAndRejectsNoise() {
 }
 
 @Test
+func minScoreGatesWeakOverlapForClickGrounding() {
+    // A weak word-overlap line (score ~1.67) is fine to HIGHLIGHT (default minScore
+    // 0) but must NOT be CLICKED (minScore 2) — a near-miss click is worse than
+    // falling through to the visual grounder. "changes save" shares 2/3 words with
+    // "save changes now" but neither contains the other → score 1.67.
+    let boxes = [box("changes save")]
+    #expect(ScreenTextRecognizer.bestMatch(anchor: "save changes now", in: boxes)?.text == "changes save")
+    #expect(ScreenTextRecognizer.bestMatch(anchor: "save changes now", in: boxes, minScore: 2) == nil)
+    // An exact / substring match clears the strong gate.
+    let titles = [box("Presentation Title")]
+    #expect(ScreenTextRecognizer.bestMatch(anchor: "Presentation Title", in: titles, minScore: 2)?.text == "Presentation Title")
+}
+
+@Test
 func ocrMatchScoreMirrorsAXTiers() {
     #expect(ScreenTextRecognizer.matchScore(needle: "send", candidate: "send") == 3)
     #expect(ScreenTextRecognizer.matchScore(needle: "send", candidate: "send message") == 2)

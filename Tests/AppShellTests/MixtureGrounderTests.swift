@@ -87,6 +87,53 @@ struct MixtureGrounderTests {
         #expect(!MixtureGrounder.clickableRoles.contains("AXImage"))
     }
 
+    @Test func oversizedAXMatchIsNotTrustedSoItFallsToVisual() {
+        // The Keynote bug: AX exposes the title placeholder as a wide AXTextArea, and
+        // its CENTER is empty space (a double-click there spawns a new text box). A
+        // frame covering a big share of the slide must NOT be AX-trusted — defer to
+        // the visual grounder. ~1100×320 on a 1440×900 display ≈ 27% → rejected.
+        #expect(!MixtureGrounder.isTrustableControlSize(
+            CGSize(width: 1100, height: 320), displayWidthPoints: 1440, displayHeightPoints: 900
+        ))
+    }
+
+    @Test func normalControlsKeepTheAXFastPath() {
+        // A button / field / menu item is a small fraction of the screen — its center
+        // is exactly where you'd click, so AX-first stays (free + exact).
+        #expect(MixtureGrounder.isTrustableControlSize(
+            CGSize(width: 120, height: 32), displayWidthPoints: 1440, displayHeightPoints: 900
+        ))
+        // A full-width but SHORT row/toolbar item is still a control (small area).
+        #expect(MixtureGrounder.isTrustableControlSize(
+            CGSize(width: 1440, height: 28), displayWidthPoints: 1440, displayHeightPoints: 900
+        ))
+    }
+
+    @Test func wholeSlideRegionIsRejected_unknownDisplayNeverOverRejects() {
+        // A near-full-screen match is plainly a region, not a control.
+        #expect(!MixtureGrounder.isTrustableControlSize(
+            CGSize(width: 1440, height: 900), displayWidthPoints: 1440, displayHeightPoints: 900
+        ))
+        // An unknown display (0 area) must not reject — degrade safely to AX, the
+        // no-effect detector remains the backstop.
+        #expect(MixtureGrounder.isTrustableControlSize(
+            CGSize(width: 1100, height: 320), displayWidthPoints: 0, displayHeightPoints: 0
+        ))
+    }
+
+    @Test func ocrTextPointMapsBoxCenterToDisplayPointWithoutYFlip() {
+        // OCR point grounding (the Keynote canvas fix): a Vision box (normalized 0…1,
+        // LOWER-LEFT origin) → the CENTER as a display-local AppKit point (bottom-left,
+        // NO Y flip), the executor's space. A box at (0.2,0.6) sized 0.3×0.05 has
+        // center (0.35, 0.625) → on a 1280×800 display → (448, 500).
+        let p = MixtureGrounder.pointFromVisionBox(
+            CGRect(x: 0.2, y: 0.6, width: 0.3, height: 0.05),
+            displayWidthPoints: 1280, displayHeightPoints: 800
+        )
+        #expect(p.x == 448)
+        #expect(p.y == 500)
+    }
+
     @Test func ocrTextBoxMapsToDisplayRectWithoutYFlip() {
         // OCR text grounding (the fix for "point at document text"): a Vision box
         // (normalized 0…1, LOWER-LEFT origin) → display-local AppKit rect (also

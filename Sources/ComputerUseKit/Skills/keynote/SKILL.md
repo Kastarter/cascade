@@ -111,22 +111,21 @@ clicks and zooms on one checkbox). Otherwise, screenshot and classify:
   size you set, the box overflowed — enlarge the box or cut words; don't
   re-send the font size. A small `+` badge at a box's bottom edge means
   clipped overflow text, NOT failed typing.
-- Writing the title: the slide's layout almost always ALREADY has a title
-  placeholder ON THE CANVAS — `fill_field` it (`click:double`,
-  `submit:cmd_return`), which double-clicks, selects, types, and exits in one
-  turn.
-- Subtitle / second / third placeholder — DON'T guess its coordinates (an
-  empty placeholder is easy to miss, and a double-click on bare canvas does
-  nothing). After the title's `cmd+return` leaves its box SELECTED, press
-  `Tab` to select the NEXT placeholder on the slide, then type to replace it
-  (Tab cycles canvas objects in order; typing onto a selected box replaces its
-  whole content). Repeat `Tab` → type for each remaining placeholder. This
-  reaches every placeholder reliably without hunting pixels. If a `Tab` selects
-  something that is NOT the box you meant (read the screenshot), `Tab` again to
-  the next; if the layout has no such placeholder, there is nothing to fill —
-  don't force one. Only fall back to clicking a placeholder directly when Tab
-  cycling clearly isn't landing on text boxes.
-  Go to the sidebar ONLY if the canvas truly shows no title box: click empty
+- Filling placeholders — name the prompt text you SEE: each placeholder shows
+  its own prompt ("Presentation Title", "Presentation Subtitle", "Author and
+  Date", "Title", "Subtitle", etc.). Target that VISIBLE prompt text and fill it
+  (`fill_field` / type-with-target: `click:double`, `submit:cmd_return`) —
+  double-click enters the box, `cmd+a` selects, type replaces, `cmd+return`
+  exits. The on-screen text is located by OCR, so naming the prompt you can read
+  lands on the right box every time — no coordinate guessing.
+- Fill EACH placeholder separately by its own prompt text. Do NOT press `Tab` to
+  hop between placeholders and then type: on a slide, `Tab` only SELECTS the next
+  object — typing or pasting onto a merely-selected (not edited) box drops a NEW
+  floating text box on top of the slide instead of replacing the placeholder
+  (this is the audited "made three text boxes, left the placeholders blank" bug).
+  One named fill per placeholder; if a layout has no such placeholder, there is
+  nothing to fill — don't force one.
+- Go to the sidebar ONLY if the canvas truly shows no title box: click empty
   canvas (deselect all) → Format sidebar `Slide` tab shows `Title` / `Body`
   checkboxes → check `Title` ONCE; the next screenshot must show a title box
   ON THE CANVAS — then work in that box, the checkbox's job is done. One
@@ -233,6 +232,17 @@ mode, not a broken launch.
   "appMatchers": {
     "bundleIdentifiers": ["com.apple.Keynote", "com.apple.iWork.Keynote"],
     "names": ["Keynote"]
-  }
+  },
+  "axUnreliable": true
 }
 ```
+
+<!-- axUnreliable: the iWork SLIDE CANVAS is NOT faithfully in the accessibility
+tree — AX exposes slide placeholders as wide AXTextAreas whose geometric CENTER is
+empty space, so an AX-first grounder returns a point off the text and a double-click
+there spawns a NEW text box (audited: "Presentation Title" grounded to (1304,637),
+the empty upper-right of the box). Flagging axUnreliable skips the AX grounding tier
+for Keynote, so a named target resolves by OCR (the visible prompt text, located
+exactly) then the visual grounder. Chrome (menus, buttons) still grounds fine — it's
+visible text too. -->
+

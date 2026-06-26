@@ -1,18 +1,21 @@
 import Foundation
 
 /// The downgraded on-screen brain (Tier 2 of the model-downgrade roadmap): a
-/// vision PLANNER (Llama 4 Scout via Groq) paired with a GROUNDER (UI-TARS). This
-/// is the Agent-S architecture — Scout looks at the screen and decides the next
-/// action, NAMING its target in words; the grounder turns that name into a click
-/// coordinate. Output is the same `CUAction`/`CUStep` the Claude agent emits, so
-/// the executor (`executeCU`) and the episode gates are reused unchanged.
+/// PLANNER (Qwen3.7 Plus via OpenRouter) paired with a GROUNDER (UI-TARS). This is
+/// the Agent-S architecture — the planner decides the next action and NAMES its
+/// target in words; the grounder turns that name into a click coordinate. Output
+/// is the same `CUAction`/`CUStep` the Claude agent emits, so the executor
+/// (`executeCU`) and the episode gates are reused unchanged.
 ///
-/// Why this shape: a general multimodal model like Scout plans well but grounds
-/// poorly (weak at exact pixel coordinates), so coordinates are delegated to the
-/// dedicated grounder. The model never emits pixels. See
-/// [[cascade-cu-downgrade-research]].
+/// Why this shape: Qwen3.7 Plus is a multimodal GUI-agent model — it SEES the
+/// screenshot (passed when `visionCapable`) AND is handed the screen as TEXT
+/// (accessibility controls + OCR Set-of-Marks; on the web, page text +
+/// interactives) via `screenText` as naming hints. It reasons over both and names
+/// targets; coordinates are delegated to the dedicated grounder. The planner never
+/// emits pixels. A text-only model (GLM-5.2, `visionCapable = false`) gets the
+/// `screenText` alone. See [[cascade-cu-downgrade-research]].
 ///
-/// RUNTIME-UNVERIFIED end to end (no Scout/UI-TARS/live screen in CI). The action
+/// RUNTIME-UNVERIFIED end to end (no planner/UI-TARS/live screen in CI). The action
 /// parser is pure + pinned; the live loop needs a dry run once both models serve.
 ///
 /// `@MainActor` (like ComputerUseAgent) because it now calls the @MainActor harness
@@ -36,9 +39,14 @@ public final class ScoutAgent {
         public let thought: String   // short narration / done reason
     }
 
-    private let vision: GroqVisionClient
+    private let planner: ScoutPlannerClient
     private let grounder: VisualGrounder
     private let model: String
+    /// Whether the planner model is multimodal — when true the screenshot is sent to
+    /// the planner each turn (Qwen3.7 Plus SEES the screen); when false it plans from
+    /// the AX + OCR `screenText` only (a text-only model like GLM-5.2). Either way the
+    /// grounder still reads the screenshot.
+    private let visionCapable: Bool
     private var displayW = 0
     private var displayH = 0
     private var history: [(user: String, assistant: String)] = []
@@ -68,9 +76,10 @@ public final class ScoutAgent {
     private let environmentNote: String?
 
     public init(
-        vision: GroqVisionClient = GroqVisionClient(),
+        planner: ScoutPlannerClient = ScoutPlannerClient(),
         grounder: VisualGrounder,
-        model: String = GroqModel.llama4Scout,
+        model: String = ScoutModel.qwen37Plus,
+        visionCapable: Bool = true,
         environmentNote: String? = nil,
         skillProvider: ((String) -> String?)? = nil,
         skillIndex: String? = nil,
@@ -78,9 +87,10 @@ public final class ScoutAgent {
         harnessTier: HarnessTier = .off,
         recallEnabled: Bool = false
     ) {
-        self.vision = vision
+        self.planner = planner
         self.grounder = grounder
         self.model = model
+        self.visionCapable = visionCapable
         self.environmentNote = environmentNote
         self.skillProvider = skillProvider
         self.skillIndex = skillIndex
@@ -113,12 +123,16 @@ public final class ScoutAgent {
         return (res.w, res.h)
     }
 
-    /// `conversation` seeds cross-turn memory (the shared assist history, so Scout
-    /// resolves "it"/"the first one"); `skill` is the frontmost app's playbook,
-    /// PUSHED into the system prompt (Scout won't pull); `note` is the first turn's
-    /// grounding line (frontmost app + window). Parity with the Opus path's harness.
+    /// `screenText` is the AX + OCR view of the screen (web: page text + interactives)
+    /// — naming hints alongside the screenshot for a vision planner, or the sole view
+    /// for a text-only one; the `screenshot` goes to the grounder (and to the planner
+    /// when `visionCapable`). `conversation` seeds cross-turn
+    /// memory (so Scout resolves "it"/"the first one"); `skill` is the frontmost
+    /// app's playbook, PUSHED into the system prompt (Scout won't pull); `note` is an
+    /// optional first-turn nudge. Parity with the Opus path's harness.
     public func begin(
         goal: String, screenshot: Data, displayWidthPoints: Int, displayHeightPoints: Int,
+        screenText: String? = nil,
         conversation: [(user: String, assistant: String)] = [], note: String? = nil, skill: String? = nil
     ) async -> CUStep {
         self.goal = goal
@@ -128,17 +142,17 @@ public final class ScoutAgent {
         episodeCopied = false
         goalAsksForPaste = ComputerUseAgent.goalMentionsClipboard(goal)
         applySkill(skill)
-        return await step(screenshot: screenshot, note: note)
+        return await step(screenshot: screenshot, screenText: screenText, note: note)
     }
 
-    /// `note` is an optional runtime nudge (e.g. a no-effect warning + the controls
-    /// actually on screen) appended to this turn's instruction — the structural way
-    /// to steer a cheap planner that can't otherwise tell its last action did nothing.
-    /// `skill` is the playbook for the app frontmost THIS turn — refreshed every
-    /// turn so it tracks the app actually in focus (e.g. once Scout opens Keynote).
-    public func proceed(screenshot: Data, note: String? = nil, skill: String? = nil) async -> CUStep {
+    /// `screenText` is this turn's screen rendered as text (the planner has no image);
+    /// `note` is an optional runtime nudge (e.g. a no-effect warning) — the structural
+    /// way to steer a cheap planner that can't otherwise tell its last action did
+    /// nothing. `skill` is the playbook for the app frontmost THIS turn — refreshed
+    /// every turn so it tracks the app actually in focus (e.g. once Scout opens Keynote).
+    public func proceed(screenshot: Data, screenText: String? = nil, note: String? = nil, skill: String? = nil) async -> CUStep {
         applySkill(skill)
-        return await step(screenshot: screenshot, note: note)
+        return await step(screenshot: screenshot, screenText: screenText, note: note)
     }
 
     /// Updates the pushed app playbook (a nil skill leaves the last one in place, so
@@ -150,7 +164,7 @@ public final class ScoutAgent {
 
     /// episodeSystem = base prompt + tool catalogue + the pushed app playbook.
     private func rebuildSystem() {
-        var s = Self.systemPrompt + toolsPrompt
+        var s = Self.perceptionIntro(visionCapable: visionCapable) + "\n\n" + Self.systemPrompt + toolsPrompt
         if let environmentNote, !environmentNote.isEmpty {
             s += "\n\n" + environmentNote
         }
@@ -202,22 +216,35 @@ public final class ScoutAgent {
     /// click landed (or that it found nothing), the visibility we were missing.
     public private(set) var lastGroundLog: String?
 
-    private func step(screenshot: Data, note: String? = nil, carried: String? = nil, hop: Int = 0, parseRetry: Bool = false) async -> CUStep {
+    private func step(screenshot: Data, screenText: String? = nil, note: String? = nil, carried: String? = nil, hop: Int = 0, parseRetry: Bool = false) async -> CUStep {
         lastGroundMiss = nil
         lastGroundLog = nil
-        var user = "Goal: \(goal)\n\nDecide the next action(s) and reply with the JSON object only."
-        if let carried, !carried.isEmpty { user += "\n\nResults of your tool calls:\n" + carried }
-        if let note, !note.isEmpty { user += "\n\n" + note }
+        // Lead with the goal, then the screen, then any tool results / nudge, then the
+        // ask. A vision planner (Qwen3.7 Plus) also gets the screenshot, so the
+        // AX/OCR text is framed as a Set-of-Marks AID; a text-only model gets it as
+        // its sole view.
+        var user = "Goal: \(goal)\n\n"
+        if let screenText, !screenText.isEmpty {
+            user += visionCapable
+                ? "ELEMENTS ON SCREEN (read via accessibility + OCR — use these exact names to target the screenshot below):\n\(screenText)\n\n"
+                : "WHAT'S ON SCREEN NOW — read from the live UI via accessibility + OCR (this text IS your view of the screen; there is no image):\n\(screenText)\n\n"
+        }
+        if let carried, !carried.isEmpty { user += "Results of your tool calls:\n" + carried + "\n\n" }
+        if let note, !note.isEmpty { user += note + "\n\n" }
+        user += "Decide the next action(s) and reply with the JSON object only."
         let reply: String
         do {
-            reply = try await vision.complete(
-                // Headroom for a batched reply with thoughts: 600 truncated ambitious
-                // batches mid-JSON, which then failed to parse and wasted the turn.
-                system: episodeSystem, user: user, imageJPEG: screenshot,
-                model: model, maxTokens: 1200, prior: history
+            reply = try await planner.complete(
+                // A vision model SEES the screenshot; a text-only model gets nil (it
+                // plans from screenText). Headroom for a batched reply with thoughts:
+                // a small cap truncated ambitious batches mid-JSON (and a reasoning
+                // model can return empty content when the cap is spent on thinking).
+                system: episodeSystem, user: user,
+                imageJPEG: visionCapable ? screenshot : nil,
+                model: model, maxTokens: 1500, prior: history
             )
         } catch {
-            // Surface the real reason (Groq rate-limit / transport / empty) so the
+            // Surface the real reason (GLM rate-limit / transport / empty) so the
             // runner can audit WHY the run failed instead of stopping silently.
             return CUStep(actions: [], text: "planner error: \(error)", done: true, failed: true)
         }
@@ -229,7 +256,7 @@ public final class ScoutAgent {
             if !reply.isEmpty, !parseRetry {
                 history.append((user: "(unparseable reply)", assistant: String(reply.prefix(200))))
                 let recover = "Your previous reply was not valid JSON (it may have been cut off). Reply with ONLY a single compact JSON action object — no prose, no code fences. If you meant several steps, send FEWER this turn."
-                return await step(screenshot: screenshot, note: recover, parseRetry: true)
+                return await step(screenshot: screenshot, screenText: screenText, note: recover, parseRetry: true)
             }
             // Unparseable → an empty, non-done turn; the runner's stall guard
             // ends the episode if this repeats.
@@ -256,7 +283,7 @@ public final class ScoutAgent {
             // multi-hop turn doesn't duplicate them across entries).
             history.append((user: "(tool call)", assistant: String(reply.prefix(300))))
             if plan.isEmpty, hop < 6 {
-                return await step(screenshot: screenshot, note: note, carried: results, hop: hop + 1)
+                return await step(screenshot: screenshot, screenText: screenText, note: note, carried: results, hop: hop + 1)
             }
             // Screen actions present (or hop cap hit): fall through to run them; the
             // tool results are in history for the model's next turn.
@@ -274,7 +301,12 @@ public final class ScoutAgent {
         // coexist on one frame (title + subtitle) still chain. Append only what we
         // actually run to history, so the model doesn't think it did the dropped tail.
         let batch = Self.safeBatchPrefix(plan)
-        history.append((user: user, assistant: batch.map(Self.historyLine).joined(separator: " ; ")))
+        // Compact memory (words-only, like the vision planner never resent old
+        // frames): store the assistant's actions + any nudge it was given — NEVER the
+        // full screen-as-text, which is huge and stale by the next turn (the fresh
+        // screenText is re-sent every turn as the CURRENT user message instead).
+        let historyUser = (note?.isEmpty == false) ? String(note!.prefix(160)) : "(observed the screen)"
+        history.append((user: historyUser, assistant: batch.map(Self.historyLine).joined(separator: " ; ")))
         // Ground every named target in the safe prefix CONCURRENTLY against this one
         // frame — the lookups are independent, so a two-fill turn pays one grounding
         // latency, not two in series. Results are recorded in plan order so the
@@ -501,10 +533,30 @@ public final class ScoutAgent {
         return s
     }
 
-    static let systemPrompt = """
-    You are an on-screen computer-use agent. You see the user's screen and drive it \
-    to accomplish their goal.
+    /// The perception sentence — adapts to whether the planner model can see the
+    /// screenshot (Qwen3.7 Plus) or only the AX + OCR text (GLM-5.2). Prepended to
+    /// `systemPrompt` in `rebuildSystem`.
+    static func perceptionIntro(visionCapable: Bool) -> String {
+        visionCapable
+            ? """
+            You are an on-screen computer-use agent that drives the user's screen to \
+            accomplish their goal. Each turn you SEE a screenshot of the screen, and you \
+            are also given a TEXT list of the on-screen elements (read via accessibility \
+            and OCR) — use those exact names to refer to what you see. When you NAME a \
+            target, a locator turns it into an exact click for you, so you never output \
+            coordinates.
+            """
+            : """
+            You are an on-screen computer-use agent that drives the user's screen to \
+            accomplish their goal. You do NOT see an image — each turn you are given a \
+            TEXT description of what's on screen right now, read from the live UI via \
+            accessibility (the app's own controls) and OCR (the visible text). Plan from \
+            that text. When you NAME a target, a locator turns it into an exact click for \
+            you, so you never output coordinates.
+            """
+    }
 
+    static let systemPrompt = """
     Reply with ONLY JSON — no prose, no code fences. For ONE action:
     {"thought": "<one short clause on what you're doing>", "action": "<one action>", \
     "target": "<the on-screen element, named in plain words>", "text": "<text to type>", \
@@ -522,7 +574,7 @@ public final class ScoutAgent {
       "the search field", "the subtitle placeholder"). DO NOT output coordinates — \
       naming the target is enough; the system locates it for you.
     - "type": enter text. "text" is what to type; "target" (optional) is the field, \
-      DESCRIBED BY WHAT YOU SEE (its visible label or placeholder text) — never the \
+      DESCRIBED BY THE ON-SCREEN TEXT (its visible label or placeholder) — never the \
       text you intend to type. Given a target it is double-clicked (to enter editing), \
       its contents selected, and replaced with "text". For the rare plain field where \
       a double-click misbehaves, add "click":"single". With no target, the text goes \
@@ -542,6 +594,10 @@ public final class ScoutAgent {
     - If your last action did NOT change the screen, do NOT repeat it — the control \
       isn't there, is disabled, or needs a different gesture. Pick a different \
       control, menu, or approach (a third identical attempt is never the answer).
+    - The on-screen text can be INCOMPLETE for graphics / canvas apps (Keynote \
+      slides, Blender, design tools) where there's little to read. If what you need \
+      isn't listed, don't assume it's absent — open the relevant menu or panel, or \
+      use a keyboard shortcut, to reveal and act on it.
     - To enter text use "type" — it delivers the text itself. NEVER press cmd+v/ctrl+v \
       to enter content: you don't own the clipboard and it pastes what the USER copied.
     - Do the work INSIDE the app the task names, through its own UI. Never detour to \

@@ -74,10 +74,47 @@ public struct MixtureGrounder: VisualGrounder {
         ) {
             return axPoint
         }
+        // On-screen TEXT — a placeholder's prompt ("Presentation Title"), a label, a
+        // heading — is exactly what the visual model fumbles on wide canvas boxes (it
+        // oscillated between the text and an empty spot on Keynote slides) but OCR
+        // nails: the text is literally rendered there. Ground to the matching text's
+        // CENTER before the visual grounder. STRONG match only (exact/substring) so
+        // vague body text can't hijack a click; otherwise fall through. General — any
+        // literally-visible-text target, in any app.
+        if let ocrPoint = await Self.ocrTextPoint(
+            screenshot: screenshot, target: target,
+            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        ) {
+            return ocrPoint
+        }
         return await base.ground(
             screenshot: screenshot, target: target,
             displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
         )
+    }
+
+    /// Locate a target that is literal ON-SCREEN TEXT by OCR and return the CENTER of
+    /// the matching text as a display-local AppKit point (the executor's space, the
+    /// same one `axGround` / the visual grounder return). Requires a STRONG match
+    /// (`minScore: 2` — exact or substring) so vague text never hijacks a click; nil
+    /// otherwise → caller falls to the visual grounder. OCR runs off-main.
+    static func ocrTextPoint(
+        screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
+    ) async -> CGPoint? {
+        let boxes = await Task.detached { ScreenTextRecognizer.recognizeBoxes(inImageData: screenshot) }.value
+        guard let match = ScreenTextRecognizer.bestMatch(anchor: target, in: boxes, minScore: 2) else { return nil }
+        return pointFromVisionBox(
+            match.boundingBox, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        )
+    }
+
+    /// Vision-normalized box (0…1, LOWER-LEFT origin) → its CENTER as a display-local
+    /// AppKit point (bottom-left origin too, so NO Y flip — same space as
+    /// `rectFromVisionBox`). Pure + pinned — a wrong number clicks empty space.
+    nonisolated static func pointFromVisionBox(
+        _ box: CGRect, displayWidthPoints w: Int, displayHeightPoints h: Int
+    ) -> CGPoint {
+        CGPoint(x: box.midX * CGFloat(w), y: box.midY * CGFloat(h))
     }
 
     /// Region grounding (the "where is X" highlight) stays the base grounder's job —
@@ -159,6 +196,18 @@ public struct MixtureGrounder: VisualGrounder {
         guard let match = AXElementResolver.find(label: target),
               match.score >= minAXScore,
               Self.clickableRoles.contains(match.role) else { return nil }
+        // An AX match whose frame is far larger than a control is a CONTENT REGION,
+        // not a button/field — e.g. a Keynote/Pages slide placeholder that AX exposes
+        // as a wide AXTextArea. Its geometric CENTER (what we'd click) is usually
+        // empty space: the click misses, and on a slide a double-click there spawns a
+        // NEW text box instead of editing the placeholder (the audited Keynote bug).
+        // Its size is untrustworthy, so defer to the visual grounder, which aims at
+        // the VISIBLE content. General + app-agnostic: real controls/fields/rows are
+        // small and stay AX-grounded (free + exact), while web/native fills already
+        // work because their fields are either small or AX-sparse → visual.
+        guard Self.isTrustableControlSize(
+            match.size, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        ) else { return nil }
         // Map the matched element center (CG-global, top-left) into the display-local
         // AppKit point the executor consumes. Use the display the screenshot came
         // from — the cursor's — selected by matching the declared dimensions.
@@ -176,6 +225,29 @@ public struct MixtureGrounder: VisualGrounder {
     nonisolated static func namesCanvasConcept(_ target: String) -> Bool {
         let t = target.lowercased()
         return t.contains("placeholder") || t.contains("canvas")
+    }
+
+    /// The largest share of the display an AX match's frame may cover and still have
+    /// a TRUSTWORTHY center to click. A real control (button, field, menu item, row)
+    /// is a small fraction; a content region / canvas placeholder covers far more,
+    /// and its center is empty space. Tuned to sit well below a Keynote title
+    /// placeholder (~20–28% of the slide) and well above any normal control (<5%).
+    static let maxTrustedControlAreaFraction = 0.10
+
+    /// Whether an AX match's frame is small enough that its CENTER is a trustworthy
+    /// click point. A frame covering more than `maxTrustedControlAreaFraction` of the
+    /// display is a content region / canvas placeholder, not a control — its center
+    /// is often empty space (a miss, or a new text box on a slide), so the visual
+    /// grounder (which aims at the visible content) should own it. An unknown display
+    /// size never over-rejects. Pure + pinned: too high re-opens the Keynote box bug;
+    /// too low needlessly drops legitimate large controls to the slower visual path.
+    nonisolated static func isTrustableControlSize(
+        _ size: CGSize, displayWidthPoints: Int, displayHeightPoints: Int
+    ) -> Bool {
+        let screenArea = Double(displayWidthPoints) * Double(displayHeightPoints)
+        guard screenArea > 0 else { return true }
+        let fraction = (Double(size.width) * Double(size.height)) / screenArea
+        return fraction <= maxTrustedControlAreaFraction
     }
 
     /// CG-global top-left element center → display-local AppKit point (bottom-left

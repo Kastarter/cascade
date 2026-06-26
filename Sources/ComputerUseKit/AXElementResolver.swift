@@ -17,6 +17,19 @@ public enum AXElementResolver {
         public let role: String
         public let title: String
         public let score: Double
+        /// The element's frame size (points). Lets a caller judge whether the
+        /// CENTER is a trustworthy click point: a frame far larger than a control
+        /// (a content region / canvas placeholder) has a center that is often empty
+        /// space, where a click misses — or, on a slide, spawns a new text box.
+        public let size: CGSize
+
+        public init(center: CGPoint, role: String, title: String, score: Double, size: CGSize = .zero) {
+            self.center = center
+            self.role = role
+            self.title = title
+            self.score = score
+            self.size = size
+        }
     }
 
     /// A recorded click target as a ranked tuple of coordinate-free locators
@@ -97,7 +110,7 @@ public enum AXElementResolver {
                 let distance = recorded.map { hypot(center.x - $0.x, center.y - $0.y) } ?? 0
                 let combined = score * 10_000 - min(distance, 9_999)
                 if best == nil || combined > bestRank {
-                    best = Match(center: center, role: role, title: text ?? "", score: score)
+                    best = Match(center: center, role: role, title: text ?? "", score: score, size: frame.size)
                     bestRank = combined
                 }
             }
@@ -143,7 +156,7 @@ public enum AXElementResolver {
                 guard !seen.contains(dedupe) else { return }
                 guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
                 seen.insert(dedupe)
-                out.append(Match(center: CGPoint(x: frame.midX, y: frame.midY), role: role, title: String(text.prefix(60)), score: 0))
+                out.append(Match(center: CGPoint(x: frame.midX, y: frame.midY), role: role, title: String(text.prefix(60)), score: 0, size: frame.size))
             }
         }
         return out

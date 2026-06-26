@@ -83,10 +83,12 @@ public enum ScreenTextRecognizer {
     }
 
     /// The text line that best matches a recorded `anchor`, or nil when nothing
-    /// scores — vague text must never hijack a click. Pure + unit-pinned. Scoring
-    /// mirrors AXElementResolver.matchScore (exact 3 / contains 2 / word-overlap 1+)
-    /// so the OCR tier ranks text the same way the AX tier does.
-    public static func bestMatch(anchor: String, in boxes: [TextBox]) -> TextBox? {
+    /// scores at least `minScore` — vague text must never hijack a click. Pure +
+    /// unit-pinned. Scoring mirrors AXElementResolver.matchScore (exact 3 / contains
+    /// 2 / word-overlap 1+) so the OCR tier ranks text the same way the AX tier does.
+    /// `minScore` lets a caller demand a STRONG match (≥2 = exact or substring) when
+    /// the result will be CLICKED, vs. the default 0 for a forgiving highlight.
+    public static func bestMatch(anchor: String, in boxes: [TextBox], minScore: Double = 0) -> TextBox? {
         let needle = normalizeText(anchor)
         guard !needle.isEmpty else { return nil }
         var best: TextBox?
@@ -95,7 +97,7 @@ public enum ScreenTextRecognizer {
             let score = matchScore(needle: needle, candidate: normalizeText(box.text))
             if score > bestScore { bestScore = score; best = box }
         }
-        return best
+        return bestScore >= minScore ? best : nil
     }
 
     static func normalizeText(_ text: String) -> String {

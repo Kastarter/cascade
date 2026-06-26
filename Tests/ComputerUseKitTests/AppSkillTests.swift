@@ -252,7 +252,13 @@ struct AppSkillTests {
         let legacy = registry.skill(appName: "Keynote", bundleIdentifier: "com.apple.iWork.Keynote")
         #expect(creatorStudio?.name == "keynote")
         #expect(legacy?.name == "keynote")
-        #expect(creatorStudio?.axUnreliable == false)
+        // The iWork SLIDE CANVAS is not faithfully in the AX tree — placeholders are
+        // wide AXTextAreas whose center is empty space, so AX-first grounded the title
+        // to (1304,637) and a double-click there spawned a new text box. Keynote is now
+        // flagged axUnreliable so named targets ground by OCR (visible prompt text)
+        // then the visual grounder, like the other canvas apps.
+        #expect(creatorStudio?.axUnreliable == true)
+        #expect(legacy?.axUnreliable == true)
         #expect(creatorStudio?.keysFollowPointer == false)
         // The task skills join the index but never app-match — matchers stay
         // on the core skill (and keynote-* would path-sort ahead of it).

@@ -99,7 +99,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var hasGroqKey = false
     @Published public private(set) var groqKeyMessage = "Groq key is not connected (for the cheaper Groq models)."
     @Published public private(set) var hasOpenRouterKey = false
-    @Published public private(set) var openRouterKeyMessage = "OpenRouter key is not connected (for hosted UI-TARS grounding)."
+    @Published public private(set) var openRouterKeyMessage = "OpenRouter key is not connected (runs the Qwen3.7 Plus Scout brain + hosted UI-TARS grounding)."
     @Published public private(set) var permissionDiagnostics = PermissionProbe.diagnostics()
     @Published public private(set) var screenAgentReady = false
     @Published public private(set) var screenAgentMessage = "Checking real-screen driver health."
@@ -1287,26 +1287,29 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
-    /// On-screen backend: Scout (Groq plan + grounder) vs the Opus computer-use loop.
-    /// ONE BRAIN: Scout is the DEFAULT whenever it's fully set up — a Groq key (the
-    /// planner) AND an OpenRouter key (the grounder) are both present — matching the
-    /// background agent. Force either way with `cascade.onScreenBackend` = "scout" /
-    /// "opus"; with the keys missing it falls back to the proven Opus path, so a
-    /// keyless setup is never broken.
+    /// On-screen backend: Scout (Qwen3.7 Plus plans + grounder) vs the Opus
+    /// computer-use loop. ONE BRAIN: Scout is the DEFAULT whenever it's fully set up —
+    /// an OpenRouter key is present, which powers BOTH the Qwen3.7 Plus planner and
+    /// the UI-TARS grounder. Force either way with `cascade.onScreenBackend` =
+    /// "scout" / "opus"; with no key it falls back to the proven Opus path, so a
+    /// keyless setup is never broken. (Qwen3.7 Plus is multimodal — it sees the
+    /// screenshot plus the AX + OCR text marks; see `runScoutEpisode`.)
     static func onScreenBackendIsScout() -> Bool {
         switch UserDefaults.standard.string(forKey: "cascade.onScreenBackend") {
         case "scout": return true
         case "opus", "claude": return false
-        default: return GroqKeyStore().hasKey() && OpenRouterKeyStore().hasKey()
+        default: return OpenRouterKeyStore().hasKey()
         }
     }
 
-    /// The Tier 2 on-screen loop: Scout (Groq, vision) plans the next action and
-    /// names its target; UI-TARS grounds the target to a coordinate; the result is
-    /// the same CUAction batch the Opus path produces, executed by the same
-    /// `executeCU` under the same generation/STOP gates. A leaner loop than the
-    /// Opus path (no SSE streaming, no skills/harness) — additive, opt-in, so the
-    /// Opus loop is untouched. RUNTIME-UNVERIFIED (needs Scout + UI-TARS serving).
+    /// The Tier 2 on-screen loop: Scout (Qwen3.7 Plus, multimodal) plans the next
+    /// action and names its target — it SEES the screenshot and is also handed the
+    /// screen as TEXT (AX controls + OCR Set-of-Marks, injected every turn) as naming
+    /// hints; UI-TARS grounds the named target to a coordinate from the screenshot;
+    /// the result is the same CUAction batch the Opus path produces, executed by the
+    /// same `executeCU` under the same generation/STOP gates, with the same no-effect
+    /// / stall / validator harness. Additive, opt-in, so the Opus loop is untouched.
+    /// RUNTIME-UNVERIFIED (needs the planner + UI-TARS serving).
     private func runScoutEpisode(
         goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
     ) async -> AssistEpisodeOutcome {
@@ -1323,10 +1326,15 @@ public final class CascadeAppModel: ObservableObject {
         // file/shell harness, and record recall — shared providers, so Scout can
         // reach for them too (it may underuse pull-tools, but the capability is here).
         let agent = ScoutAgent(
+            // Planner is Qwen3.7 Plus over OpenRouter (multimodal, 1M ctx) — it SEES
+            // the screenshot AND gets the AX + OCR text marks (injected below) to name
+            // targets; the grounder clicks. Model / endpoint / vision are swappable
+            // without a rebuild via `cascade.scout.model` / `.endpoint` / `.vision`
+            // (set `.vision false` for a text-only model like GLM-5.2).
+            planner: ScoutPlannerClient(endpoint: ScoutPlannerClient.scoutEndpoint()),
             grounder: grounder,
-            // Planner is Llama-4 Scout (the default) — Groq's only capable MULTIMODAL
-            // model. Maverick was removed from Groq and the smarter Groq models are
-            // text-only, so there's no smarter drop-in vision planner here right now.
+            model: ScoutPlannerClient.scoutModel(),
+            visionCapable: ScoutPlannerClient.visionEnabled(),
             // The SAME environment context Opus gets — foreground-browser behavior note
             // + today's date — so the planner is told everything Opus is told (parity).
             environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
@@ -1364,11 +1372,13 @@ public final class CascadeAppModel: ObservableObject {
         var nudge: String?
 
         // Parity with the Opus path's harness: seed cross-turn memory, push the
-        // frontmost app's skill (Scout can't pull), and pass the grounding note.
+        // frontmost app's skill (Scout can't pull), and inject the screen AS TEXT
+        // (AX controls + OCR) — the text-only planner is blind on turn 1 without it.
         var modelStart = ContinuousClock.now
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
-            conversation: assistMemory.historyForAPI(), note: scoutContextNote(),
+            screenText: await scoutScreenText(forFrame: firstScreenshotPNG),
+            conversation: assistMemory.historyForAPI(),
             skill: scoutSkillPush(goal: goal)
         )
         modelTime += modelStart.duration(to: .now); count += 1
@@ -1470,7 +1480,7 @@ public final class CascadeAppModel: ObservableObject {
                     }
                     // The controls list is PUSHED proactively into turnNote below
                     // (harvested once), so the nudge just steers — no second AX walk.
-                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
+                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from the on-screen text above, open the right menu/panel, or set action to \"done\" if it truly can't be done."
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout no-effect turn \(count)"))
                 }
             } else if actedThisTurn, expectsChange {
@@ -1494,7 +1504,7 @@ public final class CascadeAppModel: ObservableObject {
             if let missed = agent.lastGroundMiss {
                 let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
                 _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((controlSummary ?? "(no AX controls)").prefix(200)))"))
-                let missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name a VISIBLE field, button, or placeholder from the controls listed below (or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
+                let missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name a VISIBLE field, button, or placeholder from the on-screen text above (or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
                 nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
             }
             // Refresh the grounding line + the proactive controls list + app skill
@@ -1505,11 +1515,15 @@ public final class CascadeAppModel: ObservableObject {
             // so it stops ASSUMING what's on the page. Mirrors the AX controls push —
             // structural, gated to sparse-AX turns, off-main so it doesn't stall the loop.
             let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count)
-            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
+            // Screen-as-text is the planner's VIEW (it has no image); the nudge is
+            // separate steering. Both rebuilt every turn — the frontmost app changes
+            // once Scout opens the target.
+            let screenText = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             step = await agent.proceed(
                 screenshot: observedShot,
-                note: turnNote.isEmpty ? nil : turnNote,
+                screenText: screenText.isEmpty ? nil : screenText,
+                note: nudge,
                 skill: scoutSkillPush(goal: goal)
             )
             modelTime += modelStart.duration(to: .now); count += 1
@@ -2055,12 +2069,17 @@ public final class CascadeAppModel: ObservableObject {
         summary.map { "Controls on screen now (name one of these to click or fill, or open a menu/panel to reveal others): \($0)" }
     }
 
-    /// The first turn's pushed context for Scout: frontmost app/window + the controls
-    /// actually on screen. Subsequent turns rebuild the same shape inline (reusing a
-    /// single AX harvest alongside the no-effect/miss feedback).
-    private func scoutContextNote() -> String? {
-        let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
-        let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
+    /// The screen rendered AS TEXT for the GLM (text-only) Scout planner: frontmost
+    /// app/window + the AX controls on screen + (on sparse-AX / canvas surfaces) an
+    /// OCR Set-of-Marks of the visible text. This is the planner's entire view of the
+    /// screen — there is no image. Used for the FIRST turn; subsequent turns rebuild
+    /// the same shape inline alongside the no-effect/miss feedback. `async` because
+    /// the OCR pass runs off-main.
+    private func scoutScreenText(forFrame frame: Data) async -> String? {
+        let controls = AXElementResolver.interactables(limit: 24)
+        let controlSummary = AXElementResolver.interactableSummary(controls)
+        let ocrMarks = await ocrSetOfMarks(forFrame: frame, axControlCount: controls.count)
+        let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
 
@@ -3691,12 +3710,12 @@ public final class CascadeAppModel: ObservableObject {
             : "Paste your OpenAI API key to enable the GPT-Realtime voice (talk + spoken replies)."
         hasGroqKey = groqKeyStore.hasKey()
         groqKeyMessage = hasGroqKey
-            ? "Groq key connected — planner, validators, and the Scout on-screen agent can run on Groq."
-            : "Paste your Groq API key to run the cheap models (Llama 3.3 70B planner/validators, Llama 4 Scout agent)."
+            ? "Groq key connected — the task planner and completion validators run on Groq (Llama 3.3 70B)."
+            : "Paste your Groq API key to run the cheap text helpers (Llama 3.3 70B planner + validators)."
         hasOpenRouterKey = openRouterKeyStore.hasKey()
         openRouterKeyMessage = hasOpenRouterKey
-            ? "OpenRouter key connected — the on-screen agent grounds clicks with hosted UI-TARS."
-            : "Paste your OpenRouter API key to ground the on-screen agent with hosted UI-TARS (Opus plans, UI-TARS locates)."
+            ? "OpenRouter key connected — runs the Scout brain (Qwen3.7 Plus) and grounds its clicks with hosted UI-TARS."
+            : "Paste your OpenRouter API key to run the Scout brain (Qwen3.7 Plus) and ground its clicks with hosted UI-TARS. Without it, the on-screen agent runs on Claude (Opus)."
     }
 
     public func saveAnthropicKey(_ key: String) {
