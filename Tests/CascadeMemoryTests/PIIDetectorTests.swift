@@ -31,6 +31,19 @@ func detectsSSNAndIBANAndApiKey() {
 }
 
 @Test
+func detectsHyphenatedProviderApiKeys() {
+    // Cascade's own Anthropic key shape — must be redacted, not leaked.
+    let anthropic = "ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"
+    let (redacted, findings) = PIIDetector.redact(anthropic)
+    #expect(findings.contains { $0.type == .apiKey })
+    #expect(!redacted.contains("sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"))
+    #expect(redacted.contains("<API_KEY>"))
+    // sk-proj- and sk-or-v1- variants too.
+    #expect(PIIDetector.containsHighConfidencePII("key sk-proj-AbCdEf012345678901234567"))
+    #expect(PIIDetector.containsHighConfidencePII("key sk-or-v1-0123456789abcdefghijklmno"))
+}
+
+@Test
 func detectsIPAddress() {
     let found = PIIDetector.findings(in: "server at 192.168.1.254 responded")
     #expect(found.contains { $0.type == .ipAddress })

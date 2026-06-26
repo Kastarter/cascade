@@ -234,6 +234,12 @@ public enum AgentHarness {
         // Persistence / privilege & automation escalation.
         #"\blaunchctl\b"#,
         #"\bosascript\b"#,                                  // TCC/automation escalation via shell
+        // Inline-interpreter network egress — the obvious way around the named
+        // network-tool blocks above. Bounded look-ahead, defense-in-depth only:
+        // the deny-list is a guardrail, not a sandbox (see the type doc).
+        #"\bpython[0-9.]*\s+-c\b.{0,200}(urllib|requests|socket|http\.client|httplib|smtplib|ftplib)"#,
+        #"\b(node|nodejs|deno|bun)\s+-e\b.{0,200}(https?|net|fetch|require\()"#,
+        #"\b(perl|ruby)\s+-e\b.{0,200}(socket|net::http|net/http|lwp|open-uri|httparty)"#,
     ]
 
     /// Why a command is refused, or nil when it may run.

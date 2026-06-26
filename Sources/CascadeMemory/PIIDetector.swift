@@ -104,8 +104,11 @@ public enum PIIDetector {
         (.iban, #"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"#),
         (.ipAddress, #"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"#),
         // High-confidence API-key shapes (specific prefixes only — generic long
-        // tokens are too noisy to auto-redact).
-        (.apiKey, #"\b(?:sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z_\-]{35})\b"#),
+        // tokens are too noisy to auto-redact). The `sk-` class allows hyphens and
+        // underscores so hyphenated provider keys are caught — including Cascade's
+        // OWN Anthropic keys (sk-ant-…, sk-proj-…, sk-or-v1-…), which the old
+        // `sk-[A-Za-z0-9]+` missed at the first hyphen.
+        (.apiKey, #"\b(?:sk-[A-Za-z0-9_\-]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z_\-]{35})\b"#),
         // Candidate card numbers (13–19 digits, optional space/dash groups);
         // confirmed by Luhn below.
         (.creditCard, #"\b(?:\d[ \-]?){13,19}\b"#),
