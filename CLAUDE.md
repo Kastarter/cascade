@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): P3-05 added pure `SkillConsolidator` in ComputerUseKit: learned-skill overlap scoring, active-skill filtering, revise/archive/quarantine/new decisions, and stable order-independent tests; not wired into approval UI yet.
 - NEW (2026-06-26): P3-04 added CascadeMemory `AgentExperienceLedger`: SQLite `agent_experience_case` storage, pure retained-score logic, and query/avoid-rule APIs for verified successes, verifier-backed failures, safe refusals, and feedback-backed user stops.
 - NEW (2026-06-26): P3-03 added CascadeMemory work-graph skeleton: native SQLite graph tables, deterministic app/window/url/file/date/person extraction, alias upsert, redacted context links, graph edges, and entity timelines; not auto-wired into recorder inserts.
 - NEW (2026-06-26): P3-02 added standalone `PrefixSpanMiner` in WasteDetection: integer-compressed gap-constrained sequence mining with sequence support, occurrence spans, optional time-span bound, deterministic ordering, and closed-pattern filtering; not wired into `WasteDetector.detect` yet.
