@@ -579,7 +579,13 @@ public final class BackgroundWebAgent {
         while count < maxSteps, !stopped {
             if step.failed {
                 audit("sandbox.done", "scout planner error (acted=\(acted)): \(step.text.prefix(70))")
-                return (.failed("I couldn't reach the Scout model just now — ask again and I'll continue."), acted)
+                // A 402 from OpenRouter is "out of credits", not a transient blip —
+                // tell the user to top up rather than "ask again".
+                let outOfCredits = step.text.contains("402") || step.text.lowercased().contains("more credits")
+                let msg = outOfCredits
+                    ? "Your OpenRouter account is out of credits — top it up to run the background (Qwen) agent."
+                    : "I couldn't reach the Scout model just now — ask again and I'll continue."
+                return (.failed(msg), acted)
             }
             if step.done {
                 switch Self.classifyDone(rawText: step.text, failed: false) {

@@ -24,6 +24,7 @@ public enum ScoutPlannerError: Error, LocalizedError {
         switch self {
         case .missingKey: "Connect your OpenRouter API key in Settings to use the Scout brain."
         case .transport(let message): "Network error: \(message)"
+        case .http(402, _): "Your OpenRouter account is out of credits — top it up to run the Scout (Qwen) agent."
         case .http(let code, let message): "Scout planner API error \(code): \(message)"
         case .emptyResponse: "The Scout planner returned an empty response."
         }
@@ -102,9 +103,16 @@ public struct ScoutPlannerClient: Sendable {
         // source of the "network connection lost" / TLS errors that used to kill a run
         // on its very first turn.
         request.setValue("close", forHTTPHeaderField: "connection")
-        guard let body = try? JSONSerialization.data(
-            withJSONObject: Self.requestBody(model: model, system: system, user: user, imageJPEG: imageJPEG, maxTokens: maxTokens, prior: prior)
-        ) else { throw ScoutPlannerError.transport("Couldn't encode the request.") }
+        // The request body is rebuildable so a 402 (insufficient credits) can retry
+        // once with fewer tokens — OpenRouter reserves credits against max_tokens.
+        var effectiveMax = maxTokens
+        var creditReduced = false
+        func encodeBody() -> Data? {
+            try? JSONSerialization.data(
+                withJSONObject: Self.requestBody(model: model, system: system, user: user, imageJPEG: imageJPEG, maxTokens: effectiveMax, prior: prior)
+            )
+        }
+        guard let body = encodeBody() else { throw ScoutPlannerError.transport("Couldn't encode the request.") }
         request.httpBody = body
 
         // Retry transient transport failures (network lost / TLS / 5xx / 408 / 429):
@@ -119,7 +127,17 @@ public struct ScoutPlannerClient: Sendable {
                     guard let text = GroqClient.parseContent(data), !text.isEmpty else { throw ScoutPlannerError.emptyResponse }
                     return text
                 }
-                // Client errors (bad request / auth) won't improve on retry — surface now.
+                // 402 = "requires more credits, or fewer max_tokens": the balance can't
+                // reserve this request. Try ONCE with far fewer tokens (a single action
+                // JSON still fits) so a low-balance account isn't dead on the first turn.
+                if let http, http.statusCode == 402, !creditReduced, effectiveMax > 700 {
+                    creditReduced = true
+                    effectiveMax = 700
+                    if let smaller = encodeBody() { request.httpBody = smaller }
+                    continue
+                }
+                // Client errors (bad request / auth / unaffordable) won't improve on
+                // retry — surface now.
                 if let http, (400..<500).contains(http.statusCode), http.statusCode != 408, http.statusCode != 429 {
                     throw ScoutPlannerError.http(http.statusCode, GroqClient.errorMessage(from: data, status: http.statusCode))
                 }

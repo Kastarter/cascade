@@ -62,6 +62,16 @@ struct ScoutPlannerClientTests {
         #expect((emptySystem["messages"] as? [[String: Any]])?.count == 1)
     }
 
+    @Test func http402SurfacesAnOutOfCreditsMessage() {
+        // OpenRouter's "insufficient credits" 402 must read as an actionable billing
+        // message, not a cryptic API error — it's the #1 reason a Qwen run dies.
+        let credits = ScoutPlannerError.http(402, "This request requires more credits").errorDescription ?? ""
+        #expect(credits.lowercased().contains("credit"))
+        // Other HTTP errors keep the generic form.
+        let other = ScoutPlannerError.http(500, "server error").errorDescription ?? ""
+        #expect(other.contains("500"))
+    }
+
     @Test func defaultScoutModelIsQwen37Plus() {
         // The default model id; the runtime override is `cascade.scout.model`.
         #expect(ScoutModel.qwen37Plus == "qwen/qwen3.7-plus")
