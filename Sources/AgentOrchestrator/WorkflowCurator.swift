@@ -45,13 +45,15 @@ public struct CuratedAgent: Identifiable, Sendable, Equatable {
 /// raw detector list, so curation is never worse than showing everything.
 public struct WorkflowCurator: Sendable {
     private let client: any MessageCompleting
+    private let cachedClient: CachedMessageCompleter?
     private let model: String
     static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
     static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v1"
     static let schemaVersion = "workflow-curator.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet) {
+    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet, cache: ModelCallCache? = nil) {
         self.client = client
+        self.cachedClient = cache.map { CachedMessageCompleter(client: client, cache: $0) }
         self.model = model
     }
 
@@ -66,16 +68,22 @@ public struct WorkflowCurator: Sendable {
     /// one ("reply to emails"). Optional — with none, behaviour is exactly as before.
     public func curate(_ candidates: [DetectedWaste], onScreen: [String: String] = [:]) async -> [CuratedAgent] {
         guard !candidates.isEmpty else { return [] }
-        let raw = try? await client.complete(
+        let user = Self.userPrompt(candidates, onScreen: onScreen)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.curatePromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "WorkflowCurator.curate"
+        )
+        let raw = try? await complete(
             system: Self.systemPrompt,
-            user: Self.userPrompt(candidates, onScreen: onScreen),
-            model: model,
+            user: user,
             maxTokens: 900,
-            options: .deterministic(
-                promptVersion: Self.curatePromptVersion,
-                schemaVersion: Self.schemaVersion,
-                callsite: "WorkflowCurator.curate"
-            )
+            options: options,
+            validating: {
+                guard Self.parse($0, candidates: candidates) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
         )
         if let raw, let picked = Self.parse(raw, candidates: candidates) {
             return picked
@@ -94,16 +102,22 @@ public struct WorkflowCurator: Sendable {
     /// (`fallback`) — never worse than the automatic path, never nothing.
     public func curateOne(_ waste: DetectedWaste, statedIntent: String? = nil, onScreen: String? = nil) async -> CuratedAgent {
         let intent = statedIntent?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = try? await client.complete(
+        let user = Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil, onScreen: onScreen)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.curateOnePromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "WorkflowCurator.curateOne"
+        )
+        let raw = try? await complete(
             system: Self.curateOneSystemPrompt,
-            user: Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil, onScreen: onScreen),
-            model: model,
+            user: user,
             maxTokens: 400,
-            options: .deterministic(
-                promptVersion: Self.curateOnePromptVersion,
-                schemaVersion: Self.schemaVersion,
-                callsite: "WorkflowCurator.curateOne"
-            )
+            options: options,
+            validating: {
+                guard Self.parse($0, candidates: [waste])?.first != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
         )
         if let raw, let picked = Self.parse(raw, candidates: [waste])?.first {
             return picked
@@ -113,6 +127,26 @@ public struct WorkflowCurator: Sendable {
     }
 
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "curator")
+
+    private func complete(
+        system: String,
+        user: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions,
+        validating validate: @Sendable @escaping (String) throws -> Void
+    ) async throws -> String {
+        if let cachedClient {
+            return try await cachedClient.complete(
+                system: system,
+                user: user,
+                model: model,
+                maxTokens: maxTokens,
+                options: options,
+                validating: validate
+            )
+        }
+        return try await client.complete(system: system, user: user, model: model, maxTokens: maxTokens, options: options)
+    }
 
     static let curateOneSystemPrompt = """
     The user just DEMONSTRATED a task by hand for you to turn into an agent — they \

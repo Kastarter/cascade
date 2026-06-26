@@ -239,3 +239,51 @@ public actor ModelCallCache {
         inFlight.removeAll()
     }
 }
+
+public enum CachedMessageCompleterError: Error, Equatable, Sendable {
+    case invalidResponse
+}
+
+public struct CachedMessageCompleter: Sendable {
+    private struct CachedCompletion: Codable, Sendable {
+        let text: String
+    }
+
+    private let client: any MessageCompleting
+    private let cache: ModelCallCache
+
+    public init(client: any MessageCompleting, cache: ModelCallCache) {
+        self.client = client
+        self.cache = cache
+    }
+
+    public func complete(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions,
+        validating validate: @Sendable @escaping (String) throws -> Void = { _ in }
+    ) async throws -> String {
+        let body = try AnthropicClient.completionBodyData(
+            system: system,
+            user: user,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        )
+        let request = try options.cacheRequest(model: model, maxTokens: maxTokens, body: body)
+        let payload = try await cache.value(for: request, as: CachedCompletion.self) {
+            let text = try await client.complete(
+                system: system,
+                user: user,
+                model: model,
+                maxTokens: maxTokens,
+                options: options
+            )
+            try validate(text)
+            return CachedCompletion(text: text)
+        }
+        return payload.text
+    }
+}

@@ -46,12 +46,14 @@ public struct AgentTaskPlanner: Sendable {
     }
 
     private let client: any MessageCompleting
+    private let cachedClient: CachedMessageCompleter?
     private let model: String
     static let promptVersion = "agent-task-planner.prompt.v1"
     static let schemaVersion = "agent-task-planner.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet) {
+    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet, cache: ModelCallCache? = nil) {
         self.client = client
+        self.cachedClient = cache.map { CachedMessageCompleter(client: client, cache: $0) }
         self.model = model
     }
 
@@ -67,16 +69,21 @@ public struct AgentTaskPlanner: Sendable {
         let user = memo.isEmpty
             ? "Job: \(task)"
             : "Recent conversation (resolve references like \"it\" or \"the first one\" from here; the job below is what to plan):\n\(memo)\n\nJob: \(task)"
-        let raw = try? await client.complete(
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.promptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "AgentTaskPlanner.plan"
+        )
+        let raw = try? await complete(
             system: Self.systemPrompt(for: environment),
             user: user,
-            model: model,
             maxTokens: 700,
-            options: .deterministic(
-                promptVersion: Self.promptVersion,
-                schemaVersion: Self.schemaVersion,
-                callsite: "AgentTaskPlanner.plan"
-            )
+            options: options,
+            validating: {
+                guard Self.parse($0) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
         )
         if let raw, let parsed = Self.parse(raw) {
             return Array(parsed.prefix(Self.maxSubtasks))
@@ -93,6 +100,26 @@ public struct AgentTaskPlanner: Sendable {
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "planner")
 
     static let maxSubtasks = 5
+
+    private func complete(
+        system: String,
+        user: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions,
+        validating validate: @Sendable @escaping (String) throws -> Void
+    ) async throws -> String {
+        if let cachedClient {
+            return try await cachedClient.complete(
+                system: system,
+                user: user,
+                model: model,
+                maxTokens: maxTokens,
+                options: options,
+                validating: validate
+            )
+        }
+        return try await client.complete(system: system, user: user, model: model, maxTokens: maxTokens, options: options)
+    }
 
     static func systemPrompt(for environment: Environment) -> String {
         switch environment {

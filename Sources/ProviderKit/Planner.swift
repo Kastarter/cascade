@@ -83,27 +83,43 @@ public protocol SingleStepPlanner: Sendable {
 /// multi-step script.
 public struct ClaudeSingleStepPlanner: SingleStepPlanner {
     private let client: any MessageCompleting
+    private let cachedClient: CachedMessageCompleter?
     private let model: String
     static let promptVersion = "claude-single-step-planner.prompt.v1"
     static let schemaVersion = "claude-single-step-planner.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.opus) {
+    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.opus, cache: ModelCallCache? = nil) {
         self.client = client
+        self.cachedClient = cache.map { CachedMessageCompleter(client: client, cache: $0) }
         self.model = model
     }
 
     public func proposeNextStep(goal: String, contexts: [RecordedContext]) async throws -> ProposedStep {
-        let raw = try await client.complete(
-            system: Self.systemPrompt,
-            user: Self.userPrompt(goal: goal, contexts: contexts),
-            model: model,
-            maxTokens: 700,
-            options: .deterministic(
-                promptVersion: Self.promptVersion,
-                schemaVersion: Self.schemaVersion,
-                callsite: "ClaudeSingleStepPlanner.proposeNextStep"
-            )
+        let user = Self.userPrompt(goal: goal, contexts: contexts)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.promptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "ClaudeSingleStepPlanner.proposeNextStep"
         )
+        let raw: String
+        if let cachedClient {
+            raw = try await cachedClient.complete(
+                system: Self.systemPrompt,
+                user: user,
+                model: model,
+                maxTokens: 700,
+                options: options,
+                validating: { _ = try Self.parse($0) }
+            )
+        } else {
+            raw = try await client.complete(
+                system: Self.systemPrompt,
+                user: user,
+                model: model,
+                maxTokens: 700,
+                options: options
+            )
+        }
         return try Self.parse(raw)
     }
 

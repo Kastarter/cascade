@@ -77,8 +77,12 @@ public struct AnthropicClient: MessageCompleting {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(key, forHTTPHeaderField: "x-api-key")
         request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
-        let body = try JSONEncoder().encode(
-            RequestBody(model: model, maxTokens: maxTokens, temperature: options.temperature, system: system, messages: [.init(role: "user", content: user)])
+        let body = try Self.completionBodyData(
+            system: system,
+            user: user,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
         )
         _ = try options.cacheRequest(model: model, maxTokens: maxTokens, body: body)
         request.httpBody = body
@@ -111,25 +115,22 @@ public struct AnthropicClient: MessageCompleting {
         return String(data: data, encoding: .utf8) ?? "Status \(status)"
     }
 
-    private struct RequestBody: Encodable {
-        let model: String
-        let maxTokens: Int
-        let temperature: Double?
-        let system: String?
-        let messages: [Message]
-
-        enum CodingKeys: String, CodingKey {
-            case model
-            case maxTokens = "max_tokens"
-            case temperature
-            case system
-            case messages
-        }
-
-        struct Message: Encodable {
-            let role: String
-            let content: String
-        }
+    static func completionBodyData(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) throws -> Data {
+        try JSONEncoder().encode(
+            AnthropicMessageRequestBody(
+                model: model,
+                maxTokens: maxTokens,
+                temperature: options.temperature,
+                system: system,
+                messages: [.init(role: "user", content: user)]
+            )
+        )
     }
 
     private struct ResponseBody: Decodable {
@@ -143,5 +144,26 @@ public struct AnthropicClient: MessageCompleting {
     private struct ErrorEnvelope: Decodable {
         let error: APIError
         struct APIError: Decodable { let message: String }
+    }
+}
+
+struct AnthropicMessageRequestBody: Encodable, Sendable {
+    let model: String
+    let maxTokens: Int
+    let temperature: Double?
+    let system: String?
+    let messages: [Message]
+
+    enum CodingKeys: String, CodingKey {
+        case model
+        case maxTokens = "max_tokens"
+        case temperature
+        case system
+        case messages
+    }
+
+    struct Message: Encodable, Sendable {
+        let role: String
+        let content: String
     }
 }
