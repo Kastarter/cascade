@@ -147,6 +147,7 @@ public final class CascadeAppModel: ObservableObject {
         didSet { defaultsStore.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
     }
     private static let powerHarnessKey = "cascade.powerHarness"
+    static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
@@ -630,7 +631,6 @@ public final class CascadeAppModel: ObservableObject {
         // stop removes it, so a late terminal update finds nothing and bails — no
         // double-report, no double-count.
         guard let entry = backgroundAgents.first(where: { $0.id == id }) else { return }
-        let task = entry.task
 
         // Sign-in wall: keep the entry AND the runtime so Continue resumes at the
         // pending part of the plan — earlier parts' findings intact.
@@ -645,8 +645,15 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
 
-        // Terminal: finalize once, then drop the entry so `backgroundAgents` stays
-        // bounded across a long session.
+        _ = finishSandboxRun(id: id, entry: entry, update: update)
+    }
+
+    /// Terminal sandbox branch: finalize once, then drop the entry so
+    /// `backgroundAgents` stays bounded across a long session.
+    /// Returns the completion task so tests can await the shipped recording hook.
+    @discardableResult
+    func finishSandboxRun(id: UUID, entry: BackgroundAgentRun, update: BackgroundWebAgent.Update) -> Task<Void, Never> {
+        let task = entry.task
         sandboxRuntimes[id] = nil
         backgroundAgents.removeAll { $0.id == id }
         // Stop, failure, or running out of steps report honestly and count NOTHING;
@@ -656,12 +663,13 @@ public final class CascadeAppModel: ObservableObject {
         assistMemory.remember(user: "[background agent: \(task)]", assistant: message)
         voice.speak(message)
         let deployedAgentID = entry.agentID
-        Task {
+        let completionTask = Task {
             await recordSandboxCompletion(deployedAgentID: deployedAgentID, update: update, task: task)
             if update.completed, deployedAgentID != nil { await refreshAll() }
         }
         // Leave the box up briefly so the user can glance at the result, then close it.
         Task { try? await Task.sleep(for: .seconds(5)); sandboxBox.hide(id) }
+        return completionTask
     }
 
     /// The honest user-facing line for a finished/aborted background run: a genuine
@@ -678,11 +686,51 @@ public final class CascadeAppModel: ObservableObject {
     /// `markAgentRun` on `!stoppedEarly`, counts the same way).
     func recordSandboxCompletion(deployedAgentID: Int64?, update: BackgroundWebAgent.Update, task: String) async {
         if update.completed, let deployedAgentID {
-            try? await store.markAgentRun(id: deployedAgentID)
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: task))
+            await recordCompletedAgentRun(agentID: deployedAgentID, auditDetail: task)
         }
         let outcome = update.completed ? "completed" : "ended without completing"
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) — \(outcome)"))
+    }
+
+    func recordOnScreenAgentCompletion(_ agent: CascadeAgent) async {
+        await recordCompletedAgentRun(agentID: agent.id, auditDetail: agent.name)
+    }
+
+    private func recordCompletedAgentRun(agentID: Int64, auditDetail: String) async {
+        try? await store.markAgentRun(id: agentID)
+        if defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey),
+           let agent = try? await store.agent(id: agentID) {
+            await recordSuccessfulAgentExperience(for: agent, fallbackGoal: auditDetail)
+        }
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: auditDetail))
+    }
+
+    private func recordSuccessfulAgentExperience(for agent: CascadeAgent, fallbackGoal: String) async {
+        _ = try? await store.recordAgentExperience(AgentExperienceCase(
+            appName: Self.experienceAppName(for: agent),
+            goalPattern: Self.experienceGoalPattern(for: agent, fallback: fallbackGoal),
+            recipeSignature: Self.experienceRecipeSignature(for: agent),
+            outcome: .success,
+            verificationSignal: .completed,
+            evidenceIDs: [],
+            actionCount: agent.recipe.steps.count
+        ))
+    }
+
+    private static func experienceAppName(for agent: CascadeAgent) -> String {
+        firstNonBlank(agent.apps.first, agent.recipe.steps.first?.appName, "Agent")
+    }
+
+    private static func experienceGoalPattern(for agent: CascadeAgent, fallback: String) -> String {
+        firstNonBlank(agent.goal, fallback, agent.name, "completed agent run")
+    }
+
+    private static func experienceRecipeSignature(for agent: CascadeAgent) -> String {
+        firstNonBlank(agent.signature, agent.name, "agent-\(agent.id)")
+    }
+
+    private static func firstNonBlank(_ values: String?...) -> String {
+        values.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty } ?? "unknown"
     }
 
     /// Did the user ask for a background agent ("create an agent…", "in the background",
@@ -3119,7 +3167,7 @@ public final class CascadeAppModel: ObservableObject {
         Task { await runAgentRecipe(agent) }
     }
 
-    private func runAgentRecipe(_ agent: CascadeAgent) async {
+    func runAgentRecipe(_ agent: CascadeAgent) async {
         defer { agentRunning = false }
         let steps = agent.recipe.steps.sorted { $0.order < $1.order }
         var stoppedEarly = false
@@ -3278,8 +3326,7 @@ public final class CascadeAppModel: ObservableObject {
             dock.show(title: "Done", detail: agentMessage)
             // Only COMPLETED runs count — the reclaimed-time math multiplies
             // seconds-per-run by this counter, and a stopped run saved nothing.
-            try? await store.markAgentRun(id: agent.id)
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: agent.name))
+            await recordOnScreenAgentCompletion(agent)
         }
         await refreshAll()
     }
