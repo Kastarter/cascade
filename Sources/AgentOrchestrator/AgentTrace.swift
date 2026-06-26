@@ -113,7 +113,7 @@ public struct AgentTrace: Sendable, Equatable, Codable {
     public var toolCallCount: Int { spans.filter { $0.kind == .tool }.count }
     public var durationMs: Int { spans.map { $0.startMs + $0.durationMs }.max() ?? 0 }
     public var failureKinds: [AgentFailureKind] { spans.compactMap(\.failureKind) }
-    public var succeeded: Bool { !spans.contains { $0.status == .error } }
+    public var succeeded: Bool { spans.allSatisfy { $0.status == .ok } }
 
     // MARK: Exports
 

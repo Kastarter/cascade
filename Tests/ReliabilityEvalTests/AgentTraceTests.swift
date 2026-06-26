@@ -42,6 +42,32 @@ func pricingComputesCostFromUsage() {
 }
 
 @Test
+func succeededRequiresEverySpanToBeOk() {
+    func trace(statuses: [TraceSpan.Status]) -> AgentTrace {
+        AgentTrace(
+            traceID: "t-status",
+            goal: "g",
+            surface: "assist",
+            spans: statuses.enumerated().map { index, status in
+                TraceSpan(
+                    id: "s\(index)",
+                    parentID: index == 0 ? nil : "s0",
+                    kind: index == 0 ? .run : .tool,
+                    name: "span \(index)",
+                    startMs: index,
+                    durationMs: 1,
+                    status: status
+                )
+            }
+        )
+    }
+
+    #expect(trace(statuses: [.ok, .ok]).succeeded)
+    #expect(!trace(statuses: [.ok, .error]).succeeded)
+    #expect(!trace(statuses: [.ok, .refused]).succeeded)
+}
+
+@Test
 func otelJSONIsValidAndCarriesSemanticKeys() throws {
     let json = sampleTrace().otelJSON()
     let obj = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
