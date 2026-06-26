@@ -102,3 +102,27 @@ func csvHasHeaderAndRowPerSpanAndEscapes() {
     #expect(lines[0].hasPrefix("trace_id,span_id"))
     #expect(lines[1].contains("\"do a, b, c\""))    // comma-bearing field quoted
 }
+
+@Test
+func csvEscapesFormulaPrefixedAuditFieldsBeforeQuoteEscaping() {
+    let trace = AgentTrace(traceID: "=trace, \"quoted\"", goal: "g", surface: "assist", spans: [
+        TraceSpan(
+            id: "+span, \"quoted\"",
+            parentID: "-parent, \"quoted\"",
+            kind: .tool,
+            name: "@name, \"quoted\"",
+            startMs: 0,
+            durationMs: 1,
+            status: .error,
+            failureKind: .noEffect
+        ),
+    ])
+
+    let lines = trace.csv().split(separator: "\n", omittingEmptySubsequences: false)
+    #expect(lines.count == 2)
+    #expect(lines[1] == "\"'=trace, \"\"quoted\"\"\",\"'+span, \"\"quoted\"\"\",\"'-parent, \"\"quoted\"\"\",tool,\"'@name, \"\"quoted\"\"\",0,1,error,noEffect,")
+    #expect(AgentTraceCSVFieldEscaper.escape("=failure, \"quoted\"") == "\"'=failure, \"\"quoted\"\"\"")
+    #expect(AgentTraceCSVFieldEscaper.escape("\t=HYPERLINK(\"https://example.com\")") == "\"'\t=HYPERLINK(\"\"https://example.com\"\")\"")
+    #expect(AgentTraceCSVFieldEscaper.escape("\r=HYPERLINK(\"https://example.com\")") == "\"'\r=HYPERLINK(\"\"https://example.com\"\")\"")
+    #expect(AgentTraceCSVFieldEscaper.escape("  =SUM(1)") == "'  =SUM(1)")
+}

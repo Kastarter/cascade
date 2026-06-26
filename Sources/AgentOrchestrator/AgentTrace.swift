@@ -178,7 +178,7 @@ public struct AgentTrace: Sendable, Equatable, Codable {
                 String(span.startMs), String(span.durationMs), span.status.rawValue,
                 span.failureKind?.rawValue ?? "", span.costUSD.map { String(format: "%.6f", $0) } ?? "",
             ]
-            rows.append(fields.map(csvEscape).joined(separator: ","))
+            rows.append(fields.map(AgentTraceCSVFieldEscaper.escape).joined(separator: ","))
         }
         return rows.joined(separator: "\n")
     }
@@ -192,8 +192,4 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         return string
     }
 
-    private func csvEscape(_ field: String) -> String {
-        guard field.contains(",") || field.contains("\"") || field.contains("\n") else { return field }
-        return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
-    }
 }
