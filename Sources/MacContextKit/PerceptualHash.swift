@@ -135,6 +135,34 @@ public enum PerceptualHash {
         return zip(candidate, previous).allSatisfy { hamming($0, $1) <= threshold }
     }
 
+    /// Returns row-major grid cells whose regional hashes changed beyond
+    /// `threshold`, mapped into image coordinates for later cropped OCR.
+    public static func diffRegions(
+        current: [UInt64],
+        previous: [UInt64],
+        threshold: Int = regionSkipThreshold,
+        imageSize: CGSize
+    ) -> [CGRect] {
+        let grid = gridDimension
+        guard current.count == previous.count, current.count == grid * grid else { return [] }
+
+        let cellWidth = imageSize.width / CGFloat(grid)
+        let cellHeight = imageSize.height / CGFloat(grid)
+
+        var regions: [CGRect] = []
+        regions.reserveCapacity(current.count)
+        for index in current.indices where hamming(current[index], previous[index]) > threshold {
+            let row = index / grid
+            let col = index % grid
+            let minX = CGFloat(col) * cellWidth
+            let minY = CGFloat(row) * cellHeight
+            let maxX = col == grid - 1 ? imageSize.width : CGFloat(col + 1) * cellWidth
+            let maxY = row == grid - 1 ? imageSize.height : CGFloat(row + 1) * cellHeight
+            regions.append(CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY))
+        }
+        return regions
+    }
+
     /// Renders `image` into a `width x height` 8-bit grayscale buffer using a CPU
     /// context with low-quality interpolation (fast, and identical across runs).
     private static func grayscaleSamples(from image: CGImage) -> [UInt8]? {
