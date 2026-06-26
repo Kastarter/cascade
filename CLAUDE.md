@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): Round 3 production-grade implementation backlog lives at `docs/PRODUCTION_GRADE_PLAN_ROUND3.md`; it prioritizes additive/testable Swift work still safe for coding agents: episode mining, work graph, experience ledger, event-store helpers, embedding protocols, verifier calibration, web/voice/idempotency logic, SoM candidate indexing, structured export, local DP, and trajectory sketches.
 - NEW (2026-06-26): SEQ-27 added `VisualIndex`, an exact-scan CascadeMemory store for visual Float embeddings with provider/model/revision/dimension metadata, L2/cosine ranked ID APIs, and retention cleanup via `context_visual_embedding`.
 - NEW (2026-06-26): SEQ-25 added `GroundingVerifier`, a pure ProviderKit scorer that ranks grounding candidates by role, bounds, label/OCR evidence, source agreement, and canvas-skip rules, returning accept/reject/abstain with stable candidate IDs.
 - NEW (2026-06-26): SEQ-23 added `LocalVoiceActivityGate`, a pure Swift fixed-frame PCM16 turn gate with prefix padding, min-speech confirmation, hangover/tail-wait release decisions, and uploaded-speech accounting; integration into `RealtimeVoice` remains a later step.
