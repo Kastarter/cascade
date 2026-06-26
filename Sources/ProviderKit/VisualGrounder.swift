@@ -1,6 +1,111 @@
 import AppKit
 import Foundation
 
+/// Provenance for a grounded target candidate. Kept small and Codable so later
+/// routing/verifier code can compare AX/DOM/OCR/cache/model hits without parsing
+/// ad hoc strings.
+public enum GroundingSource: String, Codable, Equatable, Sendable {
+    case accessibility
+    case dom
+    case ocr
+    case uiTars
+    case claude
+    case cache
+    case visualModel
+    case compatibility
+    case unknown
+}
+
+/// Coordinate convention used by a grounding candidate's point/region.
+public enum GroundingCoordinateSpace: String, Codable, Equatable, Sendable {
+    /// Display-local AppKit points, bottom-left origin; this is the executor's click space.
+    case displayLocalAppKitPoints
+    /// Pixel coordinates in the screenshot/model image, top-left origin.
+    case screenshotPixelsTopLeft
+    /// 0...1000 model-normalized coordinates, top-left origin.
+    case normalizedThousandths
+    /// Web viewport CSS pixels, top-left origin.
+    case viewportCSSPixelsTopLeft
+    case unknown
+}
+
+/// One possible grounding answer for a named UI target.
+public struct GroundingCandidate: Codable, Equatable, Sendable {
+    public let point: CGPoint?
+    public let region: CGRect?
+    public let confidence: Double
+    public let source: GroundingSource
+    public let coordinateSpace: GroundingCoordinateSpace
+    public let rawModel: String?
+    public let latency: TimeInterval?
+    public let dispersion: Double?
+
+    public init(
+        point: CGPoint?,
+        region: CGRect? = nil,
+        confidence: Double,
+        source: GroundingSource,
+        coordinateSpace: GroundingCoordinateSpace,
+        rawModel: String? = nil,
+        latency: TimeInterval? = nil,
+        dispersion: Double? = nil
+    ) {
+        self.point = point
+        self.region = region
+        self.confidence = confidence
+        self.source = source
+        self.coordinateSpace = coordinateSpace
+        self.rawModel = rawModel
+        self.latency = latency
+        self.dispersion = dispersion
+    }
+}
+
+/// Structured grounding output. The legacy point API reads `legacyPoint`, while
+/// newer routing/verifier code can inspect every candidate and why it was chosen.
+public struct GroundingResult: Codable, Equatable, Sendable {
+    public let candidates: [GroundingCandidate]
+    public let selectedIndex: Int?
+
+    public init(candidates: [GroundingCandidate] = [], selectedIndex: Int? = nil) {
+        self.candidates = candidates
+        self.selectedIndex = selectedIndex
+    }
+
+    public var selectedCandidate: GroundingCandidate? {
+        guard let selectedIndex, candidates.indices.contains(selectedIndex) else { return nil }
+        return candidates[selectedIndex]
+    }
+
+    public var selectedPoint: CGPoint? {
+        selectedCandidate?.point
+    }
+
+    public var legacyPoint: CGPoint? {
+        selectedPoint
+    }
+
+    public static func legacy(
+        point: CGPoint?,
+        source: GroundingSource = .compatibility,
+        coordinateSpace: GroundingCoordinateSpace = .displayLocalAppKitPoints,
+        latency: TimeInterval? = nil
+    ) -> GroundingResult {
+        return GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: point,
+                    confidence: point == nil ? 0 : 1,
+                    source: source,
+                    coordinateSpace: coordinateSpace,
+                    latency: latency
+                )
+            ],
+            selectedIndex: 0
+        )
+    }
+}
+
 // MARK: - Grounding split (Phase 1 of the model-downgrade roadmap)
 //
 // The field consensus — and Cascade's own audited finding — is that *grounding*
@@ -34,6 +139,15 @@ public protocol VisualGrounder: Sendable {
         displayHeightPoints: Int
     ) async -> CGPoint?
 
+    /// Structured grounding output for verifier/routing code. Existing point-only
+    /// grounders inherit the compatibility wrapper in the protocol extension.
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult
+
     /// Locates a target as a REGION to frame (the "where is X" marching-ants
     /// highlight) — display-local AppKit rect + a short spoken line. Returns nil
     /// when this grounder can't produce one (unreachable, or not implemented), so
@@ -47,12 +161,33 @@ public protocol VisualGrounder: Sendable {
 }
 
 public extension VisualGrounder {
+    func groundResult(
+        screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
+    ) async -> GroundingResult {
+        let start = ContinuousClock.now
+        let point = await ground(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        let elapsed = start.duration(to: ContinuousClock.now)
+        return GroundingResult.legacy(point: point, latency: elapsed.timeInterval)
+    }
+
     /// Default: no region grounding (the caller falls back to ElementLocator). The
     /// Claude grounder uses this default on purpose — the fallback IS its engine,
     /// at full quality (tight box + spoken line + conversation context).
     func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? { nil }
+}
+
+private extension Duration {
+    var timeInterval: TimeInterval {
+        let components = self.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
+    }
 }
 
 // MARK: - Claude-backed grounder (the proven engine, as a fallback)
