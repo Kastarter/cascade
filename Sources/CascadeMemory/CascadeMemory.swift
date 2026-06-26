@@ -899,10 +899,14 @@ public actor CascadeStore {
 
     public func appendAudit(_ event: AuditEvent) throws -> AuditEvent {
         let createdAt = DateCodec.string(from: event.createdAt)
+        // Strip high-confidence secrets/PII from the detail before it touches the
+        // log: an audit trail must prove who/what/when without becoming a place
+        // emails, cards, SSNs, or API keys come to rest (OWASP logging guidance).
+        let detail = PIIDetector.redact(event.detail).redacted
         // Link this row to the chain head so any later mutation/deletion is evident.
         let prev = (try latestAuditHash()) ?? AuditChain.genesis
         let canonical = AuditChain.canonicalForm(
-            createdAt: createdAt, actor: event.actor, action: event.action, detail: event.detail
+            createdAt: createdAt, actor: event.actor, action: event.action, detail: detail
         )
         let eventHash = AuditChain.hash(prev: prev, canonical: canonical)
         let sql = "INSERT INTO audit_event (created_at, actor, action, detail, prev_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?);"
@@ -910,7 +914,7 @@ public actor CascadeStore {
             bind(createdAt, at: 1, in: statement)
             bind(event.actor, at: 2, in: statement)
             bind(event.action, at: 3, in: statement)
-            bind(event.detail, at: 4, in: statement)
+            bind(detail, at: 4, in: statement)
             bind(prev, at: 5, in: statement)
             bind(eventHash, at: 6, in: statement)
             try stepDone(statement)
@@ -920,7 +924,7 @@ public actor CascadeStore {
             createdAt: event.createdAt,
             actor: event.actor,
             action: event.action,
-            detail: event.detail
+            detail: detail
         )
     }
 
