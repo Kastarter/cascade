@@ -203,10 +203,13 @@ public enum AgentHarness {
         if PrivacyRules.isSensitiveText(expanded) || PrivacyRules.isSensitiveText(text) {
             return privacyRefusal("file")
         }
-        if text.count > readCap {
-            return String(text.prefix(readCap)) + "\n…[truncated — \(data.count) bytes total]"
-        }
-        return text
+        let content = text.count > readCap
+            ? String(text.prefix(readCap)) + "\n…[truncated — \(data.count) bytes total]"
+            : text
+        // File content is untrusted external text. If it looks like it carries
+        // instructions for the agent, spotlight it so the model treats it as data,
+        // not commands (indirect prompt-injection defense — SEQ-12).
+        return InjectionGuard.guardedUntrusted(content, source: "file \(expanded)")
     }
 
     // MARK: - Power tier
