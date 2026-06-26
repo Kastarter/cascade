@@ -87,6 +87,7 @@ public final class CascadeAppModel: ObservableObject {
     /// The curated, judged, human-named view of `detectedWaste` — what the manager's
     /// review queue shows (the only place detected workflows surface to a person).
     @Published public private(set) var curatedWaste: [CuratedAgent] = []
+    @Published public private(set) var proactiveNextActionOffer: NextActionPredictor.Prediction?
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
     @Published public private(set) var conversation: [QATurn] = []
@@ -148,6 +149,7 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let powerHarnessKey = "cascade.powerHarness"
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
+    static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
@@ -217,6 +219,8 @@ public final class CascadeAppModel: ObservableObject {
     private var agentDidHighlight = false
     private var cancellables: Set<AnyCancellable> = []
     private var lastSettingsOpen = Date.distantPast
+    private var lastNextActionOfferAt: Date?
+    private var recentNextActionDismissals = 0
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
     private var userPaused = false
     /// False in tests/headless: the model is built with an injected store +
@@ -332,10 +336,21 @@ public final class CascadeAppModel: ObservableObject {
             contexts = try await store.recentContexts(limit: 80)
             audit = try await store.recentAudit(limit: 80)
             agents = try await orchestrator.agents()
-            detectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
-            // Only genuinely repeated, time-saving workflows (the automatable filter)
-            // reach the curator and the manager's review queue.
-            curatedWaste = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
+            let personalizationEnabled = defaultsStore.bool(forKey: Self.experimentalSuggestionRankingKey)
+            let rawDetectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
+            if personalizationEnabled {
+                let preferenceModel = suggestionPreferenceModel()
+                detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
+                let curated = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
+                curatedWaste = Self.rankCuratedSuggestions(curated, using: preferenceModel)
+                await refreshProactiveNextActionOffer(now: Date())
+            } else {
+                detectedWaste = rawDetectedWaste
+                // Only genuinely repeated, time-saving workflows (the automatable filter)
+                // reach the curator and the manager's review queue.
+                curatedWaste = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
+                proactiveNextActionOffer = nil
+            }
             statusLine = recorder.status.message
         } catch {
             statusLine = error.localizedDescription
@@ -2966,6 +2981,87 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     // MARK: - Agents built from recorded workflows
+
+    private func suggestionPreferenceModel() -> PreferenceModel {
+        var model = PreferenceModel()
+        for signature in agents.map(\.signature) {
+            model.record(signature, accepted: true)
+        }
+        for signature in dismissedWasteSignatures {
+            model.record(signature, accepted: false)
+        }
+        return model
+    }
+
+    public nonisolated static func rankCuratedSuggestions(
+        _ candidates: [CuratedAgent],
+        using model: PreferenceModel,
+        ranker: SuggestionRanker = SuggestionRanker()
+    ) -> [CuratedAgent] {
+        ranker.rankElements(
+            candidates,
+            key: \.signature,
+            base: { $0.value },
+            using: model
+        )
+    }
+
+    public nonisolated static func nextActionTokens(for events: [InputEvent]) -> [String] {
+        events.map(nextActionToken)
+    }
+
+    public nonisolated static func nextActionToken(for event: InputEvent) -> String {
+        let app = event.appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let appKey = app.isEmpty ? "unknown" : app
+        switch event.kind {
+        case .key:
+            let modifiers = event.modifiers.sorted().joined(separator: "+")
+            let key = event.key ?? "unknown"
+            return modifiers.isEmpty ? "key:\(key)@\(appKey)" : "key:\(modifiers)+\(key)@\(appKey)"
+        case .type:
+            return "type@\(appKey)"
+        case .click, .doubleClick, .rightClick:
+            let label = [event.targetDescriptor, event.text]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty } ?? "unlabeled"
+            return "\(event.kind.rawValue):\(label)@\(appKey)"
+        case .scroll:
+            return "scroll@\(appKey)"
+        }
+    }
+
+    public nonisolated static func userIsActivelyTyping(events: [InputEvent], now: Date, window: TimeInterval = 6) -> Bool {
+        guard let last = events.last else { return false }
+        let age = now.timeIntervalSince(last.capturedAt)
+        guard age >= 0, age <= window else { return false }
+        if last.kind == .type { return true }
+        guard last.kind == .key else { return false }
+        let modifierSet = Set(last.modifiers.map { $0.lowercased() })
+        guard modifierSet.isDisjoint(with: ["command", "control", "option"]) else { return false }
+        let key = (last.key ?? "").lowercased()
+        return key.count == 1 || ["space", "delete", "return", "tab"].contains(key)
+    }
+
+    public func dismissProactiveNextActionOffer() {
+        proactiveNextActionOffer = nil
+        recentNextActionDismissals += 1
+    }
+
+    private func refreshProactiveNextActionOffer(now: Date) async {
+        let events = ((try? await store.recentInputEvents(limit: 80)) ?? []).reversed()
+        let orderedEvents = Array(events)
+        let secondsSinceLastOffer = lastNextActionOfferAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let offer = NextActionPredictor().proactiveOffer(
+            history: Self.nextActionTokens(for: orderedEvents),
+            secondsSinceLastOffer: secondsSinceLastOffer,
+            recentDismissals: recentNextActionDismissals,
+            userIsActivelyTyping: Self.userIsActivelyTyping(events: orderedEvents, now: now)
+        )
+        proactiveNextActionOffer = offer
+        if offer != nil {
+            lastNextActionOfferAt = now
+        }
+    }
 
     /// The curated proposals still awaiting review — the review surface's source of
     /// truth (R1). Auto-detected workflows plus the demonstrations the employee sent

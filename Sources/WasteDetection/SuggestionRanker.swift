@@ -71,6 +71,45 @@ public struct SuggestionRanker: Sendable {
             .sorted { $0.score == $1.score ? $0.key < $1.key : $0.score > $1.score }
     }
 
+    /// Rank arbitrary suggestion-like values by a key and intrinsic relevance score.
+    /// Equal personalized scores keep the input order, so enabling personalization
+    /// cannot reshuffle neutral ties.
+    public func rankElements<Element>(
+        _ candidates: [Element],
+        key: (Element) -> String,
+        base: (Element) -> Double,
+        using model: PreferenceModel
+    ) -> [Element] {
+        let scored = candidates.enumerated().map { item in
+            let element = item.element
+            let intrinsic = max(0, base(element))
+            let personalized = pow(model.preference(key(element)), preferenceWeight)
+            return RankedElement(index: item.offset, element: element, score: intrinsic * personalized)
+        }
+        return scored
+            .sorted { lhs, rhs in
+                lhs.score == rhs.score ? lhs.index < rhs.index : lhs.score > rhs.score
+            }
+            .map(\.element)
+    }
+
+    /// Rank detected workflow candidates without suppressing any of them. This is the
+    /// pure integration point for the app's default-off personalization experiment.
+    public func rankDetectedWaste(_ candidates: [DetectedWaste], using model: PreferenceModel, now: Date = Date()) -> [DetectedWaste] {
+        rankElements(
+            candidates,
+            key: \.signature,
+            base: { WasteDetector.rankingScore($0, now: now) },
+            using: model
+        )
+    }
+
+    private struct RankedElement<Element> {
+        let index: Int
+        let element: Element
+        let score: Double
+    }
+
     /// Personalized repetition threshold: a user who accepts this key's suggestions
     /// gets them sooner (lower bar); one who declines gets a higher bar. Bounded
     /// around `base` by ±`span`, never below 2.

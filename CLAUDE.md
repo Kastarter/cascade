@@ -24,6 +24,8 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): Round 4 safe-integration plan is in `docs/PRODUCTION_GRADE_PLAN_ROUND4.md`; theme is default-off wiring for standalone modules into recorder/store/planner/ranking/grounding paths without shipped behavior changes.
+- NEW (2026-06-26): P4-07 wires suggestion personalization behind `cascade.experimentalSuggestionRanking`: stable pure ranking for detected/curated suggestions, accept/decline preference inputs, and gated next-action offers; default refresh path remains unchanged.
 - NEW (2026-06-26): P3-16 added pure AgentOrchestrator `TrajectorySketchBuilder`: prompt-ready successful-demo sketches with scrubbed labels, collapsed actions, expected checks, verified recoveries, and app/goal ranking; no runtime injection yet.
 - NEW (2026-06-26): P3-15 added pure CascadeMemory local-DP fleet helpers: clipped noisy count/sum, k-ary randomized response with hash/omit category disclosure, monthly budget spend caps, and DP JSON export composing with AnalyticsPrivacyPolicy/FleetExportManifest.
 - NEW (2026-06-26): P3-05 added pure `SkillConsolidator` in ComputerUseKit: learned-skill overlap scoring, active-skill filtering, revise/archive/quarantine/new decisions, and stable order-independent tests; not wired into approval UI yet.

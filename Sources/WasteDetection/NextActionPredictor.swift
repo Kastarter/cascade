@@ -52,6 +52,25 @@ public struct NextActionPredictor: Sendable {
         }
         return nil
     }
+
+    /// Predict and gate a proactive next-action offer in one pure step. The predictor
+    /// may see a pattern, but the gate decides whether surfacing it is welcome now.
+    public func proactiveOffer(
+        history: [String],
+        secondsSinceLastOffer: TimeInterval,
+        recentDismissals: Int,
+        userIsActivelyTyping: Bool,
+        gate: InterruptibilityGate = InterruptibilityGate()
+    ) -> Prediction? {
+        guard let prediction = predict(history: history),
+              gate.shouldOffer(
+                  confidence: prediction.confidence,
+                  secondsSinceLastOffer: secondsSinceLastOffer,
+                  recentDismissals: recentDismissals,
+                  userIsActivelyTyping: userIsActivelyTyping
+              ) else { return nil }
+        return prediction
+    }
 }
 
 /// Decides WHETHER to surface a proactive offer — the hard part of proactivity is
