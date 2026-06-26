@@ -1,5 +1,23 @@
+import Foundation
 import ProviderKit
 import Testing
+
+@Test
+func stableSystemPromptIsByteIdenticalAcrossCallsAndCarriesNoClock() {
+    let a = RecordSearchAnswerer.stableSystemPrompt()
+    let b = RecordSearchAnswerer.stableSystemPrompt()
+    #expect(a == b)                                   // cacheable: identical across hops
+    #expect(!a.contains("Current time:"))             // the clock is NOT in the cached prefix
+    // No ISO timestamp leaked into the stable prefix.
+    #expect(a.range(of: #"\d{4}-\d{2}-\d{2}T"#, options: .regularExpression) == nil)
+}
+
+@Test
+func timeContextCarriesTheVolatileClock() {
+    let note = RecordSearchAnswerer.timeContext()
+    #expect(note.contains("Current time:"))
+    #expect(note.range(of: #"\d{4}-\d{2}-\d{2}T"#, options: .regularExpression) != nil)
+}
 
 @Test
 func citationsParseFromSourcesLine() {

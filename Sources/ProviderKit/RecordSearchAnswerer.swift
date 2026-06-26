@@ -112,15 +112,24 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
+        // System is split into a STABLE, cacheable prefix and a VOLATILE time
+        // block placed after the cache breakpoint. The tool loop rebuilds this
+        // request on every hop; if the wall-clock time lived in the cached prefix
+        // (as it used to), the prefix would differ by milliseconds each hop and
+        // the cache would never hit. Static-first, volatile-last is Anthropic's
+        // documented caching pattern.
         var body: [String: Any] = [
             "model": model,
             "max_tokens": 700,
-            "system": Self.systemPrompt(),
+            "system": [
+                ["type": "text", "text": Self.stableSystemPrompt(), "cache_control": ["type": "ephemeral"]],
+                ["type": "text", "text": Self.timeContext()],
+            ],
             "messages": messages,
         ]
         if toolsAllowed {
             var tools = RecordRecall.toolDefinitions()
-            // Cache the static prefix (system + tools) across hops.
+            // Also cache the (static) tools block.
             tools[tools.count - 1]["cache_control"] = ["type": "ephemeral"]
             body["tools"] = tools
         }
@@ -139,12 +148,14 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         return json
     }
 
-    private static func systemPrompt() -> String {
-        let formatter = ISO8601DateFormatter()
-        return """
+    /// The stable, cacheable system prefix — byte-identical across hops and
+    /// answers, so the prompt cache actually hits. Carries NO wall-clock time
+    /// (that lives in `timeContext()`, after the cache breakpoint). Public for tests.
+    public static func stableSystemPrompt() -> String {
+        """
         You answer questions about what the user did and saw on their Mac, grounded ONLY \
-        in their local screen record, which you search with the tools. Current time: \
-        \(formatter.string(from: Date())) (timestamps in results are local HH:mm).
+        in their local screen record, which you search with the tools. Timestamps in \
+        results are local HH:mm; the current time is given separately below.
 
         Hunt before answering: search with the user's words, then with synonyms; pull a \
         timeframe when the question is about a stretch of time; inspect promising hits. \
@@ -155,6 +166,12 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         write the moments you actually used: SOURCES: #id, #id (at most 4). If the record \
         genuinely doesn't contain the answer, say so in one line with no SOURCES line.
         """
+    }
+
+    /// The volatile per-request note (current time). Placed AFTER the cache
+    /// breakpoint so it can change every call without invalidating the cache.
+    public static func timeContext() -> String {
+        "Current time: \(ISO8601DateFormatter().string(from: Date()))."
     }
 
     // MARK: - Citation parsing
