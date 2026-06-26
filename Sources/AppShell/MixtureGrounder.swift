@@ -39,6 +39,46 @@ import ProviderKit
 /// A `VisualGrounder` that resolves a named target structurally (accessibility
 /// tree) when it can, and defers to a visual grounder otherwise.
 public struct MixtureGrounder: VisualGrounder {
+    public struct VerifiedGroundingAnchor: Equatable, Sendable {
+        public let score: Double
+        public let source: GroundingSource
+        public let hash: String?
+        public let verifiedAt: Date
+
+        public init(score: Double, source: GroundingSource, hash: String? = nil, verifiedAt: Date) {
+            self.score = score
+            self.source = source
+            self.hash = hash
+            self.verifiedAt = verifiedAt
+        }
+    }
+
+    public enum VerifiedGroundingOutcome: Equatable, Sendable {
+        case selected
+        case rejected(GroundingVerifierFailureKind?)
+        case abstained(GroundingVerifierFailureKind?)
+        case drifted
+        case ambiguous
+        case demote
+        case retryNextCandidate
+    }
+
+    public struct VerifiedGroundingSelection: Equatable, Sendable {
+        public let result: GroundingResult
+        public let outcome: VerifiedGroundingOutcome
+        public let verifierResult: GroundingVerifierResult
+
+        public init(
+            result: GroundingResult,
+            outcome: VerifiedGroundingOutcome,
+            verifierResult: GroundingVerifierResult
+        ) {
+            self.result = result
+            self.outcome = outcome
+            self.verifierResult = verifierResult
+        }
+    }
+
     private let base: any VisualGrounder
     private let skills: AppSkillRegistry
     /// Minimum AX label-match score to TRUST a structural hit: 2 = one string
@@ -46,6 +86,9 @@ public struct MixtureGrounder: VisualGrounder {
     /// this is only fuzzy word-overlap — defer to the visual grounder rather than
     /// risk a confident click on a vague match.
     private let minAXScore: Double
+    private let verifyCandidates: Bool
+    private let previousAnchor: VerifiedGroundingAnchor?
+    private let candidateFailureCounts: [String: Int]
 
     /// AX roles a CLICK target may legitimately resolve to. Excludes the passive
     /// roles `AXElementResolver.find` will also match (AXStaticText, AXImage) — a
@@ -60,24 +103,97 @@ public struct MixtureGrounder: VisualGrounder {
         "AXRadioButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider",
     ]
 
-    public init(base: any VisualGrounder, skills: AppSkillRegistry, minAXScore: Double = 2) {
+    public init(
+        base: any VisualGrounder,
+        skills: AppSkillRegistry,
+        minAXScore: Double = 2,
+        verifyCandidates: Bool = false,
+        previousAnchor: VerifiedGroundingAnchor? = nil,
+        candidateFailureCounts: [String: Int] = [:]
+    ) {
         self.base = base
         self.skills = skills
         self.minAXScore = minAXScore
+        self.verifyCandidates = verifyCandidates
+        self.previousAnchor = previousAnchor
+        self.candidateFailureCounts = candidateFailureCounts
     }
 
     public func ground(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> CGPoint? {
-        if let axPoint = await axGround(
-            target: target, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
-        ) {
-            return axPoint
+        guard verifyCandidates else {
+            if let axPoint = await axGround(
+                target: target, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+            ) {
+                return axPoint
+            }
+            return await base.ground(
+                screenshot: screenshot, target: target,
+                displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+            )
         }
-        return await base.ground(
-            screenshot: screenshot, target: target,
-            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+
+        let axCandidate = await axVerifierCandidate(
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
         )
+        let baseResult = await base.groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        return Self.selectVerifiedCandidate(
+            axCandidate: axCandidate,
+            baseResult: baseResult,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            previousAnchor: previousAnchor,
+            candidateFailureCounts: candidateFailureCounts
+        ).result.selectedPoint
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        guard verifyCandidates else {
+            let start = ContinuousClock.now
+            let point = await ground(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+            let elapsed = start.duration(to: ContinuousClock.now)
+            return GroundingResult.legacy(point: point, latency: elapsed.mixtureTimeInterval)
+        }
+
+        let axCandidate = await axVerifierCandidate(
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        let baseResult = await base.groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        return Self.selectVerifiedCandidate(
+            axCandidate: axCandidate,
+            baseResult: baseResult,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            previousAnchor: previousAnchor,
+            candidateFailureCounts: candidateFailureCounts
+        ).result
     }
 
     /// Region grounding (the "where is X" highlight) stays the base grounder's job —
@@ -129,12 +245,128 @@ public struct MixtureGrounder: VisualGrounder {
         )
     }
 
+    public static func selectVerifiedCandidate(
+        axCandidate: GroundingVerifierCandidate?,
+        baseResult: GroundingResult,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        previousAnchor: VerifiedGroundingAnchor? = nil,
+        candidateFailureCounts: [String: Int] = [:],
+        now: Date = Date()
+    ) -> VerifiedGroundingSelection {
+        let context = GroundingVerifierContext(
+            targetText: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        let verifierCandidates = Self.verifierCandidates(
+            axCandidate: axCandidate,
+            baseResult: baseResult
+        )
+        let verifierResult = GroundingVerifier().verify(verifierCandidates, context: context)
+
+        guard let previousAnchor else {
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: verifierResult.verdict == .accept ? verifierResult.selectedCandidateID : nil,
+                outcome: Self.outcome(for: verifierResult),
+                verifierResult: verifierResult
+            )
+        }
+
+        let strongScores = verifierResult.scores.filter {
+            $0.failureKind == nil && $0.score >= context.acceptThreshold
+        }
+        guard !strongScores.isEmpty else {
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: verifierResult.verdict == .accept ? verifierResult.selectedCandidateID : nil,
+                outcome: Self.outcome(for: verifierResult),
+                verifierResult: verifierResult
+            )
+        }
+
+        let candidatesByID = Dictionary(uniqueKeysWithValues: verifierCandidates.map { ($0.id, $0) })
+        let driftCandidates = strongScores.compactMap { score -> AnchorDriftScorer.Candidate? in
+            guard let candidate = candidatesByID[score.id] else { return nil }
+            return AnchorDriftScorer.Candidate(
+                id: score.id,
+                score: score.score,
+                source: Self.anchorSource(for: candidate.candidate.source),
+                hash: Self.anchorHash(for: candidate),
+                failureCount: candidateFailureCounts[score.id, default: 0]
+            )
+        }
+        let drift = AnchorDriftScorer.evaluate(
+            previous: AnchorDriftScorer.VerifiedAnchor(
+                score: previousAnchor.score,
+                source: Self.anchorSource(for: previousAnchor.source),
+                hash: previousAnchor.hash,
+                verifiedAt: previousAnchor.verifiedAt
+            ),
+            rankedCandidates: driftCandidates,
+            now: now
+        )
+
+        switch drift.outcome {
+        case .stable:
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: drift.selected?.id,
+                outcome: .selected,
+                verifierResult: verifierResult
+            )
+        case .retryNextCandidate:
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: drift.selected?.id,
+                outcome: .retryNextCandidate,
+                verifierResult: verifierResult
+            )
+        case .demote:
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: nil,
+                outcome: .demote,
+                verifierResult: verifierResult
+            )
+        case .ambiguous:
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: nil,
+                outcome: .ambiguous,
+                verifierResult: verifierResult
+            )
+        case .drifted:
+            return Self.selection(
+                from: verifierCandidates,
+                selectedID: nil,
+                outcome: .drifted,
+                verifierResult: verifierResult
+            )
+        }
+    }
+
     /// Resolve `target` against the frontmost app's accessibility tree, returning a
     /// display-local AppKit point (the executor's space) — or nil to fall back to
     /// the visual grounder. AX/NSWorkspace/NSScreen are main-thread surfaces, so the
     /// whole resolve runs on the MainActor.
     @MainActor
     private func axGround(target: String, displayWidthPoints: Int, displayHeightPoints: Int) -> CGPoint? {
+        axVerifierCandidate(
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )?.candidate.point
+    }
+
+    @MainActor
+    private func axVerifierCandidate(
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) -> GroundingVerifierCandidate? {
         // Canvas concepts are visual-only: a target named as a "placeholder" or
         // "canvas" element (Keynote/Pages slide boxes, drawing surfaces) has no
         // faithful AX node, but a short generic chrome label CAN substring-match it
@@ -165,8 +397,22 @@ public struct MixtureGrounder: VisualGrounder {
         guard let bounds = Self.captureDisplayBounds(widthPoints: displayWidthPoints, heightPoints: displayHeightPoints) else {
             return nil
         }
-        return Self.displayLocalPoint(
+        guard let point = Self.displayLocalPoint(
             cgGlobalCenter: match.center, displayCGBounds: bounds, displayHeightPoints: displayHeightPoints
+        ) else { return nil }
+
+        return GroundingVerifierCandidate(
+            id: "ax:0",
+            candidate: GroundingCandidate(
+                point: point,
+                confidence: min(1, max(0, match.score / 3)),
+                source: .accessibility,
+                coordinateSpace: .displayLocalAppKitPoints
+            ),
+            role: match.role,
+            label: match.title,
+            nearbyOCRText: match.title,
+            ocrDistancePoints: 0
         )
     }
 
@@ -211,5 +457,108 @@ public struct MixtureGrounder: VisualGrounder {
         guard let screen else { return nil }
         let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
         return CGDisplayBounds(id ?? CGMainDisplayID())
+    }
+
+    private static func verifierCandidates(
+        axCandidate: GroundingVerifierCandidate?,
+        baseResult: GroundingResult
+    ) -> [GroundingVerifierCandidate] {
+        var baseCandidates = baseResult.candidates.enumerated().map { index, candidate in
+            GroundingVerifierCandidate(
+                id: "base:\(index)",
+                candidate: candidate,
+                label: candidate.rawModel,
+                nearbyOCRText: candidate.rawModel,
+                ocrDistancePoints: candidate.dispersion,
+                agreeingSources: Self.agreeingSources(for: candidate, axCandidate: axCandidate)
+            )
+        }
+
+        guard let axCandidate else { return baseCandidates }
+        let axAgreement = baseCandidates
+            .filter { Self.pointsAgree(axCandidate.candidate.point, $0.candidate.point) }
+            .map(\.candidate.source)
+        let axWithAgreement = GroundingVerifierCandidate(
+            id: axCandidate.id,
+            candidate: axCandidate.candidate,
+            role: axCandidate.role,
+            label: axCandidate.label,
+            nearbyOCRText: axCandidate.nearbyOCRText,
+            ocrDistancePoints: axCandidate.ocrDistancePoints,
+            agreeingSources: axCandidate.agreeingSources + axAgreement
+        )
+        baseCandidates.insert(axWithAgreement, at: 0)
+        return baseCandidates
+    }
+
+    private static func agreeingSources(
+        for candidate: GroundingCandidate,
+        axCandidate: GroundingVerifierCandidate?
+    ) -> [GroundingSource] {
+        guard let axCandidate,
+              pointsAgree(candidate.point, axCandidate.candidate.point) else { return [] }
+        return [axCandidate.candidate.source]
+    }
+
+    private static func pointsAgree(_ lhs: CGPoint?, _ rhs: CGPoint?) -> Bool {
+        guard let lhs, let rhs else { return false }
+        return hypot(lhs.x - rhs.x, lhs.y - rhs.y) <= 24
+    }
+
+    private static func selection(
+        from candidates: [GroundingVerifierCandidate],
+        selectedID: String?,
+        outcome: VerifiedGroundingOutcome,
+        verifierResult: GroundingVerifierResult
+    ) -> VerifiedGroundingSelection {
+        let selectedIndex = selectedID.flatMap { id in candidates.firstIndex { $0.id == id } }
+        return VerifiedGroundingSelection(
+            result: GroundingResult(candidates: candidates.map(\.candidate), selectedIndex: selectedIndex),
+            outcome: outcome,
+            verifierResult: verifierResult
+        )
+    }
+
+    private static func outcome(for result: GroundingVerifierResult) -> VerifiedGroundingOutcome {
+        switch result.verdict {
+        case .accept:
+            return .selected
+        case .reject:
+            return .rejected(result.failureKind)
+        case .abstain:
+            return .abstained(result.failureKind)
+        }
+    }
+
+    private static func anchorSource(for source: GroundingSource) -> AnchorDriftScorer.AnchorSource {
+        switch source {
+        case .accessibility:
+            return .accessibility
+        case .cache:
+            return .recordedPoint
+        case .dom:
+            return .semantic
+        case .ocr, .uiTars, .claude, .visualModel:
+            return .vision
+        case .compatibility, .unknown:
+            return .unknown
+        }
+    }
+
+    private static func anchorHash(for candidate: GroundingVerifierCandidate) -> String? {
+        if let rawModel = candidate.candidate.rawModel, !rawModel.isEmpty {
+            return rawModel
+        }
+        if let label = candidate.label, !label.isEmpty {
+            return "\(candidate.role ?? "unknown"):\(label)"
+        }
+        return nil
+    }
+}
+
+private extension Duration {
+    var mixtureTimeInterval: TimeInterval {
+        let components = self.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
     }
 }
