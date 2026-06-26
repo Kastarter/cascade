@@ -727,6 +727,7 @@ public actor CascadeStore {
         }
         // Embeddings follow their moments out.
         try? execute("DELETE FROM context_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM context_visual_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         return removed
     }
 
@@ -1150,6 +1151,23 @@ public actor CascadeStore {
             context_id INTEGER PRIMARY KEY,
             vector BLOB NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS context_visual_embedding (
+            context_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (context_id, provider, model, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_visual_embedding_compat
+            ON context_visual_embedding(provider, model, revision, dimension);
+        CREATE TRIGGER IF NOT EXISTS recorded_context_visual_embedding_ad
+        AFTER DELETE ON recorded_context BEGIN
+            DELETE FROM context_visual_embedding WHERE context_id = old.id;
+        END;
         """, db: db)
 
         // Backfill the index for rows inserted before FTS existed (triggers only
