@@ -31,6 +31,7 @@ public struct PrefixSpanMiner: Sendable {
         public let episodeIndex: Int
         public let startEventIndex: Int
         public let endEventIndex: Int
+        public let matchedEventIndices: [Int]
         public let startTime: TimeInterval?
         public let endTime: TimeInterval?
 
@@ -132,6 +133,7 @@ private extension PrefixSpanMiner {
         let episodeIndex: Int
         let startEventIndex: Int
         let endEventIndex: Int
+        let matchedEventIndices: [Int]
         let startTime: TimeInterval?
         let endTime: TimeInterval?
 
@@ -152,6 +154,7 @@ private extension PrefixSpanMiner {
                 episodeIndex: episodeIndex,
                 startEventIndex: startEventIndex,
                 endEventIndex: endEventIndex,
+                matchedEventIndices: matchedEventIndices,
                 startTime: startTime,
                 endTime: endTime
             )
@@ -195,6 +198,7 @@ private extension PrefixSpanMiner {
                         episodeIndex: episodeIndex,
                         startEventIndex: eventIndex,
                         endEventIndex: eventIndex,
+                        matchedEventIndices: [eventIndex],
                         startTime: event.timestamp,
                         endTime: event.timestamp
                     )
@@ -229,6 +233,7 @@ private extension PrefixSpanMiner {
                         episodeIndex: occurrence.episodeIndex,
                         startEventIndex: occurrence.startEventIndex,
                         endEventIndex: eventIndex,
+                        matchedEventIndices: occurrence.matchedEventIndices + [eventIndex],
                         startTime: occurrence.startTime,
                         endTime: event.timestamp
                     )

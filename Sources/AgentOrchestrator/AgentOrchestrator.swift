@@ -261,11 +261,18 @@ public actor CascadeOrchestrator {
     /// the Rewind. Each is a candidate to turn into an agent built from real actions.
     public func detectedWaste(
         maxResults: Int = 5,
-        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        useEpisodeMining: Bool = false
     ) async throws -> [DetectedWaste] {
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)
-        return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults, webAppIdentity: webAppIdentity)
+        return wasteDetector.detect(
+            contexts: contexts,
+            inputEvents: events,
+            maxResults: maxResults,
+            webAppIdentity: webAppIdentity,
+            useEpisodeMining: useEpisodeMining
+        )
     }
 
     /// Turns an arbitrary recorded time range into ONE named, grounded

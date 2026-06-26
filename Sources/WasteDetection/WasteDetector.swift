@@ -64,7 +64,30 @@ public struct WasteDetector: Sendable {
         contexts: [RecordedContext],
         inputEvents: [InputEvent],
         maxResults: Int = 5,
-        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        useEpisodeMining: Bool = false
+    ) -> [DetectedWaste] {
+        if useEpisodeMining {
+            return detectWithEpisodeMining(
+                contexts: contexts,
+                inputEvents: inputEvents,
+                maxResults: maxResults,
+                webAppIdentity: webAppIdentity
+            )
+        }
+        return detectContiguous(
+            contexts: contexts,
+            inputEvents: inputEvents,
+            maxResults: maxResults,
+            webAppIdentity: webAppIdentity
+        )
+    }
+
+    private func detectContiguous(
+        contexts: [RecordedContext],
+        inputEvents: [InputEvent],
+        maxResults: Int,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)?
     ) -> [DetectedWaste] {
         // Oldest → newest; ignore anything in a sensitive app defensively. Scroll
         // BURSTS collapse to one gesture first — eight wheel ticks while reading
@@ -164,6 +187,104 @@ public struct WasteDetector: Sendable {
         // Rank by a composite score, not raw total-seconds: a frequent, time-saving,
         // long-and-cohesive, recent routine beats a loose or stale one. `now` is read
         // once so the ordering is internally consistent.
+        let now = Date()
+        return deduped
+            .sorted { lhs, rhs in
+                let l = Self.rankingScore(lhs, now: now), r = Self.rankingScore(rhs, now: now)
+                if l != r { return l > r }
+                return lhs.signature < rhs.signature
+            }
+            .prefix(maxResults)
+            .map { $0 }
+    }
+
+    private func detectWithEpisodeMining(
+        contexts: [RecordedContext],
+        inputEvents: [InputEvent],
+        maxResults: Int,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)?
+    ) -> [DetectedWaste] {
+        let surface: (InputEvent) -> String = { webAppIdentity?($0) ?? $0.appName }
+        let collapsed = Self.collapsingScrollBursts(
+            inputEvents.sorted {
+                if $0.capturedAt == $1.capturedAt { return $0.id < $1.id }
+                return $0.capturedAt < $1.capturedAt
+            }
+        )
+        let eventsByID = Dictionary(collapsed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let episodeEvents = ActionEpisodeSegmenter(maxIdleGap: Self.maxIdleGap)
+            .segment(collapsed, surface: webAppIdentity)
+            .map { episode in episode.eventIDs.compactMap { eventsByID[$0] } }
+            .filter { $0.count >= minRunLength }
+        guard episodeEvents.count >= 2 else { return [] }
+
+        let minedEpisodes = episodeEvents.map { episode in
+            episode.map { event in
+                PrefixSpanMiner.Event(
+                    Self.token(event, surface: surface(event)),
+                    timestamp: event.capturedAt.timeIntervalSince1970
+                )
+            }
+        }
+        let miner = PrefixSpanMiner(
+            minSupport: 2,
+            maxPatternLength: maxRunLength,
+            maxGapEvents: 1,
+            maxSpanSeconds: Self.maxIdleGap,
+            closedOnly: true
+        )
+        let patterns = miner.mine(episodes: minedEpisodes)
+            .filter { $0.tokens.count >= minRunLength }
+            .sorted { lhs, rhs in
+                if lhs.tokens.count != rhs.tokens.count { return lhs.tokens.count > rhs.tokens.count }
+                if lhs.support != rhs.support { return lhs.support > rhs.support }
+                let lFirst = lhs.occurrenceSpans.first
+                let rFirst = rhs.occurrenceSpans.first
+                if lFirst?.episodeIndex != rFirst?.episodeIndex {
+                    return (lFirst?.episodeIndex ?? Int.max) < (rFirst?.episodeIndex ?? Int.max)
+                }
+                if lFirst?.startEventIndex != rFirst?.startEventIndex {
+                    return (lFirst?.startEventIndex ?? Int.max) < (rFirst?.startEventIndex ?? Int.max)
+                }
+                return lhs.tokens.lexicographicallyPrecedes(rhs.tokens)
+            }
+
+        var consumed = Set<EpisodeEventKey>()
+        var results: [DetectedWaste] = []
+        for pattern in patterns {
+            var localConsumed = Set<EpisodeEventKey>()
+            var occurrences: [[InputEvent]] = []
+            var occurrenceKeys: [[EpisodeEventKey]] = []
+            for span in pattern.occurrenceSpans.sorted(by: Self.episodeSpanSort) {
+                let indices = Self.matchedIndices(for: span)
+                let keys = indices.map { EpisodeEventKey(episodeIndex: span.episodeIndex, eventIndex: $0) }
+                guard keys.allSatisfy({ !consumed.contains($0) && !localConsumed.contains($0) }),
+                      let events = Self.events(for: span, matchedIndices: indices, episodeEvents: episodeEvents),
+                      events.count == pattern.tokens.count
+                else { continue }
+                occurrences.append(events)
+                occurrenceKeys.append(keys)
+                localConsumed.formUnion(keys)
+            }
+            guard occurrences.count >= 2 else { continue }
+            let representative = occurrences.sorted(by: Self.newestOccurrenceFirst).first!
+            guard Self.isAutomatableInstance(representative) else { continue }
+
+            results.append(
+                makeWaste(
+                    instance: representative,
+                    occurrences: occurrences.count,
+                    contexts: contexts,
+                    surface: surface,
+                    allOccurrences: occurrences
+                )
+            )
+            for keys in occurrenceKeys {
+                consumed.formUnion(keys)
+            }
+        }
+
+        let deduped = Self.mergeVariants(results)
         let now = Date()
         return deduped
             .sorted { lhs, rhs in
@@ -565,6 +686,41 @@ public struct WasteDetector: Sendable {
             lastEnd = start + length - 1
         }
         return chosen
+    }
+
+    private struct EpisodeEventKey: Hashable {
+        let episodeIndex: Int
+        let eventIndex: Int
+    }
+
+    private static func matchedIndices(for span: PrefixSpanMiner.OccurrenceSpan) -> [Int] {
+        span.matchedEventIndices.isEmpty
+            ? Array(span.startEventIndex...span.endEventIndex)
+            : span.matchedEventIndices
+    }
+
+    private static func events(
+        for span: PrefixSpanMiner.OccurrenceSpan,
+        matchedIndices: [Int],
+        episodeEvents: [[InputEvent]]
+    ) -> [InputEvent]? {
+        guard episodeEvents.indices.contains(span.episodeIndex) else { return nil }
+        let episode = episodeEvents[span.episodeIndex]
+        guard matchedIndices.allSatisfy({ episode.indices.contains($0) }) else { return nil }
+        return matchedIndices.map { episode[$0] }
+    }
+
+    private static func episodeSpanSort(_ lhs: PrefixSpanMiner.OccurrenceSpan, _ rhs: PrefixSpanMiner.OccurrenceSpan) -> Bool {
+        if lhs.episodeIndex != rhs.episodeIndex { return lhs.episodeIndex < rhs.episodeIndex }
+        if lhs.startEventIndex != rhs.startEventIndex { return lhs.startEventIndex < rhs.startEventIndex }
+        return lhs.endEventIndex < rhs.endEventIndex
+    }
+
+    private static func newestOccurrenceFirst(_ lhs: [InputEvent], _ rhs: [InputEvent]) -> Bool {
+        let lLast = lhs.last?.capturedAt ?? .distantPast
+        let rLast = rhs.last?.capturedAt ?? .distantPast
+        if lLast != rLast { return lLast > rLast }
+        return lhs.map(\.id).lexicographicallyPrecedes(rhs.map(\.id))
     }
 
     /// The clicked element's own AX label is the strongest anchor; the recorded
