@@ -40,6 +40,34 @@ public enum AXElementResolver {
         }
     }
 
+    public struct Candidate: Sendable, Equatable {
+        public let id: String
+        public let descriptor: AXTargetDescriptorV2
+        public let center: CGPoint?
+
+        public init(id: String, descriptor: AXTargetDescriptorV2, center: CGPoint? = nil) {
+            self.id = id
+            self.descriptor = descriptor
+            self.center = center
+        }
+    }
+
+    public struct RankedCandidate: Sendable, Equatable {
+        public let candidate: Candidate
+        /// Raw weighted score over available recorded signals. Kept for pinned tests and
+        /// audit logs; use `confidence` for the normalized accept/reject threshold.
+        public let score: Double
+        public let confidence: Double
+        public let distance: Double?
+
+        public init(candidate: Candidate, score: Double, confidence: Double, distance: Double? = nil) {
+            self.candidate = candidate
+            self.score = score
+            self.confidence = confidence
+            self.distance = distance
+        }
+    }
+
     /// Roles worth clicking — tiptour's "pointable" set.
     private static let pointableRoles: Set<String> = [
         "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
@@ -212,6 +240,57 @@ public enum AXElementResolver {
 
     // MARK: - Matching
 
+    /// Similo-style weighted ranking over recorded descriptor signals. Missing recorded
+    /// signals are ignored so legacy/thin descriptors do not get unfairly penalized;
+    /// missing candidate signals score zero when the recording had that signal.
+    public static func rank(
+        recorded: AXTargetDescriptorV2,
+        candidates: [Candidate],
+        near recordedPoint: CGPoint? = nil
+    ) -> [RankedCandidate] {
+        candidates
+            .map { rank(recorded: recorded, candidate: $0, near: recordedPoint) }
+            .filter { $0.confidence > 0 }
+            .sorted { lhs, rhs in
+                if abs(lhs.confidence - rhs.confidence) > 0.000_001 {
+                    return lhs.confidence > rhs.confidence
+                }
+                switch (lhs.distance, rhs.distance) {
+                case let (l?, r?) where abs(l - r) > 0.000_001:
+                    return l < r
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    return lhs.candidate.id < rhs.candidate.id
+                }
+            }
+    }
+
+    public static func rank(
+        recorded: AXTargetDescriptorV2,
+        candidate: Candidate,
+        near recordedPoint: CGPoint? = nil
+    ) -> RankedCandidate {
+        let scored = weightedScore(recorded: recorded, candidate: candidate.descriptor)
+        let confidence = scored.availableWeight > 0 ? min(max(scored.score / scored.availableWeight, 0), 1) : 0
+        let distance = distance(from: recordedPoint, to: candidate.center)
+        return RankedCandidate(candidate: candidate, score: scored.score, confidence: confidence, distance: distance)
+    }
+
+    /// Pure thresholded wrapper for tests and future synthetic candidate harvesters. The
+    /// live AX `find(descriptor:)` overload remains the backward-compatible screen path.
+    public static func find(
+        recorded: AXTargetDescriptorV2,
+        candidates: [Candidate],
+        near recordedPoint: CGPoint? = nil,
+        minimumConfidence: Double = 0.62
+    ) -> RankedCandidate? {
+        rank(recorded: recorded, candidates: candidates, near: recordedPoint)
+            .first { $0.confidence >= minimumConfidence }
+    }
+
     /// Ranks a live `candidate` against the recorded `descriptor`. 0 = no match (must
     /// never hijack a click). A matching accessibility identifier dominates — it is
     /// unique and survives moves/renames/localization. Otherwise the label text score
@@ -245,6 +324,95 @@ public enum AXElementResolver {
             containerBonus = 0
         }
         return labelScore + roleBonus + containerBonus
+    }
+
+    private static func weightedScore(
+        recorded: AXTargetDescriptorV2,
+        candidate: AXTargetDescriptorV2
+    ) -> (score: Double, availableWeight: Double) {
+        var score = 0.0
+        var available = 0.0
+
+        func add(_ weight: Double, active: Bool, similarity: () -> Double) {
+            guard active else { return }
+            available += weight
+            score += weight * min(max(similarity(), 0), 1)
+        }
+
+        add(0.22, active: recorded.identifier != nil) {
+            exactSimilarity(recorded.identifier, candidate.identifier)
+        }
+        add(0.17, active: !recorded.label.isEmpty) {
+            matchScore(needle: normalize(recorded.label), candidate: normalize(candidate.label)) / 3.0
+        }
+        add(0.14, active: recorded.semanticHash != nil) {
+            exactSimilarity(recorded.semanticHash, candidate.semanticHash)
+        }
+        add(0.13, active: !recordedStructuralPath(recorded).isEmpty) {
+            pathSimilarity(recordedStructuralPath(recorded), recordedStructuralPath(candidate))
+        }
+        add(0.10, active: !recorded.neighborLabels.isEmpty) {
+            labelSetSimilarity(recorded.neighborLabels, candidate.neighborLabels)
+        }
+        add(0.07, active: recorded.subtreeHash != nil) {
+            exactSimilarity(recorded.subtreeHash, candidate.subtreeHash)
+        }
+        add(0.07, active: recorded.role != nil) {
+            exactSimilarity(recorded.role, candidate.role)
+        }
+        add(0.05, active: recorded.siblingIndex != nil) {
+            siblingSimilarity(recorded.siblingIndex, candidate.siblingIndex)
+        }
+        add(0.05, active: recorded.frameBucket != nil) {
+            exactSimilarity(recorded.frameBucket, candidate.frameBucket)
+        }
+
+        return (score, available)
+    }
+
+    private static func recordedStructuralPath(_ descriptor: AXTargetDescriptorV2) -> [String] {
+        if !descriptor.ancestorPath.isEmpty { return descriptor.ancestorPath }
+        return descriptor.container.map { [$0] } ?? []
+    }
+
+    private static func exactSimilarity(_ recorded: String?, _ candidate: String?) -> Double {
+        guard let recorded = recorded.map(normalize), !recorded.isEmpty,
+              let candidate = candidate.map(normalize), !candidate.isEmpty else { return 0 }
+        return recorded == candidate ? 1 : 0
+    }
+
+    private static func pathSimilarity(_ recorded: [String], _ candidate: [String]) -> Double {
+        let r = recorded.map(normalize).filter { !$0.isEmpty }
+        let c = candidate.map(normalize).filter { !$0.isEmpty }
+        guard !r.isEmpty, !c.isEmpty else { return 0 }
+        if r == c { return 1 }
+        if let last = r.last, c.contains(last) { return 0.82 }
+        var suffix = 0
+        while suffix < min(r.count, c.count), r[r.count - 1 - suffix] == c[c.count - 1 - suffix] {
+            suffix += 1
+        }
+        return Double(suffix) / Double(max(r.count, c.count))
+    }
+
+    private static func labelSetSimilarity(_ recorded: [String], _ candidate: [String]) -> Double {
+        let r = Set(recorded.map(normalize).filter { !$0.isEmpty })
+        let c = Set(candidate.map(normalize).filter { !$0.isEmpty })
+        guard !r.isEmpty, !c.isEmpty else { return 0 }
+        return Double(r.intersection(c).count) / Double(r.union(c).count)
+    }
+
+    private static func siblingSimilarity(_ recorded: Int?, _ candidate: Int?) -> Double {
+        guard let recorded, let candidate else { return 0 }
+        let delta = abs(recorded - candidate)
+        if delta == 0 { return 1 }
+        if delta == 1 { return 0.66 }
+        if delta == 2 { return 0.33 }
+        return 0
+    }
+
+    private static func distance(from recorded: CGPoint?, to candidate: CGPoint?) -> Double? {
+        guard let recorded, let candidate else { return nil }
+        return hypot(candidate.x - recorded.x, candidate.y - recorded.y)
     }
 
     /// 3 = exact, 2 = one contains the other, 1+overlap = shared words. Below 1 is

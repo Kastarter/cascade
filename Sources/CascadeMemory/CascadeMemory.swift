@@ -159,6 +159,9 @@ public enum AXTargetDescriptor {
 
     /// Unpacks an encoded descriptor; tolerant of `nil`/legacy unseparated/2-field strings.
     public static func decode(_ encoded: String?) -> (role: String?, identifier: String?, container: String?) {
+        if let descriptor = AXTargetDescriptorV2.decodeJSON(encoded) {
+            return (descriptor.role, descriptor.identifier, descriptor.container ?? descriptor.ancestorPath.last)
+        }
         guard let encoded, encoded.contains(separator) else { return (nil, nil, nil) }
         let parts = encoded.components(separatedBy: separator)
         func field(_ i: Int) -> String? {
@@ -167,6 +170,181 @@ public enum AXTargetDescriptor {
             return v.isEmpty ? nil : v
         }
         return (field(0), field(1), field(2))
+    }
+}
+
+/// JSON locator for recorded AX targets. V2 keeps the legacy role/identifier/container
+/// signals, then adds structural and semantic features used by the replay resolver's
+/// candidate ranking. It is stored in the existing string column and decodes legacy
+/// `AXTargetDescriptor` separator payloads so old recipes continue to replay.
+public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let label: String
+    public let role: String?
+    public let identifier: String?
+    public let container: String?
+    public let ancestorPath: [String]
+    public let siblingIndex: Int?
+    public let neighborLabels: [String]
+    public let frameBucket: String?
+    public let subtreeHash: String?
+    public let semanticHash: String?
+
+    public init(
+        schemaVersion: Int = 2,
+        label: String,
+        role: String? = nil,
+        identifier: String? = nil,
+        container: String? = nil,
+        ancestorPath: [String] = [],
+        siblingIndex: Int? = nil,
+        neighborLabels: [String] = [],
+        frameBucket: String? = nil,
+        subtreeHash: String? = nil,
+        semanticHash: String? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.label = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.role = Self.cleaned(role)
+        self.identifier = Self.cleaned(identifier)
+        self.container = Self.cleaned(container)
+        self.ancestorPath = ancestorPath.compactMap(Self.cleaned)
+        self.siblingIndex = siblingIndex
+        self.neighborLabels = neighborLabels.compactMap(Self.cleaned)
+        self.frameBucket = Self.cleaned(frameBucket)
+        self.subtreeHash = Self.cleaned(subtreeHash)
+        self.semanticHash = Self.cleaned(semanticHash)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case label
+        case role
+        case identifier
+        case container
+        case ancestorPath
+        case siblingIndex
+        case neighborLabels
+        case frameBucket
+        case subtreeHash
+        case semanticHash
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            schemaVersion: try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 2,
+            label: try container.decodeIfPresent(String.self, forKey: .label) ?? "",
+            role: try container.decodeIfPresent(String.self, forKey: .role),
+            identifier: try container.decodeIfPresent(String.self, forKey: .identifier),
+            container: try container.decodeIfPresent(String.self, forKey: .container),
+            ancestorPath: try container.decodeIfPresent([String].self, forKey: .ancestorPath) ?? [],
+            siblingIndex: try container.decodeIfPresent(Int.self, forKey: .siblingIndex),
+            neighborLabels: try container.decodeIfPresent([String].self, forKey: .neighborLabels) ?? [],
+            frameBucket: try container.decodeIfPresent(String.self, forKey: .frameBucket),
+            subtreeHash: try container.decodeIfPresent(String.self, forKey: .subtreeHash),
+            semanticHash: try container.decodeIfPresent(String.self, forKey: .semanticHash)
+        )
+    }
+
+    public func encodedJSON() -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(self) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    public static func encode(
+        label: String,
+        role: String? = nil,
+        identifier: String? = nil,
+        container: String? = nil,
+        ancestorPath: [String] = [],
+        siblingIndex: Int? = nil,
+        neighborLabels: [String] = [],
+        frameBucket: String? = nil,
+        subtreeHash: String? = nil,
+        semanticHash: String? = nil
+    ) -> String? {
+        let descriptor = AXTargetDescriptorV2(
+            label: label,
+            role: role,
+            identifier: identifier,
+            container: container,
+            ancestorPath: ancestorPath,
+            siblingIndex: siblingIndex,
+            neighborLabels: neighborLabels,
+            frameBucket: frameBucket,
+            subtreeHash: subtreeHash,
+            semanticHash: semanticHash
+        )
+        guard descriptor.hasSignal else { return nil }
+        return descriptor.encodedJSON()
+    }
+
+    public static func decode(_ encoded: String?, fallbackLabel: String = "") -> AXTargetDescriptorV2? {
+        if let descriptor = decodeJSON(encoded) {
+            if descriptor.label.isEmpty, !fallbackLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return AXTargetDescriptorV2(
+                    schemaVersion: descriptor.schemaVersion,
+                    label: fallbackLabel,
+                    role: descriptor.role,
+                    identifier: descriptor.identifier,
+                    container: descriptor.container,
+                    ancestorPath: descriptor.ancestorPath,
+                    siblingIndex: descriptor.siblingIndex,
+                    neighborLabels: descriptor.neighborLabels,
+                    frameBucket: descriptor.frameBucket,
+                    subtreeHash: descriptor.subtreeHash,
+                    semanticHash: descriptor.semanticHash
+                )
+            }
+            return descriptor
+        }
+        guard let encoded, encoded.contains(AXTargetDescriptor.separator) else { return nil }
+        let parts = encoded.components(separatedBy: AXTargetDescriptor.separator)
+        func field(_ index: Int) -> String? {
+            guard parts.indices.contains(index) else { return nil }
+            return cleaned(parts[index])
+        }
+        let role = field(0)
+        let identifier = field(1)
+        let container = field(2)
+        guard role != nil || identifier != nil || container != nil else { return nil }
+        return AXTargetDescriptorV2(
+            label: fallbackLabel,
+            role: role,
+            identifier: identifier,
+            container: container,
+            ancestorPath: container.map { [$0] } ?? []
+        )
+    }
+
+    static func decodeJSON(_ encoded: String?) -> AXTargetDescriptorV2? {
+        guard let encoded,
+              encoded.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
+              let data = encoded.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(AXTargetDescriptorV2.self, from: data)
+    }
+
+    public var hasSignal: Bool {
+        !label.isEmpty
+            || role != nil
+            || identifier != nil
+            || container != nil
+            || !ancestorPath.isEmpty
+            || siblingIndex != nil
+            || !neighborLabels.isEmpty
+            || frameBucket != nil
+            || subtreeHash != nil
+            || semanticHash != nil
+    }
+
+    private static func cleaned(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 }
 
