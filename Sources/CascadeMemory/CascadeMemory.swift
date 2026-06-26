@@ -1349,6 +1349,30 @@ public actor CascadeStore {
         END;
         """, db: db)
 
+        try execute("""
+        CREATE TABLE IF NOT EXISTS agent_experience_case (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            app_name TEXT NOT NULL,
+            goal_pattern TEXT NOT NULL,
+            recipe_signature TEXT NOT NULL,
+            skill_slug TEXT,
+            outcome TEXT NOT NULL,
+            verification_signal TEXT,
+            failure_kind TEXT,
+            evidence_ids_json TEXT NOT NULL,
+            action_count INTEGER NOT NULL,
+            retained_score REAL NOT NULL,
+            user_feedback TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_experience_case_app_goal
+            ON agent_experience_case(app_name, goal_pattern);
+        CREATE INDEX IF NOT EXISTS idx_agent_experience_case_failure
+            ON agent_experience_case(failure_kind);
+        CREATE INDEX IF NOT EXISTS idx_agent_experience_case_recipe
+            ON agent_experience_case(recipe_signature);
+        """, db: db)
+
         // Native work graph storage. Entities and evidence links are separate so
         // aliases can be merged without duplicating moment citations. The valid_*
         // columns describe the world-time assertion; transaction_* describes when
