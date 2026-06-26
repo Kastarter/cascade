@@ -69,6 +69,79 @@ func mutatingAnAuditRowBreaksTheChain() async throws {
     }
 }
 
+// MARK: - External anchor (truncation / wholesale rewrite)
+
+@Test
+func canonicalFormIsUnambiguousAcrossFieldSplits() {
+    // Length-prefixing must make these two distinct events hash differently even
+    // though a naive separator-join would collide.
+    let a = AuditChain.canonicalForm(createdAt: "t", actor: "x", action: "a", detail: "b\u{1f}c")
+    let b = AuditChain.canonicalForm(createdAt: "t", actor: "x", action: "a\u{1f}b", detail: "c")
+    #expect(a != b)
+}
+
+@Test
+func truncatingTheChainTailIsDetectedViaAnchor() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeAnchor-\(UUID().uuidString).sqlite").path
+    let anchor = InMemoryAuditAnchor()
+    let store = try CascadeStore(path: path, auditAnchor: anchor)
+    for detail in ["a", "b", "c"] {
+        _ = try await store.appendAudit(AuditEvent(actor: "x", action: "y", detail: detail))
+    }
+    // Internal chain alone would still look intact after a tail delete.
+    rawExec(path, "DELETE FROM audit_event WHERE id = (SELECT max(id) FROM audit_event);")
+
+    let fresh = try CascadeStore(path: path, auditAnchor: anchor)
+    if case .truncated(let expected, let found) = try await fresh.verifyAuditChain() {
+        #expect(expected == 3)
+        #expect(found == 2)
+    } else {
+        Issue.record("expected truncation to be caught by the out-of-band anchor")
+    }
+}
+
+@Test
+func forgedUnchainedRowAfterTheChainIsDetected() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeForge-\(UUID().uuidString).sqlite").path
+    let anchor = InMemoryAuditAnchor()
+    let store = try CascadeStore(path: path, auditAnchor: anchor)
+    for detail in ["a", "b"] {
+        _ = try await store.appendAudit(AuditEvent(actor: "x", action: "y", detail: detail))
+    }
+    // A row inserted with NULL hashes after the chain has begun is a forgery.
+    rawExec(path, "INSERT INTO audit_event (created_at, actor, action, detail) VALUES ('2026-06-26T00:00:00Z','x','y','forged');")
+
+    let fresh = try CascadeStore(path: path, auditAnchor: anchor)
+    if case .broken = try await fresh.verifyAuditChain() {} else {
+        Issue.record("expected a forged unchained row after the chain to be broken")
+    }
+}
+
+@Test
+func appendingRowsOutsideTheTrustedPathIsCaughtByTheAnchor() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeRewrite-\(UUID().uuidString).sqlite").path
+    let anchor = InMemoryAuditAnchor()
+    let store = try CascadeStore(path: path, auditAnchor: anchor)
+    for detail in ["a", "b", "c"] {
+        _ = try await store.appendAudit(AuditEvent(actor: "x", action: "y", detail: detail))
+    }
+    // An attacker appends an internally-VALID extra row, but without the anchor
+    // (NullAuditAnchor default) — so the trusted head still says count == 3.
+    let attacker = try CascadeStore(path: path)
+    _ = try await attacker.appendAudit(AuditEvent(actor: "x", action: "y", detail: "forged-but-valid"))
+
+    let fresh = try CascadeStore(path: path, auditAnchor: anchor)
+    if case .truncated(let expected, let found) = try await fresh.verifyAuditChain() {
+        #expect(expected == 3)
+        #expect(found == 4)
+    } else {
+        Issue.record("expected the anchor to catch rows appended outside the trusted path")
+    }
+}
+
 @Test
 func deletingAnAuditRowBreaksTheChain() async throws {
     let (store, path) = try makeStore()

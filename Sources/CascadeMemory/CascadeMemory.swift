@@ -382,9 +382,11 @@ public enum CascadeStoreError: Error, LocalizedError {
 public actor CascadeStore {
     private let connection: SQLiteConnection
     private let path: String
+    private let auditAnchor: AuditAnchorStore
 
-    public init(path: String? = nil) throws {
+    public init(path: String? = nil, auditAnchor: AuditAnchorStore = NullAuditAnchor()) throws {
         self.path = path ?? Self.defaultDatabasePath()
+        self.auditAnchor = auditAnchor
         try Self.ensureParentDirectory(for: self.path)
 
         var handle: OpaquePointer?
@@ -919,6 +921,10 @@ public actor CascadeStore {
             bind(eventHash, at: 6, in: statement)
             try stepDone(statement)
         }
+        // Mirror the new chain head to the out-of-band anchor so truncation /
+        // wholesale rewrite (which keep the internal chain self-consistent) are
+        // still detectable.
+        auditAnchor.save(AuditHead(count: chainedAuditCount(), hash: eventHash), database: path)
         return AuditEvent(
             id: sqlite3_last_insert_rowid(connection.db),
             createdAt: event.createdAt,
@@ -938,41 +944,66 @@ public actor CascadeStore {
         }
     }
 
+    private func chainedAuditCount() -> Int {
+        Int(Self.scalarValue(connection.db, "SELECT count(*) FROM audit_event WHERE event_hash IS NOT NULL;"))
+    }
+
     /// Recompute the audit hash chain and report the first row that no longer
-    /// reconciles. Detects field mutation (recomputed hash differs) and
-    /// deletion/insertion (a neighbour's `prev_hash` link no longer matches).
-    /// Only the chained era (rows with `event_hash`) is verified; pre-chain
-    /// legacy rows are ignored.
+    /// reconciles. Scans ALL rows (not just chained ones) so a forged un-chained
+    /// row inserted after the chain begins is caught; legacy pre-chain rows are
+    /// allowed only as a leading prefix, and the first chained row must start at
+    /// genesis. Detects field mutation (recompute mismatch) and insertion/deletion
+    /// (broken `prev_hash` link). Finally compares the head to the out-of-band
+    /// anchor to catch truncation / rewrites that keep the chain self-consistent.
     public func verifyAuditChain() throws -> AuditChainStatus {
         let sql = """
         SELECT id, created_at, actor, action, detail, prev_hash, event_hash
-        FROM audit_event WHERE event_hash IS NOT NULL ORDER BY id ASC;
+        FROM audit_event ORDER BY id ASC;
         """
-        return try withStatement(sql) { statement in
+        let scan: (status: AuditChainStatus?, verified: Int, head: String) = try withStatement(sql) { statement in
             var verified = 0
-            var expectedPrev: String?
+            var seenChained = false
+            var expectedPrev = AuditChain.genesis
+            var lastHash = ""
             while sqlite3_step(statement) == SQLITE_ROW {
                 let id = sqlite3_column_int64(statement, 0)
+                guard let storedHash = text(statement, 6) else {
+                    // Unchained (legacy) row — allowed ONLY as a leading prefix.
+                    if seenChained { return (.broken(atID: id), verified, lastHash) }
+                    continue
+                }
                 let createdAt = text(statement, 1) ?? ""
                 let actor = text(statement, 2) ?? ""
                 let action = text(statement, 3) ?? ""
                 let detail = text(statement, 4) ?? ""
-                let prevHash = text(statement, 5) ?? AuditChain.genesis
-                let storedHash = text(statement, 6) ?? ""
-                if let expectedPrev, prevHash != expectedPrev {
-                    return .broken(atID: id)   // a row was inserted or deleted
+                let prevHash = text(statement, 5) ?? ""
+                if !seenChained {
+                    if prevHash != AuditChain.genesis { return (.broken(atID: id), verified, lastHash) }
+                    seenChained = true
+                } else if prevHash != expectedPrev {
+                    return (.broken(atID: id), verified, lastHash)
                 }
                 let canonical = AuditChain.canonicalForm(
                     createdAt: createdAt, actor: actor, action: action, detail: detail
                 )
                 if AuditChain.hash(prev: prevHash, canonical: canonical) != storedHash {
-                    return .broken(atID: id)    // this row's content was mutated
+                    return (.broken(atID: id), verified, lastHash)
                 }
                 expectedPrev = storedHash
+                lastHash = storedHash
                 verified += 1
             }
-            return verified == 0 ? .empty : .intact(verified: verified)
+            return (nil, verified, lastHash)
         }
+        if let status = scan.status { return status }
+        // Out-of-band anchor: catches truncation / rewrite the internal chain alone
+        // can't (a shortened chain still links cleanly). Skipped when no anchor is
+        // recorded (e.g. the no-op default), so internal-only integrity still works.
+        if let head = auditAnchor.load(database: path),
+           head.count != scan.verified || head.hash != scan.head {
+            return .truncated(expectedCount: head.count, foundCount: scan.verified)
+        }
+        return scan.verified == 0 ? .empty : .intact(verified: scan.verified)
     }
 
     public func recentAudit(limit: Int = 80) throws -> [AuditEvent] {

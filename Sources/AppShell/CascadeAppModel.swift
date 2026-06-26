@@ -235,7 +235,10 @@ public final class CascadeAppModel: ObservableObject {
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
-        let store = try injectedStore ?? CascadeStore()
+        // Production store anchors its audit-chain head in the Keychain so
+        // truncation/rewrite of the local audit log is detectable. Tests inject a
+        // store and never hit this path.
+        let store = try injectedStore ?? CascadeStore(auditAnchor: KeychainAuditAnchor())
         self.store = store
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
