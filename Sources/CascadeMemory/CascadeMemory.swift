@@ -898,12 +898,21 @@ public actor CascadeStore {
     }
 
     public func appendAudit(_ event: AuditEvent) throws -> AuditEvent {
-        let sql = "INSERT INTO audit_event (created_at, actor, action, detail) VALUES (?, ?, ?, ?);"
+        let createdAt = DateCodec.string(from: event.createdAt)
+        // Link this row to the chain head so any later mutation/deletion is evident.
+        let prev = (try latestAuditHash()) ?? AuditChain.genesis
+        let canonical = AuditChain.canonicalForm(
+            createdAt: createdAt, actor: event.actor, action: event.action, detail: event.detail
+        )
+        let eventHash = AuditChain.hash(prev: prev, canonical: canonical)
+        let sql = "INSERT INTO audit_event (created_at, actor, action, detail, prev_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?);"
         try withStatement(sql) { statement in
-            bind(DateCodec.string(from: event.createdAt), at: 1, in: statement)
+            bind(createdAt, at: 1, in: statement)
             bind(event.actor, at: 2, in: statement)
             bind(event.action, at: 3, in: statement)
             bind(event.detail, at: 4, in: statement)
+            bind(prev, at: 5, in: statement)
+            bind(eventHash, at: 6, in: statement)
             try stepDone(statement)
         }
         return AuditEvent(
@@ -913,6 +922,53 @@ public actor CascadeStore {
             action: event.action,
             detail: event.detail
         )
+    }
+
+    /// The chain head: the most recent row's `event_hash`, or nil if no chained
+    /// rows exist yet (fresh DB, or a DB whose only rows predate chaining).
+    public func latestAuditHash() throws -> String? {
+        let sql = "SELECT event_hash FROM audit_event WHERE event_hash IS NOT NULL ORDER BY id DESC LIMIT 1;"
+        return try withStatement(sql) { statement in
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            return text(statement, 0)
+        }
+    }
+
+    /// Recompute the audit hash chain and report the first row that no longer
+    /// reconciles. Detects field mutation (recomputed hash differs) and
+    /// deletion/insertion (a neighbour's `prev_hash` link no longer matches).
+    /// Only the chained era (rows with `event_hash`) is verified; pre-chain
+    /// legacy rows are ignored.
+    public func verifyAuditChain() throws -> AuditChainStatus {
+        let sql = """
+        SELECT id, created_at, actor, action, detail, prev_hash, event_hash
+        FROM audit_event WHERE event_hash IS NOT NULL ORDER BY id ASC;
+        """
+        return try withStatement(sql) { statement in
+            var verified = 0
+            var expectedPrev: String?
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let id = sqlite3_column_int64(statement, 0)
+                let createdAt = text(statement, 1) ?? ""
+                let actor = text(statement, 2) ?? ""
+                let action = text(statement, 3) ?? ""
+                let detail = text(statement, 4) ?? ""
+                let prevHash = text(statement, 5) ?? AuditChain.genesis
+                let storedHash = text(statement, 6) ?? ""
+                if let expectedPrev, prevHash != expectedPrev {
+                    return .broken(atID: id)   // a row was inserted or deleted
+                }
+                let canonical = AuditChain.canonicalForm(
+                    createdAt: createdAt, actor: actor, action: action, detail: detail
+                )
+                if AuditChain.hash(prev: prevHash, canonical: canonical) != storedHash {
+                    return .broken(atID: id)    // this row's content was mutated
+                }
+                expectedPrev = storedHash
+                verified += 1
+            }
+            return verified == 0 ? .empty : .intact(verified: verified)
+        }
     }
 
     public func recentAudit(limit: Int = 80) throws -> [AuditEvent] {
@@ -960,7 +1016,9 @@ public actor CascadeStore {
             created_at TEXT NOT NULL,
             actor TEXT NOT NULL,
             action TEXT NOT NULL,
-            detail TEXT NOT NULL
+            detail TEXT NOT NULL,
+            prev_hash TEXT,
+            event_hash TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_audit_event_created_at
             ON audit_event(created_at DESC);
@@ -974,6 +1032,9 @@ public actor CascadeStore {
         try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN goal TEXT;", db: db)
         try? execute("ALTER TABLE input_event ADD COLUMN target_descriptor TEXT;", db: db)
+        // Tamper-evident audit chain columns for databases created before they existed.
+        try? execute("ALTER TABLE audit_event ADD COLUMN prev_hash TEXT;", db: db)
+        try? execute("ALTER TABLE audit_event ADD COLUMN event_hash TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
