@@ -225,6 +225,15 @@ public enum AgentHarness {
         #"\bcsrutil\b"#,
         #">\s*/dev/(disk|rdisk)"#,
         #":\(\)\s*\{"#,                                     // fork bomb
+        // Network egress / remote transfer — an autonomous harness must not
+        // exfiltrate local data or pull remote payloads. On-screen `open_url`
+        // exists for legitimate fetches the user can watch.
+        #"\b(curl|wget)\b"#,
+        #"\b(scp|sftp|rsync|ssh|telnet)\b"#,
+        #"\b(nc|ncat|netcat)\b"#,
+        // Persistence / privilege & automation escalation.
+        #"\blaunchctl\b"#,
+        #"\bosascript\b"#,                                  // TCC/automation escalation via shell
     ]
 
     /// Why a command is refused, or nil when it may run.
@@ -272,22 +281,29 @@ public enum AgentHarness {
         return text.isEmpty ? "(script ran — no return value)" : text
     }
 
+    /// Roots the power tier may write into. Containment is checked against the
+    /// *canonical* (symlink-resolved) destination, so a symlinked parent can't
+    /// redirect a write outside these roots (CWE-61).
+    private static let writeRoots = [NSHomeDirectory(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"]
+
     /// Writes only where the user's own files live — home, temp dirs — never
-    /// into system paths.
+    /// into system paths or through a symlink that escapes them.
     private static func writeFile(path: String, content: String) -> String {
-        let expanded = expand(path)
-        if let reason = sensitivePathReason(expanded) { return reason }
-        let allowedRoots = [NSHomeDirectory(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"]
-        guard allowedRoots.contains(where: { expanded.hasPrefix($0 + "/") }) else {
-            return "write_file only writes inside the user's home folder or temp dirs — not \(expanded)."
+        let canonical = canonicalize(path)
+        // Resolve symlinks BEFORE the protected-path and containment checks: a
+        // symlinked parent must not disguise the real destination (e.g.
+        // `~/work/link -> ~/.ssh`, then `write ~/work/link/config`).
+        if let reason = sensitivePathReason(canonical) { return reason }
+        guard isInsideAllowedRoot(canonical, writeRoots) else {
+            return "write_file only writes inside the user's home folder or temp dirs — not \(canonical)."
         }
-        let url = URL(fileURLWithPath: expanded)
+        let url = URL(fileURLWithPath: canonical)
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try content.write(to: url, atomically: true, encoding: .utf8)
-            return "Wrote \(content.utf8.count) bytes to \(expanded)."
+            return "Wrote \(content.utf8.count) bytes to \(canonical)."
         } catch {
-            return "Couldn't write \(expanded): \(error.localizedDescription)"
+            return "Couldn't write \(canonical): \(error.localizedDescription)"
         }
     }
 
@@ -295,6 +311,43 @@ public enum AgentHarness {
 
     private static func expand(_ path: String) -> String {
         URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+    }
+
+    /// Best-effort real on-disk path. Resolves symlinks on the nearest existing
+    /// ancestor via POSIX `realpath` and re-appends the not-yet-created tail, so
+    /// a symlinked parent can't disguise the true destination of a read or write.
+    /// Lexical `..`/`~` are already collapsed by `expand`. Falls back to the
+    /// expanded path if `realpath` is unavailable.
+    static func canonicalize(_ path: String) -> String {
+        let expanded = expand(path)
+        let fm = FileManager.default
+        var existing = expanded
+        var tail: [String] = []
+        while existing != "/", !existing.isEmpty, !fm.fileExists(atPath: existing) {
+            let url = URL(fileURLWithPath: existing)
+            tail.insert(url.lastPathComponent, at: 0)
+            let parent = url.deletingLastPathComponent().path
+            if parent == existing { break }
+            existing = parent
+        }
+        guard let resolved = existing.withCString({ ptr -> String? in
+            guard let r = realpath(ptr, nil) else { return nil }
+            defer { free(r) }
+            return String(cString: r)
+        }) else { return expanded }
+        var result = resolved
+        for component in tail { result = (result as NSString).appendingPathComponent(component) }
+        return result
+    }
+
+    /// True when `canonical` is genuinely inside one of `roots` (compared on
+    /// canonical paths, with a trailing slash so `/home-evil` can't match `/home`).
+    private static func isInsideAllowedRoot(_ canonical: String, _ roots: [String]) -> Bool {
+        let withSlash = canonical.hasSuffix("/") ? canonical : canonical + "/"
+        return roots.map(canonicalize).contains { root in
+            let rootSlash = root.hasSuffix("/") ? root : root + "/"
+            return canonical == root || withSlash.hasPrefix(rootSlash)
+        }
     }
 
     private static let protectedPathComponents: Set<String> = [
@@ -321,7 +374,9 @@ public enum AgentHarness {
     ]
 
     private static func sensitivePathReason(_ path: String) -> String? {
-        let expanded = expand(path)
+        // Canonicalize first: a symlink must not hide a protected component
+        // (e.g. `~/work/k -> ~/.ssh` would otherwise read as `…/k`, not `.ssh`).
+        let expanded = canonicalize(path)
         if PrivacyRules.isSensitiveText(expanded) {
             return privacyRefusal("path")
         }
