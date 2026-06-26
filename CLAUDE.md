@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): SEQ-25 added `GroundingVerifier`, a pure ProviderKit scorer that ranks grounding candidates by role, bounds, label/OCR evidence, source agreement, and canvas-skip rules, returning accept/reject/abstain with stable candidate IDs.
 - NEW (2026-06-26): SEQ-23 added `LocalVoiceActivityGate`, a pure Swift fixed-frame PCM16 turn gate with prefix padding, min-speech confirmation, hangover/tail-wait release decisions, and uploaded-speech accounting; integration into `RealtimeVoice` remains a later step.
 - NEW (2026-06-26): SEQ-22 added `GroundingCache`, an actor-backed exact grounding cache keyed by normalized target, app/window identity, display size, screen hash/grid hashes, and grounding mode; it caches positive `GroundingResult`s plus short-TTL negative misses and skips empty/privacy-sensitive targets.
 - NEW (2026-06-26): Research Sequence 30 LLM-call determinism/caching report lives at `docs/research/SEQ-30-llm-call-determinism-caching.md`; recommends local exact `ModelCallCache`, canonical request hashes as client-side idempotency keys, deterministic pure-call decoding, centralized Anthropic retry/request-id capture, validated DTO caching, and screenshot-hash grounding memoization.
