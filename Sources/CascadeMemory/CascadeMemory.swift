@@ -601,13 +601,13 @@ public actor CascadeStore {
         batchBindFailureInjector = injector
     }
 
-    public func insert(_ context: RecordedContext) throws -> RecordedContext {
-        try insertContexts([context])[0]
+    public func insert(_ context: RecordedContext, indexWorkGraph: Bool = false) throws -> RecordedContext {
+        try insertContexts([context], indexWorkGraph: indexWorkGraph)[0]
     }
 
     /// Batch-inserts recorded moments in one transaction, reusing the prepared INSERT
     /// statement across rows so recorder flushes don't pay prepare/finalize per frame.
-    public func insertContexts(_ contexts: [RecordedContext]) throws -> [RecordedContext] {
+    public func insertContexts(_ contexts: [RecordedContext], indexWorkGraph: Bool = false) throws -> [RecordedContext] {
         guard !contexts.isEmpty else { return [] }
         let sql = """
         INSERT INTO recorded_context
@@ -633,6 +633,9 @@ public actor CascadeStore {
                         metadataJSON: context.metadataJSON,
                         frameHash: context.frameHash
                     ))
+                    if indexWorkGraph, let row = rows.last {
+                        try linkWorkGraphEntities(for: row)
+                    }
                     try resetStatement(statement)
                     try clearBindings(statement)
                 }

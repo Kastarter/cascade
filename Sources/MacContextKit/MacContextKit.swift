@@ -180,19 +180,29 @@ public struct ContextRecorderStatus: Equatable, Sendable {
 
 @MainActor
 public final class ContextRecorder: ObservableObject {
+    public struct Options: Equatable, Sendable {
+        public var indexWorkGraph: Bool
+
+        public init(indexWorkGraph: Bool = false) {
+            self.indexWorkGraph = indexWorkGraph
+        }
+    }
+
     @Published public private(set) var status: ContextRecorderStatus
 
     private let store: CascadeStore
     private let observer: AppWindowObserver
+    private let options: Options
     private var rewind: RewindRecorder?
     private let input: InputRecorder
     private var retentionTask: Task<Void, Never>?
     private var activationObserver: NSObjectProtocol?
     private var lastActivationCaptureAt = Date.distantPast
 
-    public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver()) {
+    public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
         self.store = store
         self.observer = observer
+        self.options = options
         self.input = InputRecorder(store: store)
         let permissions = PermissionProbe.currentStatus()
         status = ContextRecorderStatus(
@@ -226,7 +236,7 @@ public final class ContextRecorder: ObservableObject {
         status.running = true
         status.message = "Recording local context."
 
-        let recorder = RewindRecorder(store: store) { [weak self] context in
+        let recorder = RewindRecorder(store: store, indexWorkGraph: options.indexWorkGraph) { [weak self] context in
             Task { @MainActor in
                 guard let self else { return }
                 self.status.latestContext = context
@@ -367,7 +377,7 @@ public final class ContextRecorder: ObservableObject {
             return nil
         }
         do {
-            let inserted = try await store.insert(context)
+            let inserted = try await store.insert(context, indexWorkGraph: options.indexWorkGraph)
             let detail = ocrText.map { "\(inserted.appName) · ocr \($0.count) chars" } ?? inserted.appName
             _ = try await store.appendAudit(AuditEvent(actor: "system", action: "context.capture", detail: detail))
             status.latestContext = inserted

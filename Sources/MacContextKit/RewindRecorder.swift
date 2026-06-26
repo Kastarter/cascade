@@ -141,6 +141,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
 /// frame so a slow OCR pass can't pile up a backlog.
 actor RewindEngine {
     private let store: CascadeStore
+    private let indexWorkGraph: Bool
     private let onMoment: @Sendable (RecordedContext) -> Void
     private var pending: ChangedFrame?
     private var processing = false
@@ -155,8 +156,9 @@ actor RewindEngine {
     /// it so a busy canvas app doesn't double the capture cost every second.
     static let nativeOCRInterval: TimeInterval = 3.0
 
-    init(store: CascadeStore, onMoment: @escaping @Sendable (RecordedContext) -> Void) {
+    init(store: CascadeStore, indexWorkGraph: Bool = false, onMoment: @escaping @Sendable (RecordedContext) -> Void) {
         self.store = store
+        self.indexWorkGraph = indexWorkGraph
         self.onMoment = onMoment
     }
 
@@ -252,7 +254,7 @@ actor RewindEngine {
         }
 
         do {
-            let inserted = try await store.insert(context)
+            let inserted = try await store.insert(context, indexWorkGraph: indexWorkGraph)
             // Semantic recall: index the moment's text locally (best-effort).
             if !mergedText.isEmpty {
                 try? await store.indexEmbedding(contextID: inserted.id, text: mergedText)
@@ -293,9 +295,10 @@ final class RewindRecorder {
         store: CascadeStore,
         threshold: Int = PerceptualHash.defaultSkipThreshold,
         fps: Int32 = 1,
+        indexWorkGraph: Bool = false,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
     ) {
-        self.engine = RewindEngine(store: store, onMoment: onMoment)
+        self.engine = RewindEngine(store: store, indexWorkGraph: indexWorkGraph, onMoment: onMoment)
         self.threshold = threshold
         self.fps = fps
     }

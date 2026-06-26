@@ -249,11 +249,12 @@ public enum WorkGraphExtractor {
             }
             guard let canonical = WorkGraphNormalizer.canonicalURL(url) else { return }
             let evidence = nsText.substring(with: match.range)
+            let display = WorkGraphNormalizer.displayURL(url)
             mentions.append(WorkGraphMention(
                 kind: .url,
                 canonicalValue: canonical,
-                displayName: WorkGraphNormalizer.displayURL(url),
-                aliases: [evidence],
+                displayName: display,
+                aliases: [canonical, display],
                 evidence: evidence,
                 source: "text"
             ))
