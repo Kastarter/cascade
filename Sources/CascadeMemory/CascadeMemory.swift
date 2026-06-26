@@ -379,10 +379,18 @@ public enum CascadeStoreError: Error, LocalizedError {
     }
 }
 
+internal enum CascadeBatchInsertTable: Sendable {
+    case recordedContext
+    case inputEvent
+}
+
+internal typealias CascadeBatchBindFailureInjector = @Sendable (CascadeBatchInsertTable, Int) throws -> Void
+
 public actor CascadeStore {
     private let connection: SQLiteConnection
     private let path: String
     private let auditAnchor: AuditAnchorStore
+    private var batchBindFailureInjector: CascadeBatchBindFailureInjector?
 
     public init(path: String? = nil, auditAnchor: AuditAnchorStore = NullAuditAnchor()) throws {
         self.path = path ?? Self.defaultDatabasePath()
@@ -411,36 +419,48 @@ public actor CascadeStore {
             .path
     }
 
+    internal func setBatchBindFailureInjector(_ injector: CascadeBatchBindFailureInjector?) {
+        batchBindFailureInjector = injector
+    }
+
     public func insert(_ context: RecordedContext) throws -> RecordedContext {
+        try insertContexts([context])[0]
+    }
+
+    /// Batch-inserts recorded moments in one transaction, reusing the prepared INSERT
+    /// statement across rows so recorder flushes don't pay prepare/finalize per frame.
+    public func insertContexts(_ contexts: [RecordedContext]) throws -> [RecordedContext] {
+        guard !contexts.isEmpty else { return [] }
         let sql = """
         INSERT INTO recorded_context
             (captured_at, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
-        try withStatement(sql) { statement in
-            bind(DateCodec.string(from: context.capturedAt), at: 1, in: statement)
-            bind(context.source.rawValue, at: 2, in: statement)
-            bind(context.appName, at: 3, in: statement)
-            bind(context.bundleIdentifier, at: 4, in: statement)
-            bind(context.windowTitle, at: 5, in: statement)
-            bind(context.ocrText, at: 6, in: statement)
-            bind(context.imagePath, at: 7, in: statement)
-            bind(context.metadataJSON, at: 8, in: statement)
-            bind(context.frameHash, at: 9, in: statement)
-            try stepDone(statement)
+        return try withTransaction {
+            try withStatement(sql) { statement in
+                var rows: [RecordedContext] = []
+                rows.reserveCapacity(contexts.count)
+                for (index, context) in contexts.enumerated() {
+                    try bindContext(context, at: index, in: statement)
+                    try stepDone(statement)
+                    rows.append(RecordedContext(
+                        id: sqlite3_last_insert_rowid(connection.db),
+                        capturedAt: context.capturedAt,
+                        source: context.source,
+                        appName: context.appName,
+                        bundleIdentifier: context.bundleIdentifier,
+                        windowTitle: context.windowTitle,
+                        ocrText: context.ocrText,
+                        imagePath: context.imagePath,
+                        metadataJSON: context.metadataJSON,
+                        frameHash: context.frameHash
+                    ))
+                    try resetStatement(statement)
+                    try clearBindings(statement)
+                }
+                return rows
+            }
         }
-        return RecordedContext(
-            id: sqlite3_last_insert_rowid(connection.db),
-            capturedAt: context.capturedAt,
-            source: context.source,
-            appName: context.appName,
-            bundleIdentifier: context.bundleIdentifier,
-            windowTitle: context.windowTitle,
-            ocrText: context.ocrText,
-            imagePath: context.imagePath,
-            metadataJSON: context.metadataJSON,
-            frameHash: context.frameHash
-        )
     }
 
     /// Column list shared by `recentContexts` / `searchContexts`, in the order
@@ -715,34 +735,25 @@ public actor CascadeStore {
     /// Batch-inserts recorded input events in one transaction.
     public func insertInputEvents(_ events: [InputEvent]) throws {
         guard !events.isEmpty else { return }
-        try execute("BEGIN TRANSACTION;")
-        do {
-            let sql = """
-            INSERT INTO input_event
-                (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """
-            for event in events {
-                try withStatement(sql) { statement in
-                    bind(DateCodec.string(from: event.capturedAt), at: 1, in: statement)
-                    bind(event.kind.rawValue, at: 2, in: statement)
-                    bind(event.x, at: 3, in: statement)
-                    bind(event.y, at: 4, in: statement)
-                    bind(event.text, at: 5, in: statement)
-                    bind(event.key, at: 6, in: statement)
-                    bind(event.modifiers.isEmpty ? nil : event.modifiers.joined(separator: ","), at: 7, in: statement)
-                    bind(event.appName, at: 8, in: statement)
-                    bind(event.bundleIdentifier, at: 9, in: statement)
-                    bind(event.windowTitle, at: 10, in: statement)
-                    bind(event.targetDescriptor, at: 11, in: statement)
+        let sql = """
+        INSERT INTO input_event
+            (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        try withTransaction {
+            try withStatement(sql) { statement in
+                for (index, event) in events.enumerated() {
+                    try bindInputEvent(event, at: index, in: statement)
                     try stepDone(statement)
+                    try resetStatement(statement)
+                    try clearBindings(statement)
                 }
             }
-            try execute("COMMIT;")
-        } catch {
-            try? execute("ROLLBACK;")
-            throw error
         }
+    }
+
+    public func insertInputEvent(_ event: InputEvent) throws {
+        try insertInputEvents([event])
     }
 
     /// Most recent input events (newest first).
@@ -1162,6 +1173,18 @@ public actor CascadeStore {
         try Self.execute(sql, db: connection.db)
     }
 
+    private func withTransaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN TRANSACTION;")
+        do {
+            let value = try body()
+            try execute("COMMIT;")
+            return value
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     private static func execute(_ sql: String, db: OpaquePointer?) throws {
         var error: UnsafeMutablePointer<CChar>?
         if sqlite3_exec(db, sql, nil, nil, &error) != SQLITE_OK {
@@ -1188,6 +1211,46 @@ public actor CascadeStore {
         }
     }
 
+    private func resetStatement(_ statement: OpaquePointer) throws {
+        guard sqlite3_reset(statement) == SQLITE_OK else {
+            throw CascadeStoreError.sqlite(lastError())
+        }
+    }
+
+    private func clearBindings(_ statement: OpaquePointer) throws {
+        guard sqlite3_clear_bindings(statement) == SQLITE_OK else {
+            throw CascadeStoreError.sqlite(lastError())
+        }
+    }
+
+    private func bindContext(_ context: RecordedContext, at rowIndex: Int, in statement: OpaquePointer) throws {
+        try batchBindFailureInjector?(.recordedContext, rowIndex)
+        try bindChecked(DateCodec.string(from: context.capturedAt), at: 1, in: statement)
+        try bindChecked(context.source.rawValue, at: 2, in: statement)
+        try bindChecked(context.appName, at: 3, in: statement)
+        try bindChecked(context.bundleIdentifier, at: 4, in: statement)
+        try bindChecked(context.windowTitle, at: 5, in: statement)
+        try bindChecked(context.ocrText, at: 6, in: statement)
+        try bindChecked(context.imagePath, at: 7, in: statement)
+        try bindChecked(context.metadataJSON, at: 8, in: statement)
+        try bindChecked(context.frameHash, at: 9, in: statement)
+    }
+
+    private func bindInputEvent(_ event: InputEvent, at rowIndex: Int, in statement: OpaquePointer) throws {
+        try batchBindFailureInjector?(.inputEvent, rowIndex)
+        try bindChecked(DateCodec.string(from: event.capturedAt), at: 1, in: statement)
+        try bindChecked(event.kind.rawValue, at: 2, in: statement)
+        try bindChecked(event.x, at: 3, in: statement)
+        try bindChecked(event.y, at: 4, in: statement)
+        try bindChecked(event.text, at: 5, in: statement)
+        try bindChecked(event.key, at: 6, in: statement)
+        try bindChecked(event.modifiers.isEmpty ? nil : event.modifiers.joined(separator: ","), at: 7, in: statement)
+        try bindChecked(event.appName, at: 8, in: statement)
+        try bindChecked(event.bundleIdentifier, at: 9, in: statement)
+        try bindChecked(event.windowTitle, at: 10, in: statement)
+        try bindChecked(event.targetDescriptor, at: 11, in: statement)
+    }
+
     private func lastError() -> String {
         connection.db.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "unknown"
     }
@@ -1200,12 +1263,36 @@ public actor CascadeStore {
         sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
     }
 
+    private func bindChecked(_ value: String?, at index: Int32, in statement: OpaquePointer) throws {
+        let result: Int32
+        if let value {
+            result = sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        } else {
+            result = sqlite3_bind_null(statement, index)
+        }
+        guard result == SQLITE_OK else {
+            throw CascadeStoreError.sqlite(lastError())
+        }
+    }
+
     private func bind(_ value: Int64?, at index: Int32, in statement: OpaquePointer) {
         guard let value else {
             sqlite3_bind_null(statement, index)
             return
         }
         sqlite3_bind_int64(statement, index, value)
+    }
+
+    private func bindChecked(_ value: Int64?, at index: Int32, in statement: OpaquePointer) throws {
+        let result: Int32
+        if let value {
+            result = sqlite3_bind_int64(statement, index, value)
+        } else {
+            result = sqlite3_bind_null(statement, index)
+        }
+        guard result == SQLITE_OK else {
+            throw CascadeStoreError.sqlite(lastError())
+        }
     }
 
     private func text(_ statement: OpaquePointer, _ index: Int32) -> String? {
@@ -1224,6 +1311,18 @@ public actor CascadeStore {
             return
         }
         sqlite3_bind_double(statement, index, value)
+    }
+
+    private func bindChecked(_ value: Double?, at index: Int32, in statement: OpaquePointer) throws {
+        let result: Int32
+        if let value {
+            result = sqlite3_bind_double(statement, index, value)
+        } else {
+            result = sqlite3_bind_null(statement, index)
+        }
+        guard result == SQLITE_OK else {
+            throw CascadeStoreError.sqlite(lastError())
+        }
     }
 
     private func double(_ statement: OpaquePointer, _ index: Int32) -> Double? {
