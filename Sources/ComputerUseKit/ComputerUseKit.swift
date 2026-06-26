@@ -412,6 +412,9 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     }
 
     private func pressKey(_ key: String, modifiers: [String], pid: pid_t?) throws {
+        if let reason = SecureInputGuard.refusalReason(secureInputActive: SecureInputGuard.isActive()) {
+            throw ComputerUseError.unsupported(reason)
+        }
         guard let code = KeyCodes.code(for: key) else {
             throw ComputerUseError.unsupported("Unknown key: \(key)")
         }
@@ -430,11 +433,13 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     /// zero delay get DROPPED by Catalyst/Electron apps (WhatsApp, Slack…) — the
     /// keys "press" but nothing lands in the field.
     private func typeText(_ text: String, pid: pid_t?) async throws {
-        let units = Array(text.utf16)
-        var index = 0
-        while index < units.count {
+        if let reason = SecureInputGuard.refusalReason(secureInputActive: SecureInputGuard.isActive()) {
+            throw ComputerUseError.unsupported(reason)
+        }
+        // Grapheme-safe chunks: a raw UTF-16 window can cut a surrogate pair (emoji)
+        // in half and inject a broken glyph.
+        for chunk in TextChunker.graphemeSafeChunks(text, maxUTF16: 16) {
             if runState?.isStopRequested == true { throw ComputerUseError.stopped }
-            let chunk = Array(units[index..<min(index + 16, units.count)])
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
                 throw ComputerUseError.unsupported("Could not create text event.")
@@ -446,7 +451,6 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
             post(down, pid: pid)
             post(up, pid: pid)
             try? await Task.sleep(for: .milliseconds(12))
-            index += 16
         }
     }
 
