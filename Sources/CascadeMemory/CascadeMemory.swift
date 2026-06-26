@@ -1264,6 +1264,41 @@ public actor CascadeStore {
         }
     }
 
+    /// Opt-in chronological audit window for trace assembly. Kept separate from
+    /// `recentAudit` so the UI's latest-first activity feed remains byte-for-byte
+    /// unchanged unless callers explicitly enable trace assembly.
+    public func auditWindowForTraceAssembly(
+        from start: Date,
+        to end: Date,
+        limit: Int = 500,
+        enableTraceAssembly: Bool = false
+    ) throws -> [AuditEvent] {
+        guard enableTraceAssembly, limit > 0 else { return [] }
+        let sql = """
+        SELECT id, created_at, actor, action, detail
+        FROM audit_event
+        WHERE created_at >= ? AND created_at <= ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(DateCodec.string(from: start), at: 1, in: statement)
+            bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [AuditEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(AuditEvent(
+                    id: sqlite3_column_int64(statement, 0),
+                    createdAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
+                    actor: text(statement, 2) ?? "system",
+                    action: text(statement, 3) ?? "unknown",
+                    detail: text(statement, 4) ?? ""
+                ))
+            }
+            return rows
+        }
+    }
+
     private static func migrate(_ db: OpaquePointer?) throws {
         try execute("""
         PRAGMA journal_mode=WAL;

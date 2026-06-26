@@ -66,7 +66,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ReliabilityEvalTests",
-            dependencies: ["AgentOrchestrator"]
+            dependencies: ["AgentOrchestrator", "CascadeMemory"]
         )
     ]
 )

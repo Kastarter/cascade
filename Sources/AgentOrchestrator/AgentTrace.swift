@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 
 /// Token usage for one model call.
@@ -192,4 +193,267 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         return string
     }
 
+}
+
+/// Builds local agent traces from the tamper-evident audit log. This is pure and
+/// intentionally conservative: only known audit action families become spans, and
+/// span attributes keep audit references/metrics instead of raw `detail` text.
+public enum AgentTraceBuilder {
+    public static func fromAuditEvents(_ events: [AuditEvent], surface: String = "assist") -> [AgentTrace] {
+        let ordered = events.enumerated().sorted { left, right in
+            if left.element.createdAt != right.element.createdAt {
+                return left.element.createdAt < right.element.createdAt
+            }
+            if left.element.id != right.element.id {
+                return left.element.id < right.element.id
+            }
+            return left.offset < right.offset
+        }
+
+        var runs: [RunDraft] = []
+        var current: RunDraft?
+        var pendingEvents: [SpanEvent] = []
+
+        func finishCurrent() {
+            guard let run = current else { return }
+            runs.append(run)
+            current = nil
+        }
+
+        for item in ordered {
+            let event = item.element
+            if event.action == "assist.task" {
+                finishCurrent()
+                if pendingEvents.isEmpty {
+                    current = RunDraft(index: runs.count, taskEvent: event, eventOrder: item.offset)
+                } else {
+                    var run = RunDraft(index: runs.count, taskEvent: event, eventOrder: item.offset)
+                    run.events = pendingEvents
+                    run.completedEvent = pendingEvents.last { $0.event.action == "agent.run.completed" }?.event
+                    runs.append(run)
+                    pendingEvents.removeAll()
+                }
+                continue
+            }
+
+            if let spanEvent = SpanEvent(event: event, eventOrder: item.offset) {
+                guard var run = current else {
+                    pendingEvents.append(spanEvent)
+                    continue
+                }
+                run.events.append(spanEvent)
+                if event.action == "agent.run.completed" {
+                    run.completedEvent = event
+                    current = run
+                    finishCurrent()
+                } else {
+                    current = run
+                }
+            }
+        }
+        finishCurrent()
+
+        return runs.map { $0.trace(surface: surface) }
+    }
+
+    private struct RunDraft {
+        var index: Int
+        var taskEvent: AuditEvent
+        var eventOrder: Int
+        var events: [SpanEvent] = []
+        var completedEvent: AuditEvent?
+
+        func trace(surface: String) -> AgentTrace {
+            let runID = spanID(prefix: "run", event: taskEvent, order: eventOrder)
+            let start = runStart
+            let status = runStatus
+            let timing = events.first { $0.event.action == "assist.timing" }?.timing
+            let runDuration = timing?.totalMs ?? measuredRunDuration(from: start)
+            var spans = [
+                TraceSpan(
+                    id: runID,
+                    parentID: nil,
+                    kind: .run,
+                    name: "assist.task",
+                    startMs: 0,
+                    durationMs: runDuration,
+                    status: status.status,
+                    failureKind: status.failureKind,
+                    attributes: safeAttributes(for: taskEvent, order: eventOrder)
+                )
+            ]
+
+            for spanEvent in events {
+                spans.append(spanEvent.span(runID: runID, runStart: start))
+            }
+
+            spans.sort { left, right in
+                if left.startMs != right.startMs { return left.startMs < right.startMs }
+                return left.id < right.id
+            }
+
+            return AgentTrace(
+                traceID: "audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
+                goal: String(taskEvent.detail.prefix(160)),
+                surface: surface,
+                spans: spans
+            )
+        }
+
+        private var runStatus: (status: TraceSpan.Status, failureKind: AgentFailureKind?) {
+            if completedEvent != nil { return (.ok, nil) }
+            if hasFinishedTiming { return (.ok, nil) }
+            let failure = events.compactMap { $0.failureKind }.last
+            guard let failure else { return (.error, .timeout) }
+            return (failure.isDesirableTerminal ? .refused : .error, failure)
+        }
+
+        private var runStart: Date {
+            ([taskEvent.createdAt] + events.map { $0.event.createdAt }).min() ?? taskEvent.createdAt
+        }
+
+        private var hasFinishedTiming: Bool {
+            events.contains { event in
+                guard event.event.action == "assist.timing" else { return false }
+                return event.event.detail
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .hasPrefix("finished")
+            }
+        }
+
+        private func measuredRunDuration(from start: Date) -> Int {
+            var dates = [taskEvent.createdAt] + events.map { $0.event.createdAt }
+            if let completedEvent { dates.append(completedEvent.createdAt) }
+            let end = dates.max() ?? start
+            return max(1, Self.milliseconds(between: start, and: end))
+        }
+
+        private static func milliseconds(between start: Date, and end: Date) -> Int {
+            Int((end.timeIntervalSince(start) * 1000.0).rounded())
+        }
+    }
+
+    private struct SpanEvent {
+        var event: AuditEvent
+        var eventOrder: Int
+        var kind: TraceSpan.Kind
+        var name: String
+        var failureKind: AgentFailureKind?
+        var timing: TimingMetrics?
+
+        init?(event: AuditEvent, eventOrder: Int) {
+            if event.action.hasPrefix("harness.") {
+                self.kind = .tool
+                self.name = String(event.action.dropFirst("harness.".count))
+            } else if event.action == "agent.recall" {
+                self.kind = .retrieval
+                self.name = "agent.recall"
+            } else if event.action == "agent.ground" {
+                self.kind = .retrieval
+                self.name = "agent.ground"
+            } else if event.action == "assist.timing" {
+                self.kind = .model
+                self.name = "assist.timing"
+            } else if event.action == "agent.run.completed" {
+                self.kind = .eval
+                self.name = "agent.run.completed"
+            } else if let failure = AgentFailureKind(auditAction: event.action, detail: event.detail) {
+                self.kind = .eval
+                self.name = event.action
+                self.failureKind = failure
+                self.event = event
+                self.eventOrder = eventOrder
+                self.timing = nil
+                return
+            } else {
+                return nil
+            }
+
+            self.event = event
+            self.eventOrder = eventOrder
+            self.failureKind = AgentFailureKind(auditAction: event.action, detail: event.detail)
+            self.timing = event.action == "assist.timing" ? TimingMetrics(detail: event.detail) : nil
+        }
+
+        func span(runID: String, runStart: Date) -> TraceSpan {
+            let failure = failureKind
+            let status: TraceSpan.Status
+            if let failure, failure.isDesirableTerminal {
+                status = .refused
+            } else if failure != nil {
+                status = .error
+            } else {
+                status = .ok
+            }
+            var attributes = safeAttributes(for: event, order: eventOrder)
+            if let timing {
+                attributes.merge(timing.attributes) { current, _ in current }
+            }
+            return TraceSpan(
+                id: spanID(prefix: kind.rawValue, event: event, order: eventOrder),
+                parentID: runID,
+                kind: kind,
+                name: name,
+                startMs: max(0, Self.milliseconds(between: runStart, and: event.createdAt)),
+                durationMs: timing?.modelMs ?? timing?.totalMs ?? 1,
+                status: status,
+                failureKind: failure,
+                attributes: attributes
+            )
+        }
+
+        private static func milliseconds(between start: Date, and end: Date) -> Int {
+            Int((end.timeIntervalSince(start) * 1000.0).rounded())
+        }
+    }
+
+    private struct TimingMetrics {
+        var totalMs: Int?
+        var modelMs: Int?
+        var actionsMs: Int?
+        var turns: Int?
+
+        init(detail: String) {
+            self.totalMs = Self.firstInt(in: detail, pattern: #"total\s+(\d+)ms"#)
+            self.modelMs = Self.firstInt(in: detail, pattern: #"model\s+(\d+)ms"#)
+            self.actionsMs = Self.firstInt(in: detail, pattern: #"actions\s+(\d+)ms"#)
+            self.turns = Self.firstInt(in: detail, pattern: #"(\d+)\s+turns"#)
+        }
+
+        var attributes: [String: String] {
+            var values: [String: String] = [:]
+            if let totalMs { values["duration.total_ms"] = String(totalMs) }
+            if let modelMs { values["duration.model_ms"] = String(modelMs) }
+            if let actionsMs { values["duration.actions_ms"] = String(actionsMs) }
+            if let turns { values["agent.turns"] = String(turns) }
+            return values
+        }
+
+        private static func firstInt(in text: String, pattern: String) -> Int? {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: text) else { return nil }
+            return Int(text[range])
+        }
+    }
+
+    private static func safeAttributes(for event: AuditEvent, order: Int) -> [String: String] {
+        [
+            "audit.id": event.id > 0 ? String(event.id) : String(order),
+            "audit.actor": safeToken(event.actor),
+            "audit.action": safeToken(event.action)
+        ]
+    }
+
+    private static func safeToken(_ value: String) -> String {
+        value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+        }
+    }
+
+    private static func spanID(prefix: String, event: AuditEvent, order: Int) -> String {
+        "\(prefix)-\(event.id > 0 ? String(event.id) : String(order))"
+    }
 }
