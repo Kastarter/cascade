@@ -611,8 +611,8 @@ public actor CascadeStore {
         guard !contexts.isEmpty else { return [] }
         let sql = """
         INSERT INTO recorded_context
-            (captured_at, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (captured_at, captured_ms, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         return try withTransaction {
             try withStatement(sql) { statement in
@@ -739,6 +739,27 @@ public actor CascadeStore {
         return try withStatement(sql) { statement in
             bind(DateCodec.string(from: start), at: 1, in: statement)
             bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
+    /// Opt-in integer time-key mirror of `contexts(between:and:limit:)`.
+    public func contexts(capturedMilliseconds range: ClosedRange<Int64>, limit: Int = 60) throws -> [RecordedContext] {
+        let sql = """
+        SELECT \(Self.contextColumns())
+        FROM recorded_context
+        WHERE captured_ms >= ? AND captured_ms <= ?
+        ORDER BY captured_ms ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(range.lowerBound, at: 1, in: statement)
+            bind(range.upperBound, at: 2, in: statement)
             sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [RecordedContext] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -916,8 +937,8 @@ public actor CascadeStore {
         guard !events.isEmpty else { return }
         let sql = """
         INSERT INTO input_event
-            (captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (captured_at, captured_ms, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         try withTransaction {
             try withStatement(sql) { statement in
@@ -968,6 +989,27 @@ public actor CascadeStore {
         return try withStatement(sql) { statement in
             bind(DateCodec.string(from: start), at: 1, in: statement)
             bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [InputEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeInputEvent(statement))
+            }
+            return rows
+        }
+    }
+
+    /// Opt-in integer time-key mirror of `inputEvents(between:and:limit:)`.
+    public func inputEvents(capturedMilliseconds range: ClosedRange<Int64>, limit: Int = 2000) throws -> [InputEvent] {
+        let sql = """
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
+        FROM input_event
+        WHERE captured_ms >= ? AND captured_ms <= ?
+        ORDER BY captured_ms ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(range.lowerBound, at: 1, in: statement)
+            bind(range.upperBound, at: 2, in: statement)
             sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [InputEvent] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -1226,6 +1268,7 @@ public actor CascadeStore {
         CREATE TABLE IF NOT EXISTS recorded_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             captured_at TEXT NOT NULL,
+            captured_ms INTEGER,
             source TEXT NOT NULL,
             app_name TEXT NOT NULL,
             bundle_identifier TEXT,
@@ -1253,11 +1296,17 @@ public actor CascadeStore {
         // Best-effort migrations for databases created before these columns existed.
         try? execute("ALTER TABLE recorded_context ADD COLUMN image_path TEXT;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN frame_hash INTEGER;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN captured_ms INTEGER;", db: db)
+        try execute("""
+        CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_ms
+            ON recorded_context(captured_ms ASC, id ASC);
+        """, db: db)
         try? execute("ALTER TABLE agents ADD COLUMN seconds_per_run INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN goal TEXT;", db: db)
         try? execute("ALTER TABLE input_event ADD COLUMN target_descriptor TEXT;", db: db)
+        try? execute("ALTER TABLE input_event ADD COLUMN captured_ms INTEGER;", db: db)
         // Tamper-evident audit chain columns for databases created before they existed.
         try? execute("ALTER TABLE audit_event ADD COLUMN prev_hash TEXT;", db: db)
         try? execute("ALTER TABLE audit_event ADD COLUMN event_hash TEXT;", db: db)
@@ -1294,6 +1343,7 @@ public actor CascadeStore {
         CREATE TABLE IF NOT EXISTS input_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             captured_at TEXT NOT NULL,
+            captured_ms INTEGER,
             kind TEXT NOT NULL,
             x REAL,
             y REAL,
@@ -1307,6 +1357,8 @@ public actor CascadeStore {
         );
         CREATE INDEX IF NOT EXISTS idx_input_event_captured_at
             ON input_event(captured_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_input_event_captured_ms
+            ON input_event(captured_ms ASC, id ASC);
 
         CREATE TABLE IF NOT EXISTS agents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1543,29 +1595,31 @@ public actor CascadeStore {
     private func bindContext(_ context: RecordedContext, at rowIndex: Int, in statement: OpaquePointer) throws {
         try batchBindFailureInjector?(.recordedContext, rowIndex)
         try bindChecked(DateCodec.string(from: context.capturedAt), at: 1, in: statement)
-        try bindChecked(context.source.rawValue, at: 2, in: statement)
-        try bindChecked(context.appName, at: 3, in: statement)
-        try bindChecked(context.bundleIdentifier, at: 4, in: statement)
-        try bindChecked(context.windowTitle, at: 5, in: statement)
-        try bindChecked(context.ocrText, at: 6, in: statement)
-        try bindChecked(context.imagePath, at: 7, in: statement)
-        try bindChecked(context.metadataJSON, at: 8, in: statement)
-        try bindChecked(context.frameHash, at: 9, in: statement)
+        try bindChecked(EventStoreLayout.capturedMilliseconds(for: context.capturedAt), at: 2, in: statement)
+        try bindChecked(context.source.rawValue, at: 3, in: statement)
+        try bindChecked(context.appName, at: 4, in: statement)
+        try bindChecked(context.bundleIdentifier, at: 5, in: statement)
+        try bindChecked(context.windowTitle, at: 6, in: statement)
+        try bindChecked(context.ocrText, at: 7, in: statement)
+        try bindChecked(context.imagePath, at: 8, in: statement)
+        try bindChecked(context.metadataJSON, at: 9, in: statement)
+        try bindChecked(context.frameHash, at: 10, in: statement)
     }
 
     private func bindInputEvent(_ event: InputEvent, at rowIndex: Int, in statement: OpaquePointer) throws {
         try batchBindFailureInjector?(.inputEvent, rowIndex)
         try bindChecked(DateCodec.string(from: event.capturedAt), at: 1, in: statement)
-        try bindChecked(event.kind.rawValue, at: 2, in: statement)
-        try bindChecked(event.x, at: 3, in: statement)
-        try bindChecked(event.y, at: 4, in: statement)
-        try bindChecked(event.text, at: 5, in: statement)
-        try bindChecked(event.key, at: 6, in: statement)
-        try bindChecked(event.modifiers.isEmpty ? nil : event.modifiers.joined(separator: ","), at: 7, in: statement)
-        try bindChecked(event.appName, at: 8, in: statement)
-        try bindChecked(event.bundleIdentifier, at: 9, in: statement)
-        try bindChecked(event.windowTitle, at: 10, in: statement)
-        try bindChecked(event.targetDescriptor, at: 11, in: statement)
+        try bindChecked(EventStoreLayout.capturedMilliseconds(for: event.capturedAt), at: 2, in: statement)
+        try bindChecked(event.kind.rawValue, at: 3, in: statement)
+        try bindChecked(event.x, at: 4, in: statement)
+        try bindChecked(event.y, at: 5, in: statement)
+        try bindChecked(event.text, at: 6, in: statement)
+        try bindChecked(event.key, at: 7, in: statement)
+        try bindChecked(event.modifiers.isEmpty ? nil : event.modifiers.joined(separator: ","), at: 8, in: statement)
+        try bindChecked(event.appName, at: 9, in: statement)
+        try bindChecked(event.bundleIdentifier, at: 10, in: statement)
+        try bindChecked(event.windowTitle, at: 11, in: statement)
+        try bindChecked(event.targetDescriptor, at: 12, in: statement)
     }
 
     private func lastError() -> String {
