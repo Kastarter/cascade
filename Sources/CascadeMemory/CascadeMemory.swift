@@ -1222,6 +1222,7 @@ public actor CascadeStore {
     private static func migrate(_ db: OpaquePointer?) throws {
         try execute("""
         PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS recorded_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             captured_at TEXT NOT NULL,
@@ -1345,6 +1346,102 @@ public actor CascadeStore {
         CREATE TRIGGER IF NOT EXISTS recorded_context_visual_embedding_ad
         AFTER DELETE ON recorded_context BEGIN
             DELETE FROM context_visual_embedding WHERE context_id = old.id;
+        END;
+        """, db: db)
+
+        // Native work graph storage. Entities and evidence links are separate so
+        // aliases can be merged without duplicating moment citations. The valid_*
+        // columns describe the world-time assertion; transaction_* describes when
+        // Cascade stored or retracted that assertion.
+        try execute("""
+        CREATE TABLE IF NOT EXISTS graph_entity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            canonical_value TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            transaction_from TEXT NOT NULL,
+            transaction_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(kind, canonical_value)
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_entity_kind_seen
+            ON graph_entity(kind, last_seen_at DESC);
+
+        CREATE TABLE IF NOT EXISTS graph_entity_alias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            alias TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            source TEXT NOT NULL,
+            mention_count INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            transaction_from TEXT NOT NULL,
+            transaction_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(entity_id, normalized_alias),
+            FOREIGN KEY(entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_entity_alias_lookup
+            ON graph_entity_alias(normalized_alias);
+
+        CREATE TABLE IF NOT EXISTS context_entity_link (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            context_id INTEGER NOT NULL,
+            entity_id INTEGER NOT NULL,
+            relation TEXT NOT NULL,
+            evidence_snippet TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            transaction_from TEXT NOT NULL,
+            transaction_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(context_id, entity_id, relation),
+            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE,
+            FOREIGN KEY(entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_entity_link_entity_time
+            ON context_entity_link(entity_id, observed_at ASC, context_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_context_entity_link_context
+            ON context_entity_link(context_id);
+
+        CREATE TABLE IF NOT EXISTS graph_edge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            relation TEXT NOT NULL,
+            evidence_snippet TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            transaction_from TEXT NOT NULL,
+            transaction_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source_entity_id, target_entity_id, relation),
+            FOREIGN KEY(source_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE,
+            FOREIGN KEY(target_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_edge_source
+            ON graph_edge(source_entity_id, relation);
+        CREATE INDEX IF NOT EXISTS idx_graph_edge_target
+            ON graph_edge(target_entity_id, relation);
+
+        CREATE TRIGGER IF NOT EXISTS recorded_context_entity_link_ad
+        AFTER DELETE ON recorded_context BEGIN
+            DELETE FROM context_entity_link WHERE context_id = old.id;
         END;
         """, db: db)
 
