@@ -14,14 +14,24 @@ public enum AgentExperienceVerificationSignal: String, Codable, Sendable {
 }
 
 public enum AgentFailureKind: String, Codable, Sendable {
+    case wrongStartState = "wrong_start_state"
     case verifierRejected = "verifier_rejected"
     case timeout
     case toolError = "tool_error"
     case targetNotFound = "target_not_found"
+    case groundingMiss = "grounding_miss"
     case permissionDenied = "permission_denied"
+    case secureInput = "secure_input"
     case loginRequired = "login_required"
     case modalBlocked = "modal_blocked"
+    case noEffect = "no_effect"
+    case staleFrameBatch = "stale_frame_batch"
+    case verificationUnavailable = "verification_unavailable"
     case unsafeAction = "unsafe_action"
+    case parameterNeedsLiveValue = "parameter_needs_live_value"
+    case stepLimit = "step_limit"
+    case userStop = "user_stop"
+    case artifactWrongLane = "artifact_wrong_lane"
     case unknown
 }
 
@@ -142,7 +152,7 @@ public struct AgentExperienceCase: Identifiable, Codable, Equatable, Sendable {
         case .failure:
             guard failureKind != nil else { throw AgentExperienceValidationError.missingFailureKind }
         case .refusal, .userStop:
-            guard failureKind == nil else { throw AgentExperienceValidationError.failureKindOnNonFailure }
+            break
         }
         return AgentExperienceCase(
             id: id,
@@ -186,11 +196,13 @@ public enum AgentExperienceRetainedScorer {
             guard let failureKind else { return 0 }
             let severity: Double
             switch failureKind {
-            case .permissionDenied, .unsafeAction:
+            case .permissionDenied, .unsafeAction, .secureInput:
                 severity = 0.18
-            case .verifierRejected, .targetNotFound, .toolError:
+            case .verifierRejected, .targetNotFound, .toolError, .groundingMiss, .noEffect:
                 severity = 0.12
-            case .timeout, .loginRequired, .modalBlocked, .unknown:
+            case .wrongStartState, .timeout, .loginRequired, .modalBlocked, .staleFrameBatch,
+                 .verificationUnavailable, .parameterNeedsLiveValue, .stepLimit, .userStop,
+                 .artifactWrongLane, .unknown:
                 severity = 0.08
             }
             return max(-1.0, -(0.58 + evidenceBonus + severity))

@@ -768,13 +768,26 @@ public final class CascadeAppModel: ObservableObject {
         // post-completion window) — otherwise we'd log a false "user stopped" against
         // a run that actually completed. The box is hidden by the tap handler anyway.
         guard sandboxRuntimes[id] != nil || backgroundAgents.contains(where: { $0.id == id }) else { return }
+        let entry = backgroundAgents.first { $0.id == id }
         sandboxRuntimes[id]?.stop()
         sandboxRuntimes[id] = nil
         // Drop the entry now: a late "Stopped." update then finds no entry and is a
         // no-op, so the stop is never re-announced or mis-counted.
         backgroundAgents.removeAll { $0.id == id }
         sandboxBox.hide(id)
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "sandbox.stopped", detail: "user stopped a background agent")) }
+        Task {
+            if defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey),
+               let entry,
+               let agentID = entry.agentID,
+               let agent = try? await store.agent(id: agentID) {
+                await recordTerminalAgentExperience(
+                    for: agent,
+                    update: BackgroundWebAgent.Update(status: "Stopped.", snapshotPNG: nil, url: "", done: true, result: nil),
+                    fallbackGoal: entry.task
+                )
+            }
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "sandbox.stopped", detail: "user stopped a background agent"))
+        }
     }
 
     private func applySandboxUpdate(_ id: UUID, _ update: BackgroundWebAgent.Update) {
@@ -840,6 +853,10 @@ public final class CascadeAppModel: ObservableObject {
     func recordSandboxCompletion(deployedAgentID: Int64?, update: BackgroundWebAgent.Update, task: String) async {
         if update.completed, let deployedAgentID {
             await recordCompletedAgentRun(agentID: deployedAgentID, auditDetail: task)
+        } else if defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey),
+                  let deployedAgentID,
+                  let agent = try? await store.agent(id: deployedAgentID) {
+            await recordTerminalAgentExperience(for: agent, update: update, fallbackGoal: task)
         }
         let outcome = update.completed ? "completed" : "ended without completing"
         _ = try? await store.appendAudit(AuditEvent(
@@ -867,15 +884,130 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func recordSuccessfulAgentExperience(for agent: CascadeAgent, fallbackGoal: String) async {
+        await recordAgentExperience(for: agent, fallbackGoal: fallbackGoal, outcome: .success, verificationSignal: .completed)
+    }
+
+    private func recordTerminalAgentExperience(
+        for agent: CascadeAgent,
+        update: BackgroundWebAgent.Update,
+        fallbackGoal: String
+    ) async {
+        let classification = Self.sandboxExperienceClassification(for: update)
+        await recordAgentExperience(
+            for: agent,
+            fallbackGoal: fallbackGoal,
+            outcome: classification.outcome,
+            failureKind: classification.failureKind
+        )
+    }
+
+    private func recordAgentExperience(
+        for agent: CascadeAgent,
+        fallbackGoal: String,
+        outcome: AgentExperienceOutcome,
+        verificationSignal: AgentExperienceVerificationSignal? = nil,
+        failureKind: CascadeMemory.AgentFailureKind? = nil
+    ) async {
         _ = try? await store.recordAgentExperience(AgentExperienceCase(
             appName: Self.experienceAppName(for: agent),
             goalPattern: Self.experienceGoalPattern(for: agent, fallback: fallbackGoal),
             recipeSignature: Self.experienceRecipeSignature(for: agent),
-            outcome: .success,
-            verificationSignal: .completed,
+            outcome: outcome,
+            verificationSignal: verificationSignal,
+            failureKind: failureKind,
             evidenceIDs: [],
             actionCount: agent.recipe.steps.count
         ))
+    }
+
+    nonisolated static func sandboxExperienceClassification(
+        for update: BackgroundWebAgent.Update
+    ) -> (outcome: AgentExperienceOutcome, failureKind: CascadeMemory.AgentFailureKind?) {
+        guard !update.completed else { return (.success, nil) }
+        let failureKind = sandboxExperienceFailureKind(for: update)
+        switch failureKind {
+        case .unsafeAction:
+            return (.refusal, failureKind)
+        case .userStop:
+            return (.userStop, failureKind)
+        default:
+            return (.failure, failureKind)
+        }
+    }
+
+    nonisolated static func sandboxExperienceFailureKind(for update: BackgroundWebAgent.Update) -> CascadeMemory.AgentFailureKind {
+        let detail = (update.result?.isEmpty == false ? update.result : nil) ?? update.status
+        let lower = detail.lowercased()
+        if update.needsLogin || lower.contains("needs_login") || lower.contains("sign in") || lower.contains("log in") {
+            return .loginRequired
+        }
+        if lower.contains("no effect") || lower.contains("unchanged") || lower.contains("stopped changing") {
+            return .noEffect
+        }
+        if lower.contains("refus") || lower.contains("unsafe") || lower.contains("guardrail") {
+            return .unsafeAction
+        }
+        if lower.contains("modal") || lower.contains("dialog") || lower.contains("sheet") {
+            return .modalBlocked
+        }
+        if lower.contains("ran out of steps")
+            || lower.contains("step limit")
+            || lower.contains("kept looking without making progress")
+            || lower.contains("without making progress, so i stopped")
+            || update.result != nil {
+            return .stepLimit
+        }
+        if lower == "stopped." || lower.contains("user stopped") {
+            return .userStop
+        }
+        if lower.contains("couldn't finish") || lower.contains("incomplete") || lower.contains("verify") {
+            return .verifierRejected
+        }
+        if lower.contains("couldn't reach") || lower.contains("failed") || lower.contains("error") {
+            return .toolError
+        }
+        return .unknown
+    }
+
+    nonisolated static func experienceFailureKind(
+        for failure: AgentOrchestrator.AgentFailureKind
+    ) -> CascadeMemory.AgentFailureKind {
+        switch failure {
+        case .wrongStartState:
+            return .wrongStartState
+        case .permissionMissing:
+            return .permissionDenied
+        case .secureInput:
+            return .secureInput
+        case .targetNotFound:
+            return .targetNotFound
+        case .groundingMiss:
+            return .groundingMiss
+        case .noEffect:
+            return .noEffect
+        case .staleFrameBatch:
+            return .staleFrameBatch
+        case .unexpectedModal:
+            return .modalBlocked
+        case .verificationUnavailable:
+            return .verificationUnavailable
+        case .validatorIncomplete:
+            return .verifierRejected
+        case .transportFailure:
+            return .toolError
+        case .unsafeActionRefused:
+            return .unsafeAction
+        case .parameterNeedsLiveValue:
+            return .parameterNeedsLiveValue
+        case .stepLimit:
+            return .stepLimit
+        case .timeout:
+            return .timeout
+        case .userStop:
+            return .userStop
+        case .artifactWrongLane:
+            return .artifactWrongLane
+        }
     }
 
     private static func experienceAppName(for agent: CascadeAgent) -> String {

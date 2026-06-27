@@ -104,6 +104,7 @@ func enabledLedgerRecordsSandboxSuccess() async throws {
     #expect(cases.count == 1)
     #expect(cases.first?.outcome == .success)
     #expect(cases.first?.verificationSignal == .completed)
+    #expect(cases.first?.failureKind == nil)
     #expect(cases.first?.appName == "Mail")
     #expect(cases.first?.goalPattern == "Copy invoice totals into the tracker.")
     #expect(cases.first?.recipeSignature == "mail-invoice-copy")
@@ -125,14 +126,69 @@ func enabledLedgerRecordsOnScreenSuccess() async throws {
 }
 
 @MainActor @Test
-func enabledLedgerSkipsStoppedFailedAndStepLimitSandboxRuns() async throws {
+func enabledLedgerRecordsStoppedFailedRefusedModalNoEffectAndStepLimitSandboxRuns() async throws {
     let (model, store) = try makeExperienceModel(ledgerEnabled: true)
     let agent = try await savedExperienceAgent(in: store)
 
     await finishSandboxRun(model, agent: agent, update: stoppedExperienceUpdate())
     await finishSandboxRun(model, agent: agent, update: failedExperienceUpdate("Browser failed."))
+    await finishSandboxRun(model, agent: agent, update: failedExperienceUpdate("Refused unsafe delete action."))
+    await finishSandboxRun(model, agent: agent, update: failedExperienceUpdate("Unexpected modal blocked the run."))
+    await finishSandboxRun(model, agent: agent, update: failedExperienceUpdate("My actions stopped changing the page, so I stopped."))
     await finishSandboxRun(model, agent: agent, update: stepLimitExperienceUpdate("Ran out of steps."))
 
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
-    #expect(try await store.agentExperienceCases().isEmpty)
+    let cases = try await store.agentExperienceCases()
+    #expect(cases.count == 6)
+    #expect(cases.filter { $0.outcome == .userStop && $0.failureKind == .userStop }.count == 1)
+    #expect(cases.filter { $0.outcome == .failure && $0.failureKind == .toolError }.count == 1)
+    #expect(cases.filter { $0.outcome == .refusal && $0.failureKind == .unsafeAction }.count == 1)
+    #expect(cases.filter { $0.outcome == .failure && $0.failureKind == .modalBlocked }.count == 1)
+    #expect(cases.filter { $0.outcome == .failure && $0.failureKind == .noEffect }.count == 1)
+    #expect(cases.filter { $0.outcome == .failure && $0.failureKind == .stepLimit }.count == 1)
+}
+
+@MainActor @Test
+func enabledLedgerRecordsSandboxStallAsStepLimitFailure() async throws {
+    let (model, store) = try makeExperienceModel(ledgerEnabled: true)
+    let agent = try await savedExperienceAgent(in: store)
+
+    await finishSandboxRun(
+        model,
+        agent: agent,
+        update: failedExperienceUpdate("I kept looking without making progress, so I stopped.")
+    )
+
+    let cases = try await store.agentExperienceCases()
+    #expect(cases.count == 1)
+    #expect(cases.first?.outcome == .failure)
+    #expect(cases.first?.failureKind == .stepLimit)
+}
+
+@Test
+func appShellMapsEveryOrchestratorFailureKindToLedgerFailureKind() {
+    let expected: [AgentOrchestrator.AgentFailureKind: CascadeMemory.AgentFailureKind] = [
+        .wrongStartState: .wrongStartState,
+        .permissionMissing: .permissionDenied,
+        .secureInput: .secureInput,
+        .targetNotFound: .targetNotFound,
+        .groundingMiss: .groundingMiss,
+        .noEffect: .noEffect,
+        .staleFrameBatch: .staleFrameBatch,
+        .unexpectedModal: .modalBlocked,
+        .verificationUnavailable: .verificationUnavailable,
+        .validatorIncomplete: .verifierRejected,
+        .transportFailure: .toolError,
+        .unsafeActionRefused: .unsafeAction,
+        .parameterNeedsLiveValue: .parameterNeedsLiveValue,
+        .stepLimit: .stepLimit,
+        .timeout: .timeout,
+        .userStop: .userStop,
+        .artifactWrongLane: .artifactWrongLane
+    ]
+
+    #expect(expected.count == AgentOrchestrator.AgentFailureKind.allCases.count)
+    for failure in AgentOrchestrator.AgentFailureKind.allCases {
+        #expect(CascadeAppModel.experienceFailureKind(for: failure) == expected[failure])
+    }
 }

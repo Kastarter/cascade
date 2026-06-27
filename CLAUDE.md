@@ -24,6 +24,8 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-27): D-11 records background runtime failure cases into the experience ledger only when `cascade.experimentalExperienceLedger` is enabled; stopped/refused/modal/no-effect/step-limit failures now retain typed ledger failure kinds via an explicit AppShell mapper from orchestrator taxonomy.
+- NEW (2026-06-27): D-11 follow-up keeps the sandbox internal stall message ("kept looking without making progress") classified as ledger `stepLimit`, while user stops now require explicit `Stopped.` / `user stopped` wording.
 - NEW (2026-06-27): D-10 adds a DEFAULT-OFF ReliabilityReport live-trace adapter; `ReliabilityReport.fromTraces(_:)` uses `AgentTrace.scenarioOutcome` for root status, failure kind, step/tool counts, and retry counts while relying on the existing opt-in trace assembly gate.
 - NEW (2026-06-27): D-09 teaches `AgentTraceBuilder` default-off trace assembly to root `sandbox.task` as `backgroundWeb` and explicit `recipe.run.started`/`recipe.run.ended` as `recipeReplay`; sandbox verifier/done failures and recipe pause events now surface failure kinds in opt-in traces.
 - NEW (2026-06-27): D-08 wires WorkGraph indexing through default-off `cascade.experimentalWorkGraphIndex`; enabled app recorders pass `ContextRecorder.Options(indexWorkGraph: true)` and `CascadeAppModel.graphTimeline(...)` exposes indexed entity timelines.
