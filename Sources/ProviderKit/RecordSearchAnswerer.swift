@@ -35,19 +35,22 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     private let keyStore: AnthropicKeyStore
     private let model: String
     private let maxHops: Int
+    private let includeStructuredContent: Bool
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "record-answerer")
 
     public init(
         store: CascadeStore,
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         model: String = AnthropicModel.sonnet,
-        maxHops: Int = 6
+        maxHops: Int = 6,
+        includeStructuredContent: Bool = false
     ) {
         self.store = store
         self.recall = RecordRecall(store: store)
         self.keyStore = keyStore
         self.model = model
         self.maxHops = maxHops
+        self.includeStructuredContent = includeStructuredContent
     }
 
     // MARK: - Public entry
@@ -99,7 +102,10 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     /// Delegates to the shared `RecordRecall` so the Ask panel and the on-screen
     /// cursor agent run byte-identical retrieval against the record.
     private func perform(tool: String, input: [String: Any]) async -> String {
-        await recall.perform(tool: tool, input: input)
+        guard RecordRecall.isRecallTool(tool, includeStructuredContent: includeStructuredContent) else {
+            return "Unknown recall tool \(tool)."
+        }
+        return await recall.perform(tool: tool, input: input)
     }
 
     // MARK: - Request plumbing
@@ -128,7 +134,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             "messages": messages,
         ]
         if toolsAllowed {
-            var tools = RecordRecall.toolDefinitions()
+            var tools = RecordRecall.toolDefinitions(includeStructuredContent: includeStructuredContent)
             // Also cache the (static) tools block.
             tools[tools.count - 1]["cache_control"] = ["type": "ephemeral"]
             body["tools"] = tools

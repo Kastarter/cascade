@@ -19,6 +19,27 @@ public enum StructuredContentExporter {
         public static let summary = Budget(maxBytes: 1_000, maxLines: 8)
     }
 
+    public struct MetadataKeyValue: Codable, Sendable, Equatable {
+        public let key: String
+        public let value: String
+    }
+
+    public struct Metadata: Codable, Sendable, Equatable {
+        public let summary: String
+        public let readingOrder: String
+        public let keyValues: [MetadataKeyValue]
+        public let markdownTables: [String]
+        public let csvTables: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case summary
+            case readingOrder = "reading_order"
+            case keyValues = "key_values"
+            case markdownTables = "markdown_tables"
+            case csvTables = "csv_tables"
+        }
+    }
+
     private static let truncationMarker = "[truncated]"
 
     public static func markdown(
@@ -114,6 +135,28 @@ public enum StructuredContentExporter {
             lines.append("Preview: \(preview)")
         }
         return bounded(lines, budget: budget)
+    }
+
+    public static func metadata(
+        from structured: ScreenContentStructurer.Structured,
+        summaryBudget: Budget = .summary,
+        readingOrderBudget: Budget = Budget(maxBytes: 4_000, maxLines: 80),
+        tableBudget: Budget = .table,
+        maxKeyValues: Int = 40,
+        maxTables: Int = 4
+    ) -> Metadata {
+        Metadata(
+            summary: summary(from: structured, budget: summaryBudget),
+            readingOrder: bounded(structured.lines.map(\.text), budget: readingOrderBudget),
+            keyValues: structured.keyValues.prefix(maxKeyValues).map {
+                MetadataKeyValue(
+                    key: clipped($0.key, maxBytes: 160),
+                    value: clipped($0.value, maxBytes: 320)
+                )
+            },
+            markdownTables: Array(markdownTables(from: structured, budget: tableBudget).prefix(maxTables)),
+            csvTables: Array(csvTables(from: structured, budget: tableBudget).prefix(maxTables))
+        )
     }
 
     private static func markdownTableLines(_ table: ScreenContentStructurer.Table) -> [String] {

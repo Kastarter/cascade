@@ -25,6 +25,7 @@
 
 ## Current State (2026-06-11)
 - NEW (2026-06-26): Round 4 safe-integration plan is in `docs/PRODUCTION_GRADE_PLAN_ROUND4.md`; theme is default-off wiring for standalone modules into recorder/store/planner/ranking/grounding paths without shipped behavior changes.
+- NEW (2026-06-26): P4-09 wires structured screen content behind `ContextRecorder.Options.structuredContent`; enabled captures store bounded reading-order/key-value/table metadata and `RecordRecall.inspect_structure` exposes it.
 - NEW (2026-06-26): P4-08 adds default-off MixtureGrounder candidate verification: AX/base `GroundingResult` candidates convert to verifier candidates, accepted candidates can be drift-scored with previous-anchor failure data, and legacy `ground(...)` behavior remains unchanged unless enabled.
 - NEW (2026-06-26): P4-07 wires suggestion personalization behind `cascade.experimentalSuggestionRanking`: stable pure ranking for detected/curated suggestions, accept/decline preference inputs, and gated next-action offers; default refresh path remains unchanged.
 - NEW (2026-06-26): P3-16 added pure AgentOrchestrator `TrajectorySketchBuilder`: prompt-ready successful-demo sketches with scrubbed labels, collapsed actions, expected checks, verified recoveries, and app/goal ranking; no runtime injection yet.

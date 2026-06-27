@@ -10,6 +10,7 @@ import OSLog
 /// - `search_record`   — full-text + semantic lookup, returns `[#id] time app — title | text` lines
 /// - `get_timeframe`   — everything between two timestamps, oldest first
 /// - `inspect_moment`  — one moment's full text plus its immediate neighbours
+/// - `inspect_structure` — structured reading order, key-values, and tables for one moment
 ///
 /// This is the single implementation of those tools. Both the Ask panel's
 /// `RecordSearchAnswerer` (which answers questions about the record) and the
@@ -24,9 +25,15 @@ public struct RecordRecall: Sendable {
     }
 
     /// The recall tool names, for routing a tool call to `perform`.
-    public static let toolNames: Set<String> = ["search_record", "get_timeframe", "inspect_moment", "list_sessions"]
+    public static func toolNames(includeStructuredContent: Bool = false) -> Set<String> {
+        var names: Set<String> = ["search_record", "get_timeframe", "inspect_moment", "list_sessions"]
+        if includeStructuredContent { names.insert("inspect_structure") }
+        return names
+    }
 
-    public static func isRecallTool(_ name: String) -> Bool { toolNames.contains(name) }
+    public static func isRecallTool(_ name: String, includeStructuredContent: Bool = false) -> Bool {
+        toolNames(includeStructuredContent: includeStructuredContent).contains(name)
+    }
 
     /// One parsed recall call — `Sendable`, so a `@MainActor` caller can extract
     /// it from the model's raw `[String: Any]` tool input and hand it to the
@@ -37,6 +44,7 @@ public struct RecordRecall: Sendable {
         case search(query: String)
         case timeframe(startISO: String?, endISO: String?)
         case inspect(id: Int64?)
+        case inspectStructure(id: Int64?)
         case sessions(startISO: String?, endISO: String?)
         case unknown(String)
 
@@ -49,6 +57,8 @@ public struct RecordRecall: Sendable {
                 self = .timeframe(startISO: input["start_iso"] as? String, endISO: input["end_iso"] as? String)
             case "inspect_moment":
                 self = .inspect(id: (input["id"] as? NSNumber)?.int64Value ?? (input["id"] as? Int).map(Int64.init))
+            case "inspect_structure":
+                self = .inspectStructure(id: (input["id"] as? NSNumber)?.int64Value ?? (input["id"] as? Int).map(Int64.init))
             case "list_sessions":
                 self = .sessions(startISO: input["start_iso"] as? String, endISO: input["end_iso"] as? String)
             default:
@@ -63,6 +73,7 @@ public struct RecordRecall: Sendable {
             case .search(let query): detail = "search_record: \(query)"
             case .timeframe(let start, let end): detail = "get_timeframe: \(start ?? "?") → \(end ?? "?")"
             case .inspect(let id): detail = "inspect_moment: #\(id.map(String.init) ?? "?")"
+            case .inspectStructure(let id): detail = "inspect_structure: #\(id.map(String.init) ?? "?")"
             case .sessions(let start, let end): detail = "list_sessions: \(start ?? "?") → \(end ?? "?")"
             case .unknown(let name): detail = name
             }
@@ -77,7 +88,8 @@ public struct RecordRecall: Sendable {
     /// concurrency. Descriptions are framed for an agent that RESOLVES references
     /// to the past, so it reaches for these when the goal points at something not
     /// on screen now ("the email I was reading", "what I started this morning").
-    public static func toolDefinitions() -> [[String: Any]] { [
+    public static func toolDefinitions(includeStructuredContent: Bool = false) -> [[String: Any]] {
+        var definitions: [[String: Any]] = [
         [
             "name": "search_record",
             "description": "Search everything the user has already seen on screen — every app, window title, and on-screen text Cascade recorded earlier. Use this to resolve references to past work (\"the email I was reading\", \"the doc from this morning\", \"that figure I had open\") before acting. Returns matching moments as [#id] time app — title | text. Search again with different words if the first try misses.",
@@ -108,7 +120,19 @@ public struct RecordRecall: Sendable {
                 "required": ["id"],
             ],
         ],
-        [
+        ]
+        if includeStructuredContent {
+            definitions.append([
+            "name": "inspect_structure",
+            "description": "Structured content for one recorded moment by id — reading-order text, key-value pairs, and markdown/CSV-safe tables when the recorder captured structured metadata. Use after search_record or inspect_moment when the user asks to extract fields or tables.",
+            "input_schema": [
+                "type": "object",
+                "properties": ["id": ["type": "integer", "description": "Moment id from a search result"]],
+                "required": ["id"],
+            ],
+            ])
+        }
+        definitions.append([
             "name": "list_sessions",
             "description": "The user's work SESSIONS between two times — each session is a contiguous stretch in one app, with its duration and what was open, instead of individual frames. Use this for \"what did I work on this morning / between 2 and 4\" style questions: it returns [#id] start–end (duration) app — title · N moments. Then inspect_moment or search_record to drill into one.",
             "input_schema": [
@@ -119,8 +143,9 @@ public struct RecordRecall: Sendable {
                 ],
                 "required": ["start_iso", "end_iso"],
             ],
-        ],
-    ] }
+        ])
+        return definitions
+    }
 
     // MARK: - Execution (resolves in-process against the local store)
 
@@ -175,6 +200,17 @@ public struct RecordRecall: Sendable {
                 out += "\nNearby: " + neighbors.map { "[#\($0.id)] \(Self.time($0.capturedAt)) \($0.appName)" }.joined(separator: ", ")
             }
             return out
+
+        case .inspectStructure(let id):
+            guard let id else { return "inspect_structure needs a numeric id." }
+            guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
+                return "No accessible moment #\(id)."
+            }
+            guard let metadata = moment.metadataJSON,
+                  let structured = Self.structuredMetadata(from: metadata) else {
+                return "No structured metadata recorded for moment #\(id). Capture structured content must be enabled first."
+            }
+            return Self.structureLine(for: moment, structured: structured)
 
         case .sessions(let startISO, let endISO):
             guard let start = Self.date(from: startISO),
@@ -236,5 +272,88 @@ public struct RecordRecall: Sendable {
         if let date = formatter.date(from: string) { return date }
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: string)
+    }
+
+    private struct StructuredEnvelope: Decodable {
+        let structured: StructuredMetadata?
+    }
+
+    private struct StructuredMetadata: Decodable {
+        let summary: String
+        let readingOrder: String
+        let keyValues: [StructuredKeyValue]
+        let markdownTables: [String]
+        let csvTables: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case summary
+            case readingOrder = "reading_order"
+            case keyValues = "key_values"
+            case markdownTables = "markdown_tables"
+            case csvTables = "csv_tables"
+        }
+    }
+
+    private struct StructuredKeyValue: Decodable {
+        let key: String
+        let value: String
+    }
+
+    private static func structuredMetadata(from json: String) -> StructuredMetadata? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(StructuredEnvelope.self, from: data).structured
+    }
+
+    private static func structureLine(for context: RecordedContext, structured: StructuredMetadata) -> String {
+        var lines = ["[#\(context.id)] \(time(context.capturedAt)) \(context.appName) structured content"]
+        lines.append("Summary: \(structured.summary)")
+        let readingOrder = structured.readingOrder.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !readingOrder.isEmpty {
+            lines.append("")
+            lines.append("Reading order:")
+            lines.append(readingOrder)
+        }
+        if !structured.keyValues.isEmpty {
+            lines.append("")
+            lines.append("Key-values:")
+            for pair in structured.keyValues {
+                lines.append("- **\(pair.key)**: \(pair.value)")
+            }
+        }
+        if !structured.markdownTables.isEmpty {
+            lines.append("")
+            lines.append("Markdown tables:")
+            for table in structured.markdownTables {
+                lines.append(table)
+            }
+        }
+        if !structured.csvTables.isEmpty {
+            lines.append("")
+            lines.append("CSV-safe tables:")
+            for table in structured.csvTables {
+                lines.append("```csv")
+                lines.append(table)
+                lines.append("```")
+            }
+        }
+        return bounded(lines, maxBytes: 12_000, maxLines: 180)
+    }
+
+    private static func bounded(_ lines: [String], maxBytes: Int, maxLines: Int) -> String {
+        let marker = "[truncated]"
+        guard maxBytes > 0, maxLines > 0 else { return "" }
+        var kept = Array(lines.prefix(maxLines))
+        while !kept.isEmpty && kept.joined(separator: "\n").utf8.count > maxBytes {
+            kept.removeLast()
+        }
+        if kept.count < lines.count || kept.joined(separator: "\n").utf8.count > maxBytes {
+            if kept.count == maxLines { kept.removeLast() }
+            kept.append(marker)
+        }
+        var text = kept.joined(separator: "\n")
+        while text.utf8.count > maxBytes, !text.isEmpty {
+            text.removeLast()
+        }
+        return text
     }
 }

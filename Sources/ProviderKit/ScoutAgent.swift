@@ -55,6 +55,7 @@ public final class ScoutAgent {
     private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
     private let harnessTier: HarnessTier
     private let recallEnabled: Bool
+    private let includeStructuredRecallContent: Bool
     /// One-line-per-skill catalogue for use_skill (so Scout knows what it CAN pull).
     private let skillIndex: String?
     /// System prompt for the episode — base prompt + tool catalogue + any pushed
@@ -76,7 +77,8 @@ public final class ScoutAgent {
         skillIndex: String? = nil,
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
         harnessTier: HarnessTier = .off,
-        recallEnabled: Bool = false
+        recallEnabled: Bool = false,
+        includeStructuredRecallContent: Bool = false
     ) {
         self.vision = vision
         self.grounder = grounder
@@ -87,6 +89,7 @@ public final class ScoutAgent {
         self.harnessProvider = harnessProvider
         self.harnessTier = harnessProvider == nil ? .off : harnessTier
         self.recallEnabled = recallEnabled && harnessProvider != nil
+        self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
         rebuildSystem()
     }
 
@@ -101,7 +104,11 @@ public final class ScoutAgent {
             // Resolve ALL recall tools (so a list_sessions/get_timeframe emitted from
             // the shared history still routes), even though toolsPrompt only
             // advertises the two a weak planner can use without an ISO time window.
-            if recallEnabled { s.formUnion(RecordRecall.toolNames) }
+            if recallEnabled {
+                s.formUnion(RecordRecall.toolNames(
+                    includeStructuredContent: includeStructuredRecallContent
+                ))
+            }
         }
         return s
     }

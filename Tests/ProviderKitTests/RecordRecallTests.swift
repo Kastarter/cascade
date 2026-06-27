@@ -210,6 +210,7 @@ func recallToolNamesAreStableAndDistinctFromOtherTools() {
     #expect(RecordRecall.isRecallTool("get_timeframe"))
     #expect(RecordRecall.isRecallTool("inspect_moment"))
     #expect(RecordRecall.isRecallTool("list_sessions"))
+    #expect(!RecordRecall.isRecallTool("inspect_structure"))
     #expect(!RecordRecall.isRecallTool("computer"))
     #expect(!RecordRecall.isRecallTool("use_skill"))
     // Recall names must not collide with the Mac harness tools, or the in-process
@@ -222,5 +223,5 @@ func recallToolNamesAreStableAndDistinctFromOtherTools() {
 @Test
 func recallToolDefinitionsExposeEveryTool() {
     let names = RecordRecall.toolDefinitions().compactMap { $0["name"] as? String }
-    #expect(Set(names) == RecordRecall.toolNames)
+    #expect(Set(names) == RecordRecall.toolNames())
 }

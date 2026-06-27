@@ -182,9 +182,11 @@ public struct ContextRecorderStatus: Equatable, Sendable {
 public final class ContextRecorder: ObservableObject {
     public struct Options: Equatable, Sendable {
         public var indexWorkGraph: Bool
+        public var structuredContent: Bool
 
-        public init(indexWorkGraph: Bool = false) {
+        public init(indexWorkGraph: Bool = false, structuredContent: Bool = false) {
             self.indexWorkGraph = indexWorkGraph
+            self.structuredContent = structuredContent
         }
     }
 
@@ -236,7 +238,11 @@ public final class ContextRecorder: ObservableObject {
         status.running = true
         status.message = "Recording local context."
 
-        let recorder = RewindRecorder(store: store, indexWorkGraph: options.indexWorkGraph) { [weak self] context in
+        let recorder = RewindRecorder(
+            store: store,
+            indexWorkGraph: options.indexWorkGraph,
+            structuredContent: options.structuredContent
+        ) { [weak self] context in
             Task { @MainActor in
                 guard let self else { return }
                 self.status.latestContext = context
@@ -340,6 +346,7 @@ public final class ContextRecorder: ObservableObject {
         let canCaptureScreen = status.permissions.canRecordContext
         var ocrText: String?
         var imagePath: String?
+        var capturedImageData: Data?
         var source: ContextSource = .app
         var isCursorScreen = false
         if canCaptureScreen,
@@ -347,7 +354,18 @@ public final class ContextRecorder: ObservableObject {
             source = .screen
             isCursorScreen = sample.isCursorScreen
             if sample.hasText { ocrText = sample.ocrText }
-            if let png = sample.imagePNG { imagePath = Self.saveFrame(png) }
+            if let png = sample.imagePNG {
+                capturedImageData = png
+                imagePath = Self.saveFrame(png)
+            }
+        }
+        let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, let capturedImageData {
+            StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(
+                ScreenTextRecognizer.recognizeBoxes(inImageData: capturedImageData),
+                topLeftOrigin: false
+            ))
+        } else {
+            nil
         }
         // Same exact-text channel as the continuous recorder: AX text leads,
         // OCR fills in what the tree can't see.
@@ -357,9 +375,11 @@ public final class ContextRecorder: ObservableObject {
             if !merged.isEmpty { ocrText = merged }
         }
 
-        let metadata = """
-        {"processIdentifier":\(snapshot.processIdentifier.map(String.init) ?? "null"),"cursorScreen":\(isCursorScreen)}
-        """
+        let metadata = RecorderMetadataJSON.capture(
+            processIdentifier: snapshot.processIdentifier,
+            cursorScreen: isCursorScreen,
+            structured: structuredMetadata
+        )
         let context = RecordedContext(
             source: source,
             appName: snapshot.appName,

@@ -28,6 +28,47 @@ struct ChangedFrame: Sendable {
     let height: Int
 }
 
+enum RecorderMetadataJSON {
+    private struct RewindPayload: Encodable {
+        let rewind: Bool
+        let w: Int
+        let h: Int
+        let ax: Int
+        let structured: StructuredContentExporter.Metadata?
+    }
+
+    private struct CapturePayload: Encodable {
+        let processIdentifier: Int32?
+        let cursorScreen: Bool
+        let structured: StructuredContentExporter.Metadata?
+    }
+
+    static func rewind(width: Int, height: Int, axCount: Int, structured: StructuredContentExporter.Metadata?) -> String {
+        guard let structured else {
+            return "{\"rewind\":true,\"w\":\(width),\"h\":\(height),\"ax\":\(axCount)}"
+        }
+        return encode(RewindPayload(rewind: true, w: width, h: height, ax: axCount, structured: structured))
+    }
+
+    static func capture(processIdentifier: Int32?, cursorScreen: Bool, structured: StructuredContentExporter.Metadata?) -> String {
+        guard let structured else {
+            return """
+            {"processIdentifier":\(processIdentifier.map(String.init) ?? "null"),"cursorScreen":\(cursorScreen)}
+            """
+        }
+        return encode(CapturePayload(processIdentifier: processIdentifier, cursorScreen: cursorScreen, structured: structured))
+    }
+
+    private static func encode<T: Encodable>(_ value: T) -> String {
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(value),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return string
+    }
+}
+
 /// Where captured frames are written on disk. Single source of truth for the
 /// frames directory so the recorder, the manual single-shot path, and retention
 /// pruning all agree. Frames are JPEG (q≈0.6) to keep disk ~3–5× smaller than PNG.
@@ -142,6 +183,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
 actor RewindEngine {
     private let store: CascadeStore
     private let indexWorkGraph: Bool
+    private let structuredContent: Bool
     private let onMoment: @Sendable (RecordedContext) -> Void
     private var pending: ChangedFrame?
     private var processing = false
@@ -156,9 +198,15 @@ actor RewindEngine {
     /// it so a busy canvas app doesn't double the capture cost every second.
     static let nativeOCRInterval: TimeInterval = 3.0
 
-    init(store: CascadeStore, indexWorkGraph: Bool = false, onMoment: @escaping @Sendable (RecordedContext) -> Void) {
+    init(
+        store: CascadeStore,
+        indexWorkGraph: Bool = false,
+        structuredContent: Bool = false,
+        onMoment: @escaping @Sendable (RecordedContext) -> Void
+    ) {
         self.store = store
         self.indexWorkGraph = indexWorkGraph
+        self.structuredContent = structuredContent
         self.onMoment = onMoment
     }
 
@@ -217,6 +265,14 @@ actor RewindEngine {
         var ocrText = await ScreenTextRecognizer.recognize(
             inPNG: frame.jpeg, level: axRich ? .fast : .accurate
         )
+        let structuredMetadata: StructuredContentExporter.Metadata? = if structuredContent {
+            StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(
+                ScreenTextRecognizer.recognizeBoxes(inImageData: frame.jpeg, level: axRich ? .fast : .accurate),
+                topLeftOrigin: false
+            ))
+        } else {
+            nil
+        }
 
         // Canvas/web window with little AX text → OCR is the only channel, so
         // do one native-resolution pass (rate-limited) for the focused window
@@ -242,7 +298,12 @@ actor RewindEngine {
             windowTitle: snapshot.windowTitle,
             ocrText: mergedText.isEmpty ? nil : mergedText,
             imagePath: imagePath,
-            metadataJSON: "{\"rewind\":true,\"w\":\(frame.width),\"h\":\(frame.height),\"ax\":\(axText.count)}",
+            metadataJSON: RecorderMetadataJSON.rewind(
+                width: frame.width,
+                height: frame.height,
+                axCount: axText.count,
+                structured: structuredMetadata
+            ),
             frameHash: Int64(bitPattern: frame.hash)
         )
 
@@ -296,9 +357,15 @@ final class RewindRecorder {
         threshold: Int = PerceptualHash.defaultSkipThreshold,
         fps: Int32 = 1,
         indexWorkGraph: Bool = false,
+        structuredContent: Bool = false,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
     ) {
-        self.engine = RewindEngine(store: store, indexWorkGraph: indexWorkGraph, onMoment: onMoment)
+        self.engine = RewindEngine(
+            store: store,
+            indexWorkGraph: indexWorkGraph,
+            structuredContent: structuredContent,
+            onMoment: onMoment
+        )
         self.threshold = threshold
         self.fps = fps
     }

@@ -121,6 +121,7 @@ public final class ComputerUseAgent {
     /// provider owns auditing and gating. Off for surfaces with no record (the
     /// web sandbox), so their behaviour is unchanged.
     private let recallEnabled: Bool
+    private let includeStructuredRecallContent: Bool
     /// Grounding split (Phase 1): when set, the on-screen agent is offered
     /// `fill_target`, where the model NAMES a target and the RUNTIME locates it via
     /// this grounder (local UI-TARS or Claude) and acts on it — the model never has
@@ -374,6 +375,7 @@ public final class ComputerUseAgent {
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
         extraTools: [[String: Any]] = [],
         recallEnabled: Bool = false,
+        includeStructuredRecallContent: Bool = false,
         grounder: VisualGrounder? = nil,
         groundingMode: GroundingMode = .coordinate
     ) {
@@ -389,6 +391,7 @@ public final class ComputerUseAgent {
         // Recall needs the same in-process provider the harness uses; without it
         // there is nothing to route the calls to.
         self.recallEnabled = recallEnabled && harnessProvider != nil
+        self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
         self.grounder = grounder
         // Structural grounding needs a grounder to act on named targets; without
         // one, fall back to the coordinate computer tool so the agent still works.
@@ -543,7 +546,9 @@ public final class ComputerUseAgent {
             tools.insert(contentsOf: Self.harnessToolDefinitions(tier: harnessTier), at: tools.count - 1)
         }
         if recallEnabled {
-            tools.insert(contentsOf: RecordRecall.toolDefinitions(), at: tools.count - 1)
+            tools.insert(contentsOf: RecordRecall.toolDefinitions(
+                includeStructuredContent: includeStructuredRecallContent
+            ), at: tools.count - 1)
         }
         if !extraTools.isEmpty {
             tools.insert(contentsOf: extraTools, at: tools.count - 1)
@@ -715,7 +720,10 @@ public final class ComputerUseAgent {
                 case "wait":
                     actions.append(.wait)
                 case let name? where AgentHarness.isHarnessTool(name)
-                    || (recallEnabled && RecordRecall.isRecallTool(name))
+                    || (recallEnabled && RecordRecall.isRecallTool(
+                        name,
+                        includeStructuredContent: includeStructuredRecallContent
+                    ))
                     || extraToolNames.contains(name):
                     // Resolved in-process like use_skill — search/read/run, recall
                     // over the record, and the sandbox's DOM tools never touch the
