@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import ProviderKit
 
 /// Runs a job entirely inside a `WebSandbox` — the isolated, background browser —
@@ -245,10 +246,10 @@ public final class BackgroundWebAgent {
         // mismatch downgrades to a failure; doubt leans verified so real wins still pass.
         if case .finished(let finding) = attempt.outcome, !stopped {
             if let reason = await verifyCompletion(task: sub.task, claimed: finding) {
-                audit("sandbox.verify", "INCOMPLETE: \(reason.prefix(80))")
+                audit("sandbox.verify", Self.sandboxVerifyAuditDescriptor(status: "incomplete", detail: reason))
                 return .failed("Couldn't finish — \(reason)")
             }
-            audit("sandbox.verify", "verified: \(finding.prefix(70))")
+            audit("sandbox.verify", Self.sandboxVerifyAuditDescriptor(status: "verified", detail: finding))
         }
         return attempt.outcome
     }
@@ -352,7 +353,7 @@ public final class BackgroundWebAgent {
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
                 if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
-                self?.audit("sandbox.tool", "\(name) \(Self.argSummary(input)) → \(result.prefix(70))")
+                self?.audit("sandbox.tool", Self.sandboxToolAuditDescriptor(name: name, input: input, result: result))
                 return result
             },
             extraTools: WebHarness.toolDefinitions()
@@ -406,22 +407,22 @@ public final class BackgroundWebAgent {
                     // the false-completion the audit log caught: a mid-task run reported
                     // "done — I couldn't reach Claude" and was marked completed. Report it
                     // honestly and count nothing.
-                    audit("sandbox.done", "unreachable — couldn't reach Claude (acted=\(acted))")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "transport_failure", acted: acted))
                     return (.failed("I couldn't reach Claude just now — ask again and I'll continue."), acted)
                 case .needsLogin(let site):
-                    audit("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "needs_login", acted: acted, detail: site, detailName: "target"))
                     return (.needsLogin(site), acted)
                 case .incomplete(let reason):
                     // The agent said done but flagged it couldn't actually finish — report
                     // it honestly and do NOT let it count as a completion.
-                    audit("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "incomplete", acted: acted, detail: reason))
                     return (.failed("Couldn't finish — \(reason)"), acted)
                 case .finished(let raw):
-                    audit("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "finished", acted: acted, detail: raw))
                     return (.finished(raw), acted)
                 }
             }
-            if !step.text.isEmpty { audit("sandbox.turn", String(step.text.prefix(90))) }
+            if !step.text.isEmpty { audit("sandbox.turn", Self.sandboxTurnAuditDescriptor(step.text)) }
             // Streamed actions already ran via the sink; this handles any non-streamed
             // leftovers (zoom/screenshot are no-ops here, harness/skill resolve inline).
             for action in step.actions {
@@ -443,7 +444,7 @@ public final class BackgroundWebAgent {
             } else if !step.done {
                 idleTurns += 1
                 if idleTurns >= 3 {
-                    audit("sandbox.stalled", String(step.text.prefix(80)))
+                    audit("sandbox.stalled", Self.sandboxStalledAuditDescriptor(step.text))
                     return (.failed("I kept looking without making progress, so I stopped."), acted)
                 }
                 if idleTurns == 2 {
@@ -583,7 +584,7 @@ public final class BackgroundWebAgent {
         var count = 0
         while count < maxSteps, !stopped {
             if step.failed {
-                audit("sandbox.done", "scout planner error (acted=\(acted)): \(step.text.prefix(70))")
+                audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "planner_error", acted: acted, detail: step.text))
                 return (.failed("I couldn't reach the Scout model just now — ask again and I'll continue."), acted)
             }
             if step.done {
@@ -591,18 +592,18 @@ public final class BackgroundWebAgent {
                 case .transportFailure:
                     return (.failed("I couldn't reach the model just now — ask again."), acted)
                 case .needsLogin(let site):
-                    audit("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "needs_login", acted: acted, detail: site, detailName: "target"))
                     return (.needsLogin(site), acted)
                 case .incomplete(let reason):
-                    audit("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "incomplete", acted: acted, detail: reason))
                     return (.failed("Couldn't finish — \(reason)"), acted)
                 case .finished(let raw):
-                    audit("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "finished", acted: acted, detail: raw))
                     return (.finished(raw), acted)
                 }
             }
             if !step.text.isEmpty {
-                audit("sandbox.turn", String(step.text.prefix(90)))
+                audit("sandbox.turn", Self.sandboxTurnAuditDescriptor(step.text))
                 onUpdate(Update(status: prefix + step.text, snapshotPNG: nil, url: sandbox.currentURL, done: false, result: nil))
             }
             // Scout's actions are already batch-safe + pre-grounded; execute them.
@@ -618,9 +619,9 @@ public final class BackgroundWebAgent {
             // Grounding visibility — where each named target resolved (or missed) —
             // plus a re-describe nudge on a miss, so Scout renames from the pushed
             // list instead of silently going idle on an un-findable target.
-            if let g = agent.lastGroundLog { audit("sandbox.ground", String(g.prefix(100))) }
+            if let g = agent.lastGroundLog { audit("sandbox.ground", Self.sandboxGroundAuditDescriptor(g)) }
             if let missed = agent.lastGroundMiss {
-                audit("sandbox.ground.miss", String(missed.prefix(80)))
+                audit("sandbox.ground.miss", Self.sandboxGroundMissAuditDescriptor(missed))
                 nudge = "Couldn't find “\(missed)” on the page — name a target EXACTLY as it appears in the clickable/fillable list below, or use type with NO target if you've already clicked into the field."
             }
 
@@ -630,7 +631,7 @@ public final class BackgroundWebAgent {
             } else if !step.done {
                 idleTurns += 1
                 if idleTurns >= 3 {
-                    audit("sandbox.stalled", String(step.text.prefix(80)))
+                    audit("sandbox.stalled", Self.sandboxStalledAuditDescriptor(step.text))
                     return (.failed("I kept looking without making progress, so I stopped."), acted)
                 }
                 if idleTurns == 2 {
@@ -812,7 +813,7 @@ public final class BackgroundWebAgent {
                 audit("sandbox.act", Self.invalidCoordinateDetail("click"))
                 return
             }
-            audit("sandbox.act", "click (\(point.x),\(point.y))")
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.click(x: x, y: y)))
             await sandbox.click(xTopLeft: CGFloat(point.x), yTopLeft: CGFloat(point.y))
         case .drag(_, _, let toX, let toY):
             // No real drag in the JS bridge — landing on the destination is the
@@ -821,24 +822,27 @@ public final class BackgroundWebAgent {
                 audit("sandbox.act", Self.invalidCoordinateDetail("drag"))
                 return
             }
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(actionKind: "drag"))
             await sandbox.click(xTopLeft: CGFloat(point.x), yTopLeft: CGFloat(point.y))
         case .move(let x, let y):
             guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
                 audit("sandbox.act", Self.invalidCoordinateDetail("move"))
                 return
             }
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(actionKind: "move"))
             await sandbox.moveCursor(toTopLeftX: CGFloat(point.x), y: CGFloat(point.y))
         case .type(let text):
-            audit("sandbox.act", "type \"\(text.prefix(40))\"")
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.type(text)))
             await sandbox.typeText(text)
         case .key(let combo):
-            audit("sandbox.act", "key \(combo)")
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.key(combo)))
             await sandbox.pressKey(combo)
         case .scroll(_, _, let direction, let amount):
             guard let delta = Self.sandboxScrollDelta(direction: direction, amount: amount) else {
                 audit("sandbox.act", Self.invalidCoordinateDetail("scroll"))
                 return
             }
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(actionKind: "scroll"))
             await sandbox.scroll(dy: CGFloat(delta))
         case .wait:
             try? await Task.sleep(for: .milliseconds(600))
@@ -849,7 +853,7 @@ public final class BackgroundWebAgent {
         case .openApp:
             break  // no apps inside the web sandbox
         case .openURL(let urlString):
-            audit("sandbox.act", "open \(urlString.prefix(60))")
+            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.openURL(urlString)))
             await sandbox.navigate(to: urlString)
             try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
         }
@@ -872,15 +876,131 @@ public final class BackgroundWebAgent {
         "invalid-coordinate action=\(action)"
     }
 
-    /// A short readable summary of a tool's input for the audit trail.
-    private static func argSummary(_ input: [String: Any]) -> String {
-        for key in ["text", "field", "url", "query"] {
-            if let v = input[key] as? String, !v.isEmpty {
-                let value = (input["value"] as? String).map { " = \"\($0.prefix(30))\"" } ?? ""
-                return "\"\(v.prefix(40))\"\(value)"
-            }
+    nonisolated static func sandboxActionAuditDescriptor(_ action: CUAction) -> String {
+        switch action {
+        case .type(let text):
+            return "action=type textChars=\(text.count) textHash=\(auditHash(text)) status=ok"
+        case .openURL(let url):
+            return "action=open_url urlChars=\(url.count) urlHash=\(auditHash(url)) status=ok"
+        case .key(let combo):
+            return "action=key comboChars=\(combo.count) comboHash=\(auditHash(combo)) status=ok"
+        case .click, .doubleClick, .rightClick, .tripleClick:
+            return sandboxActionAuditDescriptor(actionKind: "click")
+        case .drag:
+            return sandboxActionAuditDescriptor(actionKind: "drag")
+        case .move:
+            return sandboxActionAuditDescriptor(actionKind: "move")
+        case .scroll:
+            return sandboxActionAuditDescriptor(actionKind: "scroll")
+        case .wait:
+            return sandboxActionAuditDescriptor(actionKind: "wait")
+        case .screenshot:
+            return sandboxActionAuditDescriptor(actionKind: "screenshot")
+        case .zoom:
+            return sandboxActionAuditDescriptor(actionKind: "zoom")
+        case .highlight:
+            return sandboxActionAuditDescriptor(actionKind: "highlight")
+        case .openApp:
+            return sandboxActionAuditDescriptor(actionKind: "open_app")
         }
-        return ""
+    }
+
+    nonisolated static func sandboxActionAuditDescriptor(actionKind: String, status: String = "ok") -> String {
+        "action=\(safeAuditToken(actionKind)) status=\(safeAuditToken(status))"
+    }
+
+    nonisolated static func sandboxToolAuditDescriptor(name: String, input: [String: Any], result: String) -> String {
+        var parts = [
+            "tool=\(safeAuditToken(name))",
+            "status=\(safeToolStatus(result))",
+        ]
+        if let target = firstString(input, keys: ["text", "field", "target"]) {
+            parts.append("targetChars=\(target.count)")
+            parts.append("targetHash=\(auditHash(target))")
+        }
+        if let value = input["value"] as? String {
+            parts.append("valueChars=\(value.count)")
+            parts.append("valueHash=\(auditHash(value))")
+        }
+        if let url = input["url"] as? String {
+            parts.append("urlChars=\(url.count)")
+            parts.append("urlHash=\(auditHash(url))")
+        }
+        let canonical = canonicalAuditInput(input)
+        if !canonical.isEmpty {
+            parts.append("inputHash=\(auditHash(canonical))")
+        }
+        parts.append("resultChars=\(result.count)")
+        parts.append("resultHash=\(auditHash(result))")
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func sandboxTurnAuditDescriptor(_ text: String) -> String {
+        "status=message textChars=\(text.count) textHash=\(auditHash(text))"
+    }
+
+    nonisolated static func sandboxStalledAuditDescriptor(_ text: String) -> String {
+        "status=stalled textChars=\(text.count) textHash=\(auditHash(text))"
+    }
+
+    nonisolated static func sandboxGroundAuditDescriptor(_ detail: String) -> String {
+        "status=hit targetChars=\(detail.count) targetHash=\(auditHash(detail))"
+    }
+
+    nonisolated static func sandboxGroundMissAuditDescriptor(_ target: String) -> String {
+        "status=miss targetChars=\(target.count) targetHash=\(auditHash(target))"
+    }
+
+    nonisolated static func sandboxVerifyAuditDescriptor(status: String, detail: String) -> String {
+        "status=\(safeAuditToken(status)) resultChars=\(detail.count) resultHash=\(auditHash(detail))"
+    }
+
+    nonisolated static func sandboxDoneAuditDescriptor(
+        status: String,
+        acted: Bool,
+        detail: String? = nil,
+        detailName: String = "result"
+    ) -> String {
+        var parts = ["status=\(safeAuditToken(status))", "acted=\(acted)"]
+        if let detail {
+            let prefix = safeAuditToken(detailName)
+            parts.append("\(prefix)Chars=\(detail.count)")
+            parts.append("\(prefix)Hash=\(auditHash(detail))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated private static func firstString(_ input: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = input[key] as? String, !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    nonisolated private static func canonicalAuditInput(_ input: [String: Any]) -> String {
+        input.keys.sorted()
+            .map { key in "\(key)=\(String(describing: input[key] ?? ""))" }
+            .joined(separator: "\u{1f}")
+    }
+
+    nonisolated private static func safeToolStatus(_ result: String) -> String {
+        let lower = result.lowercased()
+        if lower.contains("unknown") || lower.contains(" needs ") || lower.hasPrefix("needs ")
+            || lower.contains("couldn't") || lower.contains("not found") {
+            return "error"
+        }
+        return "ok"
+    }
+
+    nonisolated private static func safeAuditToken(_ value: String) -> String {
+        let token = value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+        }
+        return token.isEmpty ? "unknown" : token
+    }
+
+    nonisolated private static func auditHash(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 
     /// What a finished model turn means, BEFORE page-verification. Kept pure (no I/O)

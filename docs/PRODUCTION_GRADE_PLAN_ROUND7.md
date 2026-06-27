@@ -54,6 +54,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/SandboxKit/BackgroundWebAgent.swift`
 - Build: Replace `argSummary`, `sandbox.act` type/open rows, `sandbox.tool`, `sandbox.turn`, `sandbox.ground`, `sandbox.ground.miss`, `sandbox.verify`, and `sandbox.done` detail strings with safe descriptors: action kind, char counts, URL hash, target hash, result hash, and status. Keep the raw final result in the user-facing update/result channel, not in audit detail.
 - Test: Run synthetic sandbox actions/tool calls containing a unique URL, field label, typed value, and final finding. Assert emitted audit details contain hashes/counts/status and do not contain the raw URL, label, typed value, or finding text.
+- Status: Fixed 2026-06-26 with sandbox action/tool/turn/ground/verify/done audit descriptors that store counts, status, and SHA-256 hash prefixes while preserving raw result text only in live update/result channels.
 - Risk: med
 - Seq: SEQ-07/SEQ-14
 

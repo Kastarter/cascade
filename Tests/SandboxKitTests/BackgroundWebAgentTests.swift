@@ -112,6 +112,44 @@ func sandboxHarnessAuditUsesRecallSafeDescriptor() {
     #expect(!harness.contains(phrase))
 }
 
+@Test
+func backgroundWebAuditDescriptorsNeverPersistSandboxRawValues() {
+    let url = "https://example.invalid/private/path?token=P7_06_UNIQUE_URL"
+    let fieldLabel = "P7_06 Unique Field Label"
+    let typedValue = "P7_06 typed value should never persist"
+    let finalFinding = "P7_06 final finding with sensitive answer text"
+    let toolResult = "Filled \(fieldLabel) with \(typedValue); \(finalFinding)"
+
+    let details = [
+        BackgroundWebAgent.sandboxActionAuditDescriptor(.openURL(url)),
+        BackgroundWebAgent.sandboxActionAuditDescriptor(.type(typedValue)),
+        BackgroundWebAgent.sandboxToolAuditDescriptor(
+            name: "fill_field",
+            input: ["field": fieldLabel, "value": typedValue, "url": url],
+            result: toolResult
+        ),
+        BackgroundWebAgent.sandboxTurnAuditDescriptor("Typed \(typedValue) into \(fieldLabel)"),
+        BackgroundWebAgent.sandboxStalledAuditDescriptor("Stalled after \(typedValue); \(finalFinding)"),
+        BackgroundWebAgent.sandboxGroundAuditDescriptor("matched \(fieldLabel)"),
+        BackgroundWebAgent.sandboxGroundMissAuditDescriptor(fieldLabel),
+        BackgroundWebAgent.sandboxVerifyAuditDescriptor(status: "verified", detail: finalFinding),
+        BackgroundWebAgent.sandboxDoneAuditDescriptor(status: "finished", acted: true, detail: finalFinding),
+    ]
+    let combined = details.joined(separator: "\n")
+
+    #expect(combined.contains("urlHash="))
+    #expect(combined.contains("targetHash="))
+    #expect(combined.contains("valueChars=\(typedValue.count)"))
+    #expect(combined.contains("resultHash="))
+    #expect(combined.contains("status=stalled"))
+    #expect(combined.contains("status=finished"))
+    #expect(combined.contains("acted=true"))
+
+    for raw in [url, fieldLabel, typedValue, finalFinding, toolResult] {
+        #expect(!combined.contains(raw))
+    }
+}
+
 // MARK: - Efficiency parity: state-change classification gates both circuit-breakers
 
 @Test
