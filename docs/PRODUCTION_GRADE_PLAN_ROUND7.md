@@ -45,6 +45,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/AppShell/CascadeAppModel.swift`
 - Build: Keep raw labels in the prompt nudge if the agent needs them to re-ground, but change audit detail for `assist.noeffect`, `agent.ground.miss`, and `scout.ocr.marks` to counts plus hashes. Examples: `labelsHash`, `coordsHash`, `ocrMarksHash`, `controlCount`, `ocrLineCount`, and the turn number. Do not store `interactableSummary`, `located`, missed target text, frontmost window title, or Set-of-Marks text verbatim in audit rows.
 - Test: Feed fake controls/OCR marks containing a unique sensitive phrase through the no-effect and OCR mark paths. Assert the next model note can still include the phrase when needed, but appended audit rows contain only counts/hashes and never the raw labels or OCR text.
+- Status: Fixed 2026-06-26 with safe audit descriptor helpers for no-effect, ground-miss, and OCR mark rows; model nudges still receive raw labels/marks for re-grounding, while audit details store only counts and SHA-256 hash prefixes.
 - Risk: med
 - Seq: SEQ-03/SEQ-07/SEQ-14
 

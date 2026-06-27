@@ -4,6 +4,7 @@ import ApplicationServices
 import CascadeMemory
 import Combine
 import ComputerUseKit
+import CryptoKit
 import Foundation
 import ImageIO
 import MacContextKit
@@ -1537,13 +1538,19 @@ public final class CascadeAppModel: ObservableObject {
                 } else {
                     noEffectTurns += 1
                     if noEffectTurns >= 3 {
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout — 3rd no-effect, stopping"))
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent", action: "assist.noeffect",
+                            detail: Self.assistNoEffectAuditDetail(turn: count, status: "scout-stopping", noEffectStreak: noEffectTurns)
+                        ))
                         return await scoutEnd(.stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way."), "noeffect-stall")
                     }
                     // The controls list is PUSHED proactively into turnNote below
                     // (harvested once), so the nudge just steers — no second AX walk.
                     nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "scout no-effect turn \(count)"))
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent", action: "assist.noeffect",
+                        detail: Self.assistNoEffectAuditDetail(turn: count, status: "scout-no-effect", noEffectStreak: noEffectTurns)
+                    ))
                 }
             } else if actedThisTurn, expectsChange {
                 noEffectTurns = 0
@@ -1564,8 +1571,15 @@ public final class CascadeAppModel: ObservableObject {
             // path above is skipped). Tells Scout to re-describe instead of silently
             // re-naming an un-findable target, and audits what was actually on screen.
             if let missed = agent.lastGroundMiss {
-                let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground.miss", detail: "“\(missed)” — frontmost \(front); on screen: \(String((controlSummary ?? "(no AX controls)").prefix(200)))"))
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent", action: "agent.ground.miss",
+                    detail: Self.groundMissAuditDetail(
+                        turn: count,
+                        missedTarget: missed,
+                        controlCount: controls.count,
+                        labels: controlSummary
+                    )
+                ))
                 let missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name a VISIBLE field, button, or placeholder from the controls listed below (or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
                 nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
             }
@@ -1576,7 +1590,7 @@ public final class CascadeAppModel: ObservableObject {
             // OCR the live frame and hand Scout the on-screen text as nameable targets
             // so it stops ASSUMING what's on the page. Mirrors the AX controls push —
             // structural, gated to sparse-AX turns, off-main so it doesn't stall the loop.
-            let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count)
+            let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count, turn: count)
             let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             step = await agent.proceed(
@@ -1876,11 +1890,17 @@ public final class CascadeAppModel: ObservableObject {
                    !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
                     // The effect just rendered late — the action DID work.
                     noEffectTurns = 0
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) re-check cleared (slow render)"))
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent", action: "assist.noeffect",
+                        detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
+                    ))
                 } else {
                     noEffectTurns += 1
                     if noEffectTurns >= 3 {
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) — 3rd no-effect, stopping"))
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent", action: "assist.noeffect",
+                            detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "stopping", noEffectStreak: noEffectTurns)
+                        ))
                         auditTiming(outcome: "stalled-noeffect")
                         return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
                     }
@@ -1897,10 +1917,27 @@ public final class CascadeAppModel: ObservableObject {
                         // tell it to re-aim with click_target by name.
                         if let summary = AXElementResolver.interactableSummary(controls) {
                             nudge! += " The controls actually on screen right now are: \(summary). Name one of THESE with click_target (by its label or role) — if what you wanted isn't listed, it isn't a clickable control here, so open the right menu/panel or take another route."
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) labels (structural): \(String(summary.prefix(700)))"))
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent", action: "assist.noeffect",
+                                detail: Self.assistNoEffectAuditDetail(
+                                    turn: count + 1,
+                                    status: "pushed-labels-structural",
+                                    noEffectStreak: noEffectTurns,
+                                    controlCount: controls.count,
+                                    labels: summary
+                                )
+                            ))
                         } else {
                             nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls, structural)"))
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent", action: "assist.noeffect",
+                                detail: Self.assistNoEffectAuditDetail(
+                                    turn: count + 1,
+                                    status: "no-controls-structural",
+                                    noEffectStreak: noEffectTurns,
+                                    controlCount: controls.count
+                                )
+                            ))
                         }
                     } else if let located = Self.groundingControls(controls, display: Self.displayBounds(of: screen), resW: size.width, resH: size.height) {
                         // Coordinate-level grounding: the model is poor at producing
@@ -1908,24 +1945,45 @@ public final class CascadeAppModel: ObservableObject {
                         // GUI-agent grounding>reasoning finding) — so hand it the
                         // exact x,y of each real control to click directly.
                         nudge! += " The controls actually on screen right now, with their click coordinates, are: \(located). Click one of THESE coordinates directly instead of guessing — if what you wanted isn't listed, it isn't a clickable control here, so open the right menu/panel or take another route."
-                        // Diagnostic: log the VERBATIM controls (labels + coords),
-                        // not just the count — so the audit reveals whether canvas
-                        // placeholders (e.g. a Keynote subtitle box) are actually in
-                        // the AX list, which decides whether structural snap-on-no-
-                        // effect is viable or the canvas needs a real visual grounder.
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) w/ coords: \(String(located.prefix(700)))"))
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent", action: "assist.noeffect",
+                            detail: Self.assistNoEffectAuditDetail(
+                                turn: count + 1,
+                                status: "pushed-coords",
+                                noEffectStreak: noEffectTurns,
+                                controlCount: controls.count,
+                                coords: located
+                            )
+                        ))
                     } else if let summary = AXElementResolver.interactableSummary(controls) {
                         nudge! += " The controls actually clickable on screen right now are: \(summary). Aim for one of these by sight — if what you wanted isn't in this list, it isn't clickable here, so open the right menu/panel or take another route."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) pushed \(controls.count) labels: \(String(summary.prefix(700)))"))
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent", action: "assist.noeffect",
+                            detail: Self.assistNoEffectAuditDetail(
+                                turn: count + 1,
+                                status: "pushed-labels",
+                                noEffectStreak: noEffectTurns,
+                                controlCount: controls.count,
+                                labels: summary
+                            )
+                        ))
                     } else {
                         nudge! += " Choose a DIFFERENT control, menu, or approach — or, if this can't be done, say so and stop."
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.noeffect", detail: "turn \(count + 1) left the screen unchanged (no AX controls to push)"))
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent", action: "assist.noeffect",
+                            detail: Self.assistNoEffectAuditDetail(
+                                turn: count + 1,
+                                status: "no-controls",
+                                noEffectStreak: noEffectTurns,
+                                controlCount: controls.count
+                            )
+                        ))
                     }
                     // Canvas perception parity with Scout: when AX is blind (Keynote
                     // slide canvas, Blender), OCR the frame and hand Opus the on-screen
                     // TEXT as nameable targets too — gated to sparse-AX NATIVE surfaces
                     // (browsers excluded) inside ocrSetOfMarks.
-                    if let ocr = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count) {
+                    if let ocr = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count, turn: count + 1) {
                         nudge! += "\n" + ocr
                     }
                 }
@@ -2143,7 +2201,7 @@ public final class CascadeAppModel: ObservableObject {
     /// the structural fix for "the planner assumes what's on the page". ON by default
     /// (it fires only where AX is blind, so it's purely additive there); disable with
     /// `cascade.ocrSetOfMarks = false`. Audited as `scout.ocr.marks`.
-    private func ocrSetOfMarks(forFrame frame: Data, axControlCount: Int) async -> String? {
+    private func ocrSetOfMarks(forFrame frame: Data, axControlCount: Int, turn: Int) async -> String? {
         // Browsers are text-heavy and DOM-native (the background agent owns the web),
         // so OCR there dumps page text as noise. Fire only on canvas / non-AX NATIVE
         // surfaces (Keynote slide canvas, Blender) where the planner is truly blind.
@@ -2155,8 +2213,76 @@ public final class CascadeAppModel: ObservableObject {
         guard let marks = ScreenTextRecognizer.setOfMarks(boxes) else { return nil }
         _ = try? await store.appendAudit(AuditEvent(
             actor: "agent", action: "scout.ocr.marks",
-            detail: "AX sparse (\(axControlCount) controls) → \(boxes.count) OCR lines: \(String(marks.prefix(360)))"))
+            detail: Self.ocrMarksAuditDetail(
+                turn: turn,
+                axControlCount: axControlCount,
+                ocrLineCount: boxes.count,
+                marks: marks
+            )
+        ))
         return marks
+    }
+
+    nonisolated static func assistNoEffectAuditDetail(
+        turn: Int,
+        status: String,
+        noEffectStreak: Int,
+        controlCount: Int? = nil,
+        labels: String? = nil,
+        coords: String? = nil,
+        ocrLineCount: Int = 0,
+        ocrMarks: String? = nil
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "status=\(safeAuditToken(status))",
+            "noEffectStreak=\(noEffectStreak)",
+            "controlCount=\(controlCount.map(String.init) ?? "not-collected")",
+            "labelsHash=\(auditHash(labels))",
+            "coordsHash=\(auditHash(coords))",
+            "ocrLineCount=\(ocrLineCount)",
+            "ocrMarksHash=\(auditHash(ocrMarks))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func groundMissAuditDetail(
+        turn: Int,
+        missedTarget: String,
+        controlCount: Int,
+        labels: String?
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "missedTargetHash=\(auditHash(missedTarget))",
+            "controlCount=\(controlCount)",
+            "labelsHash=\(auditHash(labels))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func ocrMarksAuditDetail(
+        turn: Int,
+        axControlCount: Int,
+        ocrLineCount: Int,
+        marks: String
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "controlCount=\(axControlCount)",
+            "ocrLineCount=\(ocrLineCount)",
+            "ocrMarksHash=\(auditHash(marks))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func auditHash(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "none" }
+        return SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private nonisolated static func safeAuditToken(_ value: String) -> String {
+        let token = value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+        }
+        return token.isEmpty ? "unknown" : token
     }
 
     /// AX is "sparse" — a canvas / non-AX surface where the accessibility tree
