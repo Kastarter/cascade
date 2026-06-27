@@ -3,7 +3,7 @@
 ## Findings
 
 - P5-02 (fixed): `AgentTraceBuilder` now exports a safe `assist.task#audit-<id>` root goal reference instead of raw `assist.task` detail, keeping OTel root objects free of user task text.
-- P5-03: `AXElementResolver.frame(of:)` force-casts `kAXPositionAttribute` and `kAXSizeAttribute` values to `AXValue` without checking the CF type first. A malformed or buggy AX provider can crash replay/grounding instead of returning `nil`.
+- P5-03 (fixed): `AXElementResolver.frame(of:)` now decodes position/size through AXValue type-checked helpers, so malformed AX providers return `nil` instead of crashing replay/grounding.
 
 ## Scope Notes
 

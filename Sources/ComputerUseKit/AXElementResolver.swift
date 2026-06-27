@@ -504,13 +504,29 @@ public enum AXElementResolver {
     /// Element frame in CG global (top-left) coordinates.
     private static func frame(of element: AXUIElement) -> CGRect? {
         var ref: CFTypeRef?
-        var position = CGPoint.zero
-        var size = CGSize.zero
         guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &ref) == .success,
-              let posValue = ref, AXValueGetValue(posValue as! AXValue, .cgPoint, &position) else { return nil }
+              let position = decodeAXPoint(ref) else { return nil }
         ref = nil
         guard AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &ref) == .success,
-              let sizeValue = ref, AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else { return nil }
+              let size = decodeAXSize(ref) else { return nil }
         return CGRect(origin: position, size: size)
+    }
+
+    static func decodeAXPoint(_ ref: CFTypeRef?) -> CGPoint? {
+        guard let value = ref,
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = value as! AXValue
+        var point = CGPoint.zero
+        guard AXValueGetValue(axValue, .cgPoint, &point) else { return nil }
+        return point
+    }
+
+    static func decodeAXSize(_ ref: CFTypeRef?) -> CGSize? {
+        guard let value = ref,
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = value as! AXValue
+        var size = CGSize.zero
+        guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
+        return size
     }
 }

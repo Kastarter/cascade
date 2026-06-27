@@ -1,3 +1,4 @@
+import ApplicationServices
 import CascadeMemory
 import Foundation
 import Testing
@@ -30,6 +31,24 @@ struct AXElementResolverTests {
 
     @Test func normalizeCollapsesWhitespaceAndCase() {
         #expect(AXElementResolver.normalize("  Send\n  Message ") == "send message")
+    }
+
+    @Test func decodeAXPointAcceptsOnlyAXPointValues() {
+        var point = CGPoint(x: 12.5, y: -4.25)
+        let value = AXValueCreate(.cgPoint, &point)
+
+        #expect(AXElementResolver.decodeAXPoint(value) == point)
+        #expect(AXElementResolver.decodeAXPoint("not an AXValue" as CFString) == nil)
+        #expect(AXElementResolver.decodeAXPoint(NSNumber(value: 7)) == nil)
+    }
+
+    @Test func decodeAXSizeAcceptsOnlyAXSizeValues() {
+        var size = CGSize(width: 640.5, height: 480.25)
+        let value = AXValueCreate(.cgSize, &size)
+
+        #expect(AXElementResolver.decodeAXSize(value) == size)
+        #expect(AXElementResolver.decodeAXSize("not an AXValue" as CFString) == nil)
+        #expect(AXElementResolver.decodeAXSize(NSNumber(value: 7)) == nil)
     }
 
     // MARK: - B1 ranked locator: rank(recorded:candidate:)

@@ -213,10 +213,8 @@ enum AXClickSnap {
         guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionRef) == .success,
               AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
               let positionRef, let sizeRef else { return nil }
-        var origin = CGPoint.zero
-        var size = CGSize.zero
-        guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
-              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size),
+        guard let origin = AXElementResolver.decodeAXPoint(positionRef),
+              let size = AXElementResolver.decodeAXSize(sizeRef),
               size.width > 1, size.height > 1,
               size.width <= maxElementSize.width, size.height <= maxElementSize.height else { return nil }
         let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)

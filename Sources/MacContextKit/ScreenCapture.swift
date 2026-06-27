@@ -203,10 +203,8 @@ public enum ScreenCaptureUtility {
         guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
               AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
               let positionRef, let sizeRef else { return nil }
-        var origin = CGPoint.zero
-        var size = CGSize.zero
-        guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
-              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size),
+        guard let origin = decodeAXPoint(positionRef),
+              let size = decodeAXSize(sizeRef),
               size.width > 1, size.height > 1 else { return nil }
 
         // AX coordinates are global top-left; CGDisplayBounds matches that space.
@@ -222,6 +220,24 @@ public enum ScreenCaptureUtility {
             width: windowRect.width / displayBounds.width,
             height: windowRect.height / displayBounds.height
         )
+    }
+
+    nonisolated static func decodeAXPoint(_ ref: CFTypeRef?) -> CGPoint? {
+        guard let value = ref,
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = value as! AXValue
+        var point = CGPoint.zero
+        guard AXValueGetValue(axValue, .cgPoint, &point) else { return nil }
+        return point
+    }
+
+    nonisolated static func decodeAXSize(_ ref: CFTypeRef?) -> CGSize? {
+        guard let value = ref,
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = value as! AXValue
+        var size = CGSize.zero
+        guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
+        return size
     }
 
     /// The display the cursor is on right now — lets the rewind recorder notice
