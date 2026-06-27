@@ -1631,6 +1631,94 @@ private struct WasteCard: View {
     }
 }
 
+private struct ProactiveNextActionCard: View {
+    let prediction: NextActionPredictor.Prediction
+    let onDismiss: () -> Void
+
+    var body: some View {
+        CascadePanel {
+            HStack(alignment: .top, spacing: CascadeMetrics.s3) {
+                Image(systemName: "sparkle.magnifyingglass")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(Color.cascadeAgent)
+                    .frame(width: 34, height: 34)
+                    .background(Color.cascadeAgent.opacity(0.12), in: Circle())
+                VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Likely next action").font(.cascadeSans(15, .semibold))
+                        CascadeTag("PROACTIVE", tone: .cascadeAgent)
+                        Spacer()
+                    }
+                    Text("Cascade expects you may \(actionText).")
+                        .font(.cascadeSans(13))
+                        .foregroundStyle(Color.cascadeText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Evidence: seen \(prediction.support)x after this recent sequence · \(confidenceText) confidence.")
+                        .font(.cascadeSans(12))
+                        .foregroundStyle(Color.cascadeText3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Spacer()
+                        Button(action: onDismiss) {
+                            Label("Dismiss", systemImage: "xmark")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.cascadeText3)
+                    }
+                }
+            }
+        }
+    }
+
+    private var confidenceText: String {
+        "\(Int((prediction.confidence * 100).rounded()))%"
+    }
+
+    private var actionText: String {
+        let parts = prediction.token.split(separator: "@", maxSplits: 1).map(String.init)
+        let action = parts.first ?? prediction.token
+        let appSuffix = parts.count > 1 ? " in \(parts[1])" : ""
+        if action.hasPrefix("click:") {
+            return "click \(cleanLabel(String(action.dropFirst("click:".count))))\(appSuffix)"
+        }
+        if action.hasPrefix("doubleClick:") {
+            return "double-click \(cleanLabel(String(action.dropFirst("doubleClick:".count))))\(appSuffix)"
+        }
+        if action.hasPrefix("rightClick:") {
+            return "right-click \(cleanLabel(String(action.dropFirst("rightClick:".count))))\(appSuffix)"
+        }
+        if action.hasPrefix("key:") {
+            return "press \(cleanKey(String(action.dropFirst("key:".count))))\(appSuffix)"
+        }
+        if action == "type" {
+            return "type\(appSuffix)"
+        }
+        if action == "scroll" {
+            return "scroll\(appSuffix)"
+        }
+        return "continue with \(action)\(appSuffix)"
+    }
+
+    private func cleanLabel(_ label: String) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == "unlabeled" ? "the next control" : "\"\(trimmed)\""
+    }
+
+    private func cleanKey(_ key: String) -> String {
+        key.split(separator: "+")
+            .map { part in
+                switch part.lowercased() {
+                case "command": return "Command"
+                case "control": return "Control"
+                case "option": return "Option"
+                case "shift": return "Shift"
+                default: return String(part).capitalized
+                }
+            }
+            .joined(separator: " + ")
+    }
+}
+
 private struct AgentCard: View {
     let agent: CascadeAgent
     var flash: Bool = false
@@ -1808,8 +1896,10 @@ private struct ManagerScreen: View {
     /// Cascade caught, each judged and named by the curator. Approve to land a ready
     /// agent in the employee's Cascades; dismiss to never see it again.
     private var reviewQueueSection: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(model.pendingCuratedAgents.count) pending")
+        let hasProactiveOffer = model.proactiveNextActionOffer != nil
+        let pendingCount = model.pendingCuratedAgents.count + (hasProactiveOffer ? 1 : 0)
+        return VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(pendingCount) pending")
             if let note = model.managerReviewNote {
                 HStack(spacing: CascadeMetrics.s2) {
                     Image(systemName: "checkmark.seal.fill")
@@ -1822,7 +1912,13 @@ private struct ManagerScreen: View {
                 .background(Color.cascadeAgent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .transition(.opacity)
             }
-            if model.pendingCuratedAgents.isEmpty {
+            if let offer = model.proactiveNextActionOffer {
+                ProactiveNextActionCard(
+                    prediction: offer,
+                    onDismiss: { model.dismissProactiveNextActionOffer() }
+                )
+            }
+            if model.pendingCuratedAgents.isEmpty && !hasProactiveOffer {
                 CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
             } else {
                 ForEach(model.pendingCuratedAgents) { curated in

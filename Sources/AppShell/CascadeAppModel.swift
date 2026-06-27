@@ -84,6 +84,10 @@ public final class CascadeAppModel: ObservableObject {
         didSet { Self.persist(dismissedWasteSignatures, key: Self.dismissedWasteKey, defaults: defaultsStore) }
     }
     private static let dismissedWasteKey = "cascade.dismissedWaste"
+    @Published private var dismissedNextActionOfferKeys: Set<String> {
+        didSet { Self.persist(dismissedNextActionOfferKeys, key: Self.dismissedNextActionOffersKey, defaults: defaultsStore) }
+    }
+    static let dismissedNextActionOffersKey = "cascade.dismissedNextActionOffers"
 
     private static func persist(_ values: Set<String>, key: String, defaults: UserDefaults) {
         // Capped so years of declines can't grow the defaults plist unbounded.
@@ -312,6 +316,7 @@ public final class CascadeAppModel: ObservableObject {
         cuEffort = "medium"
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
+        dismissedNextActionOfferKeys = Self.restoreSet(key: Self.dismissedNextActionOffersKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(
             store: store,
@@ -3615,13 +3620,25 @@ public final class CascadeAppModel: ObservableObject {
         case .type:
             return "type@\(appKey)"
         case .click, .doubleClick, .rightClick:
-            let label = [event.targetDescriptor, event.text]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { !$0.isEmpty } ?? "unlabeled"
+            let label = nextActionClickLabel(for: event)
             return "\(event.kind.rawValue):\(label)@\(appKey)"
         case .scroll:
             return "scroll@\(appKey)"
         }
+    }
+
+    private nonisolated static func nextActionClickLabel(for event: InputEvent) -> String {
+        if let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            return text
+        }
+        if let label = AXTargetDescriptorV2.decode(event.targetDescriptor)?.label.trimmingCharacters(in: .whitespacesAndNewlines),
+           !label.isEmpty {
+            return label
+        }
+        if let descriptor = event.targetDescriptor?.trimmingCharacters(in: .whitespacesAndNewlines), !descriptor.isEmpty {
+            return descriptor
+        }
+        return "unlabeled"
     }
 
     public nonisolated static func userIsActivelyTyping(events: [InputEvent], now: Date, window: TimeInterval = 6) -> Bool {
@@ -3637,8 +3654,14 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func dismissProactiveNextActionOffer() {
+        guard let offer = proactiveNextActionOffer else { return }
+        dismissedNextActionOfferKeys.insert(Self.nextActionOfferDismissalKey(for: offer.token))
         proactiveNextActionOffer = nil
         recentNextActionDismissals += 1
+    }
+
+    static func nextActionOfferDismissalKey(for token: String) -> String {
+        AuditIdentity.hash("next-action:\(token)")
     }
 
     private func refreshProactiveNextActionOffer(now: Date) async {
@@ -3651,6 +3674,10 @@ public final class CascadeAppModel: ObservableObject {
             recentDismissals: recentNextActionDismissals,
             userIsActivelyTyping: Self.userIsActivelyTyping(events: orderedEvents, now: now)
         )
+        if let offer, dismissedNextActionOfferKeys.contains(Self.nextActionOfferDismissalKey(for: offer.token)) {
+            proactiveNextActionOffer = nil
+            return
+        }
         proactiveNextActionOffer = offer
         if offer != nil {
             lastNextActionOfferAt = now
