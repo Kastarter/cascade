@@ -1,6 +1,12 @@
 import ApplicationServices
 import Foundation
 
+func decodeAXElement(_ ref: CFTypeRef?) -> AXUIElement? {
+    guard let value = ref,
+          CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return value as! AXUIElement
+}
+
 /// Harvests the *exact* text of the focused window through the Accessibility
 /// tree — the text channel that no resolution cap or OCR error can touch. For
 /// native apps this is character-perfect; for canvas/web apps it returns little
@@ -31,7 +37,11 @@ public enum AXTextHarvester {
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
               let focusedRef else { return "" }
-        let window = focusedRef as! AXUIElement
+        return text(forFocusedWindowRef: focusedRef)
+    }
+
+    static func text(forFocusedWindowRef focusedRef: CFTypeRef?) -> String {
+        guard let window = decodeAXElement(focusedRef) else { return "" }
 
         var lines: [String] = []
         var seen = Set<String>()

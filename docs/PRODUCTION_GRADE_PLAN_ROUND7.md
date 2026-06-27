@@ -72,6 +72,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/MacContextKit/AXTextHarvester.swift`; `/Users/khalidsh/Humain/cascade/Sources/MacContextKit/MacContextKit.swift`; `/Users/khalidsh/Humain/cascade/Sources/MacContextKit/ScreenCapture.swift`
 - Build: Add or reuse a tiny `decodeAXElement(_ ref: CFTypeRef?) -> AXUIElement?` helper that checks `CFGetTypeID(ref) == AXUIElementGetTypeID()` before casting. Replace the remaining unguarded `focusedRef as! AXUIElement` / `focused as! AXUIElement` sites. Leave already-guarded casts alone.
 - Test: Unit-test the helper with a real `AXUIElement`, `nil`, and non-AX CF values such as `CFString`. Add coverage around focused-window title/text/normalized-rect helpers using injected decode inputs or a small internal helper so malformed providers return nil/empty instead of trapping.
+- Status: Fixed 2026-06-26 with a shared AX element decoder and malformed focused-window helper tests.
 - Risk: med
 - Seq: SEQ-09/SEQ-29
 

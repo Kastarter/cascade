@@ -196,8 +196,11 @@ public enum ScreenCaptureUtility {
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
               let focusedRef else { return nil }
-        let window = focusedRef as! AXUIElement
+        return focusedWindowNormalizedRect(focusedWindowRef: focusedRef)
+    }
 
+    static func focusedWindowNormalizedRect(focusedWindowRef: CFTypeRef?) -> CGRect? {
+        guard let window = decodeAXElement(focusedWindowRef) else { return nil }
         var positionRef: CFTypeRef?
         var sizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,

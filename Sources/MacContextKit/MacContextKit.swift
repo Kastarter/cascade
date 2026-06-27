@@ -163,8 +163,13 @@ public final class AppWindowObserver: ObservableObject {
               let focused else {
             return nil
         }
+        return frontmostWindowTitle(focusedWindowRef: focused)
+    }
+
+    static func frontmostWindowTitle(focusedWindowRef focused: CFTypeRef?) -> String? {
+        guard let window = decodeAXElement(focused) else { return nil }
         var title: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(focused as! AXUIElement, kAXTitleAttribute as CFString, &title) == .success else {
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title) == .success else {
             return nil
         }
         return title as? String
