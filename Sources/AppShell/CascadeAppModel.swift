@@ -2336,10 +2336,9 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func safeFlightDelayMilliseconds(_ seconds: TimeInterval) -> Int {
         guard seconds.isFinite else { return 0 }
+        guard seconds > 0 else { return 0 }
+        if seconds >= 5 { return 5_000 }
         let milliseconds = (seconds * 1000).rounded()
-        guard milliseconds.isFinite else { return 0 }
-        if milliseconds <= 0 { return 0 }
-        if milliseconds >= 1_000 { return 1_000 }
         return Int(milliseconds)
     }
 

@@ -487,9 +487,12 @@ func watchedAppHarnessDenialPersistsHashedAppIdentity() async throws {
 func flightDelayMillisecondsRejectsNonFiniteAndClampsLargeValues() {
     #expect(CascadeAppModel.safeFlightDelayMilliseconds(.nan) == 0)
     #expect(CascadeAppModel.safeFlightDelayMilliseconds(.infinity) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(-.infinity) == 0)
     #expect(CascadeAppModel.safeFlightDelayMilliseconds(-1) == 0)
     #expect(CascadeAppModel.safeFlightDelayMilliseconds(0.245) == 245)
-    #expect(CascadeAppModel.safeFlightDelayMilliseconds(60) == 1_000)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(2.5) == 2_500)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(60) == 5_000)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(.greatestFiniteMagnitude) == 5_000)
 }
 
 private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> DetectedWaste {
