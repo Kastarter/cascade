@@ -797,17 +797,28 @@ public final class BackgroundWebAgent {
     /// Maps a Computer Use action onto the web sandbox. The agent works in bottom-left
     /// AppKit coordinates; the page wants top-left, so y is flipped.
     private func apply(_ action: CUAction) async {
-        func topLeftY(_ y: Double) -> CGFloat { WebSandbox.height - CGFloat(y) }
         switch action {
         case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y), .tripleClick(let x, let y):
-            audit("sandbox.act", "click (\(Int(x)),\(Int(topLeftY(y))))")
-            await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: topLeftY(y))
+            guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("click"))
+                return
+            }
+            audit("sandbox.act", "click (\(point.x),\(point.y))")
+            await sandbox.click(xTopLeft: CGFloat(point.x), yTopLeft: CGFloat(point.y))
         case .drag(_, _, let toX, let toY):
             // No real drag in the JS bridge — landing on the destination is the
             // closest meaningful approximation.
-            await sandbox.click(xTopLeft: CGFloat(toX), yTopLeft: topLeftY(toY))
+            guard let point = Self.sandboxTopLeftPoint(x: toX, y: toY) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("drag"))
+                return
+            }
+            await sandbox.click(xTopLeft: CGFloat(point.x), yTopLeft: CGFloat(point.y))
         case .move(let x, let y):
-            await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: topLeftY(y))
+            guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("move"))
+                return
+            }
+            await sandbox.moveCursor(toTopLeftX: CGFloat(point.x), y: CGFloat(point.y))
         case .type(let text):
             audit("sandbox.act", "type \"\(text.prefix(40))\"")
             await sandbox.typeText(text)
@@ -815,8 +826,11 @@ public final class BackgroundWebAgent {
             audit("sandbox.act", "key \(combo)")
             await sandbox.pressKey(combo)
         case .scroll(_, _, let direction, let amount):
-            let magnitude = CGFloat(max(1, amount)) * 120
-            await sandbox.scroll(dy: direction.lowercased() == "up" ? -magnitude : magnitude)
+            guard let delta = Self.sandboxScrollDelta(direction: direction, amount: amount) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("scroll"))
+                return
+            }
+            await sandbox.scroll(dy: CGFloat(delta))
         case .wait:
             try? await Task.sleep(for: .milliseconds(600))
         case .screenshot, .zoom:
@@ -830,6 +844,23 @@ public final class BackgroundWebAgent {
             await sandbox.navigate(to: urlString)
             try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
         }
+    }
+
+    nonisolated static func sandboxTopLeftPoint(x: Double, y: Double) -> (x: Int, y: Int)? {
+        guard x.isFinite, y.isFinite else { return nil }
+        let topLeftY = CGFloat(SandboxCoordinate.pageMaxY) - CGFloat(y)
+        return SandboxCoordinate.pagePoint(x: CGFloat(x), y: topLeftY)
+    }
+
+    nonisolated static func sandboxScrollDelta(direction: String, amount: Int) -> Int? {
+        guard amount < Int.max / 120 else { return nil }
+        let magnitude = CGFloat(max(1, amount)) * 120
+        let signed = direction.lowercased() == "up" ? -magnitude : magnitude
+        return SandboxCoordinate.scrollDelta(signed)
+    }
+
+    nonisolated static func invalidCoordinateDetail(_ action: String) -> String {
+        "invalid-coordinate action=\(action)"
     }
 
     /// A short readable summary of a tool's input for the audit trail.

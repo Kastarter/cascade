@@ -113,3 +113,24 @@ func realActionsCountAsStateChange() {
     #expect(BackgroundWebAgent.isStateChanging(.openURL("https://example.com")))
     #expect(BackgroundWebAgent.isStateChanging(.key("return")))
 }
+
+@Test
+func backgroundWebAgentRejectsInvalidCoordinateFormatting() {
+    let invalid = [Double.nan, .infinity, -.infinity, 1_000_000_000]
+    for value in invalid {
+        #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: value, y: 10) == nil)
+        #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: 10, y: value) == nil)
+    }
+
+    #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: 10.8, y: 20.2)?.x == 10)
+    #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: 10.8, y: 20.2)?.y == 539)
+    #expect(BackgroundWebAgent.invalidCoordinateDetail("click") == "invalid-coordinate action=click")
+}
+
+@Test
+func backgroundWebAgentScrollFormattingIsBounded() {
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: 2) == 240)
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "up", amount: 2) == -240)
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: Int.max) == nil)
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: 1_000_000_000) == nil)
+}

@@ -301,9 +301,9 @@ public final class ScoutAgent {
         var grounded: [Int: CGPoint] = [:]
         var logs: [String] = []
         for r in groundResults.sorted(by: { $0.idx < $1.idx }) {
-            if let p = r.point {
-                grounded[r.idx] = p
-                logs.append("hit \"\(r.target)\" @ (\(Int(p.x)),\(Int(p.y)))")
+            if let p = r.point, let safePoint = Self.safeGroundedPoint(p, displayWidth: dw, displayHeight: dh) {
+                grounded[r.idx] = safePoint
+                logs.append("hit \"\(r.target)\" @ (\(Int(safePoint.x)),\(Int(safePoint.y)))")
             } else {
                 if lastGroundMiss == nil { lastGroundMiss = r.target }
                 logs.append("miss \"\(r.target)\"")
@@ -426,6 +426,22 @@ public final class ScoutAgent {
             guard let point = groundedPoint else { return [] }
             return ComputerUseAgent.fillActions(at: point, text: text, double: a.click != "single", submit: "return")
         }
+    }
+
+    nonisolated private static func safeGroundedPoint(
+        _ point: CGPoint,
+        displayWidth: Int,
+        displayHeight: Int
+    ) -> CGPoint? {
+        guard point.x.isFinite, point.y.isFinite,
+              point.x >= 0, point.y >= 0 else { return nil }
+        if displayWidth > 0 {
+            guard point.x <= CGFloat(displayWidth) else { return nil }
+        }
+        if displayHeight > 0 {
+            guard point.y <= CGFloat(displayHeight) else { return nil }
+        }
+        return point
     }
 
     nonisolated private static func historyLine(_ a: ScoutAction) -> String {

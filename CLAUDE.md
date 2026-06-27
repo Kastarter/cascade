@@ -24,6 +24,9 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): P7-01 fixed web sandbox coordinate formatting with finite/range guards before JS/audit conversion; invalid click/scroll/move/drag values no-op with sanitized `invalid-coordinate` audit from background runs.
+- NEW (2026-06-26): P7-01 follow-up: web DOM grounding parser also rejects non-finite/out-of-bounds resolver output, and `ScoutAgent` drops invalid grounder points before `Int` log/action formatting.
+- NEW (2026-06-26): Round 7 convergence sweep is in `docs/PRODUCTION_GRADE_PLAN_ROUND7.md`; remaining high-confidence work is finite-safe model/web coordinate labeling plus audit/detail hashing for harness, recall, sandbox, app-shell, and local-driver paths, and unguarded focused-window AX casts.
 - NEW (2026-06-26): P6-03 makes `WebStateSignature.description` hash URL/title/active element identity so diagnostics do not print raw page identity.
 - NEW (2026-06-26): P5-03 hardens `AXElementResolver.frame(of:)`: AX position/size decode now requires AXValue type IDs and malformed CF values fail closed.
 - NEW (2026-06-26): Round 4 safe-integration plan is in `docs/PRODUCTION_GRADE_PLAN_ROUND4.md`; theme is default-off wiring for standalone modules into recorder/store/planner/ranking/grounding paths without shipped behavior changes.
