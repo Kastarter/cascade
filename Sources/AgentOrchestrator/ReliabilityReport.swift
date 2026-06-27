@@ -96,7 +96,7 @@ public enum ReliabilityRunner {
         )
     }
 
-    private static func terminalStatus(_ action: RecoveryAction) -> ScenarioStatus {
+    static func terminalStatus(_ action: RecoveryAction) -> ScenarioStatus {
         switch action {
         case .refuse: .refused
         case .stop: .userStop
@@ -116,7 +116,32 @@ public struct ReliabilityReport: Sendable {
 
     public init(_ outcomes: [ScenarioOutcome]) { self.outcomes = outcomes }
 
+    public static func fromTraces(_ traces: [AgentTrace]) -> ReliabilityReport {
+        ReliabilityReport(traces.map(\.scenarioOutcome))
+    }
+
     public var total: Int { outcomes.count }
+    public var totalRetries: Int { outcomes.reduce(0) { $0 + $1.retries } }
+
+    public var successRatesBySurface: [String: Double] {
+        Dictionary(grouping: outcomes, by: \.surface).mapValues { surfaceOutcomes in
+            guard !surfaceOutcomes.isEmpty else { return 1.0 }
+            return Double(surfaceOutcomes.filter { $0.status == .success }.count) / Double(surfaceOutcomes.count)
+        }
+    }
+
+    public var failureCountsByKind: [AgentFailureKind: Int] {
+        outcomes.reduce(into: [:]) { counts, outcome in
+            guard let failure = outcome.failureKind else { return }
+            counts[failure, default: 0] += 1
+        }
+    }
+
+    public var retriesBySurface: [String: Int] {
+        Dictionary(grouping: outcomes, by: \.surface).mapValues { surfaceOutcomes in
+            surfaceOutcomes.reduce(0) { $0 + $1.retries }
+        }
+    }
 
     /// Fraction of *clean* runs (no injected failure) that succeeded — the core
     /// "does the happy path work" number.

@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-27): D-10 adds a DEFAULT-OFF ReliabilityReport live-trace adapter; `ReliabilityReport.fromTraces(_:)` uses `AgentTrace.scenarioOutcome` for root status, failure kind, step/tool counts, and retry counts while relying on the existing opt-in trace assembly gate.
 - NEW (2026-06-27): D-09 teaches `AgentTraceBuilder` default-off trace assembly to root `sandbox.task` as `backgroundWeb` and explicit `recipe.run.started`/`recipe.run.ended` as `recipeReplay`; sandbox verifier/done failures and recipe pause events now surface failure kinds in opt-in traces.
 - NEW (2026-06-27): D-08 wires WorkGraph indexing through default-off `cascade.experimentalWorkGraphIndex`; enabled app recorders pass `ContextRecorder.Options(indexWorkGraph: true)` and `CascadeAppModel.graphTimeline(...)` exposes indexed entity timelines.
 - NEW (2026-06-27): D-06 wires `cascade.experimentalGroundingVerifier` into runtime `assistGrounder()` default-off; enabled mixture grounders reject/abstain bad candidates and audit `grounding.verifier` without posting computer actions.

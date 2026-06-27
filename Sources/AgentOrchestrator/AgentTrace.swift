@@ -115,6 +115,22 @@ public struct AgentTrace: Sendable, Equatable, Codable {
     public var durationMs: Int { spans.map { $0.startMs + $0.durationMs }.max() ?? 0 }
     public var failureKinds: [AgentFailureKind] { spans.compactMap(\.failureKind) }
     public var succeeded: Bool { spans.allSatisfy { $0.status == .ok } }
+    public var stepToolSpanCount: Int { spans.filter { $0.kind == .step || $0.kind == .tool }.count }
+    public var retryCount: Int { spans.reduce(0) { $0 + Self.retryCount(from: $1) } }
+
+    public var scenarioOutcome: ScenarioOutcome {
+        let root = spans.first { $0.kind == .run && $0.parentID == nil } ?? spans.first
+        let rootStatus = root?.status ?? (succeeded ? .ok : .error)
+        let failureKind = root?.failureKind ?? failureKinds.last
+        return ScenarioOutcome(
+            id: traceID,
+            surface: surface,
+            status: Self.scenarioStatus(rootStatus: rootStatus, failureKind: failureKind),
+            failureKind: failureKind,
+            stepsAttempted: stepToolSpanCount,
+            retries: retryCount
+        )
+    }
 
     // MARK: Exports
 
@@ -191,6 +207,37 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: options),
               let string = String(data: data, encoding: .utf8) else { return "{}" }
         return string
+    }
+
+    private static func scenarioStatus(rootStatus: TraceSpan.Status, failureKind: AgentFailureKind?) -> ScenarioStatus {
+        switch rootStatus {
+        case .ok:
+            return .success
+        case .error, .refused:
+            guard let failureKind else {
+                return rootStatus == .refused ? .refused : .failed
+            }
+            return ReliabilityRunner.terminalStatus(AgentRecoveryPolicy.plan(for: failureKind).terminal)
+        }
+    }
+
+    private static func retryCount(from span: TraceSpan) -> Int {
+        let explicitKeys = ["retries", "retry.count", "retry_count", "retryCount", "recovery.retries"]
+        for key in explicitKeys {
+            if let value = span.attributes[key].flatMap(Int.init) {
+                return max(0, value)
+            }
+        }
+        if span.attributes["recovery.action"] != nil {
+            return 1
+        }
+        if span.attributes.contains(where: { key, value in
+            key.lowercased().contains("retry") && ["1", "true", "yes"].contains(value.lowercased())
+        }) {
+            return 1
+        }
+        let name = span.name.lowercased()
+        return name.contains("retry") || name.contains("recovery") || name.contains("correction") ? 1 : 0
     }
 
 }
