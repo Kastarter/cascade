@@ -127,6 +127,18 @@ public final class WebSandbox: NSObject {
         return String(describing: result)
     }
 
+    /// Compact page state for no-effect detection. Returns `nil` when WebKit cannot
+    /// evaluate the snapshot script so callers can fall back without logging page text.
+    public func stateSignature() async -> WebStateSignature? {
+        do {
+            let result = try await webView.evaluateJavaScript(WebStateSignature.javaScriptSnippet)
+            guard let snapshot = result as? [String: Any] else { return nil }
+            return WebStateSignature(snapshot: snapshot)
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: - Action point (drives the native companion cursor in the watch box)
 
     /// The last page point (top-left coords) the agent acted on. The watch box reads

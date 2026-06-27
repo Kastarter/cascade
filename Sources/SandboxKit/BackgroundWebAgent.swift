@@ -58,6 +58,10 @@ public final class BackgroundWebAgent {
     /// A mid-run correction the user typed into the watch box. Injected into the next
     /// turn as a prominent note, then cleared — the agent's "cursor for agents".
     private var pendingSteer: String?
+    /// Bumped when WebKit cannot evaluate the typed state snapshot. The fallback is
+    /// intentionally changing so no-effect detection fails open instead of treating
+    /// an unreadable page as unchanged.
+    private var pageSignatureFallbackGeneration = 0
 
     // The current plan. Survives a login pause so `resume()` re-enters at
     // `nextIndex` with the earlier parts' findings intact.
@@ -742,13 +746,40 @@ public final class BackgroundWebAgent {
     later parts of the job rely on that line.
     """
 
-    /// Cheap "did the page change" signature for no-effect detection — URL + a
-    /// prefix of the readable text. A dead DOM action leaves it unchanged;
-    /// navigation/content changes move it. Web-native (no pixel churn from
-    /// cursors/ads), the structural analog of the on-screen frame diff.
+    /// Cheap "did the page change" signature for no-effect detection. Uses the
+    /// typed web-state snapshot so form/focus/checked-state changes count even when
+    /// visible page text is unchanged, while retaining only a stable hash.
     private func pageSignature() async -> String {
-        let text = await sandbox.readPageText()
-        return sandbox.currentURL + "\u{1}" + String(text.prefix(4000))
+        if let signature = await sandbox.stateSignature() {
+            return Self.pageStateSignatureHash(signature)
+        }
+        pageSignatureFallbackGeneration &+= 1
+        return Self.fallbackPageStateSignatureHash(
+            url: sandbox.currentURL,
+            title: sandbox.title,
+            nonce: pageSignatureFallbackGeneration
+        )
+    }
+
+    nonisolated static func pageStateSignatureHash(_ signature: WebStateSignature) -> String {
+        signature.stableHash
+    }
+
+    nonisolated static func pageStateSignatureHash(snapshot: [String: Any]) -> String {
+        pageStateSignatureHash(WebStateSignature(snapshot: snapshot))
+    }
+
+    nonisolated static func fallbackPageStateSignatureHash(url: String, title: String, nonce: Int) -> String {
+        pageStateSignatureHash(WebStateSignature(
+            url: url,
+            title: title,
+            interactivesHash: "fallback:unavailable",
+            formValuesHash: "fallback:unavailable",
+            checkedSelectedHash: "fallback:unavailable",
+            contentEditableTextHash: "fallback:unavailable",
+            ariaTextHash: "fallback:unavailable",
+            mutationSequence: nonce
+        ))
     }
 
     /// Whether a built-in action changes page state (so it counts toward acting),
