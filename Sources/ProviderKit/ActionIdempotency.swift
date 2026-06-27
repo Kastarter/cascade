@@ -337,6 +337,16 @@ public enum RetryErrorClassifier {
     }
 
     public static func classify(_ error: Error) -> RetryErrorClassification {
+        if let anthropicError = error as? AnthropicError {
+            switch anthropicError {
+            case .http(let statusCode, _):
+                return classify(httpStatusCode: statusCode)
+            case .transport:
+                return .transient
+            case .missingKey, .emptyResponse:
+                return .nonTransient
+            }
+        }
         if let urlError = error as? URLError {
             return classify(urlErrorCode: urlError.code)
         }

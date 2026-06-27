@@ -51,9 +51,17 @@ public struct AgentTaskPlanner: Sendable {
     static let promptVersion = "agent-task-planner.prompt.v1"
     static let schemaVersion = "agent-task-planner.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet, cache: ModelCallCache? = nil) {
-        self.client = client
-        self.cachedClient = cache.map { CachedMessageCompleter(client: client, cache: $0) }
+    public init(
+        client: any MessageCompleting = AnthropicClient(),
+        model: String = AnthropicModel.sonnet,
+        cache: ModelCallCache? = nil,
+        retryPolicy: RetryBackoffPolicy? = nil
+    ) {
+        let effectiveClient: any MessageCompleting = retryPolicy.map {
+            RetryingMessageCompleter(client: client, retryPolicy: $0)
+        } ?? client
+        self.client = effectiveClient
+        self.cachedClient = cache.map { CachedMessageCompleter(client: effectiveClient, cache: $0) }
         self.model = model
     }
 

@@ -88,9 +88,17 @@ public struct ClaudeSingleStepPlanner: SingleStepPlanner {
     static let promptVersion = "claude-single-step-planner.prompt.v1"
     static let schemaVersion = "claude-single-step-planner.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.opus, cache: ModelCallCache? = nil) {
-        self.client = client
-        self.cachedClient = cache.map { CachedMessageCompleter(client: client, cache: $0) }
+    public init(
+        client: any MessageCompleting = AnthropicClient(),
+        model: String = AnthropicModel.opus,
+        cache: ModelCallCache? = nil,
+        retryPolicy: RetryBackoffPolicy? = nil
+    ) {
+        let effectiveClient: any MessageCompleting = retryPolicy.map {
+            RetryingMessageCompleter(client: client, retryPolicy: $0)
+        } ?? client
+        self.client = effectiveClient
+        self.cachedClient = cache.map { CachedMessageCompleter(client: effectiveClient, cache: $0) }
         self.model = model
     }
 

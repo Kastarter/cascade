@@ -42,6 +42,98 @@ public extension MessageCompleting {
     }
 }
 
+public struct RetryingMessageCompleter: MessageCompleting {
+    private let client: any MessageCompleting
+    private let retryPolicy: RetryBackoffPolicy
+
+    public init(client: any MessageCompleting, retryPolicy: RetryBackoffPolicy) {
+        self.client = client
+        self.retryPolicy = retryPolicy
+    }
+
+    public func complete(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int
+    ) async throws -> String {
+        try await complete(system: system, user: user, model: model, maxTokens: maxTokens, options: .standard)
+    }
+
+    public func complete(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> String {
+        let key = try Self.idempotencyKey(
+            system: system,
+            user: user,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        )
+        var retryCount = 0
+
+        while true {
+            do {
+                return try await client.complete(
+                    system: system,
+                    user: user,
+                    model: model,
+                    maxTokens: maxTokens,
+                    options: options
+                )
+            } catch {
+                let classification = RetryErrorClassifier.classify(error)
+                guard let delay = retryPolicy.delay(
+                    afterRetryCount: retryCount,
+                    retryClass: key.retryClass,
+                    classification: classification,
+                    key: key
+                ) else {
+                    throw error
+                }
+                retryCount += 1
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: Self.nanoseconds(for: delay))
+                }
+            }
+        }
+    }
+
+    private static func idempotencyKey(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) throws -> ActionIdempotencyKey {
+        let body = try AnthropicClient.completionBodyData(
+            system: system,
+            user: user,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        )
+        let payload = try JSONSerialization.jsonObject(with: body, options: [])
+        return try ActionIdempotencyKey(
+            retryClass: .pureModelCall,
+            operation: options.callsite,
+            model: model,
+            prompt: options.promptVersion,
+            schema: options.schemaVersion,
+            payload: payload
+        )
+    }
+
+    private static func nanoseconds(for delay: TimeInterval) -> UInt64 {
+        let maxSeconds = Double(UInt64.max) / 1_000_000_000
+        return UInt64((min(delay, maxSeconds) * 1_000_000_000).rounded())
+    }
+}
+
 /// BYOK Anthropic Messages API client over `URLSession`. The key is read from the
 /// macOS Keychain at call time, never cached in the struct.
 public struct AnthropicClient: MessageCompleting {
