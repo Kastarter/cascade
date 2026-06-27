@@ -153,19 +153,20 @@ func categoryDisclosureHashesOrOmitsRawCategories() throws {
 @Test
 func dpSerializationComposesWithFleetManifestWithoutSensitiveFields() throws {
     let policy = AnalyticsPrivacyPolicy(clippingBounds: FleetClippingBounds(minimum: 0, maximum: 5))
-    var rng = SequenceRNG([1 << 63, 1 << 63])
+    var rng = SequenceRNG([1 << 62])
     let parameters = try LocalDPPrivacyParameters(epsilon: 0.5, delta: 0, mechanism: .laplaceBoundedCount)
     var budget = FleetDPMonthlyBudget(period: "2026-06", epsilonCap: 1)
     let spend = try budget.reserve(metricFamily: "counter", parameters: parameters)
+    let candidates: [String: FleetMetricInput] = [
+        "agent.run.completed.count": .counter(12),
+        "recorded_context.ocrText": .text("Raw OCR should not export"),
+        "recorded_context.imagePath": .text("/Users/khalid/private/frame.jpg"),
+        "https://internal.example/private": .text("private url")
+    ]
 
     let export = try LocalDifferentialPrivacy.privatizedCounterExport(
         policy: policy,
-        candidates: [
-            "agent.run.completed.count": .counter(12),
-            "recorded_context.ocrText": .text("Raw OCR should not export"),
-            "recorded_context.imagePath": .text("/Users/khalid/private/frame.jpg"),
-            "https://internal.example/private": .text("private url")
-        ],
+        candidates: candidates,
         epsilon: parameters.epsilon,
         sourceAuditHead: AuditHead(count: 7, hash: "audit-head"),
         budgetSpends: [spend],
@@ -176,16 +177,38 @@ func dpSerializationComposesWithFleetManifestWithoutSensitiveFields() throws {
 
     #expect(export.manifest.sourceAuditHead == AuditHead(count: 7, hash: "audit-head"))
     #expect(export.metrics.first?.name == "agent.run.completed.count")
-    #expect(export.metrics.first?.clippedValue == 5)
-    #expect(export.metrics.first?.wasClipped == true)
+    let releasedValue = try #require(export.metrics.first?.value)
+    #expect(releasedValue != 5)
+    #expect(releasedValue != 12)
+
+    var secondRNG = SequenceRNG([3 << 62])
+    let secondExport = try LocalDifferentialPrivacy.privatizedCounterExport(
+        policy: policy,
+        candidates: candidates,
+        epsilon: parameters.epsilon,
+        sourceAuditHead: AuditHead(count: 7, hash: "audit-head"),
+        budgetSpends: [spend],
+        rng: &secondRNG
+    )
+    #expect(try #require(secondExport.metrics.first?.value) != releasedValue)
+
+    let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let metrics = try #require(object["metrics"] as? [[String: Any]])
+    let metric = try #require(metrics.first)
+    #expect(!metric.keys.contains("clippedValue"))
+    #expect(!metric.keys.contains("wasClipped"))
+    #expect(try #require(metric["value"] as? Double) == releasedValue)
     #expect(json.contains("\"epsilon\":0.5"))
     #expect(json.contains("\"delta\":0"))
     #expect(json.contains("\"mechanism\":\"laplace_bounded_count\""))
     #expect(json.contains("\"budgetSpends\""))
+    #expect(!json.contains("\"clippedValue\""))
+    #expect(!json.contains("\"wasClipped\""))
+    #expect(!json.contains("\"value\":5"))
+    #expect(!json.contains("\"value\":12"))
     #expect(!json.contains("Raw OCR should not export"))
     #expect(!json.contains("/Users/khalid/private/frame.jpg"))
     #expect(!json.contains("internal.example"))
     #expect(!json.contains("ocrText"))
     #expect(!json.contains("imagePath"))
 }
-

@@ -90,6 +90,46 @@ public struct LocalDPMetricRecord: Codable, Equatable, Sendable {
     }
 }
 
+public struct LocalDPReleasedMetric: Codable, Equatable, Sendable {
+    public let name: String
+    public let value: Double?
+    public let epsilon: Double
+    public let delta: Double
+    public let mechanism: LocalDPMechanism
+    public let reportedCategoryHash: String?
+    public let domainSize: Int?
+
+    public init(
+        name: String,
+        value: Double?,
+        epsilon: Double,
+        delta: Double,
+        mechanism: LocalDPMechanism,
+        reportedCategoryHash: String? = nil,
+        domainSize: Int? = nil
+    ) {
+        self.name = name
+        self.value = value
+        self.epsilon = epsilon
+        self.delta = delta
+        self.mechanism = mechanism
+        self.reportedCategoryHash = reportedCategoryHash
+        self.domainSize = domainSize
+    }
+
+    init(record: LocalDPMetricRecord) {
+        self.init(
+            name: record.name,
+            value: record.value,
+            epsilon: record.epsilon,
+            delta: record.delta,
+            mechanism: record.mechanism,
+            reportedCategoryHash: record.reportedCategoryHash,
+            domainSize: record.domainSize
+        )
+    }
+}
+
 public struct FleetDPBudgetSpend: Codable, Equatable, Sendable {
     public let period: String
     public let metricFamily: String
@@ -162,12 +202,12 @@ public struct FleetDPMonthlyBudget: Codable, Equatable, Sendable {
 
 public struct LocalDPFleetExport: Codable, Equatable, Sendable {
     public let manifest: FleetExportManifest
-    public let metrics: [LocalDPMetricRecord]
+    public let metrics: [LocalDPReleasedMetric]
     public let budgetSpends: [FleetDPBudgetSpend]
 
     public init(
         manifest: FleetExportManifest,
-        metrics: [LocalDPMetricRecord],
+        metrics: [LocalDPReleasedMetric],
         budgetSpends: [FleetDPBudgetSpend] = []
     ) {
         self.manifest = manifest
@@ -316,15 +356,7 @@ public enum LocalDifferentialPrivacy {
                 rng: &localRNG
             )
             rng = localRNG
-            return LocalDPMetricRecord(
-                name: record.name,
-                value: record.value,
-                clippedValue: record.clippedValue,
-                wasClipped: metric.wasClipped,
-                epsilon: record.epsilon,
-                delta: record.delta,
-                mechanism: record.mechanism
-            )
+            return LocalDPReleasedMetric(record: record)
         }
         return LocalDPFleetExport(
             manifest: base.manifest,
