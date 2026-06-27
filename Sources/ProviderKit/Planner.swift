@@ -28,17 +28,28 @@ public enum PlannedAction: Sendable, Equatable {
     /// Compact human label for the review dock.
     public var shortLabel: String {
         switch self {
-        case .move(let x, let y): "move to \(Int(x)), \(Int(y))"
-        case .click(let x, let y): "click \(Int(x)), \(Int(y))"
-        case .doubleClick(let x, let y): "double-click \(Int(x)), \(Int(y))"
-        case .rightClick(let x, let y): "right-click \(Int(x)), \(Int(y))"
+        case .move(let x, let y): "move to \(Self.displayCoordinate(x)), \(Self.displayCoordinate(y))"
+        case .click(let x, let y): "click \(Self.displayCoordinate(x)), \(Self.displayCoordinate(y))"
+        case .doubleClick(let x, let y): "double-click \(Self.displayCoordinate(x)), \(Self.displayCoordinate(y))"
+        case .rightClick(let x, let y): "right-click \(Self.displayCoordinate(x)), \(Self.displayCoordinate(y))"
         case .type(let text): "type “\(text.prefix(40))”"
         case .key(let key, let modifiers): (modifiers + [key]).joined(separator: "+")
-        case .scroll(let dx, let dy): "scroll \(Int(dx)), \(Int(dy))"
+        case .scroll(let dx, let dy): "scroll \(Self.displayCoordinate(dx)), \(Self.displayCoordinate(dy))"
         case .openURL(let url): "open \(url)"
         case .done: "done — nothing to run"
         case .unsupported(let kind): "unsupported (\(kind))"
         }
+    }
+
+    private static let displayCoordinateLimit = 1_000_000
+
+    private static func displayCoordinate(_ value: Double) -> String {
+        guard value.isFinite else { return "?" }
+
+        let lower = Double(-displayCoordinateLimit)
+        let upper = Double(displayCoordinateLimit)
+        let clamped = min(max(value, lower), upper)
+        return String(Int(clamped))
     }
 
     /// The screen point a click-type action targets, so the runtime can visibly

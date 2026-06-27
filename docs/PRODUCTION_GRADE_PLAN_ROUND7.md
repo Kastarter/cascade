@@ -18,6 +18,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/ProviderKit/Planner.swift`
 - Build: Replace coordinate label interpolation in `PlannedAction.shortLabel` with a finite-safe formatter that clamps to a sane display range or prints `?` for invalid values. Apply it to move/click/double-click/right-click and scroll deltas. Do not let a display label be the first code path that traps on model output.
 - Test: Assert `PlannedAction.click(x: .nan, y: .infinity).shortLabel`, `scroll(deltaX: .greatestFiniteMagnitude, deltaY: -.infinity).shortLabel`, and normal finite labels all return deterministic strings without trapping.
+- Status: Fixed 2026-06-26 with finite-safe label formatting for planner coordinates and scroll deltas.
 - Risk: low
 - Seq: SEQ-02
 
