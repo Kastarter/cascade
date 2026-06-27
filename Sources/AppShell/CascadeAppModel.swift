@@ -171,6 +171,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
     static let experimentalStructuredContentKey = "cascade.experimentalStructuredContent"
+    static let experimentalWorkGraphIndexKey = "cascade.experimentalWorkGraphIndex"
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
@@ -185,6 +186,10 @@ public final class CascadeAppModel: ObservableObject {
 
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalStructuredContentKey)
+    }
+
+    static func experimentalWorkGraphIndexEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalWorkGraphIndexKey)
     }
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
@@ -271,6 +276,7 @@ public final class CascadeAppModel: ObservableObject {
     private let modelCallCache: ModelCallCache?
     private let groundingCache: GroundingCache?
     private let experimentalStructuredContent: Bool
+    private let experimentalWorkGraphIndex: Bool
     private let visualGrounderOverride: (any VisualGrounder)?
 
     public init(
@@ -287,6 +293,7 @@ public final class CascadeAppModel: ObservableObject {
         self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults)
         self.groundingCache = Self.experimentalGroundingCache(defaults: defaults)
         self.experimentalStructuredContent = Self.experimentalStructuredContentEnabled(defaults: defaults)
+        self.experimentalWorkGraphIndex = Self.experimentalWorkGraphIndexEnabled(defaults: defaults)
         self.visualGrounderOverride = visualGrounderOverride
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
@@ -308,7 +315,10 @@ public final class CascadeAppModel: ObservableObject {
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(
             store: store,
-            options: ContextRecorder.Options(structuredContent: experimentalStructuredContent)
+            options: ContextRecorder.Options(
+                indexWorkGraph: experimentalWorkGraphIndex,
+                structuredContent: experimentalStructuredContent
+            )
         )
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
@@ -430,6 +440,20 @@ public final class CascadeAppModel: ObservableObject {
             if auditIntegrityEnforcementEnabled { audit = [] }
             statusLine = error.localizedDescription
         }
+    }
+
+    public func graphTimeline(
+        kind: WorkGraphEntityKind,
+        canonicalValue: String,
+        limit: Int = 20,
+        newestFirst: Bool = false
+    ) async throws -> [WorkGraphTimelineEntry] {
+        try await store.graphTimeline(
+            kind: kind,
+            canonicalValue: canonicalValue,
+            limit: limit,
+            newestFirst: newestFirst
+        )
     }
 
     private static func auditIntegrityStatus(from status: AuditChainStatus) -> AuditIntegrityStatus {

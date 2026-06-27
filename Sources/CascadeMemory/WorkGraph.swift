@@ -713,6 +713,20 @@ public extension CascadeStore {
         }
     }
 
+    func graphTimeline(
+        kind: WorkGraphEntityKind,
+        canonicalValue: String,
+        limit: Int = 20,
+        newestFirst: Bool = false
+    ) throws -> [WorkGraphTimelineEntry] {
+        do {
+            let entity = try graphEntity(kind: kind, canonicalValue: canonicalValue)
+            return try entityTimeline(entityID: entity.id, limit: limit, newestFirst: newestFirst)
+        } catch CascadeStoreError.sqlite(let message) where message.contains("work graph entity not found") {
+            return []
+        }
+    }
+
     func entityTimeline(
         kind: WorkGraphEntityKind,
         canonicalValue: String,

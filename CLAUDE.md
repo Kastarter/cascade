@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-27): D-08 wires WorkGraph indexing through default-off `cascade.experimentalWorkGraphIndex`; enabled app recorders pass `ContextRecorder.Options(indexWorkGraph: true)` and `CascadeAppModel.graphTimeline(...)` exposes indexed entity timelines.
 - NEW (2026-06-27): D-06 wires `cascade.experimentalGroundingVerifier` into runtime `assistGrounder()` default-off; enabled mixture grounders reject/abstain bad candidates and audit `grounding.verifier` without posting computer actions.
 - NEW (2026-06-27): D-05 unifies structured capture and recall behind default-off `cascade.experimentalStructuredContent`; enabled app models construct `ContextRecorder.Options(structuredContent: true)` and expose `inspect_structure` to record-answer/computer-use recall.
 - NEW (2026-06-27): D-01 wires audit-chain verification into `CascadeAppModel.refreshAll()` before publishing recent audit rows; default-off enforcement key `cascade.auditIntegrityEnforcement` hides untrusted activity and blocks agent/harness actions when enabled, and trace assembly returns no rows on broken/truncated chains.
