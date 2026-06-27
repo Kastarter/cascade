@@ -294,7 +294,7 @@ public enum AgentTraceBuilder {
 
             return AgentTrace(
                 traceID: "audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
-                goal: String(taskEvent.detail.prefix(160)),
+                goal: "assist.task#audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
                 surface: surface,
                 spans: spans
             )

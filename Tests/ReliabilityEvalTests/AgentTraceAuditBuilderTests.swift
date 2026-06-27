@@ -45,6 +45,35 @@ func auditEventsAssembleTrailingAssistTaskWithBufferedSpans() async throws {
 }
 
 @Test
+func agentTraceRootExportKeepsAssistTaskDetailPrivate() throws {
+    let base = Date(timeIntervalSince1970: 1_800_000_050)
+    let privateDetail = """
+    Ask Jane Secret to review payroll adjustment for jane.secret@example.com \
+    at https://hr.example.test/payroll?token=secret-token-123 from /Users/khalidsh/Payroll/private.csv
+    """
+    let trace = try #require(AgentTraceBuilder.fromAuditEvents([
+        AuditEvent(id: 42, createdAt: base, actor: "agent", action: "assist.task", detail: privateDetail),
+        AuditEvent(id: 43, createdAt: base.addingTimeInterval(0.1), actor: "agent", action: "harness.list_folder", detail: "/Users/khalidsh/Payroll"),
+    ]).first)
+    let otel = trace.otelJSON()
+    let sensitiveFragments = [
+        "Jane Secret",
+        "payroll adjustment",
+        "jane.secret@example.com",
+        "secret-token-123",
+        "/Users/khalidsh/Payroll/private.csv",
+    ]
+
+    #expect(trace.goal == "assist.task#audit-42")
+    #expect(trace.traceID == "audit-42")
+    #expect(trace.spans.first?.attributes["audit.id"] == "42")
+    #expect(otel.contains("\"trace_id\":\"audit-42\""))
+    #expect(otel.contains("\"audit.id\":\"42\""))
+    #expect(sensitiveFragments.allSatisfy { !trace.goal.contains($0) })
+    #expect(sensitiveFragments.allSatisfy { !otel.contains($0) })
+}
+
+@Test
 func incompleteAuditRunsAreMarkedErrorOrRefused() {
     let base = Date(timeIntervalSince1970: 1_800_000_100)
     let traces = AgentTraceBuilder.fromAuditEvents([
