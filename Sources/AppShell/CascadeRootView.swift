@@ -1436,6 +1436,7 @@ private struct CascadesScreen: View {
             VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                 SectionLabel(title: "LEARNED SKILLS — REVIEW", trailing: "\(model.pendingLearnedSkills.count) drafted")
                 ForEach(model.pendingLearnedSkills) { skill in
+                    let consolidationHint = model.learnedSkillConsolidationHint(for: skill)
                     CascadePanel {
                         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                             HStack(spacing: CascadeMetrics.s2) {
@@ -1446,6 +1447,9 @@ private struct CascadesScreen: View {
                             }
                             Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
                                 .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+                            if let consolidationHint {
+                                learnedSkillConsolidationRow(consolidationHint)
+                            }
                             Text(skill.markdown)
                                 .font(.cascadeMono(10)).foregroundStyle(Color.cascadeText2)
                                 .lineLimit(10)
@@ -1463,6 +1467,56 @@ private struct CascadesScreen: View {
                     }
                 }
             }
+        }
+    }
+
+    private func learnedSkillConsolidationRow(_ hint: CascadeAppModel.LearnedSkillConsolidationHint) -> some View {
+        HStack(alignment: .top, spacing: CascadeMetrics.s2) {
+            Image(systemName: learnedSkillConsolidationIcon(hint.kind))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(learnedSkillConsolidationColor(hint.kind))
+                .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: CascadeMetrics.s2) {
+                    Text(hint.title)
+                        .font(.cascadeSans(12, .semibold))
+                        .foregroundStyle(Color.cascadeText)
+                    if let score = hint.score {
+                        Text("\(Int((score * 100).rounded()))% overlap")
+                            .font(.cascadeSans(11))
+                            .foregroundStyle(Color.cascadeText3)
+                    }
+                }
+                Text(hint.detail)
+                    .font(.cascadeSans(12))
+                    .foregroundStyle(Color.cascadeText3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(CascadeMetrics.s2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(learnedSkillConsolidationColor(hint.kind).opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(learnedSkillConsolidationColor(hint.kind).opacity(0.28), lineWidth: 1)
+        )
+    }
+
+    private func learnedSkillConsolidationIcon(_ kind: CascadeAppModel.LearnedSkillConsolidationHint.Kind) -> String {
+        switch kind {
+        case .newSkill: "sparkles"
+        case .reviseExisting: "pencil.and.outline"
+        case .archiveCandidate: "archivebox"
+        case .quarantine: "exclamationmark.triangle"
+        }
+    }
+
+    private func learnedSkillConsolidationColor(_ kind: CascadeAppModel.LearnedSkillConsolidationHint.Kind) -> Color {
+        switch kind {
+        case .newSkill: Color.cascadeAgent
+        case .reviseExisting: Color.cascadeAccent
+        case .archiveCandidate: Color.cascadeText3
+        case .quarantine: Color.cascadeRecText
         }
     }
 

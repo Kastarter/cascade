@@ -85,6 +85,45 @@ public struct SkillConsolidator: Sendable {
         self.thresholds = thresholds
     }
 
+    public static func record(
+        id: String,
+        markdown: String,
+        path: String,
+        source: String,
+        approved: Bool = false,
+        successCount: Int = 0,
+        failureCount: Int = 0,
+        evidenceIDs: Set<String> = [],
+        quarantined: Bool = false,
+        archived: Bool = false
+    ) -> LearnedSkillRecord? {
+        guard let skill = AppSkillRegistry.parseSkill(markdown: markdown, path: path, source: source) else { return nil }
+        return LearnedSkillRecord(
+            id: id,
+            skill: skill,
+            humanSteps: inferredHumanSteps(from: skill.instructions),
+            approved: approved,
+            successCount: successCount,
+            failureCount: failureCount,
+            evidenceIDs: evidenceIDs,
+            quarantined: quarantined,
+            archived: archived
+        )
+    }
+
+    public func learnedSkillRecords(from registry: AppSkillRegistry, source: String? = "user") -> [LearnedSkillRecord] {
+        registry.skills
+            .filter { skill in source.map { skill.source == $0 } ?? true }
+            .map { skill in
+                LearnedSkillRecord(
+                    id: skill.name,
+                    skill: skill,
+                    humanSteps: Self.inferredHumanSteps(from: skill.instructions),
+                    approved: skill.source == "user"
+                )
+            }
+    }
+
     public func evaluate(_ candidate: LearnedSkillRecord, against existing: [LearnedSkillRecord]) -> Result {
         let active = activeSkills(from: existing)
         let activeIDs = active.map(\.id)
@@ -254,6 +293,22 @@ public struct SkillConsolidator: Sendable {
 
     private static func normalizedStep(_ step: String) -> String {
         tokens(in: step).sorted().joined(separator: " ")
+    }
+
+    private static func inferredHumanSteps(from instructions: String) -> [String] {
+        instructions
+            .split(separator: "\n")
+            .compactMap { rawLine in
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.hasPrefix("- ") {
+                    return String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let marker = line.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
+                    return String(line[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                return nil
+            }
+            .filter { !$0.isEmpty }
     }
 
     private static func normalizedPhrase(_ text: String) -> String {

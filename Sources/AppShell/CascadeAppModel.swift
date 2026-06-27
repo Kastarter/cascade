@@ -150,6 +150,7 @@ public final class CascadeAppModel: ObservableObject {
     private static let powerHarnessKey = "cascade.powerHarness"
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
+    static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
@@ -200,7 +201,7 @@ public final class CascadeAppModel: ObservableObject {
     /// Per-app cheat sheets (tiptour-macos Markdown App Skills port): prompt
     /// instructions plus runtime policies, matched against the frontmost app.
     /// User files at App Support/Cascade/Skills override the bundled ones.
-    private var appSkills = AppSkillRegistry.load()
+    private var appSkills: AppSkillRegistry
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -231,15 +232,20 @@ public final class CascadeAppModel: ObservableObject {
     /// Injectable so tests get an ephemeral suite instead of polluting (and reading
     /// stale state from) the real `.standard` defaults. Production uses `.standard`.
     private let defaultsStore: UserDefaults
+    private let learnedSkillDirectory: URL?
 
     public init(
         store injectedStore: CascadeStore? = nil,
         orchestrator injectedOrchestrator: CascadeOrchestrator? = nil,
         defaults: UserDefaults = .standard,
-        startsSubsystems: Bool = true
+        startsSubsystems: Bool = true,
+        appSkills initialAppSkills: AppSkillRegistry? = nil,
+        learnedSkillDirectory: URL? = nil
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
+        self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
+        self.learnedSkillDirectory = learnedSkillDirectory
         // Production store anchors its audit-chain head in the Keychain so
         // truncation/rewrite of the local audit log is detectable. Tests inject a
         // store and never hit this path.
@@ -3676,11 +3682,40 @@ public final class CascadeAppModel: ObservableObject {
     /// A skill draft distilled from a successful assist run, awaiting the
     /// user's review in Cascades. Approving moves it into the live library.
     public struct LearnedSkill: Identifiable, Sendable, Equatable {
-        public let id = UUID()
+        public let id: UUID
         public let appName: String
         public let slug: String
         public let markdown: String
         public let sourceTask: String
+
+        public init(
+            id: UUID = UUID(),
+            appName: String,
+            slug: String,
+            markdown: String,
+            sourceTask: String
+        ) {
+            self.id = id
+            self.appName = appName
+            self.slug = slug
+            self.markdown = markdown
+            self.sourceTask = sourceTask
+        }
+    }
+
+    public struct LearnedSkillConsolidationHint: Sendable, Equatable {
+        public enum Kind: String, Sendable {
+            case newSkill
+            case reviseExisting
+            case archiveCandidate
+            case quarantine
+        }
+
+        public let kind: Kind
+        public let title: String
+        public let detail: String
+        public let existingSkillName: String?
+        public let score: Double?
     }
 
     @Published public private(set) var pendingLearnedSkills: [LearnedSkill] = []
@@ -3713,8 +3748,7 @@ public final class CascadeAppModel: ObservableObject {
         ), markdown.hasPrefix("---"), markdown.contains("appMatchers") else { return }
         let slug = "learned-" + app.lowercased().replacingOccurrences(of: " ", with: "-")
             .filter { $0.isLetter || $0.isNumber || $0 == "-" }
-        let learned = LearnedSkill(appName: app, slug: slug, markdown: markdown, sourceTask: goal)
-        pendingLearnedSkills.append(learned)
+        enqueueLearnedSkillForReview(LearnedSkill(appName: app, slug: slug, markdown: markdown, sourceTask: goal))
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "skill.learned.draft", detail: "\(app) — from “\(String(goal.prefix(80)))”"))
     }
 
@@ -3740,10 +3774,83 @@ public final class CascadeAppModel: ObservableObject {
     ```
     """
 
+    public func enqueueLearnedSkillForReview(_ skill: LearnedSkill) {
+        pendingLearnedSkills.append(skill)
+    }
+
+    public func learnedSkillConsolidationHint(for skill: LearnedSkill) -> LearnedSkillConsolidationHint? {
+        guard defaultsStore.bool(forKey: Self.experimentalSkillConsolidationKey) else { return nil }
+        return Self.learnedSkillConsolidationHint(for: skill, registry: appSkills)
+    }
+
+    public static func learnedSkillConsolidationHint(
+        for skill: LearnedSkill,
+        registry: AppSkillRegistry,
+        consolidator: SkillConsolidator = SkillConsolidator()
+    ) -> LearnedSkillConsolidationHint {
+        let path = "/Cascade/Skills/\(skill.slug)/SKILL.md"
+        guard let candidate = SkillConsolidator.record(
+            id: skill.slug,
+            markdown: skill.markdown,
+            path: path,
+            source: "draft"
+        ), skill.markdown.hasPrefix("---"), candidate.skill.hints.appMatchers != nil else {
+            return LearnedSkillConsolidationHint(
+                kind: .quarantine,
+                title: "Quarantine draft",
+                detail: "Cascade could not parse this draft as a valid SKILL.md. Review the metadata before adding it.",
+                existingSkillName: nil,
+                score: nil
+            )
+        }
+
+        let existing = consolidator.learnedSkillRecords(from: registry, source: "user")
+        let namesByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0.skill.name) })
+        let result = consolidator.evaluate(candidate, against: existing)
+        let score = result.bestMatch?.total
+
+        switch result.action {
+        case .newSkill:
+            return LearnedSkillConsolidationHint(
+                kind: .newSkill,
+                title: "New skill",
+                detail: "No similar loaded user skill matched this draft. Approval will add it as a new playbook.",
+                existingSkillName: nil,
+                score: score
+            )
+        case .reviseExisting(let existingID):
+            let name = namesByID[existingID] ?? existingID
+            return LearnedSkillConsolidationHint(
+                kind: .reviseExisting,
+                title: "Revise existing skill",
+                detail: "Similar to \(name). Treat this as an update candidate; Cascade will not edit the existing skill automatically.",
+                existingSkillName: name,
+                score: score
+            )
+        case .archiveCandidate(let existingID):
+            let name = namesByID[existingID] ?? existingID
+            return LearnedSkillConsolidationHint(
+                kind: .archiveCandidate,
+                title: "Archive candidate",
+                detail: "\(name) already covers this draft with stronger signal. Discard it unless you want a separate playbook.",
+                existingSkillName: name,
+                score: score
+            )
+        case .quarantine(let reason):
+            return LearnedSkillConsolidationHint(
+                kind: .quarantine,
+                title: "Quarantine draft",
+                detail: "Cascade marked this draft for review: \(reason).",
+                existingSkillName: nil,
+                score: score
+            )
+        }
+    }
+
     /// Moves a reviewed draft into the live skill library (user skills dir).
     public func approveLearnedSkill(_ skill: LearnedSkill) {
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
-        let dir = appSupport.appendingPathComponent("Cascade/Skills/\(skill.slug)", isDirectory: true)
+        guard let root = learnedSkillDirectory ?? Self.defaultLearnedSkillDirectory() else { return }
+        let dir = root.appendingPathComponent(skill.slug, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try skill.markdown.write(to: dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
@@ -3752,8 +3859,15 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
         pendingLearnedSkills.removeAll { $0.id == skill.id }
-        appSkills = AppSkillRegistry.load()
+        if learnedSkillDirectory == nil {
+            appSkills = AppSkillRegistry.load()
+        }
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.approved", detail: skill.appName)) }
+    }
+
+    private static func defaultLearnedSkillDirectory() -> URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Cascade/Skills", isDirectory: true)
     }
 
     public func discardLearnedSkill(_ skill: LearnedSkill) {
