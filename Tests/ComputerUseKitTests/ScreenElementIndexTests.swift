@@ -113,6 +113,37 @@ struct ScreenElementIndexTests {
         #expect(proceed?.isSafeToClick == true)
     }
 
+    @Test func nonFiniteScoresAndExtremeBoundsDoNotTrap() {
+        let outOfRange = Double(Int.max) * 2
+        let candidates = [
+            candidate(
+                label: "Untrusted score",
+                role: .button,
+                source: .visual,
+                bounds: bounds(outOfRange, 20, outOfRange, 44),
+                confidence: .nan,
+                trust: .nan),
+            candidate(
+                label: "Extreme finite bounds",
+                role: .textField,
+                source: .accessibility,
+                bounds: bounds(-outOfRange, 90, outOfRange, 36),
+                confidence: 0.75,
+                trust: 0.95),
+        ]
+
+        let index = ScreenElementIndex.build(from: candidates)
+        let repeated = ScreenElementIndex.build(from: candidates.reversed())
+
+        #expect(index.count == 2)
+        #expect(index.allSatisfy { $0.confidence.isFinite && $0.trust.isFinite })
+        #expect(index.first { $0.label == "Untrusted score" }?.confidence == 0)
+        #expect(index.first { $0.label == "Untrusted score" }?.trust == 0)
+        #expect(index.map(\.id) == repeated.map(\.id))
+        #expect(index.map(\.mark.number) == [1, 2])
+        #expect(index.map(\.mark.label) == repeated.map(\.mark.label))
+    }
+
     private func candidate(
         label: String,
         role: ScreenElementIndex.Role,

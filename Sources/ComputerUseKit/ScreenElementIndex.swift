@@ -400,7 +400,12 @@ private extension ScreenElementIndex {
     }
 
     static func quantized(_ value: Double) -> Int {
-        Int(value.rounded())
+        guard value.isFinite else { return 0 }
+        let rounded = value.rounded()
+        guard rounded.isFinite else { return 0 }
+        if rounded >= Double(Int.max) { return Int.max }
+        if rounded <= Double(Int.min) { return Int.min }
+        return Int(rounded)
     }
 
     static func fnv1a64(_ string: String) -> String {
@@ -425,6 +430,7 @@ private extension ScreenElementIndex.Source {
 
 private extension Double {
     var clampedToUnit: Double {
-        min(1, max(0, self))
+        guard isFinite else { return 0 }
+        return min(1, max(0, self))
     }
 }
