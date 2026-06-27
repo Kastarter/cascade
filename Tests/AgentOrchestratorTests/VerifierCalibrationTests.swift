@@ -92,6 +92,20 @@ func bucketMathIsStableAtBoundaries() {
 }
 
 @Test
+func nonFiniteConfidenceFallsBackToZeroBeforeBucketing() {
+    let candidate = VerificationCandidate(id: "nan-candidate", confidence: .nan)
+    let report = VerifierCalibration.report(samples: [
+        VerifierCalibrationSample(confidence: .nan, outcome: .abstained),
+    ], bucketCount: 5)
+
+    #expect(VerifierCalibration.bucketIndex(for: .nan, bucketCount: 5) == 0)
+    #expect(VerifierCalibration.bucketIndex(for: .infinity, bucketCount: 5) == 0)
+    #expect(candidate.confidence == 0)
+    #expect(report.buckets.map(\.sampleCount) == [1, 0, 0, 0, 0])
+    #expect(report.abstentionCount == 1)
+}
+
+@Test
 func expectedCalibrationErrorUsesWeightedBucketGaps() {
     let report = VerifierCalibration.report(samples: [
         VerifierCalibrationSample(confidence: 0.1, outcome: .falseAccept),
@@ -117,6 +131,7 @@ func highRiskThresholdsRouteToAcceptRegroundAndPauseBands() {
     #expect(VerifierHighRiskRouting.route(confidence: 0.89, thresholds: thresholds) == .reground)
     #expect(VerifierHighRiskRouting.route(confidence: 0.7, thresholds: thresholds) == .reground)
     #expect(VerifierHighRiskRouting.route(confidence: 0.69, thresholds: thresholds) == .pause)
+    #expect(VerifierHighRiskRouting.route(confidence: .nan, thresholds: thresholds) == .pause)
 }
 
 private extension Double {

@@ -251,7 +251,8 @@ public enum VerifierCalibration: Sendable {
     }
 
     public static func clampConfidence(_ confidence: Double) -> Double {
-        min(1, max(0, confidence))
+        guard confidence.isFinite else { return 0 }
+        return min(1, max(0, confidence))
     }
 
     private static func makeBucket(
