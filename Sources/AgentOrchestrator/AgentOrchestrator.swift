@@ -103,11 +103,58 @@ public actor LocalMacDriver: AgentDriver {
         switch action {
         case .computerUse(let computerUseAction):
             try await actuator.perform(computerUseAction)
-            _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "computer.act", detail: "\(computerUseAction)"))
+            _ = try await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "computer.act",
+                detail: Self.computerActionAuditDetail(computerUseAction)
+            ))
         case .writeLocalArtifact(let title, let body):
             let url = try Self.writeArtifact(title: title, body: body)
-            _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "artifact.write", detail: "\(title) → \(url.path)"))
+            _ = try await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "artifact.write",
+                detail: Self.artifactAuditDetail(title: title, body: body, url: url)
+            ))
         }
+    }
+
+    private nonisolated static func computerActionAuditDetail(_ action: ComputerUseAction) -> String {
+        switch action {
+        case .move(let x, let y):
+            return "kind=move x=\(coordinate(x)) y=\(coordinate(y))"
+        case .click(let x, let y):
+            return "kind=click x=\(coordinate(x)) y=\(coordinate(y))"
+        case .doubleClick(let x, let y):
+            return "kind=doubleClick x=\(coordinate(x)) y=\(coordinate(y))"
+        case .tripleClick(let x, let y):
+            return "kind=tripleClick x=\(coordinate(x)) y=\(coordinate(y))"
+        case .rightClick(let x, let y):
+            return "kind=rightClick x=\(coordinate(x)) y=\(coordinate(y))"
+        case .drag(let fromX, let fromY, let toX, let toY):
+            return "kind=drag fromX=\(coordinate(fromX)) fromY=\(coordinate(fromY)) toX=\(coordinate(toX)) toY=\(coordinate(toY))"
+        case .key(let key, let modifiers):
+            let modifierTokens = modifiers.map(AuditIdentity.safeToken).joined(separator: "+")
+            return "kind=key key=\(AuditIdentity.safeToken(key)) modifiers=\(modifierTokens)"
+        case .typeText(let text):
+            return "kind=typeText \(AuditIdentity.descriptor("text", text))"
+        case .scroll(let deltaX, let deltaY):
+            return "kind=scroll deltaX=\(coordinate(deltaX)) deltaY=\(coordinate(deltaY))"
+        case .openURL(let url):
+            return "kind=openURL \(AuditIdentity.descriptor("url", url))"
+        }
+    }
+
+    private nonisolated static func artifactAuditDetail(title: String, body: String, url: URL) -> String {
+        [
+            AuditIdentity.descriptor("title", title),
+            AuditIdentity.descriptor("path", url.path),
+            "bodyChars=\(body.count)",
+            "ext=\(AuditIdentity.safeToken(url.pathExtension.isEmpty ? "none" : url.pathExtension))",
+        ].joined(separator: " ")
+    }
+
+    private nonisolated static func coordinate(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.1f", value) : "invalid"
     }
 
     /// Writes an agent-produced artifact as Markdown under

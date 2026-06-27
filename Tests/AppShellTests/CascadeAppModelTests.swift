@@ -63,6 +63,26 @@ private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throw
     }
 }
 
+private func waitForAudit(
+    _ store: CascadeStore,
+    action: String,
+    maxTries: Int = 500
+) async throws -> AuditEvent {
+    var tries = 0
+    while tries < maxTries {
+        if let row = try await store.recentAudit(limit: 80).first(where: { $0.action == action }) {
+            return row
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+    throw CocoaError(.fileReadNoSuchFile)
+}
+
+private func expectAuditDetail(_ detail: String, excludesRawIdentityContaining token: String) {
+    #expect(!detail.lowercased().contains(token.lowercased()))
+}
+
 private let curatorKeepsOne = """
 {"agents":[{"index":0,"name":"Reply to refund emails with the policy link","why":"You do it by hand several times a day.","goal":"In Gmail, reply to each new refund request with the standard policy link.","value":0.9}]}
 """
@@ -225,6 +245,131 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
 
     // None of these finished the task, so "Reclaimed" must stay at zero.
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
+}
+
+@MainActor @Test
+func appShellAuditDetailsKeepStableIdentityReferencesNotRawText() async throws {
+    let (model, store) = try makeModel()
+    let rawToken = "ApertureDeltaAuditSeed"
+    let task = "\(rawToken)-task"
+    let scheduleName = "\(rawToken)-schedule-agent"
+    let intent = "\(rawToken)-teach-intent"
+    let pointedLabel = "\(rawToken)-pointed-label"
+    let approvedName = "\(rawToken)-approved-agent"
+    let steerMessage = "\(rawToken)-sandbox-steer"
+    let recipeLabel = "\(rawToken)-recipe-label"
+    let assistGoal = "\(rawToken)-assist-goal"
+    let skillName = "\(rawToken)-skill-name"
+
+    let scheduledAgent = try await store.upsertAgent(CascadeAgent(
+        name: scheduleName,
+        source: .detected,
+        signature: "\(rawToken)-schedule-signature",
+        recipe: AgentRecipe(steps: []),
+        apps: ["Numbers"],
+        estimatedSecondsPerRun: 30
+    ))
+
+    await model.recordSandboxCompletion(deployedAgentID: scheduledAgent.id, update: completedUpdate("done"), task: task)
+    model.setAgentSchedule(scheduledAgent, schedule: "daily@09:05")
+    model.beginTeaching()
+    model.teach(question: intent)
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "teach.clickPointed",
+        detail: CascadeAppModel.teachPointedAuditDetail(utterance: "click that", label: pointedLabel)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "employee",
+        action: "sandbox.steer",
+        detail: CascadeAppModel.sandboxSteerAuditDetail(runID: UUID(), message: steerMessage)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.task",
+        detail: CascadeAppModel.textAuditDetail("goal", assistGoal)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "recipe.step",
+        detail: CascadeAppModel.recipeAuditDetail(RecipeStep(
+            order: 1,
+            kind: .click,
+            x: 10,
+            y: 20,
+            appName: "\(rawToken)-app",
+            ocrAnchor: recipeLabel
+        ))
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "agent.skill",
+        detail: CascadeAppModel.textAuditDetail("skill", skillName)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "agent.skill.denied",
+        detail: CascadeAppModel.textAuditDetail("skill", skillName)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "computer.type.keys",
+        detail: "chars=7 \(CascadeAppModel.textAuditDetail("skill", skillName))"
+    ))
+
+    let approved = taughtCurated(signature: "\(rawToken)-approval-signature", name: approvedName)
+    model.approveCurated(approved)
+
+    let sandboxTask = try await waitForAudit(store, action: "sandbox.task")
+    #expect(sandboxTask.detail.contains("taskHash=\(AuditIdentity.hash(task))"))
+    expectAuditDetail(sandboxTask.detail, excludesRawIdentityContaining: rawToken)
+
+    let completed = try await waitForAudit(store, action: "agent.run.completed")
+    #expect(completed.detail.contains("agentID=\(scheduledAgent.id)"))
+    #expect(completed.detail.contains("labelHash=\(AuditIdentity.hash(task))"))
+    expectAuditDetail(completed.detail, excludesRawIdentityContaining: rawToken)
+
+    let schedule = try await waitForAudit(store, action: "agent.schedule.set")
+    #expect(schedule.detail.contains("agentID=\(scheduledAgent.id)"))
+    #expect(schedule.detail.contains("nameHash=\(AuditIdentity.hash(scheduleName))"))
+    expectAuditDetail(schedule.detail, excludesRawIdentityContaining: rawToken)
+
+    let teachIntent = try await waitForAudit(store, action: "teach.intent")
+    #expect(teachIntent.detail.contains("intentHash=\(AuditIdentity.hash(intent))"))
+    expectAuditDetail(teachIntent.detail, excludesRawIdentityContaining: rawToken)
+
+    let pointed = try await waitForAudit(store, action: "teach.clickPointed")
+    #expect(pointed.detail.contains("pointedLabelHash=\(AuditIdentity.hash(pointedLabel))"))
+    expectAuditDetail(pointed.detail, excludesRawIdentityContaining: rawToken)
+
+    let steer = try await waitForAudit(store, action: "sandbox.steer")
+    #expect(steer.detail.contains("messageHash=\(AuditIdentity.hash(steerMessage))"))
+    expectAuditDetail(steer.detail, excludesRawIdentityContaining: rawToken)
+
+    let assist = try await waitForAudit(store, action: "assist.task")
+    #expect(assist.detail.contains("goalHash=\(AuditIdentity.hash(assistGoal))"))
+    expectAuditDetail(assist.detail, excludesRawIdentityContaining: rawToken)
+
+    let recipe = try await waitForAudit(store, action: "recipe.step")
+    #expect(recipe.detail.contains("anchorHash=\(AuditIdentity.hash(recipeLabel))"))
+    expectAuditDetail(recipe.detail, excludesRawIdentityContaining: rawToken)
+
+    let approvedRow = try await waitForAudit(store, action: "agent.approved")
+    #expect(approvedRow.detail.contains("nameHash=\(AuditIdentity.hash(approvedName))"))
+    expectAuditDetail(approvedRow.detail, excludesRawIdentityContaining: rawToken)
+
+    let skill = try await waitForAudit(store, action: "agent.skill")
+    #expect(skill.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
+    expectAuditDetail(skill.detail, excludesRawIdentityContaining: rawToken)
+
+    let deniedSkill = try await waitForAudit(store, action: "agent.skill.denied")
+    #expect(deniedSkill.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
+    expectAuditDetail(deniedSkill.detail, excludesRawIdentityContaining: rawToken)
+
+    let typedKeys = try await waitForAudit(store, action: "computer.type.keys")
+    #expect(typedKeys.detail.contains("chars=7"))
+    #expect(typedKeys.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
+    expectAuditDetail(typedKeys.detail, excludesRawIdentityContaining: rawToken)
 }
 
 private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> DetectedWaste {

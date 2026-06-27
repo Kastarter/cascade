@@ -63,6 +63,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/AppShell/CascadeAppModel.swift`; `/Users/khalidsh/Humain/cascade/Sources/AgentOrchestrator/AgentOrchestrator.swift`
 - Build: Introduce a shared audit-sanitizing helper for user/agent identity strings, for example `AuditIdentity.hash(_:)`, and use it on `assist.task`, `sandbox.task`, `sandbox.steer`, `agent.run.completed`, `teach.*` intent/reveal/pointed labels, `agent.approved/declined`, recipe label details, learned-skill draft goals, schedule rows, `computer.act`, and `artifact.write`. Store stable IDs/hashes/counts; keep raw text in UI state and local artifacts where needed.
 - Test: Exercise representative audit paths with unique task text, agent name, artifact title/path, pointed label, and schedule name. Assert stored `AuditEvent.detail` contains stable references and never raw goal/name/path/label text.
+- Status: Fixed 2026-06-26 with shared `AuditIdentity` descriptors and focused app-shell/local-driver audit tests.
 - Risk: high
 - Seq: SEQ-07/SEQ-14
 

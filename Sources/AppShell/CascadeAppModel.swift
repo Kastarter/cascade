@@ -4,7 +4,6 @@ import ApplicationServices
 import CascadeMemory
 import Combine
 import ComputerUseKit
-import CryptoKit
 import Foundation
 import ImageIO
 import MacContextKit
@@ -622,7 +621,13 @@ public final class CascadeAppModel: ObservableObject {
             guard let self else { return }
             self.sandboxRuntimes[id]?.steer(message)
             // Audit the steer so its timing vs the agent's reaction is on the record.
-            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "employee", action: "sandbox.steer", detail: String(message.prefix(160)))) }
+            Task {
+                _ = try? await self.store.appendAudit(AuditEvent(
+                    actor: "employee",
+                    action: "sandbox.steer",
+                    detail: Self.sandboxSteerAuditDetail(runID: id, message: message)
+                ))
+            }
         })
         Task {
             await runtime.run(task: trimmed) { [weak self] update in
@@ -711,7 +716,11 @@ public final class CascadeAppModel: ObservableObject {
             await recordCompletedAgentRun(agentID: deployedAgentID, auditDetail: task)
         }
         let outcome = update.completed ? "completed" : "ended without completing"
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "sandbox.task", detail: "\(task) — \(outcome)"))
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "sandbox.task",
+            detail: Self.sandboxTaskAuditDetail(task: task, outcome: outcome, agentID: deployedAgentID)
+        ))
     }
 
     func recordOnScreenAgentCompletion(_ agent: CascadeAgent) async {
@@ -724,7 +733,11 @@ public final class CascadeAppModel: ObservableObject {
            let agent = try? await store.agent(id: agentID) {
             await recordSuccessfulAgentExperience(for: agent, fallbackGoal: auditDetail)
         }
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.run.completed", detail: auditDetail))
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "agent.run.completed",
+            detail: Self.completedRunAuditDetail(agentID: agentID, label: auditDetail)
+        ))
     }
 
     private func recordSuccessfulAgentExperience(for agent: CascadeAgent, fallbackGoal: String) async {
@@ -808,7 +821,7 @@ public final class CascadeAppModel: ObservableObject {
         if teachingMode {
             teachIntentBuffer.append(q)
             teachStatus = "Teaching — heard “\(q.prefix(48))”. Press ⌥⌃T to finish."
-            Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.intent", detail: String(q.prefix(120)))) }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.intent", detail: Self.textAuditDetail("intent", q))) }
             voice.done()
             return
         }
@@ -949,7 +962,7 @@ public final class CascadeAppModel: ObservableObject {
             guidanceOverlay.present(atGlobalPoint: CGPoint(x: globalRect.midX, y: globalRect.midY), label: "here")
             assistMemory.rememberPointed(label: q, globalPoint: CGPoint(x: globalRect.midX, y: globalRect.midY))
             assistMemory.remember(user: q, assistant: region.speech)
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.region", detail: q))
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.region", detail: Self.textAuditDetail("question", q)))
             teachMessage = region.speech
             voice.speak(region.speech)
             voice.done()
@@ -976,7 +989,11 @@ public final class CascadeAppModel: ObservableObject {
                 said = teachMessage == working ? "Stopped." : teachMessage
             }
             assistMemory.remember(user: utterance, assistant: said, ok: clicked)
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.clickPointed", detail: "\(utterance) → \(pointed.label)"))
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "teach.clickPointed",
+                detail: Self.teachPointedAuditDetail(utterance: utterance, label: pointed.label)
+            ))
             teachMessage = said
             voice.speak(said)
             voice.done()
@@ -1171,7 +1188,7 @@ public final class CascadeAppModel: ObservableObject {
         // Keep the agent's highlight up — erasing it at "Done" would defeat the
         // point of asking for it. The overlay fades it on its own timer.
         if !agentDidHighlight { guidanceOverlay.hide() }
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: goal))
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: Self.textAuditDetail("goal", goal)))
         voice.done()
         await refreshAll()
     }
@@ -1201,7 +1218,7 @@ public final class CascadeAppModel: ObservableObject {
         { [appSkills, store] name in
             guard let skill = appSkills.skill(named: name) else { return nil }
             if skill.explicitAskOnly && !AppSkill.goalAsksForScript(goal) {
-                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: name)) }
+                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill.denied", detail: Self.textAuditDetail("skill", name))) }
                 return """
                 Skill \(skill.name) is unavailable for this task: it is a scripting \
                 playbook and the user did not ask for a script. Do the work on \
@@ -1210,7 +1227,7 @@ public final class CascadeAppModel: ObservableObject {
                 editors, no shell, no writing files to open in the app.
                 """
             }
-            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: name)) }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.skill", detail: Self.textAuditDetail("skill", name))) }
             return skill.promptBlock
         }
     }
@@ -2274,15 +2291,101 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     nonisolated static func auditHash(_ value: String?) -> String {
-        guard let value, !value.isEmpty else { return "none" }
-        return SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        AuditIdentity.hash(value)
     }
 
     private nonisolated static func safeAuditToken(_ value: String) -> String {
-        let token = value.filter { character in
-            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+        AuditIdentity.safeToken(value)
+    }
+
+    nonisolated static func textAuditDetail(_ field: String, _ value: String?) -> String {
+        AuditIdentity.descriptor(field, value)
+    }
+
+    nonisolated static func teachPointedAuditDetail(utterance: String, label: String) -> String {
+        [
+            textAuditDetail("utterance", utterance),
+            textAuditDetail("pointedLabel", label),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func sandboxSteerAuditDetail(runID: UUID, message: String) -> String {
+        [
+            "runID=\(runID.uuidString.prefix(8))",
+            textAuditDetail("message", message),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func sandboxTaskAuditDetail(task: String, outcome: String, agentID: Int64?) -> String {
+        var parts = [
+            "outcome=\(safeAuditToken(outcome))",
+            textAuditDetail("task", task),
+        ]
+        if let agentID { parts.insert("agentID=\(agentID)", at: 0) }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func completedRunAuditDetail(agentID: Int64, label: String) -> String {
+        [
+            "agentID=\(agentID)",
+            textAuditDetail("label", label),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func curatedAgentAuditDetail(_ curated: CuratedAgent, agentID: Int64? = nil) -> String {
+        var parts = [
+            textAuditDetail("name", curated.name),
+            textAuditDetail("goal", curated.goal),
+            textAuditDetail("signature", curated.signature),
+        ]
+        if let agentID { parts.insert("agentID=\(agentID)", at: 0) }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func recipeAuditDetail(_ step: RecipeStep, tier: String? = nil) -> String {
+        var parts = [
+            "step=\(step.order)",
+            "kind=\(step.kind.rawValue)",
+            textAuditDetail("app", step.appName),
+            "hasPoint=\(step.x != nil && step.y != nil)",
+            "isParameter=\(step.isParameter)",
+        ]
+        if let tier { parts.append("tier=\(safeAuditToken(tier))") }
+        if let bundleIdentifier = step.bundleIdentifier { parts.append(textAuditDetail("bundle", bundleIdentifier)) }
+        if let windowTitleHint = step.windowTitleHint { parts.append(textAuditDetail("window", windowTitleHint)) }
+        if let text = step.text { parts.append(textAuditDetail("text", text)) }
+        if let ocrAnchor = step.ocrAnchor { parts.append(textAuditDetail("anchor", ocrAnchor)) }
+        if let targetDescriptor = step.targetDescriptor { parts.append(textAuditDetail("targetDescriptor", targetDescriptor)) }
+        if let key = step.key { parts.append("key=\(safeAuditToken(key))") }
+        if !step.modifiers.isEmpty {
+            parts.append("modifiers=\(step.modifiers.map(safeAuditToken).joined(separator: "+"))")
         }
-        return token.isEmpty ? "unknown" : token
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func recipeEscalationAuditDetail(agent: CascadeAgent, reason: String) -> String {
+        [
+            "agentID=\(agent.id)",
+            textAuditDetail("name", agent.name),
+            textAuditDetail("reason", reason),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func learnedSkillDraftAuditDetail(app: String, goal: String, actionCount: Int) -> String {
+        [
+            textAuditDetail("app", app),
+            textAuditDetail("goal", goal),
+            "actionCount=\(actionCount)",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func scheduleAuditDetail(agent: CascadeAgent, schedule: String?, status: String) -> String {
+        [
+            "agentID=\(agent.id)",
+            "status=\(safeAuditToken(status))",
+            textAuditDetail("name", agent.name),
+            "schedule=\(safeAuditToken(schedule ?? "off"))",
+        ].joined(separator: " ")
     }
 
     /// AX is "sparse" — a canvas / non-AX surface where the accessibility tree
@@ -2486,7 +2589,7 @@ public final class CascadeAppModel: ObservableObject {
                         try await driver.act(.computerUse(.key(key, modifiers: [])))
                         try? await Task.sleep(for: .milliseconds(30))
                     }
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.keys", detail: "chars=\(text.count) skill=\(skill.name)"))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.keys", detail: "chars=\(text.count) \(Self.textAuditDetail("skill", skill.name))"))
                 } else if skill?.axUnreliable != true, Self.axInsertText(text) {
                     // Skipped for axUnreliable apps: their AX tree can accept the
                     // write and report success while nothing visible changes.
@@ -2528,7 +2631,7 @@ public final class CascadeAppModel: ObservableObject {
                 guidanceOverlay.present(atGlobalPoint: CGPoint(x: g.midX, y: g.midY), label: label)
                 assistMemory.rememberPointed(label: label, globalPoint: CGPoint(x: g.midX, y: g.midY))
                 agentDidHighlight = true
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.highlight", detail: label))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.highlight", detail: Self.textAuditDetail("label", label)))
             case .openApp(let name):
                 // Instant programmatic launch — no Dock hunting, no cursor. Heavy apps
                 // (Word, Photoshop) take seconds to boot AND keep painting after they're
@@ -2888,7 +2991,7 @@ public final class CascadeAppModel: ObservableObject {
                 teachMessage = region.speech
                 voice.speak(region.speech)
                 voice.done()
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.reveal", detail: question))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "teach.reveal", detail: Self.textAuditDetail("question", question)))
                 await refreshAll()
                 return
             }
@@ -3051,7 +3154,13 @@ public final class CascadeAppModel: ObservableObject {
         let intent = teachIntentBuffer.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         teachIntentBuffer.removeAll()
         teachStatus = "Saving your demonstration…"
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.stopped", detail: intent.isEmpty ? "(silent)" : String(intent.prefix(120)))) }
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "teach.stopped",
+                detail: intent.isEmpty ? "status=silent" : Self.textAuditDetail("intent", intent)
+            ))
+        }
         Task { await buildTaughtAgent(from: start, to: end, statedIntent: intent.isEmpty ? nil : intent) }
     }
 
@@ -3085,7 +3194,7 @@ public final class CascadeAppModel: ObservableObject {
         Task {
             do {
                 _ = try await orchestrator.createAgent(from: curated)
-                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.taught", detail: curated.name))
+                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.taught", detail: Self.curatedAgentAuditDetail(curated)))
                 selectedTab = .cascades
                 flashTeachStatus("Added “\(curated.name)” to your agents.")
             } catch {
@@ -3104,7 +3213,7 @@ public final class CascadeAppModel: ObservableObject {
             taughtForReview.insert(curated, at: 0)
         }
         flashTeachStatus("Sent “\(curated.name)” to your manager for review.")
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.sentToManager", detail: curated.name)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.sentToManager", detail: Self.curatedAgentAuditDetail(curated))) }
     }
 
     /// Drop a taught proposal from the review queue once it's been acted on (approved
@@ -3238,8 +3347,12 @@ public final class CascadeAppModel: ObservableObject {
         clearTaughtForReview(signature: curated.signature)
         Task {
             do {
-                _ = try await orchestrator.createAgent(from: curated)
-                _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.approved", detail: curated.name))
+                let agent = try await orchestrator.createAgent(from: curated)
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "manager",
+                    action: "agent.approved",
+                    detail: Self.curatedAgentAuditDetail(curated, agentID: agent.id)
+                ))
                 flashManagerReviewNote("Approved “\(curated.name)” — it's now in the employee's Cascades, ready to deploy.")
             } catch {
                 flashManagerReviewNote("Couldn't approve “\(curated.name)”: \(error.localizedDescription)")
@@ -3254,7 +3367,7 @@ public final class CascadeAppModel: ObservableObject {
         clearTaughtForReview(signature: curated.signature)
         dismissedWasteSignatures.insert(curated.signature)
         flashManagerReviewNote("Dismissed “\(curated.name)” — you won't see it again.")
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: curated.name)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: Self.curatedAgentAuditDetail(curated))) }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {
@@ -3428,7 +3541,7 @@ public final class CascadeAppModel: ObservableObject {
             // replayed from the recording. Hand the rest to the assist runtime,
             // which supplies the current value — never retype the stale one.
             if Self.recipeStepNeedsLiveValue(step) {
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.parameter", detail: Self.recipeLabel(step)))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.parameter", detail: Self.recipeAuditDetail(step)))
                 await escalateRecipeToAssist(agent, reason: "this step enters a value that changes each run, and I need the current one")
                 stoppedEarly = true
                 break
@@ -3444,14 +3557,14 @@ public final class CascadeAppModel: ObservableObject {
                     if !startStateChecked {
                         startStateChecked = true
                         if let reason = Self.startStateMismatch(step: step) {
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.wrongstate", detail: reason))
+                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.wrongstate", detail: Self.textAuditDetail("reason", reason)))
                             await escalateRecipeToAssist(agent, reason: reason)
                             stoppedEarly = true
                             break
                         }
                     }
                     if let modalTitle = await Self.unexpectedModal() {
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: modalTitle))
+                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: Self.textAuditDetail("modalTitle", modalTitle)))
                         await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
                         stoppedEarly = true
                         break
@@ -3485,7 +3598,7 @@ public final class CascadeAppModel: ObservableObject {
                         target = await regroundedTarget(anchor: step.ocrAnchor, recorded: recorded)
                         tier = target == recorded ? "recorded" : "vision"
                     }
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.target", detail: "\(Self.recipeLabel(step)) via \(tier)"))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.target", detail: Self.recipeAuditDetail(step, tier: tier)))
                     try await driver.act(.computerUse(.move(x: target.x, y: target.y)))
                     try? await Task.sleep(for: .milliseconds(320))
 
@@ -3494,7 +3607,11 @@ public final class CascadeAppModel: ObservableObject {
                         // apps should still pause; these steps just don't count.
                         if !skillVerifySkipLogged {
                             skillVerifySkipLogged = true
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.skipped-skill", detail: stepSkill?.name ?? step.appName))
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent",
+                                action: "recipe.verify.skipped-skill",
+                                detail: Self.textAuditDetail(stepSkill == nil ? "app" : "skill", stepSkill?.name ?? step.appName)
+                            ))
                         }
                         try await clickAction(step, at: target)
                     } else {
@@ -3516,7 +3633,7 @@ public final class CascadeAppModel: ObservableObject {
                                 unverifiedStreak = 0
                             } else {
                                 unverifiedStreak += 1
-                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeLabel(step)))
+                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeAuditDetail(step)))
                                 if unverifiedStreak >= 2 {
                                     await escalateRecipeToAssist(agent, reason: "the screen no longer matches the recorded steps")
                                     stoppedEarly = true
@@ -3541,7 +3658,7 @@ public final class CascadeAppModel: ObservableObject {
                     unverifiedStreak = 0
                 }
                 dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeLabel(step)))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step)))
                 try? await Task.sleep(for: .milliseconds(500))
             } catch {
                 agentMessage = "Stopped: \(error.localizedDescription)"
@@ -3586,7 +3703,7 @@ public final class CascadeAppModel: ObservableObject {
             dock.show(title: "Stopped", detail: agentMessage)
             return
         }
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.escalate", detail: "\(agent.name) — \(reason)"))
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.escalate", detail: Self.recipeEscalationAuditDetail(agent: agent, reason: reason)))
         let mouse = NSEvent.mouseLocation
         guard hasAnthropicKey, let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
             agentMessage = "Paused “\(agent.name)” — \(reason), and I can't take over without a Claude key. Take over, or re-record."
@@ -3876,7 +3993,11 @@ public final class CascadeAppModel: ObservableObject {
         let slug = "learned-" + app.lowercased().replacingOccurrences(of: " ", with: "-")
             .filter { $0.isLetter || $0.isNumber || $0 == "-" }
         enqueueLearnedSkillForReview(LearnedSkill(appName: app, slug: slug, markdown: markdown, sourceTask: goal))
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "skill.learned.draft", detail: "\(app) — from “\(String(goal.prefix(80)))”"))
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "skill.learned.draft",
+            detail: Self.learnedSkillDraftAuditDetail(app: app, goal: goal, actionCount: actionCount)
+        ))
     }
 
     private static let skillAuthorPrompt = """
@@ -3989,7 +4110,7 @@ public final class CascadeAppModel: ObservableObject {
         if learnedSkillDirectory == nil {
             appSkills = AppSkillRegistry.load()
         }
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.approved", detail: skill.appName)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.approved", detail: Self.textAuditDetail("app", skill.appName))) }
     }
 
     private static func defaultLearnedSkillDirectory() -> URL? {
@@ -3999,7 +4120,7 @@ public final class CascadeAppModel: ObservableObject {
 
     public func discardLearnedSkill(_ skill: LearnedSkill) {
         pendingLearnedSkills.removeAll { $0.id == skill.id }
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.discarded", detail: skill.appName)) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.discarded", detail: Self.textAuditDetail("app", skill.appName))) }
     }
 
     // MARK: - Agent scheduling
@@ -4039,11 +4160,11 @@ public final class CascadeAppModel: ObservableObject {
                 // refused, leave the key unset so a later tick (this minute) retries.
                 guard createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id) else { continue }
                 firedScheduleKeys.insert(key)
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.fired", detail: agent.name))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.fired", detail: Self.scheduleAuditDetail(agent: agent, schedule: agent.schedule, status: "fired")))
                 agentMessage = "Scheduled: running “\(agent.name)” in the background."
             } else {
                 firedScheduleKeys.insert(key)
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.due", detail: agent.name))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.schedule.due", detail: Self.scheduleAuditDetail(agent: agent, schedule: agent.schedule, status: "due")))
                 dock.show(title: "Scheduled agent is due", detail: "“\(agent.name)” is ready — deploy it from Cascades whenever you want.")
                 Task { [weak self] in
                     try? await Task.sleep(for: .seconds(8))
@@ -4057,7 +4178,7 @@ public final class CascadeAppModel: ObservableObject {
     public func setAgentSchedule(_ agent: CascadeAgent, schedule: String?) {
         Task {
             try? await store.setAgentSchedule(id: agent.id, schedule: schedule)
-            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.schedule.set", detail: "\(agent.name) → \(schedule ?? "off")"))
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.schedule.set", detail: Self.scheduleAuditDetail(agent: agent, schedule: schedule, status: "set")))
             await refreshAll()
         }
     }

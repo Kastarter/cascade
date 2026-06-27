@@ -25,6 +25,7 @@
 
 ## Current State (2026-06-11)
 - NEW (2026-06-26): P7-05 sanitizes `assist.noeffect`, `agent.ground.miss`, and `scout.ocr.marks` audit details to turn/count/hash descriptors while preserving raw AX/OCR labels only in model-facing re-grounding notes.
+- NEW (2026-06-26): P7-07 adds shared `AuditIdentity` hashing for app-shell/local-driver audits so task goals, agent names, artifact paths, pointed labels, recipe labels, skill drafts, and schedules persist only as stable hashes/counts in `audit_event.detail`.
 - NEW (2026-06-26): P7-01 fixed web sandbox coordinate formatting with finite/range guards before JS/audit conversion; invalid click/scroll/move/drag values no-op with sanitized `invalid-coordinate` audit from background runs.
 - NEW (2026-06-26): P7-01 follow-up: web DOM grounding parser also rejects non-finite/out-of-bounds resolver output, and `ScoutAgent` drops invalid grounder points before `Int` log/action formatting.
 - NEW (2026-06-26): Round 7 convergence sweep is in `docs/PRODUCTION_GRADE_PLAN_ROUND7.md`; remaining high-confidence work is finite-safe model/web coordinate labeling plus audit/detail hashing for harness, recall, sandbox, app-shell, and local-driver paths, and unguarded focused-window AX casts.

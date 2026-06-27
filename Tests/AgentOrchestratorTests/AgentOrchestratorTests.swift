@@ -33,6 +33,35 @@ func localMacDriverVerifiesAgainstContext() async throws {
     #expect(verification.passed)
 }
 
+@Test
+func localMacDriverAuditDetailsHashComputerActionsAndArtifacts() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("AgentOrchestratorTests-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+    let driver = LocalMacDriver(store: store, actuator: StubActuator())
+    let rawToken = "ApertureDeltaDriverAuditSeed"
+    let typedText = "\(rawToken)-typed"
+    let artifactTitle = "\(rawToken)-artifact-title"
+
+    try await driver.act(.computerUse(.typeText(typedText)))
+    try await driver.act(.writeLocalArtifact(title: artifactTitle, body: "local artifact body"))
+
+    let rows = try await store.recentAudit(limit: 10)
+    let computer = try #require(rows.first { $0.action == "computer.act" })
+    #expect(computer.detail.contains("kind=typeText"))
+    #expect(computer.detail.contains("textHash=\(AuditIdentity.hash(typedText))"))
+    #expect(!computer.detail.lowercased().contains(rawToken.lowercased()))
+    #expect(!computer.detail.contains(typedText))
+
+    let artifact = try #require(rows.first { $0.action == "artifact.write" })
+    #expect(artifact.detail.contains("titleHash=\(AuditIdentity.hash(artifactTitle))"))
+    #expect(artifact.detail.contains("pathHash="))
+    #expect(artifact.detail.contains("bodyChars=19"))
+    #expect(!artifact.detail.lowercased().contains(rawToken.lowercased()))
+    #expect(!artifact.detail.contains(artifactTitle))
+}
+
 private struct CountingAnswerer: ContextQuestionAnswering {
     func answer(question: String, grounding: ChatGrounding) async throws -> String {
         "\(grounding.timeline.count)"
