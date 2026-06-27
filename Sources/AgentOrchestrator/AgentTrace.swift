@@ -222,12 +222,17 @@ public enum AgentTraceBuilder {
 
         for item in ordered {
             let event = item.element
-            if event.action == "assist.task" {
+            if let root = TraceRoot(event: event) {
                 finishCurrent()
                 if pendingEvents.isEmpty {
-                    current = RunDraft(index: runs.count, taskEvent: event, eventOrder: item.offset)
+                    var run = RunDraft(index: runs.count, root: root, taskEvent: event, eventOrder: item.offset)
+                    if root.closesImmediately {
+                        runs.append(run)
+                    } else {
+                        current = run
+                    }
                 } else {
-                    var run = RunDraft(index: runs.count, taskEvent: event, eventOrder: item.offset)
+                    var run = RunDraft(index: runs.count, root: root, taskEvent: event, eventOrder: item.offset)
                     run.events = pendingEvents
                     run.completedEvent = pendingEvents.last { $0.event.action == "agent.run.completed" }?.event
                     runs.append(run)
@@ -242,8 +247,10 @@ public enum AgentTraceBuilder {
                     continue
                 }
                 run.events.append(spanEvent)
-                if event.action == "agent.run.completed" {
-                    run.completedEvent = event
+                if spanEvent.closesRun {
+                    if spanEvent.marksCompleted {
+                        run.completedEvent = event
+                    }
                     current = run
                     finishCurrent()
                 } else {
@@ -252,18 +259,67 @@ public enum AgentTraceBuilder {
             }
         }
         finishCurrent()
+        if current == nil,
+           !pendingEvents.isEmpty,
+           let synthetic = TraceRoot.synthetic(from: pendingEvents) {
+            var run = RunDraft(index: runs.count, root: synthetic.root, taskEvent: synthetic.event, eventOrder: synthetic.eventOrder)
+            run.events = pendingEvents
+            runs.append(run)
+        }
 
-        return runs.map { $0.trace(surface: surface) }
+        return runs.map { $0.trace(fallbackSurface: surface) }
+    }
+
+    private struct TraceRoot {
+        var name: String
+        var surface: String?
+        var closesImmediately: Bool
+
+        init?(event: AuditEvent) {
+            switch event.action {
+            case "assist.task":
+                self.name = "assist.task"
+                self.surface = nil
+                self.closesImmediately = false
+            case "sandbox.task":
+                self.name = "sandbox.task"
+                self.surface = "backgroundWeb"
+                self.closesImmediately = true
+            case "recipe.run.started":
+                self.name = "recipe.run.started"
+                self.surface = "recipeReplay"
+                self.closesImmediately = false
+            default:
+                return nil
+            }
+        }
+
+        init(name: String, surface: String) {
+            self.name = name
+            self.surface = surface
+            self.closesImmediately = true
+        }
+
+        static func synthetic(from events: [SpanEvent]) -> (root: TraceRoot, event: AuditEvent, eventOrder: Int)? {
+            if let terminal = events.last(where: { $0.event.action.hasPrefix("sandbox.") && ($0.failureKind != nil || $0.event.action == "sandbox.done") }) {
+                return (TraceRoot(name: "sandbox.task", surface: "backgroundWeb"), terminal.event, terminal.eventOrder)
+            }
+            if let terminal = events.last(where: { $0.event.action.hasPrefix("recipe.pause.") || $0.event.action == "recipe.run.ended" }) {
+                return (TraceRoot(name: "recipe.run.started", surface: "recipeReplay"), terminal.event, terminal.eventOrder)
+            }
+            return nil
+        }
     }
 
     private struct RunDraft {
         var index: Int
+        var root: TraceRoot
         var taskEvent: AuditEvent
         var eventOrder: Int
         var events: [SpanEvent] = []
         var completedEvent: AuditEvent?
 
-        func trace(surface: String) -> AgentTrace {
+        func trace(fallbackSurface: String) -> AgentTrace {
             let runID = spanID(prefix: "run", event: taskEvent, order: eventOrder)
             let start = runStart
             let status = runStatus
@@ -274,7 +330,7 @@ public enum AgentTraceBuilder {
                     id: runID,
                     parentID: nil,
                     kind: .run,
-                    name: "assist.task",
+                    name: root.name,
                     startMs: 0,
                     durationMs: runDuration,
                     status: status.status,
@@ -294,18 +350,42 @@ public enum AgentTraceBuilder {
 
             return AgentTrace(
                 traceID: "audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
-                goal: "assist.task#audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
-                surface: surface,
+                goal: "\(root.name)#audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
+                surface: root.surface ?? fallbackSurface,
                 spans: spans
             )
         }
 
         private var runStatus: (status: TraceSpan.Status, failureKind: AgentFailureKind?) {
             if completedEvent != nil { return (.ok, nil) }
+            if isRootedSandboxRun {
+                if Self.auditValue("outcome", in: taskEvent.detail) == "completed" { return (.ok, nil) }
+                return statusFromLatestFailure()
+            }
+            if isSyntheticSandboxRun, hasSuccessfulSyntheticSandboxTerminal {
+                return (.ok, nil)
+            }
             if hasFinishedTiming { return (.ok, nil) }
-            let failure = events.compactMap { $0.failureKind }.last
+            if hasSuccessfulTerminal { return (.ok, nil) }
+            return statusFromLatestFailure()
+        }
+
+        private func statusFromLatestFailure() -> (status: TraceSpan.Status, failureKind: AgentFailureKind?) {
+            let failure = latestFailure
             guard let failure else { return (.error, .timeout) }
             return (failure.isDesirableTerminal ? .refused : .error, failure)
+        }
+
+        private var latestFailure: AgentFailureKind? {
+            events.compactMap { $0.failureKind }.last
+        }
+
+        private var isRootedSandboxRun: Bool {
+            root.name == "sandbox.task" && taskEvent.action == "sandbox.task"
+        }
+
+        private var isSyntheticSandboxRun: Bool {
+            root.name == "sandbox.task" && taskEvent.action != "sandbox.task"
         }
 
         private var runStart: Date {
@@ -322,6 +402,27 @@ public enum AgentTraceBuilder {
             }
         }
 
+        private var hasSuccessfulTerminal: Bool {
+            return events.contains { event in
+                switch event.event.action {
+                case "recipe.run.ended":
+                    return Self.auditValue("status", in: event.event.detail) == "completed"
+                default:
+                    return false
+                }
+            }
+        }
+
+        private var hasSuccessfulSyntheticSandboxTerminal: Bool {
+            guard taskEvent.action == "sandbox.done",
+                  Self.auditValue("status", in: taskEvent.detail) == "finished" else {
+                return false
+            }
+            return !events.contains { event in
+                event.eventOrder > eventOrder && event.failureKind != nil
+            }
+        }
+
         private func measuredRunDuration(from start: Date) -> Int {
             var dates = [taskEvent.createdAt] + events.map { $0.event.createdAt }
             if let completedEvent { dates.append(completedEvent.createdAt) }
@@ -332,6 +433,14 @@ public enum AgentTraceBuilder {
         private static func milliseconds(between start: Date, and end: Date) -> Int {
             Int((end.timeIntervalSince(start) * 1000.0).rounded())
         }
+
+        private static func auditValue(_ key: String, in detail: String) -> String? {
+            let prefix = "\(key)="
+            return detail
+                .split(separator: " ")
+                .first { $0.hasPrefix(prefix) }
+                .map { String($0.dropFirst(prefix.count)).lowercased() }
+        }
     }
 
     private struct SpanEvent {
@@ -341,11 +450,48 @@ public enum AgentTraceBuilder {
         var name: String
         var failureKind: AgentFailureKind?
         var timing: TimingMetrics?
+        var closesRun: Bool {
+            event.action == "agent.run.completed" || event.action == "recipe.run.ended"
+        }
+        var marksCompleted: Bool {
+            if event.action == "agent.run.completed" { return true }
+            if event.action == "recipe.run.ended", Self.auditValue("status", in: event.detail) == "completed" {
+                return true
+            }
+            return false
+        }
 
         init?(event: AuditEvent, eventOrder: Int) {
             if event.action.hasPrefix("harness.") {
                 self.kind = .tool
                 self.name = String(event.action.dropFirst("harness.".count))
+            } else if event.action == "sandbox.harness" {
+                self.kind = .tool
+                self.name = "sandbox.harness"
+            } else if event.action == "sandbox.act" {
+                self.kind = .step
+                self.name = "sandbox.act"
+            } else if event.action == "sandbox.turn" {
+                self.kind = .model
+                self.name = "sandbox.turn"
+            } else if event.action == "sandbox.done" {
+                self.kind = .eval
+                self.name = "sandbox.done"
+            } else if event.action == "sandbox.verify" {
+                self.kind = .eval
+                self.name = "sandbox.verify"
+            } else if event.action == "recipe.step" {
+                self.kind = .step
+                self.name = "recipe.step"
+            } else if event.action == "recipe.target" {
+                self.kind = .retrieval
+                self.name = "recipe.target"
+            } else if event.action == "recipe.run.ended" {
+                self.kind = .eval
+                self.name = "recipe.run.ended"
+            } else if event.action == "recipe.escalate" {
+                self.kind = .eval
+                self.name = "recipe.escalate"
             } else if event.action == "agent.recall" {
                 self.kind = .retrieval
                 self.name = "agent.recall"
@@ -358,7 +504,7 @@ public enum AgentTraceBuilder {
             } else if event.action == "agent.run.completed" {
                 self.kind = .eval
                 self.name = "agent.run.completed"
-            } else if let failure = AgentFailureKind(auditAction: event.action, detail: event.detail) {
+            } else if let failure = Self.failureKind(for: event) {
                 self.kind = .eval
                 self.name = event.action
                 self.failureKind = failure
@@ -372,7 +518,7 @@ public enum AgentTraceBuilder {
 
             self.event = event
             self.eventOrder = eventOrder
-            self.failureKind = AgentFailureKind(auditAction: event.action, detail: event.detail)
+            self.failureKind = Self.failureKind(for: event)
             self.timing = event.action == "assist.timing" ? TimingMetrics(detail: event.detail) : nil
         }
 
@@ -405,6 +551,31 @@ public enum AgentTraceBuilder {
 
         private static func milliseconds(between start: Date, and end: Date) -> Int {
             Int((end.timeIntervalSince(start) * 1000.0).rounded())
+        }
+
+        private static func failureKind(for event: AuditEvent) -> AgentFailureKind? {
+            if event.action == "sandbox.verify", auditValue("status", in: event.detail) == "incomplete" {
+                return .validatorIncomplete
+            }
+            if event.action == "sandbox.done" {
+                switch auditValue("status", in: event.detail) {
+                case "transport_failure":
+                    return .transportFailure
+                case "incomplete":
+                    return .validatorIncomplete
+                default:
+                    break
+                }
+            }
+            return AgentFailureKind(auditAction: event.action, detail: event.detail)
+        }
+
+        private static func auditValue(_ key: String, in detail: String) -> String? {
+            let prefix = "\(key)="
+            return detail
+                .split(separator: " ")
+                .first { $0.hasPrefix(prefix) }
+                .map { String($0.dropFirst(prefix.count)).lowercased() }
         }
     }
 

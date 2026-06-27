@@ -2542,6 +2542,16 @@ public final class CascadeAppModel: ObservableObject {
         ].joined(separator: " ")
     }
 
+    nonisolated static func recipeRunAuditDetail(agent: CascadeAgent, status: String? = nil) -> String {
+        var parts = [
+            "agentID=\(agent.id)",
+            "steps=\(agent.recipe.steps.count)",
+            textAuditDetail("name", agent.name),
+        ]
+        if let status { parts.insert("status=\(safeAuditToken(status))", at: 0) }
+        return parts.joined(separator: " ")
+    }
+
     nonisolated static func curatedAgentAuditDetail(_ curated: CuratedAgent, agentID: Int64? = nil) -> String {
         var parts = [
             textAuditDetail("name", curated.name),
@@ -3730,6 +3740,11 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
         let steps = agent.recipe.steps.sorted { $0.order < $1.order }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recipe.run.started",
+            detail: Self.recipeRunAuditDetail(agent: agent)
+        ))
         var stoppedEarly = false
         // Clicks whose effect could not be confirmed in a row. One is tolerated
         // (some clicks legitimately change nothing the AX tree shows); two in a row
@@ -3885,6 +3900,11 @@ public final class CascadeAppModel: ObservableObject {
                 break
             }
         }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recipe.run.ended",
+            detail: Self.recipeRunAuditDetail(agent: agent, status: stoppedEarly ? "paused" : "completed")
+        ))
         if !stoppedEarly {
             agentMessage = "Done — ran “\(agent.name)”."
             dock.show(title: "Done", detail: agentMessage)

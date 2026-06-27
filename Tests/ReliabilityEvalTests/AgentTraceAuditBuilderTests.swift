@@ -129,6 +129,51 @@ func traceAuditWindowIsOptInAndRecentAuditIsUnchanged() async throws {
 }
 
 @Test
+func traceAuditWindowAssemblesSandboxAndRecipeReplayRuns() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("AgentTraceSandboxRecipe-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+    let base = Date(timeIntervalSince1970: 1_800_000_250)
+
+    _ = try await store.appendAudit(AuditEvent(createdAt: base, actor: "agent", action: "sandbox.act", detail: "kind=click status=ok"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(0.1), actor: "agent", action: "sandbox.done", detail: "status=finished acted=true resultChars=12 resultHash=abc"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(0.2), actor: "agent", action: "sandbox.verify", detail: "status=incomplete resultChars=12 resultHash=abc"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(0.3), actor: "agent", action: "sandbox.task", detail: "outcome=endedwithoutcompleting taskChars=24 taskHash=def"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(1.0), actor: "agent", action: "recipe.run.started", detail: "agentID=7 steps=1 nameChars=8 nameHash=abc"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(1.1), actor: "agent", action: "recipe.step", detail: "step=1 kind=click appChars=6 appHash=aaa hasPoint=true isParameter=false"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(1.2), actor: "agent", action: "recipe.pause.modal", detail: "modalTitleChars=5 modalTitleHash=bbb"))
+    _ = try await store.appendAudit(AuditEvent(createdAt: base.addingTimeInterval(1.3), actor: "agent", action: "recipe.run.ended", detail: "status=paused agentID=7 steps=1 nameChars=8 nameHash=abc"))
+
+    let disabled = try await store.auditWindowForTraceAssembly(
+        from: base,
+        to: base.addingTimeInterval(2),
+        enableTraceAssembly: false
+    )
+    let events = try await store.auditWindowForTraceAssembly(
+        from: base,
+        to: base.addingTimeInterval(2),
+        enableTraceAssembly: true
+    )
+    let traces = AgentTraceBuilder.fromAuditEvents(events)
+    let sandbox = try #require(traces.first { $0.surface == "backgroundWeb" })
+    let recipe = try #require(traces.first { $0.surface == "recipeReplay" })
+
+    #expect(disabled.isEmpty)
+    #expect(traces.count == 2)
+    #expect(traces.filter { $0.surface == "backgroundWeb" }.count == 1)
+    #expect(traces.filter { $0.surface == "recipeReplay" }.count == 1)
+    #expect(sandbox.spans.first?.name == "sandbox.task")
+    #expect(sandbox.spans.first?.status == .error)
+    #expect(sandbox.spans.first?.failureKind == .validatorIncomplete)
+    #expect(sandbox.spans.count == 4)
+    #expect(recipe.spans.first?.name == "recipe.run.started")
+    #expect(recipe.spans.first?.status == .error)
+    #expect(recipe.spans.first?.failureKind == .unexpectedModal)
+    #expect(recipe.spans.count == 4)
+}
+
+@Test
 func traceAuditWindowRejectsUnchainedOnlyRows() async throws {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("AgentTraceLegacyOnly-\(UUID().uuidString).sqlite")

@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-27): D-09 teaches `AgentTraceBuilder` default-off trace assembly to root `sandbox.task` as `backgroundWeb` and explicit `recipe.run.started`/`recipe.run.ended` as `recipeReplay`; sandbox verifier/done failures and recipe pause events now surface failure kinds in opt-in traces.
 - NEW (2026-06-27): D-08 wires WorkGraph indexing through default-off `cascade.experimentalWorkGraphIndex`; enabled app recorders pass `ContextRecorder.Options(indexWorkGraph: true)` and `CascadeAppModel.graphTimeline(...)` exposes indexed entity timelines.
 - NEW (2026-06-27): D-06 wires `cascade.experimentalGroundingVerifier` into runtime `assistGrounder()` default-off; enabled mixture grounders reject/abstain bad candidates and audit `grounding.verifier` without posting computer actions.
 - NEW (2026-06-27): D-05 unifies structured capture and recall behind default-off `cascade.experimentalStructuredContent`; enabled app models construct `ContextRecorder.Options(structuredContent: true)` and expose `inspect_structure` to record-answer/computer-use recall.
