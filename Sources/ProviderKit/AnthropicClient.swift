@@ -176,7 +176,6 @@ public struct AnthropicClient: MessageCompleting {
             maxTokens: maxTokens,
             options: options
         )
-        _ = try options.cacheRequest(model: model, maxTokens: maxTokens, body: body)
         request.httpBody = body
 
         let data: Data

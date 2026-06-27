@@ -25,6 +25,7 @@
 
 ## Current State (2026-06-11)
 - NEW (2026-06-27): D-01 wires audit-chain verification into `CascadeAppModel.refreshAll()` before publishing recent audit rows; default-off enforcement key `cascade.auditIntegrityEnforcement` hides untrusted activity and blocks agent/harness actions when enabled, and trace assembly returns no rows on broken/truncated chains.
+- NEW (2026-06-27): D-02 wires `ModelCallCache` behind default-off `cascade.experimentalModelCallCache`; enabled app instances share one cache across WorkflowCurator, ClaudeSingleStepPlanner, and AgentTaskPlanner paths, while direct client/locator calls no longer fake cache-key work.
 - NEW (2026-06-27): D-01 follow-up treats non-empty all-unchained audit tables as untrusted, and enforcement/trace reads now publish only `event_hash IS NOT NULL` rows so legacy prefixes are not trusted.
 - NEW (2026-06-26): Round 9 final straggler sweep in `docs/PRODUCTION_GRADE_PLAN_ROUND9.md` found no further high-confidence audit-PII or non-finite conversion issues beyond the separately locked watched-app denial audit and cursor-flight delay items.
 - NEW (2026-06-26): Round 8 audit privacy sweep converged in `docs/PRODUCTION_GRADE_PLAN_ROUND8.md`; recorder/app-shell remaining raw audit details now use `AuditIdentity` hashes/counts, and cursor flight sleeps + UI-TARS smartResize guard non-finite/overflowing `Int` conversions.

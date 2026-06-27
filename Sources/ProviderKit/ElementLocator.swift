@@ -204,7 +204,6 @@ public struct ElementLocator: Sendable {
             ]],
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        _ = try? options.cacheRequest(model: AnthropicModel.haiku, maxTokens: 400, body: bodyData)
         request.httpBody = bodyData
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
@@ -278,12 +277,6 @@ public struct ElementLocator: Sendable {
         ]
 
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        _ = try? options.cacheRequest(
-            model: model,
-            maxTokens: 1024,
-            body: bodyData,
-            betaVersion: AnthropicRequestVersions.computerUseBeta
-        )
         request.httpBody = bodyData
 
         guard let (data, response) = try? await URLSession.shared.data(for: request),

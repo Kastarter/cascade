@@ -228,16 +228,17 @@ public actor CascadeOrchestrator {
         localAnswerer: ContextQuestionAnswering = LocalGroundedAnswerer(),
         claudeAnswerer: ContextQuestionAnswering = ClaudeGroundedAnswerer(),
         recordAnswerer: RecordAnswering? = nil,
-        planner: SingleStepPlanner = ClaudeSingleStepPlanner(),
+        planner: SingleStepPlanner? = nil,
         curator: WorkflowCurator? = nil,
+        modelCallCache: ModelCallCache? = nil,
         keyStore: AnthropicKeyStore = AnthropicKeyStore()
     ) {
         self.store = store
         self.localAnswerer = localAnswerer
         self.claudeAnswerer = claudeAnswerer
         self.recordAnswerer = recordAnswerer ?? RecordSearchAnswerer(store: store, keyStore: keyStore)
-        self.planner = planner
-        self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore))
+        self.planner = planner ?? ClaudeSingleStepPlanner(cache: modelCallCache)
+        self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore), cache: modelCallCache)
         self.keyStore = keyStore
     }
 

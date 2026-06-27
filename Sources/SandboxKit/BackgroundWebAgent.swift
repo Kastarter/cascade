@@ -126,7 +126,8 @@ public final class BackgroundWebAgent {
     public init(
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         groqKeyStore: GroqKeyStore = GroqKeyStore(),
-        model: String = AnthropicModel.sonnet
+        model: String = AnthropicModel.sonnet,
+        modelCallCache: ModelCallCache? = nil
     ) {
         self.keyStore = keyStore
         self.groqKeyStore = groqKeyStore
@@ -137,7 +138,7 @@ public final class BackgroundWebAgent {
         // structurally simple TEXT tasks — downgraded to Groq llama-3.3-70b when a
         // Groq key is set (else Anthropic haiku). The agent loop stays on `model`.
         let h = TextHelperModel.resolve(anthropicKeyStore: keyStore)
-        self.planner = AgentTaskPlanner(client: h.client, model: h.model)
+        self.planner = AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache)
         self.verifier = h.client
         self.verifierModel = h.model
     }

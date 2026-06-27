@@ -168,7 +168,12 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
+    static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
+
+    static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
+        defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
+    }
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
@@ -251,6 +256,7 @@ public final class CascadeAppModel: ObservableObject {
     /// stale state from) the real `.standard` defaults. Production uses `.standard`.
     private let defaultsStore: UserDefaults
     private let learnedSkillDirectory: URL?
+    private let modelCallCache: ModelCallCache?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -262,6 +268,7 @@ public final class CascadeAppModel: ObservableObject {
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
+        self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults)
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
@@ -285,7 +292,7 @@ public final class CascadeAppModel: ObservableObject {
         hotkey = UseDeviceHotkeyMonitor()
         teachHotkey = UseDeviceHotkeyMonitor(hotkey: UseDeviceHotkey(
             keyCode: 17, requiredModifiers: [.control, .option], label: "Control-Option-T"))
-        orchestrator = injectedOrchestrator ?? CascadeOrchestrator(store: store)
+        orchestrator = injectedOrchestrator ?? CascadeOrchestrator(store: store, modelCallCache: modelCallCache)
         driver = LocalMacDriver(store: store)
         recorder.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -643,7 +650,7 @@ public final class CascadeAppModel: ObservableObject {
             return false
         }
         let id = UUID()
-        let runtime = BackgroundWebAgent()
+        let runtime = BackgroundWebAgent(modelCallCache: modelCallCache)
         sandboxRuntimes[id] = runtime
         // The agent's pointer drives the box's native cursor overlay.
         runtime.onCursor = { [weak self] point in self?.sandboxBox.moveCursor(id, toPagePoint: point) }
@@ -1157,7 +1164,7 @@ public final class CascadeAppModel: ObservableObject {
             // Downgraded helper task: Groq llama-3.3-70b when a key is set, else
             // Anthropic haiku. Planning is text-only, so no Claude needed.
             let h = TextHelperModel.resolve()
-            plan = await AgentTaskPlanner(client: h.client, model: h.model).plan(
+            plan = await AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache).plan(
                 for: goal, in: .onScreen, conversationContext: assistMemory.contextMemo()
             )
         }
