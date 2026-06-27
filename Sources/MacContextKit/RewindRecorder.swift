@@ -323,9 +323,11 @@ actor RewindEngine {
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "system",
                 action: "rewind.capture",
-                detail: mergedText.isEmpty
-                    ? inserted.appName
-                    : "\(inserted.appName) · ax \(axText.count) + ocr \(ocrText.count) chars"
+                detail: ContextRecorder.captureAuditDetail(
+                    appName: inserted.appName,
+                    axChars: axText.count,
+                    ocrChars: ocrText.count
+                )
             ))
             onMoment(inserted)
         } catch {

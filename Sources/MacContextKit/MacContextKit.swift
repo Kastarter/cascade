@@ -220,6 +220,13 @@ public final class ContextRecorder: ObservableObject {
         )
     }
 
+    nonisolated static func captureAuditDetail(appName: String, axChars: Int? = nil, ocrChars: Int? = nil) -> String {
+        var parts = [AuditIdentity.descriptor("app", appName)]
+        if let axChars { parts.append("axChars=\(axChars)") }
+        if let ocrChars { parts.append("ocrChars=\(ocrChars)") }
+        return parts.joined(separator: " ")
+    }
+
     public func refreshPermissions() {
         let permissions = PermissionProbe.currentStatus()
         status.permissions = permissions
@@ -403,7 +410,7 @@ public final class ContextRecorder: ObservableObject {
         }
         do {
             let inserted = try await store.insert(context, indexWorkGraph: options.indexWorkGraph)
-            let detail = ocrText.map { "\(inserted.appName) · ocr \($0.count) chars" } ?? inserted.appName
+            let detail = Self.captureAuditDetail(appName: inserted.appName, ocrChars: ocrText?.count)
             _ = try await store.appendAudit(AuditEvent(actor: "system", action: "context.capture", detail: detail))
             status.latestContext = inserted
             status.message = status.running ? "Recording local context." : "Captured one context sample."
