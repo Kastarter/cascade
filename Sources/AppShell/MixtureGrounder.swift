@@ -1,6 +1,7 @@
 import AppKit
 import ComputerUseKit
 import Foundation
+import ImageIO
 import MacContextKit
 import ProviderKit
 
@@ -109,6 +110,9 @@ public struct MixtureGrounder: VisualGrounder {
     private let previousAnchor: VerifiedGroundingAnchor?
     private let candidateFailureCounts: [String: Int]
     private let onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)?
+    private let groundingCache: GroundingCache?
+    private let cacheMode: GroundingCacheMode
+    private let cacheContextProvider: @Sendable () async -> AppWindowSnapshot
 
     /// AX roles a CLICK target may legitimately resolve to. Excludes the passive
     /// roles `AXElementResolver.find` will also match (AXStaticText, AXImage) — a
@@ -130,6 +134,11 @@ public struct MixtureGrounder: VisualGrounder {
         verifyCandidates: Bool = false,
         previousAnchor: VerifiedGroundingAnchor? = nil,
         candidateFailureCounts: [String: Int] = [:],
+        groundingCache: GroundingCache? = nil,
+        cacheMode: GroundingCacheMode = .structural,
+        cacheContextProvider: @escaping @Sendable () async -> AppWindowSnapshot = {
+            await MainActor.run { AppWindowObserver.snapshot() }
+        },
         onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
         self.base = base
@@ -138,6 +147,9 @@ public struct MixtureGrounder: VisualGrounder {
         self.verifyCandidates = verifyCandidates
         self.previousAnchor = previousAnchor
         self.candidateFailureCounts = candidateFailureCounts
+        self.groundingCache = groundingCache
+        self.cacheMode = cacheMode
+        self.cacheContextProvider = cacheContextProvider
         self.onVerifierOutcome = onVerifierOutcome
     }
 
@@ -145,39 +157,32 @@ public struct MixtureGrounder: VisualGrounder {
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> CGPoint? {
         guard verifyCandidates else {
-            if let axPoint = await axGround(
+            if !Self.namesCanvasConcept(target),
+               let axPoint = await axGround(
                 target: target, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
             ) {
                 return axPoint
             }
-            return await base.ground(
-                screenshot: screenshot, target: target,
-                displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
-            )
+            guard groundingCache != nil else {
+                return await base.ground(
+                    screenshot: screenshot, target: target,
+                    displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+                )
+            }
+            return await baseGroundingResult(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            ).selectedPoint
         }
 
-        let axCandidate = await axVerifierCandidate(
-            target: target,
-            displayWidthPoints: displayWidthPoints,
-            displayHeightPoints: displayHeightPoints
-        )
-        let baseResult = await base.groundResult(
+        return await groundResult(
             screenshot: screenshot,
             target: target,
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
-        )
-        let selection = Self.selectVerifiedCandidate(
-            axCandidate: axCandidate,
-            baseResult: baseResult,
-            target: target,
-            displayWidthPoints: displayWidthPoints,
-            displayHeightPoints: displayHeightPoints,
-            previousAnchor: previousAnchor,
-            candidateFailureCounts: candidateFailureCounts
-        )
-        await recordVerifierOutcomeIfNeeded(selection, target: target)
-        return selection.result.selectedPoint
+        ).selectedPoint
     }
 
     public func groundResult(
@@ -187,39 +192,204 @@ public struct MixtureGrounder: VisualGrounder {
         displayHeightPoints: Int
     ) async -> GroundingResult {
         guard verifyCandidates else {
+            guard groundingCache != nil else {
+                let start = ContinuousClock.now
+                let point = await ground(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints
+                )
+                let elapsed = start.duration(to: ContinuousClock.now)
+                return GroundingResult.legacy(point: point, latency: elapsed.mixtureTimeInterval)
+            }
             let start = ContinuousClock.now
-            let point = await ground(
+            if !Self.namesCanvasConcept(target),
+               let axPoint = await axGround(
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            ) {
+                let elapsed = start.duration(to: ContinuousClock.now)
+                return GroundingResult.legacy(point: axPoint, latency: elapsed.mixtureTimeInterval)
+            }
+            let result = await baseGroundingResult(
                 screenshot: screenshot,
                 target: target,
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints
             )
             let elapsed = start.duration(to: ContinuousClock.now)
-            return GroundingResult.legacy(point: point, latency: elapsed.mixtureTimeInterval)
+            return result.selectedCandidate?.latency == nil
+                ? Self.withLatency(result, elapsed.mixtureTimeInterval)
+                : result
         }
 
-        let axCandidate = await axVerifierCandidate(
+        let axCandidate = Self.namesCanvasConcept(target) ? nil : await axVerifierCandidate(
             target: target,
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         )
-        let baseResult = await base.groundResult(
+        let cacheProbe = await groundingCacheProbe(
             screenshot: screenshot,
             target: target,
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         )
-        let selection = Self.selectVerifiedCandidate(
-            axCandidate: axCandidate,
-            baseResult: baseResult,
+        switch cacheProbe {
+        case .hit(let result):
+            return result
+        case .miss:
+            return GroundingResult()
+        case .key(let key):
+            let baseResult = await base.groundResult(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+            let selection = Self.selectVerifiedCandidate(
+                axCandidate: axCandidate,
+                baseResult: baseResult,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                previousAnchor: previousAnchor,
+                candidateFailureCounts: candidateFailureCounts
+            )
+            await recordVerifierOutcomeIfNeeded(selection, target: target)
+            await storeGroundingCacheResult(selection.result, key: key)
+            return selection.result
+        }
+    }
+
+    private enum CacheProbe {
+        case hit(GroundingResult)
+        case miss
+        case key(GroundingCacheKey?)
+    }
+
+    private func baseGroundingResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        let cacheProbe = await groundingCacheProbe(
+            screenshot: screenshot,
             target: target,
             displayWidthPoints: displayWidthPoints,
-            displayHeightPoints: displayHeightPoints,
-            previousAnchor: previousAnchor,
-            candidateFailureCounts: candidateFailureCounts
+            displayHeightPoints: displayHeightPoints
         )
-        await recordVerifierOutcomeIfNeeded(selection, target: target)
-        return selection.result
+        switch cacheProbe {
+        case .hit(let result):
+            return result
+        case .miss:
+            return GroundingResult()
+        case .key(let key):
+            let result = await base.groundResult(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+            await storeGroundingCacheResult(result, key: key)
+            return result
+        }
+    }
+
+    private func groundingCacheProbe(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> CacheProbe {
+        guard let groundingCache else { return .key(nil) }
+        let key = await groundingCacheKey(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        guard let lookup = await groundingCache.lookup(key) else { return .key(key) }
+        switch lookup {
+        case .hit(let result):
+            return .hit(result)
+        case .miss:
+            return .miss
+        }
+    }
+
+    private func groundingCacheKey(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingCacheKey? {
+        guard let gridHashes = Self.gridHashes(ofJPEG: screenshot) else { return nil }
+        let snapshot = await cacheContextProvider()
+        return GroundingCacheKey(
+            targetText: target,
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            screenHash: PerceptualHash.combinedHash(gridHashes),
+            gridHashes: gridHashes,
+            mode: cacheMode
+        )
+    }
+
+    private func storeGroundingCacheResult(_ result: GroundingResult, key: GroundingCacheKey?) async {
+        guard let groundingCache else { return }
+        if result.selectedPoint != nil {
+            await groundingCache.store(Self.cached(result), for: key)
+        } else {
+            await groundingCache.storeMiss(for: key)
+        }
+    }
+
+    private static func cached(_ result: GroundingResult) -> GroundingResult {
+        GroundingResult(
+            candidates: result.candidates.map { candidate in
+                GroundingCandidate(
+                    point: candidate.point,
+                    region: candidate.region,
+                    confidence: candidate.confidence,
+                    source: .cache,
+                    coordinateSpace: candidate.coordinateSpace,
+                    rawModel: candidate.rawModel,
+                    latency: candidate.latency,
+                    dispersion: candidate.dispersion
+                )
+            },
+            selectedIndex: result.selectedIndex
+        )
+    }
+
+    private static func withLatency(_ result: GroundingResult, _ latency: TimeInterval) -> GroundingResult {
+        GroundingResult(
+            candidates: result.candidates.map { candidate in
+                GroundingCandidate(
+                    point: candidate.point,
+                    region: candidate.region,
+                    confidence: candidate.confidence,
+                    source: candidate.source,
+                    coordinateSpace: candidate.coordinateSpace,
+                    rawModel: candidate.rawModel,
+                    latency: latency,
+                    dispersion: candidate.dispersion
+                )
+            },
+            selectedIndex: result.selectedIndex
+        )
+    }
+
+    private static func gridHashes(ofJPEG data: Data) -> [UInt64]? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return PerceptualHash.gridHashes(image)
     }
 
     private func recordVerifierOutcomeIfNeeded(

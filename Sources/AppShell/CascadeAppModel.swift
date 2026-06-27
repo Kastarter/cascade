@@ -172,10 +172,15 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
     static let experimentalStructuredContentKey = "cascade.experimentalStructuredContent"
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
+    static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
 
     static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
         defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
+    }
+
+    static func experimentalGroundingCache(defaults: UserDefaults) -> GroundingCache? {
+        defaults.bool(forKey: Self.experimentalGroundingCacheKey) ? GroundingCache() : nil
     }
 
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
@@ -264,6 +269,7 @@ public final class CascadeAppModel: ObservableObject {
     private let defaultsStore: UserDefaults
     private let learnedSkillDirectory: URL?
     private let modelCallCache: ModelCallCache?
+    private let groundingCache: GroundingCache?
     private let experimentalStructuredContent: Bool
     private let visualGrounderOverride: (any VisualGrounder)?
 
@@ -279,6 +285,7 @@ public final class CascadeAppModel: ObservableObject {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
         self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults)
+        self.groundingCache = Self.experimentalGroundingCache(defaults: defaults)
         self.experimentalStructuredContent = Self.experimentalStructuredContentEnabled(defaults: defaults)
         self.visualGrounderOverride = visualGrounderOverride
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
@@ -1465,6 +1472,8 @@ public final class CascadeAppModel: ObservableObject {
             base: base,
             skills: appSkills,
             verifyCandidates: verifyCandidates,
+            groundingCache: groundingCache,
+            cacheMode: Self.structuralGroundingEnabled() ? .structural : .coordinate,
             onVerifierOutcome: { [store = self.store] outcome in
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
