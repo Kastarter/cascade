@@ -79,6 +79,25 @@ public struct MixtureGrounder: VisualGrounder {
         }
     }
 
+    public struct VerifierOutcome: Equatable, Sendable {
+        public let target: String
+        public let outcome: VerifiedGroundingOutcome
+        public let verifierResult: GroundingVerifierResult
+        public let candidateCount: Int
+
+        public init(
+            target: String,
+            outcome: VerifiedGroundingOutcome,
+            verifierResult: GroundingVerifierResult,
+            candidateCount: Int
+        ) {
+            self.target = target
+            self.outcome = outcome
+            self.verifierResult = verifierResult
+            self.candidateCount = candidateCount
+        }
+    }
+
     private let base: any VisualGrounder
     private let skills: AppSkillRegistry
     /// Minimum AX label-match score to TRUST a structural hit: 2 = one string
@@ -89,6 +108,7 @@ public struct MixtureGrounder: VisualGrounder {
     private let verifyCandidates: Bool
     private let previousAnchor: VerifiedGroundingAnchor?
     private let candidateFailureCounts: [String: Int]
+    private let onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)?
 
     /// AX roles a CLICK target may legitimately resolve to. Excludes the passive
     /// roles `AXElementResolver.find` will also match (AXStaticText, AXImage) — a
@@ -109,7 +129,8 @@ public struct MixtureGrounder: VisualGrounder {
         minAXScore: Double = 2,
         verifyCandidates: Bool = false,
         previousAnchor: VerifiedGroundingAnchor? = nil,
-        candidateFailureCounts: [String: Int] = [:]
+        candidateFailureCounts: [String: Int] = [:],
+        onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
         self.base = base
         self.skills = skills
@@ -117,6 +138,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.verifyCandidates = verifyCandidates
         self.previousAnchor = previousAnchor
         self.candidateFailureCounts = candidateFailureCounts
+        self.onVerifierOutcome = onVerifierOutcome
     }
 
     public func ground(
@@ -145,7 +167,7 @@ public struct MixtureGrounder: VisualGrounder {
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         )
-        return Self.selectVerifiedCandidate(
+        let selection = Self.selectVerifiedCandidate(
             axCandidate: axCandidate,
             baseResult: baseResult,
             target: target,
@@ -153,7 +175,9 @@ public struct MixtureGrounder: VisualGrounder {
             displayHeightPoints: displayHeightPoints,
             previousAnchor: previousAnchor,
             candidateFailureCounts: candidateFailureCounts
-        ).result.selectedPoint
+        )
+        await recordVerifierOutcomeIfNeeded(selection, target: target)
+        return selection.result.selectedPoint
     }
 
     public func groundResult(
@@ -185,7 +209,7 @@ public struct MixtureGrounder: VisualGrounder {
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         )
-        return Self.selectVerifiedCandidate(
+        let selection = Self.selectVerifiedCandidate(
             axCandidate: axCandidate,
             baseResult: baseResult,
             target: target,
@@ -193,7 +217,27 @@ public struct MixtureGrounder: VisualGrounder {
             displayHeightPoints: displayHeightPoints,
             previousAnchor: previousAnchor,
             candidateFailureCounts: candidateFailureCounts
-        ).result
+        )
+        await recordVerifierOutcomeIfNeeded(selection, target: target)
+        return selection.result
+    }
+
+    private func recordVerifierOutcomeIfNeeded(
+        _ selection: VerifiedGroundingSelection,
+        target: String
+    ) async {
+        guard let onVerifierOutcome else { return }
+        switch selection.outcome {
+        case .rejected, .abstained:
+            await onVerifierOutcome(VerifierOutcome(
+                target: target,
+                outcome: selection.outcome,
+                verifierResult: selection.verifierResult,
+                candidateCount: selection.result.candidates.count
+            ))
+        case .selected, .drifted, .ambiguous, .demote, .retryNextCandidate:
+            break
+        }
     }
 
     /// Region grounding (the "where is X" highlight) stays the base grounder's job —

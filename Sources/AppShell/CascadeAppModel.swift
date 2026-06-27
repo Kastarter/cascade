@@ -171,6 +171,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
     static let experimentalStructuredContentKey = "cascade.experimentalStructuredContent"
+    static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
 
     static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
@@ -264,6 +265,7 @@ public final class CascadeAppModel: ObservableObject {
     private let learnedSkillDirectory: URL?
     private let modelCallCache: ModelCallCache?
     private let experimentalStructuredContent: Bool
+    private let visualGrounderOverride: (any VisualGrounder)?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -271,12 +273,14 @@ public final class CascadeAppModel: ObservableObject {
         defaults: UserDefaults = .standard,
         startsSubsystems: Bool = true,
         appSkills initialAppSkills: AppSkillRegistry? = nil,
-        learnedSkillDirectory: URL? = nil
+        learnedSkillDirectory: URL? = nil,
+        visualGrounderOverride: (any VisualGrounder)? = nil
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
         self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults)
         self.experimentalStructuredContent = Self.experimentalStructuredContentEnabled(defaults: defaults)
+        self.visualGrounderOverride = visualGrounderOverride
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
@@ -1422,37 +1426,53 @@ public final class CascadeAppModel: ObservableObject {
     /// can pass the live `appSkills` registry (the mixture grounder skips AX on the
     /// apps that registry flags `axUnreliable`).
     func assistGrounder() -> VisualGrounder? {
-        let d = UserDefaults.standard
+        let d = defaultsStore
         // Default ON: unset → enabled; explicit false → disabled.
         let enabled = (d.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
         guard enabled else { return nil }
         let base: VisualGrounder
-        switch d.string(forKey: "cascade.visualGrounder.backend") {
-        case "claude":
-            base = ClaudeVisualGrounder()
-        default:
-            // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
-            // Requires the key; without it return nil → coordinate fallback.
-            guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
-            // The grounder is SWAPPABLE without a rebuild — point `…model` at
-            // UI-Venus-1.5 / Holo1.5 the moment a host serves them (OpenRouter doesn't
-            // yet; UI-TARS is the proven default). A swapped Qwen3-VL model emits in a
-            // different coord space → set `…coordSpace = "sent"` (or "normalized") and
-            // confirm with a live probe; a wrong space misses every click. The endpoint
-            // override is a NEW key, deliberately set: the old `…uitarsURL` once
-            // inherited a stale dead-localhost value and stalled every run.
-            let model = d.string(forKey: "cascade.visualGrounder.model") ?? GUIGrounderModel.uiTars15_7b
-            let endpoint = d.string(forKey: "cascade.visualGrounder.endpoint")
-                .flatMap { $0.isEmpty ? nil : $0 } ?? "https://openrouter.ai/api/v1/chat/completions"
-            guard let url = URL(string: endpoint) else { return nil }
-            let space = UITARSGrounder.CoordSpace(
-                rawValue: d.string(forKey: "cascade.visualGrounder.coordSpace") ?? ""
-            ) ?? .smartResize
-            base = UITARSGrounder(baseURL: url, model: model, apiKey: key, coordSpace: space)
+        if let visualGrounderOverride {
+            base = visualGrounderOverride
+        } else {
+            switch d.string(forKey: "cascade.visualGrounder.backend") {
+            case "claude":
+                base = ClaudeVisualGrounder()
+            default:
+                // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
+                // Requires the key; without it return nil → coordinate fallback.
+                guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
+                // The grounder is SWAPPABLE without a rebuild — point `…model` at
+                // UI-Venus-1.5 / Holo1.5 the moment a host serves them (OpenRouter doesn't
+                // yet; UI-TARS is the proven default). A swapped Qwen3-VL model emits in a
+                // different coord space → set `…coordSpace = "sent"` (or "normalized") and
+                // confirm with a live probe; a wrong space misses every click. The endpoint
+                // override is a NEW key, deliberately set: the old `…uitarsURL` once
+                // inherited a stale dead-localhost value and stalled every run.
+                let model = d.string(forKey: "cascade.visualGrounder.model") ?? GUIGrounderModel.uiTars15_7b
+                let endpoint = d.string(forKey: "cascade.visualGrounder.endpoint")
+                    .flatMap { $0.isEmpty ? nil : $0 } ?? "https://openrouter.ai/api/v1/chat/completions"
+                guard let url = URL(string: endpoint) else { return nil }
+                let space = UITARSGrounder.CoordSpace(
+                    rawValue: d.string(forKey: "cascade.visualGrounder.coordSpace") ?? ""
+                ) ?? .smartResize
+                base = UITARSGrounder(baseURL: url, model: model, apiKey: key, coordSpace: space)
+            }
         }
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
-        return mixture ? MixtureGrounder(base: base, skills: appSkills) : base
+        let verifyCandidates = d.bool(forKey: Self.experimentalGroundingVerifierKey)
+        return mixture ? MixtureGrounder(
+            base: base,
+            skills: appSkills,
+            verifyCandidates: verifyCandidates,
+            onVerifierOutcome: { [store = self.store] outcome in
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "grounding.verifier",
+                    detail: Self.groundingVerifierAuditDetail(outcome)
+                ))
+            }
+        ) : base
     }
 
     /// Region locator for the "where is X" highlight: the configured grounder
@@ -2433,6 +2453,18 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func groundAuditDetail(_ detail: String) -> String {
         textAuditDetail("ground", detail)
+    }
+
+    nonisolated static func groundingVerifierAuditDetail(_ outcome: MixtureGrounder.VerifierOutcome) -> String {
+        let failure = outcome.verifierResult.failureKind?.rawValue ?? "none"
+        return [
+            "verdict=\(safeAuditToken(outcome.verifierResult.verdict.rawValue))",
+            "outcome=\(safeAuditToken(outcome.auditOutcome))",
+            "failure=\(safeAuditToken(failure))",
+            "confidence=\(String(format: "%.2f", outcome.verifierResult.confidence))",
+            "candidates=\(outcome.candidateCount)",
+            textAuditDetail("target", outcome.target),
+        ].joined(separator: " ")
     }
 
     nonisolated static func harnessDeniedWatchedAppAuditDetail(toolName: String, watchedApp: String) -> String {
@@ -4507,6 +4539,27 @@ public final class CascadeAppModel: ObservableObject {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
         if let bundleURL = Bundle.main.bundleURL as URL? {
             NSWorkspace.shared.activateFileViewerSelecting([bundleURL])
+        }
+    }
+}
+
+private extension MixtureGrounder.VerifierOutcome {
+    var auditOutcome: String {
+        switch outcome {
+        case .selected:
+            return "selected"
+        case .rejected:
+            return "rejected"
+        case .abstained:
+            return "abstained"
+        case .drifted:
+            return "drifted"
+        case .ambiguous:
+            return "ambiguous"
+        case .demote:
+            return "demote"
+        case .retryNextCandidate:
+            return "retryNextCandidate"
         }
     }
 }
