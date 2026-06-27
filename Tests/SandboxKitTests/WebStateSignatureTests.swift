@@ -126,6 +126,34 @@ struct WebStateSignatureTests {
         #expect(!serialized.contains("secret-answer"))
     }
 
+    @Test func descriptionHashesPageIdentityAndActiveElement() {
+        let signature = WebStateSignature(snapshot: Self.fixture(updating: [
+            "url": "https://hr.example.test/review?token=sentinel-query-secret",
+            "title": "sentinel-title-secret",
+            "activeElement": [
+                "tagName": "input",
+                "id": "sentinel-id-secret",
+                "name": "sentinel-name-secret",
+                "type": "text",
+                "role": "textbox",
+                "label": "sentinel-label-secret",
+                "path": "#sentinel-path-secret"
+            ]
+        ]))
+        let serialized = String(describing: signature)
+
+        #expect(serialized.contains("urlHash: fnv64:"))
+        #expect(serialized.contains("titleHash: fnv64:"))
+        #expect(serialized.contains("activeElementHash: fnv64:"))
+        #expect(serialized.contains("stableHash: fnv64:"))
+        #expect(!serialized.contains("sentinel-query-secret"))
+        #expect(!serialized.contains("sentinel-title-secret"))
+        #expect(!serialized.contains("sentinel-id-secret"))
+        #expect(!serialized.contains("sentinel-name-secret"))
+        #expect(!serialized.contains("sentinel-label-secret"))
+        #expect(!serialized.contains("sentinel-path-secret"))
+    }
+
     @Test func javascriptSnippetReturnsSignatureShapeAndMutationSequence() {
         let snippet = WebStateSignature.javaScriptSnippet
 

@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): P6-03 makes `WebStateSignature.description` hash URL/title/active element identity so diagnostics do not print raw page identity.
 - NEW (2026-06-26): P5-03 hardens `AXElementResolver.frame(of:)`: AX position/size decode now requires AXValue type IDs and malformed CF values fail closed.
 - NEW (2026-06-26): Round 4 safe-integration plan is in `docs/PRODUCTION_GRADE_PLAN_ROUND4.md`; theme is default-off wiring for standalone modules into recorder/store/planner/ranking/grounding paths without shipped behavior changes.
 - NEW (2026-06-26): P4-11 wires `RetryBackoffPolicy` into pure model completers for planner/curator/task-planner paths behind an optional default-off `retryPolicy`; transient HTTP/transport failures can retry, nontransient errors and non-model actions do not.

@@ -147,7 +147,10 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
     }
 
     public var description: String {
-        "WebStateSignature(url: \(url), title: \(title), activeElement: \(activeElement), scroll: \(scroll), interactivesHash: \(interactivesHash), formValuesHash: \(formValuesHash), checkedSelectedHash: \(checkedSelectedHash), contentEditableTextHash: \(contentEditableTextHash), ariaTextHash: \(ariaTextHash), mutationSequence: \(mutationSequence), stableHash: \(stableHash))"
+        let urlHash = Self.hashCanonical(url)
+        let titleHash = Self.hashCanonical(title)
+        let activeElementHash = Self.hashCanonical(activeElement.canonicalValue)
+        return "WebStateSignature(urlHash: \(urlHash), titleHash: \(titleHash), activeElementHash: \(activeElementHash), scroll: \(scroll), interactivesHash: \(interactivesHash), formValuesHash: \(formValuesHash), checkedSelectedHash: \(checkedSelectedHash), contentEditableTextHash: \(contentEditableTextHash), ariaTextHash: \(ariaTextHash), mutationSequence: \(mutationSequence), stableHash: \(stableHash))"
     }
 
     /// JavaScript that returns a signature-ready dictionary from a live page.
