@@ -240,15 +240,69 @@ func denyListBlocksNetworkEgressAndPersistence() {
 // MARK: - Call parsing + audit
 
 @Test
-func callsParseFromToolInputAndAuditVerbatim() {
+func callsParseFromToolInputAndAuditDescriptorsAreSafe() {
     let command = HarnessCall(name: "run_command", input: ["command": "ls ~/Desktop"])
     #expect(command == .runCommand("ls ~/Desktop"))
     #expect(command?.isPower == true)
-    #expect(command?.auditSummary == "ls ~/Desktop")
 
     let search = HarnessCall(name: "search_files", input: ["query": "quarterly report"])
     #expect(search == .searchFiles(query: "quarterly report", folder: nil))
     #expect(search?.isPower == false)
 
     #expect(HarnessCall(name: "rm_everything", input: [:]) == nil)
+
+    let path = "/Users/example/SecretPayroll/quarterly-layoff-plan.txt"
+    let folder = "/Users/example/SecretPayroll"
+    let query = "needle-query-77"
+    let commandText = "printf secret-command-token"
+    let script = "tell application \"Finder\"\ndisplay dialog \"script-token\""
+    let content = "content-prefix-secret-payload"
+
+    let descriptors = [
+        HarnessCall(name: "search_files", input: ["query": query, "folder": folder])?.auditDescriptor,
+        HarnessCall(name: "list_folder", input: ["path": path])?.auditDescriptor,
+        HarnessCall(name: "read_file", input: ["path": path])?.auditDescriptor,
+        HarnessCall(name: "run_command", input: ["command": commandText])?.auditDescriptor,
+        HarnessCall(name: "run_applescript", input: ["script": script])?.auditDescriptor,
+        HarnessCall(name: "write_file", input: ["path": path, "content": content])?.auditDescriptor,
+    ].compactMap { $0 }
+
+    #expect(descriptors.count == 6)
+    #expect(descriptors[0].contains("tool=search_files"))
+    #expect(descriptors[0].contains("queryHash="))
+    #expect(descriptors[0].contains("folderHash="))
+    #expect(descriptors[1].contains("tool=list_folder"))
+    #expect(descriptors[1].contains("pathHash="))
+    #expect(descriptors[2].contains("tool=read_file"))
+    #expect(descriptors[2].contains("pathHash="))
+    #expect(descriptors[3].contains("tool=run_command"))
+    #expect(descriptors[3].contains("commandHash="))
+    #expect(descriptors[4].contains("tool=run_applescript"))
+    #expect(descriptors[4].contains("scriptHash="))
+    #expect(descriptors[5].contains("tool=write_file"))
+    #expect(descriptors[5].contains("pathHash="))
+    #expect(descriptors[5].contains("contentBytes=\(content.utf8.count)"))
+
+    let forbidden = [
+        "SecretPayroll",
+        "quarterly-layoff-plan",
+        "/Users/example",
+        "needle-query-77",
+        "printf",
+        "secret-command-token",
+        "Finder",
+        "display dialog",
+        "script-token",
+        "content-prefix-secret",
+    ]
+    for descriptor in descriptors {
+        for leaked in forbidden {
+            #expect(!descriptor.contains(leaked), "descriptor leaked \(leaked): \(descriptor)")
+        }
+    }
+
+    let fallback = HarnessCall.auditDescriptor(name: "unknown_tool", input: ["query": query])
+    #expect(fallback.contains("tool=unknown_tool"))
+    #expect(fallback.contains("inputHash="))
+    #expect(!fallback.contains(query))
 }

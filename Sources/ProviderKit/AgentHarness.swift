@@ -1,4 +1,5 @@
 import CascadeMemory
+import CryptoKit
 import Foundation
 
 /// Which direct-Mac tools the assist agent is offered alongside the computer tool.
@@ -49,19 +50,77 @@ public enum HarnessCall: Sendable, Equatable {
         }
     }
 
-    /// What goes into the audit log — the verbatim query, path, or command
-    /// (capped for the audit row), never silently summarized away.
-    public var auditSummary: String {
+    public var toolName: String {
+        switch self {
+        case .searchFiles: "search_files"
+        case .listFolder: "list_folder"
+        case .readFile: "read_file"
+        case .runCommand: "run_command"
+        case .runAppleScript: "run_applescript"
+        case .writeFile: "write_file"
+        }
+    }
+
+    /// What the audit log stores: stable descriptors only, never raw queries,
+    /// paths, commands, script bodies, or file contents.
+    public var auditDescriptor: String {
+        var fields = ["tool=\(toolName)"]
+        switch self {
+        case .searchFiles(let query, let folder):
+            fields.append("queryHash=\(Self.hash(query))")
+            fields.append("folderHash=\(folder.map(Self.hash) ?? "none")")
+        case .listFolder(let path), .readFile(let path):
+            fields.append("pathHash=\(Self.hash(path))")
+        case .runCommand(let command):
+            fields.append("commandHash=\(Self.hash(command))")
+        case .runAppleScript(let script):
+            fields.append("scriptHash=\(Self.hash(script))")
+        case .writeFile(let path, let content):
+            fields.append("pathHash=\(Self.hash(path))")
+            fields.append("contentBytes=\(content.utf8.count)")
+        }
+        return fields.joined(separator: " ")
+    }
+
+    /// User-visible supervision text may include the concrete local value; callers
+    /// must not persist this in audit rows.
+    public var displaySummary: String {
         let detail: String
         switch self {
-        case .searchFiles(let query, _): detail = query
-        case .listFolder(let path): detail = path
-        case .readFile(let path): detail = path
-        case .runCommand(let command): detail = command
-        case .runAppleScript(let script): detail = script.replacingOccurrences(of: "\n", with: " ⏎ ")
-        case .writeFile(let path, let content): detail = "\(path) (\(content.count) chars)"
+        case .searchFiles(let query, let folder):
+            detail = folder.map { "\(query) in \($0)" } ?? query
+        case .listFolder(let path), .readFile(let path):
+            detail = path
+        case .runCommand(let command):
+            detail = command
+        case .runAppleScript(let script):
+            detail = script.replacingOccurrences(of: "\n", with: " | ")
+        case .writeFile(let path, let content):
+            detail = "\(path) (\(content.utf8.count) bytes)"
         }
-        return String(detail.prefix(240))
+        return String(detail.prefix(160))
+    }
+
+    public static func auditDescriptor(name: String, input: [String: Any]) -> String {
+        if let call = HarnessCall(name: name, input: input) {
+            return call.auditDescriptor
+        }
+        let keys = input.keys.sorted()
+        let canonical = keys.map { key in "\(key)=\(String(describing: input[key] ?? ""))" }
+            .joined(separator: "\u{1f}")
+        let inputKeys = keys.map(Self.safeToken).filter { !$0.isEmpty }.joined(separator: ",")
+        return "tool=\(Self.safeToken(name)) inputHash=\(Self.hash(canonical)) inputKeys=\(inputKeys)"
+    }
+
+    private static func hash(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func safeToken(_ value: String) -> String {
+        let token = value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+        }
+        return token.isEmpty ? "unknown" : token
     }
 }
 

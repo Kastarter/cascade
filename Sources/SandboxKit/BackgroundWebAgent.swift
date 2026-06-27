@@ -541,7 +541,7 @@ public final class BackgroundWebAgent {
         if let injectedHarness = harnessProvider {
             wrappedHarness = { [weak self] name, input in
                 guard let self, !self.stopped else { return "The user stopped this task. Do not continue — end now." }
-                self.audit("sandbox.harness", "\(name) \(Self.argSummary(input))")
+                self.audit("sandbox.harness", HarnessCall.auditDescriptor(name: name, input: input))
                 return await injectedHarness(name, input)
             }
         } else {

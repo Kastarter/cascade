@@ -1965,10 +1965,10 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// Runs one harness tool call for the assist agent: STOP/supersession gate
-    /// first, then an audit row with the verbatim query/path/command, then the
-    /// actual execution (which applies the power-tier gate and the destructive
-    /// deny-list). The dock shows each call as it runs, so the user supervises
-    /// scripts the same way they supervise clicks.
+    /// first, then an audit row with a safe descriptor, then the actual execution
+    /// (which applies the power-tier gate and the destructive deny-list). The dock
+    /// shows each call as it runs, so the user supervises scripts the same way they
+    /// supervise clicks.
     private func performHarness(name: String, input: [String: Any], goal: String, gen: Int) async -> String {
         guard assistGeneration == gen, !driver.runState.isStopRequested else {
             return "The user stopped this task. Do not continue — end now."
@@ -2007,23 +2007,24 @@ public final class CascadeAppModel: ObservableObject {
                 }
             }
         }
-        let summary = call.auditSummary
+        let displaySummary = call.displaySummary
+        let auditDescriptor = call.auditDescriptor
         if name == "run_applescript" {
             // First AppleScript touch of an app blocks on a macOS Automation
             // consent dialog — without this hint the agent just looks frozen.
-            dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · approve the permission prompt if macOS shows one.")
+            dock.show(title: "Cascade is doing it", detail: "\(name): \(displaySummary) · approve the permission prompt if macOS shows one.")
         } else {
-            dock.show(title: "Cascade is doing it", detail: "\(name): \(summary) · press STOP to take control.")
+            dock.show(title: "Cascade is doing it", detail: "\(name): \(displaySummary) · press STOP to take control.")
         }
         // Audit BEFORE executing (the audit-first invariant), then flag slow
         // calls in a second row — that's how a consent-dialog stall or a
         // crawling script shows up in the log instead of being invisible.
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: summary))
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: auditDescriptor))
         let started = ContinuousClock.now
         let result = await AgentHarness.perform(call, powerEnabled: powerHarnessEnabled)
         let ms = Int(started.duration(to: .now) / .milliseconds(1))
         if ms >= 800 {
-            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms — \(summary)"))
+            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms - \(auditDescriptor)"))
         }
         return result
     }

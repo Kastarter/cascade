@@ -335,9 +335,9 @@ public final class ComputerUseAgent {
     deck, a 3D scene, a design) is screen work in that app's UI, never a script target. \
     And never use write_file or run_command as a ferry for screen work — writing \
     content to /tmp to open or paste into an app is mixing lanes; enter it in the app \
-    directly. Every \
-    command is shown to the user and recorded in their audit log. If a script fails \
-    twice, fall back to doing it on screen.
+    directly. Power calls are shown live to the user for supervision; persisted audit \
+    rows store safe descriptors, hashes, and byte counts rather than raw commands, \
+    scripts, paths, or file content. If a script fails twice, fall back to doing it on screen.
     """
 
     /// Recall guidance — appended only when `recallEnabled`, so the model is
@@ -1118,7 +1118,7 @@ public final class ComputerUseAgent {
         defs.append(contentsOf: [
             [
                 "name": "run_command",
-                "description": "Run one zsh command on this Mac and get its output (25s limit; destructive commands like sudo or rm -rf / are refused; the user sees every command in their audit log). Use it for bulk file work, data processing, or anything a shell does better than clicking.",
+                "description": "Run one zsh command on this Mac and get its output (25s limit; destructive commands like sudo or rm -rf / are refused; the user sees the command live for supervision, while the audit row stores only a safe descriptor/hash). Use it for bulk file work, data processing, or anything a shell does better than clicking.",
                 "input_schema": [
                     "type": "object",
                     "properties": ["command": ["type": "string", "description": "The zsh command"]],

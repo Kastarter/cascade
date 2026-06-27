@@ -2127,7 +2127,7 @@ private struct HarnessCard: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Power harness").font(.cascadeSans(15, .semibold))
-                        Text("run_command · run_applescript · write_file — the agent can run shell commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Every call lands verbatim in the audit log, destructive commands (sudo, rm -rf /, …) are refused, and Esc stops it mid-run.")
+                        Text("run_command · run_applescript · write_file — the agent can run shell commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Commands and scripts are shown live for supervision; audit rows store safe descriptors, hashes, and byte counts. Destructive commands (sudo, rm -rf /, …) are refused, and Esc stops it mid-run.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()

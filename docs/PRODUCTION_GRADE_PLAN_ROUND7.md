@@ -27,6 +27,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/ProviderKit/AgentHarness.swift`; `/Users/khalidsh/Humain/cascade/Sources/AppShell/CascadeAppModel.swift`; `/Users/khalidsh/Humain/cascade/Sources/SandboxKit/BackgroundWebAgent.swift`
 - Build: Split user-visible/dock text from audit text. Replace `HarnessCall.auditSummary` with a safe audit descriptor per call: `queryHash`, `folderHash`, `pathHash`, `commandHash`, `scriptHash`, content byte count, and tool name. Use that descriptor for `harness.*`, `harness.slow`, `sandbox.harness`, and any trace-building inputs. Keep raw path/command only in the supervised local execution result shown to the model/user, not the stored audit detail.
 - Test: Construct every `HarnessCall` using a distinctive path, query, command, AppleScript, and file content. Assert audit descriptors contain hashes/counts/tool names and do not contain any raw path component, query term, command token, script text, or content prefix.
+- Status: Fixed 2026-06-26 with `HarnessCall.auditDescriptor` hashes/counts, dock-only display summaries, and sandbox harness audit routing through safe descriptors.
 - Risk: med
 - Seq: SEQ-05/SEQ-07/SEQ-14
 
