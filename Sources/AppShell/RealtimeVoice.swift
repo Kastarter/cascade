@@ -72,14 +72,28 @@ public final class RealtimeVoice: ObservableObject {
     private var permissionMessage: String?
 
     // Audio
-    private let captureEngine = AVAudioEngine()
-    private let playbackEngine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private let playbackFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
+    private let audioEnabled: Bool
+    private var captureEngine: AVAudioEngine?
+    private var playbackEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var playbackFormat: AVAudioFormat?
 
     private static let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
-    public init() {
+    public init(audioEnabled: Bool = true) {
+        self.audioEnabled = audioEnabled
+        guard audioEnabled else { return }
+        let captureEngine = AVAudioEngine()
+        let playbackEngine = AVAudioEngine()
+        let playerNode = AVAudioPlayerNode()
+        guard let playbackFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false) else {
+            permissionMessage = "No audio output is available."
+            return
+        }
+        self.captureEngine = captureEngine
+        self.playbackEngine = playbackEngine
+        self.playerNode = playerNode
+        self.playbackFormat = playbackFormat
         playbackEngine.attach(playerNode)
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
     }
@@ -96,7 +110,7 @@ public final class RealtimeVoice: ObservableObject {
 
     public func beginTalking() {
         // Barge-in: cut the agent off and listen.
-        if state == .working || playerNode.isPlaying {
+        if state == .working || (playerNode?.isPlaying ?? false) {
             stopPlayback()
             socket?.sendEvent(["type": "response.cancel"])
             onInterrupt?()
@@ -121,6 +135,7 @@ public final class RealtimeVoice: ObservableObject {
     public func done() { if state == .working { state = .idle } }
 
     public func speak(_ text: String) {
+        guard audioEnabled else { return }
         guard state != .listening else { return }
         // NOTE: speak() must not touch `state` — mid-run narration would flip
         // .working → .idle and collapse the notch while the agent still works;
@@ -243,10 +258,15 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Capture
 
     private func startCapture() {
+        guard audioEnabled, let captureEngine, let socket else {
+            permissionMessage = "No microphone input is available."
+            state = .idle
+            return
+        }
         transcript = ""
-        socket?.sendEvent(["type": "input_audio_buffer.clear"])
+        socket.sendEvent(["type": "input_audio_buffer.clear"])
         do {
-            try Self.installCaptureTap(engine: captureEngine, sender: socket!) { [weak self] level in
+            try Self.installCaptureTap(engine: captureEngine, sender: socket) { [weak self] level in
                 Task { @MainActor in
                     guard let self, self.state == .listening else { return }
                     // Light smoothing so the bars breathe instead of flickering.
@@ -261,6 +281,7 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     private func stopCapture() {
+        guard let captureEngine else { return }
         captureEngine.inputNode.removeTap(onBus: 0)
         captureEngine.stop()
         inputLevel = 0
@@ -329,6 +350,7 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Playback
 
     private func playPCM16(_ data: Data) {
+        guard let playbackFormat, let playbackEngine, let playerNode else { return }
         let frames = data.count / MemoryLayout<Int16>.size
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: AVAudioFrameCount(frames)) else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
@@ -343,12 +365,14 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     private func stopPlayback() {
+        guard let playerNode else { return }
         if playerNode.isPlaying { playerNode.stop() }
     }
 
     // MARK: - Mic auth
 
     private func ensureMic() async -> Bool {
+        guard audioEnabled else { return false }
         if micAuthorized { return true }
         let granted = await Self.requestMic()
         micAuthorized = granted

@@ -48,6 +48,22 @@ public struct BackgroundAgentRun: Identifiable, Sendable {
 
 @MainActor
 public final class CascadeAppModel: ObservableObject {
+    public enum AuditIntegrityStatus: Equatable, Sendable {
+        case unchecked
+        case trusted(AuditChainStatus)
+        case untrusted(AuditChainStatus)
+        case verificationFailed(String)
+
+        public var isTrusted: Bool {
+            switch self {
+            case .trusted:
+                true
+            case .unchecked, .untrusted, .verificationFailed:
+                false
+            }
+        }
+    }
+
     public enum Tab: String, CaseIterable, Identifiable {
         case reel = "Reel"
         case cascades = "Cascades"
@@ -81,6 +97,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var searchResults: [RecordedContext] = []
     @Published public private(set) var searchQuery: String = ""
     @Published public private(set) var audit: [AuditEvent] = []
+    @Published public private(set) var auditIntegrityStatus: AuditIntegrityStatus = .unchecked
     /// The raw recall layer: every repeated sequence the detector found, before the
     /// automatable filter and curation. Kept observable so the pipeline is testable.
     @Published public private(set) var detectedWaste: [DetectedWaste] = []
@@ -151,6 +168,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
+    static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
     /// benchmarked CU default) or "low". A runtime toggle, not a recompile, so
@@ -189,7 +207,7 @@ public final class CascadeAppModel: ObservableObject {
     private let groqKeyStore = GroqKeyStore()
     private let openRouterKeyStore = OpenRouterKeyStore()
     public let guidanceOverlay = GuidanceOverlayController()
-    public let voice = RealtimeVoice()
+    public let voice: RealtimeVoice
     public let pushToTalk = PushToTalkMonitor()
     /// Background agents running in the isolated web sandbox.
     @Published public private(set) var backgroundAgents: [BackgroundAgentRun] = []
@@ -246,6 +264,7 @@ public final class CascadeAppModel: ObservableObject {
         self.defaultsStore = defaults
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
+        self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
         // Production store anchors its audit-chain head in the Keychain so
         // truncation/rewrite of the local audit log is detectable. Tests inject a
         // store and never hit this path.
@@ -340,7 +359,15 @@ public final class CascadeAppModel: ObservableObject {
             refreshPermissionState()
             await refreshComputerUseHealth()
             contexts = try await store.recentContexts(limit: 80)
-            audit = try await store.recentAudit(limit: 80)
+            let integrity = try await store.verifyAuditChain()
+            auditIntegrityStatus = Self.auditIntegrityStatus(from: integrity)
+            if trustedAuditHistoryForSensitiveAction() {
+                audit = auditIntegrityEnforcementEnabled
+                    ? try await store.recentChainedAudit(limit: 80)
+                    : try await store.recentAudit(limit: 80)
+            } else {
+                audit = []
+            }
             agents = try await orchestrator.agents()
             let personalizationEnabled = defaultsStore.bool(forKey: Self.experimentalSuggestionRankingKey)
             let rawDetectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
@@ -359,8 +386,37 @@ public final class CascadeAppModel: ObservableObject {
             }
             statusLine = recorder.status.message
         } catch {
+            auditIntegrityStatus = .verificationFailed(error.localizedDescription)
+            if auditIntegrityEnforcementEnabled { audit = [] }
             statusLine = error.localizedDescription
         }
+    }
+
+    private static func auditIntegrityStatus(from status: AuditChainStatus) -> AuditIntegrityStatus {
+        switch status {
+        case .intact, .empty:
+            .trusted(status)
+        case .broken, .truncated, .unchained:
+            .untrusted(status)
+        }
+    }
+
+    private var auditIntegrityEnforcementEnabled: Bool {
+        defaultsStore.bool(forKey: Self.auditIntegrityEnforcementKey)
+    }
+
+    private func trustedAuditHistoryForSensitiveAction() -> Bool {
+        !auditIntegrityEnforcementEnabled || auditIntegrityStatus.isTrusted
+    }
+
+    private var untrustedAuditHistoryMessage: String {
+        "Audit history is untrusted. Cascade disabled agents and harness actions until the audit log is repaired."
+    }
+
+    private func refuseUntrustedAuditHistory() {
+        teachMessage = untrustedAuditHistoryMessage
+        agentMessage = untrustedAuditHistoryMessage
+        dock.show(title: "Audit history untrusted", detail: untrustedAuditHistoryMessage)
     }
 
     public func startRecording() {
@@ -574,6 +630,10 @@ public final class CascadeAppModel: ObservableObject {
             showSettings = true
             return false
         }
+        guard trustedAuditHistoryForSensitiveAction() else {
+            refuseUntrustedAuditHistory()
+            return false
+        }
         // Each agent owns a live WKWebView + a Computer Use loop; cap how many run at
         // once so the box stack and resource use stay sane. Refuse rather than queue —
         // the user can stop one and retry.
@@ -605,6 +665,7 @@ public final class CascadeAppModel: ObservableObject {
         runtime.recallEnabled = true
         runtime.harnessProvider = { [weak self] name, input in
             guard let self else { return "Cascade is shutting down — stop." }
+            guard self.trustedAuditHistoryForSensitiveAction() else { return self.untrustedAuditHistoryMessage }
             if RecordRecall.isRecallTool(name) {
                 return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
             }
@@ -972,6 +1033,11 @@ public final class CascadeAppModel: ObservableObject {
 
     /// Clicks the element Cascade just pointed at — the "click that" fast path.
     private func clickRememberedElement(_ pointed: AssistMemory.PointedElement, utterance: String, gen: Int) {
+        guard trustedAuditHistoryForSensitiveAction() else {
+            refuseUntrustedAuditHistory()
+            voice.done()
+            return
+        }
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointed.globalPoint) }) ?? NSScreen.main else { return }
         let working = "Clicking what I pointed at…"
         teachMessage = working
@@ -1066,6 +1132,11 @@ public final class CascadeAppModel: ObservableObject {
     /// to each target so you can watch; STOP (and the caps) keep control with you,
     /// and every run is audited.
     private func runAssistTask(goal: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int) async {
+        guard trustedAuditHistoryForSensitiveAction() else {
+            refuseUntrustedAuditHistory()
+            voice.done()
+            return
+        }
         driver.runState.reset()
         assistTaskRunning = true
         assistTaskGoal = goal
@@ -2031,6 +2102,7 @@ public final class CascadeAppModel: ObservableObject {
         guard assistGeneration == gen, !driver.runState.isStopRequested else {
             return "The user stopped this task. Do not continue — end now."
         }
+        guard trustedAuditHistoryForSensitiveAction() else { return untrustedAuditHistoryMessage }
         // Parse the Sendable call HERE (on the main actor) so the untyped
         // dictionary never crosses into RecordRecall's nonisolated executor.
         let call = RecordRecall.Call(name: name, input: input)
@@ -2048,6 +2120,7 @@ public final class CascadeAppModel: ObservableObject {
         guard assistGeneration == gen, !driver.runState.isStopRequested else {
             return "The user stopped this task. Do not continue — end now."
         }
+        guard trustedAuditHistoryForSensitiveAction() else { return untrustedAuditHistoryMessage }
         guard let call = HarnessCall(name: name, input: input) else {
             return "Unknown harness tool “\(name)”."
         }
@@ -3532,6 +3605,10 @@ public final class CascadeAppModel: ObservableObject {
     /// Everything else replays the recorded recipe on the real Mac — visible
     /// cursor, STOP valve, step cap, every action audited.
     public func deployAgent(_ agent: CascadeAgent) {
+        guard trustedAuditHistoryForSensitiveAction() else {
+            refuseUntrustedAuditHistory()
+            return
+        }
         guard !agentRunning else { return }
         guard !agent.recipe.steps.isEmpty else {
             agentMessage = "“\(agent.name)” has no recorded steps yet."
@@ -3551,6 +3628,10 @@ public final class CascadeAppModel: ObservableObject {
 
     func runAgentRecipe(_ agent: CascadeAgent) async {
         defer { agentRunning = false }
+        guard trustedAuditHistoryForSensitiveAction() else {
+            refuseUntrustedAuditHistory()
+            return
+        }
         let steps = agent.recipe.steps.sorted { $0.order < $1.order }
         var stoppedEarly = false
         // Clicks whose effect could not be confirmed in a row. One is tolerated

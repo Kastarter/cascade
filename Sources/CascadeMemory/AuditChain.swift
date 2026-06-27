@@ -56,6 +56,9 @@ public enum AuditChainStatus: Equatable, Sendable {
     /// The internal chain is consistent but disagrees with the out-of-band anchor —
     /// rows were truncated or appended/rewritten outside the trusted append path.
     case truncated(expectedCount: Int, foundCount: Int)
+    /// Rows exist, but none are covered by the tamper-evident chain. Treat this as
+    /// untrusted instead of conflating it with a genuinely empty audit table.
+    case unchained(firstID: Int64)
     /// No chained rows exist yet.
     case empty
 }

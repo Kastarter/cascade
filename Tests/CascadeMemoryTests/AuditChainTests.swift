@@ -43,6 +43,25 @@ func emptyAuditChainReportsEmpty() async throws {
 }
 
 @Test
+func unchainedOnlyAuditRowsAreUntrusted() async throws {
+    let (_, path) = try makeStore()
+    rawExec(path, """
+    INSERT INTO audit_event (created_at, actor, action, detail)
+    VALUES ('2026-06-26T00:00:00.000Z','legacy','legacy.only','one');
+    INSERT INTO audit_event (created_at, actor, action, detail)
+    VALUES ('2026-06-26T00:00:01.000Z','legacy','legacy.only','two');
+    """)
+
+    let fresh = try CascadeStore(path: path)
+    if case .unchained(let firstID) = try await fresh.verifyAuditChain() {
+        #expect(firstID == 1)
+    } else {
+        Issue.record("expected non-empty unchained rows to be untrusted, not empty")
+    }
+    #expect(try await fresh.recentChainedAudit(limit: 10).isEmpty)
+}
+
+@Test
 func appendedAuditRowsFormAnIntactChain() async throws {
     let (store, _) = try makeStore()
     for detail in ["opened reel", "ran agent", "approved cascade", "exported audit"] {

@@ -1,7 +1,15 @@
 import AgentOrchestrator
 import CascadeMemory
 import Foundation
+import SQLite3
 import Testing
+
+private func rawTraceAuditExec(_ path: String, _ sql: String) {
+    var db: OpaquePointer?
+    guard sqlite3_open(path, &db) == SQLITE_OK else { return }
+    defer { sqlite3_close(db) }
+    sqlite3_exec(db, sql, nil, nil, nil)
+}
 
 @Test
 func auditEventsAssembleTrailingAssistTaskWithBufferedSpans() async throws {
@@ -118,4 +126,53 @@ func traceAuditWindowIsOptInAndRecentAuditIsUnchanged() async throws {
     #expect(recent.map(\.action) == ["agent.run.completed", "harness.list_folder", "assist.task"])
     #expect(disabled.isEmpty)
     #expect(enabled.map(\.action) == ["assist.task", "harness.list_folder", "agent.run.completed"])
+}
+
+@Test
+func traceAuditWindowRejectsUnchainedOnlyRows() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("AgentTraceLegacyOnly-\(UUID().uuidString).sqlite")
+        .path
+    _ = try CascadeStore(path: path)
+    let base = Date(timeIntervalSince1970: 1_800_000_300)
+    rawTraceAuditExec(path, """
+    INSERT INTO audit_event (created_at, actor, action, detail)
+    VALUES ('2027-01-15T08:05:00.000Z','legacy','assist.task','unchained');
+    """)
+
+    let fresh = try CascadeStore(path: path)
+    let enabled = try await fresh.auditWindowForTraceAssembly(
+        from: base,
+        to: base.addingTimeInterval(1),
+        enableTraceAssembly: true
+    )
+
+    #expect(enabled.isEmpty)
+}
+
+@Test
+func traceAuditWindowFiltersLegacyPrefixBeforeChainedRows() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("AgentTraceLegacyPrefix-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+    let base = Date(timeIntervalSince1970: 1_800_000_400)
+    rawTraceAuditExec(path, """
+    INSERT INTO audit_event (created_at, actor, action, detail)
+    VALUES ('2027-01-15T08:06:40.000Z','legacy','assist.task','legacy prefix');
+    """)
+    _ = try await store.appendAudit(AuditEvent(
+        createdAt: base.addingTimeInterval(1),
+        actor: "agent",
+        action: "harness.list_folder",
+        detail: "chained"
+    ))
+
+    let enabled = try await store.auditWindowForTraceAssembly(
+        from: base,
+        to: base.addingTimeInterval(2),
+        enableTraceAssembly: true
+    )
+
+    #expect(enabled.map(\.action) == ["harness.list_folder"])
 }

@@ -1195,16 +1195,20 @@ public actor CascadeStore {
         SELECT id, created_at, actor, action, detail, prev_hash, event_hash
         FROM audit_event ORDER BY id ASC;
         """
-        let scan: (status: AuditChainStatus?, verified: Int, head: String) = try withStatement(sql) { statement in
+        let scan: (status: AuditChainStatus?, verified: Int, head: String, seenAny: Bool, firstUnchainedID: Int64?) = try withStatement(sql) { statement in
             var verified = 0
             var seenChained = false
+            var seenAny = false
+            var firstUnchainedID: Int64?
             var expectedPrev = AuditChain.genesis
             var lastHash = ""
             while sqlite3_step(statement) == SQLITE_ROW {
                 let id = sqlite3_column_int64(statement, 0)
+                seenAny = true
                 guard let storedHash = text(statement, 6) else {
                     // Unchained (legacy) row — allowed ONLY as a leading prefix.
-                    if seenChained { return (.broken(atID: id), verified, lastHash) }
+                    if seenChained { return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID) }
+                    firstUnchainedID = firstUnchainedID ?? id
                     continue
                 }
                 let createdAt = text(statement, 1) ?? ""
@@ -1213,22 +1217,22 @@ public actor CascadeStore {
                 let detail = text(statement, 4) ?? ""
                 let prevHash = text(statement, 5) ?? ""
                 if !seenChained {
-                    if prevHash != AuditChain.genesis { return (.broken(atID: id), verified, lastHash) }
+                    if prevHash != AuditChain.genesis { return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID) }
                     seenChained = true
                 } else if prevHash != expectedPrev {
-                    return (.broken(atID: id), verified, lastHash)
+                    return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID)
                 }
                 let canonical = AuditChain.canonicalForm(
                     createdAt: createdAt, actor: actor, action: action, detail: detail
                 )
                 if AuditChain.hash(prev: prevHash, canonical: canonical) != storedHash {
-                    return (.broken(atID: id), verified, lastHash)
+                    return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID)
                 }
                 expectedPrev = storedHash
                 lastHash = storedHash
                 verified += 1
             }
-            return (nil, verified, lastHash)
+            return (nil, verified, lastHash, seenAny, firstUnchainedID)
         }
         if let status = scan.status { return status }
         // Out-of-band anchor: catches truncation / rewrite the internal chain alone
@@ -1238,13 +1242,43 @@ public actor CascadeStore {
            head.count != scan.verified || head.hash != scan.head {
             return .truncated(expectedCount: head.count, foundCount: scan.verified)
         }
-        return scan.verified == 0 ? .empty : .intact(verified: scan.verified)
+        if scan.verified == 0 {
+            if scan.seenAny, let firstUnchainedID = scan.firstUnchainedID {
+                return .unchained(firstID: firstUnchainedID)
+            }
+            return .empty
+        }
+        return .intact(verified: scan.verified)
     }
 
     public func recentAudit(limit: Int = 80) throws -> [AuditEvent] {
         let sql = """
         SELECT id, created_at, actor, action, detail
         FROM audit_event
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(limit))
+            var rows: [AuditEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(AuditEvent(
+                    id: sqlite3_column_int64(statement, 0),
+                    createdAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
+                    actor: text(statement, 2) ?? "system",
+                    action: text(statement, 3) ?? "unknown",
+                    detail: text(statement, 4) ?? ""
+                ))
+            }
+            return rows
+        }
+    }
+
+    public func recentChainedAudit(limit: Int = 80) throws -> [AuditEvent] {
+        let sql = """
+        SELECT id, created_at, actor, action, detail
+        FROM audit_event
+        WHERE event_hash IS NOT NULL
         ORDER BY created_at DESC, id DESC
         LIMIT ?;
         """
@@ -1274,10 +1308,16 @@ public actor CascadeStore {
         enableTraceAssembly: Bool = false
     ) throws -> [AuditEvent] {
         guard enableTraceAssembly, limit > 0 else { return [] }
+        switch try verifyAuditChain() {
+        case .broken, .truncated, .unchained:
+            return []
+        case .empty, .intact:
+            break
+        }
         let sql = """
         SELECT id, created_at, actor, action, detail
         FROM audit_event
-        WHERE created_at >= ? AND created_at <= ?
+        WHERE event_hash IS NOT NULL AND created_at >= ? AND created_at <= ?
         ORDER BY created_at ASC, id ASC
         LIMIT ?;
         """
