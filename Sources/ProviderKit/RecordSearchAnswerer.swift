@@ -53,6 +53,10 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         self.includeStructuredContent = includeStructuredContent
     }
 
+    public func configuredToolDefinitions() -> [[String: Any]] {
+        RecordRecall.toolDefinitions(includeStructuredContent: includeStructuredContent)
+    }
+
     // MARK: - Public entry
 
     /// Answers `question`, optionally with prior conversation turns for

@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-27): D-05 unifies structured capture and recall behind default-off `cascade.experimentalStructuredContent`; enabled app models construct `ContextRecorder.Options(structuredContent: true)` and expose `inspect_structure` to record-answer/computer-use recall.
 - NEW (2026-06-27): D-01 wires audit-chain verification into `CascadeAppModel.refreshAll()` before publishing recent audit rows; default-off enforcement key `cascade.auditIntegrityEnforcement` hides untrusted activity and blocks agent/harness actions when enabled, and trace assembly returns no rows on broken/truncated chains.
 - NEW (2026-06-27): D-02 wires `ModelCallCache` behind default-off `cascade.experimentalModelCallCache`; enabled app instances share one cache across WorkflowCurator, ClaudeSingleStepPlanner, and AgentTaskPlanner paths, while direct client/locator calls no longer fake cache-key work.
 - NEW (2026-06-27): D-04 threads `cascade.experimentalEpisodeMining` through `CascadeAppModel.refreshAll()` to `WasteDetector.detect(..., useEpisodeMining:)`; default refresh keeps contiguous candidates, opt-in uses ActionEpisodeSegmenter/PrefixSpanMiner with contiguous fallback when the miner is empty.

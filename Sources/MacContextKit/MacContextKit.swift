@@ -206,6 +206,8 @@ public final class ContextRecorder: ObservableObject {
     private var activationObserver: NSObjectProtocol?
     private var lastActivationCaptureAt = Date.distantPast
 
+    public var configuration: Options { options }
+
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
         self.store = store
         self.observer = observer

@@ -170,10 +170,15 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
+    static let experimentalStructuredContentKey = "cascade.experimentalStructuredContent"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
 
     static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
         defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
+    }
+
+    static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalStructuredContentKey)
     }
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
@@ -258,6 +263,7 @@ public final class CascadeAppModel: ObservableObject {
     private let defaultsStore: UserDefaults
     private let learnedSkillDirectory: URL?
     private let modelCallCache: ModelCallCache?
+    private let experimentalStructuredContent: Bool
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -270,6 +276,7 @@ public final class CascadeAppModel: ObservableObject {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
         self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults)
+        self.experimentalStructuredContent = Self.experimentalStructuredContentEnabled(defaults: defaults)
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
@@ -288,12 +295,22 @@ public final class CascadeAppModel: ObservableObject {
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
-        recorder = ContextRecorder(store: store)
+        recorder = ContextRecorder(
+            store: store,
+            options: ContextRecorder.Options(structuredContent: experimentalStructuredContent)
+        )
         dock = ControlDockModel()
         hotkey = UseDeviceHotkeyMonitor()
         teachHotkey = UseDeviceHotkeyMonitor(hotkey: UseDeviceHotkey(
             keyCode: 17, requiredModifiers: [.control, .option], label: "Control-Option-T"))
-        orchestrator = injectedOrchestrator ?? CascadeOrchestrator(store: store, modelCallCache: modelCallCache)
+        orchestrator = injectedOrchestrator ?? CascadeOrchestrator(
+            store: store,
+            recordAnswerer: RecordSearchAnswerer(
+                store: store,
+                includeStructuredContent: experimentalStructuredContent
+            ),
+            modelCallCache: modelCallCache
+        )
         driver = LocalMacDriver(store: store)
         recorder.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -675,10 +692,11 @@ public final class CascadeAppModel: ObservableObject {
         // tools stay behind the user's Power-harness opt-in; recall is read-only.
         runtime.harnessTier = powerHarnessEnabled ? .full : .readOnly
         runtime.recallEnabled = true
+        runtime.includeStructuredRecallContent = experimentalStructuredContent
         runtime.harnessProvider = { [weak self] name, input in
             guard let self else { return "Cascade is shutting down — stop." }
             guard self.trustedAuditHistoryForSensitiveAction() else { return self.untrustedAuditHistoryMessage }
-            if RecordRecall.isRecallTool(name) {
+            if RecordRecall.isRecallTool(name, includeStructuredContent: self.experimentalStructuredContent) {
                 return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
             }
             guard let call = HarnessCall(name: name, input: input) else { return "Unknown harness tool “\(name)”." }
@@ -1321,7 +1339,7 @@ public final class CascadeAppModel: ObservableObject {
     private func assistHarnessProvider(goal: String, gen: Int) -> @MainActor (String, [String: Any]) async -> String {
         { [weak self] name, input in
             guard let self else { return "Cascade is shutting down — stop." }
-            if RecordRecall.isRecallTool(name) {
+            if RecordRecall.isRecallTool(name, includeStructuredContent: self.experimentalStructuredContent) {
                 return await self.performRecall(name: name, input: input, gen: gen)
             }
             return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
@@ -1350,6 +1368,7 @@ public final class CascadeAppModel: ObservableObject {
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
             recallEnabled: true,
+            includeStructuredRecallContent: experimentalStructuredContent,
             // Grounding split: the grounder locates named targets. In structural
             // mode it backs click_target/fill_target/scroll (the model never emits
             // coordinates); in coordinate mode it backs the optional fill_target aid.
@@ -1507,7 +1526,8 @@ public final class CascadeAppModel: ObservableObject {
             skillIndex: appSkills.indexText,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
             harnessTier: powerHarnessEnabled ? .full : .readOnly,
-            recallEnabled: true
+            recallEnabled: true,
+            includeStructuredRecallContent: experimentalStructuredContent
         )
         let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
         let res = AgentResolution.best(forWidth: dw, height: dh)

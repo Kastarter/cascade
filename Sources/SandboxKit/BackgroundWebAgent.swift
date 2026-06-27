@@ -106,6 +106,7 @@ public final class BackgroundWebAgent {
     /// Whether record-recall tools are offered (needs the owner to inject a store via
     /// `harnessProvider`).
     public var recallEnabled = false
+    public var includeStructuredRecallContent = false
 
     /// Emits an audit row through `onAudit`, prefixing the run tag so the row stays
     /// attributable to this run even when several agents log into the same stream.
@@ -120,8 +121,12 @@ public final class BackgroundWebAgent {
 
     /// Safe descriptor for sandbox harness audit. Recall calls use their own
     /// descriptor so search queries are never persisted as generic raw input.
-    nonisolated static func harnessAuditDescriptor(name: String, input: [String: Any]) -> String {
-        if RecordRecall.isRecallTool(name, includeStructuredContent: true) {
+    nonisolated static func harnessAuditDescriptor(
+        name: String,
+        input: [String: Any],
+        includeStructuredContent: Bool = false
+    ) -> String {
+        if RecordRecall.isRecallTool(name, includeStructuredContent: includeStructuredContent) {
             return RecordRecall.Call(name: name, input: input).auditDetail
         }
         return HarnessCall.auditDescriptor(name: name, input: input)
@@ -556,7 +561,11 @@ public final class BackgroundWebAgent {
         if let injectedHarness = harnessProvider {
             wrappedHarness = { [weak self] name, input in
                 guard let self, !self.stopped else { return "The user stopped this task. Do not continue — end now." }
-                self.audit("sandbox.harness", Self.harnessAuditDescriptor(name: name, input: input))
+                self.audit("sandbox.harness", Self.harnessAuditDescriptor(
+                    name: name,
+                    input: input,
+                    includeStructuredContent: self.includeStructuredRecallContent
+                ))
                 return await injectedHarness(name, input)
             }
         } else {
@@ -570,7 +579,8 @@ public final class BackgroundWebAgent {
             skillIndex: WebSkills.index(),
             harnessProvider: wrappedHarness,
             harnessTier: harnessTier,
-            recallEnabled: recallEnabled
+            recallEnabled: recallEnabled,
+            includeStructuredRecallContent: includeStructuredRecallContent
         )
 
         var acted = false

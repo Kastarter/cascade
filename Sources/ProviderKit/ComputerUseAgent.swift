@@ -403,6 +403,11 @@ public final class ComputerUseAgent {
     /// `ScreenCaptureUtility.captureCursorScreenJPEG`) so `proceed` skips resizing.
     public var captureSize: (width: Int, height: Int) { (resW, resH) }
 
+    public func configuredRecallToolDefinitions() -> [[String: Any]] {
+        guard recallEnabled else { return [] }
+        return RecordRecall.toolDefinitions(includeStructuredContent: includeStructuredRecallContent)
+    }
+
     /// `conversation` is the session's recent (user, assistant) exchanges, replayed
     /// as plain text turns ahead of the screenshot so the model resolves references
     /// like "the first one" or "reply to it" against what just happened. Old

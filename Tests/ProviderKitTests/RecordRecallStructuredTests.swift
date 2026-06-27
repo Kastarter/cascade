@@ -64,3 +64,18 @@ func inspectStructureParsesAndRoutesLikeOtherRecallTools() {
     #expect(optInNames.contains("inspect_structure"))
     #expect(RecordRecall.toolNames(includeStructuredContent: true).contains("inspect_structure"))
 }
+
+@Test
+func recordSearchAnswererToolDefinitionsRespectStructuredOptIn() throws {
+    let store = try makeStructuredStore()
+
+    let defaultNames = RecordSearchAnswerer(store: store)
+        .configuredToolDefinitions()
+        .compactMap { $0["name"] as? String }
+    #expect(!defaultNames.contains("inspect_structure"))
+
+    let optInNames = RecordSearchAnswerer(store: store, includeStructuredContent: true)
+        .configuredToolDefinitions()
+        .compactMap { $0["name"] as? String }
+    #expect(optInNames.contains("inspect_structure"))
+}
