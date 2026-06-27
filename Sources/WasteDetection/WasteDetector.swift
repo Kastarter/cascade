@@ -68,12 +68,13 @@ public struct WasteDetector: Sendable {
         useEpisodeMining: Bool = false
     ) -> [DetectedWaste] {
         if useEpisodeMining {
-            return detectWithEpisodeMining(
+            let episodeResults = detectWithEpisodeMining(
                 contexts: contexts,
                 inputEvents: inputEvents,
                 maxResults: maxResults,
                 webAppIdentity: webAppIdentity
             )
+            if !episodeResults.isEmpty { return episodeResults }
         }
         return detectContiguous(
             contexts: contexts,

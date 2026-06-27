@@ -166,6 +166,7 @@ public final class CascadeAppModel: ObservableObject {
     }
     private static let powerHarnessKey = "cascade.powerHarness"
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
+    static let experimentalEpisodeMiningKey = "cascade.experimentalEpisodeMining"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
@@ -377,7 +378,11 @@ public final class CascadeAppModel: ObservableObject {
             }
             agents = try await orchestrator.agents()
             let personalizationEnabled = defaultsStore.bool(forKey: Self.experimentalSuggestionRankingKey)
-            let rawDetectedWaste = try await orchestrator.detectedWaste(webAppIdentity: Self.webAppIdentity)
+            let episodeMiningEnabled = defaultsStore.bool(forKey: Self.experimentalEpisodeMiningKey)
+            let rawDetectedWaste = try await orchestrator.detectedWaste(
+                webAppIdentity: Self.webAppIdentity,
+                useEpisodeMining: episodeMiningEnabled
+            )
             if personalizationEnabled {
                 let preferenceModel = suggestionPreferenceModel()
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
