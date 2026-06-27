@@ -2057,30 +2057,8 @@ public final class CascadeAppModel: ObservableObject {
         // didn't survive failure pressure). Script-FIRST bulk work in an app
         // the agent never touched on screen stays allowed, and the user's own
         // ask for a script overrides.
-        if name == "run_applescript" || name == "run_command" {
-            let source = (input["script"] as? String) ?? (input["command"] as? String) ?? ""
-            let isScripting = name == "run_applescript" || source.lowercased().contains("osascript")
-            if isScripting, !AppSkill.goalAsksForScript(goal) {
-                let watched = AgentHarness.scriptedAppTargets(in: source).first { target in
-                    episodeAppActions.contains { app, count in
-                        count >= 3 && (app.lowercased().contains(target.lowercased())
-                            || target.lowercased().contains(app.lowercased()))
-                    }
-                }
-                if let watched {
-                    dock.show(title: "Blocked a script", detail: "\(name) targeting \(watched) — the task stays on screen.")
-                    _ = try? await store.appendAudit(AuditEvent(
-                        actor: "agent", action: "harness.denied.watched-app", detail: Self.harnessDeniedWatchedAppAuditDetail(toolName: name, watchedApp: watched)
-                    ))
-                    return """
-                    Blocked: you have been doing this task in \(watched)'s own UI on screen, \
-                    and the user is watching that work — scripting the same app now abandons \
-                    it mid-flight (one lane per artifact). Finish on screen with clicks, \
-                    fields, and shortcuts; if an edit went wrong, fix it on screen too. A \
-                    script here is only allowed when the user's own words ask for one.
-                    """
-                }
-            }
+        if let watchedDenial = await watchedAppHarnessDenialMessageIfNeeded(toolName: name, input: input, goal: goal) {
+            return watchedDenial
         }
         let displaySummary = call.displaySummary
         let auditDescriptor = call.auditDescriptor
@@ -2102,6 +2080,38 @@ public final class CascadeAppModel: ObservableObject {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms - \(auditDescriptor)"))
         }
         return result
+    }
+
+    @discardableResult
+    func watchedAppHarnessDenialMessageIfNeeded(
+        toolName name: String,
+        input: [String: Any],
+        goal: String,
+        watchedAppActionCounts: [String: Int]? = nil
+    ) async -> String? {
+        guard name == "run_applescript" || name == "run_command" else { return nil }
+        let source = (input["script"] as? String) ?? (input["command"] as? String) ?? ""
+        let isScripting = name == "run_applescript" || source.lowercased().contains("osascript")
+        guard isScripting, !AppSkill.goalAsksForScript(goal) else { return nil }
+        let appActions = watchedAppActionCounts ?? episodeAppActions
+        let watched = AgentHarness.scriptedAppTargets(in: source).first { target in
+            appActions.contains { app, count in
+                count >= 3 && (app.lowercased().contains(target.lowercased())
+                    || target.lowercased().contains(app.lowercased()))
+            }
+        }
+        guard let watched else { return nil }
+        dock.show(title: "Blocked a script", detail: "\(name) targeting \(watched) — the task stays on screen.")
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent", action: "harness.denied.watched-app", detail: Self.harnessDeniedWatchedAppAuditDetail(toolName: name, watchedApp: watched)
+        ))
+        return """
+        Blocked: you have been doing this task in \(watched)'s own UI on screen, \
+        and the user is watching that work — scripting the same app now abandons \
+        it mid-flight (one lane per artifact). Finish on screen with clicks, \
+        fields, and shortcuts; if an edit went wrong, fix it on screen too. A \
+        script here is only allowed when the user's own words ask for one.
+        """
     }
 
     /// The per-turn grounding note plus, when the stall guard fired, the firm

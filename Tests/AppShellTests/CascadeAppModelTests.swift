@@ -463,6 +463,26 @@ func appShellAuditDetailsKeepStableIdentityReferencesNotRawText() async throws {
     expectAuditDetail(timing.detail, excludesRawIdentityContaining: rawToken)
 }
 
+@MainActor @Test
+func watchedAppHarnessDenialPersistsHashedAppIdentity() async throws {
+    let (model, store) = try makeModel()
+    let watchedApp = "P9SentinelWatchedApp"
+
+    let denial = await model.watchedAppHarnessDenialMessageIfNeeded(
+        toolName: "run_applescript",
+        input: ["script": #"tell application "\#(watchedApp)" to activate"#],
+        goal: "Update the visible document",
+        watchedAppActionCounts: [watchedApp: 3]
+    )
+
+    #expect(denial != nil)
+    let watched = try await waitForAudit(store, action: "harness.denied.watched-app")
+    #expect(watched.detail.contains("tool=run_applescript"))
+    #expect(watched.detail.contains("appHash=\(AuditIdentity.hash(watchedApp))"))
+    #expect(watched.detail.contains("appChars=\(watchedApp.count)"))
+    #expect(!watched.detail.contains(watchedApp))
+}
+
 @Test
 func flightDelayMillisecondsRejectsNonFiniteAndClampsLargeValues() {
     #expect(CascadeAppModel.safeFlightDelayMilliseconds(.nan) == 0)
