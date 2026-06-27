@@ -90,6 +90,28 @@ func emptyTagLeavesDetailUntouched() {
     #expect(BackgroundWebAgent.taggedDetail(tag: "", "key Return") == "key Return")
 }
 
+@Test
+func sandboxHarnessAuditUsesRecallSafeDescriptor() {
+    let phrase = "Aperture-Delta Jane Example confidential runway.pdf"
+    let detail = BackgroundWebAgent.harnessAuditDescriptor(
+        name: "search_record",
+        input: ["query": phrase]
+    )
+    #expect(detail == RecordRecall.Call.search(query: phrase).auditDetail)
+    #expect(detail.contains("tool=search_record"))
+    #expect(detail.contains("queryLength=\(phrase.count)"))
+    #expect(detail.contains("queryHash="))
+    #expect(!detail.contains(phrase))
+
+    let harness = BackgroundWebAgent.harnessAuditDescriptor(
+        name: "search_files",
+        input: ["query": phrase]
+    )
+    #expect(harness.contains("tool=search_files"))
+    #expect(harness.contains("queryHash="))
+    #expect(!harness.contains(phrase))
+}
+
 // MARK: - Efficiency parity: state-change classification gates both circuit-breakers
 
 @Test

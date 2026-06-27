@@ -1,4 +1,5 @@
 import CascadeMemory
+import CryptoKit
 import Foundation
 import OSLog
 
@@ -66,18 +67,45 @@ public struct RecordRecall: Sendable {
             }
         }
 
-        /// The verbatim call for the audit log — query, time window, or moment id.
+        /// The safe call descriptor for persisted audit/dock surfaces. Raw queries
+        /// stay inside the local recall execution path only.
         public var auditDetail: String {
             let detail: String
             switch self {
-            case .search(let query): detail = "search_record: \(query)"
-            case .timeframe(let start, let end): detail = "get_timeframe: \(start ?? "?") → \(end ?? "?")"
-            case .inspect(let id): detail = "inspect_moment: #\(id.map(String.init) ?? "?")"
-            case .inspectStructure(let id): detail = "inspect_structure: #\(id.map(String.init) ?? "?")"
-            case .sessions(let start, let end): detail = "list_sessions: \(start ?? "?") → \(end ?? "?")"
-            case .unknown(let name): detail = name
+            case .search(let query):
+                detail = "tool=search_record queryLength=\(query.count) queryHash=\(Self.hash(query))"
+            case .timeframe(let start, let end):
+                detail = "tool=get_timeframe start=\(Self.normalizedTimestamp(start)) end=\(Self.normalizedTimestamp(end))"
+            case .inspect(let id):
+                detail = "tool=inspect_moment id=\(id.map(String.init) ?? "missing")"
+            case .inspectStructure(let id):
+                detail = "tool=inspect_structure id=\(id.map(String.init) ?? "missing")"
+            case .sessions(let start, let end):
+                detail = "tool=list_sessions start=\(Self.normalizedTimestamp(start)) end=\(Self.normalizedTimestamp(end))"
+            case .unknown(let name):
+                detail = "tool=\(Self.safeToken(name))"
             }
             return String(detail.prefix(240))
+        }
+
+        private static func hash(_ value: String) -> String {
+            SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        }
+
+        private static func normalizedTimestamp(_ value: String?) -> String {
+            guard let value else { return "missing" }
+            guard let date = RecordRecall.date(from: value) else { return "invalid" }
+            let formatter = ISO8601DateFormatter()
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return formatter.string(from: date)
+        }
+
+        private static func safeToken(_ value: String) -> String {
+            let token = value.filter { character in
+                character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+            }
+            return token.isEmpty ? "unknown" : token
         }
     }
 

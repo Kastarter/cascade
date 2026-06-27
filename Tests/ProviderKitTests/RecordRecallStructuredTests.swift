@@ -52,7 +52,7 @@ func inspectStructureMissingMetadataDegradesClearly() async throws {
 @Test
 func inspectStructureParsesAndRoutesLikeOtherRecallTools() {
     #expect(RecordRecall.Call(name: "inspect_structure", input: ["id": 42]) == .inspectStructure(id: 42))
-    #expect(RecordRecall.Call.inspectStructure(id: 12).auditDetail == "inspect_structure: #12")
+    #expect(RecordRecall.Call.inspectStructure(id: 12).auditDetail == "tool=inspect_structure id=12")
     #expect(!RecordRecall.isRecallTool("inspect_structure"))
 
     let defaultNames = RecordRecall.toolDefinitions().compactMap { $0["name"] as? String }

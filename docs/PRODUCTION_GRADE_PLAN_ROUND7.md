@@ -36,6 +36,7 @@ Date: 2026-06-26
 - Files: `/Users/khalidsh/Humain/cascade/Sources/ProviderKit/RecordRecall.swift`; `/Users/khalidsh/Humain/cascade/Sources/AppShell/CascadeAppModel.swift`; `/Users/khalidsh/Humain/cascade/Sources/SandboxKit/BackgroundWebAgent.swift`
 - Build: Change `RecordRecall.Call.auditDetail` to a safe descriptor. For `search_record`, store query length plus `queryHash`; for timeframe/session calls store normalized timestamps only; for inspect calls keep moment IDs only. Route `agent.recall` and sandbox recall/harness audit through this safe descriptor, while preserving raw query text only inside the local model tool result where recall must function.
 - Test: A search query containing a unique company/person/file phrase must not appear in the audit detail, dock-backed audit, or sandbox harness audit. Assert the row still records `search_record`, length, and a stable hash.
+- Status: Fixed 2026-06-26 with `RecordRecall.Call.auditDetail` safe descriptors, dock/`agent.recall` reuse of the descriptor, and sandbox harness audit routing recall calls through the recall descriptor.
 - Risk: med
 - Seq: SEQ-04/SEQ-07/SEQ-14
 

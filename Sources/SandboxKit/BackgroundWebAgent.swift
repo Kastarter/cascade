@@ -113,6 +113,15 @@ public final class BackgroundWebAgent {
         tag.isEmpty ? detail : "[\(tag)] \(detail)"
     }
 
+    /// Safe descriptor for sandbox harness audit. Recall calls use their own
+    /// descriptor so search queries are never persisted as generic raw input.
+    nonisolated static func harnessAuditDescriptor(name: String, input: [String: Any]) -> String {
+        if RecordRecall.isRecallTool(name, includeStructuredContent: true) {
+            return RecordRecall.Call(name: name, input: input).auditDetail
+        }
+        return HarnessCall.auditDescriptor(name: name, input: input)
+    }
+
     public init(
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         groqKeyStore: GroqKeyStore = GroqKeyStore(),
@@ -541,7 +550,7 @@ public final class BackgroundWebAgent {
         if let injectedHarness = harnessProvider {
             wrappedHarness = { [weak self] name, input in
                 guard let self, !self.stopped else { return "The user stopped this task. Do not continue — end now." }
-                self.audit("sandbox.harness", HarnessCall.auditDescriptor(name: name, input: input))
+                self.audit("sandbox.harness", Self.harnessAuditDescriptor(name: name, input: input))
                 return await injectedHarness(name, input)
             }
         } else {

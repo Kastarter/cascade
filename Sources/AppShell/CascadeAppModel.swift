@@ -599,8 +599,8 @@ public final class CascadeAppModel: ObservableObject {
         // Give the background Scout the SAME in-process harness the on-screen agent
         // has — file/shell tools + record recall — so a background run can reach the
         // user's local files and recorded screen history, not just the web. Pure
-        // execution here; the agent applies its own STOP gate + audit. Power tools
-        // stay behind the user's Power-harness opt-in; recall is read-only.
+        // execution here; the agent applies its own STOP gate + safe audit. Power
+        // tools stay behind the user's Power-harness opt-in; recall is read-only.
         runtime.harnessTier = powerHarnessEnabled ? .full : .readOnly
         runtime.recallEnabled = true
         runtime.harnessProvider = { [weak self] name, input in
@@ -1948,7 +1948,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// Runs one recall tool call for the assist agent: STOP/supersession gate,
-    /// an audit row with the verbatim query/timeframe/id, then the read-only
+    /// an audit row with the safe descriptor, then the read-only
     /// lookup against the local record via the shared `RecordRecall`. No
     /// file/shell deny-list or one-lane gate applies — this only reads what the
     /// user already saw on screen, the same surface the Ask panel searches.

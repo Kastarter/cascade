@@ -1,4 +1,5 @@
 import CascadeMemory
+import CryptoKit
 import Foundation
 import ProviderKit
 import Testing
@@ -8,6 +9,10 @@ private func makeStore() throws -> CascadeStore {
         .appendingPathComponent("CascadeRecallTests-\(UUID().uuidString).sqlite")
         .path
     return try CascadeStore(path: path)
+}
+
+private func sha256Prefix(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
 }
 
 // MARK: - search_record
@@ -198,10 +203,27 @@ func recallCallParsesEachToolFromRawInput() {
 }
 
 @Test
-func recallCallAuditDetailIsVerbatim() {
-    #expect(RecordRecall.Call.search(query: "the email").auditDetail == "search_record: the email")
-    #expect(RecordRecall.Call.timeframe(startISO: "T1", endISO: "T2").auditDetail == "get_timeframe: T1 → T2")
-    #expect(RecordRecall.Call.inspect(id: 12).auditDetail == "inspect_moment: #12")
+func recallCallAuditDetailUsesSafeDescriptors() {
+    let phrase = "Aperture-Delta Jane Example confidential runway.pdf"
+    let detail = RecordRecall.Call.search(query: phrase).auditDetail
+    #expect(detail.contains("tool=search_record"))
+    #expect(detail.contains("queryLength=\(phrase.count)"))
+    #expect(detail.contains("queryHash=\(sha256Prefix(phrase))"))
+    #expect(!detail.contains(phrase))
+    #expect(detail == RecordRecall.Call.search(query: phrase).auditDetail)
+
+    let timeframe = RecordRecall.Call.timeframe(
+        startISO: "2026-06-26T12:34:56-04:00",
+        endISO: "private appointment with Jane"
+    ).auditDetail
+    #expect(timeframe.contains("tool=get_timeframe"))
+    #expect(timeframe.contains("start=2026-06-26T16:34:56.000Z"))
+    #expect(timeframe.contains("end=invalid"))
+    #expect(!timeframe.contains("private appointment with Jane"))
+
+    #expect(RecordRecall.Call.inspect(id: 12).auditDetail == "tool=inspect_moment id=12")
+    #expect(RecordRecall.Call.sessions(startISO: nil, endISO: "not a timestamp").auditDetail
+        == "tool=list_sessions start=missing end=invalid")
 }
 
 @Test
