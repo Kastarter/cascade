@@ -260,6 +260,12 @@ func appShellAuditDetailsKeepStableIdentityReferencesNotRawText() async throws {
     let recipeLabel = "\(rawToken)-recipe-label"
     let assistGoal = "\(rawToken)-assist-goal"
     let skillName = "\(rawToken)-skill-name"
+    let validationMessage = "\(rawToken)-validation-missing"
+    let stalledText = "\(rawToken)-stalled-reason"
+    let groundLog = "hit \"\(rawToken)-ground-target\" @ (120,240)"
+    let watchedApp = "\(rawToken)-watched-app"
+    let pointQuestion = "\(rawToken)-where-is-the-private-button"
+    let plannerFailure = "\(rawToken)-planner-failed-with-private-text"
 
     let scheduledAgent = try await store.upsertAgent(CascadeAgent(
         name: scheduleName,
@@ -316,6 +322,46 @@ func appShellAuditDetailsKeepStableIdentityReferencesNotRawText() async throws {
         action: "computer.type.keys",
         detail: "chars=7 \(CascadeAppModel.textAuditDetail("skill", skillName))"
     ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "reel.point",
+        detail: CascadeAppModel.textAuditDetail("question", pointQuestion)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "system",
+        action: "voice.fragment.ignored",
+        detail: CascadeAppModel.textAuditDetail("utterance", intent)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "system",
+        action: "voice.duplicate.ignored",
+        detail: CascadeAppModel.textAuditDetail("utterance", assistGoal)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.validate",
+        detail: CascadeAppModel.assistValidationAuditDetail(validationMessage)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.stalled",
+        detail: CascadeAppModel.assistStalledAuditDetail(engine: "scout", text: stalledText)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "agent.ground",
+        detail: CascadeAppModel.groundAuditDetail(groundLog)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "harness.denied.watched-app",
+        detail: CascadeAppModel.harnessDeniedWatchedAppAuditDetail(toolName: "run_applescript", watchedApp: watchedApp)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.timing",
+        detail: "\(CascadeAppModel.assistPlannerFailedTimingReason(plannerFailure)) · scout · 1 turns"
+    ))
 
     let approved = taughtCurated(signature: "\(rawToken)-approval-signature", name: approvedName)
     model.approveCurated(approved)
@@ -370,6 +416,60 @@ func appShellAuditDetailsKeepStableIdentityReferencesNotRawText() async throws {
     #expect(typedKeys.detail.contains("chars=7"))
     #expect(typedKeys.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
     expectAuditDetail(typedKeys.detail, excludesRawIdentityContaining: rawToken)
+
+    let point = try await waitForAudit(store, action: "reel.point")
+    #expect(point.detail.contains("questionHash=\(AuditIdentity.hash(pointQuestion))"))
+    #expect(point.detail.contains("questionChars=\(pointQuestion.count)"))
+    expectAuditDetail(point.detail, excludesRawIdentityContaining: rawToken)
+
+    let fragment = try await waitForAudit(store, action: "voice.fragment.ignored")
+    #expect(fragment.detail.contains("utteranceHash=\(AuditIdentity.hash(intent))"))
+    #expect(fragment.detail.contains("utteranceChars=\(intent.count)"))
+    expectAuditDetail(fragment.detail, excludesRawIdentityContaining: rawToken)
+
+    let duplicate = try await waitForAudit(store, action: "voice.duplicate.ignored")
+    #expect(duplicate.detail.contains("utteranceHash=\(AuditIdentity.hash(assistGoal))"))
+    #expect(duplicate.detail.contains("utteranceChars=\(assistGoal.count)"))
+    expectAuditDetail(duplicate.detail, excludesRawIdentityContaining: rawToken)
+
+    let validation = try await waitForAudit(store, action: "assist.validate")
+    #expect(validation.detail.contains("status=incomplete"))
+    #expect(validation.detail.contains("missingHash=\(AuditIdentity.hash(validationMessage))"))
+    #expect(validation.detail.contains("missingChars=\(validationMessage.count)"))
+    expectAuditDetail(validation.detail, excludesRawIdentityContaining: rawToken)
+
+    let stalled = try await waitForAudit(store, action: "assist.stalled")
+    #expect(stalled.detail.contains("status=stalled"))
+    #expect(stalled.detail.contains("engine=scout"))
+    #expect(stalled.detail.contains("textHash=\(AuditIdentity.hash(stalledText))"))
+    #expect(stalled.detail.contains("textChars=\(stalledText.count)"))
+    expectAuditDetail(stalled.detail, excludesRawIdentityContaining: rawToken)
+
+    let ground = try await waitForAudit(store, action: "agent.ground")
+    #expect(ground.detail.contains("groundHash=\(AuditIdentity.hash(groundLog))"))
+    #expect(ground.detail.contains("groundChars=\(groundLog.count)"))
+    expectAuditDetail(ground.detail, excludesRawIdentityContaining: rawToken)
+
+    let watched = try await waitForAudit(store, action: "harness.denied.watched-app")
+    #expect(watched.detail.contains("tool=run_applescript"))
+    #expect(watched.detail.contains("appHash=\(AuditIdentity.hash(watchedApp))"))
+    #expect(watched.detail.contains("appChars=\(watchedApp.count)"))
+    expectAuditDetail(watched.detail, excludesRawIdentityContaining: rawToken)
+
+    let timing = try await waitForAudit(store, action: "assist.timing")
+    #expect(timing.detail.contains("status=planner-failed"))
+    #expect(timing.detail.contains("textHash=\(AuditIdentity.hash(plannerFailure))"))
+    #expect(timing.detail.contains("textChars=\(plannerFailure.count)"))
+    expectAuditDetail(timing.detail, excludesRawIdentityContaining: rawToken)
+}
+
+@Test
+func flightDelayMillisecondsRejectsNonFiniteAndClampsLargeValues() {
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(.nan) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(.infinity) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(-1) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(0.245) == 245)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(60) == 1_000)
 }
 
 private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> DetectedWaste {

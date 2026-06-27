@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-06-26): Round 8 audit privacy sweep converged in `docs/PRODUCTION_GRADE_PLAN_ROUND8.md`; recorder/app-shell remaining raw audit details now use `AuditIdentity` hashes/counts, and cursor flight sleeps + UI-TARS smartResize guard non-finite/overflowing `Int` conversions.
 - NEW (2026-06-26): P7-05 sanitizes `assist.noeffect`, `agent.ground.miss`, and `scout.ocr.marks` audit details to turn/count/hash descriptors while preserving raw AX/OCR labels only in model-facing re-grounding notes.
 - NEW (2026-06-26): P7-07 adds shared `AuditIdentity` hashing for app-shell/local-driver audits so task goals, agent names, artifact paths, pointed labels, recipe labels, skill drafts, and schedules persist only as stable hashes/counts in `audit_event.detail`.
 - NEW (2026-06-26): P7-01 fixed web sandbox coordinate formatting with finite/range guards before JS/audit conversion; invalid click/scroll/move/drag values no-op with sanitized `invalid-coordinate` audit from background runs.

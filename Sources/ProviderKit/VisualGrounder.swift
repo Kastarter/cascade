@@ -347,18 +347,36 @@ public struct UITARSGrounder: VisualGrounder {
         width: Int, height: Int,
         factor: Int = 28, minPixels: Int = 100 * 28 * 28, maxPixels: Int = 16384 * 28 * 28
     ) -> (w: Int, h: Int) {
-        let w = Double(max(1, width)), h = Double(max(1, height)), f = Double(factor)
-        func roundTo(_ v: Double) -> Int { Int((v / f).rounded()) * factor }
-        func floorTo(_ v: Double) -> Int { Int((v / f).rounded(.down)) * factor }
-        func ceilTo(_ v: Double) -> Int { Int((v / f).rounded(.up)) * factor }
-        var wb = max(factor, roundTo(w))
-        var hb = max(factor, roundTo(h))
-        if wb * hb > maxPixels {
-            let beta = (w * h / Double(maxPixels)).squareRoot()
-            wb = max(factor, floorTo(w / beta))
-            hb = max(factor, floorTo(h / beta))
-        } else if wb * hb < minPixels {
-            let beta = (Double(minPixels) / (w * h)).squareRoot()
+        let safeFactor = max(1, factor)
+        let safeMinPixels = max(1, minPixels)
+        let safeMaxPixels = max(1, maxPixels)
+        let w = Double(max(1, width)), h = Double(max(1, height)), f = Double(safeFactor)
+        func multiple(_ units: Double) -> Int {
+            guard units.isFinite else { return safeFactor }
+            let maxUnits = Int.max / safeFactor
+            if units <= 1 { return safeFactor }
+            if units >= Double(maxUnits) { return maxUnits * safeFactor }
+            return Int(units) * safeFactor
+        }
+        func roundTo(_ v: Double) -> Int { multiple((v / f).rounded()) }
+        func floorTo(_ v: Double) -> Int { multiple((v / f).rounded(.down)) }
+        func ceilTo(_ v: Double) -> Int { multiple((v / f).rounded(.up)) }
+        func productExceeds(_ lhs: Int, _ rhs: Int, _ limit: Int) -> Bool {
+            guard lhs > 0, rhs > 0 else { return false }
+            return lhs > limit / rhs
+        }
+        func productBelow(_ lhs: Int, _ rhs: Int, _ limit: Int) -> Bool {
+            guard lhs > 0, rhs > 0 else { return true }
+            return lhs <= (limit - 1) / rhs
+        }
+        var wb = max(safeFactor, roundTo(w))
+        var hb = max(safeFactor, roundTo(h))
+        if productExceeds(wb, hb, safeMaxPixels) {
+            let beta = (w * h / Double(safeMaxPixels)).squareRoot()
+            wb = max(safeFactor, floorTo(w / beta))
+            hb = max(safeFactor, floorTo(h / beta))
+        } else if productBelow(wb, hb, safeMinPixels) {
+            let beta = (Double(safeMinPixels) / (w * h)).squareRoot()
             wb = ceilTo(w * beta)
             hb = ceilTo(h * beta)
         }

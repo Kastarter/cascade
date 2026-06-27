@@ -495,7 +495,7 @@ public final class CascadeAppModel: ObservableObject {
                 let global = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
                 guidanceOverlay.present(atGlobalPoint: global, label: "this one")
                 assistMemory.rememberPointed(label: q, globalPoint: global)
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "reel.point", detail: q))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "reel.point", detail: Self.textAuditDetail("question", q)))
             } else {
                 guidanceOverlay.hide()
             }
@@ -854,7 +854,7 @@ public final class CascadeAppModel: ObservableObject {
         switch VoiceFragmentGate.classify(q) {
         case .noise:
             if !assistTaskRunning { teachMessage = "I heard “\(q.prefix(60))” — tell me the full task." }
-            Task { _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "voice.fragment.ignored", detail: String(q.prefix(80)))) }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "voice.fragment.ignored", detail: Self.textAuditDetail("utterance", q))) }
             voice.done()
             return
         case .goal(let cleaned):
@@ -878,7 +878,7 @@ public final class CascadeAppModel: ObservableObject {
         // and restarting the run at the chooser every time.
         if assistTaskRunning, let active = assistTaskGoal, Self.isSameGoal(q, active) {
             teachMessage = "Already on it — “\(active.prefix(40))”."
-            Task { _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "voice.duplicate.ignored", detail: String(q.prefix(80)))) }
+            Task { _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "voice.duplicate.ignored", detail: Self.textAuditDetail("utterance", q))) }
             voice.done()
             return
         }
@@ -1469,7 +1469,7 @@ public final class CascadeAppModel: ObservableObject {
                 dock.show(title: "Stopped", detail: agentMessage)
                 return await scoutEnd(.stopped, "user-stop")
             }
-            if step.failed { return await scoutEnd(.failed, "planner-failed: \(step.text.prefix(90))") }
+            if step.failed { return await scoutEnd(.failed, Self.assistPlannerFailedTimingReason(step.text)) }
             if !step.text.isEmpty {
                 teachMessage = prefix + step.text
                 // Speak the turn's intent aloud like the Opus path, so the agent is
@@ -1485,7 +1485,7 @@ public final class CascadeAppModel: ObservableObject {
             if step.done {
                 let claimed = step.text.isEmpty ? "Done." : step.text
                 if acted, let missing = await validateAssistCompletion(goal: goal, claimed: claimed, screen: screen) {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: "INCOMPLETE: \(missing.prefix(80))"))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: Self.assistValidationAuditDetail(missing)))
                     return await scoutEnd(.stalled("I'm not sure that finished — \(missing)"), "validate-incomplete")
                 }
                 return await scoutEnd(.finished(claimed, acted: acted), "finished")
@@ -1494,7 +1494,7 @@ public final class CascadeAppModel: ObservableObject {
             // Grounding visibility: log where each grounded click landed (or that it
             // found nothing) so the audit shows the WHERE-to-click decisions.
             if let g = agent.lastGroundLog {
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground", detail: String(g.prefix(100))))
+                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.ground", detail: Self.groundAuditDetail(g)))
             }
             // Fresh nudge each turn; the idle / no-effect branches below may set it.
             nudge = nil
@@ -1511,7 +1511,7 @@ public final class CascadeAppModel: ObservableObject {
             if step.actions.isEmpty || observationOnly {
                 idleTurns += 1
                 if idleTurns >= 3 {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: "scout: " + String(step.text.prefix(100))))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: Self.assistStalledAuditDetail(engine: "scout", text: step.text)))
                     return await scoutEnd(.stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text), "idle-stall")
                 }
                 if idleTurns == 2 {
@@ -1788,7 +1788,7 @@ public final class CascadeAppModel: ObservableObject {
                 // false "done".
                 if acted, let missing = await validateAssistCompletion(goal: goal, claimed: claimed, screen: screen) {
                     auditTiming(outcome: "incomplete")
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: "INCOMPLETE: \(missing.prefix(80))"))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: Self.assistValidationAuditDetail(missing)))
                     return .stalled("I'm not sure that finished — \(missing)")
                 }
                 auditTiming(outcome: "finished")
@@ -1810,7 +1810,7 @@ public final class CascadeAppModel: ObservableObject {
                 idleTurns += 1
                 if idleTurns >= 3 {
                     auditTiming(outcome: "stalled")
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: String(step.text.prefix(120))))
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: Self.assistStalledAuditDetail(text: step.text)))
                     return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
                 }
                 if idleTurns == 2 {
@@ -2070,7 +2070,7 @@ public final class CascadeAppModel: ObservableObject {
                 if let watched {
                     dock.show(title: "Blocked a script", detail: "\(name) targeting \(watched) — the task stays on screen.")
                     _ = try? await store.appendAudit(AuditEvent(
-                        actor: "agent", action: "harness.denied.watched-app", detail: "\(name) → \(watched)"
+                        actor: "agent", action: "harness.denied.watched-app", detail: Self.harnessDeniedWatchedAppAuditDetail(toolName: name, watchedApp: watched)
                     ))
                     return """
                     Blocked: you have been doing this task in \(watched)'s own UI on screen, \
@@ -2302,6 +2302,37 @@ public final class CascadeAppModel: ObservableObject {
         AuditIdentity.descriptor(field, value)
     }
 
+    nonisolated static func assistValidationAuditDetail(_ missing: String) -> String {
+        "status=incomplete \(textAuditDetail("missing", missing))"
+    }
+
+    nonisolated static func assistStalledAuditDetail(engine: String? = nil, text: String) -> String {
+        var parts = ["status=stalled", textAuditDetail("text", text)]
+        if let engine { parts.insert("engine=\(safeAuditToken(engine))", at: 1) }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func assistPlannerFailedTimingReason(_ text: String) -> String {
+        "status=planner-failed \(textAuditDetail("text", text))"
+    }
+
+    nonisolated static func groundAuditDetail(_ detail: String) -> String {
+        textAuditDetail("ground", detail)
+    }
+
+    nonisolated static func harnessDeniedWatchedAppAuditDetail(toolName: String, watchedApp: String) -> String {
+        "tool=\(safeAuditToken(toolName)) \(textAuditDetail("app", watchedApp))"
+    }
+
+    nonisolated static func safeFlightDelayMilliseconds(_ seconds: TimeInterval) -> Int {
+        guard seconds.isFinite else { return 0 }
+        let milliseconds = (seconds * 1000).rounded()
+        guard milliseconds.isFinite else { return 0 }
+        if milliseconds <= 0 { return 0 }
+        if milliseconds >= 1_000 { return 1_000 }
+        return Int(milliseconds)
+    }
+
     nonisolated static func teachPointedAuditDetail(utterance: String, label: String) -> String {
         [
             textAuditDetail("utterance", utterance),
@@ -2512,7 +2543,7 @@ public final class CascadeAppModel: ObservableObject {
                 }
             case .click(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))  // press only after the cursor ARRIVES
+                try? await Task.sleep(for: .milliseconds(Self.safeFlightDelayMilliseconds(flight)))  // press only after the cursor ARRIVES
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))   // show the press dip
                 let p = cg(x, y)
@@ -2527,7 +2558,7 @@ public final class CascadeAppModel: ObservableObject {
                 }
             case .doubleClick(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
+                try? await Task.sleep(for: .milliseconds(Self.safeFlightDelayMilliseconds(flight)))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
@@ -2537,7 +2568,7 @@ public final class CascadeAppModel: ObservableObject {
                 }
             case .tripleClick(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
+                try? await Task.sleep(for: .milliseconds(Self.safeFlightDelayMilliseconds(flight)))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
@@ -2549,7 +2580,7 @@ public final class CascadeAppModel: ObservableObject {
                 // The companion cursor traces the drag so the user sees the motion —
                 // and like clicks, the press waits for it to actually ARRIVE.
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(fromX, fromY))
-                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
+                try? await Task.sleep(for: .milliseconds(Self.safeFlightDelayMilliseconds(flight)))
                 guidanceOverlay.press()
                 guidanceOverlay.navigate(toGlobalPoint: globalAppKit(toX, toY))
                 let from = cg(fromX, fromY)
@@ -2560,7 +2591,7 @@ public final class CascadeAppModel: ObservableObject {
                 }
             case .rightClick(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
-                try? await Task.sleep(for: .milliseconds(Int(flight * 1000)))
+                try? await Task.sleep(for: .milliseconds(Self.safeFlightDelayMilliseconds(flight)))
                 guidanceOverlay.press()
                 try? await Task.sleep(for: .milliseconds(55))
                 let p = cg(x, y)
