@@ -56,13 +56,13 @@ let package = Package(
             name: "AgentOrchestratorTests",
             dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
-        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit"]),
-        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit"]),
+        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory"]),
+        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory"]),
         .testTarget(name: "ProviderKitTests", dependencies: ["ProviderKit", "CascadeMemory"]),
         .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit"]),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection", "SandboxKit"]
+            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection", "SandboxKit", "MacContextKit"]
         ),
         .testTarget(
             name: "ReliabilityEvalTests",

@@ -131,7 +131,7 @@ func sketchIncludesOnlyVerifiedRecoveries() {
 }
 
 @Test
-func structuredChecksMatchAuditTraceAndExperienceEvidence() {
+func structuredChecksMatchAuditTraceAndExperienceEvidence() throws {
     let recipe = AgentRecipe(steps: [step(0, .activateApp)])
     let audit = AuditEvent(
         id: 20,
@@ -169,9 +169,9 @@ func structuredChecksMatchAuditTraceAndExperienceEvidence() {
         traces: [trace]
     )
 
-    let auditCheck = try! #require(sketch.expectedChecks.first { $0.source == .auditEvent })
-    let traceCheck = try! #require(sketch.expectedChecks.first { $0.source == .traceSpan })
-    let experienceCheck = try! #require(sketch.expectedChecks.first { $0.source == .agentExperience })
+    let auditCheck = try #require(sketch.expectedChecks.first { $0.source == .auditEvent })
+    let traceCheck = try #require(sketch.expectedChecks.first { $0.source == .traceSpan })
+    let experienceCheck = try #require(sketch.expectedChecks.first { $0.source == .agentExperience })
     #expect(auditCheck.matches(audit: audit))
     #expect(traceCheck.matches(traceSpan: traceSpan))
     #expect(experienceCheck.matches(experience: experience))
