@@ -168,7 +168,15 @@ public struct GroundingVerifier: Sendable {
         }
 
         if let second = viable.dropFirst().first,
-           best.score - second.score < context.ambiguityMargin {
+           best.score - second.score < context.ambiguityMargin,
+           !pointsCoincide(best.id, second.id, in: candidates, context: context) {
+            // Two high-scoring candidates within the margin are only AMBIGUOUS when
+            // they sit at materially different places (which of two buttons?). When
+            // they point at essentially the SAME spot they CORROBORATE each other —
+            // e.g. AX and the visual grounder both resolving the named control — which
+            // is the strongest signal, not a conflict. Treating agreement as ambiguity
+            // made the verifier abstain on every AX+visual hit (audit: 0.98 confidence,
+            // candidates=2, failure=ambiguous → ground.miss → stall).
             return GroundingVerifierResult(
                 verdict: .abstain,
                 selectedCandidateID: best.id,
@@ -270,6 +278,25 @@ public struct GroundingVerifier: Sendable {
             sourceAgreement: 0,
             failureKind: kind
         )
+    }
+
+    /// Whether the two candidates resolve to essentially the same location — they
+    /// corroborate rather than compete. Tolerance scales with the coordinate space
+    /// (≈3% of the smaller bound, floored at 24) so it holds for display points and
+    /// 0–1000 normalized coords alike. Region-only candidates (no point) never
+    /// coincide, so genuine ambiguity is still reported.
+    private func pointsCoincide(
+        _ lhsID: String,
+        _ rhsID: String,
+        in candidates: [GroundingVerifierCandidate],
+        context: GroundingVerifierContext
+    ) -> Bool {
+        guard let lhs = candidates.first(where: { $0.id == lhsID })?.candidate,
+              let rhs = candidates.first(where: { $0.id == rhsID })?.candidate,
+              let lp = lhs.point, let rp = rhs.point else { return false }
+        let bounds = coordinateBounds(for: lhs.coordinateSpace, context: context)
+        let tolerance = max(24, 0.03 * min(bounds.width, bounds.height))
+        return hypot(lp.x - rp.x, lp.y - rp.y) <= tolerance
     }
 
     private func isOnDisplay(_ candidate: GroundingCandidate, context: GroundingVerifierContext) -> Bool {

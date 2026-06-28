@@ -119,6 +119,40 @@ struct GroundingVerifierTests {
         #expect(result.selectedCandidateID == "a-send")
     }
 
+    @Test func agreeingCandidatesAtSamePointAcceptNotAbstain() {
+        // AX and the visual grounder both resolving the named control to the same
+        // spot is corroboration, not ambiguity (regression pin: the verifier abstained
+        // on every AX+visual hit at confidence 0.98, candidates=2, failure=ambiguous).
+        let result = verifier.verify(
+            [
+                evidence(
+                    id: "ax-new-doc",
+                    point: CGPoint(x: 459, y: 481),
+                    confidence: 0.95,
+                    role: "AXButton",
+                    label: "New Document",
+                    nearbyOCRText: "New Document",
+                    ocrDistancePoints: 4,
+                    source: .accessibility,
+                    agreeingSources: [.uiTars]
+                ),
+                GroundingVerifierCandidate(
+                    id: "visual-new-doc",
+                    candidate: GroundingCandidate(
+                        point: CGPoint(x: 462, y: 483),
+                        confidence: 1,
+                        source: .uiTars,
+                        coordinateSpace: .displayLocalAppKitPoints
+                    )
+                ),
+            ],
+            context: context(target: "New Document")
+        )
+        #expect(result.verdict == .accept)
+        #expect(result.failureKind == nil)
+        #expect(result.selectedCandidateID == "ax-new-doc")
+    }
+
     @Test func randomizedCandidateOrderDoesNotChangeSelection() {
         let candidates = [
             evidence(
