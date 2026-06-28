@@ -162,6 +162,50 @@ struct GroundingVerifierTests {
         #expect(selected == ["primary-send", "primary-send", "primary-send"])
     }
 
+    @Test func confidentVisualOnlyCandidateAccepts() {
+        // UI-TARS returns a bare confident point with no role/label/OCR — the exact
+        // case the visual grounder exists for. It must NOT floor-reject (regression
+        // pin: the verifier shipped rejecting every visual ground at constant 0.42).
+        let result = verifier.verify(
+            [
+                GroundingVerifierCandidate(
+                    id: "visual",
+                    candidate: GroundingCandidate(
+                        point: CGPoint(x: 420, y: 320),
+                        confidence: 1,
+                        source: .compatibility,
+                        coordinateSpace: .displayLocalAppKitPoints
+                    )
+                )
+            ],
+            context: context(target: "New Document")
+        )
+        #expect(result.verdict == .accept)
+        #expect(result.selectedCandidateID == "visual")
+    }
+
+    @Test func metadataLessNonVisualCandidateStillRejects() {
+        // An AX-sourced candidate with no role and no label/OCR is genuinely
+        // low-evidence — the visual-trust path must not hand it a free pass.
+        let result = verifier.verify(
+            [
+                GroundingVerifierCandidate(
+                    id: "bare-ax",
+                    candidate: GroundingCandidate(
+                        point: CGPoint(x: 420, y: 320),
+                        confidence: 1,
+                        source: .accessibility,
+                        coordinateSpace: .displayLocalAppKitPoints
+                    )
+                )
+            ],
+            context: context(target: "Send")
+        )
+        #expect(result.verdict == .reject)
+        #expect(result.failureKind == .lowEvidence)
+        #expect(result.selectedCandidateID == nil)
+    }
+
     @Test func canvasCandidatesRejectUnlessExplicitlyAllowed() {
         let candidate = evidence(
             id: "canvas-hit",

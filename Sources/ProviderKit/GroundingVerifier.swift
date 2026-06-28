@@ -206,6 +206,29 @@ public struct GroundingVerifier: Sendable {
             return rejected(candidate, kind: .passiveRole)
         }
 
+        // A dedicated visual grounder (UI-TARS et al.) returns a bare, confident
+        // POINT with no AX role, label, or OCR text to score against — which is the
+        // case it exists for (canvas/custom controls AX can't see). The
+        // evidence-weighted score below structurally caps such a candidate at ~0.42,
+        // far under the 0.72 accept bar, so an evidence-only verifier rejects EVERY
+        // visual ground (audit: 0 accepts / 24 rejects, all constant 0.42). The
+        // structural vetoes above already dropped offscreen / passive / canvas /
+        // missing-point hits, so a metadata-less survivor from a visual source is a
+        // clean hit: trust the grounder's own confidence rather than penalizing it
+        // for evidence it can never carry.
+        let hasTextEvidence = !Self.normalizedText(candidate.label).isEmpty
+            || !Self.normalizedText(candidate.nearbyOCRText).isEmpty
+        if role.isEmpty, !hasTextEvidence, Self.visualSources.contains(candidate.candidate.source) {
+            return GroundingVerifierScore(
+                id: candidate.id,
+                score: clamp(0.55 + (0.35 * clamp(candidate.candidate.confidence))),
+                labelSimilarity: 0,
+                ocrProximity: 0,
+                sourceAgreement: Self.sourceAgreement(candidate),
+                failureKind: nil
+            )
+        }
+
         let roleScore = Self.actionableRoles.contains(role) ? 1.0 : (role.isEmpty ? 0.35 : 0.15)
         let labelSimilarity = Self.textSimilarity(context.targetText, candidate.label)
         let ocrProximity = Self.ocrProximity(
@@ -332,6 +355,16 @@ public struct GroundingVerifier: Sendable {
         "canvas", "axcanvas",
         "webarea", "axwebarea"
     ]
+
+    /// Grounders whose candidates are pixel-derived points: a metadata-less hit from
+    /// one of these is a confident visual ground, not a weak AX/DOM/OCR candidate.
+    private static let visualSources: Set<GroundingSource> = [
+        .uiTars, .visualModel, .claude, .compatibility, .cache
+    ]
+
+    private static func normalizedText(_ text: String?) -> String {
+        (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     private static func normalizedRole(_ role: String?) -> String {
         role?
