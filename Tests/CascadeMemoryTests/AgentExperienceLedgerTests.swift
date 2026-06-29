@@ -210,9 +210,46 @@ func failureMemoryPersistsStateSummaryAndRedactsRawText() async throws {
     let fetched = try #require(try await store.agentFailureMemories().first)
 
     #expect(saved.stateSummary?.contains("<EMAIL>") == true)
-    #expect(saved.stateSummary?.contains("jane.private@example.com") == false)
-    #expect(fetched.stateSummary == saved.stateSummary)
-    #expect(fetched.recoveryEvidenceHash == "evidence-hash")
+	    #expect(saved.stateSummary?.contains("jane.private@example.com") == false)
+	    #expect(fetched.stateSummary == saved.stateSummary)
+	    #expect(fetched.recoveryEvidenceHash == "evidence-hash")
+	    #expect(fetched.expiresAfterSuccesses == 2)
+	    #expect(fetched.remainingCounterexamples == 2)
+	    #expect(fetched.isActive)
+	}
+
+@Test
+func failureMemoryUseAndCounterexamplesExpireRules() async throws {
+    let store = try makeExperienceStore()
+    let saved = try await store.recordAgentFailureMemory(AgentFailureMemory(
+        appName: "Mail",
+        normalizedGoalTokens: ["copy", "invoice"],
+        failureKind: .targetNotFound,
+        firstBadAction: "click",
+        repairHint: "Re-ground the visible invoice row.",
+        expiresAfterSuccesses: 2
+    ))
+
+    let used = try await store.markAgentFailureMemoriesUsed(ids: [saved.id])
+    #expect(used.first?.lastUsedAt != nil)
+    #expect(try await store.agentFailureMemories().count == 1)
+
+    let firstCounterexample = try await store.recordAgentFailureCounterexample(
+        appName: "Mail",
+        goalPattern: "copy invoice totals"
+    )
+    #expect(firstCounterexample.first?.remainingCounterexamples == 1)
+    #expect(firstCounterexample.first?.expiredAt == nil)
+    #expect(try await store.agentFailureMemories().count == 1)
+
+    let expired = try await store.recordAgentFailureCounterexample(
+        appName: "Mail",
+        goalPattern: "copy invoice totals"
+    )
+    #expect(expired.first?.remainingCounterexamples == 0)
+    #expect(expired.first?.expiredAt != nil)
+    #expect(try await store.agentFailureMemories().isEmpty)
+    #expect(try await store.agentFailureMemories(matching: AgentFailureMemoryQuery(activeOnly: false)).count == 1)
 }
 
 @Test
@@ -245,9 +282,10 @@ func failureMemoryMigrationAddsStateSummaryColumnToExistingStore() async throws 
         repairHint: "Re-ground before clicking."
     ))
 
-    #expect(saved.stateSummary == "target hash changed after re-harvest")
-    #expect(try await store.agentFailureMemories().first?.stateSummary == saved.stateSummary)
-}
+	    #expect(saved.stateSummary == "target hash changed after re-harvest")
+	    #expect(try await store.agentFailureMemories().first?.stateSummary == saved.stateSummary)
+	    #expect(try await store.agentFailureMemories().first?.remainingCounterexamples == 2)
+	}
 
 @Test
 func failureMemoryDecodesLegacyPayloadWithoutStateSummary() throws {
@@ -265,6 +303,8 @@ func failureMemoryDecodesLegacyPayloadWithoutStateSummary() throws {
     let memory = try JSONDecoder().decode(AgentFailureMemory.self, from: Data(json.utf8))
 
     #expect(memory.id == 7)
-    #expect(memory.stateSummary == nil)
-    #expect(memory.failureKind == .noEffect)
-}
+	    #expect(memory.stateSummary == nil)
+	    #expect(memory.failureKind == .noEffect)
+	    #expect(memory.expiresAfterSuccesses == 2)
+	    #expect(memory.remainingCounterexamples == 2)
+	}

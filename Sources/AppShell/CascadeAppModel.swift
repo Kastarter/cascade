@@ -93,6 +93,29 @@ public final class CascadeAppModel: ObservableObject {
         public var id: String { rawValue }
     }
 
+    public struct LearningOpportunity: Identifiable, Sendable, Equatable {
+        public enum Kind: String, Sendable {
+            case repeatedWorkflow
+            case overlappingDrafts
+            case recurringFailure
+            case parameterizedRecipe
+        }
+
+        public let id: String
+        public let kind: Kind
+        public let title: String
+        public let detail: String
+        public let actionTitle: String
+
+        public init(id: String, kind: Kind, title: String, detail: String, actionTitle: String) {
+            self.id = id
+            self.kind = kind
+            self.title = title
+            self.detail = detail
+            self.actionTitle = actionTitle
+        }
+    }
+
     @Published public var selectedTab: Tab = .reel
     @Published public var showSettings = false
     /// First-run setup: permissions + keys, shown once over everything until
@@ -109,6 +132,10 @@ public final class CascadeAppModel: ObservableObject {
         didSet { Self.persist(dismissedNextActionOfferKeys, key: Self.dismissedNextActionOffersKey, defaults: defaultsStore) }
     }
     static let dismissedNextActionOffersKey = "cascade.dismissedNextActionOffers"
+    @Published private var dismissedLearningOpportunityKeys: Set<String> {
+        didSet { Self.persist(dismissedLearningOpportunityKeys, key: Self.dismissedLearningOpportunitiesKey, defaults: defaultsStore) }
+    }
+    static let dismissedLearningOpportunitiesKey = "cascade.dismissedLearningOpportunities"
 
     private static func persist(_ values: Set<String>, key: String, defaults: UserDefaults) {
         // Capped so years of declines can't grow the defaults plist unbounded.
@@ -139,6 +166,7 @@ public final class CascadeAppModel: ObservableObject {
     /// The curated, judged, human-named view of `detectedWaste` — what the manager's
     /// review queue shows (the only place detected workflows surface to a person).
     @Published public private(set) var curatedWaste: [CuratedAgent] = []
+    @Published public private(set) var learningOpportunities: [LearningOpportunity] = []
     @Published public private(set) var proactiveNextActionOffer: NextActionPredictor.Prediction?
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
@@ -413,6 +441,7 @@ public final class CascadeAppModel: ObservableObject {
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         dismissedNextActionOfferKeys = Self.restoreSet(key: Self.dismissedNextActionOffersKey, defaults: defaults)
+        dismissedLearningOpportunityKeys = Self.restoreSet(key: Self.dismissedLearningOpportunitiesKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(
             store: store,
@@ -544,10 +573,11 @@ public final class CascadeAppModel: ObservableObject {
                 detectedWaste = rawDetectedWaste
                 // Only genuinely repeated, time-saving workflows (the automatable filter)
                 // reach the curator and the manager's review queue.
-                curatedWaste = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0) })
-                proactiveNextActionOffer = nil
-            }
-            statusLine = recorder.status.message
+	                curatedWaste = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0) })
+	                proactiveNextActionOffer = nil
+	            }
+	            await refreshLearningOpportunities(from: detectedWaste)
+	            statusLine = recorder.status.message
         } catch {
             auditIntegrityStatus = .verificationFailed(error.localizedDescription)
             if auditIntegrityEnforcementEnabled { audit = [] }
@@ -1153,29 +1183,42 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
-    private func recordAgentExperience(
-        for agent: CascadeAgent,
+	    private func recordAgentExperience(
+	        for agent: CascadeAgent,
         fallbackGoal: String,
         outcome: AgentExperienceOutcome,
         verificationSignal: AgentExperienceVerificationSignal? = nil,
         failureKind: CascadeMemory.AgentFailureKind? = nil,
         failureMemoryContext: FailureMemoryContext? = nil
     ) async {
-        let appName = Self.experienceAppName(for: agent)
-        let goalPattern = Self.experienceGoalPattern(for: agent, fallback: fallbackGoal)
-        let recipeSignature = Self.experienceRecipeSignature(for: agent)
-        _ = try? await store.recordAgentExperience(AgentExperienceCase(
-            appName: appName,
-            goalPattern: goalPattern,
-            recipeSignature: recipeSignature,
-            outcome: outcome,
-            verificationSignal: verificationSignal,
-            failureKind: failureKind,
-            evidenceIDs: [],
-            actionCount: agent.recipe.steps.count
-        ))
-        if outcome == .failure, let failureKind, let failureMemoryContext {
-            await recordAgentFailureMemory(
+	        let appName = Self.experienceAppName(for: agent)
+	        let goalPattern = Self.experienceGoalPattern(for: agent, fallback: fallbackGoal)
+	        let recipeSignature = Self.experienceRecipeSignature(for: agent)
+	        let saved = try? await store.recordAgentExperience(AgentExperienceCase(
+	            appName: appName,
+	            goalPattern: goalPattern,
+	            recipeSignature: recipeSignature,
+	            outcome: outcome,
+	            verificationSignal: verificationSignal,
+	            failureKind: failureKind,
+	            evidenceIDs: agent.evidenceIDs,
+	            actionCount: agent.recipe.steps.count
+	        ))
+	        if saved?.outcome == .success, saved?.verificationSignal != nil {
+	            let expired = (try? await store.recordAgentFailureCounterexample(
+	                appName: appName,
+	                goalPattern: goalPattern
+	            )) ?? []
+	            for memory in expired where memory.expiredAt != nil {
+	                _ = try? await store.appendAudit(AuditEvent(
+	                    actor: "agent",
+	                    action: "agent.failure_memory.counterexample",
+	                    detail: Self.failureMemoryCounterexampleAuditDetail(memory)
+	                ))
+	            }
+	        }
+	        if outcome == .failure, let failureKind, let failureMemoryContext {
+	            await recordAgentFailureMemory(
                 agent: agent,
                 appName: appName,
                 goalPattern: goalPattern,
@@ -1208,14 +1251,14 @@ public final class CascadeAppModel: ObservableObject {
             repairHint: Self.failureMemoryRepairHint(for: failureKind),
             recoveryEvidenceHash: context.recoveryEvidenceHash
         )
-        if let saved = try? await store.recordAgentFailureMemory(memory) {
+	        if let saved = try? await store.recordAgentFailureMemory(memory) {
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "agent",
                 action: "agent.failure_memory.saved",
                 detail: Self.failureMemorySavedAuditDetail(saved)
             ))
-        }
-    }
+	        }
+	    }
 
     struct FailureMemoryContext: Sendable, Equatable {
         let stateSummary: String
@@ -3469,10 +3512,11 @@ public final class CascadeAppModel: ObservableObject {
             }
             .prefix(2)
         guard !ranked.isEmpty else { return nil }
-        let selected = ranked.map(\.memory)
-        _ = try? await store.appendAudit(AuditEvent(
-            actor: "agent",
-            action: "agent.failure_memory.used",
+	        let selected = ranked.map(\.memory)
+	        _ = try? await store.markAgentFailureMemoriesUsed(ids: selected.map(\.id))
+	        _ = try? await store.appendAudit(AuditEvent(
+	            actor: "agent",
+	            action: "agent.failure_memory.used",
             detail: Self.failureMemoryUsedAuditDetail(selected)
         ))
         var lines = ["FAILURE REFLECTIONS"]
@@ -3804,6 +3848,15 @@ public final class CascadeAppModel: ObservableObject {
         ].joined(separator: " ")
     }
 
+    nonisolated static func failureMemoryCounterexampleAuditDetail(_ memory: AgentFailureMemory) -> String {
+        [
+            "id=\(memory.id)",
+            "failureKind=\(safeAuditToken(memory.failureKind.rawValue))",
+            "remainingCounterexamples=\(memory.remainingCounterexamples)",
+            "expired=\(memory.expiredAt != nil)",
+        ].joined(separator: " ")
+    }
+
     nonisolated static func normalizedFrontmostApp(_ appName: String?) -> String? {
         guard let appName = appName?.trimmingCharacters(in: .whitespacesAndNewlines),
               !appName.isEmpty,
@@ -3856,11 +3909,13 @@ public final class CascadeAppModel: ObservableObject {
             return "Treat this as a known grounding branch; re-harvest visible controls and re-describe the target before acting."
         case .verifierRejected, .verificationUnavailable:
             return "Treat this as a known verifier branch; gather visible completion evidence before saying done."
-        case .modalBlocked, .wrongStartState:
-            return "Treat this as a known replay-pause branch; verify the current app/window or blocking dialog before continuing."
-        default:
-            return "Treat this as a prior externally observed failure, not as proof the current run will fail."
-        }
+	        case .modalBlocked, .wrongStartState:
+	            return "Treat this as a known replay-pause branch; verify the current app/window or blocking dialog before continuing."
+	        case .permissionDenied, .secureInput, .unsafeAction:
+	            return "Treat this as a safety or environment boundary; do not bypass it, and ask for user action or choose a safer alternative."
+	        default:
+	            return "Treat this as a prior externally observed failure, not as proof the current run will fail."
+	        }
     }
 
     nonisolated static func failureMemoryCategory(_ failureKind: CascadeMemory.AgentFailureKind) -> String {
@@ -5275,19 +5330,105 @@ public final class CascadeAppModel: ObservableObject {
     /// truth (R1). Auto-detected workflows plus the demonstrations the employee sent
     /// up for review (taught-once); same approved/declined filter, keyed by signature.
     /// Taught proposals lead — they're the freshest, most intentional candidates.
-    public var pendingCuratedAgents: [CuratedAgent] {
-        let approved = Set(agents.map(\.signature))
-        var seen = Set<String>()
-        return (taughtForReview + curatedWaste).filter { candidate in
+	    public var pendingCuratedAgents: [CuratedAgent] {
+	        let approved = Set(agents.map(\.signature))
+	        var seen = Set<String>()
+	        return (taughtForReview + curatedWaste).filter { candidate in
             guard !approved.contains(candidate.signature),
                   !dismissedWasteSignatures.contains(candidate.signature),
                   !seen.contains(candidate.signature) else { return false }
             seen.insert(candidate.signature)
             return true
+	        }
+	    }
+
+    private func refreshLearningOpportunities(from wastes: [DetectedWaste]) async {
+        var opportunities: [LearningOpportunity] = []
+        var seen = Set<String>()
+        func append(_ opportunity: LearningOpportunity) {
+            guard !dismissedLearningOpportunityKeys.contains(opportunity.id),
+                  seen.insert(opportunity.id).inserted else { return }
+            opportunities.append(opportunity)
+        }
+
+        let approvedSignatures = Set(agents.map(\.signature))
+        for waste in wastes where Self.meetsRepetitionBar(waste) && !approvedSignatures.contains(waste.signature) {
+            let hasActiveSkill = waste.apps.contains { appSkills.skill(appName: $0, bundleIdentifier: nil) != nil }
+            guard !hasActiveSkill else { continue }
+            append(LearningOpportunity(
+                id: "workflow:\(waste.signature)",
+                kind: .repeatedWorkflow,
+                title: "Form a skill for \(waste.title)",
+                detail: "\(waste.occurrences) repeats, \(waste.estimatedSecondsPerRun)s each, with no active approved skill.",
+                actionTitle: "Review workflow"
+            ))
+        }
+
+        let draftsByApp = Dictionary(grouping: pendingLearnedSkills, by: \.appName)
+        for (app, drafts) in draftsByApp where drafts.count > 1 {
+            append(LearningOpportunity(
+                id: "drafts:\(app.lowercased())",
+                kind: .overlappingDrafts,
+                title: "Consolidate \(app) drafts",
+                detail: "\(drafts.count) learned-skill drafts target the same app.",
+                actionTitle: "Review drafts"
+            ))
+        }
+
+        let activeFailureMemories = (try? await store.agentFailureMemories(limit: 200)) ?? []
+        let failuresByKey = Dictionary(grouping: activeFailureMemories) {
+            "\($0.appName.lowercased())|\($0.failureKind.rawValue)"
+        }
+        for (_, memories) in failuresByKey where memories.count >= 2 {
+            let first = memories[0]
+            append(LearningOpportunity(
+                id: "failure:\(first.appName.lowercased()):\(first.failureKind.rawValue)",
+                kind: .recurringFailure,
+                title: "Patch \(first.appName) failure pattern",
+                detail: "\(memories.count) active \(first.failureKind.rawValue) avoid rules are recurring.",
+                actionTitle: "Review failure rules"
+            ))
+        }
+
+        for waste in wastes where waste.recipe.steps.contains(where: Self.parameterStepNeedsLabel) {
+            append(LearningOpportunity(
+                id: "parameter:\(waste.signature)",
+                kind: .parameterizedRecipe,
+                title: "Name live values in \(waste.title)",
+                detail: "This recipe has parameters without useful labels, so a skill should define placeholders before reuse.",
+                actionTitle: "Review parameters"
+            ))
+        }
+
+        learningOpportunities = Array(opportunities.prefix(6))
+    }
+
+    nonisolated static func parameterStepNeedsLabel(_ step: RecipeStep) -> Bool {
+        guard step.isParameter else { return false }
+        let key = step.parameterKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if key.isEmpty { return true }
+        if key.range(of: #"^(field|value|input|param|parameter)[_-]?\d*$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return true
+        }
+        return step.parameterKind == .freeText && key.count < 4
+    }
+
+    public func dismissLearningOpportunity(_ opportunity: LearningOpportunity) {
+        dismissedLearningOpportunityKeys.insert(opportunity.id)
+        learningOpportunities.removeAll { $0.id == opportunity.id }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "skill.learning_opportunity.dismissed", detail: Self.textAuditDetail("id", opportunity.id))) }
+    }
+
+    public func focusLearningOpportunity(_ opportunity: LearningOpportunity) {
+        switch opportunity.kind {
+        case .overlappingDrafts:
+            selectedTab = .cascades
+        case .repeatedWorkflow, .recurringFailure, .parameterizedRecipe:
+            selectedTab = .manager
         }
     }
 
-    /// A transient confirmation for the Manager's review queue — approve/decline
+	    /// A transient confirmation for the Manager's review queue — approve/decline
     /// happen on the Manager tab, so the only feedback (the new agent landing in the
     /// Cascades tab) is somewhere the manager isn't looking. This banner closes that
     /// gap. It auto-clears, superseded by the next review action.
@@ -5999,19 +6140,34 @@ public final class CascadeAppModel: ObservableObject {
         public let slug: String
         public let markdown: String
         public let sourceTask: String
+        public let sourceCaseIDs: [Int64]
+        public let evidenceIDs: [Int64]
+        public let successCount: Int
+        public let failureCount: Int
+        public let risk: SkillConsolidator.SkillRisk
 
         public init(
             id: UUID = UUID(),
             appName: String,
             slug: String,
             markdown: String,
-            sourceTask: String
+            sourceTask: String,
+            sourceCaseIDs: [Int64] = [],
+            evidenceIDs: [Int64] = [],
+            successCount: Int = 0,
+            failureCount: Int = 0,
+            risk: SkillConsolidator.SkillRisk = .low
         ) {
             self.id = id
             self.appName = appName
             self.slug = slug
             self.markdown = markdown
             self.sourceTask = sourceTask
+            self.sourceCaseIDs = sourceCaseIDs
+            self.evidenceIDs = evidenceIDs
+            self.successCount = max(0, successCount)
+            self.failureCount = max(0, failureCount)
+            self.risk = risk
         }
     }
 
@@ -6028,6 +6184,38 @@ public final class CascadeAppModel: ObservableObject {
         public let detail: String
         public let existingSkillName: String?
         public let score: Double?
+        public let sourceCaseIDs: [Int64]
+        public let successCount: Int
+        public let failureCount: Int
+        public let predictedRisk: SkillConsolidator.SkillRisk
+        public let requiredEvidence: [String]
+        public let mergeReason: String
+
+        public init(
+            kind: Kind,
+            title: String,
+            detail: String,
+            existingSkillName: String?,
+            score: Double?,
+            sourceCaseIDs: [Int64] = [],
+            successCount: Int = 0,
+            failureCount: Int = 0,
+            predictedRisk: SkillConsolidator.SkillRisk = .low,
+            requiredEvidence: [String] = [],
+            mergeReason: String = ""
+        ) {
+            self.kind = kind
+            self.title = title
+            self.detail = detail
+            self.existingSkillName = existingSkillName
+            self.score = score
+            self.sourceCaseIDs = sourceCaseIDs
+            self.successCount = successCount
+            self.failureCount = failureCount
+            self.predictedRisk = predictedRisk
+            self.requiredEvidence = requiredEvidence
+            self.mergeReason = mergeReason
+        }
     }
 
     @Published public private(set) var pendingLearnedSkills: [LearnedSkill] = []
@@ -6099,10 +6287,36 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func distillSkill(app: String, goal: String, findingsMemo: String, actionCount: Int) async {
+        let sourceCases = (try? await store.verifiedAgentExperienceCases(appName: app, limit: 8)) ?? []
+        guard !sourceCases.isEmpty else { return }
+        let agents = (try? await store.agents()) ?? []
+        let agentsBySignature = Dictionary(grouping: agents, by: \.signature)
+        let activeAvoidRules = (try? await store.agentFailureMemories(
+            matching: AgentFailureMemoryQuery(appName: app),
+            limit: 12
+        )) ?? []
+        let procedureMemo = Self.skillProcedureEvidenceMemo(
+            app: app,
+            goal: goal,
+            sourceCases: sourceCases,
+            agentsBySignature: agentsBySignature,
+            activeAvoidRules: activeAvoidRules
+        )
+        guard !procedureMemo.isEmpty else { return }
+        let sourceCaseIDs = sourceCases.map(\.id)
+        let evidenceIDs = Array(Set(sourceCases.flatMap(\.evidenceIDs))).sorted()
+        let failureCount = ((try? await store.agentExperienceCases(
+            matching: AgentExperienceQuery(appName: app, outcome: .failure),
+            limit: 20
+        )) ?? []).count
+        let risk: SkillConsolidator.SkillRisk = activeAvoidRules.contains(where: { $0.failureKind == .unsafeAction || $0.failureKind == .secureInput || $0.failureKind == .permissionDenied }) ? .safety : (failureCount > 0 ? .medium : .low)
         let user = """
         App: \(app)
         Task the agent just completed there (\(actionCount) on-screen actions): \(goal)
-        What each part accomplished:
+        Verified procedure evidence from the experience ledger:
+        \(procedureMemo)
+
+        Supplemental run observations:
         \(findingsMemo)
         """
         guard let markdown = try? await AnthropicClient().complete(
@@ -6110,12 +6324,133 @@ public final class CascadeAppModel: ObservableObject {
         ), markdown.hasPrefix("---"), markdown.contains("appMatchers") else { return }
         let slug = "learned-" + app.lowercased().replacingOccurrences(of: " ", with: "-")
             .filter { $0.isLetter || $0.isNumber || $0 == "-" }
-        enqueueLearnedSkillForReview(LearnedSkill(appName: app, slug: slug, markdown: markdown, sourceTask: goal))
-        _ = try? await store.appendAudit(AuditEvent(
-            actor: "agent",
-            action: "skill.learned.draft",
-            detail: Self.learnedSkillDraftAuditDetail(app: app, goal: goal, actionCount: actionCount)
+        enqueueLearnedSkillForReview(LearnedSkill(
+            appName: app,
+            slug: slug,
+            markdown: markdown,
+            sourceTask: goal,
+            sourceCaseIDs: sourceCaseIDs,
+            evidenceIDs: evidenceIDs,
+            successCount: sourceCaseIDs.count,
+            failureCount: failureCount,
+            risk: risk
         ))
+	        _ = try? await store.appendAudit(AuditEvent(
+	            actor: "agent",
+	            action: "skill.learned.draft",
+	            detail: Self.learnedSkillDraftAuditDetail(app: app, goal: goal, actionCount: actionCount)
+	        ))
+	    }
+
+    nonisolated static func skillProcedureEvidenceMemo(
+        app: String,
+        goal: String,
+        sourceCases: [AgentExperienceCase],
+        agentsBySignature: [String: [CascadeAgent]],
+        activeAvoidRules: [AgentFailureMemory]
+    ) -> String {
+        let builder = TrajectorySketchBuilder(maxActions: 8, maxAnchors: 6, maxChecks: 4, maxCorrections: 2)
+        var sections: [String] = []
+        sections.append("source_case_ids: \(sourceCases.map { String($0.id) }.joined(separator: ", "))")
+        sections.append("evidence_ids: \(Array(Set(sourceCases.flatMap(\.evidenceIDs))).sorted().map(String.init).joined(separator: ", "))")
+
+        var preconditions = Set<String>()
+        var parameters: [String] = []
+        var steps: [String] = []
+        var postconditions = Set<String>()
+        var seenParameters = Set<String>()
+        var seenSteps = Set<String>()
+
+        for experience in sourceCases {
+            guard let agent = agentsBySignature[experience.recipeSignature]?.first else { continue }
+            let sketch = builder.build(
+                goal: experience.goalPattern.isEmpty ? goal : experience.goalPattern,
+                recipe: agent.recipe,
+                experiences: [experience]
+            )
+            if let appName = Self.safeProcedureText(sketch.appName) {
+                preconditions.insert("App is \(appName).")
+            }
+            if let windowTitle = Self.safeProcedureText(sketch.windowTitle) {
+                preconditions.insert("Relevant window contains \(windowTitle).")
+            }
+            for step in agent.recipe.steps.sorted(by: { $0.order < $1.order }) {
+                if step.isParameter, let line = Self.parameterProcedureLine(step), seenParameters.insert(line).inserted {
+                    parameters.append(line)
+                }
+            }
+            for action in sketch.firstActions {
+                let repeatText = action.repeatCount > 1 ? " \(action.repeatCount)x" : ""
+                let line = "\(action.index). \(action.label)\(repeatText)"
+                if let safe = Self.safeProcedureText(line), seenSteps.insert(safe).inserted {
+                    steps.append(safe)
+                }
+            }
+            for check in sketch.expectedChecks {
+                if let safe = Self.safeProcedureText(check.label) {
+                    postconditions.insert(safe)
+                }
+            }
+        }
+
+        let avoid = activeAvoidRules
+            .filter { rule in
+                let queryTokens = Set(TrajectorySketch.normalizedGoalTokens(from: goal))
+                return queryTokens.isEmpty || !Set(rule.normalizedGoalTokens).isDisjoint(with: queryTokens)
+            }
+            .prefix(5)
+            .compactMap { rule -> String? in
+                guard rule.isActive else { return nil }
+                let note = Self.failureSpecificMemoryNote(for: rule.failureKind)
+                let hint = Self.safeProcedureText(rule.repairHint)
+                let state = Self.safeProcedureText(rule.stateSummary).map { " State: \($0)" } ?? ""
+                return "- \(rule.failureKind.rawValue): \(note) \(hint ?? "")\(state)"
+            }
+
+        if !preconditions.isEmpty {
+            sections.append("preconditions:\n\(preconditions.sorted().map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        if !parameters.isEmpty {
+            sections.append("parameters:\n\(parameters.joined(separator: "\n"))")
+        }
+        if !steps.isEmpty {
+            sections.append("steps:\n\(steps.prefix(12).map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        if !postconditions.isEmpty {
+            sections.append("postconditions:\n\(postconditions.sorted().prefix(6).map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        if !avoid.isEmpty {
+            sections.append("avoid:\n\(avoid.joined(separator: "\n"))")
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private nonisolated static func parameterProcedureLine(_ step: RecipeStep) -> String? {
+        let key = step.parameterKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? step.ocrAnchor?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? "value"
+        guard let safeKey = safeProcedureText(key) else { return nil }
+        let placeholder = "<\(safeKey.lowercased().replacingOccurrences(of: #"[^a-z0-9]+"#, with: "_", options: .regularExpression).trimmingCharacters(in: CharacterSet(charactersIn: "_")))>"
+        let kind = step.parameterKind?.rawValue ?? "freeText"
+        let hashes = Array(step.valueHashes.prefix(3)).map { String($0) }.joined(separator: ", ")
+        let hashText = hashes.isEmpty ? "" : "; observed value hashes: \(hashes)"
+        return "- \(safeKey): \(placeholder) (\(kind))\(hashText)"
+    }
+
+    private nonisolated static func safeProcedureText(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !PrivacyRules.isSensitiveText(trimmed),
+              !PIIDetector.containsHighConfidencePII(trimmed) else {
+            return nil
+        }
+        let redacted = PIIDetector.redact(trimmed, includeNames: false, highConfidenceOnly: false).redacted
+            .replacingOccurrences(of: #"\b[A-Za-z0-9_\-]{24,}\b"#, with: "<TOKEN>", options: .regularExpression)
+            .replacingOccurrences(of: #"\b\d{7,}\b"#, with: "<NUMBER>", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return redacted.isEmpty ? nil : String(redacted.prefix(220))
     }
 
     private static let skillAuthorPrompt = """
@@ -6131,9 +6466,26 @@ public final class CascadeAppModel: ObservableObject {
 
     # <Title>
 
-    - 5–9 short, imperative bullets with what actually works in this app: the \
+    ## Procedure
+
+    ### Preconditions
+    - 2–4 concrete app/window/state conditions evidenced by the source cases.
+
+    ### Parameters
+    - List each live value as `<placeholder>` with its kind. Never include raw typed values.
+
+    ### Steps
+    - 5–9 short, imperative steps with what actually works in this app: the \
     reliable entry points, shortcuts, gotchas, and the order that worked. Only \
-    include things evidenced by the run — no generic advice.
+    include things evidenced by verified source cases — no generic advice.
+
+    ### Postconditions
+    - Completion checks the next run should verify from visible state.
+
+    ### Avoid
+    - Failure-avoidance rules only from active failure memories. For safety, \
+    permission, or secure-input failures, write boundary-respecting advice only; \
+    never describe bypasses.
 
     ```cascade-runtime-hints
     {"appMatchers": {"names": ["<App Name>"]}}
@@ -6153,25 +6505,33 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func learnedSkillConsolidationHint(for skill: LearnedSkill) -> LearnedSkillConsolidationHint? {
-        guard defaultsStore.bool(forKey: Self.experimentalSkillConsolidationKey) else { return nil }
-        return Self.learnedSkillConsolidationHint(for: skill, registry: appSkills)
-    }
+	        guard defaultsStore.bool(forKey: Self.experimentalSkillConsolidationKey) else { return nil }
+	        return Self.learnedSkillConsolidationHint(for: skill, registry: appSkills)
+	    }
 
     public static func learnedSkillConsolidationHint(
         for skill: LearnedSkill,
         registry: AppSkillRegistry,
         consolidator: SkillConsolidator = SkillConsolidator()
     ) -> LearnedSkillConsolidationHint {
-        let path = "/Cascade/Skills/\(skill.slug)/SKILL.md"
-        guard let candidate = SkillConsolidator.record(
-            id: skill.slug,
-            markdown: skill.markdown,
-            path: path,
-            source: "draft"
-        ), skill.markdown.hasPrefix("---"), candidate.skill.hints.appMatchers != nil else {
-            return LearnedSkillConsolidationHint(
-                kind: .quarantine,
-                title: "Quarantine draft",
+	        let path = "/Cascade/Skills/\(skill.slug)/SKILL.md"
+	        let sourceCaseIDStrings = Set(skill.sourceCaseIDs.map(String.init))
+	        guard let candidate = SkillConsolidator.record(
+	            id: skill.slug,
+	            markdown: skill.markdown,
+	            path: path,
+	            source: "draft",
+	            approved: false,
+	            successCount: skill.successCount,
+	            failureCount: skill.failureCount,
+	            evidenceIDs: Set(skill.evidenceIDs.map(String.init)),
+	            sourceCaseIDs: sourceCaseIDStrings,
+	            risk: skill.risk,
+	            status: .draft
+	        ), skill.markdown.hasPrefix("---"), candidate.skill.hints.appMatchers != nil else {
+	            return LearnedSkillConsolidationHint(
+	                kind: .quarantine,
+	                title: "Quarantine draft",
                 detail: "Cascade could not parse this draft as a valid SKILL.md. Review the metadata before adding it.",
                 existingSkillName: nil,
                 score: nil
@@ -6180,46 +6540,62 @@ public final class CascadeAppModel: ObservableObject {
 
         let existing = consolidator.learnedSkillRecords(from: registry, source: "user")
         let namesByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0.skill.name) })
-        let result = consolidator.evaluate(candidate, against: existing)
-        let score = result.bestMatch?.total
+	        let result = consolidator.evaluate(candidate, against: existing)
+	        let score = result.bestMatch?.total
+	        func metadata(
+	            _ kind: LearnedSkillConsolidationHint.Kind,
+	            _ title: String,
+	            _ detail: String,
+	            _ existingSkillName: String?
+	        ) -> LearnedSkillConsolidationHint {
+	            LearnedSkillConsolidationHint(
+	                kind: kind,
+	                title: title,
+	                detail: detail,
+	                existingSkillName: existingSkillName,
+	                score: score,
+	                sourceCaseIDs: result.sourceCaseIDs.compactMap(Int64.init),
+	                successCount: result.successCount,
+	                failureCount: result.failureCount,
+	                predictedRisk: result.predictedRisk,
+	                requiredEvidence: result.requiredEvidence,
+	                mergeReason: result.mergeReason
+	            )
+	        }
 
-        switch result.action {
-        case .newSkill:
-            return LearnedSkillConsolidationHint(
-                kind: .newSkill,
-                title: "New skill",
-                detail: "No similar loaded user skill matched this draft. Approval will add it as a new playbook.",
-                existingSkillName: nil,
-                score: score
-            )
-        case .reviseExisting(let existingID):
-            let name = namesByID[existingID] ?? existingID
-            return LearnedSkillConsolidationHint(
-                kind: .reviseExisting,
-                title: "Revise existing skill",
-                detail: "Similar to \(name). Treat this as an update candidate; Cascade will not edit the existing skill automatically.",
-                existingSkillName: name,
-                score: score
-            )
-        case .archiveCandidate(let existingID):
-            let name = namesByID[existingID] ?? existingID
-            return LearnedSkillConsolidationHint(
-                kind: .archiveCandidate,
-                title: "Archive candidate",
-                detail: "\(name) already covers this draft with stronger signal. Discard it unless you want a separate playbook.",
-                existingSkillName: name,
-                score: score
-            )
-        case .quarantine(let reason):
-            return LearnedSkillConsolidationHint(
-                kind: .quarantine,
-                title: "Quarantine draft",
-                detail: "Cascade marked this draft for review: \(reason).",
-                existingSkillName: nil,
-                score: score
-            )
-        }
-    }
+	        switch result.action {
+	        case .newSkill:
+	            return metadata(
+	                .newSkill,
+	                "New skill",
+	                "No similar loaded user skill matched this draft. Approval will add it as a new playbook.",
+	                nil
+	            )
+	        case .reviseExisting(let existingID):
+	            let name = namesByID[existingID] ?? existingID
+	            return metadata(
+	                .reviseExisting,
+	                "Revise existing skill",
+	                "Similar to \(name). Treat this as an update candidate; Cascade will not edit the existing skill automatically.",
+	                name
+	            )
+	        case .archiveCandidate(let existingID):
+	            let name = namesByID[existingID] ?? existingID
+	            return metadata(
+	                .archiveCandidate,
+	                "Archive candidate",
+	                "\(name) already covers this draft with stronger signal. Discard it unless you want a separate playbook.",
+	                name
+	            )
+	        case .quarantine(let reason):
+	            return metadata(
+	                .quarantine,
+	                "Quarantine draft",
+	                "Cascade marked this draft for review: \(reason).",
+	                nil
+	            )
+	        }
+	    }
 
     private static func sparseAXEvidenceMemo(_ profiles: [AXRuntimeProfile], minimumSamples: Int = 2) -> [String] {
         guard profiles.count >= minimumSamples else { return [] }
@@ -6232,24 +6608,66 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// Moves a reviewed draft into the live skill library (user skills dir).
-    public func approveLearnedSkill(_ skill: LearnedSkill) {
-        guard let root = learnedSkillDirectory ?? Self.defaultLearnedSkillDirectory() else { return }
-        let dir = root.appendingPathComponent(skill.slug, isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try skill.markdown.write(to: dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
-        } catch {
-            teachMessage = "Couldn't save the skill: \(error.localizedDescription)"
+	    public func approveLearnedSkill(_ skill: LearnedSkill) {
+	        guard let root = learnedSkillDirectory ?? Self.defaultLearnedSkillDirectory() else { return }
+	        let dir = root.appendingPathComponent(skill.slug, isDirectory: true)
+	        let hint = learnedSkillConsolidationHint(for: skill)
+	        let approvedMarkdown = Self.markdownWithLearnedSkillMetadata(skill, hint: hint)
+	        do {
+	            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+	            try approvedMarkdown.write(to: dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+	        } catch {
+	            teachMessage = "Couldn't save the skill: \(error.localizedDescription)"
             return
         }
         pendingLearnedSkills.removeAll { $0.id == skill.id }
         if learnedSkillDirectory == nil {
             appSkills = AppSkillRegistry.load()
         }
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.approved", detail: Self.textAuditDetail("app", skill.appName))) }
+	        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "skill.learned.approved", detail: Self.textAuditDetail("app", skill.appName))) }
+	    }
+
+    nonisolated static func markdownWithLearnedSkillMetadata(
+        _ skill: LearnedSkill,
+        hint: LearnedSkillConsolidationHint?,
+        now: Date = Date()
+    ) -> String {
+        guard skill.markdown.hasPrefix("---\n"),
+              let endRange = skill.markdown.range(
+                of: "\n---",
+                range: skill.markdown.index(skill.markdown.startIndex, offsetBy: 4)..<skill.markdown.endIndex
+              ) else {
+            return skill.markdown
+        }
+        let existingBlock = String(skill.markdown[skill.markdown.index(skill.markdown.startIndex, offsetBy: 4)..<endRange.lowerBound])
+        let existingKeys = Set(existingBlock.split(separator: "\n").compactMap { line -> String? in
+            line.split(separator: ":", maxSplits: 1).first.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        })
+        let parentSkills = hint?.existingSkillName.map { [$0] } ?? []
+        let version = hint?.kind == .reviseExisting ? 2 : 1
+        let metadata: [(String, String)] = [
+            ("version", "\(version)"),
+            ("parentSkills", Self.yamlInlineList(parentSkills)),
+            ("sourceCaseIDs", Self.yamlInlineList(skill.sourceCaseIDs.map(String.init))),
+            ("lastVerifiedAt", ISO8601DateFormatter().string(from: now)),
+            ("successCount", "\(max(skill.successCount, hint?.successCount ?? 0))"),
+            ("failureCount", "\(max(skill.failureCount, hint?.failureCount ?? 0))"),
+            ("riskClass", (hint?.predictedRisk ?? skill.risk).rawValue),
+            ("status", "active"),
+        ].filter { !existingKeys.contains($0.0) }
+        guard !metadata.isEmpty else { return skill.markdown }
+        let insertion = metadata.map { "\($0.0): \($0.1)" }.joined(separator: "\n")
+        var updated = skill.markdown
+        updated.insert(contentsOf: "\n\(insertion)", at: endRange.lowerBound)
+        return updated
     }
 
-    private static func defaultLearnedSkillDirectory() -> URL? {
+    private nonisolated static func yamlInlineList(_ values: [String]) -> String {
+        guard !values.isEmpty else { return "[]" }
+        return "[" + values.map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }.joined(separator: ", ") + "]"
+    }
+
+	    private static func defaultLearnedSkillDirectory() -> URL? {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("Cascade/Skills", isDirectory: true)
     }

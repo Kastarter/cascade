@@ -1548,11 +1548,16 @@ private struct CascadesScreen: View {
                                 Text("New skill for \(skill.appName)").font(.cascadeSans(15, .semibold))
                                 Spacer()
                             }
-                            Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
-                                .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
-                            if let consolidationHint {
-                                learnedSkillConsolidationRow(consolidationHint)
-                            }
+	                            Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
+	                                .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+	                            if !skill.sourceCaseIDs.isEmpty {
+	                                Text("Source cases \(skill.sourceCaseIDs.map(String.init).joined(separator: ", ")) · evidence \(skill.evidenceIDs.count)")
+	                                    .font(.cascadeMono(10))
+	                                    .foregroundStyle(Color.cascadeText3)
+	                            }
+	                            if let consolidationHint {
+	                                learnedSkillConsolidationRow(consolidationHint)
+	                            }
                             Text(skill.markdown)
                                 .font(.cascadeMono(10)).foregroundStyle(Color.cascadeText2)
                                 .lineLimit(10)
@@ -1590,12 +1595,30 @@ private struct CascadesScreen: View {
                             .foregroundStyle(Color.cascadeText3)
                     }
                 }
-                Text(hint.detail)
-                    .font(.cascadeSans(12))
-                    .foregroundStyle(Color.cascadeText3)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
+	                Text(hint.detail)
+	                    .font(.cascadeSans(12))
+	                    .foregroundStyle(Color.cascadeText3)
+	                    .fixedSize(horizontal: false, vertical: true)
+	                HStack(spacing: CascadeMetrics.s2) {
+	                    Text("risk \(hint.predictedRisk.rawValue)")
+	                    Text("\(hint.successCount) success")
+	                    if hint.failureCount > 0 { Text("\(hint.failureCount) failure") }
+	                    if !hint.sourceCaseIDs.isEmpty { Text("cases \(hint.sourceCaseIDs.map(String.init).joined(separator: ","))") }
+	                }
+	                .font(.cascadeMono(10))
+	                .foregroundStyle(Color.cascadeText3)
+	                if !hint.requiredEvidence.isEmpty {
+	                    Text("Needs \(hint.requiredEvidence.joined(separator: ", "))")
+	                        .font(.cascadeSans(11))
+	                        .foregroundStyle(Color.cascadeText3)
+	                }
+	                if !hint.mergeReason.isEmpty {
+	                    Text(hint.mergeReason)
+	                        .font(.cascadeSans(11))
+	                        .foregroundStyle(Color.cascadeText3)
+	                }
+	            }
+	        }
         .padding(CascadeMetrics.s2)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(learnedSkillConsolidationColor(hint.kind).opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1995,8 +2018,9 @@ private struct ManagerScreen: View {
                     MetricCard(value: sloText, label: "SLO pass rate")
                     MetricCard(value: "0", label: "Raw screenshots")
                 }
-                reviewQueueSection
-                whereTimeGoesSection
+	                learningOpportunitiesSection
+	                reviewQueueSection
+	                whereTimeGoesSection
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, CascadeMetrics.s6)
@@ -2004,9 +2028,50 @@ private struct ManagerScreen: View {
             .frame(maxWidth: 960, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
+	    }
+
+    private var learningOpportunitiesSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            if !model.learningOpportunities.isEmpty {
+                SectionLabel(title: "LEARNING CURRICULUM", trailing: "\(model.learningOpportunities.count) suggested")
+                ForEach(model.learningOpportunities) { opportunity in
+                    CascadePanel {
+                        HStack(alignment: .top, spacing: CascadeMetrics.s3) {
+                            Image(systemName: learningOpportunityIcon(opportunity.kind))
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Color.cascadeAgent)
+                                .frame(width: 20, height: 20)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(opportunity.title)
+                                    .font(.cascadeSans(13, .semibold))
+                                    .foregroundStyle(Color.cascadeText)
+                                Text(opportunity.detail)
+                                    .font(.cascadeSans(12))
+                                    .foregroundStyle(Color.cascadeText3)
+                            }
+                            Spacer(minLength: CascadeMetrics.s2)
+                            Button(opportunity.actionTitle) { model.focusLearningOpportunity(opportunity) }
+                                .buttonStyle(CascadeQuietButtonStyle())
+                            Button("Dismiss") { model.dismissLearningOpportunity(opportunity) }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Color.cascadeText3)
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// The manager's review queue: the genuinely repeated, time-saving workflows
+    private func learningOpportunityIcon(_ kind: CascadeAppModel.LearningOpportunity.Kind) -> String {
+        switch kind {
+        case .repeatedWorkflow: "repeat"
+        case .overlappingDrafts: "square.stack.3d.up"
+        case .recurringFailure: "wrench.and.screwdriver"
+        case .parameterizedRecipe: "tag"
+        }
+    }
+
+	    /// The manager's review queue: the genuinely repeated, time-saving workflows
     /// Cascade caught, each judged and named by the curator. Approve to land a ready
     /// agent in the employee's Cascades; dismiss to never see it again.
     private var reviewQueueSection: some View {

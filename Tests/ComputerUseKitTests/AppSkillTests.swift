@@ -310,6 +310,58 @@ struct AppSkillTests {
         #expect(parsed(blenderFixture)?.explicitAskOnly == false)
     }
 
+    @Test func lifecycleMetadataParsesAndArchivedSkillsDoNotSurface() throws {
+        let archived = """
+        ---
+        name: archived-mail
+        description: Old mail workflow.
+        useWhen: Send archived mail updates
+        version: 3
+        parentSkills: ["mail-v2"]
+        sourceCaseIDs: ["101", "102"]
+        lastVerifiedAt: 2026-06-29T12:00:00Z
+        successCount: 4
+        failureCount: 1
+        riskClass: medium
+        status: archived
+        ---
+
+        # Archived Mail
+
+        ```cascade-runtime-hints
+        {"appMatchers":{"names":["Mail"]}}
+        ```
+        """
+        let active = """
+        ---
+        name: active-mail
+        description: Current mail workflow.
+        status: active
+        ---
+
+        # Active Mail
+
+        ```cascade-runtime-hints
+        {"appMatchers":{"names":["Mail"]}}
+        ```
+        """
+        let archivedSkill = try #require(parsed(archived, path: "/tmp/skills/archived-mail/SKILL.md"))
+        let activeSkill = try #require(parsed(active, path: "/tmp/skills/active-mail/SKILL.md"))
+        let registry = AppSkillRegistry(skills: [archivedSkill, activeSkill])
+
+        #expect(archivedSkill.version == 3)
+        #expect(archivedSkill.parentSkills == ["mail-v2"])
+        #expect(archivedSkill.sourceCaseIDs == ["101", "102"])
+        #expect(archivedSkill.successCount == 4)
+        #expect(archivedSkill.failureCount == 1)
+        #expect(archivedSkill.riskClass == "medium")
+        #expect(archivedSkill.status == .archived)
+        #expect(!archivedSkill.isActive)
+        #expect(registry.skill(named: "archived-mail") == nil)
+        #expect(registry.skill(appName: "Mail", bundleIdentifier: nil)?.name == "active-mail")
+        #expect(registry.indexText?.contains("archived-mail") == false)
+    }
+
     @Test func goalAsksForScriptOnlyOnExplicitWording() {
         for asking in [
             "Write me a Python script that builds a city",

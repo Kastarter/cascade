@@ -430,6 +430,7 @@ public actor CascadeOrchestrator {
             estimatedSeconds: waste.estimatedTotalSeconds,
             estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
             evidenceCount: waste.occurrences,
+            evidenceIDs: curated.evidence,
             goal: curated.goal
         ))
     }

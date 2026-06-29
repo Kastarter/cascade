@@ -219,17 +219,20 @@ public enum AgentExperienceRetainedScorer {
 public struct AgentExperienceQuery: Sendable {
     public var appName: String?
     public var goalPattern: String?
+    public var recipeSignature: String?
     public var failureKind: AgentFailureKind?
     public var outcome: AgentExperienceOutcome?
 
     public init(
         appName: String? = nil,
         goalPattern: String? = nil,
+        recipeSignature: String? = nil,
         failureKind: AgentFailureKind? = nil,
         outcome: AgentExperienceOutcome? = nil
     ) {
         self.appName = appName
         self.goalPattern = goalPattern
+        self.recipeSignature = recipeSignature
         self.failureKind = failureKind
         self.outcome = outcome
     }
@@ -265,6 +268,10 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
     public let repairHint: String
     public let recoveryEvidenceHash: String?
     public let retainedScore: Double
+    public let expiresAfterSuccesses: Int
+    public let remainingCounterexamples: Int
+    public let lastUsedAt: Date?
+    public let expiredAt: Date?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -279,6 +286,10 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
         case repairHint
         case recoveryEvidenceHash
         case retainedScore
+        case expiresAfterSuccesses
+        case remainingCounterexamples
+        case lastUsedAt
+        case expiredAt
     }
 
     public init(
@@ -293,7 +304,11 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
         stateSummary: String? = nil,
         repairHint: String,
         recoveryEvidenceHash: String? = nil,
-        retainedScore: Double? = nil
+        retainedScore: Double? = nil,
+        expiresAfterSuccesses: Int = 2,
+        remainingCounterexamples: Int? = nil,
+        lastUsedAt: Date? = nil,
+        expiredAt: Date? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -307,6 +322,11 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
         self.repairHint = repairHint
         self.recoveryEvidenceHash = recoveryEvidenceHash
         self.retainedScore = retainedScore ?? Self.defaultRetainedScore(for: failureKind)
+        let ttl = max(0, expiresAfterSuccesses)
+        self.expiresAfterSuccesses = ttl
+        self.remainingCounterexamples = max(0, remainingCounterexamples ?? ttl)
+        self.lastUsedAt = lastUsedAt
+        self.expiredAt = expiredAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -323,8 +343,16 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
             stateSummary: try container.decodeIfPresent(String.self, forKey: .stateSummary),
             repairHint: try container.decode(String.self, forKey: .repairHint),
             recoveryEvidenceHash: try container.decodeIfPresent(String.self, forKey: .recoveryEvidenceHash),
-            retainedScore: try container.decodeIfPresent(Double.self, forKey: .retainedScore)
+            retainedScore: try container.decodeIfPresent(Double.self, forKey: .retainedScore),
+            expiresAfterSuccesses: try container.decodeIfPresent(Int.self, forKey: .expiresAfterSuccesses) ?? 2,
+            remainingCounterexamples: try container.decodeIfPresent(Int.self, forKey: .remainingCounterexamples),
+            lastUsedAt: try container.decodeIfPresent(Date.self, forKey: .lastUsedAt),
+            expiredAt: try container.decodeIfPresent(Date.self, forKey: .expiredAt)
         )
+    }
+
+    public var isActive: Bool {
+        expiredAt == nil && remainingCounterexamples > 0
     }
 
     public func validatedForStorage() throws -> AgentFailureMemory {
@@ -348,7 +376,11 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
             stateSummary: Self.safeStateSummary(stateSummary),
             repairHint: String(hint.prefix(180)),
             recoveryEvidenceHash: Self.safeOptional(recoveryEvidenceHash),
-            retainedScore: retainedScore
+            retainedScore: retainedScore,
+            expiresAfterSuccesses: expiresAfterSuccesses,
+            remainingCounterexamples: remainingCounterexamples,
+            lastUsedAt: lastUsedAt,
+            expiredAt: expiredAt
         )
     }
 
@@ -381,10 +413,12 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
 public struct AgentFailureMemoryQuery: Sendable {
     public var appName: String?
     public var failureKind: AgentFailureKind?
+    public var activeOnly: Bool
 
-    public init(appName: String? = nil, failureKind: AgentFailureKind? = nil) {
+    public init(appName: String? = nil, failureKind: AgentFailureKind? = nil, activeOnly: Bool = true) {
         self.appName = appName
         self.failureKind = failureKind
+        self.activeOnly = activeOnly
     }
 }
 
@@ -443,6 +477,10 @@ public extension CascadeStore {
             conditions.append("goal_pattern = ?")
             values.append(goalPattern)
         }
+        if let recipeSignature = normalizedQueryValue(query.recipeSignature) {
+            conditions.append("recipe_signature = ?")
+            values.append(recipeSignature)
+        }
         if let failureKind = query.failureKind {
             conditions.append("failure_kind = ?")
             values.append(failureKind.rawValue)
@@ -487,6 +525,10 @@ public extension CascadeStore {
             conditions.append("goal_pattern = ?")
             values.append(goalPattern)
         }
+        if let recipeSignature = normalizedQueryValue(query.recipeSignature) {
+            conditions.append("recipe_signature = ?")
+            values.append(recipeSignature)
+        }
         if let failureKind = query.failureKind {
             conditions.append("failure_kind = ?")
             values.append(failureKind.rawValue)
@@ -515,14 +557,54 @@ public extension CascadeStore {
         }
     }
 
+    func verifiedAgentExperienceCases(
+        appName: String? = nil,
+        goalPattern: String? = nil,
+        recipeSignature: String? = nil,
+        limit: Int = 50
+    ) throws -> [AgentExperienceCase] {
+        var conditions = ["outcome = ?", "verification_signal IS NOT NULL"]
+        var values = [AgentExperienceOutcome.success.rawValue]
+        if let appName = normalizedQueryValue(appName) {
+            conditions.append("app_name = ?")
+            values.append(appName)
+        }
+        if let goalPattern = normalizedQueryValue(goalPattern) {
+            conditions.append("goal_pattern = ?")
+            values.append(goalPattern)
+        }
+        if let recipeSignature = normalizedQueryValue(recipeSignature) {
+            conditions.append("recipe_signature = ?")
+            values.append(recipeSignature)
+        }
+        let whereClause = "WHERE \(conditions.joined(separator: " AND "))"
+        return try withStatement("""
+        \(Self.agentExperienceColumns)
+        FROM agent_experience_case
+        \(whereClause)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?;
+        """) { statement in
+            for (index, value) in values.enumerated() {
+                ledgerBind(value, at: Int32(index + 1), in: statement)
+            }
+            sqlite3_bind_int(statement, Int32(values.count + 1), Int32(max(0, limit)))
+            var rows: [AgentExperienceCase] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(Self.decodeAgentExperience(statement))
+            }
+            return rows
+        }
+    }
+
     @discardableResult
     func recordAgentFailureMemory(_ memory: AgentFailureMemory) throws -> AgentFailureMemory {
         let valid = try memory.validatedForStorage()
         let tokensJSON = Self.encodeGoalTokens(valid.normalizedGoalTokens)
         try withStatement("""
         INSERT INTO agent_failure_memory
-            (created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, state_summary, repair_hint, recovery_evidence_hash, retained_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, state_summary, repair_hint, recovery_evidence_hash, retained_score, expires_after_successes, remaining_counterexamples, last_used_at, expired_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """) { statement in
             ledgerBind(AgentExperienceDateCodec.string(from: valid.createdAt), at: 1, in: statement)
             ledgerBind(valid.appName, at: 2, in: statement)
@@ -535,6 +617,10 @@ public extension CascadeStore {
             ledgerBind(valid.repairHint, at: 9, in: statement)
             ledgerBind(valid.recoveryEvidenceHash, at: 10, in: statement)
             sqlite3_bind_double(statement, 11, valid.retainedScore)
+            sqlite3_bind_int(statement, 12, Int32(valid.expiresAfterSuccesses))
+            sqlite3_bind_int(statement, 13, Int32(valid.remainingCounterexamples))
+            ledgerBind(valid.lastUsedAt.map(AgentExperienceDateCodec.string(from:)), at: 14, in: statement)
+            ledgerBind(valid.expiredAt.map(AgentExperienceDateCodec.string(from:)), at: 15, in: statement)
             try stepDone(statement)
         }
         let id = try withStatement("SELECT last_insert_rowid();") { statement in
@@ -552,7 +638,11 @@ public extension CascadeStore {
             stateSummary: valid.stateSummary,
             repairHint: valid.repairHint,
             recoveryEvidenceHash: valid.recoveryEvidenceHash,
-            retainedScore: valid.retainedScore
+            retainedScore: valid.retainedScore,
+            expiresAfterSuccesses: valid.expiresAfterSuccesses,
+            remainingCounterexamples: valid.remainingCounterexamples,
+            lastUsedAt: valid.lastUsedAt,
+            expiredAt: valid.expiredAt
         )
     }
 
@@ -566,6 +656,10 @@ public extension CascadeStore {
         if let failureKind = query.failureKind {
             conditions.append("failure_kind = ?")
             values.append(failureKind.rawValue)
+        }
+        if query.activeOnly {
+            conditions.append("expired_at IS NULL")
+            conditions.append("remaining_counterexamples > 0")
         }
         let whereClause = conditions.isEmpty ? "" : "WHERE \(conditions.joined(separator: " AND "))"
         return try withStatement("""
@@ -587,6 +681,57 @@ public extension CascadeStore {
         }
     }
 
+    @discardableResult
+    func markAgentFailureMemoriesUsed(ids: [Int64], at date: Date = Date()) throws -> [AgentFailureMemory] {
+        let uniqueIDs = Array(Set(ids.filter { $0 > 0 })).sorted()
+        guard !uniqueIDs.isEmpty else { return [] }
+        let usedAt = AgentExperienceDateCodec.string(from: date)
+        for id in uniqueIDs {
+            try withStatement("UPDATE agent_failure_memory SET last_used_at = ? WHERE id = ?;") { statement in
+                ledgerBind(usedAt, at: 1, in: statement)
+                sqlite3_bind_int64(statement, 2, id)
+                try stepDone(statement)
+            }
+        }
+        return try agentFailureMemories(ids: uniqueIDs, activeOnly: false)
+    }
+
+    @discardableResult
+    func recordAgentFailureCounterexample(
+        appName: String,
+        goalPattern: String,
+        failureKind: AgentFailureKind? = nil,
+        at date: Date = Date()
+    ) throws -> [AgentFailureMemory] {
+        let app = normalizedQueryValue(appName) ?? appName
+        let queryTokens = Set(TrajectoryGoalTokenizer.normalizedGoalTokens(from: goalPattern))
+        guard !app.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !queryTokens.isEmpty else { return [] }
+        let candidates = try agentFailureMemories(
+            matching: AgentFailureMemoryQuery(appName: app, failureKind: failureKind, activeOnly: true),
+            limit: 200
+        )
+        let matched = candidates.filter { memory in
+            !Set(memory.normalizedGoalTokens).isDisjoint(with: queryTokens)
+        }
+        guard !matched.isEmpty else { return [] }
+        let now = AgentExperienceDateCodec.string(from: date)
+        for memory in matched {
+            let remaining = max(0, memory.remainingCounterexamples - 1)
+            try withStatement("""
+            UPDATE agent_failure_memory
+            SET remaining_counterexamples = ?, last_used_at = ?, expired_at = ?
+            WHERE id = ?;
+            """) { statement in
+                sqlite3_bind_int(statement, 1, Int32(remaining))
+                ledgerBind(now, at: 2, in: statement)
+                ledgerBind(remaining == 0 ? now : nil, at: 3, in: statement)
+                sqlite3_bind_int64(statement, 4, memory.id)
+                try stepDone(statement)
+            }
+        }
+        return try agentFailureMemories(ids: matched.map(\.id), activeOnly: false)
+    }
+
     private static var agentExperienceColumns: String {
         """
         SELECT id, created_at, app_name, goal_pattern, recipe_signature, skill_slug, outcome, verification_signal, failure_kind, evidence_ids_json, action_count, retained_score, user_feedback
@@ -595,8 +740,30 @@ public extension CascadeStore {
 
     private static var agentFailureMemoryColumns: String {
         """
-        SELECT id, created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, state_summary, repair_hint, recovery_evidence_hash, retained_score
+        SELECT id, created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, state_summary, repair_hint, recovery_evidence_hash, retained_score, expires_after_successes, remaining_counterexamples, last_used_at, expired_at
         """
+    }
+
+    private func agentFailureMemories(ids: [Int64], activeOnly: Bool) throws -> [AgentFailureMemory] {
+        let uniqueIDs = Array(Set(ids.filter { $0 > 0 })).sorted()
+        guard !uniqueIDs.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: uniqueIDs.count).joined(separator: ",")
+        let activeClause = activeOnly ? "AND expired_at IS NULL AND remaining_counterexamples > 0" : ""
+        return try withStatement("""
+        \(Self.agentFailureMemoryColumns)
+        FROM agent_failure_memory
+        WHERE id IN (\(placeholders)) \(activeClause)
+        ORDER BY created_at DESC, id DESC;
+        """) { statement in
+            for (index, id) in uniqueIDs.enumerated() {
+                sqlite3_bind_int64(statement, Int32(index + 1), id)
+            }
+            var rows: [AgentFailureMemory] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(Self.decodeAgentFailureMemory(statement))
+            }
+            return rows
+        }
     }
 
     private static func decodeAgentExperience(_ statement: OpaquePointer) -> AgentExperienceCase {
@@ -631,7 +798,11 @@ public extension CascadeStore {
             stateSummary: ledgerText(statement, 8),
             repairHint: ledgerText(statement, 9) ?? "",
             recoveryEvidenceHash: ledgerText(statement, 10),
-            retainedScore: sqlite3_column_double(statement, 11)
+            retainedScore: sqlite3_column_double(statement, 11),
+            expiresAfterSuccesses: Int(sqlite3_column_int(statement, 12)),
+            remainingCounterexamples: Int(sqlite3_column_int(statement, 13)),
+            lastUsedAt: AgentExperienceDateCodec.date(from: ledgerText(statement, 14)),
+            expiredAt: AgentExperienceDateCodec.date(from: ledgerText(statement, 15))
         )
     }
 
@@ -697,6 +868,28 @@ private func ledgerBind(_ value: String?, at index: Int32, in statement: OpaqueP
         return
     }
     sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+}
+
+private enum TrajectoryGoalTokenizer {
+    static func normalizedGoalTokens(from goal: String) -> [String] {
+        let stopwords: Set<String> = [
+            "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
+            "into", "is", "it", "latest", "of", "on", "or", "out", "the", "then",
+            "this", "to", "with"
+        ]
+        let parts = goal
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0.count > 1 && !stopwords.contains($0) && !PrivacyRules.isSensitiveText($0) }
+
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for part in parts where seen.insert(part).inserted {
+            ordered.append(part)
+        }
+        return ordered
+    }
 }
 
 private func ledgerText(_ statement: OpaquePointer, _ index: Int32) -> String? {
