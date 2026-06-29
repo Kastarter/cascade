@@ -480,16 +480,78 @@ public enum ScreenElementIndex {
         )
     }
 
+    public static func applyTargetAliases(_ target: String, aliases: [String: [String]]) -> String {
+        let normalizedTarget = normalizedSearchLabel(target)
+        guard !normalizedTarget.isEmpty else { return target }
+        for (canonical, rawAliases) in aliases {
+            let candidates = ([canonical] + rawAliases).map(normalizedSearchLabel).filter { !$0.isEmpty }
+            guard candidates.contains(where: { normalizedTarget == $0 || normalizedTarget.contains($0) }) else {
+                continue
+            }
+            return canonical
+        }
+        return target
+    }
+
+    public static func applyPreferredSourceHints(
+        _ candidates: [Candidate],
+        hints: AppSkillRuntimeHints?,
+        target: String
+    ) -> [Candidate] {
+        guard let preferred = hints?.preferredGroundingSource?.lowercased(), !preferred.isEmpty else {
+            return candidates
+        }
+        return candidates.map { candidate in
+            let sourceName = candidate.source.rawValue.lowercased()
+            let matches = preferred == sourceName
+                || (preferred == "ax" && candidate.source == .accessibility)
+                || (preferred == "accessibility" && candidate.source == .accessibility)
+            let adjustedTrust = matches ? min(1, candidate.trust * 1.12) : max(0, candidate.trust * 0.88)
+            return Candidate(
+                bounds: candidate.bounds,
+                imageBounds: candidate.imageBounds,
+                label: candidate.label,
+                role: candidate.role,
+                source: candidate.source,
+                confidence: candidate.confidence,
+                trust: adjustedTrust,
+                clickSafety: candidate.clickSafety
+            )
+        }
+    }
+
+    public static func normalizedSearchLabel(_ value: String) -> String {
+        value.lowercased()
+            .replacingOccurrences(
+                of: #"\b(the|a|an|button|field|box|link|menu|item|placeholder|input|control)\b"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func textMatchScore(needle: String, candidate: String) -> Double {
+        guard !needle.isEmpty, !candidate.isEmpty else { return 0 }
+        if needle == candidate { return 3 }
+        if candidate.contains(needle) || needle.contains(candidate) { return 2 }
+        let needleWords = Set(needle.split(separator: " "))
+        let candidateWords = Set(candidate.split(separator: " "))
+        guard !needleWords.isEmpty else { return 0 }
+        let overlap = Double(needleWords.intersection(candidateWords).count) / Double(needleWords.count)
+        return overlap >= 0.75 ? 1 + overlap : 0
+    }
+
     public static func bestCandidate(
         for target: String,
         in candidates: [IndexedCandidate],
         policy: TrustPolicy = .default
     ) -> IndexedCandidate? {
-        let target = normalizedLabelForSearch(target)
+        let target = normalizedSearchLabel(target)
         guard !target.isEmpty else { return nil }
         var best: (candidate: IndexedCandidate, score: Double)?
         for candidate in candidates where candidate.isSafeToClick {
-            let score = matchScore(needle: target, candidate: normalizedLabelForSearch(candidate.label)) * candidate.trust
+            let score = textMatchScore(needle: target, candidate: normalizedSearchLabel(candidate.label)) * candidate.trust
             guard score >= 1.30 else { continue }
             if best == nil
                 || score > best!.score
@@ -731,24 +793,6 @@ private extension ScreenElementIndex {
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-    }
-
-    static func normalizedLabelForSearch(_ value: String) -> String {
-        value.lowercased()
-            .replacingOccurrences(of: #"\b(the|a|an|button|field|box|link|menu|item|placeholder|input|control)\b"#, with: " ", options: .regularExpression)
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static func matchScore(needle: String, candidate: String) -> Double {
-        guard !needle.isEmpty, !candidate.isEmpty else { return 0 }
-        if needle == candidate { return 3 }
-        if candidate.contains(needle) || needle.contains(candidate) { return 2 }
-        let needleWords = Set(needle.split(separator: " "))
-        let candidateWords = Set(candidate.split(separator: " "))
-        guard !needleWords.isEmpty else { return 0 }
-        let overlap = Double(needleWords.intersection(candidateWords).count) / Double(needleWords.count)
-        return overlap >= 0.75 ? 1 + overlap : 0
     }
 
     static func rectFromVisionBox(

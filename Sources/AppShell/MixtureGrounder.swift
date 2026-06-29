@@ -114,6 +114,7 @@ public struct MixtureGrounder: VisualGrounder {
     private let groundingCache: GroundingCache?
     private let cacheMode: GroundingCacheMode
     private let cacheContextProvider: @Sendable () async -> AppWindowSnapshot
+    private let regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
 
     /// AX roles a CLICK target may legitimately resolve to. Excludes the passive
     /// roles `AXElementResolver.find` will also match (AXStaticText, AXImage) — a
@@ -137,6 +138,7 @@ public struct MixtureGrounder: VisualGrounder {
         cacheContextProvider: @escaping @Sendable () async -> AppWindowSnapshot = {
             await MainActor.run { AppWindowObserver.snapshot() }
         },
+        regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
         onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)? = nil,
         onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
@@ -149,6 +151,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.groundingCache = groundingCache
         self.cacheMode = cacheMode
         self.cacheContextProvider = cacheContextProvider
+        self.regionNarrower = regionNarrower
         self.onRuntimeProfile = onRuntimeProfile
         self.onVerifierOutcome = onVerifierOutcome
     }
@@ -488,23 +491,31 @@ public struct MixtureGrounder: VisualGrounder {
         }
     }
 
-    /// Region grounding (the "where is X" highlight) stays the base grounder's job —
-    /// a marquee frames an area, which the visual grounder produces and AX point
-    /// matching does not improve.
+    /// Region grounding (the "where is X" highlight) first tries a deterministic
+    /// local AX/OCR/text-index pass, then falls back to the visual/cloud grounder
+    /// only when local evidence is missing or ambiguous.
     public func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? {
         let target = await targetWithRuntimeHints(target)
-        // On-screen TEXT (a document heading/section, a labeled link) is exactly what
-        // the visual grounder misses — it's trained on UI CONTROLS, so "the student
-        // evaluation section" in a PDF resolved to a toolbar button (the audited
-        // ■ square next to Download). Match the literal text by OCR FIRST; fall back to
-        // the visual grounder for icons / canvas / non-text targets.
-        if let region = await Self.ocrTextRegion(
-            screenshot: screenshot, target: target,
-            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
-        ) {
-            return region
+        if let regionNarrower {
+            if let region = await regionNarrower(screenshot, target, displayWidthPoints, displayHeightPoints) {
+                return region
+            }
+        } else {
+            let narrower = LocalRegionNarrower(
+                skills: skills,
+                policy: Self.trustPolicy,
+                onRuntimeProfile: onRuntimeProfile
+            )
+            if let region = await narrower.narrow(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            ) {
+                return region
+            }
         }
         return await base.groundRegion(
             screenshot: screenshot, target: target,
@@ -630,16 +641,7 @@ public struct MixtureGrounder: VisualGrounder {
     }
 
     static func applyTargetAliases(_ target: String, aliases: [String: [String]]) -> String {
-        let normalizedTarget = normalizedIndexLabel(target)
-        guard !normalizedTarget.isEmpty else { return target }
-        for (canonical, rawAliases) in aliases {
-            let candidates = ([canonical] + rawAliases).map(normalizedIndexLabel).filter { !$0.isEmpty }
-            guard candidates.contains(where: { normalizedTarget == $0 || normalizedTarget.contains($0) }) else {
-                continue
-            }
-            return canonical
-        }
-        return target
+        ScreenElementIndex.applyTargetAliases(target, aliases: aliases)
     }
 
     private static func applyPreferredSourceHints(
@@ -647,26 +649,7 @@ public struct MixtureGrounder: VisualGrounder {
         hints: AppSkillRuntimeHints?,
         target: String
     ) -> [ScreenElementIndex.Candidate] {
-        guard let preferred = hints?.preferredGroundingSource?.lowercased(), !preferred.isEmpty else {
-            return candidates
-        }
-        return candidates.map { candidate in
-            let sourceName = candidate.source.rawValue.lowercased()
-            let matches = preferred == sourceName
-                || (preferred == "ax" && candidate.source == .accessibility)
-                || (preferred == "accessibility" && candidate.source == .accessibility)
-            let adjustedTrust = matches ? min(1, candidate.trust * 1.12) : max(0, candidate.trust * 0.88)
-            return ScreenElementIndex.Candidate(
-                bounds: candidate.bounds,
-                imageBounds: candidate.imageBounds,
-                label: candidate.label,
-                role: candidate.role,
-                source: candidate.source,
-                confidence: candidate.confidence,
-                trust: adjustedTrust,
-                clickSafety: candidate.clickSafety
-            )
-        }
+        ScreenElementIndex.applyPreferredSourceHints(candidates, hints: hints, target: target)
     }
 
     @MainActor
