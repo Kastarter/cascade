@@ -106,6 +106,11 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         let failureKind = root?.failureKind ?? failureKinds.last
         let status = Self.scenarioStatus(rootStatus: rootStatus, failureKind: failureKind)
         let confidence = spans.compactMap { Self.confidence(from: $0.attributes) }.last
+        let calibrationOutcome = Self.calibrationOutcome(
+            in: spans,
+            status: status,
+            retries: retryCount
+        )
         let noEffectCount = Self.countSpans(namedLike: ["noeffect", "no_effect"], failureKind: .noEffect, in: spans)
         let subgoals = Self.subgoalMetrics(in: spans)
         let redundantStepCount = Self.redundantStepCount(in: spans)
@@ -127,7 +132,8 @@ public struct AgentTrace: Sendable, Equatable, Codable {
             redundantStepCount: redundantStepCount,
             wrongStartStateCount: wrongStartStateCount,
             confidence: confidence,
-            actualSuccess: confidence == nil ? nil : status == .success
+            actualSuccess: confidence == nil ? nil : status == .success,
+            calibrationOutcome: calibrationOutcome
         )
     }
 
@@ -510,6 +516,37 @@ public struct AgentTrace: Sendable, Equatable, Codable {
             return VerifierCalibration.clampConfidence(value)
         }
         return nil
+    }
+
+    private static func calibrationOutcome(
+        in spans: [TraceSpan],
+        status: ScenarioStatus,
+        retries: Int
+    ) -> VerifierCalibrationOutcome? {
+        let verifierSpans = spans.filter { span in
+            span.attributes["verifier.verdict"] != nil
+                || span.attributes["verifier.outcome"] != nil
+                || span.name == "grounding.verifier"
+                || span.name == "assist.verify.action"
+        }
+        guard !verifierSpans.isEmpty else { return nil }
+        if verifierSpans.contains(where: { span in
+            let verdict = span.attributes["verifier.verdict"] ?? span.attributes["verdict"]
+            let outcome = span.attributes["verifier.outcome"] ?? span.attributes["outcome"]
+            return verdict == "abstain" || verdict == "reject" || outcome == "abstained" || outcome == "rejected"
+        }) {
+            return status == .paused ? .paused : .abstained
+        }
+        if status == .paused { return .paused }
+        let accepted = verifierSpans.contains { span in
+            let verdict = span.attributes["verifier.verdict"] ?? span.attributes["verdict"]
+            let outcome = span.attributes["verifier.outcome"] ?? span.attributes["outcome"]
+            return verdict == "accept" || outcome == "selected"
+        }
+        guard accepted else { return nil }
+        return status == .success
+            ? (retries > 0 ? .regrounded : .acceptedCorrect)
+            : .falseAccept
     }
 
     private static func intAttribute(_ keys: [String], in span: TraceSpan) -> Int {
@@ -1274,12 +1311,19 @@ public enum AgentTraceBuilder {
                 return .verificationUnavailable
             }
             if event.action == "assist.verify.action", auditValue("status", in: event.detail) == "failed" {
-                return cascadeFailureKind(auditValue("failureKind", in: event.detail)) ?? .validatorIncomplete
+                if auditValue("postEffect", in: event.detail) == "mismatch" {
+                    return .effectMismatch
+                }
+                return cascadeFailureKind(auditValue("failureKind", in: event.detail)) ?? .preconditionFailed
             }
             if event.action == "grounding.verifier",
-               let failure = auditValue("failure", in: event.detail),
-               failure != "none" {
-                return cascadeFailureKind(failure) ?? .groundingMiss
+               let verdict = auditValue("verdict", in: event.detail),
+               verdict == "reject" || verdict == "abstain" {
+                if auditValue("failure", in: event.detail) == "ambiguous"
+                    || auditValue("outcome", in: event.detail) == "ambiguous" {
+                    return .verifierDisagreement
+                }
+                return .lowConfidenceGrounding
             }
             if event.action == "sandbox.verify", auditValue("status", in: event.detail) == "incomplete" {
                 return .validatorIncomplete
@@ -1328,6 +1372,14 @@ public enum AgentTraceBuilder {
                 return .noEffect
             case "groundingmiss", "grounding_miss":
                 return .groundingMiss
+            case "lowconfidencegrounding", "low_confidence_grounding":
+                return .lowConfidenceGrounding
+            case "preconditionfailed", "precondition_failed":
+                return .preconditionFailed
+            case "effectmismatch", "effect_mismatch":
+                return .effectMismatch
+            case "verifierdisagreement", "verifier_disagreement":
+                return .verifierDisagreement
             case "parameterneedslivevalue", "parameter_needs_live_value":
                 return .parameterNeedsLiveValue
             case "artifactwronglane", "artifact_wrong_lane":
@@ -1348,6 +1400,14 @@ public enum AgentTraceBuilder {
                 return .targetNotFound
             case "grounding_miss":
                 return .groundingMiss
+            case "low_confidence_grounding":
+                return .lowConfidenceGrounding
+            case "precondition_failed":
+                return .preconditionFailed
+            case "effect_mismatch":
+                return .effectMismatch
+            case "verifier_disagreement":
+                return .verifierDisagreement
             case "permission_denied":
                 return .permissionMissing
             case "secure_input":
@@ -1429,6 +1489,27 @@ public enum AgentTraceBuilder {
         if event.action == "grounding.verifier",
            let outcome = auditValue("outcome", in: event.detail) {
             attributes["verifier.outcome"] = safeToken(outcome)
+        }
+        if let verdict = auditValue("verdict", in: event.detail) {
+            attributes["verifier.verdict"] = safeToken(verdict)
+        }
+        if let failure = auditValue("failure", in: event.detail) {
+            attributes["verifier.failure"] = safeToken(failure)
+        }
+        if let selectedSource = auditValue("selectedSource", in: event.detail) ?? auditValue("source", in: event.detail) {
+            attributes["selected.source"] = safeToken(selectedSource)
+        }
+        if let candidateHash = auditValue("selectedCandidateHash", in: event.detail) ?? auditValue("candidateHash", in: event.detail) {
+            attributes["selected.candidate_hash"] = safeToken(candidateHash)
+        }
+        if let candidates = auditValue("candidates", in: event.detail) {
+            attributes["candidate.count"] = safeToken(candidates)
+        }
+        if let postEffect = auditValue("postEffect", in: event.detail) {
+            attributes["post_effect"] = safeToken(postEffect)
+        }
+        if let expectedEffect = auditValue("expectedEffect", in: event.detail) {
+            attributes["expected_effect"] = safeToken(expectedEffect)
         }
         for key in ["status", "outcome", "failure", "failureKind", "recoveryAction"] {
             if let value = auditValue(key, in: event.detail) {

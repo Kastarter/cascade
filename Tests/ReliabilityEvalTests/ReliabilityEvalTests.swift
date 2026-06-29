@@ -31,6 +31,10 @@ func detailAwareMappingClassifiesValidatorAndSecureInput() {
     // Secure Input now has an emitted action that classifies.
     #expect(AgentFailureKind(auditAction: "agent.secure_input") == .secureInput)
     #expect(AgentFailureKind.secureInput.category == .environment)
+    #expect(AgentFailureKind(auditAction: "grounding.verifier", detail: "verdict=reject failure=low_evidence") == .lowConfidenceGrounding)
+    #expect(AgentFailureKind(auditAction: "grounding.verifier", detail: "verdict=abstain failure=ambiguous") == .verifierDisagreement)
+    #expect(AgentFailureKind(auditAction: "assist.verify.action", detail: "status=failed failureKind=no_effect postEffect=mismatch") == .effectMismatch)
+    #expect(AgentFailureKind(auditAction: "assist.verify.action", detail: "status=failed failureKind=unsafe_action") == .preconditionFailed)
 }
 
 @Test
@@ -67,6 +71,25 @@ func groundingFailuresRegroundBeforeGivingUp() {
     let plan = AgentRecoveryPolicy.plan(for: .groundingMiss)
     #expect(plan.retryRungs == [.reharvestAX, .regroundVisual])
     #expect(plan.terminal == .pauseForUser)
+}
+
+@Test
+func verifierFailuresUseTypedRecoveryPlans() {
+    let lowConfidence = AgentRecoveryPolicy.plan(for: .lowConfidenceGrounding)
+    #expect(lowConfidence.retryRungs == [.reharvestAX, .regroundVisual])
+    #expect(lowConfidence.terminal == .pauseForUser)
+
+    let effectMismatch = AgentRecoveryPolicy.plan(for: .effectMismatch)
+    #expect(effectMismatch.retryRungs == [.recapture, .rerunVerifier])
+    #expect(effectMismatch.terminal == .escalate)
+
+    let precondition = AgentRecoveryPolicy.plan(for: .preconditionFailed)
+    #expect(precondition.retryRungs == [.diagnosticProbe])
+    #expect(precondition.terminal == .pauseForUser)
+
+    let disagreement = AgentRecoveryPolicy.plan(for: .verifierDisagreement)
+    #expect(disagreement.retryRungs == [.rerunVerifier, .diagnosticProbe])
+    #expect(disagreement.terminal == .pauseForUser)
 }
 
 // MARK: - Scenario runner

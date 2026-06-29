@@ -132,6 +132,177 @@ public protocol ActionCritic: Sendable {
     func critique(_ request: ActionCritiqueRequest) async -> ActionCritique
 }
 
+public enum ActionRisk: String, Sendable, Equatable, Codable {
+    case low
+    case elevated
+    case high
+    case destructive
+}
+
+public struct PreActionVerification: Sendable, Equatable {
+    public let risk: ActionRisk
+    public let triggerReasons: [String]
+    public let failureKind: CascadeMemory.AgentFailureKind?
+
+    public init(
+        risk: ActionRisk,
+        triggerReasons: [String],
+        failureKind: CascadeMemory.AgentFailureKind? = nil
+    ) {
+        self.risk = risk
+        self.triggerReasons = Array(Set(triggerReasons)).sorted()
+        self.failureKind = failureKind
+    }
+
+    public var shouldCritique: Bool { !triggerReasons.isEmpty }
+}
+
+public enum PreActionVerifier: Sendable {
+    public static func verify(
+        action: CUAction? = nil,
+        harnessToolName: String? = nil,
+        lowConfidenceGrounding: Bool = false,
+        alternativeCount: Int = 0,
+        groundingMissCount: Int = 0,
+        noEffectCount: Int = 0,
+        liveValueFailure: Bool = false
+    ) -> PreActionVerification {
+        var reasons: [String] = []
+        var risk: ActionRisk = .low
+        var failureKind: CascadeMemory.AgentFailureKind?
+
+        if let harnessToolName {
+            switch harnessToolName {
+            case "run_command":
+                reasons.append("power_harness_tool")
+                reasons.append("shell")
+                risk = .high
+                failureKind = .unsafeAction
+            case "run_applescript":
+                reasons.append("power_harness_tool")
+                reasons.append("applescript")
+                risk = .high
+                failureKind = .unsafeAction
+            case "write_file":
+                reasons.append("power_harness_tool")
+                reasons.append("file_write")
+                risk = .high
+                failureKind = .unsafeAction
+            default:
+                break
+            }
+        }
+
+        if let action {
+            let text = actionRiskText(action)
+            if containsDestructiveIntent(text) {
+                reasons.append("destructive_or_submit_intent")
+                risk = maxRisk(risk, .destructive)
+                failureKind = .unsafeAction
+            } else if containsPrivacySensitiveFormIntent(text) {
+                reasons.append("privacy_sensitive_form")
+                risk = maxRisk(risk, .high)
+                failureKind = .unsafeAction
+            }
+            switch action {
+            case .key(let combo) where ComputerUseAgent.isIrreversibleCombo(combo):
+                reasons.append("irreversible_key")
+                risk = maxRisk(risk, .destructive)
+                failureKind = .unsafeAction
+            case .key(let combo) where ComputerUseAgent.looksExternallySignificant(combo):
+                reasons.append("external_side_effect_key")
+                risk = maxRisk(risk, .high)
+                failureKind = .unsafeAction
+            case .type(let text) where ComputerUseAgent.looksExternallySignificant(text):
+                reasons.append("external_side_effect_text")
+                risk = maxRisk(risk, .high)
+                failureKind = .unsafeAction
+            case .openURL(let url):
+                if isExternalURL(url) {
+                    reasons.append("external_url")
+                    risk = maxRisk(risk, .high)
+                    failureKind = .unsafeAction
+                }
+            default:
+                break
+            }
+        }
+
+        if lowConfidenceGrounding {
+            reasons.append("low_confidence_grounding")
+            risk = maxRisk(risk, .high)
+            failureKind = failureKind ?? .groundingMiss
+        }
+        if alternativeCount > 0 {
+            reasons.append("ambiguous_grounding")
+            risk = maxRisk(risk, .elevated)
+            failureKind = failureKind ?? .groundingMiss
+        }
+        if groundingMissCount >= 2 {
+            reasons.append("repeated_grounding_miss")
+            risk = maxRisk(risk, .high)
+            failureKind = failureKind ?? .groundingMiss
+        }
+        if noEffectCount >= 2 {
+            reasons.append("repeated_no_effect")
+            risk = maxRisk(risk, .high)
+            failureKind = failureKind ?? .noEffect
+        }
+        if liveValueFailure {
+            reasons.append("parameter_needs_live_value")
+            risk = maxRisk(risk, .elevated)
+            failureKind = failureKind ?? .parameterNeedsLiveValue
+        }
+
+        return PreActionVerification(risk: risk, triggerReasons: reasons, failureKind: failureKind)
+    }
+
+    private static func actionRiskText(_ action: CUAction) -> String {
+        switch action {
+        case .type(let text), .key(let text), .openApp(let text), .openURL(let text):
+            return text
+        case .highlight(_, _, _, _, let label):
+            return label
+        default:
+            return ""
+        }
+    }
+
+    private static func containsDestructiveIntent(_ value: String) -> Bool {
+        value.range(
+            of: #"(?i)\b(send|submit|delete|remove|trash|erase|pay|purchase|buy|allow|grant|approve|confirm|post|publish|wire|transfer)\b"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func containsPrivacySensitiveFormIntent(_ value: String) -> Bool {
+        value.range(
+            of: #"(?i)\b(password|passcode|ssn|social\s+security|credit\s*card|card\s*number|bank|routing|secret|token|api\s*key)\b"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func isExternalURL(_ value: String) -> Bool {
+        guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return true }
+        guard scheme == "http" || scheme == "https" else { return true }
+        guard let host = url.host()?.lowercased() else { return true }
+        return !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.hasSuffix(".local"))
+    }
+
+    private static func maxRisk(_ lhs: ActionRisk, _ rhs: ActionRisk) -> ActionRisk {
+        order(lhs) >= order(rhs) ? lhs : rhs
+    }
+
+    private static func order(_ risk: ActionRisk) -> Int {
+        switch risk {
+        case .low: return 0
+        case .elevated: return 1
+        case .high: return 2
+        case .destructive: return 3
+        }
+    }
+}
+
 public struct PromptActionCritic: ActionCritic {
     private let client: any MessageCompleting
     private let model: String

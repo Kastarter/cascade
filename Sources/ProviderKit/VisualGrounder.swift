@@ -85,6 +85,32 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
     public let markNumber: Int?
     public let displayBounds: CGRect?
     public let imageBounds: CGRect?
+    public let role: String?
+    public let label: String?
+    public let nearbyOCRText: String?
+    public let ocrDistancePoints: Double?
+    public let agreeingSources: [GroundingSource]
+
+    enum CodingKeys: String, CodingKey {
+        case point
+        case region
+        case confidence
+        case source
+        case coordinateSpace
+        case rawModel
+        case latency
+        case dispersion
+        case reason
+        case candidateID
+        case markNumber
+        case displayBounds
+        case imageBounds
+        case role
+        case label
+        case nearbyOCRText
+        case ocrDistancePoints
+        case agreeingSources
+    }
 
     public init(
         point: CGPoint?,
@@ -99,7 +125,12 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         candidateID: String? = nil,
         markNumber: Int? = nil,
         displayBounds: CGRect? = nil,
-        imageBounds: CGRect? = nil
+        imageBounds: CGRect? = nil,
+        role: String? = nil,
+        label: String? = nil,
+        nearbyOCRText: String? = nil,
+        ocrDistancePoints: Double? = nil,
+        agreeingSources: [GroundingSource] = []
     ) {
         self.point = point
         self.region = region
@@ -114,6 +145,33 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         self.markNumber = markNumber
         self.displayBounds = displayBounds
         self.imageBounds = imageBounds
+        self.role = role
+        self.label = label
+        self.nearbyOCRText = nearbyOCRText
+        self.ocrDistancePoints = ocrDistancePoints
+        self.agreeingSources = agreeingSources
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.point = try container.decodeIfPresent(CGPoint.self, forKey: .point)
+        self.region = try container.decodeIfPresent(CGRect.self, forKey: .region)
+        self.confidence = try container.decode(Double.self, forKey: .confidence)
+        self.source = try container.decode(GroundingSource.self, forKey: .source)
+        self.coordinateSpace = try container.decode(GroundingCoordinateSpace.self, forKey: .coordinateSpace)
+        self.rawModel = try container.decodeIfPresent(String.self, forKey: .rawModel)
+        self.latency = try container.decodeIfPresent(TimeInterval.self, forKey: .latency)
+        self.dispersion = try container.decodeIfPresent(Double.self, forKey: .dispersion)
+        self.reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        self.candidateID = try container.decodeIfPresent(String.self, forKey: .candidateID)
+        self.markNumber = try container.decodeIfPresent(Int.self, forKey: .markNumber)
+        self.displayBounds = try container.decodeIfPresent(CGRect.self, forKey: .displayBounds)
+        self.imageBounds = try container.decodeIfPresent(CGRect.self, forKey: .imageBounds)
+        self.role = try container.decodeIfPresent(String.self, forKey: .role)
+        self.label = try container.decodeIfPresent(String.self, forKey: .label)
+        self.nearbyOCRText = try container.decodeIfPresent(String.self, forKey: .nearbyOCRText)
+        self.ocrDistancePoints = try container.decodeIfPresent(Double.self, forKey: .ocrDistancePoints)
+        self.agreeingSources = try container.decodeIfPresent([GroundingSource].self, forKey: .agreeingSources) ?? []
     }
 }
 
@@ -698,7 +756,12 @@ public struct UITARSGrounder: VisualGrounder {
                 candidateID: candidate.id,
                 markNumber: candidate.markNumber,
                 displayBounds: candidate.displayBounds,
-                imageBounds: candidate.imageBounds
+                imageBounds: candidate.imageBounds,
+                role: candidate.role,
+                label: candidate.label,
+                nearbyOCRText: candidate.label,
+                ocrDistancePoints: 0,
+                agreeingSources: [candidate.source]
             )
         }
         return GroundingResult(

@@ -227,6 +227,46 @@ func traceBuilderPreservesVerifierConfidenceAsSafeAttributes() throws {
     #expect(outcome.confidence == 0.91)
     #expect(outcome.confidenceBucket == "0.8-1.0")
     #expect(outcome.actualSuccess == true)
+    #expect(outcome.calibrationOutcome == .acceptedCorrect)
+}
+
+@Test
+func traceBuilderDerivesVerifierFailureAttributesAndCalibration() throws {
+    let base = Date(timeIntervalSince1970: 1_800_000_276)
+    let traces = AgentTraceBuilder.fromAuditEvents([
+        AuditEvent(id: 40, createdAt: base, actor: "agent", action: "assist.task", detail: "private task text"),
+        AuditEvent(
+            id: 41,
+            createdAt: base.addingTimeInterval(0.1),
+            actor: "agent",
+            action: "grounding.verifier",
+            detail: "verdict=abstain outcome=ambiguous failure=ambiguous confidence=0.42 candidates=3 selectedSource=accessibility selectedCandidateHash=abc123 targetChars=12 targetHash=def"
+        ),
+        AuditEvent(
+            id: 42,
+            createdAt: base.addingTimeInterval(0.2),
+            actor: "agent",
+            action: "assist.verify.action",
+            detail: "status=failed postEffect=mismatch expectedEffect=frontmost_app failureKind=no_effect"
+        ),
+        AuditEvent(id: 43, createdAt: base.addingTimeInterval(0.3), actor: "agent", action: "agent.run.completed", detail: "agentID=1 labelHash=abc"),
+    ])
+
+    let trace = try #require(traces.first)
+    let grounding = try #require(trace.spans.first { $0.name == "grounding.verifier" })
+    let actionVerify = try #require(trace.spans.first { $0.name == "assist.verify.action" })
+    let outcome = trace.scenarioOutcome
+
+    #expect(grounding.failureKind == .verifierDisagreement)
+    #expect(grounding.attributes["verifier.verdict"] == "abstain")
+    #expect(grounding.attributes["verifier.failure"] == "ambiguous")
+    #expect(grounding.attributes["selected.source"] == "accessibility")
+    #expect(grounding.attributes["selected.candidate_hash"] == "abc123")
+    #expect(grounding.attributes["candidate.count"] == "3")
+    #expect(actionVerify.failureKind == .effectMismatch)
+    #expect(actionVerify.attributes["post_effect"] == "mismatch")
+    #expect(actionVerify.attributes["expected_effect"] == "frontmost_app")
+    #expect(outcome.calibrationOutcome == .abstained)
 }
 
 @Test

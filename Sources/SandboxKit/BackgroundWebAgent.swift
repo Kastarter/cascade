@@ -1137,12 +1137,13 @@ public final class BackgroundWebAgent {
     }
 
     nonisolated static func sandboxVerifyAuditDescriptor(status: String, detail: String) -> String {
-        "status=\(safeAuditToken(status)) resultChars=\(detail.count) resultHash=\(auditHash(detail))"
+        let postEffect = status == "verified" ? "verified" : "mismatch"
+        return "status=\(safeAuditToken(status)) postEffect=\(postEffect) expectedEffect=page_state resultChars=\(detail.count) resultHash=\(auditHash(detail))"
     }
 
     nonisolated static func sandboxNoEffectAuditDescriptor(status: String, streak: Int) -> String {
         let action = recoveryAction(for: .noEffect, attempt: streak)
-        return "status=\(safeAuditToken(status)) noEffectStreak=\(streak) recoveryAction=\(safeAuditToken(action.rawValue))"
+        return "status=\(safeAuditToken(status)) postEffect=mismatch expectedEffect=page_state noEffectStreak=\(streak) recoveryAction=\(safeAuditToken(action.rawValue))"
     }
 
     nonisolated static func sandboxReplanAuditDescriptor(
