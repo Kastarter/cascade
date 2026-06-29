@@ -42,4 +42,24 @@ struct ScreenCaptureUtilityTests {
         #expect(ScreenCaptureUtility.focusedWindowNormalizedRect(focusedWindowRef: nil) == nil)
         #expect(ScreenCaptureUtility.focusedWindowNormalizedRect(focusedWindowRef: malformed) == nil)
     }
+
+    @Test func axClientRejectsInvalidFrames() {
+        let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let valid = CGRect(x: 10, y: 10, width: 100, height: 40)
+        let zero = CGRect(x: 10, y: 10, width: 0, height: 40)
+        let offscreen = CGRect(x: 2000, y: 10, width: 100, height: 40)
+
+        #expect((try? AXClient.validateFrame(valid, knownDisplays: [display]).get()) == valid)
+        #expect((try? AXClient.validateFrame(zero, knownDisplays: [display]).get()) == nil)
+        #expect((try? AXClient.validateFrame(offscreen, knownDisplays: [display]).get()) == nil)
+    }
+
+    @Test func axClientUsesParentFallbackForTinyChildFrame() throws {
+        let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let parent = CGRect(x: 20, y: 20, width: 200, height: 80)
+        let zero = CGRect(x: 20, y: 20, width: 0, height: 0)
+
+        let resolved = try AXClient.validateFrame(zero, knownDisplays: [display], parentFrame: parent).get()
+        #expect(resolved == parent)
+    }
 }

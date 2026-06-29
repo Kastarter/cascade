@@ -2,6 +2,95 @@ import AppKit
 import ApplicationServices
 import CascadeMemory
 import Foundation
+import MacContextKit
+
+public struct AXRuntimeProfile: Equatable, Sendable {
+    public let bundleIdentifier: String?
+    public let appName: String?
+    public let sampledNodeCount: Int
+    public let actionableRoleCount: Int
+    public let labeledActionableCount: Int
+    public let identifierCount: Int
+    public let frameFailureCount: Int
+    public let timeoutOrErrorCount: Int
+    public let canvasSizedElementRatio: Double
+    public let manualAccessibilityAttempted: Bool
+
+    public init(
+        bundleIdentifier: String?,
+        appName: String?,
+        sampledNodeCount: Int,
+        actionableRoleCount: Int,
+        labeledActionableCount: Int,
+        identifierCount: Int,
+        frameFailureCount: Int,
+        timeoutOrErrorCount: Int,
+        canvasSizedElementRatio: Double,
+        manualAccessibilityAttempted: Bool = false
+    ) {
+        self.bundleIdentifier = bundleIdentifier
+        self.appName = appName
+        self.sampledNodeCount = sampledNodeCount
+        self.actionableRoleCount = actionableRoleCount
+        self.labeledActionableCount = labeledActionableCount
+        self.identifierCount = identifierCount
+        self.frameFailureCount = frameFailureCount
+        self.timeoutOrErrorCount = timeoutOrErrorCount
+        self.canvasSizedElementRatio = canvasSizedElementRatio.isFinite ? max(0, min(1, canvasSizedElementRatio)) : 0
+        self.manualAccessibilityAttempted = manualAccessibilityAttempted
+    }
+
+    public var isSparse: Bool {
+        Self.isSparse(
+            sampledNodeCount: sampledNodeCount,
+            actionableRoleCount: actionableRoleCount,
+            labeledActionableCount: labeledActionableCount,
+            identifierCount: identifierCount,
+            frameFailureCount: frameFailureCount,
+            timeoutOrErrorCount: timeoutOrErrorCount,
+            canvasSizedElementRatio: canvasSizedElementRatio
+        )
+    }
+
+    public var shouldRetryManualAccessibility: Bool {
+        isSparse && !manualAccessibilityAttempted
+    }
+
+    public static func isSparse(
+        sampledNodeCount: Int,
+        actionableRoleCount: Int,
+        labeledActionableCount: Int,
+        identifierCount: Int,
+        frameFailureCount: Int,
+        timeoutOrErrorCount: Int,
+        canvasSizedElementRatio: Double
+    ) -> Bool {
+        if sampledNodeCount < 12 { return true }
+        if actionableRoleCount < 3 { return true }
+        if labeledActionableCount == 0 { return true }
+        if identifierCount == 0 && actionableRoleCount < 6 { return true }
+        let denominator = max(sampledNodeCount, 1)
+        if Double(frameFailureCount + timeoutOrErrorCount) / Double(denominator) > 0.35 { return true }
+        if canvasSizedElementRatio >= 0.45 { return true }
+        return false
+    }
+
+    public var safeAuditDetail: String {
+        [
+            "bundleHash=\(AuditIdentity.hash(bundleIdentifier))",
+            "appHash=\(AuditIdentity.hash(appName))",
+            "nodes=\(sampledNodeCount)",
+            "actionable=\(actionableRoleCount)",
+            "labeledActionable=\(labeledActionableCount)",
+            "identifiers=\(identifierCount)",
+            "frameFailures=\(frameFailureCount)",
+            "errors=\(timeoutOrErrorCount)",
+            "canvasRatio=\(String(format: "%.2f", canvasSizedElementRatio))",
+            "manualAccessibility=\(manualAccessibilityAttempted ? "true" : "false")",
+            "sparse=\(isSparse ? "true" : "false")",
+        ].joined(separator: " ")
+    }
+}
 
 // Accessibility-tree target resolution for replaying recorded recipes.
 // Ported pattern from `milind-soni/tiptour-macos` (`ElementResolver` /
@@ -175,6 +264,31 @@ public enum AXElementResolver {
             }
         }
         return out
+    }
+
+    public static func runtimeProfileForFrontmost(limit: Int = 600, retryManualAccessibility: Bool = true) -> AXRuntimeProfile? {
+        guard AXIsProcessTrusted(),
+              let frontmost = NSWorkspace.shared.frontmostApplication else { return nil }
+        let app = AXUIElementCreateApplication(frontmost.processIdentifier)
+        AXClient.setMessagingTimeout(app)
+        let first = runtimeProfile(
+            app: app,
+            appName: frontmost.localizedName,
+            bundleIdentifier: frontmost.bundleIdentifier,
+            limit: limit,
+            manualAccessibilityAttempted: false
+        )
+        guard retryManualAccessibility, first.shouldRetryManualAccessibility,
+              enableManualAccessibility(app: app) else {
+            return first
+        }
+        return runtimeProfile(
+            app: app,
+            appName: frontmost.localizedName,
+            bundleIdentifier: frontmost.bundleIdentifier,
+            limit: limit,
+            manualAccessibilityAttempted: true
+        )
     }
 
     /// Compact, LLM-readable list of clickable controls — pushed at a flail moment.
@@ -437,9 +551,9 @@ public enum AXElementResolver {
     // MARK: - AX plumbing
 
     private static func windows(of app: AXUIElement) -> [AXUIElement] {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &ref) == .success,
-              let windows = ref as? [AXUIElement] else { return [] }
+        guard case .success(let windows) = AXClient.attribute(app, kAXWindowsAttribute as String, as: [AXUIElement].self) else {
+            return []
+        }
         return windows
     }
 
@@ -451,9 +565,7 @@ public enum AXElementResolver {
         visited += 1
         let role = string(of: element, kAXRoleAttribute) ?? ""
         visit(element, role)
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &ref) == .success,
-              let children = ref as? [AXUIElement] else { return }
+        guard case .success(let children) = AXClient.children(element) else { return }
         for child in children {
             guard visited < limit else { return }
             walk(child, depth: depth + 1, limit: limit, visited: &visited, visit: visit)
@@ -489,27 +601,19 @@ public enum AXElementResolver {
     }
 
     private static func string(of element: AXUIElement, _ attribute: String) -> String? {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success else { return nil }
-        return ref as? String
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: String.self) else { return nil }
+        return value
     }
 
     private static func element(of parent: AXUIElement, attribute: String) -> AXUIElement? {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(parent, attribute as CFString, &ref) == .success,
-              let value = ref, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        return (value as! AXUIElement)
+        guard case .success(let value) = AXClient.elementAttribute(parent, attribute) else { return nil }
+        return value
     }
 
     /// Element frame in CG global (top-left) coordinates.
     private static func frame(of element: AXUIElement) -> CGRect? {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &ref) == .success,
-              let position = decodeAXPoint(ref) else { return nil }
-        ref = nil
-        guard AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &ref) == .success,
-              let size = decodeAXSize(ref) else { return nil }
-        return CGRect(origin: position, size: size)
+        guard case .success(let frame) = AXClient.frame(element) else { return nil }
+        return frame
     }
 
     static func decodeAXPoint(_ ref: CFTypeRef?) -> CGPoint? {
@@ -528,5 +632,78 @@ public enum AXElementResolver {
         var size = CGSize.zero
         guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
         return size
+    }
+
+    private static func runtimeProfile(
+        app: AXUIElement,
+        appName: String?,
+        bundleIdentifier: String?,
+        limit: Int,
+        manualAccessibilityAttempted: Bool
+    ) -> AXRuntimeProfile {
+        let displays = AXClient.activeDisplayBounds()
+        let displayArea = displays.map { max(0, $0.width * $0.height) }.max() ?? 1
+        var sampled = 0
+        var actionable = 0
+        var labeledActionable = 0
+        var identifiers = 0
+        var frameFailures = 0
+        var errors = 0
+        var canvasSized = 0
+
+        func sample(_ element: AXUIElement, depth: Int) {
+            guard sampled < limit, depth <= maxDepth else { return }
+            sampled += 1
+            let role = string(of: element, kAXRoleAttribute) ?? ""
+            let isActionable = actionableRoles.contains(role)
+            if isActionable { actionable += 1 }
+            if isActionable, labelText(of: element) != nil { labeledActionable += 1 }
+            if identifier(of: element) != nil { identifiers += 1 }
+            switch AXClient.frame(element, knownDisplays: displays) {
+            case .success(let rect):
+                if displayArea > 0, rect.width * rect.height / displayArea >= 0.35 {
+                    canvasSized += 1
+                }
+            case .failure:
+                frameFailures += 1
+            }
+            guard depth < maxDepth, sampled < limit else { return }
+            switch AXClient.children(element) {
+            case .success(let children):
+                for child in children {
+                    guard sampled < limit else { return }
+                    sample(child, depth: depth + 1)
+                }
+            case .failure:
+                errors += 1
+            }
+        }
+
+        let roots = windows(of: app)
+        if roots.isEmpty {
+            sample(app, depth: 0)
+        } else {
+            for window in roots {
+                guard sampled < limit else { break }
+                sample(window, depth: 0)
+            }
+        }
+        let ratio = sampled > 0 ? Double(canvasSized) / Double(sampled) : 0
+        return AXRuntimeProfile(
+            bundleIdentifier: bundleIdentifier,
+            appName: appName,
+            sampledNodeCount: sampled,
+            actionableRoleCount: actionable,
+            labeledActionableCount: labeledActionable,
+            identifierCount: identifiers,
+            frameFailureCount: frameFailures,
+            timeoutOrErrorCount: errors,
+            canvasSizedElementRatio: ratio,
+            manualAccessibilityAttempted: manualAccessibilityAttempted
+        )
+    }
+
+    private static func enableManualAccessibility(app: AXUIElement) -> Bool {
+        AXClient.setAttribute(app, "AXManualAccessibility", value: kCFBooleanTrue) == .success
     }
 }

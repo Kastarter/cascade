@@ -298,6 +298,29 @@ public final class CascadeAppModel: ObservableObject {
         let screenChanged: Bool
     }
     private var episodeGroundingSelections: [GroundingSelectionEvidence] = []
+    private final class SparseAXProfileBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var profiles: [AXRuntimeProfile] = []
+
+        func record(_ profile: AXRuntimeProfile) {
+            lock.lock()
+            profiles.append(profile)
+            lock.unlock()
+        }
+
+        func reset() {
+            lock.lock()
+            profiles.removeAll()
+            lock.unlock()
+        }
+
+        func snapshot() -> [AXRuntimeProfile] {
+            lock.lock()
+            defer { lock.unlock() }
+            return profiles
+        }
+    }
+    private let episodeSparseAXProfiles = SparseAXProfileBuffer()
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -1563,6 +1586,7 @@ public final class CascadeAppModel: ObservableObject {
         agentDidHighlight = false
         episodeAppActions = [:]
         episodeGroundingSelections = []
+        episodeSparseAXProfiles.reset()
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
 
@@ -1940,6 +1964,14 @@ public final class CascadeAppModel: ObservableObject {
             candidateFailureCounts: groundingCandidateFailureCounts,
             groundingCache: groundingCache,
             cacheMode: Self.structuralGroundingEnabled() ? .structural : .coordinate,
+            onRuntimeProfile: { [store = self.store, profileBuffer = self.episodeSparseAXProfiles] profile in
+                profileBuffer.record(profile)
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "grounding.ax_profile",
+                    detail: profile.safeAuditDetail
+                ))
+            },
             onVerifierOutcome: { [store = self.store] outcome in
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
@@ -3402,11 +3434,13 @@ public final class CascadeAppModel: ObservableObject {
     /// screenshot doesn't actually contain). Pure + unit-tested: a wrong number
     /// here would send the agent clicking into empty space.
     nonisolated static func modelPixel(forCGGlobal point: CGPoint, in display: CGRect, resW: Int, resH: Int) -> CGPoint? {
-        guard display.width > 0, display.height > 0 else { return nil }
-        let fx = (point.x - display.minX) / display.width
-        let fy = (point.y - display.minY) / display.height
-        guard fx >= -0.002, fx <= 1.002, fy >= -0.002, fy <= 1.002 else { return nil }
-        return CGPoint(x: min(max(fx, 0), 1) * Double(resW), y: min(max(fy, 0), 1) * Double(resH))
+        let mapper = DisplayCoordinateMapper(
+            displayID: CGMainDisplayID(),
+            appKitFrame: CGRect(x: 0, y: 0, width: display.width, height: display.height),
+            cgBounds: display,
+            backingScaleFactor: 1
+        )
+        return mapper.capturedImagePixel(fromCGGlobal: point, imageSize: CGSize(width: resW, height: resH))
     }
 
     /// The flail-moment grounding push WITH coordinates: each on-screen control
@@ -3428,18 +3462,22 @@ public final class CascadeAppModel: ObservableObject {
     /// CG-global bounds (top-left origin) of the display a screen represents —
     /// the coordinate system AX element positions live in.
     nonisolated static func displayBounds(of screen: NSScreen) -> CGRect {
-        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-        return CGDisplayBounds(id ?? CGMainDisplayID())
+        DisplayCoordinateMapper(screen: screen)?.cgBounds ?? CGDisplayBounds(CGMainDisplayID())
     }
 
     private func executeCU(_ action: CUAction, on screen: NSScreen) async -> Bool {
         // An action means the thinking freeze is over — drop the sonar pulse so the
         // cursor's flight/press reads cleanly (the next turn re-arms it).
         guidanceOverlay.setThinking(false)
+        let mapper = DisplayCoordinateMapper(screen: screen)
         func globalAppKit(_ x: Double, _ y: Double) -> CGPoint {
-            CGPoint(x: screen.frame.minX + x, y: screen.frame.minY + y)
+            mapper?.appKitGlobal(fromScreenLocal: CGPoint(x: x, y: y))
+                ?? CGPoint(x: screen.frame.minX + x, y: screen.frame.minY + y)
         }
-        func cg(_ x: Double, _ y: Double) -> CGPoint { Self.toCGGlobal(globalAppKit(x, y)) }
+        func cg(_ x: Double, _ y: Double) -> CGPoint {
+            let local = CGPoint(x: x, y: y)
+            return mapper?.cgGlobal(fromScreenLocal: local) ?? Self.toCGGlobal(globalAppKit(x, y))
+        }
         // Skill auto-learning: tally which app this run actually worked in.
         if let app = NSWorkspace.shared.frontmostApplication?.localizedName,
            app.caseInsensitiveCompare("Cascade") != .orderedSame {
@@ -3543,15 +3581,48 @@ public final class CascadeAppModel: ObservableObject {
                         try await driver.act(.computerUse(.key(key, modifiers: [])))
                         try? await Task.sleep(for: .milliseconds(30))
                     }
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.keys", detail: "chars=\(text.count) \(Self.textAuditDetail("skill", skill.name))"))
-                } else if skill?.axUnreliable != true, Self.axInsertText(text) {
+                    let result = TextInjectionResult.make(
+                        method: .physicalKeys,
+                        text: text,
+                        succeeded: true,
+                        bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                        secureInputEnabled: SecureInputGuard.isActive(),
+                        elapsedMs: 0
+                    )
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: result.auditDetail + " \(Self.textAuditDetail("skill", skill.name))"))
+                } else if skill?.axUnreliable != true {
                     // Skipped for axUnreliable apps: their AX tree can accept the
                     // write and report success while nothing visible changes.
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.ax", detail: "chars=\(text.count)"))
-                } else if await pasteText(text, pointerRouted: keepPointer) {
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type.paste", detail: "chars=\(text.count)"))
-                } else {
+                    let axResult = Self.axInsertText(text)
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: axResult.auditDetail))
+                    if axResult.succeeded { break }
+                    let pasteResult = try await pasteText(text, pointerRouted: keepPointer)
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: pasteResult.auditDetail))
+                    if pasteResult.succeeded { break }
                     try await driver.act(.computerUse(.typeText(text)))
+                    let unicodeResult = TextInjectionResult.make(
+                        method: .unicodeEvent,
+                        text: text,
+                        succeeded: true,
+                        bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                        secureInputEnabled: SecureInputGuard.isActive(),
+                        elapsedMs: 0
+                    )
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: unicodeResult.auditDetail))
+                } else {
+                    let pasteResult = try await pasteText(text, pointerRouted: keepPointer)
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: pasteResult.auditDetail))
+                    if pasteResult.succeeded { break }
+                    try await driver.act(.computerUse(.typeText(text)))
+                    let unicodeResult = TextInjectionResult.make(
+                        method: .unicodeEvent,
+                        text: text,
+                        succeeded: true,
+                        bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                        secureInputEnabled: SecureInputGuard.isActive(),
+                        elapsedMs: 0
+                    )
+                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: unicodeResult.auditDetail))
                 }
             case .key(let combo):
                 // Pointer-routed apps act where they last saw the pointer —
@@ -3713,14 +3784,10 @@ public final class CascadeAppModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, AXIsProcessTrusted() else { return nil }
         let system = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-              let focused = focusedRef else { return nil }
-        let element = unsafeBitCast(focused, to: AXUIElement.self)
+        AXClient.setMessagingTimeout(system)
+        guard case .success(let element) = AXClient.elementAttribute(system, kAXFocusedUIElementAttribute as String) else { return nil }
         for attribute in [kAXValueAttribute, kAXSelectedTextAttribute] {
-            var valueRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, attribute as CFString, &valueRef) == .success,
-               let value = valueRef as? String {
+            if case .success(let value) = AXClient.attribute(element, attribute as String, as: String.self) {
                 return value.contains(trimmed)
             }
         }
@@ -3833,10 +3900,7 @@ public final class CascadeAppModel: ObservableObject {
     /// a following `type` lands. Returns false if nothing actionable is there (the
     /// caller then falls back to a cursor-restoring CGEvent click).
     private static func axActivate(atCG point: CGPoint, showMenu: Bool = false) -> Bool {
-        let system = AXUIElementCreateSystemWide()
-        var ref: AXUIElement?
-        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
-              let element = ref else { return false }
+        guard case .success(let element) = AXClient.elementAtPosition(point) else { return false }
 
         if !showMenu, let role = axString(element, kAXRoleAttribute), textRoles.contains(role) {
             // Multi-line editors are clicked to PLACE THE CARET at the click
@@ -3844,16 +3908,15 @@ public final class CascadeAppModel: ObservableObject {
             // click would "succeed" while typing lands at the old insertion
             // point. Only a real CGEvent click positions the caret.
             if role == "AXTextArea" { return false }
-            if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
+            if AXClient.setAttribute(element, kAXFocusedAttribute as String, value: kCFBooleanTrue) == .success {
                 return true
             }
         }
 
-        var namesRef: CFArray?
-        let names = (AXUIElementCopyActionNames(element, &namesRef) == .success ? namesRef as? [String] : nil) ?? []
+        let names = AXClient.actionNames(element)
         let wanted = showMenu ? [kAXShowMenuAction] : [kAXPressAction, kAXConfirmAction, kAXPickAction]
         for action in wanted where names.contains(action) {
-            if AXUIElementPerformAction(element, action as CFString) == .success { return true }
+            if AXClient.performAction(element, action) == .success { return true }
         }
         return false
     }
@@ -3866,7 +3929,13 @@ public final class CascadeAppModel: ObservableObject {
     /// ctrl+V (the literal keymap binding — cmd is only an alias layer), and the
     /// clipboard must stay ours much longer: the app reads it when its main loop
     /// runs the paste operator, easily later than the keystroke itself.
-    private func pasteText(_ text: String, pointerRouted: Bool = false) async -> Bool {
+    private func pasteText(_ text: String, pointerRouted: Bool = false) async throws -> TextInjectionResult {
+        let start = Date()
+        let secureInput = SecureInputGuard.isActive()
+        if let reason = SecureInputGuard.refusalReason(secureInputActive: secureInput) {
+            throw ComputerUseError.secureInput(reason)
+        }
+        let front = NSWorkspace.shared.frontmostApplication
         if pointerRouted { await establishPointerRoutedPosition() }
         let pasteboard = NSPasteboard.general
         // Snapshot what the user had so the agent never eats their clipboard.
@@ -3897,9 +3966,29 @@ public final class CascadeAppModel: ObservableObject {
             try await driver.act(.computerUse(.key("v", modifiers: [pointerRouted ? "control" : "command"])))
             // Let the app consume the pasteboard before we restore it.
             try? await Task.sleep(for: .milliseconds(pointerRouted ? 900 : 180))
-            return true
+            let readback = Self.focusedAXValueContains(text)
+            return TextInjectionResult.make(
+                method: .paste,
+                text: text,
+                succeeded: true,
+                bundleIdentifier: front?.bundleIdentifier,
+                secureInputEnabled: secureInput,
+                readbackStatus: Self.textReadbackStatus(readback),
+                elapsedMs: Self.elapsedMilliseconds(since: start)
+            )
+        } catch ComputerUseError.secureInput(let reason) {
+            throw ComputerUseError.secureInput(reason)
         } catch {
-            return false
+            return TextInjectionResult.make(
+                method: .paste,
+                text: text,
+                succeeded: false,
+                bundleIdentifier: front?.bundleIdentifier,
+                secureInputEnabled: secureInput,
+                readbackStatus: .notChecked,
+                fallbackReason: "paste-key-failed",
+                elapsedMs: Self.elapsedMilliseconds(since: start)
+            )
         }
     }
 
@@ -3907,24 +3996,46 @@ public final class CascadeAppModel: ObservableObject {
     /// `AXSelectedText` (the tiptour-macos `ActionExecutor` pattern — see
     /// docs/THIRD_PARTY_NOTICES.md). Returns false when there's no focused,
     /// settable text element — the caller falls back to synthetic keystrokes.
-    private static func axInsertText(_ text: String) -> Bool {
-        guard let app = NSWorkspace.shared.frontmostApplication,
+    private static func axInsertText(_ text: String) -> TextInjectionResult {
+        let start = Date()
+        let secureInput = SecureInputGuard.isActive()
+        let front = NSWorkspace.shared.frontmostApplication
+        func result(
+            succeeded: Bool,
+            element: AXUIElement? = nil,
+            readback: TextInjectionResult.ReadbackStatus = .notChecked,
+            reason: String? = nil
+        ) -> TextInjectionResult {
+            TextInjectionResult.make(
+                method: .ax,
+                text: text,
+                succeeded: succeeded,
+                focusedRole: element.flatMap { axString($0, kAXRoleAttribute) },
+                focusedSubrole: element.flatMap { axString($0, kAXSubroleAttribute) },
+                bundleIdentifier: front?.bundleIdentifier,
+                secureInputEnabled: secureInput,
+                readbackStatus: readback,
+                fallbackReason: reason,
+                elapsedMs: elapsedMilliseconds(since: start)
+            )
+        }
+        guard let app = front,
               // Never AX-insert into Cascade's OWN focused element — if Cascade is
               // frontmost the insert "succeeds" silently and the text never reaches
               // the target app (the audited phantom "can't type"). Fall through to
               // paste / keystrokes, which follow real keyboard focus.
-              app.bundleIdentifier != "com.humain.cascade" else { return false }
+              app.bundleIdentifier != "com.humain.cascade" else { return result(succeeded: false, reason: "cascade-frontmost") }
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(appRef, 0.3)
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appRef, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-              let focused = focusedRef, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
-        let element = focused as! AXUIElement
-        var settable = DarwinBoolean(false)
-        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
-              settable.boolValue,
-              AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
-        else { return false }
+        AXClient.setMessagingTimeout(appRef)
+        guard case .success(let element) = AXClient.elementAttribute(appRef, kAXFocusedUIElementAttribute as String) else {
+            return result(succeeded: false, reason: "no-focused-element")
+        }
+        guard AXClient.isSettable(element, kAXSelectedTextAttribute as String) else {
+            return result(succeeded: false, element: element, reason: "selected-text-not-settable")
+        }
+        guard AXClient.setAttribute(element, kAXSelectedTextAttribute as String, value: text as CFString) == .success else {
+            return result(succeeded: false, element: element, reason: "set-selected-text-failed")
+        }
         // VERIFY the insert actually took. Web <input>/combobox elements (Google
         // Flights, most sites) ACCEPT the set and report .success while the value
         // never changes — the phantom write behind the audited "can't type"
@@ -3935,13 +4046,30 @@ public final class CascadeAppModel: ObservableObject {
         // is reliable, so an occasional unnecessary paste is harmless).
         let after = axString(element, kAXValueAttribute as String)
             ?? axString(element, kAXSelectedTextAttribute as String)
-        return after?.contains(text) ?? false
+        let matched = after?.contains(text)
+        return result(
+            succeeded: matched == true,
+            element: element,
+            readback: Self.textReadbackStatus(matched),
+            reason: matched == true ? nil : "readback-mismatch"
+        )
     }
 
     private nonisolated static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success else { return nil }
-        return ref as? String
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: String.self) else { return nil }
+        return value
+    }
+
+    private nonisolated static func textReadbackStatus(_ matched: Bool?) -> TextInjectionResult.ReadbackStatus {
+        switch matched {
+        case .some(true): return .matched
+        case .some(false): return .mismatched
+        case .none: return .notAvailable
+        }
+    }
+
+    private nonisolated static func elapsedMilliseconds(since start: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(start) * 1000))
     }
 
     /// The title of a sheet or modal dialog currently focused in the frontmost
@@ -3950,11 +4078,10 @@ public final class CascadeAppModel: ObservableObject {
         await Task.detached { () -> String? in
             guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
             let appRef = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(appRef, 0.3)
-            var focusedRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
-                  let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else { return nil }
-            let window = focusedRef as! AXUIElement
+            AXClient.setMessagingTimeout(appRef)
+            guard case .success(let window) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
+                return nil
+            }
             let role = axString(window, kAXRoleAttribute) ?? ""
             let subrole = axString(window, kAXSubroleAttribute) ?? ""
             guard role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" else { return nil }
@@ -4125,6 +4252,11 @@ public final class CascadeAppModel: ObservableObject {
     /// Global AppKit (bottom-left, primary-display origin) → CGEvent global
     /// (top-left) coordinates for the native actuator.
     private static func toCGGlobal(_ appkit: CGPoint) -> CGPoint {
+        if let screen = NSScreen.screens.first(where: { $0.frame.insetBy(dx: -1, dy: -1).contains(appkit) }),
+           let mapper = DisplayCoordinateMapper(screen: screen) {
+            let local = CGPoint(x: appkit.x - screen.frame.minX, y: appkit.y - screen.frame.minY)
+            if let cg = mapper.cgGlobal(fromScreenLocal: local) { return cg }
+        }
         let primaryHeight = (NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main)?.frame.height ?? appkit.y
         return CGPoint(x: appkit.x, y: primaryHeight - appkit.y)
     }
@@ -4993,8 +5125,12 @@ public final class CascadeAppModel: ObservableObject {
             displayHeightPoints: Int(screen.frame.height)
         )
         guard let local = guidance.point else { return recorded }
-        let appKitGlobal = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
-        return Self.toCGGlobal(appKitGlobal)
+        guard let mapper = DisplayCoordinateMapper(screen: screen),
+              let cg = mapper.cgGlobal(fromScreenLocal: local) else {
+            let appKitGlobal = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
+            return Self.toCGGlobal(appKitGlobal)
+        }
+        return cg
     }
 
     /// B4 on-device OCR grounder: re-locate a click target by finding its recorded
@@ -5019,8 +5155,11 @@ public final class CascadeAppModel: ObservableObject {
         guard let match = ScreenTextRecognizer.bestMatch(anchor: anchor, in: boxes) else { return nil }
         let local = CGPoint(x: match.boundingBox.midX * screen.frame.width,
                             y: match.boundingBox.midY * screen.frame.height)
-        let appKitGlobal = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
-        return Self.toCGGlobal(appKitGlobal)
+        guard let mapper = DisplayCoordinateMapper(screen: screen) else {
+            let appKitGlobal = CGPoint(x: screen.frame.minX + local.x, y: screen.frame.minY + local.y)
+            return Self.toCGGlobal(appKitGlobal)
+        }
+        return mapper.cgGlobal(fromScreenLocal: local)
     }
 
     private static func retargeted(_ step: RecipeStep, to point: CGPoint) -> RecipeStep {
@@ -5145,7 +5284,10 @@ public final class CascadeAppModel: ObservableObject {
             episodeGroundingSelections.filter { $0.app == app && $0.screenChanged },
             calibrationReport: nil
         )
-        let memo = (findings.map { "\($0.task) → \($0.result)" } + groundingMemo).joined(separator: "\n")
+        let sparseAXMemo = Self.sparseAXEvidenceMemo(
+            episodeSparseAXProfiles.snapshot().filter { $0.appName == app && $0.isSparse }
+        )
+        let memo = (findings.map { "\($0.task) → \($0.result)" } + groundingMemo + sparseAXMemo).joined(separator: "\n")
         Task { await distillSkill(app: app, goal: goal, findingsMemo: memo, actionCount: count) }
     }
 
@@ -5313,6 +5455,16 @@ public final class CascadeAppModel: ObservableObject {
                 score: score
             )
         }
+    }
+
+    private static func sparseAXEvidenceMemo(_ profiles: [AXRuntimeProfile], minimumSamples: Int = 2) -> [String] {
+        guard profiles.count >= minimumSamples else { return [] }
+        let nodes = profiles.map(\.sampledNodeCount).reduce(0, +) / max(1, profiles.count)
+        let labeled = profiles.map(\.labeledActionableCount).reduce(0, +) / max(1, profiles.count)
+        let canvas = profiles.map(\.canvasSizedElementRatio).reduce(0, +) / Double(max(1, profiles.count))
+        return [
+            "AX sparse evidence: \(profiles.count) sampled turns exposed sparse accessibility for this app (avg nodes \(nodes), avg labeled actionable \(labeled), avg canvas ratio \(String(format: "%.2f", canvas))). It is legitimate to set \"axUnreliable\": true if other run evidence also relied on OCR or visual grounding."
+        ]
     }
 
     /// Moves a reviewed draft into the live skill library (user skills dir).

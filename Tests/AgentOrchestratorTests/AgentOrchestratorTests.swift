@@ -17,6 +17,25 @@ private struct StubActuator: ComputerUseActuator {
     func perform(_ action: ComputerUseAction) async throws {}
 }
 
+private struct RefusingSecureInputActuator: ComputerUseActuator {
+    func health() async -> ComputerUseHealth {
+        ComputerUseHealth(
+            ready: true,
+            permissions: .init(screenRecording: true, accessibility: true, inputMonitoring: true),
+            secureInputEnabled: true,
+            message: "secure"
+        )
+    }
+
+    func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult {
+        action.result(status: .refused, failureKind: .secureInput)
+    }
+
+    func perform(_ action: ComputerUseAction) async throws {
+        throw ComputerUseError.secureInput("secure")
+    }
+}
+
 @Test
 func localMacDriverVerifiesAgainstContext() async throws {
     let path = FileManager.default.temporaryDirectory
@@ -60,6 +79,27 @@ func localMacDriverAuditDetailsHashComputerActionsAndArtifacts() async throws {
     #expect(artifact.detail.contains("bodyChars=19"))
     #expect(!artifact.detail.lowercased().contains(rawToken.lowercased()))
     #expect(!artifact.detail.contains(artifactTitle))
+}
+
+@Test
+func localMacDriverAuditsAndRethrowsSecureInputRefusal() async throws {
+    let store = try makeStore()
+    let driver = LocalMacDriver(store: store, actuator: RefusingSecureInputActuator())
+
+    do {
+        try await driver.act(.computerUse(.typeText("secret")))
+        Issue.record("expected secure input refusal")
+    } catch ComputerUseError.secureInput {
+    } catch {
+        Issue.record("expected secure input, got \(error)")
+    }
+
+    let rows = try await store.recentAudit(limit: 10)
+    let audit = try #require(rows.first { $0.action == "computer.act" })
+    #expect(audit.detail.contains("status=refused"))
+    #expect(audit.detail.contains("failureKind=secure_input"))
+    #expect(audit.detail.contains("textHash="))
+    #expect(!audit.detail.contains("secret"))
 }
 
 private struct CountingAnswerer: ContextQuestionAnswering {

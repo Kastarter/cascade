@@ -1,4 +1,5 @@
 import ComputerUseKit
+import CoreGraphics
 import Foundation
 import Testing
 
@@ -61,4 +62,64 @@ func oversizeSingleGraphemeBecomesItsOwnChunk() {
 @Test
 func emptyTextYieldsNoChunks() {
     #expect(TextChunker.graphemeSafeChunks("", maxUTF16: 16).isEmpty)
+}
+
+@Test
+func textInjectionResultAuditNeverIncludesRawText() {
+    let raw = "SensitiveSeed-12345"
+    let result = TextInjectionResult.make(
+        method: .paste,
+        text: raw,
+        succeeded: false,
+        focusedRole: "AXTextField",
+        focusedSubrole: "AXSearchField",
+        bundleIdentifier: "com.example.SecretApp",
+        secureInputEnabled: false,
+        readbackStatus: .mismatched,
+        fallbackReason: "readback mismatch",
+        elapsedMs: 12
+    )
+
+    #expect(result.auditDetail.contains("method=paste"))
+    #expect(result.auditDetail.contains("chars=\(raw.count)"))
+    #expect(result.auditDetail.contains("textHash="))
+    #expect(!result.auditDetail.contains(raw))
+    #expect(!result.auditDetail.contains("com.example.SecretApp"))
+}
+
+@Test
+func keyboardFallbackMapsShiftedSymbols() throws {
+    let plus = try #require(KeyboardLayoutMapper.usFallbackMapping(for: "plus"))
+    let bang = try #require(KeyboardLayoutMapper.usFallbackMapping(for: "!"))
+    let equal = try #require(KeyboardLayoutMapper.usFallbackMapping(for: "="))
+
+    #expect(plus.keyCode == 24)
+    #expect(plus.requiredModifiers.contains(.maskShift))
+    #expect(bang.keyCode == 18)
+    #expect(bang.requiredModifiers.contains(.maskShift))
+    #expect(equal.keyCode == 24)
+    #expect(!equal.requiredModifiers.contains(.maskShift))
+}
+
+@Test
+func modifierSequenceWrapsMainKeyWithDownUpEvents() {
+    let steps = EventSynthesisPlan.modifierEventSequence(mainKeyCode: 8, flags: [.maskCommand, .maskShift])
+
+    #expect(steps.count == 6)
+    #expect(steps[0].keyDown)
+    #expect(steps[1].keyDown)
+    #expect(steps[2] == KeyboardEventStep(keyCode: 8, keyDown: true, flags: [.maskCommand, .maskShift]))
+    #expect(steps[3] == KeyboardEventStep(keyCode: 8, keyDown: false, flags: [.maskCommand, .maskShift]))
+    #expect(!steps[4].keyDown)
+    #expect(!steps[5].keyDown)
+}
+
+@Test
+func clickAndScrollPlansAreDeterministic() {
+    #expect(EventSynthesisPlan.clickStates(clickCount: 3) == [1, 2, 3])
+    let scroll = EventSynthesisPlan.scrollConfiguration(deltaX: 12.4, deltaY: -40.6)
+    #expect(scroll.deltaX == 12)
+    #expect(scroll.deltaY == -41)
+    #expect(scroll.continuous)
+    #expect(scroll.phase == 1)
 }

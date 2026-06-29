@@ -168,6 +168,38 @@ struct ScreenElementIndexTests {
         #expect(index.map(\.mark.label) == repeated.map(\.mark.label))
     }
 
+    @Test func trustPolicyRejectsAXWhenRuntimeProfileIsSparse() {
+        let policy = ScreenElementIndex.TrustPolicy.default
+        let sparseProfile = AXRuntimeProfile(
+            bundleIdentifier: "com.example.Sparse",
+            appName: "Sparse",
+            sampledNodeCount: 10,
+            actionableRoleCount: 1,
+            labeledActionableCount: 0,
+            identifierCount: 0,
+            frameFailureCount: 0,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0.1
+        )
+
+        #expect(!policy.acceptsAXCandidate(
+            role: "AXButton",
+            score: 3,
+            bounds: bounds(20, 20, 80, 32),
+            displayWidthPoints: 1280,
+            displayHeightPoints: 800,
+            runtimeProfile: sparseProfile
+        ))
+        #expect(policy.acceptsAXCandidate(
+            role: "AXButton",
+            score: 3,
+            bounds: bounds(20, 20, 80, 32),
+            displayWidthPoints: 1280,
+            displayHeightPoints: 800,
+            runtimeProfile: nil
+        ))
+    }
+
     private func candidate(
         label: String,
         role: ScreenElementIndex.Role,

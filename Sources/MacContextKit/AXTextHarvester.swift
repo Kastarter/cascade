@@ -34,14 +34,19 @@ public enum AXTextHarvester {
     public static func text(forWindowOfPID pid: pid_t) -> String {
         guard AXIsProcessTrusted() else { return "" }
         let appRef = AXUIElementCreateApplication(pid)
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
-              let focusedRef else { return "" }
-        return text(forFocusedWindowRef: focusedRef)
+        AXClient.setMessagingTimeout(appRef)
+        guard case .success(let focused) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
+            return ""
+        }
+        return text(forWindow: focused)
     }
 
     static func text(forFocusedWindowRef focusedRef: CFTypeRef?) -> String {
         guard let window = decodeAXElement(focusedRef) else { return "" }
+        return text(forWindow: window)
+    }
+
+    private static func text(forWindow window: AXUIElement) -> String {
 
         var lines: [String] = []
         var seen = Set<String>()
@@ -69,9 +74,7 @@ public enum AXTextHarvester {
             }
 
             guard depth < maxDepth else { continue }
-            var childrenRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-                  let children = childrenRef as? [AXUIElement] else { continue }
+            guard case .success(let children) = AXClient.children(element) else { continue }
             // Reversed so the stack pops children in natural (top-first) order.
             for child in children.reversed() {
                 stack.append((child, depth + 1))
@@ -98,8 +101,7 @@ public enum AXTextHarvester {
     }
 
     private static func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
-        return value as? String
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: String.self) else { return nil }
+        return value
     }
 }
