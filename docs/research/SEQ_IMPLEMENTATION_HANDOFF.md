@@ -16,6 +16,23 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 
 ## Continuation log (latest first)
 
+### 2026-06-29 — session 5: ran SEQ-21→26, stopped by user (continue later)
+- **Re-launched** the script as run `wf_ec1592c5-934` (task `w7g1vmd34`). Skipped SEQ-01–20, then
+  **committed + pushed SEQ-21, 22, 23, 24, 25, 26** (build-green each):
+  - `a75c323` seq-21 vlm-screen-action-models (grounding, registry, eval, corpus)
+  - `8597d87` seq-22 semantic-action-caching (demo replay, target cache, focused tests)
+  - `6cc5342` seq-23 voice-realtime-pipeline (vad, clearing, tail wait, barge-in, single-flight, transcripts, endpoints)
+  - `d081bd1` seq-24 ui-state-diffing (descriptors, deltas, rewind, web mutations, tests)
+  - `a983ea7` seq-25 test-time-verification (grounding, action gates, validators, calibration)
+  - `a436c42` seq-26 event-store-engineering (chunk retention pruning)
+  HEAD is now `a436c42`, in sync with `origin/feat/production-grade` (0/0).
+- **Stopped by the user** (~19:49) to continue later — `TaskStop w7g1vmd34`. The stop landed cleanly on a
+  SEQ boundary (just after committing SEQ-26, before SEQ-27's Plan), so the **tree was already clean —
+  nothing discarded.** This was a deliberate pause, not a quota/error stop.
+- **Remaining work: SEQ-27 → SEQ-31 (5 SEQs).** Resume = a fresh re-launch of the same script:
+  `Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js" })`. It skips SEQ-01–26 via the
+  Plan `feat(seq-NN …)` pre-check and picks up at SEQ-27.
+
 ### 2026-06-29 — session 4: ran SEQ-16→20, paused at user request (codex quota low)
 - **Re-launched** the script as run `wf_b8cec9ae-6dd` (task `w5t27fbmv`) after the morning usage-limit
   reset. Skipped SEQ-01–15, then **committed + pushed SEQ-16, 17, 18, 19, 20** (build-green each):
@@ -75,8 +92,8 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 The workflow is **still running**. Committed so far on `feat/production-grade`:
 
 ```
-SEQ-01 … 20   ← committed + pushed (build-green); HEAD = 5ac88c4 (seq-20)
-SEQ-21 … 31   ← pending (paused at SEQ-21 mid-implement; codex quota low — resumes on fresh re-launch after refresh)
+SEQ-01 … 26   ← committed + pushed (build-green); HEAD = a436c42 (seq-26)
+SEQ-27 … 31   ← pending (user-paused on a clean SEQ boundary — resumes on fresh re-launch)
 ```
 
 - HEAD advances as each SEQ lands (latest `feat(seq-NN …)` / docs commit); the commit gate guarantees
