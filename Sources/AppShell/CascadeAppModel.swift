@@ -2870,7 +2870,9 @@ public final class CascadeAppModel: ObservableObject {
         let call = RecordRecall.Call(name: name, input: input)
         dock.show(title: "Cascade is remembering", detail: call.auditDetail)
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "agent.recall", detail: call.auditDetail))
-        return await RecordRecall(store: store).perform(call)
+        let result = await RecordRecall(store: store).perform(call)
+        await auditObservationResultIfNeeded(tool: name, result: result)
+        return result
     }
 
     /// Runs one harness tool call for the assist agent: STOP/supersession gate
@@ -2918,11 +2920,19 @@ public final class CascadeAppModel: ObservableObject {
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: auditDescriptor))
         let started = ContinuousClock.now
         let result = await AgentHarness.perform(call, powerEnabled: effectivePowerHarnessEnabled)
+        await auditObservationResultIfNeeded(tool: name, result: result)
         let ms = Int(started.duration(to: .now) / .milliseconds(1))
         if ms >= 800 {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms - \(auditDescriptor)"))
         }
         return result
+    }
+
+    private func auditObservationResultIfNeeded(tool: String, result: String) async {
+        guard let info = InjectionGuard.envelopeAuditInfo(from: result), info.injectionScore > 0 else { return }
+        let detail = Self.observationAuditDescriptor(tool: tool, info: info)
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "trust.untrusted_seen", detail: detail))
+        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "injection.suspected", detail: detail))
     }
 
     @discardableResult
@@ -3377,6 +3387,20 @@ public final class CascadeAppModel: ObservableObject {
             "decision=\(safeAuditToken(decision))",
             textAuditDetail("reason", reason)
         ].joined(separator: " ")
+    }
+
+    nonisolated static func observationAuditDescriptor(tool: String, info: InjectionGuard.EnvelopeAuditInfo) -> String {
+        var parts = [
+            "tool=\(safeAuditToken(tool))",
+            "trust=\(safeAuditToken(info.trust.rawValue))",
+            "sourceHash=\(auditHash(info.source))",
+            "payloadHash=\(safeAuditToken(info.payloadHash))",
+            "score=\(info.injectionScore)",
+        ]
+        if !info.injectionReasons.isEmpty {
+            parts.append("reasons=\(info.injectionReasons.map(safeAuditToken).joined(separator: ","))")
+        }
+        return parts.joined(separator: " ")
     }
 
     private func deniedURLReason(inHarnessInput input: [String: Any]) -> String? {

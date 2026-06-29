@@ -199,7 +199,11 @@ public struct RecordRecall: Sendable {
             let visible = await searchContexts(query: query, limit: 12, candidatePool: reranker == nil ? 40 : 80)
             guard !visible.isEmpty else { return "No recorded moments match “\(query)”. Try different words or a timeframe." }
             try? await store.markMemoryEventsAccessed(visible.map(\.id))
-            return visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n")
+            return Self.enveloped(
+                visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n"),
+                source: "record search",
+                tool: "search_record"
+            )
 
         case .timeframe(let startISO, let endISO):
             guard let start = Self.date(from: startISO),
@@ -209,7 +213,11 @@ public struct RecordRecall: Sendable {
             let rows = ((try? await store.contexts(between: start, and: end, limit: 60)) ?? [])
                 .filter { !PrivacyRules.isSensitive($0) }
             guard !rows.isEmpty else { return "Nothing recorded in that window." }
-            return rows.map { Self.line(for: $0, textCap: 160) }.joined(separator: "\n")
+            return Self.enveloped(
+                rows.map { Self.line(for: $0, textCap: 160) }.joined(separator: "\n"),
+                source: "record timeframe",
+                tool: "get_timeframe"
+            )
 
         case .inspect(let id):
             guard let id else { return "inspect_moment needs a numeric id." }
@@ -227,7 +235,7 @@ public struct RecordRecall: Sendable {
             if !neighbors.isEmpty {
                 out += "\nNearby: " + neighbors.map { "[#\($0.id)] \(Self.time($0.capturedAt)) \($0.appName)" }.joined(separator: ", ")
             }
-            return out
+            return Self.enveloped(out, source: "record moment #\(id)", tool: "inspect_moment")
 
         case .inspectStructure(let id):
             guard let id else { return "inspect_structure needs a numeric id." }
@@ -239,7 +247,11 @@ public struct RecordRecall: Sendable {
                 return "No structured metadata recorded for moment #\(id). Capture structured content must be enabled first."
             }
             try? await store.markMemoryEventsAccessed([moment.id])
-            return Self.structureLine(for: moment, structured: structured)
+            return Self.enveloped(
+                Self.structureLine(for: moment, structured: structured),
+                source: "record structure #\(id)",
+                tool: "inspect_structure"
+            )
 
         case .sessions(let startISO, let endISO):
             guard let start = Self.date(from: startISO),
@@ -258,7 +270,11 @@ public struct RecordRecall: Sendable {
             }
             let visible = episodes.filter { !Self.isSensitive($0) }
             guard !visible.isEmpty else { return "No sessions recorded in that window." }
-            return visible.map { Self.sessionLine(for: $0) }.joined(separator: "\n")
+            return Self.enveloped(
+                visible.map { Self.sessionLine(for: $0) }.joined(separator: "\n"),
+                source: "record sessions",
+                tool: "list_sessions"
+            )
 
         case .unknown(let name):
             return "Unknown recall tool \(name)."
@@ -300,7 +316,8 @@ public struct RecordRecall: Sendable {
         let title = context.windowTitle.map { " — \($0)" } ?? ""
         let text = (context.ocrText ?? "").replacingOccurrences(of: "\n", with: " · ")
         let trimmed = text.isEmpty ? "" : " | \(String(text.prefix(textCap)))"
-        return "[#\(context.id)] \(time(context.capturedAt)) \(context.appName)\(title)\(trimmed)"
+        let trust = " [trust=\(context.sourceTrust) safeForControl=\(context.safeForControl)]"
+        return "[#\(context.id)] \(time(context.capturedAt)) \(context.appName)\(title)\(trust)\(trimmed)"
     }
 
     /// "[#42] 09:12–09:48 (36m) Keynote — Q1 Deck · 42 moments" — the anchor id
@@ -380,7 +397,7 @@ public struct RecordRecall: Sendable {
     }
 
     private static func structureLine(for context: RecordedContext, structured: StructuredMetadata) -> String {
-        var lines = ["[#\(context.id)] \(time(context.capturedAt)) \(context.appName) structured content"]
+        var lines = ["[#\(context.id)] \(time(context.capturedAt)) \(context.appName) structured content [trust=\(context.sourceTrust) safeForControl=\(context.safeForControl)]"]
         lines.append("Summary: \(structured.summary)")
         let readingOrder = structured.readingOrder.trimmingCharacters(in: .whitespacesAndNewlines)
         if !readingOrder.isEmpty {
@@ -412,6 +429,15 @@ public struct RecordRecall: Sendable {
             }
         }
         return bounded(lines, maxBytes: 12_000, maxLines: 180)
+    }
+
+    private static func enveloped(_ payload: String, source: String, tool: String) -> String {
+        InjectionGuard.renderEnvelope(
+            trust: .untrustedRecord,
+            source: source,
+            acquiredByTool: tool,
+            payload: payload
+        )
     }
 
     private static func bounded(_ lines: [String], maxBytes: Int, maxLines: Int) -> String {

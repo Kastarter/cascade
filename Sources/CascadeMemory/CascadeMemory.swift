@@ -22,6 +22,14 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
     /// Perceptual fingerprint of the captured frame, used to dedupe near-identical
     /// moments across restarts. `nil` for rows without a frame (e.g. app-only ticks).
     public let frameHash: Int64?
+    public let sourceTrust: String
+    public let rawTrustLabel: String?
+    public let injectionScore: Int
+    public let injectionReasonsJSON: String?
+    public let userConfirmed: Bool
+    public let safeToShow: Bool
+    public let safeToSummarize: Bool
+    public let safeForControl: Bool
 
     public init(
         id: Int64 = 0,
@@ -33,8 +41,17 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
         ocrText: String? = nil,
         imagePath: String? = nil,
         metadataJSON: String? = nil,
-        frameHash: Int64? = nil
+        frameHash: Int64? = nil,
+        sourceTrust: String? = nil,
+        rawTrustLabel: String? = nil,
+        injectionScore: Int = 0,
+        injectionReasonsJSON: String? = nil,
+        userConfirmed: Bool = false,
+        safeToShow: Bool = true,
+        safeToSummarize: Bool = true,
+        safeForControl: Bool? = nil
     ) {
+        let defaults = Self.trustDefaults(for: source)
         self.id = id
         self.capturedAt = capturedAt
         self.source = source
@@ -45,6 +62,27 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
         self.imagePath = imagePath
         self.metadataJSON = metadataJSON
         self.frameHash = frameHash
+        self.sourceTrust = sourceTrust ?? defaults.trust
+        self.rawTrustLabel = rawTrustLabel
+        self.injectionScore = max(0, injectionScore)
+        self.injectionReasonsJSON = injectionReasonsJSON
+        self.userConfirmed = userConfirmed
+        self.safeToShow = safeToShow
+        self.safeToSummarize = safeToSummarize
+        self.safeForControl = safeForControl ?? defaults.safeForControl
+    }
+
+    private static func trustDefaults(for source: ContextSource) -> (trust: String, safeForControl: Bool) {
+        switch source {
+        case .input:
+            return ("trustedUserInstruction", true)
+        case .system:
+            return ("trustedRuntimePolicy", true)
+        case .app:
+            return ("trustedLocalMetadata", false)
+        case .screen, .accessibility:
+            return ("untrustedScreen", false)
+        }
     }
 }
 
@@ -926,8 +964,9 @@ public actor CascadeStore {
         guard !contexts.isEmpty else { return [] }
         let sql = """
         INSERT INTO recorded_context
-            (captured_at, captured_ms, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (captured_at, captured_ms, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash,
+             source_trust, raw_trust_label, injection_score, injection_reasons, user_confirmed, safe_to_show, safe_to_summarize, safe_for_control)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         return try withTransaction {
             try withStatement(sql) { statement in
@@ -947,7 +986,15 @@ public actor CascadeStore {
                         ocrText: sanitized.ocrText,
                         imagePath: sanitized.imagePath,
                         metadataJSON: sanitized.metadataJSON,
-                        frameHash: sanitized.frameHash
+                        frameHash: sanitized.frameHash,
+                        sourceTrust: sanitized.sourceTrust,
+                        rawTrustLabel: sanitized.rawTrustLabel,
+                        injectionScore: sanitized.injectionScore,
+                        injectionReasonsJSON: sanitized.injectionReasonsJSON,
+                        userConfirmed: sanitized.userConfirmed,
+                        safeToShow: sanitized.safeToShow,
+                        safeToSummarize: sanitized.safeToSummarize,
+                        safeForControl: sanitized.safeForControl
                     ))
                     if indexWorkGraph, let row = rows.last {
                         try linkWorkGraphEntities(for: row)
@@ -969,7 +1016,7 @@ public actor CascadeStore {
     /// both tables) is unambiguous.
     private static func contextColumns(prefix: String = "") -> String {
         let p = prefix.isEmpty ? "" : "\(prefix)."
-        return "\(p)id, \(p)captured_at, \(p)source, \(p)app_name, \(p)bundle_identifier, \(p)window_title, \(p)ocr_text, \(p)image_path, \(p)metadata_json, \(p)frame_hash"
+        return "\(p)id, \(p)captured_at, \(p)source, \(p)app_name, \(p)bundle_identifier, \(p)window_title, \(p)ocr_text, \(p)image_path, \(p)metadata_json, \(p)frame_hash, \(p)source_trust, \(p)raw_trust_label, \(p)injection_score, \(p)injection_reasons, \(p)user_confirmed, \(p)safe_to_show, \(p)safe_to_summarize, \(p)safe_for_control"
     }
 
     public func recentContexts(limit: Int = 40) throws -> [RecordedContext] {
@@ -995,7 +1042,9 @@ public actor CascadeStore {
     public func contextTimeline(since: Date, limit: Int = 8000) throws -> [RecordedContext] {
         let sql = """
         SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
-               NULL, image_path, NULL, frame_hash
+               NULL, image_path, NULL, frame_hash,
+               source_trust, raw_trust_label, injection_score, injection_reasons,
+               user_confirmed, safe_to_show, safe_to_summarize, safe_for_control
         FROM recorded_context
         WHERE captured_at >= ?
         ORDER BY captured_at DESC, id DESC
@@ -1020,6 +1069,8 @@ public actor CascadeStore {
         let sql = """
         SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
                substr(ocr_text, 1, ?), image_path, NULL, frame_hash,
+               source_trust, raw_trust_label, injection_score, injection_reasons,
+               user_confirmed, safe_to_show, safe_to_summarize, safe_for_control,
                MAX(length(ocr_text))
         FROM recorded_context
         WHERE captured_at >= ? AND ocr_text IS NOT NULL AND length(ocr_text) > 0
@@ -1361,7 +1412,9 @@ public actor CascadeStore {
     private func privacyContexts(scope: PrivacyDataScope, limit: Int) throws -> [RecordedContext] {
         let sql = """
         SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
-               NULL, image_path, NULL, frame_hash
+               NULL, image_path, NULL, frame_hash,
+               source_trust, raw_trust_label, injection_score, injection_reasons,
+               user_confirmed, safe_to_show, safe_to_summarize, safe_for_control
         FROM recorded_context
         WHERE (? IS NULL OR source = ?)
           AND (? IS NULL OR app_name = ?)
@@ -2100,7 +2153,16 @@ public actor CascadeStore {
             window_title TEXT,
             ocr_text TEXT,
             image_path TEXT,
-            metadata_json TEXT
+            metadata_json TEXT,
+            frame_hash INTEGER,
+            source_trust TEXT NOT NULL DEFAULT 'untrustedScreen',
+            raw_trust_label TEXT,
+            injection_score INTEGER NOT NULL DEFAULT 0,
+            injection_reasons TEXT,
+            user_confirmed INTEGER NOT NULL DEFAULT 0,
+            safe_to_show INTEGER NOT NULL DEFAULT 1,
+            safe_to_summarize INTEGER NOT NULL DEFAULT 1,
+            safe_for_control INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_at
             ON recorded_context(captured_at DESC);
@@ -2125,6 +2187,14 @@ public actor CascadeStore {
         try? execute("ALTER TABLE recorded_context ADD COLUMN image_path TEXT;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN frame_hash INTEGER;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN captured_ms INTEGER;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN source_trust TEXT NOT NULL DEFAULT 'untrustedScreen';", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN raw_trust_label TEXT;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN injection_score INTEGER NOT NULL DEFAULT 0;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN injection_reasons TEXT;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN user_confirmed INTEGER NOT NULL DEFAULT 0;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN safe_to_show INTEGER NOT NULL DEFAULT 1;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN safe_to_summarize INTEGER NOT NULL DEFAULT 1;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN safe_for_control INTEGER NOT NULL DEFAULT 0;", db: db)
         try execute("""
         CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_ms
             ON recorded_context(captured_ms ASC, id ASC);
@@ -2536,6 +2606,14 @@ public actor CascadeStore {
         try bindChecked(context.imagePath, at: 8, in: statement)
         try bindChecked(context.metadataJSON, at: 9, in: statement)
         try bindChecked(context.frameHash, at: 10, in: statement)
+        try bindChecked(context.sourceTrust, at: 11, in: statement)
+        try bindChecked(context.rawTrustLabel, at: 12, in: statement)
+        try bindChecked(Int64(context.injectionScore), at: 13, in: statement)
+        try bindChecked(context.injectionReasonsJSON, at: 14, in: statement)
+        try bindChecked(Int64(context.userConfirmed ? 1 : 0), at: 15, in: statement)
+        try bindChecked(Int64(context.safeToShow ? 1 : 0), at: 16, in: statement)
+        try bindChecked(Int64(context.safeToSummarize ? 1 : 0), at: 17, in: statement)
+        try bindChecked(Int64(context.safeForControl ? 1 : 0), at: 18, in: statement)
     }
 
     private static func sanitizedContext(_ context: RecordedContext) -> RecordedContext {
@@ -2549,7 +2627,15 @@ public actor CascadeStore {
             ocrText: sanitizeStoredText(context.ocrText),
             imagePath: context.imagePath,
             metadataJSON: context.metadataJSON,
-            frameHash: context.frameHash
+            frameHash: context.frameHash,
+            sourceTrust: sanitizeStoredText(context.sourceTrust) ?? context.sourceTrust,
+            rawTrustLabel: sanitizeStoredText(context.rawTrustLabel),
+            injectionScore: context.injectionScore,
+            injectionReasonsJSON: context.injectionReasonsJSON,
+            userConfirmed: context.userConfirmed,
+            safeToShow: context.safeToShow,
+            safeToSummarize: context.safeToSummarize,
+            safeForControl: context.safeForControl
         )
     }
 
@@ -2773,7 +2859,15 @@ public actor CascadeStore {
             ocrText: text(statement, 6),
             imagePath: text(statement, 7),
             metadataJSON: text(statement, 8),
-            frameHash: int64(statement, 9)
+            frameHash: int64(statement, 9),
+            sourceTrust: text(statement, 10),
+            rawTrustLabel: text(statement, 11),
+            injectionScore: Int(int64(statement, 12) ?? 0),
+            injectionReasonsJSON: text(statement, 13),
+            userConfirmed: (int64(statement, 14) ?? 0) != 0,
+            safeToShow: (int64(statement, 15) ?? 1) != 0,
+            safeToSummarize: (int64(statement, 16) ?? 1) != 0,
+            safeForControl: (int64(statement, 17).map { $0 != 0 })
         )
     }
 

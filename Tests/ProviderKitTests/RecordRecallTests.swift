@@ -40,6 +40,9 @@ func recallSearchReturnsCitableIdLines() async throws {
     #expect(out.contains("Safari"))
     #expect(out.contains("revenue projections"))
     #expect(!out.contains("lunch plans"))         // the other moment didn't match
+    let envelope = try observationEnvelope(from: out)
+    #expect(envelope.trust == .untrustedRecord)
+    #expect(envelope.acquiredByTool == "search_record")
 }
 
 @Test
@@ -180,7 +183,8 @@ func recallListSessionsGroupsMomentsIntoSessions() async throws {
     #expect(out.contains("[#\(mail.id)]"))
     #expect(out.contains("Mail — Inbox"))
     #expect(out.contains("moments"))
-    #expect(out.components(separatedBy: "\n").count == 2)
+    let envelope = try observationEnvelope(from: out)
+    #expect(envelope.payload.components(separatedBy: "\n").count == 2)
 }
 
 @Test
@@ -309,4 +313,10 @@ func recallToolNamesAreStableAndDistinctFromOtherTools() {
 func recallToolDefinitionsExposeEveryTool() {
     let names = RecordRecall.toolDefinitions().compactMap { $0["name"] as? String }
     #expect(Set(names) == RecordRecall.toolNames())
+}
+
+private func observationEnvelope(from rendered: String) throws -> ObservationEnvelope {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try decoder.decode(ObservationEnvelope.self, from: Data(rendered.utf8))
 }
