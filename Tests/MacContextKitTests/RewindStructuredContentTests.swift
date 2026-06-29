@@ -15,6 +15,7 @@ func structuredContentRecordingIsDefaultOff() {
     let metadata = RecorderMetadataJSON.rewind(width: 1920, height: 1080, axCount: 42, structured: nil)
 
     #expect(options.structuredContent == false)
+    #expect(options.indexWorkGraph == true)
     #expect(metadata == "{\"rewind\":true,\"w\":1920,\"h\":1080,\"ax\":42}")
     #expect(!metadata.contains("structured"))
 }

@@ -2674,96 +2674,182 @@ public actor CascadeStore {
         // columns describe the world-time assertion; transaction_* describes when
         // Cascade stored or retracted that assertion.
         try execute("""
-        CREATE TABLE IF NOT EXISTS graph_entity (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            canonical_value TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            valid_from TEXT NOT NULL,
-            valid_to TEXT,
-            transaction_from TEXT NOT NULL,
-            transaction_to TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(kind, canonical_value)
-        );
-        CREATE INDEX IF NOT EXISTS idx_graph_entity_kind_seen
-            ON graph_entity(kind, last_seen_at DESC);
+	        CREATE TABLE IF NOT EXISTS graph_entity (
+	            id INTEGER PRIMARY KEY AUTOINCREMENT,
+	            kind TEXT NOT NULL,
+	            canonical_value TEXT NOT NULL,
+	            display_name TEXT NOT NULL,
+	            normalized_value TEXT,
+	            confidence REAL NOT NULL DEFAULT 1.0,
+	            source TEXT NOT NULL DEFAULT 'legacy',
+	            pii_class TEXT,
+	            metadata_json TEXT,
+	            first_seen_at TEXT NOT NULL,
+	            last_seen_at TEXT NOT NULL,
+	            valid_from TEXT NOT NULL,
+	            valid_to TEXT,
+	            transaction_from TEXT NOT NULL,
+	            transaction_to TEXT,
+	            created_at TEXT NOT NULL,
+	            updated_at TEXT NOT NULL,
+	            UNIQUE(kind, canonical_value)
+	        );
+	        CREATE INDEX IF NOT EXISTS idx_graph_entity_type_key
+	            ON graph_entity(kind, canonical_value);
+	        CREATE INDEX IF NOT EXISTS idx_graph_entity_kind_seen
+	            ON graph_entity(kind, last_seen_at DESC);
+	        CREATE INDEX IF NOT EXISTS idx_graph_entity_current
+	            ON graph_entity(kind, transaction_to, last_seen_at DESC);
 
-        CREATE TABLE IF NOT EXISTS graph_entity_alias (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_id INTEGER NOT NULL,
-            alias TEXT NOT NULL,
-            normalized_alias TEXT NOT NULL,
-            source TEXT NOT NULL,
-            mention_count INTEGER NOT NULL DEFAULT 1,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            valid_from TEXT NOT NULL,
-            valid_to TEXT,
-            transaction_from TEXT NOT NULL,
-            transaction_to TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(entity_id, normalized_alias),
-            FOREIGN KEY(entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_graph_entity_alias_lookup
-            ON graph_entity_alias(normalized_alias);
+	        CREATE TABLE IF NOT EXISTS graph_entity_alias (
+	            id INTEGER PRIMARY KEY AUTOINCREMENT,
+	            entity_id INTEGER NOT NULL,
+	            alias TEXT NOT NULL,
+	            normalized_alias TEXT NOT NULL,
+	            source TEXT NOT NULL,
+	            confidence REAL NOT NULL DEFAULT 1.0,
+	            mention_count INTEGER NOT NULL DEFAULT 1,
+	            first_seen_at TEXT NOT NULL,
+	            last_seen_at TEXT NOT NULL,
+	            valid_from TEXT NOT NULL,
+	            valid_to TEXT,
+	            transaction_from TEXT NOT NULL,
+	            transaction_to TEXT,
+	            created_at TEXT NOT NULL,
+	            updated_at TEXT NOT NULL,
+	            UNIQUE(entity_id, normalized_alias),
+	            FOREIGN KEY(entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+	        );
+	        CREATE INDEX IF NOT EXISTS idx_graph_entity_alias_lookup
+	            ON graph_entity_alias(normalized_alias);
 
-        CREATE TABLE IF NOT EXISTS context_entity_link (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            context_id INTEGER NOT NULL,
-            entity_id INTEGER NOT NULL,
-            relation TEXT NOT NULL,
-            evidence_snippet TEXT NOT NULL,
-            observed_at TEXT NOT NULL,
-            valid_from TEXT NOT NULL,
-            valid_to TEXT,
-            transaction_from TEXT NOT NULL,
-            transaction_to TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(context_id, entity_id, relation),
-            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE,
-            FOREIGN KEY(entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_context_entity_link_entity_time
-            ON context_entity_link(entity_id, observed_at ASC, context_id ASC);
-        CREATE INDEX IF NOT EXISTS idx_context_entity_link_context
-            ON context_entity_link(context_id);
+	        CREATE TABLE IF NOT EXISTS context_entity_link (
+	            id INTEGER PRIMARY KEY AUTOINCREMENT,
+	            context_id INTEGER NOT NULL,
+	            entity_id INTEGER NOT NULL,
+	            relation TEXT NOT NULL,
+	            role TEXT NOT NULL DEFAULT 'observed',
+	            extractor TEXT NOT NULL DEFAULT 'legacy',
+	            evidence_snippet TEXT NOT NULL,
+	            span_start INTEGER,
+	            span_end INTEGER,
+	            confidence REAL NOT NULL DEFAULT 1.0,
+	            observed_at TEXT NOT NULL,
+	            valid_from TEXT NOT NULL,
+	            valid_to TEXT,
+	            transaction_from TEXT NOT NULL,
+	            transaction_to TEXT,
+	            created_at TEXT NOT NULL,
+	            updated_at TEXT NOT NULL,
+	            UNIQUE(context_id, entity_id, relation),
+	            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE,
+	            FOREIGN KEY(entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+	        );
+	        CREATE INDEX IF NOT EXISTS idx_context_entity_link_entity_time
+	            ON context_entity_link(entity_id, observed_at ASC, context_id ASC);
+	        CREATE INDEX IF NOT EXISTS idx_context_entity_link_context
+	            ON context_entity_link(context_id);
+	        CREATE INDEX IF NOT EXISTS idx_context_entity_link_role_extractor
+	            ON context_entity_link(context_id, entity_id, role, extractor, span_start);
 
-        CREATE TABLE IF NOT EXISTS graph_edge (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_entity_id INTEGER NOT NULL,
-            target_entity_id INTEGER NOT NULL,
-            relation TEXT NOT NULL,
-            evidence_snippet TEXT NOT NULL,
-            weight REAL NOT NULL DEFAULT 1.0,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            valid_from TEXT NOT NULL,
-            valid_to TEXT,
-            transaction_from TEXT NOT NULL,
-            transaction_to TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(source_entity_id, target_entity_id, relation),
-            FOREIGN KEY(source_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE,
-            FOREIGN KEY(target_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_graph_edge_source
-            ON graph_edge(source_entity_id, relation);
-        CREATE INDEX IF NOT EXISTS idx_graph_edge_target
-            ON graph_edge(target_entity_id, relation);
+	        CREATE TABLE IF NOT EXISTS graph_edge (
+	            id INTEGER PRIMARY KEY AUTOINCREMENT,
+	            source_entity_id INTEGER NOT NULL,
+	            target_entity_id INTEGER NOT NULL,
+	            relation TEXT NOT NULL,
+	            evidence_snippet TEXT NOT NULL,
+	            weight REAL NOT NULL DEFAULT 1.0,
+	            confidence REAL NOT NULL DEFAULT 1.0,
+	            provenance_context_id INTEGER REFERENCES recorded_context(id) ON DELETE SET NULL,
+	            provenance_input_event_id INTEGER REFERENCES input_event(id) ON DELETE SET NULL,
+	            extractor TEXT NOT NULL DEFAULT 'legacy',
+	            metadata_json TEXT,
+	            first_seen_at TEXT NOT NULL,
+	            last_seen_at TEXT NOT NULL,
+	            valid_from TEXT NOT NULL,
+	            valid_to TEXT,
+	            transaction_from TEXT NOT NULL,
+	            transaction_to TEXT,
+	            created_at TEXT NOT NULL,
+	            updated_at TEXT NOT NULL,
+	            UNIQUE(source_entity_id, target_entity_id, relation),
+	            FOREIGN KEY(source_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE,
+	            FOREIGN KEY(target_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+	        );
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_source
+	            ON graph_edge(source_entity_id, relation);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_target
+	            ON graph_edge(target_entity_id, relation);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_time_provenance
+	            ON graph_edge(relation, valid_from, valid_to, provenance_context_id);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_current
+	            ON graph_edge(source_entity_id, relation, transaction_to, valid_to);
 
-        CREATE TRIGGER IF NOT EXISTS recorded_context_entity_link_ad
-        AFTER DELETE ON recorded_context BEGIN
-            DELETE FROM context_entity_link WHERE context_id = old.id;
-        END;
-        """, db: db)
+	        CREATE TABLE IF NOT EXISTS graph_edge_assertion (
+	            id INTEGER PRIMARY KEY AUTOINCREMENT,
+	            source_entity_id INTEGER NOT NULL,
+	            target_entity_id INTEGER NOT NULL,
+	            relation TEXT NOT NULL,
+	            evidence_snippet TEXT NOT NULL,
+	            weight REAL NOT NULL DEFAULT 1.0,
+	            first_seen_at TEXT NOT NULL,
+	            last_seen_at TEXT NOT NULL,
+	            valid_from TEXT NOT NULL,
+	            valid_to TEXT,
+	            transaction_from TEXT NOT NULL,
+	            transaction_to TEXT,
+	            confidence REAL NOT NULL DEFAULT 1.0,
+	            provenance_context_id INTEGER REFERENCES recorded_context(id) ON DELETE SET NULL,
+	            provenance_input_event_id INTEGER REFERENCES input_event(id) ON DELETE SET NULL,
+	            extractor TEXT NOT NULL DEFAULT 'legacy',
+	            metadata_json TEXT,
+	            created_at TEXT NOT NULL,
+	            updated_at TEXT NOT NULL,
+	            FOREIGN KEY(source_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE,
+	            FOREIGN KEY(target_entity_id) REFERENCES graph_entity(id) ON DELETE CASCADE
+	        );
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_assertion_current
+	            ON graph_edge_assertion(source_entity_id, relation, transaction_to, valid_to);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_assertion_asof
+	            ON graph_edge_assertion(transaction_from, transaction_to, valid_from, valid_to);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_assertion_provenance
+	            ON graph_edge_assertion(provenance_context_id, provenance_input_event_id);
+
+	        CREATE TRIGGER IF NOT EXISTS recorded_context_entity_link_ad
+	        AFTER DELETE ON recorded_context BEGIN
+	            DELETE FROM context_entity_link WHERE context_id = old.id;
+	            UPDATE graph_edge SET provenance_context_id = NULL WHERE provenance_context_id = old.id;
+	            UPDATE graph_edge_assertion SET provenance_context_id = NULL WHERE provenance_context_id = old.id;
+	        END;
+	        """, db: db)
+	        try? execute("ALTER TABLE graph_entity ADD COLUMN normalized_value TEXT;", db: db)
+	        try? execute("ALTER TABLE graph_entity ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0;", db: db)
+	        try? execute("ALTER TABLE graph_entity ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy';", db: db)
+	        try? execute("ALTER TABLE graph_entity ADD COLUMN pii_class TEXT;", db: db)
+	        try? execute("ALTER TABLE graph_entity ADD COLUMN metadata_json TEXT;", db: db)
+	        try? execute("ALTER TABLE graph_entity_alias ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0;", db: db)
+	        try? execute("ALTER TABLE context_entity_link ADD COLUMN role TEXT NOT NULL DEFAULT 'observed';", db: db)
+	        try? execute("ALTER TABLE context_entity_link ADD COLUMN extractor TEXT NOT NULL DEFAULT 'legacy';", db: db)
+	        try? execute("ALTER TABLE context_entity_link ADD COLUMN span_start INTEGER;", db: db)
+	        try? execute("ALTER TABLE context_entity_link ADD COLUMN span_end INTEGER;", db: db)
+	        try? execute("ALTER TABLE context_entity_link ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0;", db: db)
+	        try? execute("ALTER TABLE graph_edge ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0;", db: db)
+	        try? execute("ALTER TABLE graph_edge ADD COLUMN provenance_context_id INTEGER REFERENCES recorded_context(id) ON DELETE SET NULL;", db: db)
+	        try? execute("ALTER TABLE graph_edge ADD COLUMN provenance_input_event_id INTEGER REFERENCES input_event(id) ON DELETE SET NULL;", db: db)
+	        try? execute("ALTER TABLE graph_edge ADD COLUMN extractor TEXT NOT NULL DEFAULT 'legacy';", db: db)
+	        try? execute("ALTER TABLE graph_edge ADD COLUMN metadata_json TEXT;", db: db)
+	        try execute("""
+	        CREATE INDEX IF NOT EXISTS idx_graph_entity_type_key
+	            ON graph_entity(kind, canonical_value);
+	        CREATE INDEX IF NOT EXISTS idx_graph_entity_current
+	            ON graph_entity(kind, transaction_to, last_seen_at DESC);
+	        CREATE INDEX IF NOT EXISTS idx_context_entity_link_role_extractor
+	            ON context_entity_link(context_id, entity_id, role, extractor, span_start);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_time_provenance
+	            ON graph_edge(relation, valid_from, valid_to, provenance_context_id);
+	        CREATE INDEX IF NOT EXISTS idx_graph_edge_current
+	            ON graph_edge(source_entity_id, relation, transaction_to, valid_to);
+	        """, db: db)
 
         // Backfill the index for rows inserted before FTS existed (triggers only
         // fire on new writes). Counts match in steady state, so this rebuild runs
