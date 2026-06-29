@@ -17,12 +17,17 @@ public enum ScreenTextRecognizer {
     /// `await` this so the CPU-bound Vision pass runs off the main thread and the
     /// UI stays smooth. Returns recognized lines joined by newlines, or `""` when
     /// nothing is read.
-    public static func recognize(inPNG data: Data, level: VNRequestTextRecognitionLevel = .accurate) async -> String {
-        guard let cgImage = decode(imageData: data) else {
+    public static func recognize(
+        inPNG data: Data,
+        level: VNRequestTextRecognitionLevel = .accurate,
+        regionOfInterest: CGRect? = nil,
+        maxDecodeDimension: Int? = nil
+    ) async -> String {
+        guard let cgImage = decode(imageData: data, maxDecodeDimension: maxDecodeDimension) else {
             logger.error("OCR skipped — could not decode PNG frame.")
             return ""
         }
-        return recognize(in: cgImage, level: level)
+        return recognize(in: cgImage, level: level, regionOfInterest: regionOfInterest)
     }
 
     /// Synchronous Vision recognition over a `CGImage`. Safe to call from any
@@ -31,8 +36,12 @@ public enum ScreenTextRecognizer {
     /// `level` lets the always-on recorder pick the cheap `.fast` model for the
     /// common case where the Accessibility channel already owns the text, and
     /// reserve the slow `.accurate` model for frames where OCR is load-bearing.
-    public static func recognize(in cgImage: CGImage, level: VNRequestTextRecognitionLevel = .accurate) -> String {
-        let request = makeTextRequest(level: level)
+    public static func recognize(
+        in cgImage: CGImage,
+        level: VNRequestTextRecognitionLevel = .accurate,
+        regionOfInterest: CGRect? = nil
+    ) -> String {
+        let request = makeTextRequest(level: level, regionOfInterest: regionOfInterest)
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
@@ -68,14 +77,24 @@ public enum ScreenTextRecognizer {
     /// of the B4 grounder: re-find a recorded click target by its text on a live
     /// frame, with NO model round-trip and NO Accessibility (so it works on the
     /// canvas/Electron apps where the AX tree is blind). Accepts PNG or JPEG.
-    public static func recognizeBoxes(inImageData data: Data, level: VNRequestTextRecognitionLevel = .accurate) -> [TextBox] {
-        guard let cgImage = decode(imageData: data) else { return [] }
-        let request = makeTextRequest(level: level)
+    public static func recognizeBoxes(
+        inImageData data: Data,
+        level: VNRequestTextRecognitionLevel = .accurate,
+        regionOfInterest: CGRect? = nil,
+        maxDecodeDimension: Int? = nil
+    ) -> [TextBox] {
+        guard let cgImage = decode(imageData: data, maxDecodeDimension: maxDecodeDimension) else { return [] }
+        let clippedROI = clippedRegionOfInterest(regionOfInterest)
+        let request = makeTextRequest(level: level, regionOfInterest: clippedROI)
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         guard (try? handler.perform([request])) != nil, let observations = request.results else { return [] }
         return observations.compactMap { obs in
             guard let candidate = obs.topCandidates(1).first else { return nil }
-            return TextBox(text: candidate.string, boundingBox: obs.boundingBox, confidence: candidate.confidence)
+            return TextBox(
+                text: candidate.string,
+                boundingBox: fullFrameBoundingBox(obs.boundingBox, regionOfInterest: clippedROI),
+                confidence: candidate.confidence
+            )
         }
     }
 
@@ -157,9 +176,15 @@ public enum ScreenTextRecognizer {
 
     /// Builds a text-recognition request with the knobs that matter for screen
     /// OCR, set consistently across both the line and box paths.
-    private static func makeTextRequest(level: VNRequestTextRecognitionLevel) -> VNRecognizeTextRequest {
+    private static func makeTextRequest(
+        level: VNRequestTextRecognitionLevel,
+        regionOfInterest: CGRect? = nil
+    ) -> VNRecognizeTextRequest {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = level
+        if let region = clippedRegionOfInterest(regionOfInterest) {
+            request.regionOfInterest = region
+        }
         // Language correction is an extra NLP pass that mostly helps the slower
         // `.accurate` model; on the cheap `.fast` insurance pass it's wasted cost.
         request.usesLanguageCorrection = (level == .accurate)
@@ -183,11 +208,39 @@ public enum ScreenTextRecognizer {
         return filtered.isEmpty ? ["en-US"] : filtered
     }
 
-    private static func decode(imageData data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    static func clippedRegionOfInterest(_ region: CGRect?) -> CGRect? {
+        guard let region else { return nil }
+        let clipped = region.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard clipped.width > 0, clipped.height > 0 else { return nil }
+        return clipped
+    }
+
+    static func fullFrameBoundingBox(_ box: CGRect, regionOfInterest: CGRect?) -> CGRect {
+        guard let region = clippedRegionOfInterest(regionOfInterest) else { return box }
+        return CGRect(
+            x: region.minX + box.minX * region.width,
+            y: region.minY + box.minY * region.height,
+            width: box.width * region.width,
+            height: box.height * region.height
+        )
+    }
+
+    static func decodedImageSize(imageData data: Data, maxDecodeDimension: Int? = nil) -> CGSize? {
+        decode(imageData: data, maxDecodeDimension: maxDecodeDimension)
+            .map { CGSize(width: $0.width, height: $0.height) }
+    }
+
+    private static func decode(imageData data: Data, maxDecodeDimension: Int? = nil) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             return nil
         }
-        return image
+        if let maxDecodeDimension, maxDecodeDimension > 0 {
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxDecodeDimension,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ] as CFDictionary)
+        }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
 }

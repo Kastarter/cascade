@@ -52,6 +52,174 @@ public struct ScheduledCapture: Sendable, Equatable {
     }
 }
 
+public enum RecorderThermalCondition: String, Codable, Sendable, Equatable {
+    case nominal
+    case fair
+    case serious
+    case critical
+
+    public init(_ state: ProcessInfo.ThermalState) {
+        switch state {
+        case .nominal:
+            self = .nominal
+        case .fair:
+            self = .fair
+        case .serious:
+            self = .serious
+        case .critical:
+            self = .critical
+        @unknown default:
+            self = .serious
+        }
+    }
+}
+
+public enum RecorderOCRPolicy: String, Codable, Sendable, Equatable {
+    case adaptive
+    case fastOnly
+}
+
+public struct RecorderCadenceBudget: Sendable, Equatable {
+    public let admitsCapture: Bool
+    public let heartbeatInterval: TimeInterval
+    public let ocrPolicy: RecorderOCRPolicy
+    public let allowsNativeResolutionOCR: Bool
+    public let allowsSemanticIndexing: Bool
+    public let pendingFrameByteBudget: Int
+
+    public init(
+        admitsCapture: Bool = true,
+        heartbeatInterval: TimeInterval = CaptureScheduler.idleHeartbeatInterval,
+        ocrPolicy: RecorderOCRPolicy = .adaptive,
+        allowsNativeResolutionOCR: Bool = true,
+        allowsSemanticIndexing: Bool = true,
+        pendingFrameByteBudget: Int = 16 * 1024 * 1024
+    ) {
+        self.admitsCapture = admitsCapture
+        self.heartbeatInterval = heartbeatInterval
+        self.ocrPolicy = ocrPolicy
+        self.allowsNativeResolutionOCR = allowsNativeResolutionOCR
+        self.allowsSemanticIndexing = allowsSemanticIndexing
+        self.pendingFrameByteBudget = pendingFrameByteBudget
+    }
+
+    public static let normal = RecorderCadenceBudget()
+}
+
+public struct RecorderCadenceController: Sendable, Equatable {
+    public static let idleSlowdownAfter: TimeInterval = 90
+    public static let typingQuietWindow: TimeInterval = 1.2
+    public static let scrollQuietWindow: TimeInterval = 0.65
+    public static let backlogPressureBytes = 8 * 1024 * 1024
+
+    private var lastInputAt: Date?
+    private var lastActivationAt: Date?
+    private var lastActivityKind: InputActivityKind?
+    private var lowPowerMode = false
+    private var thermalCondition: RecorderThermalCondition = .nominal
+    private var isProcessing = false
+    private var pendingFrameBytes = 0
+
+    public init() {}
+
+    public mutating func record(activity: InputActivityKind, at date: Date = Date()) {
+        lastActivityKind = activity
+        switch activity {
+        case .appActivated, .windowChanged:
+            lastActivationAt = date
+        case .click, .typingRun, .scroll, .keyCombo:
+            lastInputAt = date
+        }
+    }
+
+    public mutating func updatePower(lowPowerMode: Bool, thermalCondition: RecorderThermalCondition) {
+        self.lowPowerMode = lowPowerMode
+        self.thermalCondition = thermalCondition
+    }
+
+    public mutating func updateBacklog(isProcessing: Bool, pendingFrameBytes: Int) {
+        self.isProcessing = isProcessing
+        self.pendingFrameBytes = max(0, pendingFrameBytes)
+    }
+
+    public func budget(now: Date = Date()) -> RecorderCadenceBudget {
+        let secondsSinceInput = lastInputAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let secondsSinceActivation = lastActivationAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let typingQuiet = lastActivityKind == .typingRun && secondsSinceInput < Self.typingQuietWindow
+        let scrollQuiet = lastActivityKind == .scroll && secondsSinceInput < Self.scrollQuietWindow
+        let backlogPressured = isProcessing && pendingFrameBytes >= Self.backlogPressureBytes
+
+        switch thermalCondition {
+        case .critical:
+            return RecorderCadenceBudget(
+                admitsCapture: false,
+                heartbeatInterval: 90,
+                ocrPolicy: .fastOnly,
+                allowsNativeResolutionOCR: false,
+                allowsSemanticIndexing: false,
+                pendingFrameByteBudget: 2 * 1024 * 1024
+            )
+        case .serious:
+            return RecorderCadenceBudget(
+                admitsCapture: !scrollQuiet && !backlogPressured,
+                heartbeatInterval: 45,
+                ocrPolicy: .fastOnly,
+                allowsNativeResolutionOCR: false,
+                allowsSemanticIndexing: false,
+                pendingFrameByteBudget: 4 * 1024 * 1024
+            )
+        case .fair, .nominal:
+            break
+        }
+
+        if lowPowerMode {
+            return RecorderCadenceBudget(
+                admitsCapture: !scrollQuiet && !backlogPressured,
+                heartbeatInterval: 30,
+                ocrPolicy: .fastOnly,
+                allowsNativeResolutionOCR: false,
+                allowsSemanticIndexing: false,
+                pendingFrameByteBudget: 8 * 1024 * 1024
+            )
+        }
+
+        if backlogPressured {
+            return RecorderCadenceBudget(
+                admitsCapture: false,
+                heartbeatInterval: 20,
+                ocrPolicy: .fastOnly,
+                allowsNativeResolutionOCR: false,
+                allowsSemanticIndexing: false,
+                pendingFrameByteBudget: 8 * 1024 * 1024
+            )
+        }
+
+        if typingQuiet || scrollQuiet {
+            return RecorderCadenceBudget(
+                admitsCapture: !scrollQuiet,
+                heartbeatInterval: CaptureScheduler.idleHeartbeatInterval,
+                ocrPolicy: .fastOnly,
+                allowsNativeResolutionOCR: false,
+                allowsSemanticIndexing: true,
+                pendingFrameByteBudget: 16 * 1024 * 1024
+            )
+        }
+
+        if secondsSinceInput >= Self.idleSlowdownAfter && secondsSinceActivation >= Self.idleSlowdownAfter {
+            return RecorderCadenceBudget(
+                admitsCapture: true,
+                heartbeatInterval: 30,
+                ocrPolicy: .adaptive,
+                allowsNativeResolutionOCR: true,
+                allowsSemanticIndexing: true,
+                pendingFrameByteBudget: 16 * 1024 * 1024
+            )
+        }
+
+        return .normal
+    }
+}
+
 public struct CaptureScheduler: Sendable, Equatable {
     public static let clickDelay: TimeInterval = 0.22
     public static let typingPauseDelay: TimeInterval = 0.75

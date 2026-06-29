@@ -69,6 +69,18 @@ func indexEmbeddingUsesRedactedTextForChunkDigests() async throws {
     }
 }
 
+@Test
+func unindexedRecentContextsFindsTextRowsNeedingSemanticCatchUp() async throws {
+    let store = try makeSemanticStore()
+    let text = try await store.insert(RecordedContext(source: .screen, appName: "Notes", ocrText: "needs semantic catch up"))
+    _ = try await store.insert(RecordedContext(source: .screen, appName: "Blank", ocrText: nil))
+
+    let pending = try await store.unindexedRecentContexts(limit: 10)
+
+    #expect(pending.map(\.id).contains(text.id))
+    #expect(!pending.contains { $0.appName == "Blank" })
+}
+
 private func rawInt64(_ path: String, _ sql: String) -> Int64? {
     var db: OpaquePointer?
     guard sqlite3_open(path, &db) == SQLITE_OK else { return nil }

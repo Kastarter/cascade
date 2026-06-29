@@ -79,6 +79,18 @@ func diffRegionsPinsLastCellToImageEdges() {
     #expect(abs(region.maxY - imageSize.height) < 0.0001)
 }
 
+@Test
+func normalizedChangedRegionMapsMaskToPaddedUnion() {
+    let center = PerceptualHash.normalizedChangedRegion(changedCellsMask: 1 << 4, padding: 0)
+    #expect(center == CGRect(x: 1.0 / 3.0, y: 1.0 / 3.0, width: 1.0 / 3.0, height: 1.0 / 3.0))
+
+    let clipped = PerceptualHash.normalizedChangedRegion(changedCellsMask: 1 << 0, padding: 0.1)
+    #expect(clipped?.minX == 0)
+    #expect(clipped?.minY == 0)
+    #expect(abs((clipped?.maxX ?? 0) - ((1.0 / 3.0) + 0.1)) <= 0.0001)
+    #expect(abs((clipped?.maxY ?? 0) - ((1.0 / 3.0) + 0.1)) <= 0.0001)
+}
+
 private func grid(changes: [Int: UInt64] = [:]) -> [UInt64] {
     var hashes = Array(repeating: UInt64(0), count: PerceptualHash.gridDimension * PerceptualHash.gridDimension)
     for (index, hash) in changes {

@@ -924,6 +924,12 @@ public enum CascadeStoreError: Error, LocalizedError {
     }
 }
 
+public enum CascadeStoreMaintenanceReason: String, Sendable, Equatable {
+    case idle
+    case quit
+    case admin
+}
+
 internal enum CascadeBatchInsertTable: Sendable {
     case recordedContext
     case inputEvent
@@ -959,6 +965,7 @@ public actor CascadeStore {
 
         connection = SQLiteConnection(handle)
         try Self.migrate(handle)
+        try Self.configureConnection(handle)
     }
 
     public static func defaultDatabasePath() -> String {
@@ -1191,6 +1198,27 @@ public actor CascadeStore {
         }
     }
 
+    public func unindexedRecentContexts(limit: Int = 24) throws -> [RecordedContext] {
+        let sql = """
+        SELECT \(Self.contextColumns(prefix: "c"))
+        FROM recorded_context c
+        WHERE c.ocr_text IS NOT NULL
+          AND length(c.ocr_text) > 0
+          AND NOT EXISTS (SELECT 1 FROM context_embedding e WHERE e.context_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM context_chunk_embedding ce WHERE ce.context_id = c.id)
+        ORDER BY c.captured_at DESC, c.id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(max(0, min(limit, Int(Int32.max)))))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
     /// Full-text search over the OCR text, window title, and app name of stored
     /// moments via the `rewind_fts` FTS5 index. Returns matches newest-first.
     public func searchContexts(query: String, limit: Int = 80) throws -> [RecordedContext] {
@@ -1374,6 +1402,25 @@ public actor CascadeStore {
         try? execute("DELETE FROM ocr_structure WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM frame_signature WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         return removed
+    }
+
+    public func performMaintenance(reason: CascadeStoreMaintenanceReason = .idle) throws {
+        try execute("PRAGMA wal_checkpoint(PASSIVE);")
+        try execute("PRAGMA optimize;")
+        if reason == .quit || reason == .admin {
+            try execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        }
+    }
+
+    internal func pragmaIntValue(_ name: String) throws -> Int64 {
+        precondition(name.range(of: #"^[A-Za-z_]+$"#, options: .regularExpression) != nil)
+        return try withStatement("PRAGMA \(name);") { statement in
+            sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : 0
+        }
+    }
+
+    internal func walFileBytes() -> Int64 {
+        Self.fileSize(at: path + "-wal") ?? 0
     }
 
     public func privacySummary(
@@ -2857,6 +2904,18 @@ public actor CascadeStore {
         if scalarValue(db, "SELECT count(*) FROM recorded_context;") != scalarValue(db, "SELECT count(*) FROM rewind_fts;") {
             try? execute("INSERT INTO rewind_fts(rewind_fts) VALUES('rebuild');", db: db)
         }
+    }
+
+    private static func configureConnection(_ db: OpaquePointer?) throws {
+        try execute("""
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=2500;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA mmap_size=268435456;
+        PRAGMA wal_autocheckpoint=512;
+        """, db: db)
     }
 
     /// Runs a single-column scalar query and returns the first integer result

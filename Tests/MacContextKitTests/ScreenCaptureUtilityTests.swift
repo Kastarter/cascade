@@ -1,5 +1,7 @@
 import ApplicationServices
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 
 @testable import MacContextKit
@@ -61,5 +63,29 @@ struct ScreenCaptureUtilityTests {
 
         let resolved = try AXClient.validateFrame(zero, knownDisplays: [display], parentFrame: parent).get()
         #expect(resolved == parent)
+    }
+
+    @Test @MainActor func boundedJPEGCapsLongSideWithImageIOPath() throws {
+        let image = try #require(testImage(width: 1200, height: 600))
+        let jpeg = try #require(ScreenCaptureUtility.boundedJPEG(from: image, maxDimension: 300, compression: 0.8))
+        let source = try #require(CGImageSourceCreateWithData(jpeg as CFData, nil))
+        let encoded = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+
+        #expect(max(encoded.width, encoded.height) == 300)
+    }
+
+    private func testImage(width: Int, height: Int) -> CGImage? {
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setFillColor(CGColor(srgbRed: 0.2, green: 0.4, blue: 0.6, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
     }
 }

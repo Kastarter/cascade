@@ -1,9 +1,11 @@
 import AppKit
 import CoreGraphics
+import ImageIO
 import CoreMedia
 import CoreVideo
 import Foundation
 import OSLog
+import UniformTypeIdentifiers
 // @preconcurrency: on SDKs where ScreenCaptureKit hasn't marked SCShareableContent
 // Sendable (e.g. the Swift 6.0 / Xcode 16 toolchain CI runs), returning it from the
 // nonisolated async API into this @MainActor type is otherwise a hard error. This
@@ -160,26 +162,7 @@ public enum ScreenCaptureUtility {
             ).intersection(CGRect(x: 0, y: 0, width: frame.width, height: frame.height))
             guard !cropRect.isEmpty, let crop = frame.cropping(to: cropRect) else { return nil }
 
-            let longSide = max(crop.width, crop.height)
-            guard longSide > maxDimension else { return jpegData(from: crop, compression: compression) }
-            let factor = CGFloat(maxDimension) / CGFloat(longSide)
-            let width = max(1, Int((CGFloat(crop.width) * factor).rounded()))
-            let height = max(1, Int((CGFloat(crop.height) * factor).rounded()))
-            guard let rep = NSBitmapImageRep(
-                bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-            ) else { return nil }
-            NSGraphicsContext.saveGraphicsState()
-            let context = NSGraphicsContext(bitmapImageRep: rep)
-            NSGraphicsContext.current = context
-            context?.imageInterpolation = .high
-            NSImage(cgImage: crop, size: .zero).draw(
-                in: NSRect(x: 0, y: 0, width: width, height: height),
-                from: .zero, operation: .copy, fraction: 1.0
-            )
-            NSGraphicsContext.restoreGraphicsState()
-            return rep.representation(using: .jpeg, properties: [.compressionFactor: compression])
+            return boundedJPEG(from: crop, maxDimension: maxDimension, compression: compression)
         } catch {
             logger.error("Zoom capture failed: \(error.localizedDescription, privacy: .public)")
             return nil
@@ -389,11 +372,60 @@ public enum ScreenCaptureUtility {
     }
 
     private static func pngData(from cgImage: CGImage) -> Data? {
-        NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+        encode(cgImage, as: .png, compression: nil)
     }
 
     private static func jpegData(from cgImage: CGImage, compression: Double) -> Data? {
-        NSBitmapImageRep(cgImage: cgImage).representation(using: .jpeg, properties: [.compressionFactor: compression])
+        encode(cgImage, as: .jpeg, compression: compression)
+    }
+
+    static func boundedJPEG(from cgImage: CGImage, maxDimension: Int, compression: Double) -> Data? {
+        let longSide = max(cgImage.width, cgImage.height)
+        guard longSide > maxDimension else { return jpegData(from: cgImage, compression: compression) }
+        let factor = CGFloat(max(1, maxDimension)) / CGFloat(longSide)
+        let width = max(1, Int((CGFloat(cgImage.width) * factor).rounded()))
+        let height = max(1, Int((CGFloat(cgImage.height) * factor).rounded()))
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let scaled = context.makeImage() else { return nil }
+        return jpegData(from: scaled, compression: compression)
+    }
+
+    private enum EncodedImageFormat {
+        case png
+        case jpeg
+
+        var identifier: CFString {
+            switch self {
+            case .png:
+                UTType.png.identifier as CFString
+            case .jpeg:
+                UTType.jpeg.identifier as CFString
+            }
+        }
+    }
+
+    private static func encode(_ cgImage: CGImage, as format: EncodedImageFormat, compression: Double?) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, format.identifier, 1, nil) else {
+            return nil
+        }
+        var properties: [String: Any] = [:]
+        if let compression {
+            properties[kCGImageDestinationLossyCompressionQuality as String] = compression
+        }
+        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
     }
 
     /// Maps each `SCDisplay` to its `NSScreen` so we can reason about cursor
