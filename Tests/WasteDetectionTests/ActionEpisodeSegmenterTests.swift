@@ -198,3 +198,56 @@ func liveRepetitionDetectorSuppressesNoisyAndSensitiveSessions() {
     #expect(detector.detect(events: noisy, now: segmentBase.addingTimeInterval(30)) == nil)
     #expect(detector.detect(events: sensitive, now: segmentBase.addingTimeInterval(30)) == nil)
 }
+
+@Test
+func wasteDetectorActionTokensUseSharedIdempotentIdentity() {
+    let first = InputEvent(
+        id: 1,
+        kind: .click,
+        x: 10,
+        y: 20,
+        text: "Send",
+        appName: "Mail",
+        bundleIdentifier: "com.apple.mail",
+        windowTitle: "Inbox",
+        targetDescriptor: AXTargetDescriptor.encode(role: "AXButton", identifier: "send")
+    )
+    let moved = InputEvent(
+        id: 2,
+        kind: .click,
+        x: 200,
+        y: 300,
+        text: "Send",
+        appName: "Mail",
+        bundleIdentifier: "com.apple.mail",
+        windowTitle: "Inbox",
+        targetDescriptor: AXTargetDescriptor.encode(role: "AXButton", identifier: "send")
+    )
+    let different = InputEvent(
+        id: 3,
+        kind: .click,
+        x: 10,
+        y: 20,
+        text: "Archive",
+        appName: "Mail",
+        bundleIdentifier: "com.apple.mail",
+        windowTitle: "Inbox",
+        targetDescriptor: AXTargetDescriptor.encode(role: "AXButton", identifier: "archive")
+    )
+
+    #expect(WasteDetector.actionToken(first, surface: "Gmail") == WasteDetector.actionToken(moved, surface: "Gmail"))
+    #expect(WasteDetector.actionToken(first, surface: "Gmail") != WasteDetector.actionToken(different, surface: "Gmail"))
+}
+
+@Test
+func wasteDetectorTypeTokensDoNotLeakOrVaryByTypedText() {
+    let secret = InputEvent(kind: .type, text: "SSN 123-45-6789 secret", appName: "Mail", windowTitle: "Inbox")
+    let other = InputEvent(kind: .type, text: "different private text", appName: "Mail", windowTitle: "Inbox")
+
+    let token = WasteDetector.actionToken(secret, surface: "Mail")
+
+    #expect(token == WasteDetector.actionToken(other, surface: "Mail"))
+    #expect(!token.contains("SSN"))
+    #expect(!token.contains("secret"))
+    #expect(!token.contains("123"))
+}

@@ -1,6 +1,7 @@
 import CascadeMemory
 import Foundation
 import Testing
+import WasteDetection
 
 @testable import AgentOrchestrator
 
@@ -202,4 +203,72 @@ func rankPrefersCloserAppAndGoalSketches() {
     )
 
     #expect(ranked.first?.id == mail.id)
+}
+
+@Test
+func createAgentPersistsPromptSafeDemoSketch() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("TrajectorySketchAgent-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+    let orchestrator = CascadeOrchestrator(store: store)
+    let recipe = AgentRecipe(steps: [
+        step(0, .activateApp, app: "Mail"),
+        step(1, .click, app: "Mail", anchor: "Reply to candidate"),
+        step(2, .type, app: "Mail", text: "SSN 123-45-6789 secret offer", isParameter: true),
+    ])
+    let waste = DetectedWaste(
+        title: "Mail: reply",
+        apps: ["Mail"],
+        occurrences: 2,
+        estimatedSecondsPerRun: 15,
+        estimatedTotalSeconds: 30,
+        recipe: recipe,
+        evidence: [1, 2],
+        confidence: 0.8,
+        signature: "mail-reply"
+    )
+    let curated = CuratedAgent(
+        source: waste,
+        name: "Reply to candidate",
+        why: "Repeated reply workflow",
+        goal: "Reply to the candidate with the current offer",
+        value: 30
+    )
+
+    let agent = try await orchestrator.createAgent(from: curated)
+
+    let demo = try #require(agent.demoSketches.first)
+    #expect(demo.appName == "Mail")
+    #expect(demo.normalizedGoalTokens.contains("candidate"))
+    #expect(!demo.promptText.contains("123-45-6789"))
+    #expect(!demo.promptText.contains("secret offer"))
+    #expect(try await store.agent(id: agent.id)?.demoSketches == agent.demoSketches)
+}
+
+@Test
+func persistedDemoSketchRelevancePrefersMatchingAppAndGoal() {
+    let mail = AgentDemoSketch(
+        id: "mail-invoice",
+        appName: "Mail",
+        windowTitle: nil,
+        normalizedGoalTokens: ["copy", "invoice", "totals"],
+        promptText: "TRAJECTORY SKETCH\napp: Mail",
+        actionCount: 2,
+        anchorCount: 1,
+        checkCount: 0
+    )
+    let safari = AgentDemoSketch(
+        id: "safari-news",
+        appName: "Safari",
+        windowTitle: nil,
+        normalizedGoalTokens: ["open", "article"],
+        promptText: "TRAJECTORY SKETCH\napp: Safari",
+        actionCount: 2,
+        anchorCount: 1,
+        checkCount: 0
+    )
+    let queryTokens = Set(TrajectorySketch.normalizedGoalTokens(from: "copy invoice total from mail into spreadsheet"))
+
+    #expect(mail.relevanceScore(appName: "Mail", goalTokens: queryTokens) > safari.relevanceScore(appName: "Mail", goalTokens: queryTokens))
 }

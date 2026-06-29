@@ -1,59 +1,5 @@
 import Foundation
-import NaturalLanguage
 import SQLite3
-
-/// Local sentence embeddings (Apple NLEmbedding — on-device, no network) for
-/// fuzzy recall: "that pricing page from last week" finds the moment even when
-/// no keyword matches. Vectors live in SQLite next to the moments; search is a
-/// brute-force cosine scan, which at rewind scale (thousands of moments) costs
-/// single-digit milliseconds.
-enum SemanticEmbedder {
-    /// Embedding of `text` as the average of its word vectors, or nil when the
-    /// model/asset is unavailable. Word-vector averaging beats Apple's sentence
-    /// model decisively for retrieval (measured: "cheap plane tickets to japan"
-    /// ranks a Tokyo-flights moment 0.72 vs 0.49 for an unrelated one, while the
-    /// sentence model gets it backwards). NLEmbedding is not Sendable — load per
-    /// call and confine to the calling actor (CascadeStore serializes anyway).
-    static func vector(for text: String) -> [Float]? {
-        let trimmed = String(text.prefix(1_000)).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        guard let embedding = NLEmbedding.wordEmbedding(for: .english) else { return nil }
-
-        var sum = [Double](repeating: 0, count: embedding.dimension)
-        var words = 0
-        let tokenizer = NLTokenizer(unit: .word)
-        tokenizer.string = trimmed
-        tokenizer.enumerateTokens(in: trimmed.startIndex..<trimmed.endIndex) { range, _ in
-            if let wordVector = embedding.vector(for: String(trimmed[range]).lowercased()) {
-                for i in wordVector.indices { sum[i] += wordVector[i] }
-                words += 1
-            }
-            return true
-        }
-        guard words > 0 else { return nil }
-        return sum.map { Float($0 / Double(words)) }
-    }
-
-    static func cosine(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Float = 0, magA: Float = 0, magB: Float = 0
-        for i in a.indices {
-            dot += a[i] * b[i]
-            magA += a[i] * a[i]
-            magB += b[i] * b[i]
-        }
-        let denominator = (magA * magB).squareRoot()
-        return denominator > 0 ? dot / denominator : 0
-    }
-
-    static func blob(from vector: [Float]) -> Data {
-        vector.withUnsafeBufferPointer { Data(buffer: $0) }
-    }
-
-    static func vector(from blob: Data) -> [Float] {
-        blob.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-    }
-}
 
 enum SemanticTextChunker {
     static let targetCharacters = 850
@@ -113,10 +59,10 @@ public extension CascadeStore {
     /// a missing embedding asset just means keyword search carries that moment.
     func indexEmbedding(contextID: Int64, text: String) throws {
         let safeText = CascadeStore.sanitizeStoredText(text) ?? ""
-        if let vector = SemanticEmbedder.vector(for: safeText) {
+        if let vector = LocalSemanticVector.vector(for: safeText) {
             try withStatement("INSERT OR REPLACE INTO context_embedding (context_id, vector) VALUES (?, ?);") { statement in
                 sqlite3_bind_int64(statement, 1, contextID)
-                let blob = SemanticEmbedder.blob(from: vector)
+                let blob = LocalSemanticVector.blob(from: vector)
                 _ = blob.withUnsafeBytes {
                     sqlite3_bind_blob(statement, 2, $0.baseAddress, Int32(blob.count), nil)
                 }
@@ -144,11 +90,11 @@ public extension CascadeStore {
         VALUES (?, ?, ?, ?);
         """) { statement in
             for (index, chunk) in chunks.enumerated() {
-                guard let vector = SemanticEmbedder.vector(for: chunk) else { continue }
+                guard let vector = LocalSemanticVector.vector(for: chunk) else { continue }
                 sqlite3_bind_int64(statement, 1, contextID)
                 sqlite3_bind_int(statement, 2, Int32(index))
                 sqlite3_bind_int64(statement, 3, SemanticTextChunker.digest(chunk))
-                let blob = SemanticEmbedder.blob(from: vector)
+                let blob = LocalSemanticVector.blob(from: vector)
                 _ = blob.withUnsafeBytes {
                     sqlite3_bind_blob(statement, 4, $0.baseAddress, Int32(blob.count), nil)
                 }
@@ -177,7 +123,7 @@ public extension CascadeStore {
         start: Date? = nil,
         end: Date? = nil
     ) throws -> [Int64] {
-        guard let queryVector = SemanticEmbedder.vector(for: query) else { return [] }
+        guard let queryVector = LocalSemanticVector.vector(for: query) else { return [] }
         var bestScoreByContext: [Int64: Float] = [:]
 
         func bindFilters(_ statement: OpaquePointer, startingAt startIndex: Int32 = 1) {
@@ -218,7 +164,7 @@ public extension CascadeStore {
                 guard let pointer = sqlite3_column_blob(statement, 1) else { continue }
                 let count = Int(sqlite3_column_bytes(statement, 1))
                 let blob = Data(bytes: pointer, count: count)
-                let score = SemanticEmbedder.cosine(queryVector, SemanticEmbedder.vector(from: blob))
+                let score = LocalSemanticVector.cosine(queryVector, LocalSemanticVector.vector(from: blob))
                 if score > 0.55 {
                     bestScoreByContext[id] = max(bestScoreByContext[id] ?? -.greatestFiniteMagnitude, score)
                 }
@@ -238,7 +184,7 @@ public extension CascadeStore {
                       let pointer = sqlite3_column_blob(statement, 1) else { continue }
                 let count = Int(sqlite3_column_bytes(statement, 1))
                 let blob = Data(bytes: pointer, count: count)
-                let score = SemanticEmbedder.cosine(queryVector, SemanticEmbedder.vector(from: blob))
+                let score = LocalSemanticVector.cosine(queryVector, LocalSemanticVector.vector(from: blob))
                 if score > 0.55 { bestScoreByContext[id] = score }
             }
         }

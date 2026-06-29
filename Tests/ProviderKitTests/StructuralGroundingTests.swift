@@ -16,8 +16,21 @@ struct StructuralGroundingTests {
     /// Returns a fixed point regardless of input — exercises the glue, not a model.
     struct StubGrounder: VisualGrounder {
         let point: CGPoint?
+        let counter: GroundingCallCounter?
+
+        init(point: CGPoint?, counter: GroundingCallCounter? = nil) {
+            self.point = point
+            self.counter = counter
+        }
+
         func ground(screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int) async -> CGPoint? {
-            point
+            await counter?.increment()
+            return point
+        }
+
+        func groundResult(screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int) async -> GroundingResult {
+            await counter?.increment()
+            return .legacy(point: point, source: .visualModel)
         }
     }
 
@@ -119,6 +132,68 @@ struct StructuralGroundingTests {
         #expect(action == nil)
     }
 
+    @Test func persistentGroundingCacheSuppressesRepeatedGrounderCalls() async throws {
+        let cache = GroundingCache()
+        let counter = GroundingCallCounter()
+        let agent = ComputerUseAgent(
+            grounder: StubGrounder(point: CGPoint(x: 7, y: 8), counter: counter),
+            groundingMode: .structural,
+            groundingCache: cache,
+            groundingCacheKeyProvider: { _, target, width, height, mode in
+                makeGroundingCacheKey(targetText: target, displayWidthPoints: width, displayHeightPoints: height, mode: mode)
+            }
+        )
+
+        #expect(await agent.groundedClick(["target": "Save"], frame: dummyFrame) == .click(x: 7, y: 8))
+        #expect(await agent.groundedClick(["target": "Save"], frame: dummyFrame) == .click(x: 7, y: 8))
+
+        #expect(await counter.value() == 1)
+    }
+
+    @Test func persistentGroundingCacheMissesWhenStateKeyChanges() async throws {
+        let cache = GroundingCache()
+        let counter = GroundingCallCounter()
+        let agent = ComputerUseAgent(
+            grounder: StubGrounder(point: CGPoint(x: 3, y: 4), counter: counter),
+            groundingMode: .structural,
+            groundingCache: cache,
+            groundingCacheKeyProvider: { frame, target, width, height, mode in
+                let hash = UInt64(frame.last ?? 0)
+                return makeGroundingCacheKey(
+                    targetText: target,
+                    displayWidthPoints: width,
+                    displayHeightPoints: height,
+                    screenHash: hash,
+                    gridHashes: [hash],
+                    mode: mode
+                )
+            }
+        )
+
+        _ = await agent.groundedClick(["target": "Save"], frame: Data([1]))
+        _ = await agent.groundedClick(["target": "Save"], frame: Data([2]))
+
+        #expect(await counter.value() == 2)
+    }
+
+    @Test func persistentNegativeMissShortCircuitsGrounder() async throws {
+        let cache = GroundingCache(negativeMissTTL: 30)
+        let counter = GroundingCallCounter()
+        let agent = ComputerUseAgent(
+            grounder: StubGrounder(point: nil, counter: counter),
+            groundingMode: .structural,
+            groundingCache: cache,
+            groundingCacheKeyProvider: { _, target, width, height, mode in
+                makeGroundingCacheKey(targetText: target, displayWidthPoints: width, displayHeightPoints: height, mode: mode)
+            }
+        )
+
+        #expect(await agent.groundedClick(["target": "Missing"], frame: dummyFrame) == nil)
+        #expect(await agent.groundedClick(["target": "Missing"], frame: dummyFrame) == nil)
+
+        #expect(await counter.value() == 1)
+    }
+
     @Test func groundedClickBlocksRejectedResultWithPoint() async {
         let result = GroundingResult(
             candidates: [
@@ -190,4 +265,40 @@ struct StructuralGroundingTests {
         #expect(!p.contains("computer tool"))
         #expect(p.lowercased().contains("coordinate"))
     }
+}
+
+actor GroundingCallCounter {
+    private var calls = 0
+
+    func increment() {
+        calls += 1
+    }
+
+    func value() -> Int {
+        calls
+    }
+}
+
+private func makeGroundingCacheKey(
+    targetText: String = "Save",
+    appName: String = "Mail",
+    bundleIdentifier: String? = "com.apple.mail",
+    windowTitle: String? = "Inbox",
+    displayWidthPoints: Int = 0,
+    displayHeightPoints: Int = 0,
+    screenHash: UInt64 = 0xCAFE,
+    gridHashes: [UInt64] = [0xCAFE],
+    mode: GroundingCacheMode = .structural
+) -> GroundingCacheKey? {
+    GroundingCacheKey(
+        targetText: targetText,
+        appName: appName,
+        bundleIdentifier: bundleIdentifier,
+        windowTitle: windowTitle,
+        displayWidthPoints: displayWidthPoints,
+        displayHeightPoints: displayHeightPoints,
+        screenHash: screenHash,
+        gridHashes: gridHashes,
+        mode: mode
+    )
 }
