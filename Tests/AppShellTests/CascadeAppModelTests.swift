@@ -41,13 +41,13 @@ private func makeModel(curatorReply: String = #"{"agents":[]}"#) throws -> (mode
 private func webWorkflowEvents() -> [InputEvent] {
     var events: [InputEvent] = []
     var i = 0
-    func at() -> Date { base.addingTimeInterval(Double(i) * 3) }
-    for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "a", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .type, text: "reply", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 30, y: 30, text: "Send", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+    for run in 0..<3 {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 8), kind: .key, key: "a", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 16), kind: .type, text: "reply", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 24), kind: .click, x: 30, y: 30, text: "Send", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 32), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
     }
     return events
 }
@@ -121,12 +121,12 @@ func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
     // escalate to the cursor-class runtime on drift).
     var events: [InputEvent] = []
     var i = 0
-    func at() -> Date { base.addingTimeInterval(Double(i) * 4) } // clear the 30s floor
-    for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    for run in 0..<3 {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 8), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 16), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 24), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
     }
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
     try await store.insertInputEvents(events)
@@ -495,11 +495,11 @@ func flightDelayMillisecondsRejectsNonFiniteAndClampsLargeValues() {
     #expect(CascadeAppModel.safeFlightDelayMilliseconds(.greatestFiniteMagnitude) == 5_000)
 }
 
-private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> DetectedWaste {
+private func waste(apps: [String], occurrences: Int, perRun: Int = 20, sig: String = "sig") -> DetectedWaste {
     DetectedWaste(
         title: "t", apps: apps, occurrences: occurrences,
         estimatedSecondsPerRun: perRun, estimatedTotalSeconds: perRun * occurrences,
-        recipe: AgentRecipe(steps: []), evidence: [], confidence: 0.7, signature: "sig"
+        recipe: AgentRecipe(steps: []), evidence: [], confidence: 0.7, signature: sig
     )
 }
 
@@ -562,6 +562,16 @@ func repetitionBarNeedsThreeRepeats() {
     // demands a genuine habit — three or more.
     #expect(!CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 2)))
     #expect(CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 3)))
+}
+
+@Test
+func repetitionBarUsesAcceptedAndDeclinedPreferenceThresholds() {
+    var model = PreferenceModel()
+    for _ in 0..<12 { model.record("accepted", accepted: true) }
+    for _ in 0..<12 { model.record("declined", accepted: false) }
+
+    #expect(CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 2, sig: "accepted"), using: model))
+    #expect(!CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 3, sig: "declined"), using: model))
 }
 
 @Test

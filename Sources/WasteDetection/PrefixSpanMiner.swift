@@ -62,6 +62,7 @@ public struct PrefixSpanMiner: Sendable {
     public let minSupport: Int
     public let maxPatternLength: Int
     public let maxGapEvents: Int
+    public let maxGapSeconds: TimeInterval?
     public let maxSpanSeconds: TimeInterval?
     public let closedOnly: Bool
 
@@ -69,12 +70,14 @@ public struct PrefixSpanMiner: Sendable {
         minSupport: Int = 2,
         maxPatternLength: Int = 5,
         maxGapEvents: Int = 1,
+        maxGapSeconds: TimeInterval? = nil,
         maxSpanSeconds: TimeInterval? = nil,
         closedOnly: Bool = true
     ) {
         self.minSupport = max(1, minSupport)
         self.maxPatternLength = max(1, maxPatternLength)
         self.maxGapEvents = max(0, maxGapEvents)
+        self.maxGapSeconds = maxGapSeconds
         self.maxSpanSeconds = maxSpanSeconds
         self.closedOnly = closedOnly
     }
@@ -227,6 +230,7 @@ private extension PrefixSpanMiner {
 
             for eventIndex in startIndex...endIndex {
                 let event = episode[eventIndex]
+                guard gapAllowed(from: occurrence.endTime, to: event.timestamp) else { continue }
                 guard spanAllowed(start: occurrence.startTime, end: event.timestamp) else { continue }
                 candidates[event.tokenID, default: []].append(
                     EncodedOccurrence(
@@ -252,6 +256,12 @@ private extension PrefixSpanMiner {
         return end >= start && end - start <= maxSpanSeconds
     }
 
+    func gapAllowed(from previous: TimeInterval?, to next: TimeInterval?) -> Bool {
+        guard let maxGapSeconds else { return true }
+        guard let previous, let next else { return true }
+        return next >= previous && next - previous <= maxGapSeconds
+    }
+
     func support(of occurrences: [EncodedOccurrence]) -> Int {
         Set(occurrences.map(\.episodeIndex)).count
     }
@@ -274,8 +284,29 @@ private extension PrefixSpanMiner {
                 other.support == candidate.support
                     && other.tokenIDs.count > candidate.tokenIDs.count
                     && candidate.tokenIDs.isSubsequence(of: other.tokenIDs)
+                    && occurrenceSpansAreSimilar(candidate.occurrenceSpans, other.occurrenceSpans)
             }
         }
+    }
+
+    func occurrenceSpansAreSimilar(_ candidate: [OccurrenceSpan], _ other: [OccurrenceSpan]) -> Bool {
+        let byEpisode = Dictionary(grouping: other, by: \.episodeIndex)
+        let indexTolerance = max(1, maxGapEvents + 1)
+        let timeTolerance = max(10, maxGapSeconds ?? 30)
+        for span in candidate {
+            guard let match = byEpisode[span.episodeIndex]?.first(where: { otherSpan in
+                abs(otherSpan.startEventIndex - span.startEventIndex) <= indexTolerance
+                    && abs(otherSpan.endEventIndex - span.endEventIndex) <= indexTolerance
+                    && durationDifference(span, otherSpan) <= timeTolerance
+            }) else { return false }
+            _ = match
+        }
+        return true
+    }
+
+    func durationDifference(_ lhs: OccurrenceSpan, _ rhs: OccurrenceSpan) -> TimeInterval {
+        guard let left = lhs.durationSeconds, let right = rhs.durationSeconds else { return 0 }
+        return abs(left - right)
     }
 
     func sortPatterns(_ patterns: [EncodedPattern]) -> [EncodedPattern] {

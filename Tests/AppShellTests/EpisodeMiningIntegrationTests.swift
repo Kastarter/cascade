@@ -75,7 +75,7 @@ private func divergentEpisodeMiningEvents() -> [InputEvent] {
 }
 
 @MainActor @Test
-func refreshAllThreadsEpisodeMiningThroughDefaultOffFlag() async throws {
+func refreshAllUsesEpisodeMiningByDefaultAndAllowsOptOut() async throws {
     let events = divergentEpisodeMiningEvents()
     let oldSignatures = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).map(\.signature)
     let episodeSignatures = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: true).map(\.signature)
@@ -91,11 +91,12 @@ func refreshAllThreadsEpisodeMiningThroughDefaultOffFlag() async throws {
     try await store.insertInputEvents(events)
 
     await model.refreshAll()
-    #expect(model.detectedWaste.map(\.signature) == oldSignatures)
-
-    defaults.set(true, forKey: CascadeAppModel.experimentalEpisodeMiningKey)
-    await model.refreshAll()
-
     #expect(model.detectedWaste.map(\.signature) == episodeSignatures)
     #expect(model.detectedWaste.map(\.signature).contains(gappedSignature))
+
+    defaults.set(false, forKey: CascadeAppModel.experimentalEpisodeMiningKey)
+    await model.refreshAll()
+
+    #expect(model.detectedWaste.map(\.signature) == oldSignatures)
+    #expect(!model.detectedWaste.map(\.signature).contains(gappedSignature))
 }

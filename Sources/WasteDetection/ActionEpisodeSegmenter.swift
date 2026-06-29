@@ -84,15 +84,12 @@ public struct ActionEpisodeSegmenter: Sendable {
                 pendingStartReasons.removeAll()
             }
 
-            if Self.isCompletionControl(event), var builder = active {
-                builder.close(with: [.completionControl])
-                episodes.append(builder.build())
-                active = nil
-                Self.appendUnique(.completionControl, to: &pendingStartReasons)
-            }
         }
 
-        if let builder = active {
+        if var builder = active {
+            if Self.isCompletionControl(builder.lastEvent) {
+                builder.close(with: [.completionControl])
+            }
             episodes.append(builder.build())
         }
         return episodes
@@ -102,11 +99,16 @@ public struct ActionEpisodeSegmenter: Sendable {
         let gap = event.capturedAt.timeIntervalSince(builder.lastEvent.capturedAt)
         if gap > maxIdleGap { return [.idleGap] }
 
+        let continuous = continuesDataflow(from: builder, to: event, gap: gap)
+        if Self.isCompletionControl(builder.lastEvent), !continuous {
+            return [.completionControl]
+        }
+
         let surfaceChanged = builder.lastSurface != surface
         let windowChanged = Self.isWindowSwitch(from: builder.lastEvent.windowTitle, to: event.windowTitle)
         guard surfaceChanged || windowChanged else { return [] }
 
-        if continuesDataflow(from: builder, to: event, gap: gap) {
+        if continuous {
             return []
         }
 
@@ -119,7 +121,7 @@ public struct ActionEpisodeSegmenter: Sendable {
     private func continuesDataflow(from builder: EpisodeBuilder, to event: InputEvent, gap: TimeInterval) -> Bool {
         guard gap <= dataflowContinuityGap else { return false }
         if builder.hasOpenCopyFlow { return true }
-        if let token = Self.dataflowToken(for: event), builder.hasRecentDataflowToken(token) { return true }
+        if builder.hasRecentContinuityToken(in: Self.continuityTokens(for: event)) { return true }
         return false
     }
 
@@ -183,17 +185,60 @@ public struct ActionEpisodeSegmenter: Sendable {
         return modifiers.contains("command") || modifiers.contains("control")
     }
 
-    private static func dataflowToken(for event: InputEvent) -> String? {
+    private static func continuityTokens(for event: InputEvent) -> [String] {
+        var tokens: [String] = []
+        if let descriptor = normalizedDescriptorToken(event.targetDescriptor) {
+            tokens.append("target:\(descriptor)")
+        }
+        if let label = descriptorLabel(event.targetDescriptor) {
+            tokens.append("label:\(label)")
+        }
         switch event.kind {
         case .click, .doubleClick, .rightClick:
             let label = WasteDetector.normalizedLabel(event.text)
-            return label.isEmpty ? nil : "click:\(label)"
+            if !label.isEmpty {
+                tokens.append("label:\(label)")
+                tokens.append("value:\(label)")
+            }
         case .type:
-            let text = WasteDetector.normalizedLabel(event.text)
-            return text.isEmpty ? nil : "type:\(text)"
+            if let value = normalizedValue(event.text) {
+                tokens.append("value:\(value)")
+            }
         case .key, .scroll:
+            break
+        }
+        return Array(Set(tokens)).sorted()
+    }
+
+    private static func normalizedDescriptorToken(_ descriptor: String?) -> String? {
+        guard let descriptor = descriptor?.trimmingCharacters(in: .whitespacesAndNewlines), !descriptor.isEmpty else {
             return nil
         }
+        if let decoded = AXTargetDescriptorV2.decode(descriptor) {
+            let parts = [decoded.role, decoded.identifier, decoded.container, decoded.label]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let joined = parts.joined(separator: " ")
+            return normalizedValue(joined)
+        }
+        return normalizedValue(descriptor)
+    }
+
+    private static func descriptorLabel(_ descriptor: String?) -> String? {
+        guard let label = AXTargetDescriptorV2.decode(descriptor)?.label else { return nil }
+        let normalized = WasteDetector.normalizedLabel(label)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func normalizedValue(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let normalized = text
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = normalized
+            .replacingOccurrences(of: #"^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$"#, with: "", options: .regularExpression)
+        return stripped.isEmpty ? nil : String(stripped.prefix(80))
     }
 
     fileprivate static func appendUnique(_ reason: ActionEpisodeBoundaryReason, to reasons: inout [ActionEpisodeBoundaryReason]) {
@@ -207,7 +252,7 @@ public struct ActionEpisodeSegmenter: Sendable {
         var boundaryReasons: [ActionEpisodeBoundaryReason]
         var lastSurface: String
         var hasOpenCopyFlow: Bool
-        private var recentDataflowTokens: [String]
+        private var recentContinuityTokens: [String]
 
         var lastEvent: InputEvent { events[events.count - 1] }
 
@@ -218,7 +263,7 @@ public struct ActionEpisodeSegmenter: Sendable {
             self.boundaryReasons = startReasons
             self.lastSurface = surface
             self.hasOpenCopyFlow = false
-            self.recentDataflowTokens = []
+            self.recentContinuityTokens = []
             append(event, surface: surface)
         }
 
@@ -234,10 +279,10 @@ public struct ActionEpisodeSegmenter: Sendable {
             } else if ActionEpisodeSegmenter.isPasteShortcut(event) {
                 hasOpenCopyFlow = false
             }
-            if let token = ActionEpisodeSegmenter.dataflowToken(for: event) {
-                recentDataflowTokens.append(token)
-                if recentDataflowTokens.count > 6 {
-                    recentDataflowTokens.removeFirst(recentDataflowTokens.count - 6)
+            for token in ActionEpisodeSegmenter.continuityTokens(for: event) {
+                recentContinuityTokens.append(token)
+                if recentContinuityTokens.count > 12 {
+                    recentContinuityTokens.removeFirst(recentContinuityTokens.count - 12)
                 }
             }
         }
@@ -248,8 +293,8 @@ public struct ActionEpisodeSegmenter: Sendable {
             }
         }
 
-        func hasRecentDataflowToken(_ token: String) -> Bool {
-            recentDataflowTokens.contains(token)
+        func hasRecentContinuityToken(in tokens: [String]) -> Bool {
+            !Set(tokens).isDisjoint(with: recentContinuityTokens)
         }
 
         func build() -> ActionEpisode {

@@ -1,6 +1,48 @@
 import CascadeMemory
 import Foundation
 
+public struct RoutineQuality: Sendable, Equatable {
+    public let supportScore: Double
+    public let compactnessScore: Double
+    public let determinismScore: Double
+    public let parameterScore: Double
+    public let replayabilityScore: Double
+    public let privacyPenalty: Double
+    public let interruptionPenalty: Double
+    public let utilityScore: Double
+    public let score: Double
+
+    public init(
+        supportScore: Double,
+        compactnessScore: Double,
+        determinismScore: Double,
+        parameterScore: Double,
+        replayabilityScore: Double,
+        privacyPenalty: Double,
+        interruptionPenalty: Double,
+        utilityScore: Double,
+        score: Double? = nil
+    ) {
+        self.supportScore = supportScore
+        self.compactnessScore = compactnessScore
+        self.determinismScore = determinismScore
+        self.parameterScore = parameterScore
+        self.replayabilityScore = replayabilityScore
+        self.privacyPenalty = privacyPenalty
+        self.interruptionPenalty = interruptionPenalty
+        self.utilityScore = utilityScore
+        self.score = score ?? (
+            utilityScore
+            * compactnessScore
+            * determinismScore
+            * replayabilityScore
+            * (1.0 + 0.25 * parameterScore)
+            * (1.0 - privacyPenalty)
+            * (1.0 - interruptionPenalty)
+        )
+    }
+}
+
 /// What Cascade detected the user repeating — a candidate to turn into an agent.
 /// The `recipe` is built from the user's *actual* recorded actions, so a deployed
 /// agent reproduces the task the way the user does it.
@@ -20,6 +62,9 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
     /// When the workflow was last observed — lets the UI date the card and pick
     /// a nearby rewind frame as visual evidence.
     public let lastSeenAt: Date
+    /// Precision/utility signals computed before LLM curation. Manual/test values
+    /// may leave this nil and use the legacy score/gates.
+    public let quality: RoutineQuality?
 
     public init(
         id: UUID = UUID(),
@@ -32,7 +77,8 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
         evidence: [Int64],
         confidence: Double,
         signature: String,
-        lastSeenAt: Date = Date()
+        lastSeenAt: Date = Date(),
+        quality: RoutineQuality? = nil
     ) {
         self.id = id
         self.title = title
@@ -45,6 +91,7 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
         self.confidence = confidence
         self.signature = signature
         self.lastSeenAt = lastSeenAt
+        self.quality = quality
     }
 }
 
@@ -54,6 +101,36 @@ public struct DetectedWaste: Identifiable, Sendable, Equatable {
 public struct WasteDetector: Sendable {
     private let minRunLength: Int
     private let maxRunLength: Int
+
+    private struct RoutineCandidate: Sendable {
+        let patternTokens: [String]
+        let occurrences: [[InputEvent]]
+        let support: Int
+        let coverage: Double
+        let medianGap: TimeInterval
+        let surfaces: Set<String>
+
+        init(patternTokens: [String], occurrences: [[InputEvent]], surface: (InputEvent) -> String) {
+            self.patternTokens = patternTokens
+            self.occurrences = occurrences
+            self.support = occurrences.count
+            self.coverage = Double(Set(occurrences.flatMap { $0.map(\.id) }).count)
+            self.medianGap = Self.medianInterStepGap(occurrences)
+            self.surfaces = Set(occurrences.flatMap { occurrence in occurrence.map(surface) })
+        }
+
+        private static func medianInterStepGap(_ occurrences: [[InputEvent]]) -> TimeInterval {
+            var gaps: [TimeInterval] = []
+            for occurrence in occurrences {
+                guard occurrence.count >= 2 else { continue }
+                for index in 1..<occurrence.count {
+                    let gap = occurrence[index].capturedAt.timeIntervalSince(occurrence[index - 1].capturedAt)
+                    if gap >= 0 { gaps.append(gap) }
+                }
+            }
+            return WasteDetector.median(gaps) ?? 0
+        }
+    }
 
     public init(minRunLength: Int = 2, maxRunLength: Int = 8) {
         self.minRunLength = minRunLength
@@ -65,16 +142,15 @@ public struct WasteDetector: Sendable {
         inputEvents: [InputEvent],
         maxResults: Int = 5,
         webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
-        useEpisodeMining: Bool = false
+        useEpisodeMining: Bool = true
     ) -> [DetectedWaste] {
         if useEpisodeMining {
-            let episodeResults = detectWithEpisodeMining(
+            return detectWithEpisodeMining(
                 contexts: contexts,
                 inputEvents: inputEvents,
                 maxResults: maxResults,
                 webAppIdentity: webAppIdentity
             )
-            if !episodeResults.isEmpty { return episodeResults }
         }
         return detectContiguous(
             contexts: contexts,
@@ -121,7 +197,7 @@ public struct WasteDetector: Sendable {
         let tokens = events.map { Self.token($0, surface: surface($0)) }
         let n = events.count
         var consumed = Set<Int>()
-        var results: [DetectedWaste] = []
+        var candidates: [RoutineCandidate] = []
 
         // Longest repeats first; mark their indices consumed so shorter
         // sub-sequences inside them don't double-count.
@@ -172,13 +248,18 @@ public struct WasteDetector: Sendable {
                 // `waste(fromInstance:)` path — one rule, one place.
                 guard Self.isAutomatableInstance(instance) else { continue }
                 let allOccurrences = nonOverlapping.map { Array(events[$0..<$0 + length]) }
-                results.append(makeWaste(instance: instance, occurrences: nonOverlapping.count, contexts: contexts, surface: surface, allOccurrences: allOccurrences))
+                candidates.append(RoutineCandidate(
+                    patternTokens: Array(tokens[representativeStart..<representativeStart + length]),
+                    occurrences: allOccurrences,
+                    surface: surface
+                ))
                 for start in nonOverlapping {
                     for index in start..<start + length { consumed.insert(index) }
                 }
             }
         }
 
+        let results = promoteCandidates(candidates, contexts: contexts, surface: surface)
         // H5: merge near-duplicate VARIANTS of the same routine (done slightly
         // differently across runs) into one process — summing their occurrences. This
         // both rescues a real routine whose runs split across variants (neither variant
@@ -228,9 +309,10 @@ public struct WasteDetector: Sendable {
             }
         }
         let miner = PrefixSpanMiner(
-            minSupport: 2,
+            minSupport: 1,
             maxPatternLength: maxRunLength,
-            maxGapEvents: 1,
+            maxGapEvents: 3,
+            maxGapSeconds: 90,
             maxSpanSeconds: Self.maxIdleGap,
             closedOnly: true
         )
@@ -251,7 +333,7 @@ public struct WasteDetector: Sendable {
             }
 
         var consumed = Set<EpisodeEventKey>()
-        var results: [DetectedWaste] = []
+        var candidates: [RoutineCandidate] = []
         for pattern in patterns {
             var localConsumed = Set<EpisodeEventKey>()
             var occurrences: [[InputEvent]] = []
@@ -267,24 +349,23 @@ public struct WasteDetector: Sendable {
                 occurrenceKeys.append(keys)
                 localConsumed.formUnion(keys)
             }
-            guard occurrences.count >= 2 else { continue }
+            guard !occurrences.isEmpty else { continue }
             let representative = occurrences.sorted(by: Self.newestOccurrenceFirst).first!
             guard Self.isAutomatableInstance(representative) else { continue }
 
-            results.append(
-                makeWaste(
-                    instance: representative,
-                    occurrences: occurrences.count,
-                    contexts: contexts,
-                    surface: surface,
-                    allOccurrences: occurrences
-                )
-            )
-            for keys in occurrenceKeys {
-                consumed.formUnion(keys)
+            candidates.append(RoutineCandidate(
+                patternTokens: pattern.tokens,
+                occurrences: occurrences,
+                surface: surface
+            ))
+            if occurrences.count >= 2 {
+                for keys in occurrenceKeys {
+                    consumed.formUnion(keys)
+                }
             }
         }
 
+        let results = promoteCandidates(candidates, contexts: contexts, surface: surface)
         let deduped = Self.mergeVariants(results)
         let now = Date()
         return deduped
@@ -295,6 +376,150 @@ public struct WasteDetector: Sendable {
             }
             .prefix(maxResults)
             .map { $0 }
+    }
+
+    private func promoteCandidates(
+        _ candidates: [RoutineCandidate],
+        contexts: [RecordedContext],
+        surface: (InputEvent) -> String
+    ) -> [DetectedWaste] {
+        Self.clusterRoutineCandidates(candidates).compactMap { cluster in
+            let merged = Self.mergeRoutineCandidateCluster(cluster)
+            guard merged.support >= 2,
+                  let representative = Self.representativeOccurrence(in: merged),
+                  Self.isAutomatableInstance(representative)
+            else { return nil }
+            return makeWaste(
+                instance: representative,
+                occurrences: merged.support,
+                contexts: contexts,
+                surface: surface,
+                allOccurrences: merged.occurrences
+            )
+        }
+    }
+
+    private static func clusterRoutineCandidates(
+        _ candidates: [RoutineCandidate],
+        threshold: Double = 0.72
+    ) -> [[RoutineCandidate]] {
+        var clusters: [[RoutineCandidate]] = []
+        for candidate in candidates {
+            if let index = clusters.firstIndex(where: { cluster in
+                cluster.contains { routineCandidateSimilarity($0.patternTokens, candidate.patternTokens) >= threshold }
+            }) {
+                clusters[index].append(candidate)
+            } else {
+                clusters.append([candidate])
+            }
+        }
+        return clusters
+    }
+
+    private static func mergeRoutineCandidateCluster(_ cluster: [RoutineCandidate]) -> RoutineCandidate {
+        guard let representative = representativeCandidate(in: cluster) else {
+            return RoutineCandidate(patternTokens: [], occurrences: [], surface: { $0.appName })
+        }
+        var seen = Set<String>()
+        var seenEventIDs = Set<Int64>()
+        var occurrences: [[InputEvent]] = []
+        for candidate in cluster.sorted(by: routineCandidateSort) {
+            for occurrence in candidate.occurrences.sorted(by: episodeOccurrenceSort) {
+                let key = occurrenceIdentity(occurrence)
+                let ids = Set(occurrence.map(\.id))
+                guard !seen.contains(key), ids.isDisjoint(with: seenEventIDs) else { continue }
+                seen.insert(key)
+                seenEventIDs.formUnion(ids)
+                occurrences.append(occurrence)
+            }
+        }
+        return RoutineCandidate(
+            patternTokens: representative.patternTokens,
+            occurrences: occurrences,
+            surface: { event in
+                representative.surfaces.first(where: { $0 == event.appName }) ?? event.appName
+            }
+        )
+    }
+
+    private static func representativeCandidate(in cluster: [RoutineCandidate]) -> RoutineCandidate? {
+        cluster.max { lhs, rhs in
+            let lScore = medoidScore(lhs, in: cluster)
+            let rScore = medoidScore(rhs, in: cluster)
+            if lScore != rScore { return lScore < rScore }
+            if lhs.patternTokens.count != rhs.patternTokens.count {
+                return lhs.patternTokens.count < rhs.patternTokens.count
+            }
+            if lhs.support != rhs.support { return lhs.support < rhs.support }
+            if lhs.medianGap != rhs.medianGap { return lhs.medianGap > rhs.medianGap }
+            return lhs.patternTokens.lexicographicallyPrecedes(rhs.patternTokens)
+        }
+    }
+
+    private static func representativeOccurrence(in candidate: RoutineCandidate) -> [InputEvent]? {
+        candidate.occurrences.sorted(by: newestOccurrenceFirst).first
+    }
+
+    private static func medoidScore(_ candidate: RoutineCandidate, in cluster: [RoutineCandidate]) -> Double {
+        guard !cluster.isEmpty else { return 0 }
+        let total = cluster.reduce(0.0) { partial, other in
+            partial + routineCandidateSimilarity(candidate.patternTokens, other.patternTokens)
+        }
+        return total / Double(cluster.count)
+    }
+
+    private static func routineCandidateSort(_ lhs: RoutineCandidate, _ rhs: RoutineCandidate) -> Bool {
+        if lhs.support != rhs.support { return lhs.support > rhs.support }
+        if lhs.patternTokens.count != rhs.patternTokens.count { return lhs.patternTokens.count > rhs.patternTokens.count }
+        return lhs.patternTokens.lexicographicallyPrecedes(rhs.patternTokens)
+    }
+
+    private static func episodeOccurrenceSort(_ lhs: [InputEvent], _ rhs: [InputEvent]) -> Bool {
+        let lFirst = lhs.first?.capturedAt ?? .distantPast
+        let rFirst = rhs.first?.capturedAt ?? .distantPast
+        if lFirst != rFirst { return lFirst < rFirst }
+        return lhs.map(\.id).lexicographicallyPrecedes(rhs.map(\.id))
+    }
+
+    private static func occurrenceIdentity(_ occurrence: [InputEvent]) -> String {
+        occurrence.map { event in
+            if event.id != 0 { return "id:\(event.id)" }
+            return [
+                "t:\(event.capturedAt.timeIntervalSince1970)",
+                "k:\(event.kind.rawValue)",
+                "a:\(event.appName)",
+                "x:\(event.text ?? "")",
+                "key:\(event.key ?? "")"
+            ].joined(separator: ";")
+        }.joined(separator: "|")
+    }
+
+    private static func routineCandidateSimilarity(_ a: [String], _ b: [String]) -> Double {
+        max(
+            sequenceSimilarity(a, b),
+            weightedTokenJaccard(a, b),
+            subsequenceSimilarity(a, b)
+        )
+    }
+
+    private static func weightedTokenJaccard(_ a: [String], _ b: [String]) -> Double {
+        var aCounts: [String: Int] = [:]
+        var bCounts: [String: Int] = [:]
+        for token in a { aCounts[token, default: 0] += 1 }
+        for token in b { bCounts[token, default: 0] += 1 }
+        let keys = Set(aCounts.keys).union(bCounts.keys)
+        let intersection = keys.reduce(0) { $0 + min(aCounts[$1] ?? 0, bCounts[$1] ?? 0) }
+        let union = keys.reduce(0) { $0 + max(aCounts[$1] ?? 0, bCounts[$1] ?? 0) }
+        guard union > 0 else { return 1 }
+        return Double(intersection) / Double(union)
+    }
+
+    private static func subsequenceSimilarity(_ a: [String], _ b: [String]) -> Double {
+        guard !a.isEmpty, !b.isEmpty else { return a.isEmpty && b.isEmpty ? 1 : 0 }
+        if a.isSubsequence(of: b) || b.isSubsequence(of: a) {
+            return Double(min(a.count, b.count)) / Double(max(a.count, b.count))
+        }
+        return 0
     }
 
     /// Orders detected workflows by genuine worth, replacing a raw total-seconds sort
@@ -311,6 +536,9 @@ public struct WasteDetector: Sendable {
     ///                  automatable routine (Leno) — nudge it up.
     /// Pure + unit-pinned (asserts the ordering properties, not magic numbers).
     static func rankingScore(_ waste: DetectedWaste, now: Date) -> Double {
+        if let quality = waste.quality {
+            return quality.score
+        }
         let roi = Double(waste.occurrences) * Double(max(1, waste.estimatedSecondsPerRun))
         let cohesion = Double(waste.recipe.steps.count { $0.kind != .activateApp && $0.kind != .scroll })
         let lengthBoost = 1.0 + 0.15 * cohesion
@@ -363,7 +591,8 @@ public struct WasteDetector: Sendable {
             evidence: cluster.flatMap(\.evidence),
             confidence: min(0.95, 0.5 + Double(totalOccurrences) * 0.12),
             signature: representative.signature,
-            lastSeenAt: cluster.map(\.lastSeenAt).max() ?? representative.lastSeenAt
+            lastSeenAt: cluster.map(\.lastSeenAt).max() ?? representative.lastSeenAt,
+            quality: representative.quality
         )
     }
 
@@ -427,21 +656,277 @@ public struct WasteDetector: Sendable {
         return makeWaste(instance: instance, occurrences: max(1, occurrences), contexts: contexts, surface: resolve)
     }
 
+    private struct InferredParameter: Sendable {
+        let position: Int
+        let parameterKey: String
+        let parameterKind: RecipeParameterKind
+        let valueExamples: [String]
+        let valueHashes: [String]
+        let sourceEventIndices: [Int]
+        let transform: String?
+    }
+
+    private struct TypeCell {
+        let position: Int
+        let identity: String
+        let label: String
+        let value: String
+        let sourceEventIndices: [Int]
+    }
+
+    private struct TargetIdentity {
+        let key: String
+        let label: String
+    }
+
     /// The instance-array positions whose `.type` value VARIES across a workflow's
-    /// recorded occurrences — its parameters (AWM placeholder abstraction). A position
-    /// qualifies only when EVERY occurrence has a `.type` event there (same shape) and
-    /// at least two of the recorded values differ. Pure + unit-pinned. Empty for fewer
-    /// than two occurrences (a single demo can't reveal what changes).
+    /// recorded occurrences — its parameters (AWM placeholder abstraction). Target
+    /// identity wins over position: a field with a stable AX descriptor/label still
+    /// matches when one occurrence has an extra click before typing. Same-index typing
+    /// remains the fallback for legacy tests and unlabeled fields.
     static func variableTypePositions(_ occurrences: [[InputEvent]]) -> Set<Int> {
-        guard occurrences.count >= 2, let length = occurrences.first?.count else { return [] }
-        var variable = Set<Int>()
-        for position in 0..<length {
-            let cells = occurrences.compactMap { $0.indices.contains(position) ? $0[position] : nil }
-            guard cells.count == occurrences.count, cells.allSatisfy({ $0.kind == .type }) else { continue }
-            let values = Set(cells.map { ($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines) })
-            if values.count >= 2 { variable.insert(position) }
+        Set(inferredParameters(occurrences).keys)
+    }
+
+    private static func inferredParameters(_ occurrences: [[InputEvent]]) -> [Int: InferredParameter] {
+        guard occurrences.count >= 2, let representative = occurrences.first else { return [:] }
+        let cellsByOccurrence = occurrences.map(typeCells)
+        guard let representativeCells = cellsByOccurrence.first else { return [:] }
+        var inferred: [Int: InferredParameter] = [:]
+
+        for representativeCell in representativeCells {
+            var matched: [TypeCell] = []
+            for (occurrenceIndex, cells) in cellsByOccurrence.enumerated() {
+                if let identityMatch = cells.first(where: { $0.identity == representativeCell.identity }) {
+                    matched.append(identityMatch)
+                    continue
+                }
+                if occurrences[occurrenceIndex].indices.contains(representativeCell.position) {
+                    let event = occurrences[occurrenceIndex][representativeCell.position]
+                    if event.kind == .type {
+                        let fallback = TypeCell(
+                            position: representativeCell.position,
+                            identity: "index:\(representativeCell.position)",
+                            label: representativeCell.label,
+                            value: event.text ?? "",
+                            sourceEventIndices: sourceEventIndices(for: representativeCell.position, in: occurrences[occurrenceIndex], value: event.text)
+                        )
+                        matched.append(fallback)
+                    }
+                }
+            }
+
+            guard matched.count == occurrences.count else { continue }
+            let values = matched.map { $0.value.trimmingCharacters(in: .whitespacesAndNewlines) }
+            let normalizedValues = Set(values.map(normalizedParameterValue).filter { !$0.isEmpty })
+            guard normalizedValues.count >= 2 else { continue }
+
+            let kind = classifyParameter(values)
+            let key = parameterKey(from: representativeCell.label, fallbackPosition: representativeCell.position)
+            inferred[representativeCell.position] = InferredParameter(
+                position: representativeCell.position,
+                parameterKey: key,
+                parameterKind: kind,
+                valueExamples: Array(Set(values.map { valueShape($0, kind: kind) })).sorted().prefix(3).map { $0 },
+                valueHashes: Array(Set(values.map { AuditIdentity.hash(normalizedParameterValue($0)) })).sorted().prefix(5).map { $0 },
+                sourceEventIndices: Array(Set(matched.flatMap(\.sourceEventIndices))).sorted(),
+                transform: values.allSatisfy { $0 == $0.trimmingCharacters(in: .whitespacesAndNewlines) } ? nil : "trim"
+            )
         }
-        return variable
+
+        _ = representative
+        return inferred
+    }
+
+    private static func typeCells(in occurrence: [InputEvent]) -> [TypeCell] {
+        occurrence.indices.compactMap { index in
+            let event = occurrence[index]
+            guard event.kind == .type else { return nil }
+            let identity = targetIdentity(forTypeAt: index, in: occurrence)
+            return TypeCell(
+                position: index,
+                identity: identity.key,
+                label: identity.label,
+                value: event.text ?? "",
+                sourceEventIndices: sourceEventIndices(for: index, in: occurrence, value: event.text)
+            )
+        }
+    }
+
+    private static func targetIdentity(forTypeAt index: Int, in occurrence: [InputEvent]) -> TargetIdentity {
+        let event = occurrence[index]
+        if let identity = targetIdentity(for: event) {
+            return identity
+        }
+        if let priorIndex = stride(from: index - 1, through: max(0, index - 4), by: -1)
+            .first(where: { occurrence.indices.contains($0) && isTargetingEvent(occurrence[$0]) }),
+           let identity = targetIdentity(for: occurrence[priorIndex]) {
+            return identity
+        }
+        if let window = event.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !window.isEmpty {
+            let label = String(window.prefix(48))
+            return TargetIdentity(key: "window:\(normalizedParameterValue(label))@\(event.appName.lowercased())", label: label)
+        }
+        return TargetIdentity(key: "index:\(index)", label: "field \(index + 1)")
+    }
+
+    private static func targetIdentity(for event: InputEvent) -> TargetIdentity? {
+        if let descriptor = event.targetDescriptor?.trimmingCharacters(in: .whitespacesAndNewlines), !descriptor.isEmpty {
+            if let decoded = AXTargetDescriptorV2.decode(descriptor) {
+                let label = decoded.label.trimmingCharacters(in: .whitespacesAndNewlines)
+                let parts = [decoded.role, decoded.identifier, decoded.container, label.isEmpty ? nil : label]
+                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                if !parts.isEmpty {
+                    return TargetIdentity(key: "target:\(normalizedParameterValue(parts.joined(separator: " ")))", label: label.isEmpty ? "field" : label)
+                }
+            }
+            return TargetIdentity(key: "target:\(normalizedParameterValue(descriptor))", label: "field")
+        }
+        guard isTargetingEvent(event) else { return nil }
+        let label = normalizedLabel(event.text)
+        if !label.isEmpty {
+            return TargetIdentity(key: "label:\(label)@\(event.appName.lowercased())", label: label)
+        }
+        return nil
+    }
+
+    private static func isTargetingEvent(_ event: InputEvent) -> Bool {
+        switch event.kind {
+        case .click, .doubleClick, .rightClick:
+            return event.targetDescriptor?.isEmpty == false || normalizedLabel(event.text).isEmpty == false
+        case .type, .key, .scroll:
+            return false
+        }
+    }
+
+    private static func sourceEventIndices(for position: Int, in occurrence: [InputEvent], value: String?) -> [Int] {
+        guard position > 0 else { return [] }
+        let normalizedValue = normalizedParameterValue(value ?? "")
+        var sourceIndices: [Int] = []
+        for index in 0..<position {
+            let event = occurrence[index]
+            if isCopyShortcut(event) || isTargetingEvent(event) {
+                sourceIndices.append(index)
+                continue
+            }
+            if !normalizedValue.isEmpty,
+               let text = event.text,
+               normalizedParameterValue(text) == normalizedValue {
+                sourceIndices.append(index)
+            }
+        }
+        return Array(sourceIndices.suffix(4))
+    }
+
+    private static func isCopyShortcut(_ event: InputEvent) -> Bool {
+        guard event.kind == .key, ["c", "x"].contains(event.key?.lowercased() ?? "") else { return false }
+        let modifiers = event.modifiers.map { $0.lowercased() }
+        return modifiers.contains("command") || modifiers.contains("control")
+    }
+
+    private static func isPasteShortcut(_ event: InputEvent) -> Bool {
+        guard event.kind == .key, event.key?.lowercased() == "v" else { return false }
+        let modifiers = event.modifiers.map { $0.lowercased() }
+        return modifiers.contains("command") || modifiers.contains("control")
+    }
+
+    private static func dataflowParameters(in occurrence: [InputEvent]) -> [Int: InferredParameter] {
+        var inferred: [Int: InferredParameter] = [:]
+        var latestCopyIndex: Int?
+        for index in occurrence.indices {
+            let event = occurrence[index]
+            if isCopyShortcut(event) {
+                latestCopyIndex = index
+                continue
+            }
+            guard isPasteShortcut(event),
+                  let copyIndex = latestCopyIndex,
+                  copyIndex < index
+            else { continue }
+            let copyEvent = occurrence[copyIndex]
+            guard copyEvent.appName != event.appName || copyEvent.bundleIdentifier != event.bundleIdentifier else { continue }
+            inferred[index] = InferredParameter(
+                position: index,
+                parameterKey: dataflowParameterKey(copyIndex: copyIndex, pasteIndex: index, in: occurrence),
+                parameterKind: .freeText,
+                valueExamples: ["freeText:clipboard"],
+                valueHashes: [],
+                sourceEventIndices: [copyIndex],
+                transform: nil
+            )
+        }
+        return inferred
+    }
+
+    private static func dataflowParameterKey(copyIndex: Int, pasteIndex: Int, in occurrence: [InputEvent]) -> String {
+        if let destination = nearbyTargetIdentity(before: pasteIndex, in: occurrence, matchingAppOf: occurrence[pasteIndex]) {
+            return parameterKey(from: destination.label, fallbackPosition: pasteIndex)
+        }
+        if let source = nearbyTargetIdentity(before: copyIndex, in: occurrence, matchingAppOf: occurrence[copyIndex]) {
+            return parameterKey(from: source.label, fallbackPosition: pasteIndex)
+        }
+        return "copied_value"
+    }
+
+    private static func nearbyTargetIdentity(before index: Int, in occurrence: [InputEvent], matchingAppOf event: InputEvent) -> TargetIdentity? {
+        guard index > 0 else { return nil }
+        for candidateIndex in stride(from: index - 1, through: max(0, index - 4), by: -1) {
+            guard occurrence.indices.contains(candidateIndex) else { continue }
+            let candidate = occurrence[candidateIndex]
+            guard candidate.appName == event.appName, isTargetingEvent(candidate) else { continue }
+            if let identity = targetIdentity(for: candidate) {
+                return identity
+            }
+        }
+        return nil
+    }
+
+    private static func parameterKey(from label: String, fallbackPosition: Int) -> String {
+        let cleaned = label
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: "_", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        return cleaned.isEmpty ? "field_\(fallbackPosition + 1)" : String(cleaned.prefix(48))
+    }
+
+    private static func classifyParameter(_ values: [String]) -> RecipeParameterKind {
+        let cleaned = values.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return .freeText }
+        if cleaned.allSatisfy({ matches($0, #"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$"#, caseInsensitive: true) }) { return .email }
+        if cleaned.allSatisfy({ matches($0, #"^(https?://|www\.)\S+$"#, caseInsensitive: true) }) { return .url }
+        if cleaned.allSatisfy({ matches($0, #"^(\~|/|[A-Za-z]:\\|\.{1,2}/).+"#) }) { return .filePath }
+        if cleaned.allSatisfy({ matches($0, #"(\$|€|£|¥)\s*\d|\d[\d,]*(\.\d{2})?\s*(usd|cad|eur|gbp)"#, caseInsensitive: true) }) { return .currency }
+        if cleaned.allSatisfy({ matches($0, #"^\d{4}-\d{1,2}-\d{1,2}$|^\d{1,2}/\d{1,2}/\d{2,4}$|^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"#, caseInsensitive: true) }) { return .date }
+        if cleaned.allSatisfy({ matches($0, #"^[A-Z]*[-_ ]?\d[\dA-Z._ -]*$"#, caseInsensitive: true) }) { return .number }
+        if cleaned.allSatisfy({ matches($0, #"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$"#) }) { return .personName }
+        return .freeText
+    }
+
+    private static func matches(_ value: String, _ pattern: String, caseInsensitive: Bool = false) -> Bool {
+        let options: String.CompareOptions = caseInsensitive ? [.regularExpression, .caseInsensitive] : [.regularExpression]
+        return value.range(of: pattern, options: options) != nil
+    }
+
+    private static func valueShape(_ value: String, kind: RecipeParameterKind) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if kind == .freeText || PrivacyRules.isSensitiveText(trimmed) {
+            return "\(kind.rawValue):\(InputEventSanitizer.typedShape(for: trimmed))"
+        }
+        let shape = trimmed.map { character -> Character in
+            if character.isNumber { return "0" }
+            if character.isLetter { return "A" }
+            if character.isWhitespace { return " " }
+            return character
+        }
+        return "\(kind.rawValue):\(String(shape).prefix(48))"
+    }
+
+    private static func normalizedParameterValue(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Recipe construction
@@ -450,8 +935,12 @@ public struct WasteDetector: Sendable {
         // Which positions hold a typed value that CHANGES across the recorded
         // occurrences — those are parameters, not fixed content (B5/AWM). Empty for
         // the single-demonstration (Teach-once) path, which has no occurrences to diff.
-        let variablePositions = Self.variableTypePositions(allOccurrences)
+        var parameterMetadata = Self.inferredParameters(allOccurrences)
+        for (position, parameter) in Self.dataflowParameters(in: instance) where parameterMetadata[position] == nil {
+            parameterMetadata[position] = parameter
+        }
         var steps: [RecipeStep] = []
+        var eventPositionToStepOrder: [Int: Int] = [:]
         var order = 0
         var lastApp: String?
         for (position, event) in instance.enumerated() {
@@ -460,6 +949,9 @@ public struct WasteDetector: Sendable {
                 order += 1
                 lastApp = event.appName
             }
+            let parameter = parameterMetadata[position]
+            let sourceStepIDs = parameter?.sourceEventIndices.compactMap { eventPositionToStepOrder[$0] } ?? []
+            eventPositionToStepOrder[position] = order
             steps.append(RecipeStep(
                 order: order,
                 kind: Self.recipeKind(event.kind),
@@ -473,7 +965,13 @@ public struct WasteDetector: Sendable {
                 windowTitleHint: event.windowTitle,
                 ocrAnchor: Self.ocrAnchor(for: event, contexts: contexts),
                 targetDescriptor: event.targetDescriptor,
-                isParameter: variablePositions.contains(position)
+                isParameter: parameter != nil,
+                parameterKey: parameter?.parameterKey,
+                parameterKind: parameter?.parameterKind,
+                valueExamples: parameter?.valueExamples ?? [],
+                valueHashes: parameter?.valueHashes ?? [],
+                sourceStepIDs: sourceStepIDs,
+                transform: parameter?.transform
             ))
             order += 1
         }
@@ -486,6 +984,14 @@ public struct WasteDetector: Sendable {
         let surfaces = Self.orderedDistinct(instance.map(surface))
         let span = instance.last!.capturedAt.timeIntervalSince(instance.first!.capturedAt)
         let perRun = max(instance.count, Int(span.rounded()))
+        let qualityOccurrences = allOccurrences.isEmpty ? [instance] : allOccurrences
+        let quality = Self.routineQuality(
+            instance: instance,
+            occurrences: qualityOccurrences,
+            steps: steps,
+            support: occurrences,
+            estimatedSecondsPerRun: perRun
+        )
         return DetectedWaste(
             title: Self.title(apps: surfaces, steps: steps),
             apps: apps,
@@ -493,10 +999,11 @@ public struct WasteDetector: Sendable {
             estimatedSecondsPerRun: perRun,
             estimatedTotalSeconds: perRun * occurrences,
             recipe: AgentRecipe(steps: steps),
-            evidence: instance.map(\.id),
+            evidence: Self.evidenceIDs(instance: instance, allOccurrences: allOccurrences),
             confidence: min(0.95, 0.5 + Double(occurrences) * 0.12),
             signature: instance.map { Self.token($0, surface: surface($0)) }.joined(separator: "|"),
-            lastSeenAt: instance.last!.capturedAt
+            lastSeenAt: instance.last!.capturedAt,
+            quality: quality
         )
     }
 
@@ -520,6 +1027,112 @@ public struct WasteDetector: Sendable {
             return story.isEmpty ? "Repeated steps in \(app)" : "\(app): \(String(story.prefix(64)))"
         }
         return "\(apps.joined(separator: " → ")): \(String(story.prefix(48)))"
+    }
+
+    private static func routineQuality(
+        instance: [InputEvent],
+        occurrences: [[InputEvent]],
+        steps: [RecipeStep],
+        support: Int,
+        estimatedSecondsPerRun: Int
+    ) -> RoutineQuality {
+        let spans = occurrences.compactMap { occurrence -> TimeInterval? in
+            guard let first = occurrence.first?.capturedAt, let last = occurrence.last?.capturedAt else { return nil }
+            return max(0, last.timeIntervalSince(first))
+        }
+        let gaps = occurrences.flatMap { occurrence -> [TimeInterval] in
+            guard occurrence.count >= 2 else { return [] }
+            return (1..<occurrence.count).map {
+                max(0, occurrence[$0].capturedAt.timeIntervalSince(occurrence[$0 - 1].capturedAt))
+            }
+        }
+        let medianGap = median(gaps) ?? 0
+        let medianSpan = median(spans) ?? 0
+        let compactness = clamp(1.0 / (1.0 + medianGap / 30.0 + medianSpan / 300.0))
+        let supportScore = clamp(Double(support) / 5.0)
+
+        let meaningfulEvents = instance.filter { $0.kind != .scroll }
+        let deterministic = meaningfulEvents.map(determinismContribution).reduce(0, +)
+        let determinism = meaningfulEvents.isEmpty ? 0 : clamp(deterministic / Double(meaningfulEvents.count))
+
+        let parameterSteps = steps.filter(\.isParameter)
+        let typeSteps = steps.filter { $0.kind == .type }
+        let typedParameterRatio = typeSteps.isEmpty ? 0 : Double(parameterSteps.count) / Double(typeSteps.count)
+        let kindBonus = parameterSteps.map { parameterKindScore($0.parameterKind) }.reduce(0, +)
+        let parameterScore = parameterSteps.isEmpty ? 0 : clamp((typedParameterRatio + kindBonus / Double(parameterSteps.count)) / 2)
+
+        let replayability = clamp(0.45 + 0.45 * determinism + (hasCrossAppCopyPaste(steps) ? 0.10 : 0))
+        let privacyPenalty = routinePrivacyPenalty(instance: instance, steps: steps)
+        let interruptionPenalty = routineInterruptionPenalty(gaps: gaps, occurrenceCount: occurrences.count, instance: instance)
+        let activePerRunCap = max(instance.count, instance.count * 8)
+        let observedSeconds = Double(max(1, support * min(estimatedSecondsPerRun, activePerRunCap)))
+        let transferBoost = hasCrossAppCopyPaste(steps) ? 1.25 : 1.0
+        let utility = min(2.0, max(0.20, observedSeconds / 90.0)) * transferBoost * (1.0 + 0.25 * supportScore)
+
+        return RoutineQuality(
+            supportScore: supportScore,
+            compactnessScore: compactness,
+            determinismScore: determinism,
+            parameterScore: parameterScore,
+            replayabilityScore: replayability,
+            privacyPenalty: privacyPenalty,
+            interruptionPenalty: interruptionPenalty,
+            utilityScore: utility
+        )
+    }
+
+    private static func determinismContribution(_ event: InputEvent) -> Double {
+        switch event.kind {
+        case .key:
+            return (event.modifiers.contains("command") || event.modifiers.contains("control")) ? 1.0 : 0.20
+        case .click, .doubleClick, .rightClick:
+            if event.targetDescriptor?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false { return 1.0 }
+            if normalizedLabel(event.text).isEmpty == false { return 0.85 }
+            return 0.35
+        case .type:
+            return 0.50
+        case .scroll:
+            return 0.10
+        }
+    }
+
+    private static func parameterKindScore(_ kind: RecipeParameterKind?) -> Double {
+        switch kind {
+        case .date, .currency, .number, .email, .url, .filePath:
+            return 1.0
+        case .personName:
+            return 0.75
+        case .freeText:
+            return 0.30
+        case nil:
+            return 0
+        }
+    }
+
+    private static func routinePrivacyPenalty(instance: [InputEvent], steps: [RecipeStep]) -> Double {
+        var penalty = 0.0
+        for event in instance {
+            if PrivacyRules.isSensitive(appName: event.appName, bundleIdentifier: event.bundleIdentifier, windowTitle: event.windowTitle) {
+                penalty += 0.45
+            }
+            if let text = event.text, PrivacyRules.isSensitiveText(text) {
+                penalty += 0.30
+            }
+        }
+        for step in steps where step.isParameter {
+            if step.parameterKind == .freeText { penalty += 0.20 }
+            if let key = step.parameterKey, PrivacyRules.isSensitiveText(key) { penalty += 0.25 }
+        }
+        return clamp(penalty)
+    }
+
+    private static func routineInterruptionPenalty(gaps: [TimeInterval], occurrenceCount: Int, instance: [InputEvent]) -> Double {
+        guard !gaps.isEmpty else { return 0 }
+        let longGapRatio = Double(gaps.count { $0 > 45 }) / Double(gaps.count)
+        let scrollRatio = Double(instance.count { $0.kind == .scroll }) / Double(max(1, instance.count))
+        let noisyRatio = Double(instance.count { isNoisyApp(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier) }) / Double(max(1, instance.count))
+        let supportPenalty = occurrenceCount <= 1 ? 0.20 : 0
+        return clamp(longGapRatio * 0.55 + scrollRatio * 0.25 + noisyRatio * 0.35 + supportPenalty)
     }
 
     // MARK: - Helpers
@@ -749,6 +1362,17 @@ public struct WasteDetector: Sendable {
         return event.windowTitle
     }
 
+    private static func evidenceIDs(instance: [InputEvent], allOccurrences: [[InputEvent]]) -> [Int64] {
+        let source = allOccurrences.isEmpty ? [instance] : allOccurrences
+        var seen = Set<Int64>()
+        var ids: [Int64] = []
+        for id in source.flatMap({ $0.map(\.id) }) where !seen.contains(id) {
+            seen.insert(id)
+            ids.append(id)
+        }
+        return ids
+    }
+
     private static func orderedDistinct(_ values: [String]) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
@@ -757,5 +1381,31 @@ public struct WasteDetector: Sendable {
             result.append(value)
         }
         return result
+    }
+
+    static func median(_ values: [TimeInterval]) -> TimeInterval? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
+    }
+
+    private static func clamp(_ value: Double, lower: Double = 0, upper: Double = 1) -> Double {
+        min(upper, max(lower, value))
+    }
+}
+
+private extension Array where Element: Equatable {
+    func isSubsequence(of other: [Element]) -> Bool {
+        guard !isEmpty else { return true }
+        var cursor = startIndex
+        for element in other where self[cursor] == element {
+            formIndex(after: &cursor)
+            if cursor == endIndex { return true }
+        }
+        return false
     }
 }

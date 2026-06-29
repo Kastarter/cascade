@@ -493,6 +493,17 @@ public enum RecipeStepKind: String, Codable, Sendable {
     case scroll
 }
 
+public enum RecipeParameterKind: String, Codable, Sendable {
+    case date
+    case currency
+    case number
+    case email
+    case url
+    case filePath
+    case personName
+    case freeText
+}
+
 /// One step of an agent recipe, derived from the user's recorded actions. The
 /// `ocrAnchor` is text seen near a click so the deploy loop can re-locate the
 /// target instead of trusting a stale coordinate.
@@ -519,6 +530,24 @@ public struct RecipeStep: Codable, Equatable, Sendable {
     /// CURRENT value, never blindly retype the recorded one; the curator goal is
     /// written parameter-aware so it does. `false` for fixed steps and old recipes.
     public let isParameter: Bool
+    /// Stable field key for a parameterized step, e.g. `invoice_number`.
+    /// Additive and optional so old recipes decode without migration.
+    public let parameterKey: String?
+    public let parameterKind: RecipeParameterKind?
+    /// Privacy-safe value shapes/examples, never raw typed values.
+    public let valueExamples: [String]
+    /// Short stable hashes of raw values for equivalence without disclosure.
+    public let valueHashes: [String]
+    /// Recipe step orders that supplied or selected this value before it was typed.
+    public let sourceStepIDs: [Int]
+    /// Simple data transform evidence when known, e.g. `trim`.
+    public let transform: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case order, kind, x, y, text, key, modifiers, appName, bundleIdentifier
+        case windowTitleHint, ocrAnchor, targetDescriptor, isParameter
+        case parameterKey, parameterKind, valueExamples, valueHashes, sourceStepIDs, transform
+    }
 
     public init(
         order: Int,
@@ -533,7 +562,13 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         windowTitleHint: String? = nil,
         ocrAnchor: String? = nil,
         targetDescriptor: String? = nil,
-        isParameter: Bool = false
+        isParameter: Bool = false,
+        parameterKey: String? = nil,
+        parameterKind: RecipeParameterKind? = nil,
+        valueExamples: [String] = [],
+        valueHashes: [String] = [],
+        sourceStepIDs: [Int] = [],
+        transform: String? = nil
     ) {
         self.order = order
         self.kind = kind
@@ -548,6 +583,35 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         self.ocrAnchor = ocrAnchor
         self.targetDescriptor = targetDescriptor
         self.isParameter = isParameter
+        self.parameterKey = parameterKey
+        self.parameterKind = parameterKind
+        self.valueExamples = valueExamples
+        self.valueHashes = valueHashes
+        self.sourceStepIDs = sourceStepIDs
+        self.transform = transform
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.order = try container.decode(Int.self, forKey: .order)
+        self.kind = try container.decode(RecipeStepKind.self, forKey: .kind)
+        self.x = try container.decodeIfPresent(Double.self, forKey: .x)
+        self.y = try container.decodeIfPresent(Double.self, forKey: .y)
+        self.text = try container.decodeIfPresent(String.self, forKey: .text)
+        self.key = try container.decodeIfPresent(String.self, forKey: .key)
+        self.modifiers = try container.decodeIfPresent([String].self, forKey: .modifiers) ?? []
+        self.appName = try container.decode(String.self, forKey: .appName)
+        self.bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier)
+        self.windowTitleHint = try container.decodeIfPresent(String.self, forKey: .windowTitleHint)
+        self.ocrAnchor = try container.decodeIfPresent(String.self, forKey: .ocrAnchor)
+        self.targetDescriptor = try container.decodeIfPresent(String.self, forKey: .targetDescriptor)
+        self.isParameter = try container.decodeIfPresent(Bool.self, forKey: .isParameter) ?? false
+        self.parameterKey = try container.decodeIfPresent(String.self, forKey: .parameterKey)
+        self.parameterKind = try container.decodeIfPresent(RecipeParameterKind.self, forKey: .parameterKind)
+        self.valueExamples = try container.decodeIfPresent([String].self, forKey: .valueExamples) ?? []
+        self.valueHashes = try container.decodeIfPresent([String].self, forKey: .valueHashes) ?? []
+        self.sourceStepIDs = try container.decodeIfPresent([Int].self, forKey: .sourceStepIDs) ?? []
+        self.transform = try container.decodeIfPresent(String.self, forKey: .transform)
     }
 }
 

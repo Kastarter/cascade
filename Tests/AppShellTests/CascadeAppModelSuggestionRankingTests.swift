@@ -34,15 +34,15 @@ private func makeRankingModel(curatorReply: String) throws -> (model: CascadeApp
 private func rankingWorkflowEvents() -> [InputEvent] {
     var events: [InputEvent] = []
     var i = 0
-    func at() -> Date { rankingBase.addingTimeInterval(Double(i) * 4) }
-    func appendRun(app: String, first: String, second: String) {
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: first, appName: app)); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "a", modifiers: ["command"], appName: app)); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 30, y: 30, text: second, appName: app)); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "Return", modifiers: ["command"], appName: app)); i += 1
+    func appendRun(run: Int, app: String, first: String, second: String) {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: first, appName: app)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start + 10), kind: .key, key: "a", modifiers: ["command"], appName: app)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start + 20), kind: .click, x: 30, y: 30, text: second, appName: app)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start + 30), kind: .key, key: "Return", modifiers: ["command"], appName: app)); i += 1
     }
-    for _ in 0..<3 { appendRun(app: "Safari", first: "Refund", second: "Send") }
-    for _ in 0..<3 { appendRun(app: "Mail", first: "Invoice", second: "Archive") }
+    for run in 0..<3 { appendRun(run: run, app: "Safari", first: "Refund", second: "Send") }
+    for run in 3..<6 { appendRun(run: run, app: "Mail", first: "Invoice", second: "Archive") }
     return events
 }
 
@@ -86,9 +86,10 @@ private func waitForRanking(_ condition: () -> Bool, maxTries: Int = 500) async 
 }
 
 @MainActor @Test
-func defaultOffRefreshPreservesCuratedOrder() async throws {
-    let (model, store, _) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
+func explicitOptOutRefreshPreservesCuratedOrderAndDisablesProactiveOffer() async throws {
+    let (model, store, defaults) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
     try await store.insertInputEvents(rankingWorkflowEvents())
+    defaults.set(false, forKey: CascadeAppModel.experimentalSuggestionRankingKey)
 
     await model.refreshAll()
     let firstOrder = model.curatedWaste.map(\.signature)
@@ -100,8 +101,8 @@ func defaultOffRefreshPreservesCuratedOrder() async throws {
 }
 
 @MainActor @Test
-func optInRefreshRanksAcceptedAboveDeclinedWithoutSuppressingCandidates() async throws {
-    let (model, store, defaults) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
+func defaultRefreshRanksAcceptedAndKeepsDeclinedOutOfReviewQueue() async throws {
+    let (model, store, _) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
     try await store.insertInputEvents(rankingWorkflowEvents())
     await model.refreshAll()
     let original = model.curatedWaste
@@ -112,22 +113,20 @@ func optInRefreshRanksAcceptedAboveDeclinedWithoutSuppressingCandidates() async 
     model.approveCurated(accepted)
     try await waitForRanking { model.agents.contains { $0.signature == accepted.signature } }
     model.declineCurated(declined)
-    defaults.set(true, forKey: CascadeAppModel.experimentalSuggestionRankingKey)
 
     await model.refreshAll()
     let ranked = model.curatedWaste.map(\.signature)
 
-    #expect(ranked.count == 2)
+    #expect(model.detectedWaste.map(\.signature).contains(declined.signature))
+    #expect(ranked.count == 1)
     #expect(ranked.first == accepted.signature)
-    #expect(ranked.last == declined.signature)
-    #expect(ranked.contains(declined.signature))
+    #expect(!ranked.contains(declined.signature))
 }
 
 @MainActor @Test
-func optInRefreshSurfacesDismissibleProactiveNextActionOffer() async throws {
+func defaultRefreshSurfacesDismissibleProactiveNextActionOffer() async throws {
     let (model, store, defaults) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
     try await store.insertInputEvents(rankingWorkflowEvents())
-    defaults.set(true, forKey: CascadeAppModel.experimentalSuggestionRankingKey)
 
     await model.refreshAll()
     let offer = try #require(model.proactiveNextActionOffer)
@@ -142,11 +141,10 @@ func optInRefreshSurfacesDismissibleProactiveNextActionOffer() async throws {
 }
 
 @MainActor @Test
-func optInProactiveNextActionOfferUsesDescriptorHumanLabel() async throws {
-    let (model, store, defaults) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
+func defaultProactiveNextActionOfferUsesDescriptorHumanLabel() async throws {
+    let (model, store, _) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
     let fixture = try descriptorBackedRankingEvents()
     try await store.insertInputEvents(fixture.events)
-    defaults.set(true, forKey: CascadeAppModel.experimentalSuggestionRankingKey)
 
     await model.refreshAll()
     let offer = try #require(model.proactiveNextActionOffer)
