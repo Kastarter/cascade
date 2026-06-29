@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 
 public protocol SemanticEmbeddingProvider: Sendable {
     var metadata: SemanticEmbeddingModelMetadata { get }
@@ -129,6 +130,82 @@ public enum SemanticEmbeddingText {
             hash &*= 0x100000001b3
         }
         return hash
+    }
+}
+
+/// Reusable local semantic vectors backed by Apple's on-device English
+/// `NLEmbedding` word vectors. This intentionally preserves the existing recall
+/// behavior from `SemanticIndex`: trim to the first 1,000 characters, tokenize as
+/// words, average available word vectors, and use cosine scoring over raw floats.
+public enum LocalSemanticVector {
+    public static let maxCharacters = 1_000
+    public static let modelID = "apple.nl.embedding.word.english.average.v1"
+    public static let fallbackDimension = 300
+
+    public static var metadata: SemanticEmbeddingModelMetadata {
+        SemanticEmbeddingModelMetadata(
+            modelID: modelID,
+            dimension: fallbackDimension,
+            distanceMetric: .cosine
+        )
+    }
+
+    public static func normalizedText(_ text: String) -> String {
+        SemanticEmbeddingText.normalized(String(text.prefix(maxCharacters)))
+    }
+
+    public static func cacheKey(for text: String) -> String {
+        metadata.cacheKey(forNormalizedTextHash: SemanticEmbeddingText.stableHashHex(forNormalizedText: normalizedText(text)))
+    }
+
+    public static func vector(for text: String) -> [Float]? {
+        let trimmed = String(text.prefix(maxCharacters)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let embedding = NLEmbedding.wordEmbedding(for: .english) else { return nil }
+
+        var sum = [Double](repeating: 0, count: embedding.dimension)
+        var words = 0
+        let tokenizer = NLTokenizer(unit: .word)
+        tokenizer.string = trimmed
+        tokenizer.enumerateTokens(in: trimmed.startIndex..<trimmed.endIndex) { range, _ in
+            if let wordVector = embedding.vector(for: String(trimmed[range]).lowercased()) {
+                for index in wordVector.indices {
+                    sum[index] += wordVector[index]
+                }
+                words += 1
+            }
+            return true
+        }
+        guard words > 0 else { return nil }
+        return sum.map { Float($0 / Double(words)) }
+    }
+
+    public static func cosine(_ lhs: [Float], _ rhs: [Float]) -> Float {
+        VectorDistanceMetric.cosineSimilarity(lhs, rhs)
+    }
+
+    public static func rankScore(query: [Float], candidate: [Float]) -> Float {
+        VectorDistanceMetric.cosine.rankScore(query: query, candidate: candidate)
+    }
+
+    public static func blob(from vector: [Float]) -> Data {
+        vector.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    public static func vector(from blob: Data) -> [Float] {
+        blob.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+}
+
+public struct LocalSemanticEmbeddingProvider: SemanticEmbeddingProvider {
+    public let metadata: SemanticEmbeddingModelMetadata
+
+    public init(metadata: SemanticEmbeddingModelMetadata = LocalSemanticVector.metadata) {
+        self.metadata = metadata
+    }
+
+    public func embedding(for text: String) async throws -> [Float]? {
+        LocalSemanticVector.vector(for: text)
     }
 }
 

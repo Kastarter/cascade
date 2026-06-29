@@ -73,3 +73,41 @@ func fallbackOutputIsDeterministicAcrossProviderInstances() async throws {
     #expect(first == second)
     #expect(firstProvider.metadata.cacheKey(forText: "Manager review calibration") == secondProvider.metadata.cacheKey(forText: "Manager review calibration"))
 }
+
+@Test
+func localSemanticVectorNormalizesAndKeysDeterministically() {
+    let first = LocalSemanticVector.normalizedText("  Résumé  Project — Alpha!  ")
+    let second = LocalSemanticVector.normalizedText("resume project alpha")
+
+    #expect(first == "resume project alpha")
+    #expect(first == second)
+    #expect(LocalSemanticVector.cacheKey(for: "Résumé Project Alpha") == LocalSemanticVector.cacheKey(for: "resume project alpha"))
+}
+
+@Test
+func localSemanticVectorCosineAndBlobRoundTrip() {
+    let query: [Float] = [1, 0, 0]
+    let near: [Float] = [0.9, 0.1, 0]
+    let far: [Float] = [0, 1, 0]
+    let blob = LocalSemanticVector.blob(from: near)
+
+    #expect(LocalSemanticVector.vector(from: blob) == near)
+    #expect(LocalSemanticVector.cosine(query, near) > LocalSemanticVector.cosine(query, far))
+    #expect(LocalSemanticVector.rankScore(query: query, candidate: near) > LocalSemanticVector.rankScore(query: query, candidate: far))
+}
+
+@Test
+func localSemanticVectorReturnsNilForEmptyText() async throws {
+    let provider = LocalSemanticEmbeddingProvider()
+
+    #expect(LocalSemanticVector.vector(for: " \n\t ") == nil)
+    #expect(try await provider.embedding(for: " \n\t ") == nil)
+}
+
+@Test
+func localSemanticProviderWrapsSyncHelper() async throws {
+    let provider = LocalSemanticEmbeddingProvider()
+    let text = "Quarterly planning review"
+
+    #expect(try await provider.embedding(for: text) == LocalSemanticVector.vector(for: text))
+}

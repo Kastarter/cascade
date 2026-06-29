@@ -182,6 +182,13 @@ public enum CUStreamItem: Sendable {
 @MainActor
 public final class ComputerUseAgent {
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "computeruse")
+    public typealias GroundingCacheKeyProvider = @Sendable (
+        _ frame: Data,
+        _ target: String,
+        _ displayWidthPoints: Int,
+        _ displayHeightPoints: Int,
+        _ mode: GroundingCacheMode
+    ) async -> GroundingCacheKey?
 
     private let keyStore: AnthropicKeyStore
     private let model: String
@@ -241,6 +248,8 @@ public final class ComputerUseAgent {
     /// so behaviour is unchanged. See [[cascade-cu-downgrade-research]].
     private let grounder: VisualGrounder?
     private let groundingCropProvider: (@Sendable (CGRect, Int, Int) async -> GroundingCrop?)?
+    private let groundingCache: GroundingCache?
+    private let groundingCacheKeyProvider: GroundingCacheKeyProvider?
 
     /// How the model points at things on screen.
     /// - `.coordinate`: the proven default — the model drives the screen with
@@ -567,6 +576,8 @@ public final class ComputerUseAgent {
         grounder: VisualGrounder? = nil,
         groundingMode: GroundingMode = .coordinate,
         groundingCropProvider: (@Sendable (CGRect, Int, Int) async -> GroundingCrop?)? = nil,
+        groundingCache: GroundingCache? = nil,
+        groundingCacheKeyProvider: GroundingCacheKeyProvider? = nil,
         actionCritic: (any ActionCritic)? = nil
     ) {
         self.keyStore = keyStore
@@ -584,6 +595,8 @@ public final class ComputerUseAgent {
         self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
         self.grounder = grounder
         self.groundingCropProvider = groundingCropProvider
+        self.groundingCache = groundingCache
+        self.groundingCacheKeyProvider = groundingCacheKeyProvider
         self.actionCritic = actionCritic
         // Structural grounding needs a grounder to act on named targets; without
         // one, fall back to the coordinate computer tool so the agent still works.
@@ -1176,19 +1189,73 @@ public final class ComputerUseAgent {
         options: GroundingRequestOptions = .default
     ) async -> GroundingResult {
         if let cache, let cached = cache[target] { return cached }
+        let cacheKey = await persistentGroundingCacheKey(target: target, frame: frame)
+        if let lookup = await groundingCache?.lookup(cacheKey) {
+            switch lookup {
+            case .hit(let result):
+                return result
+            case .miss:
+                return GroundingResult()
+            }
+        }
         let result = await grounder?.groundResult(
             screenshot: frame, target: target,
             displayWidthPoints: displayW, displayHeightPoints: displayH,
             options: options
         ) ?? GroundingResult()
+        let resolved: GroundingResult
         if let correction = await cursorCorrectionGrounding(target: target, frame: frame, firstResult: result, options: options) {
-            return correction
+            resolved = correction
+        } else if Self.shouldRetryGrounding(result),
+                  let retry = await cropRetryGrounding(target: target, frame: frame, firstResult: result, options: options) {
+            resolved = retry
+        } else {
+            resolved = result
         }
-        guard Self.shouldRetryGrounding(result),
-              let retry = await cropRetryGrounding(target: target, frame: frame, firstResult: result, options: options) else {
-            return result
+        await storePersistentGroundingCacheResult(resolved, key: cacheKey)
+        return resolved
+    }
+
+    private func persistentGroundingCacheKey(target: String, frame: Data) async -> GroundingCacheKey? {
+        guard groundingCache != nil, let groundingCacheKeyProvider else { return nil }
+        let mode: GroundingCacheMode = groundingMode == .structural ? .structural : .coordinate
+        return await groundingCacheKeyProvider(frame, target, displayW, displayH, mode)
+    }
+
+    private func storePersistentGroundingCacheResult(_ result: GroundingResult, key: GroundingCacheKey?) async {
+        guard let groundingCache else { return }
+        if result.selectedPoint != nil {
+            await groundingCache.store(Self.cachedGroundingResult(result), for: key)
+        } else {
+            await groundingCache.storeMiss(for: key)
         }
-        return retry
+    }
+
+    private static func cachedGroundingResult(_ result: GroundingResult) -> GroundingResult {
+        GroundingResult(
+            candidates: result.candidates.map { candidate in
+                GroundingCandidate(
+                    point: candidate.point,
+                    region: candidate.region,
+                    confidence: candidate.confidence,
+                    source: .cache,
+                    coordinateSpace: candidate.coordinateSpace,
+                    rawModel: candidate.rawModel,
+                    latency: candidate.latency,
+                    dispersion: candidate.dispersion,
+                    reason: candidate.reason ?? "cached \(candidate.source.rawValue) candidate",
+                    candidateID: candidate.candidateID,
+                    markNumber: candidate.markNumber,
+                    displayBounds: candidate.displayBounds,
+                    imageBounds: candidate.imageBounds
+                )
+            },
+            selectedIndex: result.selectedIndex,
+            selectedCandidateID: result.selectedCandidateID,
+            verifierVerdict: result.verifierVerdict,
+            verifierFailureKind: result.verifierFailureKind,
+            alternativeCount: result.alternativeCount
+        )
     }
 
     private func cropRetryGrounding(

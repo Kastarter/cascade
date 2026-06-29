@@ -504,6 +504,7 @@ public final class CascadeAppModel: ObservableObject {
     private let learnedSkillDirectory: URL?
     private let modelCallCache: ModelCallCache?
     private let groundingCache: GroundingCache?
+    private let recipeTargetCache = RecipeTargetCache()
     private let experimentalStructuredContent: Bool
     private let experimentalWorkGraphIndex: Bool
     private let visualGrounderOverride: (any VisualGrounder)?
@@ -2376,7 +2377,7 @@ public final class CascadeAppModel: ObservableObject {
         // the runtime grounds each — the model never emits pixel coordinates. The
         // proven coordinate computer-tool path runs whenever no grounder is present
         // (no OpenRouter key) or the user opts out, so existing behaviour is intact.
-        let grounder = assistGrounder()
+        let grounder = assistGrounder(ownsGroundingCache: false)
         let mode: ComputerUseAgent.GroundingMode =
             (grounder != nil && Self.structuralGroundingEnabled()) ? .structural : .coordinate
         let agent = ComputerUseAgent(
@@ -2399,6 +2400,8 @@ public final class CascadeAppModel: ObservableObject {
             grounder: grounder,
             groundingMode: mode,
             groundingCropProvider: Self.assistGroundingCropProvider(),
+            groundingCache: groundingCache,
+            groundingCacheKeyProvider: Self.assistGroundingCacheKeyProvider(),
             actionCritic: assistActionCritic()
         )
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
@@ -2428,6 +2431,24 @@ public final class CascadeAppModel: ObservableObject {
                 return nil
             }
             return GroundingCrop(screenshot: jpeg, displayBounds: rect)
+        }
+    }
+
+    private static func assistGroundingCacheKeyProvider() -> ComputerUseAgent.GroundingCacheKeyProvider {
+        { frame, target, displayWidthPoints, displayHeightPoints, mode in
+            guard let gridHashes = Self.gridHashes(ofJPEG: frame) else { return nil }
+            let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
+            return GroundingCacheKey(
+                targetText: target,
+                appName: snapshot.appName,
+                bundleIdentifier: snapshot.bundleIdentifier,
+                windowTitle: snapshot.windowTitle,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                screenHash: PerceptualHash.combinedHash(gridHashes),
+                gridHashes: gridHashes,
+                mode: mode
+            )
         }
     }
 
@@ -2568,7 +2589,7 @@ public final class CascadeAppModel: ObservableObject {
     /// canvas/custom elements fall through to the visual model. Instance method so it
     /// can pass the live `appSkills` registry (the mixture grounder skips AX on the
     /// apps that registry flags `axUnreliable`).
-    func assistGrounder() -> VisualGrounder? {
+    func assistGrounder(ownsGroundingCache: Bool = true) -> VisualGrounder? {
         let d = defaultsStore
         // Default ON: unset → enabled; explicit false → disabled.
         let enabled = (d.object(forKey: "cascade.visualGrounder") as? Bool) ?? true
@@ -2599,7 +2620,7 @@ public final class CascadeAppModel: ObservableObject {
             verifyCandidates: verifyCandidates,
             previousAnchor: previousGroundingAnchor,
             candidateFailureCounts: groundingCandidateFailureCounts,
-            groundingCache: groundingCache,
+            groundingCache: ownsGroundingCache ? groundingCache : nil,
             cacheMode: Self.structuralGroundingEnabled() ? .structural : .coordinate,
             onRuntimeProfile: { [store = self.store, profileBuffer = self.episodeSparseAXProfiles] profile in
                 profileBuffer.record(profile)
@@ -3655,7 +3676,6 @@ public final class CascadeAppModel: ObservableObject {
             matching: AgentExperienceQuery(outcome: .success),
             limit: 80
         )) ?? []
-        guard !successes.isEmpty else { return nil }
         let agents = (try? await store.agents()) ?? []
         guard !agents.isEmpty else { return nil }
 
@@ -3674,18 +3694,56 @@ public final class CascadeAppModel: ObservableObject {
                 experiences: [experience]
             )
         }
-        guard let sketch = builder.rank(sketches, appName: frontmostApp, goal: goal).first else { return nil }
-        let score = sketch.relevanceScore(appName: frontmostApp, goal: goal)
-        guard score > 0.05 else { return nil }
+        var candidates: [(id: String, appName: String, promptText: String, actionCount: Int, anchorCount: Int, checkCount: Int, score: Double)] = []
+        for sketch in builder.rank(sketches, appName: frontmostApp, goal: goal) {
+            candidates.append((
+                id: sketch.id,
+                appName: sketch.appName,
+                promptText: sketch.promptText,
+                actionCount: sketch.firstActions.count,
+                anchorCount: sketch.safeAnchors.count,
+                checkCount: sketch.expectedChecks.count,
+                score: sketch.relevanceScore(appName: frontmostApp, goal: goal)
+            ))
+        }
+        let queryTokens = Set(TrajectorySketch.normalizedGoalTokens(from: goal))
+        for agent in agents where !PrivacyRules.isSensitiveText(agent.name) && agent.goal.map(PrivacyRules.isSensitiveText) != true {
+            for demo in agent.demoSketches {
+                candidates.append((
+                    id: demo.id,
+                    appName: demo.appName,
+                    promptText: demo.promptText,
+                    actionCount: demo.actionCount,
+                    anchorCount: demo.anchorCount,
+                    checkCount: demo.checkCount,
+                    score: demo.relevanceScore(appName: frontmostApp, goalTokens: queryTokens)
+                ))
+            }
+        }
+        guard let selected = candidates
+            .filter({ $0.score > 0.05 })
+            .sorted(by: { lhs, rhs in
+                if lhs.score == rhs.score { return lhs.id < rhs.id }
+                return lhs.score > rhs.score
+            })
+            .first
+        else { return nil }
         _ = try? await store.appendAudit(AuditEvent(
             actor: "agent",
             action: "agent.trajectory_sketch",
-            detail: Self.trajectorySketchAuditDetail(sketch: sketch, score: score)
+            detail: Self.trajectorySketchAuditDetail(
+                sketchID: selected.id,
+                appName: selected.appName,
+                actionCount: selected.actionCount,
+                anchorCount: selected.anchorCount,
+                checkCount: selected.checkCount,
+                score: selected.score
+            )
         ))
         return """
         PRIOR SUCCESSFUL LOCAL DEMO
         Use this compact replay sketch as a hint, not as proof. Re-ground each target on the live screen before acting.
-        \(String(sketch.promptText.prefix(1200)))
+        \(String(selected.promptText.prefix(1200)))
         """
     }
 
@@ -4123,13 +4181,31 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     nonisolated static func trajectorySketchAuditDetail(sketch: TrajectorySketch, score: Double) -> String {
+        trajectorySketchAuditDetail(
+            sketchID: sketch.id,
+            appName: sketch.appName,
+            actionCount: sketch.firstActions.count,
+            anchorCount: sketch.safeAnchors.count,
+            checkCount: sketch.expectedChecks.count,
+            score: score
+        )
+    }
+
+    nonisolated static func trajectorySketchAuditDetail(
+        sketchID: String,
+        appName: String,
+        actionCount: Int,
+        anchorCount: Int,
+        checkCount: Int,
+        score: Double
+    ) -> String {
         [
             "score=\(String(format: "%.2f", score))",
-            "sketchHash=\(auditHash(sketch.id))",
-            "appHash=\(auditHash(sketch.appName))",
-            "actionCount=\(sketch.firstActions.count)",
-            "anchorCount=\(sketch.safeAnchors.count)",
-            "checkCount=\(sketch.expectedChecks.count)",
+            "sketchHash=\(auditHash(sketchID))",
+            "appHash=\(auditHash(appName))",
+            "actionCount=\(actionCount)",
+            "anchorCount=\(anchorCount)",
+            "checkCount=\(checkCount)",
         ].joined(separator: " ")
     }
 
@@ -4440,17 +4516,28 @@ public final class CascadeAppModel: ObservableObject {
             textAuditDetail("app", step.appName),
             "hasPoint=\(step.x != nil && step.y != nil)",
             "isParameter=\(step.isParameter)",
+            "actionKeyHash=\(step.idempotentActionKeyHash)",
         ]
         if let tier { parts.append("tier=\(safeAuditToken(tier))") }
         if let bundleIdentifier = step.bundleIdentifier { parts.append(textAuditDetail("bundle", bundleIdentifier)) }
         if let windowTitleHint = step.windowTitleHint { parts.append(textAuditDetail("window", windowTitleHint)) }
-        if let text = step.text { parts.append(textAuditDetail("text", text)) }
-        if let ocrAnchor = step.ocrAnchor { parts.append(textAuditDetail("anchor", ocrAnchor)) }
-        if let targetDescriptor = step.targetDescriptor { parts.append(textAuditDetail("targetDescriptor", targetDescriptor)) }
-        if let key = step.key { parts.append("key=\(safeAuditToken(key))") }
-        if !step.modifiers.isEmpty {
-            parts.append("modifiers=\(step.modifiers.map(safeAuditToken).joined(separator: "+"))")
-        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func recipeTargetCacheAuditDetail(
+        step: RecipeStep,
+        tier: RecipeTargetCacheTier? = nil,
+        reason: String? = nil,
+        confidence: Double? = nil
+    ) -> String {
+        var parts = [
+            "step=\(step.order)",
+            "kind=\(safeAuditToken(step.kind.rawValue))",
+            "actionKeyHash=\(step.idempotentActionKeyHash)",
+        ]
+        if let tier { parts.append("tier=\(safeAuditToken(tier.rawValue))") }
+        if let reason { parts.append("reason=\(safeAuditToken(reason))") }
+        if let confidence { parts.append("confidence=\(String(format: "%.2f", confidence))") }
         return parts.joined(separator: " ")
     }
 
@@ -6777,12 +6864,55 @@ public final class CascadeAppModel: ObservableObject {
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
                     let recorded = CGPoint(x: x, y: y)
                     // Canvas apps (Blender) have an AX tree that never reflects
-                    // their visible UI — the skill flags them so replay skips the
-                    // AX tier and fingerprint verification instead of false-pausing.
-                    let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
-                    let axUnreliable = stepSkill?.axUnreliable == true
-                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
-                    // recorded AX label in the live tree. Tier 2 (ocr): B4's ON-DEVICE
+	                    // their visible UI — the skill flags them so replay skips the
+	                    // AX tier and fingerprint verification instead of false-pausing.
+	                    let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
+	                    let axUnreliable = stepSkill?.axUnreliable == true
+	                    let cacheSkipReason = Self.recipeTargetCacheSkipReason(step: step, axUnreliable: axUnreliable)
+	                    let cacheInitialFingerprint = cacheSkipReason == nil ? await Self.uiFingerprint() : 0
+	                    let targetCacheContext: RecipeTargetCacheContext?
+	                    if let cacheSkipReason {
+	                        targetCacheContext = nil
+	                        _ = try? await store.appendAudit(AuditEvent(
+	                            actor: "agent",
+	                            action: "recipe.target_cache.skipped_sensitive",
+	                            detail: Self.recipeTargetCacheAuditDetail(step: step, reason: cacheSkipReason)
+	                        ))
+	                    } else {
+	                        targetCacheContext = await recipeTargetCacheContext(for: step, stateFingerprint: cacheInitialFingerprint)
+	                    }
+	                    if let targetCacheContext,
+	                       let cached = await recipeTargetCache.lookup(targetCacheContext) {
+	                        try await driver.act(.computerUse(.move(x: cached.point.x, y: cached.point.y)))
+	                        try? await Task.sleep(for: .milliseconds(320))
+	                        try await clickAction(step, at: cached.point)
+	                        if await Self.uiChanged(after: cacheInitialFingerprint) {
+	                            _ = await recipeTargetCache.promote(targetCacheContext, point: cached.point, tier: cached.tier)
+	                            unverifiedStreak = 0
+	                            _ = try? await store.appendAudit(AuditEvent(
+	                                actor: "agent",
+	                                action: "recipe.target_cache.hit",
+	                                detail: Self.recipeTargetCacheAuditDetail(step: step, tier: cached.tier, confidence: cached.confidence)
+	                            ))
+	                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+	                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "cache")))
+	                            try? await Task.sleep(for: .milliseconds(500))
+	                            continue
+	                        }
+	                        let demoted = await recipeTargetCache.demote(targetCacheContext)
+	                        _ = try? await store.appendAudit(AuditEvent(
+	                            actor: "agent",
+	                            action: "recipe.target_cache.demote",
+	                            detail: Self.recipeTargetCacheAuditDetail(
+	                                step: step,
+	                                tier: cached.tier,
+	                                reason: "no_effect",
+	                                confidence: demoted?.confidence
+	                            )
+	                        ))
+	                    }
+	                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
+	                    // recorded AX label in the live tree. Tier 2 (ocr): B4's ON-DEVICE
                     // OCR grounder — find the recorded target's text on the live frame
                     // via Apple Vision, no model round-trip, and it sees canvas/Electron
                     // text the AX tree can't. Tier 3 (vision): Claude vision via the OCR
@@ -6823,18 +6953,35 @@ public final class CascadeAppModel: ObservableObject {
                             verifyUnavailableLogged = true
                             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
                         }
-                        try await clickAction(step, at: target)
-                        if await Self.uiChanged(after: before) {
-                            unverifiedStreak = 0
-                        } else {
-                            // One corrective retry at the recorded coordinate (if the
-                            // resolved target differed), then count the step unverified.
-                            if target != recorded {
-                                try await clickAction(step, at: recorded)
-                            }
-                            if await Self.uiChanged(after: before) {
-                                unverifiedStreak = 0
-                            } else {
+	                        try await clickAction(step, at: target)
+	                        if await Self.uiChanged(after: before) {
+	                            unverifiedStreak = 0
+	                            if let targetCacheContext,
+	                               let cacheTier = RecipeTargetCacheTier(rawValue: tier) {
+	                                let promoted = await recipeTargetCache.promote(targetCacheContext, point: target, tier: cacheTier)
+	                                _ = try? await store.appendAudit(AuditEvent(
+	                                    actor: "agent",
+	                                    action: "recipe.target_cache.promote",
+	                                    detail: Self.recipeTargetCacheAuditDetail(step: step, tier: cacheTier, confidence: promoted.confidence)
+	                                ))
+	                            }
+	                        } else {
+	                            // One corrective retry at the recorded coordinate (if the
+	                            // resolved target differed), then count the step unverified.
+	                            if target != recorded {
+	                                try await clickAction(step, at: recorded)
+	                            }
+	                            if await Self.uiChanged(after: before) {
+	                                unverifiedStreak = 0
+	                                if let targetCacheContext {
+	                                    let promoted = await recipeTargetCache.promote(targetCacheContext, point: recorded, tier: .recorded)
+	                                    _ = try? await store.appendAudit(AuditEvent(
+	                                        actor: "agent",
+	                                        action: "recipe.target_cache.promote",
+	                                        detail: Self.recipeTargetCacheAuditDetail(step: step, tier: .recorded, confidence: promoted.confidence)
+	                                    ))
+	                                }
+	                            } else {
                                 unverifiedStreak += 1
                                 let recovery = Self.recoveryAction(for: .noEffect, attempt: unverifiedStreak)
                                 _ = try? await store.appendAudit(AuditEvent(
@@ -7029,6 +7176,36 @@ public final class CascadeAppModel: ObservableObject {
             if await uiFingerprint() != before { return true }
         }
         return false
+    }
+
+    private func recipeTargetCacheContext(for step: RecipeStep, stateFingerprint: Int) async -> RecipeTargetCacheContext {
+        let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
+        return RecipeTargetCacheContext(
+            actionKey: step.idempotentActionKey,
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier ?? step.bundleIdentifier,
+            windowTitle: snapshot.windowTitle ?? step.windowTitleHint,
+            stateFingerprint: String(stateFingerprint)
+        )
+    }
+
+    nonisolated static func recipeTargetCacheSkipReason(step: RecipeStep, axUnreliable: Bool) -> String? {
+        if axUnreliable { return "ax_unreliable" }
+        if PrivacyRules.isSensitive(
+            appName: step.appName,
+            bundleIdentifier: step.bundleIdentifier,
+            windowTitle: step.windowTitleHint
+        ) {
+            return "sensitive"
+        }
+        let identityText = [
+            step.kind == .type ? nil : step.text,
+            step.ocrAnchor,
+            step.targetDescriptor,
+            step.parameterKey,
+            step.windowTitleHint,
+        ].compactMap { $0 }.joined(separator: " ")
+        return PrivacyRules.isSensitiveText(identityText) ? "sensitive" : nil
     }
 
     /// Activates an app and waits (up to ~2s) until it is actually frontmost, so the

@@ -421,6 +421,9 @@ public actor CascadeOrchestrator {
     @discardableResult
     public func createAgent(from curated: CuratedAgent) async throws -> CascadeAgent {
         let waste = curated.source
+        let demoSketch = TrajectorySketchBuilder(maxActions: 6, maxAnchors: 4, maxChecks: 3, maxCorrections: 2)
+            .build(goal: curated.goal, recipe: waste.recipe)
+        let persistedSketches = [AgentDemoSketch(demoSketch)].filter { !$0.promptText.isEmpty }
         return try await store.upsertAgent(CascadeAgent(
             name: curated.name,
             source: .detected,
@@ -431,11 +434,27 @@ public actor CascadeOrchestrator {
             estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
             evidenceCount: waste.occurrences,
             evidenceIDs: curated.evidence,
-            goal: curated.goal
+            goal: curated.goal,
+            demoSketches: Array(persistedSketches.prefix(3))
         ))
     }
 
     public func agents() async throws -> [CascadeAgent] {
         try await store.agents()
+    }
+}
+
+private extension AgentDemoSketch {
+    init(_ sketch: TrajectorySketch) {
+        self.init(
+            id: sketch.id,
+            appName: sketch.appName,
+            windowTitle: sketch.windowTitle,
+            normalizedGoalTokens: sketch.normalizedGoalTokens,
+            promptText: sketch.promptText,
+            actionCount: sketch.firstActions.count,
+            anchorCount: sketch.safeAnchors.count,
+            checkCount: sketch.expectedChecks.count
+        )
     }
 }

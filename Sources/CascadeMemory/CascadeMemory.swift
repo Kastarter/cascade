@@ -440,6 +440,109 @@ public enum InputEventSanitizer {
     }
 }
 
+public enum RecipeActionIdentity {
+    public static func key(for step: RecipeStep) -> String {
+        key(
+            kind: step.kind.rawValue,
+            appSurface: step.appName,
+            bundleIdentifier: step.bundleIdentifier,
+            windowTitle: step.windowTitleHint,
+            targetDescriptor: step.targetDescriptor,
+            label: step.kind == .type ? nil : (step.ocrAnchor ?? step.text),
+            key: step.kind == .key ? step.key : nil,
+            modifiers: step.kind == .key ? step.modifiers : [],
+            isParameter: step.isParameter,
+            parameterKey: step.parameterKey,
+            parameterKind: step.parameterKind?.rawValue
+        )
+    }
+
+    public static func key(for event: InputEvent, surface: String? = nil) -> String {
+        key(
+            kind: recipeKind(for: event.kind),
+            appSurface: surface ?? event.appName,
+            bundleIdentifier: event.bundleIdentifier,
+            windowTitle: event.windowTitle,
+            targetDescriptor: event.targetDescriptor,
+            label: event.kind == .type ? nil : event.text,
+            key: event.kind == .key ? event.key : nil,
+            modifiers: event.kind == .key ? event.modifiers : [],
+            isParameter: false,
+            parameterKey: nil,
+            parameterKind: nil
+        )
+    }
+
+    public static func hash(_ key: String) -> String {
+        AuditIdentity.hash(key)
+    }
+
+    public static func normalizedComponent(_ value: String?) -> String {
+        guard let value else { return "" }
+        let folded = value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let parts = folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        return parts.joined(separator: " ")
+    }
+
+    private static func key(
+        kind: String,
+        appSurface: String,
+        bundleIdentifier: String?,
+        windowTitle: String?,
+        targetDescriptor: String?,
+        label: String?,
+        key: String?,
+        modifiers: [String],
+        isParameter: Bool,
+        parameterKey: String?,
+        parameterKind: String?
+    ) -> String {
+        let modifierKey = modifiers.map { normalizedComponent($0) }.filter { !$0.isEmpty }.sorted().joined(separator: "+")
+        let parts = [
+            "v1",
+            "kind=\(normalizedComponent(kind))",
+            "surface=\(normalizedComponent(appSurface))",
+            "bundle=\(normalizedComponent(bundleIdentifier))",
+            "window=\(normalizedComponent(windowTitle))",
+            "target=\(normalizedComponent(targetDescriptor))",
+            "label=\(normalizedComponent(label))",
+            "key=\(normalizedComponent(key))",
+            "modifiers=\(modifierKey)",
+            "parameter=\(isParameter ? "1" : "0")",
+            "parameterKey=\(normalizedComponent(parameterKey))",
+            "parameterKind=\(normalizedComponent(parameterKind))",
+        ]
+        return parts.joined(separator: "|")
+    }
+
+    private static func recipeKind(for kind: InputEventKind) -> String {
+        switch kind {
+        case .click: RecipeStepKind.click.rawValue
+        case .doubleClick: RecipeStepKind.doubleClick.rawValue
+        case .rightClick: RecipeStepKind.rightClick.rawValue
+        case .type: RecipeStepKind.type.rawValue
+        case .key: RecipeStepKind.key.rawValue
+        case .scroll: RecipeStepKind.scroll.rawValue
+        }
+    }
+}
+
+public extension InputEvent {
+    func idempotentActionKey(surface: String? = nil) -> String {
+        RecipeActionIdentity.key(for: self, surface: surface)
+    }
+
+    func idempotentActionKeyHash(surface: String? = nil) -> String {
+        RecipeActionIdentity.hash(idempotentActionKey(surface: surface))
+    }
+}
+
 public struct OCRLine: Codable, Equatable, Sendable {
     public let contextID: Int64
     public let lineIndex: Int
@@ -933,6 +1036,14 @@ public extension RecipeStep {
         }
     }
 
+    var idempotentActionKey: String {
+        RecipeActionIdentity.key(for: self)
+    }
+
+    var idempotentActionKeyHash: String {
+        RecipeActionIdentity.hash(idempotentActionKey)
+    }
+
     private func anchored(_ verb: String) -> String {
         guard let anchor = ocrAnchor?.trimmingCharacters(in: .whitespacesAndNewlines), !anchor.isEmpty else {
             return verb
@@ -969,6 +1080,59 @@ public enum AgentSource: String, Codable, Sendable {
     case detected
 }
 
+public struct AgentDemoSketch: Codable, Equatable, Sendable {
+    public let id: String
+    public let appName: String
+    public let windowTitle: String?
+    public let normalizedGoalTokens: [String]
+    public let promptText: String
+    public let actionCount: Int
+    public let anchorCount: Int
+    public let checkCount: Int
+
+    public init(
+        id: String,
+        appName: String,
+        windowTitle: String? = nil,
+        normalizedGoalTokens: [String],
+        promptText: String,
+        actionCount: Int,
+        anchorCount: Int,
+        checkCount: Int
+    ) {
+        self.id = id
+        self.appName = appName
+        self.windowTitle = windowTitle
+        self.normalizedGoalTokens = normalizedGoalTokens
+        self.promptText = String(promptText.prefix(1_200))
+        self.actionCount = actionCount
+        self.anchorCount = anchorCount
+        self.checkCount = checkCount
+    }
+
+    public func relevanceScore(appName queryAppName: String?, goalTokens queryTokens: Set<String>) -> Double {
+        var score = 0.0
+        let queryApp = queryAppName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let queryApp, !queryApp.isEmpty {
+            let sketchApp = appName.lowercased()
+            if sketchApp == queryApp {
+                score += 2.0
+            } else if sketchApp.contains(queryApp) || queryApp.contains(sketchApp) {
+                score += 1.0
+            }
+        }
+
+        let sketchTokens = Set(normalizedGoalTokens)
+        let overlap = sketchTokens.intersection(queryTokens).count
+        let union = sketchTokens.union(queryTokens).count
+        if union > 0 {
+            score += Double(overlap) / Double(union)
+        }
+        score += Double(overlap) * 0.05
+        return score
+    }
+}
+
 /// A saved Cascade: a named, re-runnable agent built from a recorded workflow.
 public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
     public let id: Int64
@@ -1000,6 +1164,16 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
     /// Drives background-sandbox deploys (intent, not recorded pixels); nil for
     /// agents created before curation or without a goal.
     public let goal: String?
+    /// Prompt-safe teach-once demo sketches available before the agent has any
+    /// successful deployment experience rows. Stored as CascadeMemory DTOs to avoid a
+    /// CascadeMemory -> AgentOrchestrator dependency.
+    public let demoSketches: [AgentDemoSketch]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, source, signature, recipe, apps, estimatedSeconds
+        case estimatedSecondsPerRun, evidenceCount, evidenceIDs, runCount
+        case createdAt, lastRunAt, enabled, schedule, goal, demoSketches
+    }
 
     public init(
         id: Int64 = 0,
@@ -1017,7 +1191,8 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         lastRunAt: Date? = nil,
         enabled: Bool = true,
         schedule: String? = nil,
-        goal: String? = nil
+        goal: String? = nil,
+        demoSketches: [AgentDemoSketch] = []
     ) {
         self.id = id
         self.name = name
@@ -1035,6 +1210,49 @@ public struct CascadeAgent: Identifiable, Codable, Equatable, Sendable {
         self.enabled = enabled
         self.schedule = schedule
         self.goal = goal
+        self.demoSketches = demoSketches
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decodeIfPresent(Int64.self, forKey: .id) ?? 0
+        self.name = try container.decode(String.self, forKey: .name)
+        self.source = try container.decode(AgentSource.self, forKey: .source)
+        self.signature = try container.decode(String.self, forKey: .signature)
+        self.recipe = try container.decode(AgentRecipe.self, forKey: .recipe)
+        self.apps = try container.decodeIfPresent([String].self, forKey: .apps) ?? []
+        self.estimatedSeconds = try container.decodeIfPresent(Int.self, forKey: .estimatedSeconds) ?? 0
+        self.estimatedSecondsPerRun = try container.decodeIfPresent(Int.self, forKey: .estimatedSecondsPerRun) ?? 0
+        self.evidenceCount = try container.decodeIfPresent(Int.self, forKey: .evidenceCount) ?? 0
+        self.evidenceIDs = try container.decodeIfPresent([Int64].self, forKey: .evidenceIDs) ?? []
+        self.runCount = try container.decodeIfPresent(Int.self, forKey: .runCount) ?? 0
+        self.createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        self.lastRunAt = try container.decodeIfPresent(Date.self, forKey: .lastRunAt)
+        self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.schedule = try container.decodeIfPresent(String.self, forKey: .schedule)
+        self.goal = try container.decodeIfPresent(String.self, forKey: .goal)
+        self.demoSketches = try container.decodeIfPresent([AgentDemoSketch].self, forKey: .demoSketches) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(source, forKey: .source)
+        try container.encode(signature, forKey: .signature)
+        try container.encode(recipe, forKey: .recipe)
+        try container.encode(apps, forKey: .apps)
+        try container.encode(estimatedSeconds, forKey: .estimatedSeconds)
+        try container.encode(estimatedSecondsPerRun, forKey: .estimatedSecondsPerRun)
+        try container.encode(evidenceCount, forKey: .evidenceCount)
+        try container.encode(evidenceIDs, forKey: .evidenceIDs)
+        try container.encode(runCount, forKey: .runCount)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(lastRunAt, forKey: .lastRunAt)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encodeIfPresent(schedule, forKey: .schedule)
+        try container.encodeIfPresent(goal, forKey: .goal)
+        try container.encode(demoSketches, forKey: .demoSketches)
     }
 }
 
@@ -2060,6 +2278,7 @@ public actor CascadeStore {
         let recipeJSON = Self.encodeRecipe(agent.recipe)
         let appsCSV = agent.apps.joined(separator: "\u{1F}") // unit separator — app names may contain commas
         let evidenceIDsJSON = Self.encodeAgentEvidenceIDs(agent.evidenceIDs)
+        let demoSketchesJSON = Self.encodeAgentDemoSketches(agent.demoSketches)
 
         let existingID = try withStatement("SELECT id FROM agents WHERE signature = ? LIMIT 1;") { statement in
             bind(agent.signature, at: 1, in: statement)
@@ -2071,7 +2290,7 @@ public actor CascadeStore {
             // re-detect — the run history, schedule, and curated goal belong to the
             // approved agent, not the detection.
             try withStatement("""
-            UPDATE agents SET name = ?, source = ?, recipe_json = ?, apps = ?, estimated_seconds = ?, seconds_per_run = ?, evidence_count = ?, evidence_ids_json = ?
+            UPDATE agents SET name = ?, source = ?, recipe_json = ?, apps = ?, estimated_seconds = ?, seconds_per_run = ?, evidence_count = ?, evidence_ids_json = ?, demo_sketches_json = CASE WHEN ? = '[]' THEN demo_sketches_json ELSE ? END
             WHERE id = ?;
             """) { statement in
                 bind(agent.name, at: 1, in: statement)
@@ -2082,7 +2301,9 @@ public actor CascadeStore {
                 sqlite3_bind_int64(statement, 6, Int64(agent.estimatedSecondsPerRun))
                 sqlite3_bind_int64(statement, 7, Int64(agent.evidenceCount))
                 bind(evidenceIDsJSON, at: 8, in: statement)
-                sqlite3_bind_int64(statement, 9, existingID)
+                bind(demoSketchesJSON, at: 9, in: statement)
+                bind(demoSketchesJSON, at: 10, in: statement)
+                sqlite3_bind_int64(statement, 11, existingID)
                 try stepDone(statement)
             }
             return try self.agent(id: existingID) ?? agent
@@ -2090,8 +2311,8 @@ public actor CascadeStore {
 
         try withStatement("""
         INSERT INTO agents
-            (name, source, signature, recipe_json, apps, estimated_seconds, seconds_per_run, evidence_count, evidence_ids_json, run_count, created_at, last_run_at, enabled, schedule, goal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (name, source, signature, recipe_json, apps, estimated_seconds, seconds_per_run, evidence_count, evidence_ids_json, run_count, created_at, last_run_at, enabled, schedule, goal, demo_sketches_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """) { statement in
             bind(agent.name, at: 1, in: statement)
             bind(agent.source.rawValue, at: 2, in: statement)
@@ -2108,6 +2329,7 @@ public actor CascadeStore {
             sqlite3_bind_int(statement, 13, agent.enabled ? 1 : 0)
             bind(agent.schedule, at: 14, in: statement)
             bind(agent.goal, at: 15, in: statement)
+            bind(demoSketchesJSON, at: 16, in: statement)
             try stepDone(statement)
         }
         let newID = sqlite3_last_insert_rowid(connection.db)
@@ -2682,6 +2904,7 @@ public actor CascadeStore {
         try? execute("ALTER TABLE agents ADD COLUMN schedule TEXT;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN goal TEXT;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN evidence_ids_json TEXT NOT NULL DEFAULT '[]';", db: db)
+        try? execute("ALTER TABLE agents ADD COLUMN demo_sketches_json TEXT NOT NULL DEFAULT '[]';", db: db)
         try? execute("ALTER TABLE input_event ADD COLUMN target_descriptor TEXT;", db: db)
         try? execute("ALTER TABLE input_event ADD COLUMN captured_ms INTEGER;", db: db)
         // Tamper-evident audit chain columns for databases created before they existed.
@@ -2756,7 +2979,8 @@ public actor CascadeStore {
             last_run_at TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
             schedule TEXT,
-            goal TEXT
+            goal TEXT,
+            demo_sketches_json TEXT NOT NULL DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS context_embedding (
@@ -3686,7 +3910,7 @@ public actor CascadeStore {
     }
 
     private static let agentColumns =
-        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count, schedule, goal, evidence_ids_json"
+        "SELECT id, name, source, signature, recipe_json, apps, estimated_seconds, evidence_count, created_at, last_run_at, enabled, seconds_per_run, run_count, schedule, goal, evidence_ids_json, demo_sketches_json"
 
     private func decodeAgent(_ statement: OpaquePointer) -> CascadeAgent {
         let appsRaw = text(statement, 5) ?? ""
@@ -3707,7 +3931,8 @@ public actor CascadeStore {
             lastRunAt: DateCodec.date(from: text(statement, 9)),
             enabled: sqlite3_column_int(statement, 10) != 0,
             schedule: text(statement, 13),
-            goal: text(statement, 14)
+            goal: text(statement, 14),
+            demoSketches: Self.decodeAgentDemoSketches(text(statement, 16))
         )
     }
 
@@ -3741,6 +3966,22 @@ public actor CascadeStore {
             return []
         }
         return ids
+    }
+
+    private static func encodeAgentDemoSketches(_ sketches: [AgentDemoSketch]) -> String {
+        guard let data = try? JSONEncoder().encode(sketches),
+              let json = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return json
+    }
+
+    private static func decodeAgentDemoSketches(_ json: String?) -> [AgentDemoSketch] {
+        guard let json, let data = json.data(using: .utf8),
+              let sketches = try? JSONDecoder().decode([AgentDemoSketch].self, from: data) else {
+            return []
+        }
+        return sketches
     }
 
     /// Decodes a `recorded_context` row in the `contextColumns(...)` order.

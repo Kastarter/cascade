@@ -1152,14 +1152,9 @@ public struct WasteDetector: Sendable {
     // MARK: - Helpers
 
     /// The token used to compare actions for repetition. Coordinates and typed
-    /// content are intentionally ignored, but a click now carries the clicked
-    /// element's IDENTITY (its AX label) — clicking the same "Reply All" button
-    /// across runs shares a token; clicking different buttons doesn't. This is
-    /// Leno's normalized-UI model: keep CONTEXT params (element identity), drop DATA
-    /// params (typed text). Before, every click in an app was the same token, so the
-    /// detector couldn't tell one routine from another in that app. The label is
-    /// already recorded in `InputEvent.text`; an unlabeled click degrades to the old
-    /// coarse `click@app` token.
+    /// content are intentionally ignored; action kind, app/surface, window hint, UI
+    /// labels/descriptors, shortcuts, and parameter shape flow through
+    /// `RecipeActionIdentity`, the same key recipe replay target caching uses.
     public static func actionToken(_ event: InputEvent, surface: String) -> String {
         token(event, surface: surface)
     }
@@ -1181,20 +1176,7 @@ public struct WasteDetector: Sendable {
     }
 
     static func token(_ event: InputEvent, surface: String) -> String {
-        switch event.kind {
-        case .key:
-            let mods = event.modifiers.sorted().joined(separator: "+")
-            return "key:\(mods)+\(event.key ?? "")@\(surface)"
-        case .type:
-            return "type@\(surface)"
-        case .click, .doubleClick, .rightClick:
-            let label = normalizedLabel(event.text)
-            return label.isEmpty
-                ? "\(event.kind.rawValue)@\(surface)"
-                : "\(event.kind.rawValue):\(label)@\(surface)"
-        case .scroll:
-            return "scroll@\(surface)"
-        }
+        event.idempotentActionKey(surface: surface)
     }
 
     /// Video-meeting apps whose input is overwhelmingly noise (mute/camera/chat),
