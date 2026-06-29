@@ -418,6 +418,9 @@ actor RewindEngine {
         // Character-perfect for native apps, immune to the resolution cap.
         // (Thread-safe C API; this actor serializes the walks.)
         let axText = snapshot.processIdentifier.map { AXTextHarvester.text(forWindowOfPID: $0) } ?? ""
+        let axControls = structuredContent
+            ? (snapshot.processIdentifier.map { AXTextHarvester.controls(forWindowOfPID: $0) } ?? [])
+            : []
 
         // OCR carries the frame only where AX can't. When AX already owns the
         // window's text (native apps), a full `.accurate` pass every second is
@@ -468,6 +471,16 @@ actor RewindEngine {
         redactedOCRBoxes = redacted.boxes
         ocrText = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false).readingOrderText
         let redactedAXText = FrameRedactor.redactedText(axText, policy: policy)
+        let redactedAXControls = axControls.map {
+            ScreenContentStructurer.AXControl(
+                id: $0.id,
+                kind: $0.kind,
+                label: $0.label.map { FrameRedactor.redactedText($0, policy: policy) },
+                value: $0.value.map { FrameRedactor.redactedText($0, policy: policy) },
+                rect: $0.rect,
+                confidence: $0.confidence
+            )
+        }
         nativeOCRLines = nativeOCRLines.map {
             ScreenTextRecognizer.TextBox(
                 text: FrameRedactor.redactedText($0.text, policy: policy),
@@ -475,7 +488,11 @@ actor RewindEngine {
                 confidence: $0.confidence
             )
         }
-        let structuredRedacted = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false)
+        let structuredRedacted = ScreenContentStructurer.structure(
+            redactedOCRBoxes,
+            topLeftOrigin: false,
+            axControls: redactedAXControls
+        )
         let structuredMetadata: StructuredContentExporter.Metadata? = if structuredContent {
             StructuredContentExporter.metadata(from: structuredRedacted)
         } else {
@@ -522,6 +539,15 @@ actor RewindEngine {
 
         do {
             let inserted = try await store.insert(context, indexWorkGraph: indexWorkGraph)
+            if structuredContent,
+               let payload = StructuredContentExporter.sidecarPayload(from: structuredRedacted) {
+                try? await store.insertOCRStructure(
+                    contextID: inserted.id,
+                    version: payload.version,
+                    json: payload.json,
+                    searchableText: payload.searchableText
+                )
+            }
             var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: redactedOCRBoxes, source: "vision")
             lines += OCRLineBuilder.axLines(contextID: inserted.id, text: redactedAXText, startingAt: lines.count)
             if !nativeOCRLines.isEmpty {

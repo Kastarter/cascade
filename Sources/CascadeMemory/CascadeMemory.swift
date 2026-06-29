@@ -346,6 +346,20 @@ public struct OCRLine: Codable, Equatable, Sendable {
     }
 }
 
+public struct StoredOCRStructure: Codable, Equatable, Sendable {
+    public let contextID: Int64
+    public let version: Int
+    public let json: String
+    public let searchableText: String
+
+    public init(contextID: Int64, version: Int, json: String, searchableText: String) {
+        self.contextID = contextID
+        self.version = version
+        self.json = json
+        self.searchableText = searchableText
+    }
+}
+
 public struct StoredFrameSignature: Codable, Equatable, Sendable {
     public let contextID: Int64
     public let dHash: Int64
@@ -1223,12 +1237,14 @@ public actor CascadeStore {
         let keyword = try lexicalRankedIDs(matching: query, limit: candidatePool)
         let semantic = try semanticRankedIDs(matching: query, limit: candidatePool)
         let memory = try memoryRankedIDs(matching: query, limit: candidatePool, now: now)
+        let structured = try structuredRankedIDs(matching: query, limit: candidatePool)
         // Both empty → no match; one empty → RRF degenerates to the other lane's
         // order (still correct, no special-casing). Fuse and hydrate the winners.
         return RankFusion.reciprocalRankFusion([
             .init(.lexical, ids: keyword),
             .init(.vector, ids: semantic),
             .init(.memory, ids: memory),
+            .init(.structured, ids: structured),
         ], limit: limit)
     }
 
@@ -1260,6 +1276,28 @@ public actor CascadeStore {
         FROM rewind_fts
         WHERE rewind_fts MATCH ?
         ORDER BY bm25(rewind_fts)
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(match, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(limit))
+            var ids: [Int64] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                ids.append(sqlite3_column_int64(statement, 0))
+            }
+            return ids
+        }
+    }
+
+    private func structuredRankedIDs(matching query: String, limit: Int) throws -> [Int64] {
+        let match = Self.ftsAnyQuery(from: query)
+        guard !match.isEmpty else { return [] }
+        let sql = """
+        SELECT ocr_structure_fts.rowid
+        FROM ocr_structure_fts
+        JOIN recorded_context c ON c.id = ocr_structure_fts.rowid
+        WHERE ocr_structure_fts MATCH ?
+        ORDER BY bm25(ocr_structure_fts), c.captured_at DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -1333,6 +1371,7 @@ public actor CascadeStore {
         try? execute("DELETE FROM context_chunk_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM context_visual_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM ocr_line WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM ocr_structure WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM frame_signature WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         return removed
     }
@@ -1669,6 +1708,48 @@ public actor CascadeStore {
                 ))
             }
             return rows
+        }
+    }
+
+    public func insertOCRStructure(
+        contextID: Int64,
+        version: Int,
+        json: String,
+        searchableText: String
+    ) throws {
+        let sql = """
+        INSERT INTO ocr_structure (context_id, version, json, searchable_text)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(context_id) DO UPDATE SET
+            version = excluded.version,
+            json = excluded.json,
+            searchable_text = excluded.searchable_text;
+        """
+        try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, contextID)
+            sqlite3_bind_int(statement, 2, Int32(version))
+            bind(json, at: 3, in: statement)
+            bind(searchableText, at: 4, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    public func ocrStructure(contextID: Int64) throws -> StoredOCRStructure? {
+        let sql = """
+        SELECT context_id, version, json, searchable_text
+        FROM ocr_structure
+        WHERE context_id = ?
+        LIMIT 1;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, contextID)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            return StoredOCRStructure(
+                contextID: sqlite3_column_int64(statement, 0),
+                version: Int(sqlite3_column_int(statement, 1)),
+                json: text(statement, 2) ?? "{}",
+                searchableText: text(statement, 3) ?? ""
+            )
         }
     }
 
@@ -2321,6 +2402,32 @@ public actor CascadeStore {
         CREATE INDEX IF NOT EXISTS idx_ocr_line_context
             ON ocr_line(context_id, line_index);
 
+        CREATE TABLE IF NOT EXISTS ocr_structure (
+            context_id INTEGER PRIMARY KEY,
+            version INTEGER NOT NULL,
+            json TEXT NOT NULL,
+            searchable_text TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS ocr_structure_fts USING fts5(
+            searchable_text,
+            context_id UNINDEXED
+        );
+
+        CREATE TRIGGER IF NOT EXISTS ocr_structure_ai AFTER INSERT ON ocr_structure BEGIN
+            INSERT INTO ocr_structure_fts(rowid, context_id, searchable_text)
+            VALUES (new.context_id, new.context_id, new.searchable_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS ocr_structure_ad AFTER DELETE ON ocr_structure BEGIN
+            DELETE FROM ocr_structure_fts WHERE rowid = old.context_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS ocr_structure_au AFTER UPDATE ON ocr_structure BEGIN
+            DELETE FROM ocr_structure_fts WHERE rowid = old.context_id;
+            INSERT INTO ocr_structure_fts(rowid, context_id, searchable_text)
+            VALUES (new.context_id, new.context_id, new.searchable_text);
+        END;
+
         CREATE TABLE IF NOT EXISTS frame_signature (
             context_id INTEGER PRIMARY KEY,
             dhash INTEGER NOT NULL,
@@ -2353,6 +2460,7 @@ public actor CascadeStore {
             DELETE FROM context_embedding WHERE context_id = old.id;
             DELETE FROM context_chunk_embedding WHERE context_id = old.id;
             DELETE FROM ocr_line WHERE context_id = old.id;
+            DELETE FROM ocr_structure WHERE context_id = old.id;
             DELETE FROM frame_signature WHERE context_id = old.id;
         END;
 

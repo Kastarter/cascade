@@ -89,6 +89,62 @@ func pruneDropsOldMomentsAndSyncsSearchIndex() async throws {
 }
 
 @Test
+func ocrStructureSidecarRoundTripsAndPrunesWithContext() async throws {
+    let store = try makeStore()
+    let old = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSinceNow: -100 * 24 * 3600),
+        source: .screen,
+        appName: "Numbers",
+        ocrText: "flat text"
+    ))
+    let fresh = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Numbers",
+        ocrText: "new flat text"
+    ))
+
+    try await store.insertOCRStructure(
+        contextID: old.id,
+        version: 2,
+        json: #"{"version":2,"fields":[{"key":"TOTAL DUE","value":"$443,355"}]}"#,
+        searchableText: "TOTAL DUE $443,355"
+    )
+    try await store.insertOCRStructure(
+        contextID: fresh.id,
+        version: 2,
+        json: #"{"version":2,"fields":[{"key":"Status","value":"Ready"}]}"#,
+        searchableText: "Status Ready"
+    )
+
+    #expect(try await store.ocrStructure(contextID: old.id)?.version == 2)
+
+    _ = try await store.prune(maxAge: 7 * 24 * 3600)
+
+    #expect(try await store.ocrStructure(contextID: old.id) == nil)
+    #expect(try await store.ocrStructure(contextID: fresh.id)?.searchableText == "Status Ready")
+}
+
+@Test
+func hybridSearchUsesStructuredSidecarLane() async throws {
+    let store = try makeStore()
+    let moment = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Preview",
+        ocrText: "plain invoice frame"
+    ))
+    try await store.insertOCRStructure(
+        contextID: moment.id,
+        version: 2,
+        json: #"{"version":2,"fields":[{"key":"Amount Due","value":"$443,355"}],"tables":[]}"#,
+        searchableText: "Amount Due $443,355"
+    )
+
+    let hits = try await store.hybridContexts(matching: "amount due", limit: 5)
+
+    #expect(hits.map(\.id).contains(moment.id))
+}
+
+@Test
 func contextTimelineReturnsRowsSinceCutoffWithoutHeavyPayloads() async throws {
     let store = try makeStore()
     _ = try await store.insert(RecordedContext(
