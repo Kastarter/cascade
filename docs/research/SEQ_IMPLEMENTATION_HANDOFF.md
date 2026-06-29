@@ -16,6 +16,26 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 
 ## Continuation log (latest first)
 
+### 2026-06-29 — session 4: ran SEQ-16→20, paused at user request (codex quota low)
+- **Re-launched** the script as run `wf_b8cec9ae-6dd` (task `w5t27fbmv`) after the morning usage-limit
+  reset. Skipped SEQ-01–15, then **committed + pushed SEQ-16, 17, 18, 19, 20** (build-green each):
+  - `c71cef5` seq-16 document-understanding (reading order, tables, retrieval)
+  - `07e9498` seq-17 temporal-knowledge-graph (deterministic edges, graph tests)
+  - `32f308d` seq-18 proactive-intelligence (live repetition detector, trust controls)
+  - `e6c5f0a` seq-19 performance-efficiency (cadence, ROI OCR, memory, SQLite, maintenance) + `6300de5` fix (ImageIO JPEG encoding)
+  - `5ac88c4` seq-20 personalization (event log, ranking, thresholds, routines, cold start, controls)
+  HEAD is now `5ac88c4`, in sync with `origin/feat/production-grade` (0/0).
+- **Paused by the user** (~14:48) because the codex/inference-gateway quota was down to ~7% — stopped
+  cleanly via `TaskStop w5t27fbmv` rather than crashing mid-SEQ. The run was mid-**SEQ-21**
+  (vlm-screen-action-models); its uncommitted Implement-stage edits (new GrounderRegistry /
+  GroundingActionRouter / GroundingCropRefinement / GroundingEval / GroundingSampling /
+  RegionBudgetedScreenshot / ComputerUseVerifier / GroundingCorpusExporter + edits) were discarded with
+  `git stash -u && git stash drop`. Tree is clean at `5ac88c4`. **Nothing past SEQ-20 is committed.**
+- **Remaining work: SEQ-21 → SEQ-31 (11 SEQs).** Resume = a fresh re-launch of the same script once
+  quota refreshes: `Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js" })`. The Plan
+  skip-check was tightened this session to match only real `feat(seq-NN <slug>):` commits (not docs/
+  handoff commits that merely mention a tag), so SEQ-21→31 will be picked up correctly.
+
 ### 2026-06-29 — session 3: ran SEQ-05/13/14/15, then hit usage limit
 - **Relaunched** the self-contained script as run `wf_844b5f93-b9d` (task `wqy88noyy`). It skipped the
   already-committed SEQs and **committed + pushed SEQ-05, 13, 14, 15** (build-green each):
@@ -55,8 +75,8 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 The workflow is **still running**. Committed so far on `feat/production-grade`:
 
 ```
-SEQ-01 02 03 04 05 06 07 08 09 10 11 12 13 14 15   ← committed + pushed (build-green); HEAD = 3e5b488 (seq-15)
-SEQ-16…31                                          ← pending (blocked by usage limit at SEQ-16; resumes after reset)
+SEQ-01 … 20   ← committed + pushed (build-green); HEAD = 5ac88c4 (seq-20)
+SEQ-21 … 31   ← pending (paused at SEQ-21 mid-implement; codex quota low — resumes on fresh re-launch after refresh)
 ```
 
 - HEAD advances as each SEQ lands (latest `feat(seq-NN …)` / docs commit); the commit gate guarantees
