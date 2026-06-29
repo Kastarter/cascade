@@ -1,5 +1,6 @@
 import Testing
 
+@testable import AgentOrchestrator
 @testable import ProviderKit
 @testable import SandboxKit
 
@@ -193,4 +194,18 @@ func backgroundWebAgentScrollFormattingIsBounded() {
     #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "up", amount: 2) == -240)
     #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: Int.max) == nil)
     #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: 1_000_000_000) == nil)
+}
+
+@Test
+func backgroundWebAuditDetailsIncludeSelectedRecoveryAction() {
+    let transport = BackgroundWebAgent.sandboxDoneAuditDescriptor(
+        status: "transport_failure",
+        acted: false,
+        recoveryAction: .backoffRetry
+    )
+    let noEffect = BackgroundWebAgent.sandboxNoEffectAuditDescriptor(status: "unchanged", streak: 2)
+
+    #expect(transport.contains("recoveryAction=backoffRetry"))
+    #expect(noEffect.contains("noEffectStreak=2"))
+    #expect(noEffect.contains("recoveryAction=alternateTarget"))
 }

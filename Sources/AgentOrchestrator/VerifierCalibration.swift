@@ -250,6 +250,14 @@ public enum VerifierCalibration: Sendable {
         return min(Int(clamped * Double(bucketCount)), bucketCount - 1)
     }
 
+    public static func bucketLabel(for confidence: Double, bucketCount: Int = 5) -> String {
+        let bucketCount = max(1, bucketCount)
+        let index = bucketIndex(for: confidence, bucketCount: bucketCount)
+        let lower = Double(index) / Double(bucketCount)
+        let upper = Double(index + 1) / Double(bucketCount)
+        return String(format: "%.1f-%.1f", lower, upper)
+    }
+
     public static func clampConfidence(_ confidence: Double) -> Double {
         guard confidence.isFinite else { return 0 }
         return min(1, max(0, confidence))

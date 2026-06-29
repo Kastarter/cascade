@@ -1,5 +1,6 @@
 import CascadeMemory
 import Foundation
+import SQLite3
 import Testing
 
 private func makeExperienceStore() throws -> CascadeStore {
@@ -7,6 +8,13 @@ private func makeExperienceStore() throws -> CascadeStore {
         .appendingPathComponent("CascadeAgentExperienceTests-\(UUID().uuidString).sqlite")
         .path
     return try CascadeStore(path: path)
+}
+
+private func rawLedgerExec(_ path: String, _ sql: String) {
+    var db: OpaquePointer?
+    guard sqlite3_open(path, &db) == SQLITE_OK else { return }
+    defer { sqlite3_close(db) }
+    sqlite3_exec(db, sql, nil, nil, nil)
 }
 
 private func expectValidationError(
@@ -182,4 +190,81 @@ func queryFiltersByAppGoalAndFailureKind() async throws {
         failureKind: .targetNotFound
     ))
     #expect(exact.map(\.recipeSignature) == ["mail-invoice"])
+}
+
+@Test
+func failureMemoryPersistsStateSummaryAndRedactsRawText() async throws {
+    let store = try makeExperienceStore()
+
+    let saved = try await store.recordAgentFailureMemory(AgentFailureMemory(
+        appName: "Safari",
+        normalizedGoalTokens: ["submit", "invoice"],
+        failureKind: .noEffect,
+        firstBadAction: "click",
+        screenSignatureHash: "screen-hash",
+        targetHash: "target-hash",
+        stateSummary: "status unchanged for jane.private@example.com after click",
+        repairHint: "Choose another visible submit control.",
+        recoveryEvidenceHash: "evidence-hash"
+    ))
+    let fetched = try #require(try await store.agentFailureMemories().first)
+
+    #expect(saved.stateSummary?.contains("<EMAIL>") == true)
+    #expect(saved.stateSummary?.contains("jane.private@example.com") == false)
+    #expect(fetched.stateSummary == saved.stateSummary)
+    #expect(fetched.recoveryEvidenceHash == "evidence-hash")
+}
+
+@Test
+func failureMemoryMigrationAddsStateSummaryColumnToExistingStore() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeAgentFailureMemoryMigration-\(UUID().uuidString).sqlite")
+        .path
+    rawLedgerExec(path, """
+    CREATE TABLE agent_failure_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        app_name TEXT NOT NULL,
+        goal_tokens_json TEXT NOT NULL,
+        failure_kind TEXT NOT NULL,
+        first_bad_action TEXT,
+        screen_signature_hash TEXT,
+        target_hash TEXT,
+        repair_hint TEXT NOT NULL,
+        recovery_evidence_hash TEXT,
+        retained_score REAL NOT NULL
+    );
+    """)
+    let store = try CascadeStore(path: path)
+
+    let saved = try await store.recordAgentFailureMemory(AgentFailureMemory(
+        appName: "Numbers",
+        normalizedGoalTokens: ["paste", "totals"],
+        failureKind: .groundingMiss,
+        stateSummary: "target hash changed after re-harvest",
+        repairHint: "Re-ground before clicking."
+    ))
+
+    #expect(saved.stateSummary == "target hash changed after re-harvest")
+    #expect(try await store.agentFailureMemories().first?.stateSummary == saved.stateSummary)
+}
+
+@Test
+func failureMemoryDecodesLegacyPayloadWithoutStateSummary() throws {
+    let json = """
+    {
+      "id": 7,
+      "appName": "Safari",
+      "normalizedGoalTokens": ["submit"],
+      "failureKind": "no_effect",
+      "repairHint": "Use another target.",
+      "retainedScore": -0.7
+    }
+    """
+
+    let memory = try JSONDecoder().decode(AgentFailureMemory.self, from: Data(json.utf8))
+
+    #expect(memory.id == 7)
+    #expect(memory.stateSummary == nil)
+    #expect(memory.failureKind == .noEffect)
 }

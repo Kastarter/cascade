@@ -931,11 +931,13 @@ public final class CascadeAppModel: ObservableObject {
         fallbackGoal: String
     ) async {
         let classification = Self.sandboxExperienceClassification(for: update)
+        let failureMemoryContext = Self.sandboxFailureMemoryContext(for: update, failureKind: classification.failureKind)
         await recordAgentExperience(
             for: agent,
             fallbackGoal: fallbackGoal,
             outcome: classification.outcome,
-            failureKind: classification.failureKind
+            failureKind: classification.failureKind,
+            failureMemoryContext: failureMemoryContext
         )
     }
 
@@ -944,7 +946,8 @@ public final class CascadeAppModel: ObservableObject {
         fallbackGoal: String,
         outcome: AgentExperienceOutcome,
         verificationSignal: AgentExperienceVerificationSignal? = nil,
-        failureKind: CascadeMemory.AgentFailureKind? = nil
+        failureKind: CascadeMemory.AgentFailureKind? = nil,
+        failureMemoryContext: FailureMemoryContext? = nil
     ) async {
         let appName = Self.experienceAppName(for: agent)
         let goalPattern = Self.experienceGoalPattern(for: agent, fallback: fallbackGoal)
@@ -959,13 +962,14 @@ public final class CascadeAppModel: ObservableObject {
             evidenceIDs: [],
             actionCount: agent.recipe.steps.count
         ))
-        if outcome == .failure, let failureKind {
+        if outcome == .failure, let failureKind, let failureMemoryContext {
             await recordAgentFailureMemory(
                 agent: agent,
                 appName: appName,
                 goalPattern: goalPattern,
                 recipeSignature: recipeSignature,
-                failureKind: failureKind
+                failureKind: failureKind,
+                context: failureMemoryContext
             )
         }
     }
@@ -975,7 +979,8 @@ public final class CascadeAppModel: ObservableObject {
         appName: String,
         goalPattern: String,
         recipeSignature: String,
-        failureKind: CascadeMemory.AgentFailureKind
+        failureKind: CascadeMemory.AgentFailureKind,
+        context: FailureMemoryContext
     ) async {
         let goalTokens = TrajectorySketch.normalizedGoalTokens(from: goalPattern).prefix(8)
         let firstBadAction = agent.recipe.steps.sorted { $0.order < $1.order }.first.map(Self.failureMemoryActionDescriptor)
@@ -987,8 +992,9 @@ public final class CascadeAppModel: ObservableObject {
             firstBadAction: firstBadAction,
             screenSignatureHash: Self.auditHash(recipeSignature),
             targetHash: target.map(Self.auditHash),
+            stateSummary: context.stateSummary,
             repairHint: Self.failureMemoryRepairHint(for: failureKind),
-            recoveryEvidenceHash: nil
+            recoveryEvidenceHash: context.recoveryEvidenceHash
         )
         if let saved = try? await store.recordAgentFailureMemory(memory) {
             _ = try? await store.appendAudit(AuditEvent(
@@ -997,6 +1003,64 @@ public final class CascadeAppModel: ObservableObject {
                 detail: Self.failureMemorySavedAuditDetail(saved)
             ))
         }
+    }
+
+    struct FailureMemoryContext: Sendable, Equatable {
+        let stateSummary: String
+        let recoveryEvidenceHash: String
+    }
+
+    nonisolated static func sandboxFailureMemoryContext(
+        for update: BackgroundWebAgent.Update,
+        failureKind: CascadeMemory.AgentFailureKind?
+    ) -> FailureMemoryContext? {
+        guard let failureKind, failureKind != .unknown else { return nil }
+        let detail = (update.result?.isEmpty == false ? update.result : nil) ?? update.status
+        let lower = detail.lowercased()
+        let externallyObserved =
+            update.needsLogin
+            || lower.contains("no effect")
+            || lower.contains("unchanged")
+            || lower.contains("stopped changing")
+            || lower.contains("modal")
+            || lower.contains("dialog")
+            || lower.contains("sheet")
+            || lower.contains("ran out of steps")
+            || lower.contains("step limit")
+            || lower.contains("verify")
+            || lower.contains("verified")
+            || lower.contains("couldn't open")
+            || lower.contains("failed")
+            || lower.contains("error")
+            || lower.contains("unsafe")
+            || lower.contains("guardrail")
+            || lower.contains("refus")
+        guard externallyObserved else { return nil }
+        let summary = failureMemoryStateSummary(
+            status: update.status,
+            url: update.url,
+            failureKind: failureKind
+        )
+        return FailureMemoryContext(
+            stateSummary: summary,
+            recoveryEvidenceHash: auditHash("\(failureKind.rawValue)|\(summary)")
+        )
+    }
+
+    nonisolated static func failureMemoryStateSummary(
+        status: String,
+        url: String,
+        failureKind: CascadeMemory.AgentFailureKind
+    ) -> String {
+        let host = URL(string: url)?.host() ?? ""
+        let redactedStatus = PIIDetector.redact(status).redacted
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var parts = ["failureKind=\(safeAuditToken(failureKind.rawValue))"]
+        if !host.isEmpty { parts.append("host=\(safeAuditToken(host))") }
+        if !redactedStatus.isEmpty {
+            parts.append("status=\(String(redactedStatus.prefix(120)))")
+        }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func sandboxExperienceClassification(
@@ -2071,7 +2135,7 @@ public final class CascadeAppModel: ObservableObject {
                     noEffectTurns = 0  // the effect just rendered late — it DID work
                 } else {
                     noEffectTurns += 1
-                    if noEffectTurns >= 3 {
+                    if noEffectTurns >= Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect) {
                         _ = try? await store.appendAudit(AuditEvent(
                             actor: "agent", action: "assist.noeffect",
                             detail: Self.assistNoEffectAuditDetail(turn: count, status: "scout-stopping", noEffectStreak: noEffectTurns)
@@ -2457,7 +2521,7 @@ public final class CascadeAppModel: ObservableObject {
 	                } else {
 	                    noEffectTurns += 1
 	                    recordGroundingNoEffect(from: agent)
-	                    if noEffectTurns >= 3 {
+	                    if noEffectTurns >= Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect) {
                         _ = try? await store.appendAudit(AuditEvent(
                             actor: "agent", action: "assist.noeffect",
                             detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "stopping", noEffectStreak: noEffectTurns)
@@ -2755,7 +2819,8 @@ public final class CascadeAppModel: ObservableObject {
         var lines = ["FAILURE REFLECTIONS"]
         for memory in selected {
             let action = memory.firstBadAction.map { " after \($0)" } ?? ""
-            lines.append("- prior \(memory.failureKind.rawValue)\(action): \(memory.repairHint)")
+            let state = memory.stateSummary.map { " state: \($0)." } ?? ""
+            lines.append("- prior \(memory.failureKind.rawValue)\(action): \(Self.failureSpecificMemoryNote(for: memory.failureKind)) \(memory.repairHint)\(state)")
         }
         return lines.joined(separator: "\n")
     }
@@ -2893,6 +2958,7 @@ public final class CascadeAppModel: ObservableObject {
         turn: Int,
         status: String,
         noEffectStreak: Int,
+        recoveryAction: RecoveryAction? = nil,
         controlCount: Int? = nil,
         labels: String? = nil,
         coords: String? = nil,
@@ -2903,6 +2969,7 @@ public final class CascadeAppModel: ObservableObject {
             "turn=\(turn)",
             "status=\(safeAuditToken(status))",
             "noEffectStreak=\(noEffectStreak)",
+            "recoveryAction=\(safeAuditToken((recoveryAction ?? Self.recoveryAction(for: AgentOrchestrator.AgentFailureKind.noEffect, attempt: noEffectStreak)).rawValue))",
             "controlCount=\(controlCount.map(String.init) ?? "not-collected")",
             "labelsHash=\(auditHash(labels))",
             "coordsHash=\(auditHash(coords))",
@@ -2971,7 +3038,8 @@ public final class CascadeAppModel: ObservableObject {
     nonisolated static func failureMemoryScore(
         _ memory: AgentFailureMemory,
         queryTokens: Set<String>,
-        frontmostApp: String?
+        frontmostApp: String?,
+        expectedFailureKind: CascadeMemory.AgentFailureKind? = nil
     ) -> Double {
         var score = 0.0
         if let frontmostApp {
@@ -2991,8 +3059,72 @@ public final class CascadeAppModel: ObservableObject {
                 score += Double(overlap) * 0.05
             }
         }
+        if let expectedFailureKind {
+            if memory.failureKind == expectedFailureKind {
+                score += 1.25
+            } else if Self.failureMemoryCategory(memory.failureKind) == Self.failureMemoryCategory(expectedFailureKind) {
+                score += 0.35
+            }
+        }
         if memory.retainedScore < 0 { score += min(0.4, abs(memory.retainedScore) * 0.25) }
         return score
+    }
+
+    nonisolated static func failureSpecificMemoryNote(for failureKind: CascadeMemory.AgentFailureKind) -> String {
+        switch failureKind {
+        case .noEffect:
+            return "Treat another identical action as a known no-effect branch; recapture once, then choose an alternate target or route."
+        case .groundingMiss, .targetNotFound:
+            return "Treat this as a known grounding branch; re-harvest visible controls and re-describe the target before acting."
+        case .verifierRejected, .verificationUnavailable:
+            return "Treat this as a known verifier branch; gather visible completion evidence before saying done."
+        case .modalBlocked, .wrongStartState:
+            return "Treat this as a known replay-pause branch; verify the current app/window or blocking dialog before continuing."
+        default:
+            return "Treat this as a prior externally observed failure, not as proof the current run will fail."
+        }
+    }
+
+    nonisolated static func failureMemoryCategory(_ failureKind: CascadeMemory.AgentFailureKind) -> String {
+        switch failureKind {
+        case .targetNotFound, .groundingMiss:
+            return "grounding"
+        case .noEffect, .staleFrameBatch:
+            return "effect"
+        case .verifierRejected, .verificationUnavailable:
+            return "verification"
+        case .modalBlocked, .wrongStartState:
+            return "replay_pause"
+        case .permissionDenied, .secureInput, .loginRequired:
+            return "environment"
+        case .unsafeAction:
+            return "safety"
+        case .toolError, .timeout, .stepLimit:
+            return "runtime"
+        case .parameterNeedsLiveValue, .artifactWrongLane:
+            return "policy"
+        case .userStop:
+            return "user"
+        case .unknown:
+            return "unknown"
+        }
+    }
+
+    nonisolated static func recoveryAction(
+        for failureKind: AgentOrchestrator.AgentFailureKind,
+        attempt: Int
+    ) -> RecoveryAction {
+        let plan = AgentRecoveryPolicy.plan(for: failureKind)
+        let rungs = plan.retryRungs
+        let index = max(0, attempt - 1)
+        guard rungs.indices.contains(index) else { return plan.terminal }
+        return rungs[index]
+    }
+
+    nonisolated static func recoveryAttemptLimit(
+        for failureKind: AgentOrchestrator.AgentFailureKind
+    ) -> Int {
+        AgentRecoveryPolicy.plan(for: failureKind).retryRungs.count + 1
     }
 
     nonisolated static func auditHash(_ value: String?) -> String {
@@ -3008,7 +3140,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     nonisolated static func assistValidationAuditDetail(_ missing: String) -> String {
-        "status=incomplete \(textAuditDetail("missing", missing))"
+        "status=incomplete recoveryAction=\(RecoveryAction.diagnosticProbe.rawValue) \(textAuditDetail("missing", missing))"
     }
 
     nonisolated static func assistVerifyAuditDetail(
@@ -3155,12 +3287,20 @@ public final class CascadeAppModel: ObservableObject {
         return parts.joined(separator: " ")
     }
 
-    nonisolated static func recipeEscalationAuditDetail(agent: CascadeAgent, reason: String) -> String {
-        [
+    nonisolated static func recipeEscalationAuditDetail(
+        agent: CascadeAgent,
+        reason: String,
+        failureKind: AgentOrchestrator.AgentFailureKind? = nil,
+        recoveryAction: RecoveryAction? = nil
+    ) -> String {
+        var parts = [
             "agentID=\(agent.id)",
             textAuditDetail("name", agent.name),
             textAuditDetail("reason", reason),
-        ].joined(separator: " ")
+        ]
+        if let failureKind { parts.append("failureKind=\(safeAuditToken(failureKind.rawValue))") }
+        if let recoveryAction { parts.append("recoveryAction=\(safeAuditToken(recoveryAction.rawValue))") }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func learnedSkillDraftAuditDetail(app: String, goal: String, actionCount: Int) -> String {
@@ -4455,8 +4595,18 @@ public final class CascadeAppModel: ObservableObject {
             // replayed from the recording. Hand the rest to the assist runtime,
             // which supplies the current value — never retype the stale one.
             if Self.recipeStepNeedsLiveValue(step) {
-                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.parameter", detail: Self.recipeAuditDetail(step)))
-                await escalateRecipeToAssist(agent, reason: "this step enters a value that changes each run, and I need the current one")
+                let recovery = Self.recoveryAction(for: .parameterNeedsLiveValue, attempt: 1)
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "recipe.parameter",
+                    detail: Self.recipeAuditDetail(step) + " recoveryAction=\(recovery.rawValue)"
+                ))
+                await escalateRecipeToAssist(
+                    agent,
+                    reason: "this step enters a value that changes each run, and I need the current one",
+                    failureKind: .parameterNeedsLiveValue,
+                    recoveryAction: recovery
+                )
                 stoppedEarly = true
                 break
             }
@@ -4471,15 +4621,35 @@ public final class CascadeAppModel: ObservableObject {
                     if !startStateChecked {
                         startStateChecked = true
                         if let reason = Self.startStateMismatch(step: step) {
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.wrongstate", detail: Self.textAuditDetail("reason", reason)))
-                            await escalateRecipeToAssist(agent, reason: reason)
+                            let recovery = Self.recoveryAction(for: .wrongStartState, attempt: 1)
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent",
+                                action: "recipe.pause.wrongstate",
+                                detail: Self.textAuditDetail("reason", reason) + " recoveryAction=\(recovery.rawValue)"
+                            ))
+                            await escalateRecipeToAssist(
+                                agent,
+                                reason: reason,
+                                failureKind: .wrongStartState,
+                                recoveryAction: recovery
+                            )
                             stoppedEarly = true
                             break
                         }
                     }
                     if let modalTitle = await Self.unexpectedModal() {
-                        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.pause.modal", detail: Self.textAuditDetail("modalTitle", modalTitle)))
-                        await escalateRecipeToAssist(agent, reason: "an unexpected dialog (“\(modalTitle)”) appeared")
+                        let recovery = AgentRecoveryPolicy.plan(for: AgentOrchestrator.AgentFailureKind.unexpectedModal).terminal
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "recipe.pause.modal",
+                            detail: Self.textAuditDetail("modalTitle", modalTitle) + " recoveryAction=\(recovery.rawValue)"
+                        ))
+                        await escalateRecipeToAssist(
+                            agent,
+                            reason: "an unexpected dialog (“\(modalTitle)”) appeared",
+                            failureKind: .unexpectedModal,
+                            recoveryAction: recovery
+                        )
                         stoppedEarly = true
                         break
                     }
@@ -4547,9 +4717,19 @@ public final class CascadeAppModel: ObservableObject {
                                 unverifiedStreak = 0
                             } else {
                                 unverifiedStreak += 1
-                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.unverified", detail: Self.recipeAuditDetail(step)))
+                                let recovery = Self.recoveryAction(for: .noEffect, attempt: unverifiedStreak)
+                                _ = try? await store.appendAudit(AuditEvent(
+                                    actor: "agent",
+                                    action: "recipe.unverified",
+                                    detail: Self.recipeAuditDetail(step) + " recoveryAction=\(recovery.rawValue)"
+                                ))
                                 if unverifiedStreak >= 2 {
-                                    await escalateRecipeToAssist(agent, reason: "the screen no longer matches the recorded steps")
+                                    await escalateRecipeToAssist(
+                                        agent,
+                                        reason: "the screen no longer matches the recorded steps",
+                                        failureKind: .noEffect,
+                                        recoveryAction: recovery
+                                    )
                                     stoppedEarly = true
                                     break
                                 }
@@ -4614,7 +4794,12 @@ public final class CascadeAppModel: ObservableObject {
     /// model: fast when the UI matches, intelligent when it doesn't. Mirrors the
     /// hotkey/voice setup (bump generation, capture, supersession guard) so a barge-in
     /// still stands the escalated agent down. agentRunning stays true (the caller owns it).
-    private func escalateRecipeToAssist(_ agent: CascadeAgent, reason: String) async {
+    private func escalateRecipeToAssist(
+        _ agent: CascadeAgent,
+        reason: String,
+        failureKind: AgentOrchestrator.AgentFailureKind? = nil,
+        recoveryAction: RecoveryAction? = nil
+    ) async {
         // Honor a pending STOP: runAssistTask resets runState on entry, which would
         // otherwise swallow an abort the user pressed just as drift triggered.
         guard !driver.runState.isStopRequested else {
@@ -4622,7 +4807,16 @@ public final class CascadeAppModel: ObservableObject {
             dock.show(title: "Stopped", detail: agentMessage)
             return
         }
-        _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.escalate", detail: Self.recipeEscalationAuditDetail(agent: agent, reason: reason)))
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recipe.escalate",
+            detail: Self.recipeEscalationAuditDetail(
+                agent: agent,
+                reason: reason,
+                failureKind: failureKind,
+                recoveryAction: recoveryAction
+            )
+        ))
         let mouse = NSEvent.mouseLocation
         guard hasAnthropicKey, let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
             agentMessage = "Paused “\(agent.name)” — \(reason), and I can't take over without a Claude key. Take over, or re-record."
@@ -4896,13 +5090,19 @@ public final class CascadeAppModel: ObservableObject {
               !pendingLearnedSkills.contains(where: { $0.appName == app })
         else { return }
         let groundingMemo = Self.groundingEvidenceMemo(
-            episodeGroundingSelections.filter { $0.app == app && $0.screenChanged }
+            episodeGroundingSelections.filter { $0.app == app && $0.screenChanged },
+            calibrationReport: nil
         )
         let memo = (findings.map { "\($0.task) → \($0.result)" } + groundingMemo).joined(separator: "\n")
         Task { await distillSkill(app: app, goal: goal, findingsMemo: memo, actionCount: count) }
     }
 
-    private static func groundingEvidenceMemo(_ selections: [GroundingSelectionEvidence]) -> [String] {
+    private static func groundingEvidenceMemo(
+        _ selections: [GroundingSelectionEvidence],
+        calibrationReport: VerifierCalibrationReport? = nil,
+        minimumSamples: Int = 8,
+        minimumAccuracy: Double = 0.85
+    ) -> [String] {
         guard !selections.isEmpty else { return [] }
         let highConfidence = selections.filter { $0.confidence >= 0.72 }
         guard !highConfidence.isEmpty else { return [] }
@@ -4914,8 +5114,30 @@ public final class CascadeAppModel: ObservableObject {
             .prefix(8)
             .map { group in
                 let first = group[0]
-                return "Grounding evidence: target \"\(first.target)\" worked via \(first.source.rawValue) at confidence \(String(format: "%.2f", first.confidence)); candidate hash \(Self.safeAuditToken(first.candidateID)); screen changed after selection."
+                let calibrated = Self.groundingBucketIsReliable(
+                    confidence: first.confidence,
+                    report: calibrationReport,
+                    minimumSamples: minimumSamples,
+                    minimumAccuracy: minimumAccuracy
+                )
+                let prefix = calibrated ? "Grounding evidence" : "Grounding hint"
+                let verb = calibrated ? "worked" : "previously changed the screen"
+                return "\(prefix): target \"\(first.target)\" \(verb) via \(first.source.rawValue) at confidence \(String(format: "%.2f", first.confidence)); candidate hash \(Self.safeAuditToken(first.candidateID)); screen changed after selection."
             }
+    }
+
+    nonisolated static func groundingBucketIsReliable(
+        confidence: Double,
+        report: VerifierCalibrationReport?,
+        minimumSamples: Int = 8,
+        minimumAccuracy: Double = 0.85
+    ) -> Bool {
+        guard let report else { return false }
+        let bucketCount = max(1, report.buckets.count)
+        let index = VerifierCalibration.bucketIndex(for: confidence, bucketCount: bucketCount)
+        guard report.buckets.indices.contains(index) else { return false }
+        let bucket = report.buckets[index]
+        return bucket.sampleCount >= minimumSamples && bucket.accuracy >= minimumAccuracy
     }
 
     private func distillSkill(app: String, goal: String, findingsMemo: String, actionCount: Int) async {

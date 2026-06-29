@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import AgentOrchestrator
 import ComputerUseKit
 import ProviderKit
 
@@ -424,7 +425,11 @@ public final class BackgroundWebAgent {
                     // the false-completion the audit log caught: a mid-task run reported
                     // "done — I couldn't reach Claude" and was marked completed. Report it
                     // honestly and count nothing.
-                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "transport_failure", acted: acted))
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(
+                        status: "transport_failure",
+                        acted: acted,
+                        recoveryAction: Self.recoveryAction(for: .transportFailure, attempt: 1)
+                    ))
                     return (.failed("I couldn't reach Claude just now — ask again and I'll continue."), acted)
                 case .needsLogin(let site):
                     audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "needs_login", acted: acted, detail: site, detailName: "target"))
@@ -480,11 +485,17 @@ public final class BackgroundWebAgent {
                 let signature = await pageSignature()
                 if signature == lastSignature {
                     noEffectTurns += 1
-                    if noEffectTurns >= 3 {
-                        audit("sandbox.noeffect", "3rd no-effect — stopping")
+                    if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
+                        audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                            status: "stopping",
+                            streak: noEffectTurns
+                        ))
                         return (.failed("My actions stopped changing the page, so I stopped."), acted)
                     }
-                    audit("sandbox.noeffect", "page unchanged after acting")
+                    audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                        status: "unchanged",
+                        streak: noEffectTurns
+                    ))
                     let extra = "Your last action did NOT change the page — it had no effect. Do NOT repeat it; try a different element or route (list_interactives shows what's actually clickable)."
                     nudge = nudge.map { $0 + " " + extra } ?? extra
                 } else {
@@ -613,6 +624,11 @@ public final class BackgroundWebAgent {
             if step.done {
                 switch Self.classifyDone(rawText: step.text, failed: false) {
                 case .transportFailure:
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(
+                        status: "transport_failure",
+                        acted: acted,
+                        recoveryAction: Self.recoveryAction(for: .transportFailure, attempt: 1)
+                    ))
                     return (.failed("I couldn't reach the model just now — ask again."), acted)
                 case .needsLogin(let site):
                     audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "needs_login", acted: acted, detail: site, detailName: "target"))
@@ -670,11 +686,17 @@ public final class BackgroundWebAgent {
                 let signature = await pageSignature()
                 if signature == lastSignature {
                     noEffectTurns += 1
-                    if noEffectTurns >= 3 {
-                        audit("sandbox.noeffect", "3rd no-effect — stopping")
+                    if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
+                        audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                            status: "stopping",
+                            streak: noEffectTurns
+                        ))
                         return (.failed("My actions stopped changing the page, so I stopped."), acted)
                     }
-                    audit("sandbox.noeffect", "page unchanged after acting")
+                    audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                        status: "unchanged",
+                        streak: noEffectTurns
+                    ))
                     let extra = "Your last action did NOT change the page — it had no effect. Do NOT repeat it; name a DIFFERENT element from the clickable list, or take another route."
                     nudge = nudge.map { $0 + " " + extra } ?? extra
                 } else {
@@ -1018,19 +1040,43 @@ public final class BackgroundWebAgent {
         "status=\(safeAuditToken(status)) resultChars=\(detail.count) resultHash=\(auditHash(detail))"
     }
 
+    nonisolated static func sandboxNoEffectAuditDescriptor(status: String, streak: Int) -> String {
+        let action = recoveryAction(for: .noEffect, attempt: streak)
+        return "status=\(safeAuditToken(status)) noEffectStreak=\(streak) recoveryAction=\(safeAuditToken(action.rawValue))"
+    }
+
     nonisolated static func sandboxDoneAuditDescriptor(
         status: String,
         acted: Bool,
         detail: String? = nil,
-        detailName: String = "result"
+        detailName: String = "result",
+        recoveryAction: RecoveryAction? = nil
     ) -> String {
         var parts = ["status=\(safeAuditToken(status))", "acted=\(acted)"]
+        if let recoveryAction {
+            parts.append("recoveryAction=\(safeAuditToken(recoveryAction.rawValue))")
+        }
         if let detail {
             let prefix = safeAuditToken(detailName)
             parts.append("\(prefix)Chars=\(detail.count)")
             parts.append("\(prefix)Hash=\(auditHash(detail))")
         }
         return parts.joined(separator: " ")
+    }
+
+    nonisolated static func recoveryAction(
+        for failureKind: AgentOrchestrator.AgentFailureKind,
+        attempt: Int
+    ) -> RecoveryAction {
+        let plan = AgentRecoveryPolicy.plan(for: failureKind)
+        let rungs = plan.retryRungs
+        let index = max(0, attempt - 1)
+        guard rungs.indices.contains(index) else { return plan.terminal }
+        return rungs[index]
+    }
+
+    nonisolated static func recoveryAttemptLimit(for failureKind: AgentOrchestrator.AgentFailureKind) -> Int {
+        AgentRecoveryPolicy.plan(for: failureKind).retryRungs.count + 1
     }
 
     nonisolated private static func firstString(_ input: [String: Any], keys: [String]) -> String? {

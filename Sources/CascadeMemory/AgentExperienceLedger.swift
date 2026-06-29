@@ -261,9 +261,25 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
     public let firstBadAction: String?
     public let screenSignatureHash: String?
     public let targetHash: String?
+    public let stateSummary: String?
     public let repairHint: String
     public let recoveryEvidenceHash: String?
     public let retainedScore: Double
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case createdAt
+        case appName
+        case normalizedGoalTokens
+        case failureKind
+        case firstBadAction
+        case screenSignatureHash
+        case targetHash
+        case stateSummary
+        case repairHint
+        case recoveryEvidenceHash
+        case retainedScore
+    }
 
     public init(
         id: Int64 = 0,
@@ -274,6 +290,7 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
         firstBadAction: String? = nil,
         screenSignatureHash: String? = nil,
         targetHash: String? = nil,
+        stateSummary: String? = nil,
         repairHint: String,
         recoveryEvidenceHash: String? = nil,
         retainedScore: Double? = nil
@@ -286,9 +303,28 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
         self.firstBadAction = firstBadAction
         self.screenSignatureHash = screenSignatureHash
         self.targetHash = targetHash
+        self.stateSummary = stateSummary
         self.repairHint = repairHint
         self.recoveryEvidenceHash = recoveryEvidenceHash
         self.retainedScore = retainedScore ?? Self.defaultRetainedScore(for: failureKind)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decodeIfPresent(Int64.self, forKey: .id) ?? 0,
+            createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date(),
+            appName: try container.decode(String.self, forKey: .appName),
+            normalizedGoalTokens: try container.decode([String].self, forKey: .normalizedGoalTokens),
+            failureKind: try container.decode(AgentFailureKind.self, forKey: .failureKind),
+            firstBadAction: try container.decodeIfPresent(String.self, forKey: .firstBadAction),
+            screenSignatureHash: try container.decodeIfPresent(String.self, forKey: .screenSignatureHash),
+            targetHash: try container.decodeIfPresent(String.self, forKey: .targetHash),
+            stateSummary: try container.decodeIfPresent(String.self, forKey: .stateSummary),
+            repairHint: try container.decode(String.self, forKey: .repairHint),
+            recoveryEvidenceHash: try container.decodeIfPresent(String.self, forKey: .recoveryEvidenceHash),
+            retainedScore: try container.decodeIfPresent(Double.self, forKey: .retainedScore)
+        )
     }
 
     public func validatedForStorage() throws -> AgentFailureMemory {
@@ -309,6 +345,7 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
             firstBadAction: Self.safeOptional(firstBadAction),
             screenSignatureHash: Self.safeOptional(screenSignatureHash),
             targetHash: Self.safeOptional(targetHash),
+            stateSummary: Self.safeStateSummary(stateSummary),
             repairHint: String(hint.prefix(180)),
             recoveryEvidenceHash: Self.safeOptional(recoveryEvidenceHash),
             retainedScore: retainedScore
@@ -330,6 +367,14 @@ public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : String(trimmed.prefix(160))
+    }
+
+    private static func safeStateSummary(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let redacted = PIIDetector.redact(value).redacted
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !redacted.isEmpty, !PrivacyRules.isSensitiveText(redacted) else { return nil }
+        return String(redacted.prefix(240))
     }
 }
 
@@ -476,8 +521,8 @@ public extension CascadeStore {
         let tokensJSON = Self.encodeGoalTokens(valid.normalizedGoalTokens)
         try withStatement("""
         INSERT INTO agent_failure_memory
-            (created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, repair_hint, recovery_evidence_hash, retained_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, state_summary, repair_hint, recovery_evidence_hash, retained_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """) { statement in
             ledgerBind(AgentExperienceDateCodec.string(from: valid.createdAt), at: 1, in: statement)
             ledgerBind(valid.appName, at: 2, in: statement)
@@ -486,9 +531,10 @@ public extension CascadeStore {
             ledgerBind(valid.firstBadAction, at: 5, in: statement)
             ledgerBind(valid.screenSignatureHash, at: 6, in: statement)
             ledgerBind(valid.targetHash, at: 7, in: statement)
-            ledgerBind(valid.repairHint, at: 8, in: statement)
-            ledgerBind(valid.recoveryEvidenceHash, at: 9, in: statement)
-            sqlite3_bind_double(statement, 10, valid.retainedScore)
+            ledgerBind(valid.stateSummary, at: 8, in: statement)
+            ledgerBind(valid.repairHint, at: 9, in: statement)
+            ledgerBind(valid.recoveryEvidenceHash, at: 10, in: statement)
+            sqlite3_bind_double(statement, 11, valid.retainedScore)
             try stepDone(statement)
         }
         let id = try withStatement("SELECT last_insert_rowid();") { statement in
@@ -503,6 +549,7 @@ public extension CascadeStore {
             firstBadAction: valid.firstBadAction,
             screenSignatureHash: valid.screenSignatureHash,
             targetHash: valid.targetHash,
+            stateSummary: valid.stateSummary,
             repairHint: valid.repairHint,
             recoveryEvidenceHash: valid.recoveryEvidenceHash,
             retainedScore: valid.retainedScore
@@ -548,7 +595,7 @@ public extension CascadeStore {
 
     private static var agentFailureMemoryColumns: String {
         """
-        SELECT id, created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, repair_hint, recovery_evidence_hash, retained_score
+        SELECT id, created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, state_summary, repair_hint, recovery_evidence_hash, retained_score
         """
     }
 
@@ -581,9 +628,10 @@ public extension CascadeStore {
             firstBadAction: ledgerText(statement, 5),
             screenSignatureHash: ledgerText(statement, 6),
             targetHash: ledgerText(statement, 7),
-            repairHint: ledgerText(statement, 8) ?? "",
-            recoveryEvidenceHash: ledgerText(statement, 9),
-            retainedScore: sqlite3_column_double(statement, 10)
+            stateSummary: ledgerText(statement, 8),
+            repairHint: ledgerText(statement, 9) ?? "",
+            recoveryEvidenceHash: ledgerText(statement, 10),
+            retainedScore: sqlite3_column_double(statement, 11)
         )
     }
 

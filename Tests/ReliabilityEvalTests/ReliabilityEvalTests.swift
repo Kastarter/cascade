@@ -114,37 +114,7 @@ func transportFailureNeverReportsSuccess() {
 /// The SEQ-06 starter suite: known high-risk paths plus happy-path runs. The
 /// report must meet every reliability budget.
 private func standardSuite() -> [ScenarioOutcome] {
-    let scenarios: [ReliabilityScenario] = [
-        // Happy paths across all three surfaces (clean-success-rate denominator).
-        .init(id: "happy-replay", surface: "recipeReplay", injectedFailure: nil),
-        .init(id: "happy-assist", surface: "assist", injectedFailure: nil),
-        .init(id: "happy-web", surface: "backgroundWeb", injectedFailure: nil),
-        // 1. AX label moved but present → re-harvest heals.
-        .init(id: "s1-ax-moved", surface: "recipeReplay", injectedFailure: .groundingMiss, healsAtStep: 1),
-        // 2. AX label changed, OCR matches → visual reground heals.
-        .init(id: "s2-ocr-match", surface: "recipeReplay", injectedFailure: .targetNotFound, healsAtStep: 2),
-        // 3. OCR noisy, vision fallback required → heals at rung 2.
-        .init(id: "s3-vision", surface: "recipeReplay", injectedFailure: .groundingMiss, healsAtStep: 2),
-        // 4. Wrong frontmost app → pause.
-        .init(id: "s4-wrongstate", surface: "recipeReplay", injectedFailure: .wrongStartState),
-        // 5. Unexpected modal → pause.
-        .init(id: "s5-modal", surface: "recipeReplay", injectedFailure: .unexpectedModal),
-        // 6. Click no-effect, never recovers → escalate.
-        .init(id: "s6-noeffect", surface: "assist", injectedFailure: .noEffect),
-        // 7. Parameter needs a live value → fail with reason.
-        .init(id: "s7-param", surface: "recipeReplay", injectedFailure: .parameterNeedsLiveValue),
-        // 8. Unsafe irreversible combo → refuse.
-        .init(id: "s8-unsafe", surface: "assist", injectedFailure: .unsafeActionRefused),
-        // 9. Background web transport failure → fail (NOT success).
-        .init(id: "s9-transport", surface: "backgroundWeb", injectedFailure: .transportFailure),
-        // 10. Verifier incomplete → fail with reason.
-        .init(id: "s10-validator", surface: "backgroundWeb", injectedFailure: .validatorIncomplete),
-        // 11. Assist stalls twice → step limit.
-        .init(id: "s11-stall", surface: "assist", injectedFailure: .stepLimit),
-        // 12. Scout drops unsafe suffix → the unsafe action is refused.
-        .init(id: "s12-scout-unsafe", surface: "assist", injectedFailure: .unsafeActionRefused),
-    ]
-    return scenarios.map(ReliabilityRunner.run)
+    ReplayScenarioFixtures.standardSuite.map(ReplayScenarioRunner.run)
 }
 
 @Test
@@ -155,6 +125,12 @@ func reliabilitySuiteMeetsEveryBudget() {
     #expect(report.unsafeRefusalRate == 1.0)
     #expect(report.falseCompletionRate == 0.0)
     #expect(report.modalPauseRate == 1.0)
+    #expect(report.targetTierCounts["ax"] == 2)
+    #expect(report.targetTierCounts["vision"] == 2)
+    #expect(report.modalCount == 1)
+    #expect(report.noEffectCount == 1)
+    #expect(report.validatorIncompleteCount == 1)
+    #expect(report.verificationFailureCount >= 1)
     let violations = report.violations()
     #expect(violations.isEmpty, "reliability budget violations: \(violations)")
 }
@@ -182,6 +158,8 @@ func reportWritesDurableJsonlMetrics() throws {
     let obj = try JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any]
     #expect(obj?["id"] != nil)
     #expect(obj?["status"] != nil)
+    #expect(obj?["confidence_bucket"] != nil)
+    #expect(obj?["actual_success"] as? Bool == true)
     // Persist the durable eval artifact where SEQ-06 specifies (best-effort).
     let dir = URL(fileURLWithPath: ".build/reliability-eval")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -198,4 +176,14 @@ func violationsReportWhenABudgetIsMissed() {
     let report = ReliabilityReport(bad)
     #expect(!report.violations().isEmpty)
     #expect(report.falseCompletionRate == 1.0)
+}
+
+@Test
+func reliabilityReportBuildsCalibrationReportFromOutcomes() {
+    let report = ReliabilityReport(standardSuite())
+    let calibration = report.verifierCalibrationReport(bucketCount: 5)
+
+    #expect(calibration.sampleCount == standardSuite().filter { $0.confidence != nil }.count)
+    #expect(calibration.falseAcceptCount >= 1)
+    #expect(calibration.buckets.reduce(0) { $0 + $1.sampleCount } == calibration.sampleCount)
 }

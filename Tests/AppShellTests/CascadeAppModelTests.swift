@@ -627,6 +627,65 @@ func completionMessageIsHonestAboutTheOutcome() {
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stepLimitUpdate("Ran out of steps — ask again.")) == "Ran out of steps — ask again.")
 }
 
+@Test
+func sandboxFailureMemoryContextRequiresExternalSignalAndKnownFailure() {
+    let rawSelfReport = BackgroundWebAgent.Update(
+        status: "INCOMPLETE: I could not finish",
+        snapshotPNG: nil,
+        url: "https://example.test/private",
+        done: true,
+        result: nil
+    )
+    #expect(CascadeAppModel.sandboxFailureMemoryContext(for: rawSelfReport, failureKind: .verifierRejected) == nil)
+    #expect(CascadeAppModel.sandboxFailureMemoryContext(for: rawSelfReport, failureKind: .unknown) == nil)
+
+    let verifierSignal = BackgroundWebAgent.Update(
+        status: "Couldn't finish — verify check found the form still blank for jane@example.com",
+        snapshotPNG: nil,
+        url: "https://example.test/form",
+        done: true,
+        result: nil
+    )
+    let context = CascadeAppModel.sandboxFailureMemoryContext(for: verifierSignal, failureKind: .verifierRejected)
+    #expect(context != nil)
+    #expect(context?.stateSummary.contains("<EMAIL>") == true)
+    #expect(context?.stateSummary.contains("jane@example.com") == false)
+    #expect(context?.recoveryEvidenceHash.isEmpty == false)
+}
+
+@Test
+func failureMemoryScoreBoostsSameFailureKindAndCategory() {
+    let memory = AgentFailureMemory(
+        appName: "Safari",
+        normalizedGoalTokens: ["submit", "invoice"],
+        failureKind: .noEffect,
+        repairHint: "Use a different button."
+    )
+    let queryTokens: Set<String> = ["submit", "invoice"]
+
+    let base = CascadeAppModel.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: "Safari")
+    let exact = CascadeAppModel.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: "Safari", expectedFailureKind: .noEffect)
+    let category = CascadeAppModel.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: "Safari", expectedFailureKind: .staleFrameBatch)
+
+    #expect(exact > category)
+    #expect(category > base)
+}
+
+@Test
+func groundingBucketReliabilityRequiresEnoughAccurateSamples() {
+    let goodReport = VerifierCalibration.report(samples: Array(repeating: VerifierCalibrationSample(
+        confidence: 0.9,
+        outcome: .acceptedCorrect
+    ), count: 8), bucketCount: 5)
+    let sparseReport = VerifierCalibration.report(samples: [
+        VerifierCalibrationSample(confidence: 0.9, outcome: .acceptedCorrect)
+    ], bucketCount: 5)
+
+    #expect(CascadeAppModel.groundingBucketIsReliable(confidence: 0.91, report: goodReport))
+    #expect(!CascadeAppModel.groundingBucketIsReliable(confidence: 0.91, report: sparseReport))
+    #expect(!CascadeAppModel.groundingBucketIsReliable(confidence: 0.91, report: nil))
+}
+
 // MARK: - Teach-once (demonstrate a task → agent, over the shared spine)
 
 /// A single cross-app copy/paste demonstration timestamped INSIDE the bracket

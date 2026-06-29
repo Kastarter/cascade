@@ -160,6 +160,7 @@ struct NoEffectDetectionTests {
         )
         #expect(labelDetail.contains("turn=7"))
         #expect(labelDetail.contains("controlCount=1"))
+        #expect(labelDetail.contains("recoveryAction=recapture"))
         #expect(labelDetail.contains("labelsHash=\(CascadeAppModel.auditHash(labels))"))
         #expect(!labelDetail.contains(phrase))
         #expect(!labelDetail.contains(labels))

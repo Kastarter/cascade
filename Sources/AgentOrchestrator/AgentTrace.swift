@@ -122,13 +122,17 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         let root = spans.first { $0.kind == .run && $0.parentID == nil } ?? spans.first
         let rootStatus = root?.status ?? (succeeded ? .ok : .error)
         let failureKind = root?.failureKind ?? failureKinds.last
+        let status = Self.scenarioStatus(rootStatus: rootStatus, failureKind: failureKind)
+        let confidence = spans.compactMap { Self.confidence(from: $0.attributes) }.last
         return ScenarioOutcome(
             id: traceID,
             surface: surface,
-            status: Self.scenarioStatus(rootStatus: rootStatus, failureKind: failureKind),
+            status: status,
             failureKind: failureKind,
             stepsAttempted: stepToolSpanCount,
-            retries: retryCount
+            retries: retryCount,
+            confidence: confidence,
+            actualSuccess: confidence == nil ? nil : status == .success
         )
     }
 
@@ -238,6 +242,14 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         }
         let name = span.name.lowercased()
         return name.contains("retry") || name.contains("recovery") || name.contains("correction") ? 1 : 0
+    }
+
+    private static func confidence(from attributes: [String: String]) -> Double? {
+        for key in ["verifier.confidence", "ground.confidence", "confidence"] {
+            guard let raw = attributes[key], let value = Double(raw) else { continue }
+            return VerifierCalibration.clampConfidence(value)
+        }
+        return nil
     }
 
 }
@@ -734,17 +746,44 @@ public enum AgentTraceBuilder {
     }
 
     private static func safeAttributes(for event: AuditEvent, order: Int) -> [String: String] {
-        [
+        var attributes = [
             "audit.id": event.id > 0 ? String(event.id) : String(order),
             "audit.actor": safeToken(event.actor),
             "audit.action": safeToken(event.action)
         ]
+        if let confidence = confidenceValue(in: event.detail) {
+            let key = event.action == "agent.ground" ? "ground.confidence" : "verifier.confidence"
+            attributes[key] = String(format: "%.4f", confidence)
+            attributes["confidence.bucket"] = VerifierCalibration.bucketLabel(for: confidence)
+        }
+        if event.action == "grounding.verifier",
+           let outcome = auditValue("outcome", in: event.detail) {
+            attributes["verifier.outcome"] = safeToken(outcome)
+        }
+        return attributes
     }
 
     private static func safeToken(_ value: String) -> String {
         value.filter { character in
             character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
         }
+    }
+
+    private static func confidenceValue(in detail: String) -> Double? {
+        for key in ["confidence", "score"] {
+            guard let raw = auditValue(key, in: detail),
+                  let value = Double(raw) else { continue }
+            return VerifierCalibration.clampConfidence(value)
+        }
+        return nil
+    }
+
+    private static func auditValue(_ key: String, in detail: String) -> String? {
+        let prefix = "\(key)="
+        return detail
+            .split(separator: " ")
+            .first { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)).lowercased() }
     }
 
     private static func spanID(prefix: String, event: AuditEvent, order: Int) -> String {

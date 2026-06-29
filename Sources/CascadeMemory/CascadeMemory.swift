@@ -1933,6 +1933,7 @@ public actor CascadeStore {
             first_bad_action TEXT,
             screen_signature_hash TEXT,
             target_hash TEXT,
+            state_summary TEXT,
             repair_hint TEXT NOT NULL,
             recovery_evidence_hash TEXT,
             retained_score REAL NOT NULL
@@ -1940,6 +1941,7 @@ public actor CascadeStore {
         CREATE INDEX IF NOT EXISTS idx_agent_failure_memory_app_failure
             ON agent_failure_memory(app_name, failure_kind, created_at DESC);
         """, db: db)
+        try? execute("ALTER TABLE agent_failure_memory ADD COLUMN state_summary TEXT;", db: db)
 
         // Native work graph storage. Entities and evidence links are separate so
         // aliases can be merged without duplicating moment citations. The valid_*

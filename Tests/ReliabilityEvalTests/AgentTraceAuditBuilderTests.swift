@@ -174,6 +174,32 @@ func traceAuditWindowAssemblesSandboxAndRecipeReplayRuns() async throws {
 }
 
 @Test
+func traceBuilderPreservesVerifierConfidenceAsSafeAttributes() throws {
+    let base = Date(timeIntervalSince1970: 1_800_000_275)
+    let traces = AgentTraceBuilder.fromAuditEvents([
+        AuditEvent(id: 30, createdAt: base, actor: "agent", action: "assist.task", detail: "private task text"),
+        AuditEvent(
+            id: 31,
+            createdAt: base.addingTimeInterval(0.1),
+            actor: "agent",
+            action: "grounding.verifier",
+            detail: "verdict=accept outcome=accepted failure=none confidence=0.91 targetChars=12 targetHash=abc"
+        ),
+        AuditEvent(id: 32, createdAt: base.addingTimeInterval(0.2), actor: "agent", action: "agent.run.completed", detail: "agentID=1 labelHash=abc"),
+    ])
+
+    let trace = try #require(traces.first)
+    let verifier = try #require(trace.spans.first { $0.name == "grounding.verifier" })
+    let outcome = trace.scenarioOutcome
+
+    #expect(verifier.attributes["verifier.confidence"] == "0.9100")
+    #expect(verifier.attributes["confidence.bucket"] == "0.8-1.0")
+    #expect(outcome.confidence == 0.91)
+    #expect(outcome.confidenceBucket == "0.8-1.0")
+    #expect(outcome.actualSuccess == true)
+}
+
+@Test
 func traceAuditWindowRejectsUnchainedOnlyRows() async throws {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("AgentTraceLegacyOnly-\(UUID().uuidString).sqlite")

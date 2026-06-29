@@ -20,10 +20,27 @@ public struct ScenarioOutcome: Sendable, Equatable, Codable {
     public let failureKind: AgentFailureKind?
     public let stepsAttempted: Int
     public let retries: Int
+    public let targetTier: String?
+    public let modalCount: Int
+    public let noEffectCount: Int
+    public let validatorIncompleteCount: Int
+    public let verificationFailureCount: Int
+    public let confidence: Double?
+    public let confidenceBucket: String?
+    public let actualSuccess: Bool?
+    public let calibrationOutcome: VerifierCalibrationOutcome?
 
     public init(
         id: String, surface: String, status: ScenarioStatus,
-        failureKind: AgentFailureKind?, stepsAttempted: Int, retries: Int
+        failureKind: AgentFailureKind?, stepsAttempted: Int, retries: Int,
+        targetTier: String? = nil,
+        modalCount: Int = 0,
+        noEffectCount: Int = 0,
+        validatorIncompleteCount: Int = 0,
+        verificationFailureCount: Int = 0,
+        confidence: Double? = nil,
+        actualSuccess: Bool? = nil,
+        calibrationOutcome: VerifierCalibrationOutcome? = nil
     ) {
         self.id = id
         self.surface = surface
@@ -31,6 +48,57 @@ public struct ScenarioOutcome: Sendable, Equatable, Codable {
         self.failureKind = failureKind
         self.stepsAttempted = stepsAttempted
         self.retries = retries
+        self.targetTier = targetTier
+        self.modalCount = modalCount
+        self.noEffectCount = noEffectCount
+        self.validatorIncompleteCount = validatorIncompleteCount
+        self.verificationFailureCount = verificationFailureCount
+        let clampedConfidence = confidence.map(VerifierCalibration.clampConfidence)
+        self.confidence = clampedConfidence
+        self.confidenceBucket = clampedConfidence.map { VerifierCalibration.bucketLabel(for: $0) }
+        self.actualSuccess = actualSuccess ?? (clampedConfidence == nil ? nil : status == .success)
+        self.calibrationOutcome = calibrationOutcome ?? Self.defaultCalibrationOutcome(
+            status: status,
+            actualSuccess: self.actualSuccess,
+            retries: retries
+        )
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case surface
+        case status
+        case failureKind
+        case stepsAttempted
+        case retries
+        case targetTier = "target_tier"
+        case modalCount = "modal_count"
+        case noEffectCount = "no_effect_count"
+        case validatorIncompleteCount = "validator_incomplete_count"
+        case verificationFailureCount = "verification_failure_count"
+        case confidence
+        case confidenceBucket = "confidence_bucket"
+        case actualSuccess = "actual_success"
+        case calibrationOutcome = "calibration_outcome"
+    }
+
+    private static func defaultCalibrationOutcome(
+        status: ScenarioStatus,
+        actualSuccess: Bool?,
+        retries: Int
+    ) -> VerifierCalibrationOutcome? {
+        guard let actualSuccess else { return nil }
+        if actualSuccess { return retries > 0 ? .regrounded : .acceptedCorrect }
+        switch status {
+        case .paused:
+            return .paused
+        case .refused, .userStop:
+            return .abstained
+        case .success:
+            return .falseAccept
+        case .failed, .escalated:
+            return .falseAccept
+        }
     }
 
     /// One JSON object per line — the durable, machine-readable eval record.
@@ -141,6 +209,26 @@ public struct ReliabilityReport: Sendable {
         Dictionary(grouping: outcomes, by: \.surface).mapValues { surfaceOutcomes in
             surfaceOutcomes.reduce(0) { $0 + $1.retries }
         }
+    }
+
+    public var targetTierCounts: [String: Int] {
+        outcomes.reduce(into: [:]) { counts, outcome in
+            guard let tier = outcome.targetTier else { return }
+            counts[tier, default: 0] += 1
+        }
+    }
+
+    public var modalCount: Int { outcomes.reduce(0) { $0 + $1.modalCount } }
+    public var noEffectCount: Int { outcomes.reduce(0) { $0 + $1.noEffectCount } }
+    public var validatorIncompleteCount: Int { outcomes.reduce(0) { $0 + $1.validatorIncompleteCount } }
+    public var verificationFailureCount: Int { outcomes.reduce(0) { $0 + $1.verificationFailureCount } }
+
+    public func verifierCalibrationReport(bucketCount: Int = 5) -> VerifierCalibrationReport {
+        VerifierCalibration.report(samples: outcomes.compactMap { outcome in
+            guard let confidence = outcome.confidence,
+                  let calibrationOutcome = outcome.calibrationOutcome else { return nil }
+            return VerifierCalibrationSample(confidence: confidence, outcome: calibrationOutcome)
+        }, bucketCount: bucketCount)
     }
 
     /// Fraction of *clean* runs (no injected failure) that succeeded — the core
