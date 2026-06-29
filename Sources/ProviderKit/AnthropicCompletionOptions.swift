@@ -58,3 +58,114 @@ public struct AnthropicCompletionOptions: Equatable, Sendable {
         )
     }
 }
+
+public struct AnthropicModelPricing: Equatable, Sendable {
+    public let inputPerMTok: Double
+    public let outputPerMTok: Double
+    public let cacheReadPerMTok: Double
+    public let cacheWritePerMTok: Double
+
+    public init(
+        inputPerMTok: Double,
+        outputPerMTok: Double,
+        cacheReadPerMTok: Double,
+        cacheWritePerMTok: Double
+    ) {
+        self.inputPerMTok = inputPerMTok
+        self.outputPerMTok = outputPerMTok
+        self.cacheReadPerMTok = cacheReadPerMTok
+        self.cacheWritePerMTok = cacheWritePerMTok
+    }
+
+    public static func illustrative(for model: String) -> AnthropicModelPricing {
+        let lowercased = model.lowercased()
+        if lowercased.contains("haiku") {
+            return AnthropicModelPricing(inputPerMTok: 1, outputPerMTok: 5, cacheReadPerMTok: 0.1, cacheWritePerMTok: 1.25)
+        }
+        if lowercased.contains("sonnet") {
+            return AnthropicModelPricing(inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75)
+        }
+        return AnthropicModelPricing(inputPerMTok: 15, outputPerMTok: 75, cacheReadPerMTok: 1.5, cacheWritePerMTok: 18.75)
+    }
+
+    public func cost(
+        inputTokens: Int,
+        outputTokens: Int,
+        cacheReadTokens: Int = 0,
+        cacheWriteTokens: Int = 0
+    ) -> Double {
+        (
+            Double(inputTokens) * inputPerMTok
+            + Double(outputTokens) * outputPerMTok
+            + Double(cacheReadTokens) * cacheReadPerMTok
+            + Double(cacheWriteTokens) * cacheWritePerMTok
+        ) / 1_000_000.0
+    }
+}
+
+public struct EpisodeBudget: Equatable, Sendable {
+    public var preflightInputTokens: Int
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var cacheReadTokens: Int
+    public var cacheWriteTokens: Int
+    public var estimatedCostUSD: Double
+    public var actualCostUSD: Double
+    public var actionCount: Int
+    public var noEffectCount: Int
+    public var screenshotCount: Int
+    public var compactedToolResults: Int
+    public var pricing: AnthropicModelPricing
+
+    public init(
+        preflightInputTokens: Int = 0,
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cacheReadTokens: Int = 0,
+        cacheWriteTokens: Int = 0,
+        estimatedCostUSD: Double = 0,
+        actualCostUSD: Double = 0,
+        actionCount: Int = 0,
+        noEffectCount: Int = 0,
+        screenshotCount: Int = 0,
+        compactedToolResults: Int = 0,
+        pricing: AnthropicModelPricing = .illustrative(for: AnthropicModel.sonnet)
+    ) {
+        self.preflightInputTokens = preflightInputTokens
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.estimatedCostUSD = estimatedCostUSD
+        self.actualCostUSD = actualCostUSD
+        self.actionCount = actionCount
+        self.noEffectCount = noEffectCount
+        self.screenshotCount = screenshotCount
+        self.compactedToolResults = compactedToolResults
+        self.pricing = pricing
+    }
+
+    public var cacheHitRatio: Double {
+        let total = inputTokens + cacheReadTokens + cacheWriteTokens
+        guard total > 0 else { return 0 }
+        return Double(cacheReadTokens) / Double(total)
+    }
+
+    public mutating func recordPreflight(inputTokens: Int, maxOutputTokens: Int) {
+        preflightInputTokens += inputTokens
+        estimatedCostUSD += pricing.cost(inputTokens: inputTokens, outputTokens: maxOutputTokens)
+    }
+
+    public mutating func recordActual(_ usage: AnthropicUsage) {
+        inputTokens += usage.inputTokens
+        outputTokens += usage.outputTokens
+        cacheReadTokens += usage.cacheReadInputTokens
+        cacheWriteTokens += usage.cacheCreationInputTokens
+        actualCostUSD += pricing.cost(
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cacheReadTokens: usage.cacheReadInputTokens,
+            cacheWriteTokens: usage.cacheCreationInputTokens
+        )
+    }
+}

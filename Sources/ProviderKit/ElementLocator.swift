@@ -39,6 +39,7 @@ public struct ElementRegion: Sendable {
 
 public struct ElementLocator: Sendable {
     private let keyStore: AnthropicKeyStore
+    private let messagesClient: AnthropicMessagesClient
     private let model: String
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
     static let guidePromptVersion = "element-locator.guide.prompt.v1"
@@ -48,6 +49,7 @@ public struct ElementLocator: Sendable {
 
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
+        self.messagesClient = AnthropicMessagesClient(keyStore: keyStore)
         self.model = model
     }
 
@@ -238,12 +240,7 @@ public struct ElementLocator: Sendable {
     }
 
     private func callRegion(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String, conversation: [(user: String, assistant: String)] = []) async -> (box: [CGFloat]?, say: String)? {
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        _ = key
         let options = AnthropicCompletionOptions.deterministic(
             promptVersion: Self.regionPromptVersion,
             schemaVersion: Self.regionSchemaVersion,
@@ -266,30 +263,27 @@ public struct ElementLocator: Sendable {
         element itself. If it is not visible on screen, use {"box": null, "say": "..."}.
         """
 
-        let body: [String: Any] = [
-            // Region detection is a simple bounding-box vision task — Haiku is ~2× faster
-            // and plenty accurate for framing, so the find loop isn't bottlenecked on it.
-            "model": AnthropicModel.haiku,
-            "max_tokens": 400,
-            "temperature": options.temperature ?? 0,
-            // Instruction BEFORE the image — measurably better localization.
-            "messages": Self.historyMessages(conversation) + [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": prompt],
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
-                ],
-            ]],
-        ]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        request.httpBody = bodyData
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String else {
-            return nil
-        }
+        let messages = Self.historyMessages(conversation) + [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ],
+        ]]
+        _ = try? await messagesClient.countTokens(
+            model: AnthropicModel.haiku,
+            maxTokens: 400,
+            messages: messages,
+            temperature: options.temperature ?? 0
+        )
+        guard let response = try? await messagesClient.send(
+            model: AnthropicModel.haiku,
+            maxTokens: 400,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            timeout: 20
+        ) else { return nil }
+        let text = response.text
         return parseRegion(text)
     }
 
@@ -302,12 +296,7 @@ public struct ElementLocator: Sendable {
         key: String,
         conversation: [(user: String, assistant: String)] = []
     ) async -> (mark: Int?, say: String)? {
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        _ = key
         let options = AnthropicCompletionOptions.deterministic(
             promptVersion: Self.guidePromptVersion,
             schemaVersion: Self.guideSchemaVersion,
@@ -327,27 +316,27 @@ public struct ElementLocator: Sendable {
         Candidates:
         \(list)
         """
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 256,
-            "temperature": options.temperature ?? 0,
-            "messages": Self.historyMessages(conversation) + [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": prompt],
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
-                ],
-            ]],
-        ]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        request.httpBody = bodyData
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String else {
-            return nil
-        }
+        let messages = Self.historyMessages(conversation) + [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ],
+        ]]
+        _ = try? await messagesClient.countTokens(
+            model: model,
+            maxTokens: 256,
+            messages: messages,
+            temperature: options.temperature ?? 0
+        )
+        guard let response = try? await messagesClient.send(
+            model: model,
+            maxTokens: 256,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            timeout: 20
+        ) else { return nil }
+        let text = response.text
         return Self.parseMarkedSelection(text)
     }
 
@@ -397,13 +386,7 @@ public struct ElementLocator: Sendable {
     }
 
     private func callComputerUse(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String, conversation: [(user: String, assistant: String)] = []) async -> (point: CGPoint?, text: String)? {
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue(AnthropicRequestVersions.computerUseBeta, forHTTPHeaderField: "anthropic-beta")
+        _ = key
         let options = AnthropicCompletionOptions.deterministic(
             promptVersion: Self.guidePromptVersion,
             schemaVersion: Self.guideSchemaVersion,
@@ -419,36 +402,40 @@ public struct ElementLocator: Sendable {
         left_click the closest relevant element.
         """
 
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 1024,
-            "temperature": options.temperature ?? 0,
-            "tools": [[
+        let tools: [[String: Any]] = [[
                 "type": "computer_20251124",
                 "name": "computer",
                 "display_width_px": declaredW,
                 "display_height_px": declaredH,
-            ]],
-            "tool_choice": ["type": "tool", "name": "computer"],
-            // Instruction BEFORE the image — measurably better click accuracy.
-            "messages": Self.historyMessages(conversation) + [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": prompt],
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
-                ],
-            ]],
-        ]
-
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        request.httpBody = bodyData
-
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode) else {
-            return nil
-        }
-        return parse(data)
+        ]]
+        let messages = Self.historyMessages(conversation) + [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ],
+        ]]
+        let toolChoice = ["type": "tool", "name": "computer"]
+        _ = try? await messagesClient.countTokens(
+            model: model,
+            maxTokens: 1024,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            tools: tools,
+            toolChoice: toolChoice,
+            betaHeader: AnthropicRequestVersions.computerUseBeta
+        )
+        guard let response = try? await messagesClient.send(
+            model: model,
+            maxTokens: 1024,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            tools: tools,
+            toolChoice: toolChoice,
+            betaHeader: AnthropicRequestVersions.computerUseBeta,
+            timeout: 20
+        ) else { return nil }
+        return parse(content: response.content)
     }
 
     /// Claude's response: a `text` block (the spoken instruction) and/or a
@@ -456,6 +443,10 @@ public struct ElementLocator: Sendable {
     private func parse(_ data: Data) -> (point: CGPoint?, text: String)? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]] else { return nil }
+        return parse(content: content)
+    }
+
+    private func parse(content: [[String: Any]]) -> (point: CGPoint?, text: String)? {
         var coordinate: CGPoint?
         var texts: [String] = []
         for block in content {

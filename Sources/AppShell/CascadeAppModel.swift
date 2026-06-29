@@ -2246,6 +2246,7 @@ public final class CascadeAppModel: ObservableObject {
         // calls); on a no-op acting turn, nudge with the controls actually on screen,
         // and stop after 3 in a row. This is the single biggest harness Scout lacked.
         var noEffectTurns = 0
+        var noEffectVerifierUsed = false
         var lastFrameHashes = Self.gridHashes(ofJPEG: firstScreenshotPNG)
         var nudge: String?
 
@@ -2351,6 +2352,21 @@ public final class CascadeAppModel: ObservableObject {
                     noEffectTurns = 0  // the effect just rendered late — it DID work
                 } else {
                     noEffectTurns += 1
+                    // The controls list is PUSHED proactively into turnNote below
+                    // (harvested once), so the nudge just steers — no second AX walk.
+                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
+                    if noEffectTurns >= 2, !noEffectVerifierUsed {
+                        noEffectVerifierUsed = true
+                        if let verifierNudge = await runNoEffectVerifier(
+                            goal: goal,
+                            lastAction: Self.actionSummary(step.actions),
+                            screenshot: observedShot,
+                            turn: count,
+                            engine: "scout"
+                        ) {
+                            nudge = [nudge, verifierNudge].compactMap { $0 }.joined(separator: " ")
+                        }
+                    }
                     if noEffectTurns >= Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect) {
                         _ = try? await store.appendAudit(AuditEvent(
                             actor: "agent", action: "assist.noeffect",
@@ -2358,9 +2374,6 @@ public final class CascadeAppModel: ObservableObject {
                         ))
                         return await scoutEnd(.stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way."), "noeffect-stall")
                     }
-                    // The controls list is PUSHED proactively into turnNote below
-                    // (harvested once), so the nudge just steers — no second AX walk.
-                    nudge = "Your last action did NOT change the screen at all — do NOT repeat that same action; pick a DIFFERENT control from those listed below, open the right menu/panel, or set action to \"done\" if it truly can't be done."
                     _ = try? await store.appendAudit(AuditEvent(
                         actor: "agent", action: "assist.noeffect",
                         detail: Self.assistNoEffectAuditDetail(turn: count, status: "scout-no-effect", noEffectStreak: noEffectTurns)
@@ -2546,6 +2559,7 @@ public final class CascadeAppModel: ObservableObject {
         // and tell the model to change approach. `lastFrameHashes` is the
         // fingerprint of the frame the current `step` was generated from.
         var noEffectTurns = 0
+        var noEffectVerifierUsed = false
         var lastFrameHashes = Self.gridHashes(ofJPEG: firstScreenshotPNG)
         func auditTiming(outcome: String) {
             let total = episodeStart.duration(to: .now)
@@ -2734,10 +2748,22 @@ public final class CascadeAppModel: ObservableObject {
                         actor: "agent", action: "assist.noeffect",
                         detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
                     ))
-	                } else {
-	                    noEffectTurns += 1
-	                    recordGroundingNoEffect(from: agent)
-	                    if noEffectTurns >= Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect) {
+		                } else {
+		                    noEffectTurns += 1
+		                    recordGroundingNoEffect(from: agent)
+		                    if noEffectTurns >= 2, !noEffectVerifierUsed {
+		                        noEffectVerifierUsed = true
+		                        if let verifierNudge = await runNoEffectVerifier(
+		                            goal: goal,
+		                            lastAction: Self.actionSummary(step.actions),
+		                            screenshot: observedShot,
+		                            turn: count + 1,
+		                            engine: "opus"
+		                        ) {
+		                            nudge = [nudge, verifierNudge].compactMap { $0 }.joined(separator: " ")
+		                        }
+		                    }
+		                    if noEffectTurns >= Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect) {
                         _ = try? await store.appendAudit(AuditEvent(
                             actor: "agent", action: "assist.noeffect",
                             detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "stopping", noEffectStreak: noEffectTurns)
@@ -3110,6 +3136,64 @@ public final class CascadeAppModel: ObservableObject {
         return Self.parseAssistVerdict(reply)
     }
 
+    private func runNoEffectVerifier(
+        goal: String,
+        lastAction: String,
+        screenshot: Data,
+        turn: Int,
+        engine: String
+    ) async -> String? {
+        guard hasAnthropicKey else { return nil }
+        let context = [scoutGroundingNote(), groundingNote()].compactMap { $0 }.joined(separator: "\n")
+        guard let result = try? await NoEffectVerifier().verify(
+            goal: goal,
+            lastAction: lastAction,
+            currentScreenshotJPEG: screenshot,
+            visibleContext: context.isEmpty ? nil : context
+        ) else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.noeffect.verifier",
+            detail: Self.noEffectVerifierAuditDetail(turn: turn, engine: engine, result: result)
+        ))
+        let appName = AppWindowObserver.snapshot().appName
+        let tokens = TrajectorySketch.normalizedGoalTokens(from: goal)
+        if !tokens.isEmpty, appName != "Unknown app" {
+            _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
+                appName: appName,
+                normalizedGoalTokens: Array(tokens.prefix(10)),
+                failureKind: .noEffect,
+                firstBadAction: lastAction,
+                stateSummary: result.state,
+                repairHint: "\(result.nextStrategy) Avoid: \(result.avoid)"
+            ))
+        }
+        return "Verifier state: \(result.state). Next: \(result.nextStrategy). Avoid: \(result.avoid)."
+    }
+
+    nonisolated static func actionSummary(_ actions: [CUAction]) -> String {
+        let labels = actions.prefix(4).map { action -> String in
+            switch action {
+            case .move(let x, let y): return "move \(Int(x)),\(Int(y))"
+            case .click(let x, let y): return "click \(Int(x)),\(Int(y))"
+            case .doubleClick(let x, let y): return "double_click \(Int(x)),\(Int(y))"
+            case .tripleClick(let x, let y): return "triple_click \(Int(x)),\(Int(y))"
+            case .rightClick(let x, let y): return "right_click \(Int(x)),\(Int(y))"
+            case .drag: return "drag"
+            case .type(let text): return "type \(text.prefix(24))"
+            case .key(let key): return "key \(key)"
+            case .scroll(_, _, let direction, let amount): return "scroll \(direction) \(amount)"
+            case .wait: return "wait"
+            case .screenshot: return "screenshot"
+            case .openApp(let name): return "open_app \(name)"
+            case .openURL(let url): return "open_url \(url.prefix(48))"
+            case .zoom: return "zoom"
+            case .highlight(_, _, _, _, let label): return "highlight \(label)"
+            }
+        }
+        return labels.isEmpty ? "no executable action" : labels.joined(separator: "; ")
+    }
+
     /// Parses the validator's reply: an INCOMPLETE reason, or nil to accept
     /// (VERIFIED / unclear / empty all accept). Pure + pinned. Mirrors the
     /// background agent's verdict parse.
@@ -3217,6 +3301,20 @@ public final class CascadeAppModel: ObservableObject {
             "coordsHash=\(auditHash(coords))",
             "ocrLineCount=\(ocrLineCount)",
             "ocrMarksHash=\(auditHash(ocrMarks))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func noEffectVerifierAuditDetail(
+        turn: Int,
+        engine: String,
+        result: NoEffectVerifierResult
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "engine=\(safeAuditToken(engine))",
+            textAuditDetail("state", result.state),
+            textAuditDetail("nextStrategy", result.nextStrategy),
+            textAuditDetail("avoid", result.avoid),
         ].joined(separator: " ")
     }
 
@@ -3450,6 +3548,13 @@ public final class CascadeAppModel: ObservableObject {
             "cacheReadTokens=\(usage.cacheReadTokens)",
             "cacheWriteTokens=\(usage.cacheWriteTokens)",
             "verifierCalls=\(usage.verifierCalls)",
+            "preflightInputTokens=\(usage.preflightInputTokens)",
+            "estimatedCostUSD=\(String(format: "%.6f", usage.estimatedCostUSD))",
+            "actualCostUSD=\(String(format: "%.6f", usage.actualCostUSD))",
+            "cacheHitRatio=\(String(format: "%.3f", usage.cacheHitRatio))",
+            "compactedToolResults=\(usage.compactedToolResults)",
+            "actionCount=\(usage.actionCount)",
+            "noEffectCount=\(usage.noEffectCount)",
         ].joined(separator: " ")
     }
 

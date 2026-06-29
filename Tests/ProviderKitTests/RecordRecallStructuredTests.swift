@@ -46,7 +46,7 @@ func inspectStructureMissingMetadataDegradesClearly() async throws {
 
     let out = await RecordRecall(store: store).perform(.inspectStructure(id: moment.id))
 
-    #expect(out == "No structured metadata recorded for moment #\(moment.id). Capture structured content must be enabled first.")
+    #expect(out == #"{"kind":"missing_structured_metadata","message":"No structured metadata recorded for moment #\#(moment.id). Capture structured content must be enabled first.","status":"no_result","tool":"inspect_structure"}"#)
 }
 
 @Test

@@ -176,7 +176,29 @@ public struct RecordRecall: Sendable {
                 "required": ["start_iso", "end_iso"],
             ],
         ])
-        return definitions
+        return definitions.map { definition in
+            StableToolDefinition.strict(
+                definition,
+                examples: inputExamples(for: definition["name"] as? String ?? "")
+            )
+        }
+    }
+
+    private static func inputExamples(for tool: String) -> [[String: Any]] {
+        switch tool {
+        case "search_record":
+            [["query": "Q2 budget spreadsheet from this morning"]]
+        case "get_timeframe":
+            [["start_iso": "2026-06-10T14:00:00Z", "end_iso": "2026-06-10T15:00:00Z"]]
+        case "inspect_moment":
+            [["id": 42]]
+        case "inspect_structure":
+            [["id": 42]]
+        case "list_sessions":
+            [["start_iso": "2026-06-10T09:00:00Z", "end_iso": "2026-06-10T12:00:00Z"]]
+        default:
+            []
+        }
     }
 
     // MARK: - Execution (resolves in-process against the local store)
@@ -195,9 +217,9 @@ public struct RecordRecall: Sendable {
     public func perform(_ call: Call) async -> String {
         switch call {
         case .search(let query):
-            guard !query.isEmpty else { return "search_record needs a query." }
+            guard !query.isEmpty else { return Self.status(.error, tool: "search_record", kind: "validation_error", message: "search_record needs a query.") }
             let visible = await searchContexts(query: query, limit: 12, candidatePool: reranker == nil ? 40 : 80)
-            guard !visible.isEmpty else { return "No recorded moments match “\(query)”. Try different words or a timeframe." }
+            guard !visible.isEmpty else { return Self.status(.noResult, tool: "search_record", kind: "no_matches", message: "No recorded moments match “\(query)”. Try different words or a timeframe.") }
             try? await store.markMemoryEventsAccessed(visible.map(\.id))
             return Self.enveloped(
                 visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n"),
@@ -208,11 +230,11 @@ public struct RecordRecall: Sendable {
         case .timeframe(let startISO, let endISO):
             guard let start = Self.date(from: startISO),
                   let end = Self.date(from: endISO), end > start else {
-                return "get_timeframe needs start_iso and end_iso (ISO-8601, end after start)."
+                return Self.status(.error, tool: "get_timeframe", kind: "validation_error", message: "get_timeframe needs start_iso and end_iso (ISO-8601, end after start).")
             }
             let rows = ((try? await store.contexts(between: start, and: end, limit: 60)) ?? [])
                 .filter { !PrivacyRules.isSensitive($0) }
-            guard !rows.isEmpty else { return "Nothing recorded in that window." }
+            guard !rows.isEmpty else { return Self.status(.noResult, tool: "get_timeframe", kind: "empty_window", message: "Nothing recorded in that window.") }
             return Self.enveloped(
                 rows.map { Self.line(for: $0, textCap: 160) }.joined(separator: "\n"),
                 source: "record timeframe",
@@ -220,9 +242,9 @@ public struct RecordRecall: Sendable {
             )
 
         case .inspect(let id):
-            guard let id else { return "inspect_moment needs a numeric id." }
+            guard let id else { return Self.status(.error, tool: "inspect_moment", kind: "validation_error", message: "inspect_moment needs a numeric id.") }
             guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
-                return "No accessible moment #\(id)."
+                return Self.status(.noResult, tool: "inspect_moment", kind: "not_accessible", message: "No accessible moment #\(id).")
             }
             try? await store.markMemoryEventsAccessed([moment.id])
             var out = Self.line(for: moment, textCap: 2_000)
@@ -238,13 +260,13 @@ public struct RecordRecall: Sendable {
             return Self.enveloped(out, source: "record moment #\(id)", tool: "inspect_moment")
 
         case .inspectStructure(let id):
-            guard let id else { return "inspect_structure needs a numeric id." }
+            guard let id else { return Self.status(.error, tool: "inspect_structure", kind: "validation_error", message: "inspect_structure needs a numeric id.") }
             guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
-                return "No accessible moment #\(id)."
+                return Self.status(.noResult, tool: "inspect_structure", kind: "not_accessible", message: "No accessible moment #\(id).")
             }
             guard let metadata = moment.metadataJSON,
                   let structured = Self.structuredMetadata(from: metadata) else {
-                return "No structured metadata recorded for moment #\(id). Capture structured content must be enabled first."
+                return Self.status(.noResult, tool: "inspect_structure", kind: "missing_structured_metadata", message: "No structured metadata recorded for moment #\(id). Capture structured content must be enabled first.")
             }
             try? await store.markMemoryEventsAccessed([moment.id])
             return Self.enveloped(
@@ -256,7 +278,7 @@ public struct RecordRecall: Sendable {
         case .sessions(let startISO, let endISO):
             guard let start = Self.date(from: startISO),
                   let end = Self.date(from: endISO), end > start else {
-                return "list_sessions needs start_iso and end_iso (ISO-8601, end after start)."
+                return Self.status(.error, tool: "list_sessions", kind: "validation_error", message: "list_sessions needs start_iso and end_iso (ISO-8601, end after start).")
             }
             // Refresh materialized sessions from the deterministic segmenter, then
             // read that session layer back. Sensitive frames are already dropped at
@@ -269,7 +291,7 @@ public struct RecordRecall: Sendable {
                 episodes = (try? await store.timelineEpisodes(between: start, and: end)) ?? []
             }
             let visible = episodes.filter { !Self.isSensitive($0) }
-            guard !visible.isEmpty else { return "No sessions recorded in that window." }
+            guard !visible.isEmpty else { return Self.status(.noResult, tool: "list_sessions", kind: "empty_window", message: "No sessions recorded in that window.") }
             return Self.enveloped(
                 visible.map { Self.sessionLine(for: $0) }.joined(separator: "\n"),
                 source: "record sessions",
@@ -277,7 +299,7 @@ public struct RecordRecall: Sendable {
             )
 
         case .unknown(let name):
-            return "Unknown recall tool \(name)."
+            return Self.status(.error, tool: name, kind: "unknown_tool", message: "Unknown recall tool \(name).")
         }
     }
 
@@ -438,6 +460,15 @@ public struct RecordRecall: Sendable {
             acquiredByTool: tool,
             payload: payload
         )
+    }
+
+    private static func status(
+        _ status: ToolResultStatusEnvelope.Status,
+        tool: String,
+        kind: String,
+        message: String
+    ) -> String {
+        ToolResultStatusEnvelope.render(status, kind: kind, message: message, tool: tool)
     }
 
     private static func bounded(_ lines: [String], maxBytes: Int, maxLines: Int) -> String {
