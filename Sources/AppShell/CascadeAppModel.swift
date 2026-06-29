@@ -518,6 +518,8 @@ public final class CascadeAppModel: ObservableObject {
             }
             agents = try await orchestrator.agents()
             let trustedTraces = try await recentTrustedAuditTraces()
+            await persistDerivedTraceRows(trustedTraces)
+            await persistTraceFailureClusterMemories(from: trustedTraces)
             sloSnapshot = ReliabilityReport.sloSnapshot(from: trustedTraces)
             valueSummary = AgentValueSummary.from(
                 agents: agents,
@@ -622,6 +624,46 @@ public final class CascadeAppModel: ObservableObject {
         let start = end.addingTimeInterval(-window)
         let events = try await store.auditWindowForTraceAssembly(from: start, to: end, enableTraceAssembly: true)
         return AgentTraceBuilder.fromAuditEvents(events)
+    }
+
+    private func persistDerivedTraceRows(_ traces: [AgentTrace]) async {
+        for trace in traces {
+            let rows = trace.storageRows()
+            _ = try? await store.upsertAgentTrace(rows.trace)
+            for span in rows.spans {
+                _ = try? await store.upsertAgentSpan(span)
+            }
+            let existingCosts = (try? await store.modelCosts(traceID: trace.traceID)) ?? []
+            let existingCostSpanIDs = Set(existingCosts.map(\.spanID))
+            for cost in rows.costs where !existingCostSpanIDs.contains(cost.spanID) {
+                _ = try? await store.recordModelCost(cost)
+            }
+            let existingEvals = (try? await store.traceEvals(traceID: trace.traceID)) ?? []
+            let existingEvalKeys = Set(existingEvals.map { "\($0.spanID ?? ""):\($0.evaluatorKind.rawValue):\($0.evaluatorName)" })
+            for eval in rows.evals {
+                let key = "\(eval.spanID ?? ""):\(eval.evaluatorKind.rawValue):\(eval.evaluatorName)"
+                guard !existingEvalKeys.contains(key) else { continue }
+                _ = try? await store.recordTraceEval(eval)
+            }
+        }
+    }
+
+    private func persistTraceFailureClusterMemories(from traces: [AgentTrace]) async {
+        guard defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey) else { return }
+        let candidates = ReliabilityReport.topFailureClusters(from: traces, minCount: 2).compactMap { $0.failureMemoryCandidate() }
+        guard !candidates.isEmpty else { return }
+        var existingHashes = Set((try? await store.agentFailureMemories(limit: 500).compactMap(\.recoveryEvidenceHash)) ?? [])
+        for memory in candidates {
+            guard let hash = memory.recoveryEvidenceHash, !existingHashes.contains(hash) else { continue }
+            if let saved = try? await store.recordAgentFailureMemory(memory) {
+                existingHashes.insert(hash)
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "agent.failure_memory.saved",
+                    detail: Self.failureMemorySavedAuditDetail(saved)
+                ))
+            }
+        }
     }
 
     @discardableResult
@@ -6427,23 +6469,7 @@ public final class CascadeAppModel: ObservableObject {
     public func exportAgentAuditToPasteboard(format: AgentAuditExportFormat = .siemJSONL) {
         Task {
             do {
-                let status = try await store.verifyAuditChain()
-                auditIntegrityStatus = Self.auditIntegrityStatus(from: status)
-                guard !auditIntegrityEnforcementEnabled || AgentAuditExportPackage.isTrusted(status) else {
-                    refuseManagedPolicy(capability: "audit_export", reason: "audit_chain_untrusted")
-                    return
-                }
-                let end = Date()
-                let start = end.addingTimeInterval(-7 * 24 * 60 * 60)
-                let events = try await store.auditWindowForTraceAssembly(from: start, to: end, enableTraceAssembly: true)
-                let package = AgentAuditExportPackage.build(
-                    trustedChronologicalEvents: events,
-                    windowStart: start,
-                    windowEnd: end,
-                    auditChainStatus: status,
-                    auditHead: try await store.auditHead()
-                )
-                let content = format == .manifestJSON ? package.manifestJSON() : package.content(format: format)
+                let (content, package) = try await agentAuditExportContent(format: format)
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(content, forType: .string)
                 statusLine = "Agent audit \(format.rawValue) copied."
@@ -6455,6 +6481,74 @@ public final class CascadeAppModel: ObservableObject {
             } catch {
                 statusLine = error.localizedDescription
             }
+        }
+    }
+
+    public func saveAgentAuditExport(format: AgentAuditExportFormat) {
+        Task {
+            do {
+                let (content, package) = try await agentAuditExportContent(format: format)
+                let panel = NSSavePanel()
+                panel.nameFieldStringValue = Self.agentAuditExportFilename(format)
+                panel.canCreateDirectories = true
+                guard panel.runModal() == .OK, let url = panel.url else { return }
+                try content.write(to: url, atomically: true, encoding: .utf8)
+                statusLine = "Agent audit \(format.rawValue) saved."
+                let action = format == .diagnosticBundleMetadata ? "trace.export.diagnostic" : "audit.exported"
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "employee",
+                    action: action,
+                    detail: "format=\(Self.safeAuditToken(format.rawValue)) traces=\(package.manifest.traceCount) spans=\(package.manifest.spanCount) destination=file"
+                ))
+            } catch {
+                statusLine = error.localizedDescription
+            }
+        }
+    }
+
+    private func agentAuditExportContent(format: AgentAuditExportFormat) async throws -> (String, AgentAuditExportPackage) {
+        guard capturePrivacyPolicy.agentAuditExportAvailable else {
+            refuseManagedPolicy(capability: "audit_export", reason: "agent_audit_export_unavailable")
+            throw CocoaError(.userCancelled)
+        }
+        if format == .diagnosticBundleMetadata, !capturePrivacyPolicy.diagnosticBundleExportAvailable {
+            refuseManagedPolicy(capability: "diagnostic_export", reason: "diagnostic_bundle_export_unavailable")
+            throw CocoaError(.userCancelled)
+        }
+        let status = try await store.verifyAuditChain()
+        auditIntegrityStatus = Self.auditIntegrityStatus(from: status)
+        guard !auditIntegrityEnforcementEnabled || AgentAuditExportPackage.isTrusted(status) else {
+            refuseManagedPolicy(capability: "audit_export", reason: "audit_chain_untrusted")
+            throw CocoaError(.userCancelled)
+        }
+        let end = Date()
+        let start = end.addingTimeInterval(-7 * 24 * 60 * 60)
+        let events = try await store.auditWindowForTraceAssembly(from: start, to: end, enableTraceAssembly: true)
+        let package = AgentAuditExportPackage.build(
+            trustedChronologicalEvents: events,
+            windowStart: start,
+            windowEnd: end,
+            auditChainStatus: status,
+            auditHead: try await store.auditHead()
+        )
+        let content = format == .manifestJSON ? package.manifestJSON() : package.content(format: format)
+        return (content, package)
+    }
+
+    private static func agentAuditExportFilename(_ format: AgentAuditExportFormat) -> String {
+        switch format {
+        case .otelJSON:
+            return "cascade-traces-otlp.json"
+        case .siemJSONL:
+            return "cascade-traces-siem.jsonl"
+        case .csv:
+            return "cascade-traces-csv-bundle.txt"
+        case .reliabilityJSONL:
+            return "cascade-reliability.jsonl"
+        case .manifestJSON:
+            return "cascade-trace-manifest.json"
+        case .diagnosticBundleMetadata:
+            return "cascade-diagnostic-metadata.json"
         }
     }
 

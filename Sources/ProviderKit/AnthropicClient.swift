@@ -68,6 +68,7 @@ public struct AnthropicUsage: Sendable, Equatable {
 }
 
 public struct AnthropicMessagesResponse {
+    public let id: String?
     public let content: [[String: Any]]
     public let stopReason: String?
     public let usage: AnthropicUsage
@@ -77,6 +78,10 @@ public struct AnthropicMessagesResponse {
         content.compactMap { block in
             (block["type"] as? String) == "text" ? block["text"] as? String : nil
         }.joined()
+    }
+
+    public func normalizedUsage(model: String) -> ModelUsage {
+        usage.normalized(model: model, responseID: id)
     }
 }
 
@@ -249,6 +254,7 @@ public struct AnthropicMessagesClient: Sendable {
 
     public static func response(from raw: [String: Any]) -> AnthropicMessagesResponse {
         AnthropicMessagesResponse(
+            id: raw["id"] as? String,
             content: raw["content"] as? [[String: Any]] ?? [],
             stopReason: raw["stop_reason"] as? String,
             usage: AnthropicUsage.parse(raw["usage"] as? [String: Any] ?? [:]),
@@ -296,6 +302,18 @@ public protocol MessageCompleting: Sendable {
     func complete(system: String?, user: String, model: String, maxTokens: Int, options: AnthropicCompletionOptions) async throws -> String
 }
 
+public struct MessageCompletionResult: Sendable, Equatable {
+    public let text: String
+    public let usage: ModelUsage?
+    public let responseID: String?
+
+    public init(text: String, usage: ModelUsage? = nil, responseID: String? = nil) {
+        self.text = text
+        self.usage = usage
+        self.responseID = responseID
+    }
+}
+
 public extension MessageCompleting {
     func complete(system: String?, user: String, model: String, maxTokens: Int, options: AnthropicCompletionOptions) async throws -> String {
         try await complete(system: system, user: user, model: model, maxTokens: maxTokens)
@@ -304,6 +322,17 @@ public extension MessageCompleting {
     /// Convenience for callers that don't need to pin a model.
     func complete(system: String? = nil, user: String) async throws -> String {
         try await complete(system: system, user: user, model: AnthropicModel.opus, maxTokens: 1024)
+    }
+
+    func completeWithMetadata(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> MessageCompletionResult {
+        let text = try await complete(system: system, user: user, model: model, maxTokens: maxTokens, options: options)
+        return MessageCompletionResult(text: text)
     }
 }
 
@@ -332,6 +361,22 @@ public struct RetryingMessageCompleter: MessageCompleting {
         maxTokens: Int,
         options: AnthropicCompletionOptions
     ) async throws -> String {
+        try await completeWithMetadata(
+            system: system,
+            user: user,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        ).text
+    }
+
+    public func completeWithMetadata(
+        system: String?,
+        user: String,
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> MessageCompletionResult {
         let key = try Self.idempotencyKey(
             system: system,
             user: user,
@@ -343,7 +388,7 @@ public struct RetryingMessageCompleter: MessageCompleting {
 
         while true {
             do {
-                return try await client.complete(
+                return try await client.completeWithMetadata(
                     system: system,
                     user: user,
                     model: model,
@@ -429,6 +474,22 @@ public struct AnthropicClient: MessageCompleting {
         maxTokens: Int = 1024,
         options: AnthropicCompletionOptions
     ) async throws -> String {
+        try await completeWithMetadata(
+            system: system,
+            user: user,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        ).text
+    }
+
+    public func completeWithMetadata(
+        system: String? = nil,
+        user: String,
+        model: String = AnthropicModel.opus,
+        maxTokens: Int = 1024,
+        options: AnthropicCompletionOptions
+    ) async throws -> MessageCompletionResult {
         let response = try await messagesClient.send(
             model: model,
             maxTokens: maxTokens,
@@ -438,7 +499,11 @@ public struct AnthropicClient: MessageCompleting {
         )
         let text = response.text
         guard !text.isEmpty else { throw AnthropicError.emptyResponse }
-        return text
+        return MessageCompletionResult(
+            text: text,
+            usage: response.normalizedUsage(model: model),
+            responseID: response.id
+        )
     }
 
     static func errorMessage(from data: Data, status: Int) -> String {

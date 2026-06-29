@@ -11,6 +11,36 @@ private func rawTraceAuditExec(_ path: String, _ sql: String) {
     sqlite3_exec(db, sql, nil, nil, nil)
 }
 
+private func otelHasStringAttribute(_ key: String, _ value: String, in json: String) throws -> Bool {
+    guard
+        let obj = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+        let resourceSpans = obj["resourceSpans"] as? [[String: Any]]
+    else {
+        return false
+    }
+    for resourceSpan in resourceSpans {
+        guard let scopeSpans = resourceSpan["scopeSpans"] as? [[String: Any]] else { continue }
+        for scopeSpan in scopeSpans {
+            guard let spans = scopeSpan["spans"] as? [[String: Any]] else { continue }
+            for span in spans {
+                guard let attrs = span["attributes"] as? [[String: Any]] else { continue }
+                if attrs.contains(where: { attr in
+                    guard
+                        attr["key"] as? String == key,
+                        let typedValue = attr["value"] as? [String: Any]
+                    else {
+                        return false
+                    }
+                    return typedValue["stringValue"] as? String == value
+                }) {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
 @Test
 func auditEventsAssembleTrailingAssistTaskWithBufferedSpans() async throws {
     let path = FileManager.default.temporaryDirectory
@@ -76,7 +106,7 @@ func agentTraceRootExportKeepsAssistTaskDetailPrivate() throws {
     #expect(trace.traceID == "audit-42")
     #expect(trace.spans.first?.attributes["audit.id"] == "42")
     #expect(otel.contains("\"trace_id\":\"audit-42\""))
-    #expect(otel.contains("\"audit.id\":\"42\""))
+    #expect(try otelHasStringAttribute("audit.id", "42", in: otel))
     #expect(sensitiveFragments.allSatisfy { !trace.goal.contains($0) })
     #expect(sensitiveFragments.allSatisfy { !otel.contains($0) })
 }

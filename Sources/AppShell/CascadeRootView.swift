@@ -2539,6 +2539,8 @@ private struct PrivacyPolicyCard: View {
             ("Schedules", policy.scheduledRunsAvailable),
             ("Power harness", policy.powerHarnessAvailable),
             ("Record recall", policy.recordRecallAvailable),
+            ("Audit export", policy.agentAuditExportAvailable),
+            ("Diagnostic export", policy.diagnosticBundleExportAvailable),
             ("Irreversible guard", policy.forceIrreversibleActionGuard),
         ]
         return controls.map { "\($0.0): \($0.1 ? "on" : "blocked")" }.joined(separator: " · ")
@@ -2613,17 +2615,11 @@ private struct AuditExportCard: View {
                             .foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()
-                    Menu("Copy") {
-                        Button("SIEM JSONL") { model.exportAgentAuditToPasteboard(format: .siemJSONL) }
-                        Button("OTel JSON") { model.exportAgentAuditToPasteboard(format: .otelJSON) }
-                        Button("CSV") { model.exportAgentAuditToPasteboard(format: .csv) }
-                        Button("Reliability JSONL") { model.exportAgentAuditToPasteboard(format: .reliabilityJSONL) }
-                        Button("Manifest JSON") { model.exportAgentAuditToPasteboard(format: .manifestJSON) }
-                    }
-                    .buttonStyle(CascadeQuietButtonStyle())
                     Button("Copy SLO") { model.copySLOSnapshotToPasteboard() }
                         .buttonStyle(CascadeQuietButtonStyle())
                 }
+                Divider().overlay(Color.cascadeBorder)
+                TraceExportSheet(model: model)
                 Divider().overlay(Color.cascadeBorder)
                 HStack(spacing: CascadeMetrics.s3) {
                     MetricPill(title: "Runs", value: "\(model.sloSnapshot?.totalRuns ?? 0)")
