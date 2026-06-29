@@ -150,7 +150,8 @@ public struct GroundingResult: Codable, Equatable, Sendable {
     }
 
     public var selectedPoint: CGPoint? {
-        selectedCandidate?.point
+        guard !isAbstainedOrRejected else { return nil }
+        return selectedCandidate?.point
     }
 
     public var legacyPoint: CGPoint? {
@@ -218,6 +219,53 @@ public struct GroundingResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct GroundingRequestOptions: Equatable, Sendable {
+    public let sampleCount: Int
+    public let maxDispersion: Double
+    public let minimumConfidence: Double
+    public let risk: GroundingActionRisk
+    public let priorityRegions: [CGRect]
+    public let useRegionBudgeting: Bool
+    public let hostedMode: Bool
+
+    public init(
+        sampleCount: Int = 1,
+        maxDispersion: Double = 28,
+        minimumConfidence: Double = 0.30,
+        risk: GroundingActionRisk = .normal,
+        priorityRegions: [CGRect] = [],
+        useRegionBudgeting: Bool = false,
+        hostedMode: Bool = true
+    ) {
+        self.sampleCount = max(1, min(sampleCount, 5))
+        self.maxDispersion = max(1, maxDispersion)
+        self.minimumConfidence = max(0, min(1, minimumConfidence))
+        self.risk = risk
+        self.priorityRegions = priorityRegions
+        self.useRegionBudgeting = useRegionBudgeting
+        self.hostedMode = hostedMode
+    }
+
+    public static let `default` = GroundingRequestOptions()
+
+    public static func highRisk(priorityRegions: [CGRect] = []) -> GroundingRequestOptions {
+        GroundingRequestOptions(
+            sampleCount: 3,
+            maxDispersion: 24,
+            minimumConfidence: 0.72,
+            risk: .high,
+            priorityRegions: priorityRegions
+        )
+    }
+}
+
+public enum GroundingActionRisk: String, Codable, Equatable, Sendable {
+    case normal
+    case visual
+    case high
+    case destructive
+}
+
 // MARK: - Grounding split (Phase 1 of the model-downgrade roadmap)
 //
 // The field consensus — and Cascade's own audited finding — is that *grounding*
@@ -260,6 +308,14 @@ public protocol VisualGrounder: Sendable {
         displayHeightPoints: Int
     ) async -> GroundingResult
 
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult
+
     /// Locates a target as a REGION to frame (the "where is X" marching-ants
     /// highlight) — display-local AppKit rect + a short spoken line. Returns nil
     /// when this grounder can't produce one (unreachable, or not implemented), so
@@ -283,6 +339,21 @@ public protocol VisualGrounder: Sendable {
 }
 
 public extension VisualGrounder {
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+    }
+
     func groundResult(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> GroundingResult {
@@ -396,7 +467,7 @@ public enum GUIGrounderModel {
 public struct UITARSGrounder: VisualGrounder {
     /// How the served model encodes the coordinates it returns. A swapped grounder
     /// read in the wrong space misses every click, so this is explicit + unit-pinned.
-    public enum CoordSpace: String, Sendable {
+    public enum CoordSpace: String, Codable, Equatable, CaseIterable, Sendable {
         /// UI-TARS / Qwen2.5-VL: absolute pixels in the SMART-RESIZED image space
         /// (the proven default — coords come back in `smartResize(sent)` space).
         case smartResize
@@ -412,6 +483,7 @@ public struct UITARSGrounder: VisualGrounder {
     private let apiKey: String?
     private let coordSpace: CoordSpace
     private let session: URLSession
+    private let enableRegionBudgeting: Bool
 
     /// - Parameters:
     ///   - baseURL: OpenAI-compatible chat-completions endpoint. Defaults to the
@@ -423,12 +495,14 @@ public struct UITARSGrounder: VisualGrounder {
         model: String = "ui-tars-1.5-7b",
         apiKey: String? = nil,
         coordSpace: CoordSpace = .smartResize,
+        enableRegionBudgeting: Bool = false,
         session: URLSession = .shared
     ) {
         self.endpoint = baseURL
         self.model = model
         self.apiKey = apiKey
         self.coordSpace = coordSpace
+        self.enableRegionBudgeting = enableRegionBudgeting
         self.session = session
     }
 
@@ -438,30 +512,12 @@ public struct UITARSGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> CGPoint? {
-        // Resize to the same Anthropic-recommended resolution the rest of the agent
-        // declares, so coords come back in a known image space (frames captured at
-        // this size pass through untouched). UI-TARS-1.5-7B emits ABSOLUTE pixel
-        // coords in the input image's space.
-        let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
-        guard let jpeg = Self.resizeJPEG(screenshot, toWidth: res.w, toHeight: res.h) else { return nil }
-        guard let content = await callModel(jpeg: jpeg, target: target, declaredW: res.w, declaredH: res.h) else {
-            return nil
-        }
-        guard let imagePoint = Self.parseBox(content) else { return nil }
-        // Map the model's coordinate into the sent image's pixel space per its coord
-        // convention, THEN scale to the display. UI-TARS (Qwen2.5-VL) emits in the
-        // SMART-RESIZED space (live-verified: a 1280×800 send yields coords in
-        // 1288×812; mapping through it lands to the pixel — bytedance/UI-TARS
-        // README_coordinates.md). A swapped Qwen3-VL grounder (UI-Venus-1.5 / Holo1.5)
-        // may emit in the sent space or 0–1000 instead — `coordSpace` selects which.
-        let space = Self.resolveImageSpace(
-            parsed: imagePoint, sentW: res.w, sentH: res.h, space: coordSpace
-        )
-        return Self.toDisplayPoint(
-            imagePoint: space.point,
-            imageW: space.imageW, imageH: space.imageH,
-            displayW: displayWidthPoints, displayH: displayHeightPoints
-        )
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ).selectedPoint
     }
 
     public func groundResult(
@@ -470,13 +526,57 @@ public struct UITARSGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> GroundingResult {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            options: .default
+        )
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult {
         let start = ContinuousClock.now
         let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
-        guard let jpeg = Self.resizeJPEG(screenshot, toWidth: res.w, toHeight: res.h) else { return GroundingResult() }
-        guard let content = await callModel(jpeg: jpeg, target: target, declaredW: res.w, declaredH: res.h) else {
+        guard let jpeg = prepareJPEG(
+            screenshot,
+            toWidth: res.w,
+            height: res.h,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            options: options
+        ) else { return GroundingResult() }
+
+        let sampleCount = options.sampleCount
+        var rawContents: [String] = []
+        var parsedPoints: [CGPoint] = []
+        for sample in 0..<sampleCount {
+            guard let content = await callModel(
+                jpeg: jpeg,
+                target: target,
+                declaredW: res.w,
+                declaredH: res.h,
+                temperature: sampleCount == 1 ? 0 : 0.1,
+                seed: sample
+            ) else {
+                continue
+            }
+            rawContents.append(content)
+            if let imagePoint = Self.parseBox(content) {
+                parsedPoints.append(imagePoint)
+            }
+        }
+
+        guard !rawContents.isEmpty else {
             return GroundingResult()
         }
-        guard let imagePoint = Self.parseBox(content) else {
+        guard !parsedPoints.isEmpty else {
             return GroundingResult(
                 candidates: [
                     GroundingCandidate(
@@ -484,9 +584,9 @@ public struct UITARSGrounder: VisualGrounder {
                         confidence: 0,
                         source: .uiTars,
                         coordinateSpace: .screenshotPixelsTopLeft,
-                        rawModel: content,
+                        rawModel: rawContents.joined(separator: "\n---\n"),
                         latency: start.duration(to: ContinuousClock.now).timeInterval,
-                        reason: "ui-tars parse miss"
+                        reason: "ui-tars parse miss samples=\(sampleCount)"
                     )
                 ],
                 selectedIndex: 0,
@@ -494,6 +594,8 @@ public struct UITARSGrounder: VisualGrounder {
                 verifierFailureKind: .missingPoint
             )
         }
+        let cluster = Self.cluster(points: parsedPoints)
+        let imagePoint = cluster.center
         let space = Self.resolveImageSpace(
             parsed: imagePoint,
             sentW: res.w,
@@ -507,19 +609,31 @@ public struct UITARSGrounder: VisualGrounder {
             displayW: displayWidthPoints,
             displayH: displayHeightPoints
         )
+        let parseRate = Double(parsedPoints.count) / Double(sampleCount)
+        let dispersionOK = cluster.dispersion <= options.maxDispersion
+        let sampleAgreement = Double(cluster.points.count) / Double(max(1, parsedPoints.count))
+        let confidence = max(0, min(1, 0.62 + 0.18 * parseRate + 0.18 * sampleAgreement - min(0.30, cluster.dispersion / 180)))
+        let accepted = confidence >= options.minimumConfidence && (sampleCount == 1 || dispersionOK)
+        let reason = sampleCount == 1
+            ? "ui-tars coordinate"
+            : "ui-tars samples=\(sampleCount) accepted=\(cluster.points.count) dispersion=\(String(format: "%.1f", cluster.dispersion))"
         return GroundingResult(
             candidates: [
                 GroundingCandidate(
                     point: point,
-                    confidence: 0.82,
+                    confidence: confidence,
                     source: .uiTars,
                     coordinateSpace: .displayLocalAppKitPoints,
-                    rawModel: content,
+                    rawModel: rawContents.joined(separator: "\n---\n"),
                     latency: start.duration(to: ContinuousClock.now).timeInterval,
-                    reason: "ui-tars coordinate"
+                    dispersion: cluster.dispersion,
+                    reason: accepted ? reason : "\(reason) rejected",
+                    displayBounds: Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints)
                 )
             ],
-            selectedIndex: 0
+            selectedIndex: 0,
+            verifierVerdict: accepted ? nil : .abstain,
+            verifierFailureKind: accepted ? nil : .lowEvidence
         )
     }
 
@@ -677,7 +791,7 @@ public struct UITARSGrounder: VisualGrounder {
 
     /// A display-local AppKit rect framing a located point — ~12%×8% of the
     /// display, clamped on screen. Pure + pinned (a bad rect frames empty space).
-    static func boxAround(point: CGPoint, displayW: Int, displayH: Int) -> CGRect {
+    public static func boxAround(point: CGPoint, displayW: Int, displayH: Int) -> CGRect {
         let w = CGFloat(displayW) * 0.12
         let h = CGFloat(displayH) * 0.08
         let x = max(0, min(point.x - w / 2, CGFloat(displayW) - w))
@@ -749,7 +863,38 @@ public struct UITARSGrounder: VisualGrounder {
         return nil
     }
 
-    private func callModel(jpeg: Data, target: String, declaredW: Int, declaredH: Int, prompt: String? = nil) async -> String? {
+    private func prepareJPEG(
+        _ screenshot: Data,
+        toWidth width: Int,
+        height: Int,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) -> Data? {
+        if enableRegionBudgeting || options.useRegionBudgeting {
+            let budgeted = RegionBudgetedImage.composeJPEG(
+                screenshot: screenshot,
+                outputWidth: width,
+                outputHeight: height,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                priorityRegions: options.priorityRegions,
+                hostedMode: options.hostedMode
+            )
+            if let budgeted { return budgeted }
+        }
+        return Self.resizeJPEG(screenshot, toWidth: width, toHeight: height)
+    }
+
+    private func callModel(
+        jpeg: Data,
+        target: String,
+        declaredW: Int,
+        declaredH: Int,
+        prompt: String? = nil,
+        temperature: Double = 0,
+        seed: Int? = nil
+    ) async -> String? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         // Short per-attempt cap: grounding normally returns in ~1s, so a connection
@@ -767,10 +912,10 @@ public struct UITARSGrounder: VisualGrounder {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "authorization")
         }
         let dataURL = "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": 128,
-            "temperature": 0,
+            "temperature": temperature,
             "messages": [[
                 "role": "user",
                 "content": [
@@ -779,6 +924,7 @@ public struct UITARSGrounder: VisualGrounder {
                 ],
             ]],
         ]
+        if let seed { body["seed"] = seed }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         request.httpBody = bodyData
         // Hosted UI-TARS over OpenRouter hits transient TLS/connection failures
@@ -848,6 +994,47 @@ public struct UITARSGrounder: VisualGrounder {
             return CGPoint(x: x, y: y)
         }
         return nil
+    }
+
+    struct SampleCluster: Equatable {
+        let points: [CGPoint]
+        let center: CGPoint
+        let dispersion: Double
+    }
+
+    static func cluster(points: [CGPoint], radius: Double = 32) -> SampleCluster {
+        guard let first = points.first else {
+            return SampleCluster(points: [], center: .zero, dispersion: .greatestFiniteMagnitude)
+        }
+        var best: [CGPoint] = []
+        for point in points {
+            let cluster = points.filter { hypot($0.x - point.x, $0.y - point.y) <= radius }
+            if cluster.count > best.count {
+                best = cluster
+            } else if cluster.count == best.count, !cluster.isEmpty {
+                let lhs = dispersion(of: cluster)
+                let rhs = dispersion(of: best)
+                if lhs < rhs { best = cluster }
+            }
+        }
+        if best.isEmpty { best = [first] }
+        let center = average(best)
+        return SampleCluster(points: best, center: center, dispersion: dispersion(of: best, center: center))
+    }
+
+    static func average(_ points: [CGPoint]) -> CGPoint {
+        guard !points.isEmpty else { return .zero }
+        let sum = points.reduce(CGPoint.zero) { partial, point in
+            CGPoint(x: partial.x + point.x, y: partial.y + point.y)
+        }
+        return CGPoint(x: sum.x / CGFloat(points.count), y: sum.y / CGFloat(points.count))
+    }
+
+    static func dispersion(of points: [CGPoint], center: CGPoint? = nil) -> Double {
+        guard !points.isEmpty else { return .greatestFiniteMagnitude }
+        let c = center ?? average(points)
+        let distances = points.map { hypot($0.x - c.x, $0.y - c.y) }
+        return distances.reduce(0, +) / Double(distances.count)
     }
 
     /// Runs `pattern` and returns capture groups 1...n as optional CGFloats

@@ -137,6 +137,31 @@ public struct GroundingCrop: Sendable, Equatable {
     }
 }
 
+public struct RiskyVisualGroundingClick: Sendable, Equatable {
+    public let target: String
+    public let source: GroundingSource
+    public let confidence: Double
+    public let dispersion: Double?
+    public let risk: GroundingActionRisk
+    public let reason: String?
+
+    public init(
+        target: String,
+        source: GroundingSource,
+        confidence: Double,
+        dispersion: Double?,
+        risk: GroundingActionRisk,
+        reason: String?
+    ) {
+        self.target = target
+        self.source = source
+        self.confidence = confidence
+        self.dispersion = dispersion
+        self.risk = risk
+        self.reason = reason
+    }
+}
+
 /// One piece of a streamed model reply, delivered in response order the moment
 /// its block finishes generating — actions execute while the rest of the reply
 /// is still being written, instead of after the full round trip.
@@ -266,6 +291,9 @@ public final class ComputerUseAgent {
     public private(set) var lastGroundCandidateID: String?
     public private(set) var lastGroundSource: GroundingSource?
     public private(set) var lastGroundConfidence: Double?
+    public private(set) var lastGroundDispersion: Double?
+    public private(set) var lastGroundRisk: GroundingActionRisk?
+    public private(set) var lastRiskyVisualClick: RiskyVisualGroundingClick?
 
     /// Paste-key gate state (see `pasteRefusal`): does the goal's own wording ask
     /// for clipboard work, and has the agent itself copied something this episode
@@ -822,6 +850,9 @@ public final class ComputerUseAgent {
         lastGroundCandidateID = nil
         lastGroundSource = nil
         lastGroundConfidence = nil
+        lastGroundDispersion = nil
+        lastGroundRisk = nil
+        lastRiskyVisualClick = nil
         let groundCache = await pregroundTargets(in: content)
         for (index, block) in content.enumerated() {
             switch block["type"] as? String {
@@ -1121,7 +1152,13 @@ public final class ComputerUseAgent {
         await withTaskGroup(of: (String, GroundingResult).self) { group in
             for t in targets {
                 group.addTask {
-                    (t, await g.groundResult(screenshot: frame, target: t, displayWidthPoints: dw, displayHeightPoints: dh))
+                    (t, await g.groundResult(
+                        screenshot: frame,
+                        target: t,
+                        displayWidthPoints: dw,
+                        displayHeightPoints: dh,
+                        options: .default
+                    ))
                 }
             }
             for await r in group { cache[r.0] = r.1 }
@@ -1134,14 +1171,23 @@ public final class ComputerUseAgent {
     /// grounding live only on a cache miss. The cache stores the SAME frame's result
     /// the live call would return, so this is behaviour-identical to a direct ground
     /// — purely a latency win when multiple targets share one frame.
-    private func groundCached(_ target: String, frame: Data, cache: [String: GroundingResult]?) async -> GroundingResult {
+    private func groundCached(
+        _ target: String,
+        frame: Data,
+        cache: [String: GroundingResult]?,
+        options: GroundingRequestOptions = .default
+    ) async -> GroundingResult {
         if let cache, let cached = cache[target] { return cached }
         let result = await grounder?.groundResult(
             screenshot: frame, target: target,
-            displayWidthPoints: displayW, displayHeightPoints: displayH
+            displayWidthPoints: displayW, displayHeightPoints: displayH,
+            options: options
         ) ?? GroundingResult()
-        guard !result.isActionable(),
-              let retry = await cropRetryGrounding(target: target, frame: frame, firstResult: result) else {
+        if let correction = await cursorCorrectionGrounding(target: target, frame: frame, firstResult: result, options: options) {
+            return correction
+        }
+        guard Self.shouldRetryGrounding(result),
+              let retry = await cropRetryGrounding(target: target, frame: frame, firstResult: result, options: options) else {
             return result
         }
         return retry
@@ -1150,30 +1196,111 @@ public final class ComputerUseAgent {
     private func cropRetryGrounding(
         target: String,
         frame: Data,
-        firstResult: GroundingResult
+        firstResult: GroundingResult,
+        options: GroundingRequestOptions
     ) async -> GroundingResult? {
         guard let grounder, let groundingCropProvider else { return nil }
-        guard let region = await grounder.groundRegion(
+        var candidates = Self.cropCandidateRects(
+            from: firstResult,
+            displayWidth: displayW,
+            displayHeight: displayH
+        )
+        if let region = await grounder.groundRegion(
             screenshot: frame,
             target: target,
             displayWidthPoints: displayW,
             displayHeightPoints: displayH
-        ).flatMap(\.rect) else {
+        ).flatMap(\.rect) {
+            candidates.append(region)
+        }
+        for region in Self.uniqueCropCandidates(candidates) {
+            let cropRect = Self.paddedCropRect(region, displayWidth: displayW, displayHeight: displayH)
+            guard cropRect.width >= 16, cropRect.height >= 16,
+                  let crop = await groundingCropProvider(cropRect, displayW, displayH) else {
+                continue
+            }
+            let cropResult = await grounder.groundResult(
+                screenshot: crop.screenshot,
+                target: target,
+                displayWidthPoints: max(1, Int(crop.displayBounds.width.rounded())),
+                displayHeightPoints: max(1, Int(crop.displayBounds.height.rounded())),
+                options: options
+            )
+            guard !cropResult.candidates.isEmpty else { continue }
+            let mapped = Self.mapCropResult(cropResult, crop: crop, firstResult: firstResult)
+            if mapped.isActionable(minConfidence: options.minimumConfidence) { return mapped }
+        }
+        return nil
+    }
+
+    private func cursorCorrectionGrounding(
+        target: String,
+        frame: Data,
+        firstResult: GroundingResult,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult? {
+        guard let grounder, let groundingCropProvider,
+              let candidate = firstResult.selectedCandidate,
+              Self.isVisualSource(candidate.source),
+              let point = candidate.point,
+              !firstResult.isActionable(minConfidence: options.minimumConfidence) || Self.hasHighDispersion(candidate, limit: options.maxDispersion) else {
             return nil
         }
-        let cropRect = Self.paddedCropRect(region, displayWidth: displayW, displayHeight: displayH)
-        guard cropRect.width >= 16, cropRect.height >= 16,
-              let crop = await groundingCropProvider(cropRect, displayW, displayH) else {
-            return nil
-        }
+        let anchor = Self.cursorCorrectionCropRect(
+            around: point,
+            displayWidth: displayW,
+            displayHeight: displayH
+        )
+        guard let crop = await groundingCropProvider(anchor, displayW, displayH) else { return nil }
         let cropResult = await grounder.groundResult(
             screenshot: crop.screenshot,
-            target: target,
+            target: "\(target) near the parked cursor",
             displayWidthPoints: max(1, Int(crop.displayBounds.width.rounded())),
-            displayHeightPoints: max(1, Int(crop.displayBounds.height.rounded()))
+            displayHeightPoints: max(1, Int(crop.displayBounds.height.rounded())),
+            options: options
         )
         guard !cropResult.candidates.isEmpty else { return nil }
-        return Self.mapCropResult(cropResult, crop: crop, firstResult: firstResult)
+        return Self.mapCropResult(cropResult, crop: crop, firstResult: firstResult, reasonSuffix: "ground.cursor_correction")
+    }
+
+    nonisolated static func cropCandidateRects(
+        from result: GroundingResult,
+        displayWidth: Int,
+        displayHeight: Int
+    ) -> [CGRect] {
+        guard let candidate = result.selectedCandidate else { return [] }
+        var rects: [CGRect] = []
+        if let region = candidate.region { rects.append(region) }
+        if let displayBounds = candidate.displayBounds { rects.append(displayBounds) }
+        if let point = candidate.point {
+            rects.append(UITARSGrounder.boxAround(point: point, displayW: displayWidth, displayH: displayHeight))
+        }
+        return uniqueCropCandidates(rects)
+    }
+
+    nonisolated static func uniqueCropCandidates(_ rects: [CGRect]) -> [CGRect] {
+        var seen = Set<String>()
+        return rects.compactMap { rect in
+            guard !rect.isNull, !rect.isEmpty else { return nil }
+            let key = [
+                Int(rect.minX.rounded()),
+                Int(rect.minY.rounded()),
+                Int(rect.width.rounded()),
+                Int(rect.height.rounded()),
+            ].map(String.init).joined(separator: ":")
+            guard seen.insert(key).inserted else { return nil }
+            return rect
+        }
+    }
+
+    nonisolated static func cursorCorrectionCropRect(
+        around point: CGPoint,
+        displayWidth: Int,
+        displayHeight: Int,
+        side: CGFloat = 320
+    ) -> CGRect {
+        let rect = CGRect(x: point.x - side / 2, y: point.y - side / 2, width: side, height: side)
+        return paddedCropRect(rect, displayWidth: displayWidth, displayHeight: displayHeight, paddingFraction: 0, minSide: side)
     }
 
     nonisolated static func paddedCropRect(
@@ -1198,7 +1325,8 @@ public final class ComputerUseAgent {
     nonisolated static func mapCropResult(
         _ result: GroundingResult,
         crop: GroundingCrop,
-        firstResult: GroundingResult
+        firstResult: GroundingResult,
+        reasonSuffix: String = "ground.crop"
     ) -> GroundingResult {
         let offset = crop.displayBounds.origin
         return GroundingResult(
@@ -1212,7 +1340,7 @@ public final class ComputerUseAgent {
                 let mappedDisplayBounds = candidate.displayBounds.map {
                     CGRect(x: $0.minX + offset.x, y: $0.minY + offset.y, width: $0.width, height: $0.height)
                 }
-                let reason = [candidate.reason, "ground.crop"]
+                let reason = [candidate.reason, reasonSuffix]
                     .compactMap { $0 }
                     .joined(separator: " ")
                 return GroundingCandidate(
@@ -1224,7 +1352,7 @@ public final class ComputerUseAgent {
                     rawModel: candidate.rawModel,
                     latency: candidate.latency,
                     dispersion: candidate.dispersion,
-                    reason: reason.isEmpty ? "ground.crop" : reason,
+                    reason: reason.isEmpty ? reasonSuffix : reason,
                     candidateID: candidate.candidateID,
                     markNumber: candidate.markNumber,
                     displayBounds: mappedDisplayBounds,
@@ -1246,9 +1374,21 @@ public final class ComputerUseAgent {
     func groundedClick(_ input: [String: Any], frame: Data? = nil, cache: [String: GroundingResult]? = nil) async -> CUAction? {
         guard grounder != nil, let frame = frame ?? lastFrameJPEG,
               let target = (input["target"] as? String), !target.isEmpty else { return nil }
-        let result = await groundCached(target, frame: frame, cache: cache)
-        recordGrounding(result, target: target)
-        guard result.isActionable(), let point = result.selectedPoint else { return nil }
+        let route = Self.riskRoute(target: target, click: input["click"] as? String)
+        let options = Self.groundingOptions(for: route)
+        let result = await groundCached(target, frame: frame, cache: cache, options: options)
+        recordGrounding(result, target: target, risk: route.risk)
+        guard Self.allowsGroundedAction(result, route: route), let point = result.selectedPoint else { return nil }
+        if let candidate = result.selectedCandidate, Self.isRiskyVisualClick(candidate, route: route) {
+            lastRiskyVisualClick = RiskyVisualGroundingClick(
+                target: target,
+                source: candidate.source,
+                confidence: candidate.confidence,
+                dispersion: candidate.dispersion,
+                risk: route.risk,
+                reason: candidate.reason
+            )
+        }
         // The grounder returns display-local AppKit points already — do NOT scale.
         switch input["click"] as? String {
         case "double": return .doubleClick(x: point.x, y: point.y)
@@ -1275,25 +1415,111 @@ public final class ComputerUseAgent {
         return .scroll(x: point.x, y: point.y, direction: direction, amount: amount)
     }
 
-    private func recordGrounding(_ result: GroundingResult, target: String) {
+    private func recordGrounding(_ result: GroundingResult, target: String, risk: GroundingActionRisk = .normal) {
         lastGroundTarget = target
+        lastGroundRisk = risk
         if let candidate = result.selectedCandidate, let point = candidate.point {
             lastGroundCandidateID = candidate.candidateID ?? result.selectedCandidateID
             lastGroundSource = candidate.source
             lastGroundConfidence = candidate.confidence
+            lastGroundDispersion = candidate.dispersion
             let reason = candidate.reason.map { " reason=\(Self.safeLogToken($0))" } ?? ""
             let id = (candidate.candidateID ?? result.selectedCandidateID).map { " id=\(Self.safeLogToken($0))" } ?? ""
             let mark = candidate.markNumber.map { " mark=\($0)" } ?? ""
             let verdict = result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
             let failure = result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
-            let actionable = result.isActionable() ? "hit" : "blocked"
-            if !result.isActionable(), lastGroundMiss == nil { lastGroundMiss = target }
-            appendGroundLog("\(actionable) \"\(target)\" source=\(candidate.source.rawValue)\(id)\(mark) confidence=\(String(format: "%.2f", candidate.confidence)) @(\(Int(point.x)),\(Int(point.y))) alternatives=\(result.alternativeCount)\(verdict)\(failure)\(reason)")
+            let dispersion = candidate.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
+            let actionable = result.isActionable(minConfidence: Self.minimumConfidence(for: risk, source: candidate.source)) ? "hit" : "blocked"
+            if actionable == "blocked", lastGroundMiss == nil { lastGroundMiss = target }
+            appendGroundLog("\(actionable) \"\(target)\" source=\(candidate.source.rawValue)\(id)\(mark) confidence=\(String(format: "%.2f", candidate.confidence))\(dispersion) risk=\(risk.rawValue) @(\(Int(point.x)),\(Int(point.y))) alternatives=\(result.alternativeCount)\(verdict)\(failure)\(reason)")
         } else {
             if lastGroundMiss == nil { lastGroundMiss = target }
             let verdict = result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
             let failure = result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
-            appendGroundLog("miss \"\(target)\" alternatives=\(result.alternativeCount)\(verdict)\(failure)")
+            appendGroundLog("miss \"\(target)\" risk=\(risk.rawValue) alternatives=\(result.alternativeCount)\(verdict)\(failure)")
+        }
+    }
+
+    struct GroundingRiskRoute: Equatable, Sendable {
+        let risk: GroundingActionRisk
+        let minConfidence: Double
+        let maxDispersion: Double
+    }
+
+    nonisolated static func riskRoute(target: String, click: String?) -> GroundingRiskRoute {
+        let lower = target.lowercased()
+        let destructive = [
+            "delete", "remove", "trash", "discard", "erase", "cancel subscription",
+            "sign out", "log out", "logout", "purchase", "buy", "send", "submit",
+            "pay", "external", "open link"
+        ].contains { lower.contains($0) }
+        let clickRisk = click == "right" || click == "double"
+        let risk: GroundingActionRisk = destructive ? .destructive : (clickRisk ? .high : .visual)
+        return GroundingRiskRoute(
+            risk: risk,
+            minConfidence: minimumConfidence(for: risk, source: .uiTars),
+            maxDispersion: risk == .destructive ? 18 : (risk == .high ? 24 : 32)
+        )
+    }
+
+    nonisolated static func groundingOptions(for route: GroundingRiskRoute) -> GroundingRequestOptions {
+        switch route.risk {
+        case .normal:
+            return .default
+        case .visual:
+            return GroundingRequestOptions(sampleCount: 1, maxDispersion: route.maxDispersion, minimumConfidence: route.minConfidence, risk: route.risk)
+        case .high:
+            return GroundingRequestOptions(sampleCount: 3, maxDispersion: route.maxDispersion, minimumConfidence: route.minConfidence, risk: route.risk)
+        case .destructive:
+            return GroundingRequestOptions(sampleCount: 3, maxDispersion: route.maxDispersion, minimumConfidence: route.minConfidence, risk: route.risk)
+        }
+    }
+
+    nonisolated static func allowsGroundedAction(_ result: GroundingResult, route: GroundingRiskRoute) -> Bool {
+        guard let candidate = result.selectedCandidate else { return false }
+        let minConfidence = minimumConfidence(for: route.risk, source: candidate.source)
+        guard result.isActionable(minConfidence: minConfidence) else { return false }
+        guard !hasHighDispersion(candidate, limit: route.maxDispersion) else { return false }
+        if route.risk == .destructive, isVisualSource(candidate.source) {
+            return candidate.confidence >= 0.82 && (candidate.dispersion ?? 0) <= route.maxDispersion
+        }
+        return true
+    }
+
+    nonisolated static func minimumConfidence(for risk: GroundingActionRisk, source: GroundingSource) -> Double {
+        guard isVisualSource(source) else { return 0.30 }
+        switch risk {
+        case .normal: return 0.58
+        case .visual: return 0.68
+        case .high: return 0.74
+        case .destructive: return 0.82
+        }
+    }
+
+    nonisolated static func shouldRetryGrounding(_ result: GroundingResult) -> Bool {
+        guard let candidate = result.selectedCandidate else { return true }
+        if candidate.point == nil { return true }
+        if result.isAbstainedOrRejected { return true }
+        if isVisualSource(candidate.source), candidate.confidence < 0.68 { return true }
+        if hasHighDispersion(candidate, limit: 32) { return true }
+        return false
+    }
+
+    nonisolated static func hasHighDispersion(_ candidate: GroundingCandidate, limit: Double) -> Bool {
+        guard let dispersion = candidate.dispersion else { return false }
+        return dispersion > limit
+    }
+
+    nonisolated static func isRiskyVisualClick(_ candidate: GroundingCandidate, route: GroundingRiskRoute) -> Bool {
+        isVisualSource(candidate.source) && (route.risk == .high || route.risk == .destructive || candidate.confidence < 0.78)
+    }
+
+    nonisolated static func isVisualSource(_ source: GroundingSource) -> Bool {
+        switch source {
+        case .uiTars, .visualModel, .claude:
+            return true
+        case .accessibility, .dom, .ocr, .cache, .compatibility, .unknown:
+            return false
         }
     }
 

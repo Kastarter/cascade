@@ -137,6 +137,20 @@ public struct WasteDetector: Sendable {
         self.maxRunLength = maxRunLength
     }
 
+    public func groundingCorpusJSONL(
+        contexts: [RecordedContext],
+        inputEvents: [InputEvent],
+        recipe: AgentRecipe? = nil,
+        options: GroundingCorpusExporter.Options = .init()
+    ) throws -> String {
+        try GroundingCorpusExporter().jsonl(
+            clicks: inputEvents,
+            contexts: contexts,
+            recipe: recipe,
+            options: options
+        )
+    }
+
     // TODO(seq-08 validation): category/parameter-aware mining. Today this needs
     // near-identical token sequences, so the SAME ACTIONS with DIFFERENT DATA don't
     // cluster — e.g. copying ETH/SOL/BTC/LTC prices from Google into Notion (×4)

@@ -3,6 +3,7 @@ import AppKit
 import CascadeDesignSystem
 import CascadeMemory
 import MacContextKit
+import ProviderKit
 import WasteDetection
 import SwiftUI
 
@@ -3137,18 +3138,68 @@ private struct GroqKeyCard: View {
 private struct OpenRouterKeyCard: View {
     @ObservedObject var model: CascadeAppModel
     @State private var key = ""
+    @State private var endpoint = ""
 
     var body: some View {
+        let runtime = model.visualGrounderRuntime
         CascadePanel {
             VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("OpenRouter key · UI-TARS grounding").font(.cascadeSans(16, .semibold))
+                        Text("Visual grounder runtime").font(.cascadeSans(16, .semibold))
                         Text(model.openRouterKeyMessage).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()
                     CascadeTag(model.hasOpenRouterKey ? "Connected" : "Grounder off", tone: model.hasOpenRouterKey ? .cascadeGood : .cascadeWarn)
                 }
+                HStack(spacing: CascadeMetrics.s2) {
+                    runtimePill("Backend", runtime.preset.endpointClass.rawValue)
+                    runtimePill("Model", runtime.preset.modelSize)
+                    runtimePill("Coord", runtime.coordSpace.rawValue)
+                    runtimePill("Probe", runtime.probeStatus)
+                }
+                Picker("Preset", selection: Binding(
+                    get: { model.visualGrounderRuntime.preset.id },
+                    set: { model.selectVisualGrounderPreset($0); endpoint = model.visualGrounderRuntime.endpoint }
+                )) {
+                    ForEach(GrounderRegistry.presets) { preset in
+                        Text(preset.displayName).tag(preset.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                HStack(spacing: CascadeMetrics.s2) {
+                    TextField(runtime.endpoint, text: $endpoint)
+                        .textFieldStyle(.plain)
+                        .font(.cascadeMono(12))
+                        .padding(.horizontal, CascadeMetrics.s3)
+                        .padding(.vertical, CascadeMetrics.s2 + 1)
+                        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                    Picker("Coord", selection: Binding(
+                        get: { model.visualGrounderRuntime.coordSpace.rawValue },
+                        set: { model.updateVisualGrounderCoordSpace($0) }
+                    )) {
+                        ForEach(UITARSGrounder.CoordSpace.allCases, id: \.rawValue) { space in
+                            Text(space.rawValue).tag(space.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+                HStack {
+                    Button("Save runtime") {
+                        model.updateVisualGrounderEndpoint(endpoint.isEmpty ? runtime.endpoint : endpoint)
+                    }.buttonStyle(CascadeQuietButtonStyle())
+                    Button("Run coord probe") { model.runVisualGrounderCoordinateProbe() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                    Spacer()
+                    runtimePill("License", runtime.preset.license.rawValue)
+                    runtimePill("Eval", runtime.lastMiniEvalScore.map { String(format: "%.0f%%", $0 * 100) } ?? "none")
+                }
+                Text(runtime.preset.note)
+                    .font(.cascadeSans(12))
+                    .foregroundStyle(Color.cascadeText3)
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider().overlay(Color.cascadeBorder)
                 SecureField("sk-or-…", text: $key)
                     .textFieldStyle(.plain)
                     .font(.cascadeMono(12))
@@ -3160,10 +3211,28 @@ private struct OpenRouterKeyCard: View {
                     Button("Save key") { model.saveOpenRouterKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
                     Button("Clear") { model.clearOpenRouterKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
-                Text("Stored in macOS Keychain. Hosts UI-TARS-1.5-7B for the on-screen agent: Opus 4.8 names the target, hosted UI-TARS locates it (no local 7B model). When connected, the on-screen agent grounds every click through it; without it, Opus places its own coordinates.")
+                Text("OpenRouter keys stay in macOS Keychain. Local and BYO presets require their own endpoint; no model weights are bundled.")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
+            .onAppear { endpoint = model.visualGrounderRuntime.endpoint }
         }
+    }
+
+    private func runtimePill(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.cascadeMono(8, .semibold))
+                .foregroundStyle(Color.cascadeText4)
+            Text(value)
+                .font(.cascadeMono(10))
+                .foregroundStyle(Color.cascadeText2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, CascadeMetrics.s2)
+        .padding(.vertical, 5)
+        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
     }
 }
 
