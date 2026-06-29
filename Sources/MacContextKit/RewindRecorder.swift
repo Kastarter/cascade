@@ -4,8 +4,10 @@ import CoreImage
 import CoreMedia
 import CoreVideo
 import Foundation
+import ImageIO
 import OSLog
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 import Vision
 
 // Continuous, always-on screen recorder. Replaces the old 4s Timer with an
@@ -228,8 +230,9 @@ public enum FrameStore {
     /// JPEG and persists it.
     public static func save(imageData: Data, compression: CGFloat = 0.6) -> String? {
         autoreleasepool {
-            guard let rep = NSBitmapImageRep(data: imageData),
-                  let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: compression]) else {
+            guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+                  let jpeg = RewindImageEncoder.jpegData(from: image, compression: Double(compression)) else {
                 return nil
             }
             return save(jpeg: jpeg)
@@ -238,6 +241,22 @@ public enum FrameStore {
 
     public static func delete(_ path: String) {
         try? FileManager.default.removeItem(atPath: path)
+    }
+}
+
+private enum RewindImageEncoder {
+    static func jpegData(from cgImage: CGImage, compression: Double) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else { return nil }
+        let properties = [kCGImageDestinationLossyCompressionQuality as String: compression]
+        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
     }
 }
 
@@ -293,8 +312,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
                 changedCellsMask: changedCellsMask
             )
 
-            guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
-                .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
+            guard let jpeg = RewindImageEncoder.jpegData(from: cgImage, compression: 0.6) else {
                 return nil
             }
             let ocrPlan = Self.ocrPlan(
