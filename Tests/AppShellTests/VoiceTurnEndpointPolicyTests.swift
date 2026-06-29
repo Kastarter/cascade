@@ -118,6 +118,20 @@ struct VoiceTurnEndpointPolicyTests {
         #expect(decision == .tailWait(remainingMs: 120))
     }
 
+    @Test func lexicalFragmentDetectorFlagsLeadInsAndTrailingConnectors() {
+        #expect(VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("can you"))
+        #expect(VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("please open"))
+        #expect(VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("find"))
+        #expect(VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("open Keynote and"))
+        #expect(VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("move it to"))
+    }
+
+    @Test func lexicalFragmentDetectorAllowsCompleteCommands() {
+        #expect(!VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("open Keynote"))
+        #expect(!VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("find the invoices"))
+        #expect(!VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment("please open the budget"))
+    }
+
     @Test func ongoingKeyDownAppendsOnly() {
         let decision = policy.decide(timing(
             nowMs: 520,

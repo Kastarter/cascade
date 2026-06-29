@@ -97,6 +97,31 @@ public struct VoiceTurnEndpointPolicy: Sendable {
         return .commitNow
     }
 
+    public static func hasUnfinishedLexicalFragment(_ transcript: String) -> Bool {
+        let normalized = transcript
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,!?;:")))
+        guard !normalized.isEmpty else { return false }
+
+        let leadIns: Set<String> = [
+            "and", "then", "and then", "can you", "could you", "would you",
+            "please", "open", "find", "search", "look up", "go to", "click",
+            "select", "move", "copy", "paste",
+        ]
+        if leadIns.contains(normalized) { return true }
+        if leadIns.contains(where: { normalized.hasSuffix(" " + $0) }) { return true }
+
+        let trailingWords: Set<String> = [
+            "and", "or", "then", "to", "for", "with", "in", "on", "at",
+            "from", "into", "onto", "of", "by", "about", "as", "after",
+            "before", "when", "while", "because", "if",
+        ]
+        let words = normalized.split(separator: " ").map(String.init)
+        guard let last = words.last else { return false }
+        return trailingWords.contains(last)
+    }
+
     private func hasValidSpeech(_ timing: Timing) -> Bool {
         guard timing.uploadedSpeechMs >= settings.minSpeechMs,
               let speechStartedAtMs = timing.speechStartedAtMs,
