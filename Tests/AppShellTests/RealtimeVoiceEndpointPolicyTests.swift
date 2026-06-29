@@ -50,10 +50,24 @@ private func realtimeSpeechFrame(amplitude: Int16 = 8_000) -> [Int16] {
     }
 }
 
+private func realtimeClickFrame() -> [Int16] {
+    var frame = realtimeSilenceFrame()
+    frame[realtimeEndpointGateConfig.samplesPerFrame / 2] = 31_000
+    return frame
+}
+
 private func realtimeFrameData(_ samples: [Int16]) -> Data {
     samples.withUnsafeBufferPointer { pointer in
         Data(buffer: pointer)
     }
+}
+
+private func appendedSampleCount(_ sender: FakeRealtimeVoiceEventSender) -> Int {
+    sender.events
+        .filter { $0["type"] as? String == "input_audio_buffer.append" }
+        .compactMap { $0["audio"] as? String }
+        .compactMap { Data(base64Encoded: $0) }
+        .reduce(0) { $0 + $1.count / MemoryLayout<Int16>.size }
 }
 
 private func feedRealtimeEndpoint(_ session: RealtimeVoiceEndpointSession, frames: [[Int16]]) {
@@ -81,11 +95,7 @@ struct RealtimeVoiceEndpointPolicyTests {
         #expect(!RealtimeVoice.experimentalLocalVoiceEndpointingEnabled(defaults: defaults))
     }
 
-    @Test func enabledShortSpeechReleaseFailsOpenAndCommits() {
-        // Fail-open for push-to-talk: a short / unconfirmed utterance (below the
-        // VAD's min-speech bar) must NOT be silently dropped — the key release is
-        // the turn boundary. The captured audio is committed; genuine noise is
-        // rejected downstream from the TRANSCRIPT by VoiceFragmentGate.
+    @Test func enabledShortSpeechReleaseClearsWithoutAppending() {
         let sender = FakeRealtimeVoiceEventSender()
         let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
         sender.sendEvent(["type": "input_audio_buffer.clear"])
@@ -97,16 +107,13 @@ struct RealtimeVoiceEndpointPolicyTests {
         )
         let result = session.release()
 
-        #expect(result == .committed)
-        #expect(sender.eventTypes.contains("input_audio_buffer.append"))
-        #expect(sender.eventTypes.last == "input_audio_buffer.commit")
+        #expect(result == .cleared)
+        #expect(!sender.eventTypes.contains("input_audio_buffer.append"))
+        #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
+        #expect(sender.eventTypes.last == "input_audio_buffer.clear")
     }
 
-    @Test func enabledQuietSpeechReleaseStillCommits() {
-        // The actual reported failure: a mic quiet enough that every frame scores
-        // below the energy gate's speech threshold was classified as "silence" and
-        // the whole turn was discarded → the agent took no request at all. Fail-open
-        // uploads and commits it anyway.
+    @Test func enabledQuietSpeechReleaseClearsWithoutAppending() {
         let sender = FakeRealtimeVoiceEventSender()
         let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
         sender.sendEvent(["type": "input_audio_buffer.clear"])
@@ -115,9 +122,27 @@ struct RealtimeVoiceEndpointPolicyTests {
         feedRealtimeEndpoint(session, frames: Array(repeating: realtimeSpeechFrame(amplitude: 200), count: 20))
         let result = session.release()
 
-        #expect(result == .committed)
-        #expect(sender.eventTypes.contains("input_audio_buffer.append"))
-        #expect(sender.eventTypes.last == "input_audio_buffer.commit")
+        #expect(result == .cleared)
+        #expect(!sender.eventTypes.contains("input_audio_buffer.append"))
+        #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
+        #expect(sender.eventTypes.last == "input_audio_buffer.clear")
+    }
+
+    @Test func enabledClickBurstReleaseClearsWithoutAppending() {
+        let sender = FakeRealtimeVoiceEventSender()
+        let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
+
+        feedRealtimeEndpoint(
+            session,
+            frames: [realtimeClickFrame(), realtimeClickFrame()]
+                + Array(repeating: realtimeSilenceFrame(), count: 6)
+        )
+        let result = session.release()
+
+        #expect(result == .cleared)
+        #expect(!sender.eventTypes.contains("input_audio_buffer.append"))
+        #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
     }
 
     @Test func enabledEmptyReleaseClears() {
@@ -144,9 +169,65 @@ struct RealtimeVoiceEndpointPolicyTests {
 
         #expect(result == .tailWait(remainingMs: 30))
         #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
+        let samplesBeforeTail = appendedSampleCount(sender)
 
-        session.commit()
+        feedRealtimeEndpoint(session, frames: [realtimeSilenceFrame()])
+        let final = session.release()
 
+        #expect(final == .committed)
+        #expect(appendedSampleCount(sender) == samplesBeforeTail + realtimeEndpointGateConfig.samplesPerFrame)
+        #expect(sender.eventTypes.last == "input_audio_buffer.commit")
+    }
+
+    @Test func enabledNormalSpeechUploadsPrefixSpeechAndHangoverFrames() {
+        let sender = FakeRealtimeVoiceEventSender()
+        let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
+
+        feedRealtimeEndpoint(
+            session,
+            frames: Array(repeating: realtimeSilenceFrame(), count: 10)
+                + Array(repeating: realtimeSpeechFrame(), count: 8)
+        )
+        let result = session.release()
+        #expect(result == .tailWait(remainingMs: 30))
+
+        feedRealtimeEndpoint(session, frames: [realtimeSilenceFrame()])
+        let final = session.release()
+
+        #expect(final == .committed)
+        #expect(appendedSampleCount(sender) == realtimeEndpointGateConfig.samplesPerFrame * 19)
+        #expect(sender.eventTypes.last == "input_audio_buffer.commit")
+    }
+
+    @Test func unfinishedPartialTranscriptRequestsLexicalTailWait() {
+        let sender = FakeRealtimeVoiceEventSender()
+        let lexicalPolicy = VoiceTurnEndpointPolicy(settings: VoiceTurnEndpointPolicy.Settings(
+            minSpeechMs: 210,
+            hangoverMs: 30,
+            maxTailMs: 300,
+            lexicalFragmentWaitMs: 120
+        ))
+        let session = RealtimeVoiceEndpointSession(
+            localEndpointingEnabled: true,
+            sender: sender,
+            gateConfiguration: realtimeEndpointGateConfig,
+            endpointPolicy: lexicalPolicy
+        )
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
+
+        feedRealtimeEndpoint(
+            session,
+            frames: Array(repeating: realtimeSpeechFrame(), count: 8)
+                + [realtimeSilenceFrame()]
+        )
+        session.updatePartialTranscript("can you")
+
+        #expect(session.release() == .tailWait(remainingMs: 120))
+
+        session.updatePartialTranscript("can you open Keynote")
+
+        #expect(session.release() == .committed)
         #expect(sender.eventTypes.last == "input_audio_buffer.commit")
     }
 

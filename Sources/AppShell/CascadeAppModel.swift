@@ -292,6 +292,8 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var agentRunning = false
     @Published public private(set) var agentMessage = "Connect a Claude key and a goal, then watch Cascade use this Mac."
     @Published public private(set) var teachMessage = "Ask “where do I find X” and Cascade points at it on your screen."
+    @Published public private(set) var voicePartialUtterance = ""
+    @Published public private(set) var voicePartialAppHint: String?
     /// Teach-once: true while the user is demonstrating a task by hand for Cascade to
     /// turn into an agent. Recording is already always-on — this only BRACKETS a time
     /// range and reroutes any narration into the intent buffer.
@@ -491,6 +493,7 @@ public final class CascadeAppModel: ObservableObject {
     private var lastNextActionOfferAt: Date?
     private var recentNextActionDismissals = 0
     private var loggedCuratedProposalKeys: Set<String> = []
+    private var voicePartialAppHintSource = ""
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
     private var userPaused = false
     /// False in tests/headless: the model is built with an injected store +
@@ -623,6 +626,9 @@ public final class CascadeAppModel: ObservableObject {
             .store(in: &cancellables)
         voice.onUtterance = { [weak self] phrase in
             self?.teach(question: phrase)
+        }
+        voice.onPartialUtterance = { [weak self] partial in
+            self?.handlePartialVoiceUtterance(partial)
         }
         // Barge-in: the user talking over the agent halts whatever it's doing.
         voice.onInterrupt = { [weak self] in
@@ -1661,6 +1667,30 @@ public final class CascadeAppModel: ObservableObject {
         return cleaned
     }
 
+    private func handlePartialVoiceUtterance(_ partial: String) {
+        let trimmed = partial.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        voicePartialUtterance = trimmed
+        teachStatus = "Listening - \(String(trimmed.prefix(80)))"
+        ScreenCaptureUtility.prewarm()
+        AnthropicWarmup.prewarm()
+        if let hint = appSkills.appNamed(inGoal: trimmed) {
+            voicePartialAppHint = hint
+            voicePartialAppHintSource = trimmed
+        }
+    }
+
+    private func appNameHint(forCompletedVoiceGoal goal: String) -> String? {
+        let normalizedGoal = goal.lowercased()
+        let normalizedSource = voicePartialAppHintSource.lowercased()
+        if let hint = voicePartialAppHint,
+           !normalizedSource.isEmpty,
+           normalizedGoal.contains(normalizedSource) {
+            return hint
+        }
+        return appSkills.appNamed(inGoal: goal)
+    }
+
     public func teach(question: String) {
         var q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { teachMessage = "Ask where something is, or what to do."; return }
@@ -2004,7 +2034,7 @@ public final class CascadeAppModel: ObservableObject {
         // then spent two turns (~8s) opening the app its own goal names. Open it
         // before the first frame instead, so turn 1 already sees it frontmost.
         if let first = plan.first, first.app.isEmpty,
-           let named = appSkills.appNamed(inGoal: goal) {
+           let named = appNameHint(forCompletedVoiceGoal: goal) {
             await executeCU(.openApp(named), on: screen)
             if let fresh = await freshShot() { shot = fresh }
         }

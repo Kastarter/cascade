@@ -815,6 +815,24 @@ func teachingGatesNarrationIntoIntentNotAnAssistRun() throws {
 }
 
 @MainActor @Test
+func voicePartialUtteranceUpdatesStatusWithoutTeaching() throws {
+    let (model, _) = try makeModel()
+    let initialTeachMessage = model.teachMessage
+
+    model.voice.onPartialUtterance?("  ok  ")
+
+    #expect(model.voicePartialUtterance == "ok")
+    #expect(model.teachStatus?.contains("ok") == true)
+    #expect(model.teachMessage == initialTeachMessage)
+    #expect(!model.showSettings)
+    #expect(!model.agentRunning)
+
+    model.teach(question: "ok")
+
+    #expect(model.teachMessage == "ok")
+}
+
+@MainActor @Test
 func createTaughtAgentLandsInYourAgents() async throws {
     let (model, _) = try makeModel()
     model.teachPreview = taughtCurated()
