@@ -14,7 +14,8 @@ private func input(
     modifiers: [String] = [],
     app: String = "Mail",
     bundle: String? = nil,
-    window: String? = nil
+    window: String? = nil,
+    targetDescriptor: String? = nil
 ) -> InputEvent {
     InputEvent(
         id: Int64(id),
@@ -27,7 +28,8 @@ private func input(
         modifiers: modifiers,
         appName: app,
         bundleIdentifier: bundle,
-        windowTitle: window
+        windowTitle: window,
+        targetDescriptor: targetDescriptor
     )
 }
 
@@ -103,8 +105,36 @@ func saveAndSendCompletionControlsCloseEpisodes() {
 	    ])
 	
 	    #expect(episodes.map(\.eventIDs) == [[1, 2], [3, 4], [5]])
-	    #expect(episodes.map(\.boundaryReasons) == [[.completionControl], [.completionControl], [.completionControl]])
-	}
+	    #expect(episodes.map(\.boundaryReasons) == [[.completionControl], [.completionControl], []])
+		}
+
+@Test
+func completionControlKeepsEpisodeWhenNextEventSharesContext() {
+    let segmenter = ActionEpisodeSegmenter()
+    let episodes = segmenter.segment([
+        input(1, at: 0, text: "Invoice 142", app: "Mail", window: "Invoice"),
+        input(2, at: 2, text: "Save", app: "Mail", window: "Invoice"),
+        input(3, at: 4, text: "Invoice 142", app: "Mail", window: "Invoice"),
+        input(4, at: 6, kind: .key, key: "c", modifiers: ["command"], app: "Mail", window: "Invoice"),
+    ])
+
+    #expect(episodes.count == 1)
+    #expect(episodes[0].eventIDs == [1, 2, 3, 4])
+    #expect(!episodes[0].boundaryReasons.contains(.completionControl))
+}
+
+@Test
+func completionControlSplitsWhenNextEventStartsNewTask() {
+    let segmenter = ActionEpisodeSegmenter()
+    let episodes = segmenter.segment([
+        input(1, at: 0, text: "Invoice 142", app: "Mail", window: "Invoice"),
+        input(2, at: 2, text: "Save", app: "Mail", window: "Invoice"),
+        input(3, at: 4, text: "Compose", app: "Mail", window: "Inbox"),
+    ])
+
+    #expect(episodes.map(\.eventIDs) == [[1, 2], [3]])
+    #expect(episodes[0].boundaryReasons == [.completionControl])
+}
 
 @Test
 func noisyAndSensitiveSurfacesAreExcludedAndBoundariesRemainVisible() {

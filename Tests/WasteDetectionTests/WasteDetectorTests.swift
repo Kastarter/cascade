@@ -48,7 +48,7 @@ func distinctButtonSequencesAreDistinctWorkflows() {
         return out
     }
     let events = runs("Open Invoice", "Mark Paid", app: "Books", start: 0)
-    let sig = WasteDetector().detect(contexts: [], inputEvents: events).first?.signature ?? ""
+    let sig = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first?.signature ?? ""
     #expect(sig.contains("open invoice"))
     #expect(sig.contains("mark paid"))
 }
@@ -85,7 +85,7 @@ func interruptedRoutineIsRescuedByNoiseFilter() {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 9, y: 9, text: "Stray-\(run)", appName: "Books")); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Books")); i += 1
     }
-    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
     let waste = try? #require(results.first)
     if let waste {
         #expect(waste.occurrences == 3)
@@ -118,7 +118,7 @@ func patternStraddlingAnIdleGapIsNotCounted() {
     }
     var events = pair(0, clickAt: 0, keyAt: 1) + pair(2, clickAt: 2, keyAt: 3) + pair(4, clickAt: 4, keyAt: 5)
     events += pair(6, clickAt: 400, keyAt: 700) // 300s internal gap → rejected
-    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first
     #expect(waste?.occurrences == 3) // the gap-straddling 4th pair is not counted
 }
 
@@ -151,6 +151,27 @@ func mergeVariantsKeepsGenuinelyDifferentRoutinesApart() {
     #expect(merged.count == 2) // dissimilar → not merged
 }
 
+@Test
+func preThresholdVariantAggregationLetsSplitSupportClearRepetitionBar() {
+    var events: [InputEvent] = []
+    var i = 0
+    func appendRun(run: Int, thirdClick: String) {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 1, y: 1, text: "Open", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 1), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 2), kind: .click, x: 2, y: 2, text: thirdClick, appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 3), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    }
+    appendRun(run: 0, thirdClick: "Row")
+    appendRun(run: 1, thirdClick: "Row")
+    appendRun(run: 2, thirdClick: "Cell")
+
+    let waste = try? #require(WasteDetector().detect(contexts: [], inputEvents: events).first)
+
+    #expect(waste?.occurrences == 3)
+    #expect(waste?.evidence.count == Set(waste?.evidence ?? []).count)
+}
+
 // MARK: - H6 noisy-app exclusion
 
 @Test
@@ -166,7 +187,7 @@ func noisyMeetingAppsAreExcludedFromDetection() {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: "Mute", appName: "zoom.us", bundleIdentifier: "us.zoom.xos")); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "a", modifiers: ["command"], appName: "zoom.us", bundleIdentifier: "us.zoom.xos")); i += 1
     }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 // MARK: - H2 composite ranking
@@ -208,6 +229,44 @@ func crossAppCopyPasteIsDetectedAndBoosted() {
           > WasteDetector.rankingScore(rankWaste(steps: sameApp, lastSeen: now), now: now))
 }
 
+@Test
+func routineQualityRewardsCompactDeterministicRoutines() {
+    func makeEvents(startID: Int, gap: TimeInterval, label: String) -> [InputEvent] {
+        var output: [InputEvent] = []
+        var id = startID
+        for run in 0..<3 {
+            let start = Double(run) * 400
+            output.append(InputEvent(id: Int64(id), capturedAt: base.addingTimeInterval(start), kind: .click, x: 1, y: 1, text: label, appName: "Mail")); id += 1
+            output.append(InputEvent(id: Int64(id), capturedAt: base.addingTimeInterval(start + gap), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); id += 1
+        }
+        return output
+    }
+    let compact = WasteDetector().detect(contexts: [], inputEvents: makeEvents(startID: 0, gap: 2, label: "Inbox"), useEpisodeMining: false).first
+    let loose = WasteDetector().detect(contexts: [], inputEvents: makeEvents(startID: 20, gap: 100, label: "Archive"), useEpisodeMining: false).first
+
+    #expect((compact?.quality?.score ?? 0) > (loose?.quality?.score ?? 0))
+    #expect((compact?.quality?.compactnessScore ?? 0) > (loose?.quality?.compactnessScore ?? 0))
+}
+
+@Test
+func routineQualityPenalizesFreeTextParametersBeforeCuration() {
+    func makeParameterized(values: [String], label: String) -> DetectedWaste {
+        var events: [InputEvent] = []
+        var i = 0
+        for value in values {
+            events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: label, appName: "Notes")); i += 1
+            events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: value, appName: "Notes")); i += 1
+            events.append(event(i, .key, app: "Notes", key: "s", modifiers: ["command"])); i += 1
+        }
+        return WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
+    }
+    let numeric = makeParameterized(values: ["INV-001", "INV-002", "INV-003"], label: "Invoice number")
+    let freeText = makeParameterized(values: ["Please call me later", "Can you review this", "Draft the note"], label: "Message body")
+
+    #expect((numeric.quality?.privacyPenalty ?? 1) < (freeText.quality?.privacyPenalty ?? 0))
+    #expect((numeric.quality?.score ?? 0) > (freeText.quality?.score ?? 0))
+}
+
 // MARK: - B5 parameter extraction
 
 private func typeEvent(_ i: Int, app: String, text: String) -> InputEvent {
@@ -237,6 +296,44 @@ func variableTypePositionsIgnoresConstantTypingAndSingleRuns() {
 }
 
 @Test
+func variableTypePositionsAlignsByTargetWhenPositionsVary() {
+    let runA = [
+        InputEvent(id: 0, capturedAt: base, kind: .click, text: "Invoice number", appName: "Books"),
+        typeEvent(1, app: "Books", text: "INV-001"),
+        event(2, .key, app: "Books", key: "s", modifiers: ["command"])
+    ]
+    let runB = [
+        InputEvent(id: 3, capturedAt: base.addingTimeInterval(3), kind: .click, text: "Open", appName: "Books"),
+        InputEvent(id: 4, capturedAt: base.addingTimeInterval(4), kind: .click, text: "Invoice number", appName: "Books"),
+        typeEvent(5, app: "Books", text: "INV-002"),
+        event(6, .key, app: "Books", key: "s", modifiers: ["command"])
+    ]
+
+    #expect(WasteDetector.variableTypePositions([runA, runB]) == [1])
+}
+
+@Test
+func detectCarriesTypedParameterMetadata() {
+    var events: [InputEvent] = []
+    var i = 0
+    for value in ["INV-001", "INV-002"] {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: "Invoice number", appName: "Books")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: value, appName: "Books")); i += 1
+        events.append(event(i, .key, app: "Books", key: "s", modifiers: ["command"])); i += 1
+    }
+
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
+    let parameter = waste.recipe.steps.first { $0.kind == .type }
+
+    #expect(parameter?.isParameter == true)
+    #expect(parameter?.parameterKey == "invoice_number")
+    #expect(parameter?.parameterKind == .number)
+    #expect(parameter?.valueExamples.contains { $0.contains("number:") } == true)
+    #expect(parameter?.valueHashes.isEmpty == false)
+    #expect(parameter?.sourceStepIDs.isEmpty == false)
+}
+
+@Test
 func detectMarksVaryingTypedValueAsParameter() {
     // A repeated save-with-a-changing-name workflow: the typed value differs each run,
     // so the deployed recipe must flag it (don't blindly retype the stale value).
@@ -248,7 +345,7 @@ func detectMarksVaryingTypedValueAsParameter() {
         events.append(typeEvent(i, app: "TextEdit", text: values[run])); i += 1
         events.append(event(i, .key, app: "TextEdit", key: "s", modifiers: ["command"])); i += 1
     }
-    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
     let typeStep = waste.recipe.steps.first { $0.kind == .type }
     #expect(typeStep?.isParameter == true)
     // Fixed steps stay fixed.
@@ -268,7 +365,7 @@ func detectsRepeatedCrossAppWorkflow() {
         events.append(event(i, .key, app: "Numbers", key: "v", modifiers: ["command"])); i += 1
     }
 
-    let result = WasteDetector().detect(contexts: [], inputEvents: events)
+    let result = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
     #expect(result.count == 1)
     let waste = result.first!
     #expect(waste.occurrences == 2)
@@ -280,9 +377,32 @@ func detectsRepeatedCrossAppWorkflow() {
 }
 
 @Test
+func crossAppPasteCarriesDataflowParameterMetadata() {
+    var events: [InputEvent] = []
+    var i = 0
+    for _ in 0..<2 {
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, text: "Invoice total", appName: "Mail")); i += 1
+        events.append(event(i, .key, app: "Mail", key: "c", modifiers: ["command"])); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 2, y: 2, text: "A1", appName: "Numbers")); i += 1
+        events.append(event(i, .key, app: "Numbers", key: "v", modifiers: ["command"])); i += 1
+    }
+
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
+    let copy = waste.recipe.steps.first { $0.kind == .key && $0.key == "c" }
+    let paste = waste.recipe.steps.first { $0.kind == .key && $0.key == "v" }
+
+    #expect(paste?.isParameter == true)
+    #expect(paste?.parameterKey == "a1")
+    #expect(paste?.parameterKind == .freeText)
+    #expect(paste?.valueExamples == ["freeText:clipboard"])
+    #expect(paste?.valueHashes.isEmpty == true)
+    #expect(copy.map { paste?.sourceStepIDs.contains($0.order) == true } == true)
+}
+
+@Test
 func nonRepeatingActivityDetectsNothing() {
     let events = (0..<6).map { event($0, .click, app: "App\($0)") }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 @Test
@@ -290,7 +410,7 @@ func scrollSpamIsNeverAWorkflow() {
     // Hours of reading in iTerm2 — hundreds of wheel ticks, no real actions.
     // This was surfacing as "Repeated steps in iTerm2 · scroll · scroll · …".
     let events = (0..<60).map { event($0, .scroll, app: "iTerm2") }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 @Test
@@ -302,7 +422,7 @@ func scrollThenOneActionIsStillNotAWorkflow() {
         for _ in 0..<6 { events.append(event(i, .scroll, app: "iTerm2")); i += 1 }
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "ls", appName: "iTerm2")); i += 1
     }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 @Test
@@ -315,7 +435,7 @@ func scrollBurstsCollapseToOneGesture() {
         events.append(event(i, .click, app: "Mail")); i += 1
         events.append(event(i, .key, app: "Mail", key: "r", modifiers: ["command"])); i += 1
     }
-    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
     #expect(results.count == 1)
     let waste = results[0]
     // The burst is one step, not eight — recipes and time-saved stay honest.
@@ -333,7 +453,7 @@ func recipeStepsCarryRealCoordinatesAndText() {
         events.append(event(i, .key, app: "Safari", key: "l", modifiers: ["command"])); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "hello", appName: "Safari")); i += 1
     }
-    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
     #expect(waste.recipe.steps.contains { $0.kind == .click && $0.x == 42 && $0.y == 99 })
     #expect(waste.recipe.steps.contains { $0.kind == .type && $0.text == "hello" })
 }
@@ -349,7 +469,7 @@ func editingKeysAreNeverAWorkflow() {
         events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "fix", appName: "Google Chrome")); i += 1
     }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 @Test
@@ -357,7 +477,7 @@ func anonymousSameAppClickingIsNotAWorkflow() {
     // Click, click, click around a browser — that's reading. No named element,
     // no shortcut, one app: no agent.
     let events = (0..<12).map { event($0, .click, app: "Google Chrome") }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 @Test
@@ -371,7 +491,7 @@ func clickPlusTypingAloneIsNotAWorkflow() {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .type, text: "words", appName: "Google Chrome")); i += 1
         events.append(event(i, .key, app: "Google Chrome", key: "Delete")); i += 1
     }
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).isEmpty)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).isEmpty)
 }
 
 @Test
@@ -384,7 +504,7 @@ func clickAXLabelBecomesTheAnchor() {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 42, y: 99, text: "Send Message", appName: "Mail")); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "w", modifiers: ["command"], appName: "Mail")); i += 1
     }
-    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
     let click = waste.recipe.steps.first { $0.kind == .click }!
     #expect(click.ocrAnchor == "Send Message")
 }
@@ -407,7 +527,7 @@ func contextAnchorMustComeFromTheSameApp() {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 1, y: 1, appName: "Safari", windowTitle: "Safari window")); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "r", modifiers: ["command"], appName: "Safari")); i += 1
     }
-    let waste = WasteDetector().detect(contexts: [foreign], inputEvents: events).first!
+    let waste = WasteDetector().detect(contexts: [foreign], inputEvents: events, useEpisodeMining: false).first!
     let click = waste.recipe.steps.first { $0.kind == .click }!
     #expect(click.ocrAnchor == "Safari window")
 }
@@ -421,7 +541,7 @@ func copyPasteAcrossAppsGetsNamedOutright() {
         events.append(event(i, .key, app: "Mail", key: "c", modifiers: ["command"])); i += 1
         events.append(event(i, .key, app: "Numbers", key: "v", modifiers: ["command"])); i += 1
     }
-    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
     #expect(waste.title == "Copy from Mail into Numbers")
 }
 
@@ -436,7 +556,7 @@ func titleTellsTheStoryFromAnchorsNotJustTheApp() {
         )); i += 1
         events.append(event(i, .key, app: "Mail", key: "r", modifiers: ["command"])); i += 1
     }
-    let waste = WasteDetector().detect(contexts: [], inputEvents: events).first!
+    let waste = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).first!
     #expect(waste.title.contains("Mail"))
     #expect(waste.title.contains("Reply All"))
     #expect(!waste.title.contains("Repeated steps"))
@@ -445,7 +565,7 @@ func titleTellsTheStoryFromAnchorsNotJustTheApp() {
 }
 
 @Test
-func resultsSortByTotalTimeSavedDescending() {
+func resultsSortByRoutineQualityDescending() {
     var events: [InputEvent] = []
     var i = 0
     // Small workflow: 2 occurrences × 2 events in TextEdit.
@@ -458,10 +578,10 @@ func resultsSortByTotalTimeSavedDescending() {
         events.append(event(i, .click, app: "Mail")); i += 1
         events.append(event(i, .key, app: "Mail", key: "e", modifiers: ["command"])); i += 1
     }
-    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
     #expect(results.count >= 2)
-    #expect(results[0].estimatedTotalSeconds >= results[1].estimatedTotalSeconds)
-    #expect(results[0].apps == ["Mail"])
+    #expect(WasteDetector.rankingScore(results[0], now: base) >= WasteDetector.rankingScore(results[1], now: base))
+    #expect(results[0].quality != nil)
 }
 
 @Test
@@ -484,7 +604,7 @@ func overlappingWorkflowsAreNotDoubleCounted() {
         click(0), key(1, "c"), key(2, "v"), key(3, "s"),
         click(4), key(5, "c"), key(6, "x"), key(7, "c"), key(8, "v"),
     ]
-    let results = WasteDetector().detect(contexts: [], inputEvents: events)
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
     #expect(results.count == 1)
     // H1: the click token now carries the element identity ("Inbox").
     #expect(results.first?.signature == "click:inbox@Mail|key:command+c@Mail")
@@ -512,7 +632,7 @@ func wasteFromInstanceBuildsTheSameRecipeAsDetect() {
     // The intentional path (Teach-once) must yield the very recipe the automatic path
     // would for that instance — one creation spine, not a divergent second one.
     let detector = WasteDetector()
-    let detected = detector.detect(contexts: [], inputEvents: copyPasteInstance(0) + copyPasteInstance(4)).first!
+    let detected = detector.detect(contexts: [], inputEvents: copyPasteInstance(0) + copyPasteInstance(4), useEpisodeMining: false).first!
     let taught = detector.waste(fromInstance: copyPasteInstance(0), contexts: [])
 
     let one = try! #require(taught)
@@ -569,7 +689,7 @@ func webAppsInSameBrowserAreDistinctWorkflows() {
     for _ in 0..<2 { events.append(click(i, notion)); i += 1; events.append(copy(i, notion)); i += 1 }
 
     let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.from(windowTitle: $0.windowTitle) }
-    let results = WasteDetector().detect(contexts: [], inputEvents: events, webAppIdentity: resolver)
+    let results = WasteDetector().detect(contexts: [], inputEvents: events, webAppIdentity: resolver, useEpisodeMining: false)
     #expect(results.count == 2)
     #expect(results.contains { $0.title.contains("Gmail") })
     #expect(results.contains { $0.title.contains("Notion") })
@@ -577,5 +697,5 @@ func webAppsInSameBrowserAreDistinctWorkflows() {
     #expect(results.allSatisfy { $0.apps == ["Google Chrome"] })
 
     // Contrast: with no resolver, both collapse into a single "Chrome" workflow.
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events).count == 1)
+    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).count == 1)
 }

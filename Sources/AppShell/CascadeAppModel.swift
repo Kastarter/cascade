@@ -475,23 +475,23 @@ public final class CascadeAppModel: ObservableObject {
                 audit = []
             }
             agents = try await orchestrator.agents()
-            let personalizationEnabled = defaultsStore.bool(forKey: Self.experimentalSuggestionRankingKey)
-            let episodeMiningEnabled = defaultsStore.bool(forKey: Self.experimentalEpisodeMiningKey)
+            let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
+            let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
             let rawDetectedWaste = try await orchestrator.detectedWaste(
                 webAppIdentity: Self.webAppIdentity,
                 useEpisodeMining: episodeMiningEnabled
             )
+            let preferenceModel = suggestionPreferenceModel()
             if personalizationEnabled {
-                let preferenceModel = suggestionPreferenceModel()
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
-                let curated = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
+                let curated = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0, using: preferenceModel) })
                 curatedWaste = Self.rankCuratedSuggestions(curated, using: preferenceModel)
                 await refreshProactiveNextActionOffer(now: Date())
             } else {
                 detectedWaste = rawDetectedWaste
                 // Only genuinely repeated, time-saving workflows (the automatable filter)
                 // reach the curator and the manager's review queue.
-                curatedWaste = await orchestrator.curate(detectedWaste.filter(Self.isAutomatable))
+                curatedWaste = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0) })
                 proactiveNextActionOffer = nil
             }
             statusLine = recorder.status.message
@@ -4276,6 +4276,13 @@ public final class CascadeAppModel: ObservableObject {
         return model
     }
 
+    private static func enabledByDefault(_ defaults: UserDefaults, key: String) -> Bool {
+        if let value = defaults.object(forKey: key) as? Bool {
+            return value
+        }
+        return true
+    }
+
     public nonisolated static func rankCuratedSuggestions(
         _ candidates: [CuratedAgent],
         using model: PreferenceModel,
@@ -4468,11 +4475,21 @@ public final class CascadeAppModel: ObservableObject {
     /// without a key — so a deterministic floor keeps trivial sub-minute habits out
     /// of the queue regardless. "Really save time" starts here.
     nonisolated static let minSecondsToReview = 30
+    nonisolated static let minRoutineQualityScore = 0.08
+    nonisolated static let minRoutineDeterminismScore = 0.45
+    nonisolated static let maxRoutinePrivacyPenalty = 0.55
 
     /// A real habit — repeated often enough to be worth automating, not a one-off.
     /// Browser-independent, so it can be pinned without the machine's browser list.
-    nonisolated static func meetsRepetitionBar(_ waste: DetectedWaste) -> Bool {
-        waste.occurrences >= minRepeatsToAutomate
+    nonisolated static func meetsRepetitionBar(
+        _ waste: DetectedWaste,
+        using model: PreferenceModel? = nil,
+        ranker: SuggestionRanker = SuggestionRanker()
+    ) -> Bool {
+        let threshold = model.map {
+            ranker.personalizedThreshold(waste.signature, base: minRepeatsToAutomate, using: $0)
+        } ?? minRepeatsToAutomate
+        return waste.occurrences >= threshold
     }
 
     /// Represents real time — the cumulative observed seconds clear the floor, so a
@@ -4482,14 +4499,21 @@ public final class CascadeAppModel: ObservableObject {
         waste.estimatedTotalSeconds >= minSecondsToReview
     }
 
+    nonisolated static func meetsQualityBar(_ waste: DetectedWaste) -> Bool {
+        guard let quality = waste.quality else { return true }
+        return quality.score >= minRoutineQualityScore
+            && quality.determinismScore >= minRoutineDeterminismScore
+            && quality.privacyPenalty <= maxRoutinePrivacyPenalty
+    }
+
     /// The product bar for promoting a detected repetition into an agent the
     /// manager reviews: a real, time-saving habit — repeated enough to be a habit and
     /// representing real time. App identity does NOT gate this: a browser-only
     /// workflow deploys to the background sandbox, a native-app one replays on-screen
     /// (and escalates to the full cursor-class runtime on drift), so every kind of
     /// repeated work can become an agent. `deployAgent` routes by app at deploy time.
-    nonisolated static func isAutomatable(_ waste: DetectedWaste) -> Bool {
-        meetsRepetitionBar(waste) && representsRealTime(waste)
+    nonisolated static func isAutomatable(_ waste: DetectedWaste, using model: PreferenceModel? = nil) -> Bool {
+        meetsRepetitionBar(waste, using: model) && representsRealTime(waste) && meetsQualityBar(waste)
     }
 
     /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a
@@ -5013,7 +5037,13 @@ public final class CascadeAppModel: ObservableObject {
             windowTitleHint: step.windowTitleHint,
             ocrAnchor: step.ocrAnchor,
             targetDescriptor: step.targetDescriptor,
-            isParameter: step.isParameter
+            isParameter: step.isParameter,
+            parameterKey: step.parameterKey,
+            parameterKind: step.parameterKind,
+            valueExamples: step.valueExamples,
+            valueHashes: step.valueHashes,
+            sourceStepIDs: step.sourceStepIDs,
+            transform: step.transform
         )
     }
 

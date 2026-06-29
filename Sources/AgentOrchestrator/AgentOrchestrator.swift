@@ -313,7 +313,7 @@ public actor CascadeOrchestrator {
     public func detectedWaste(
         maxResults: Int = 5,
         webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
-        useEpisodeMining: Bool = false
+        useEpisodeMining: Bool = true
     ) async throws -> [DetectedWaste] {
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)

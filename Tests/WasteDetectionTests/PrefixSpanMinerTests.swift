@@ -106,3 +106,54 @@ func maxSpanSecondsBoundsOccurrenceDuration() {
     #expect(shortPattern?.occurrenceSpans.compactMap(\.durationSeconds) == [1, 2])
     #expect(patterns.contains { $0.tokens == ["open", "copy", "paste"] } == false)
 }
+
+@Test
+func maxGapSecondsRejectsLooseConsecutiveMatches() {
+    let miner = PrefixSpanMiner(
+        minSupport: 2,
+        maxPatternLength: 2,
+        maxGapEvents: 0,
+        maxGapSeconds: 60,
+        closedOnly: false
+    )
+
+    let patterns = miner.mine(episodes: [
+        [
+            PrefixSpanMiner.Event("open", timestamp: 0),
+            PrefixSpanMiner.Event("copy", timestamp: 120)
+        ],
+        [
+            PrefixSpanMiner.Event("open", timestamp: 200),
+            PrefixSpanMiner.Event("copy", timestamp: 320)
+        ]
+    ])
+
+    #expect(patterns.contains { $0.tokens == ["open", "copy"] } == false)
+    #expect(patterns.contains { $0.tokens == ["open"] })
+}
+
+@Test
+func closedPatternsKeepShorterPatternWhenOccurrenceSpansDiffer() {
+    let miner = PrefixSpanMiner(
+        minSupport: 2,
+        maxPatternLength: 3,
+        maxGapEvents: 0,
+        closedOnly: true
+    )
+
+    let patterns = miner.mine(episodes: [
+        [
+            PrefixSpanMiner.Event("open", timestamp: 0),
+            PrefixSpanMiner.Event("copy", timestamp: 1),
+            PrefixSpanMiner.Event("paste", timestamp: 240)
+        ],
+        [
+            PrefixSpanMiner.Event("open", timestamp: 300),
+            PrefixSpanMiner.Event("copy", timestamp: 301),
+            PrefixSpanMiner.Event("paste", timestamp: 540)
+        ]
+    ])
+
+    #expect(patterns.contains { $0.tokens == ["open", "copy"] })
+    #expect(patterns.contains { $0.tokens == ["open", "copy", "paste"] })
+}

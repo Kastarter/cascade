@@ -248,11 +248,10 @@ public struct WorkflowCurator: Sendable {
     than "reply to emails") — but NEVER invent details the snippet does not show, and \
     never copy private/sensitive values verbatim into the goal.
 
-    When a candidate notes that "N value(s) change each run", those are parameters — the \
-    user typed a DIFFERENT value each time (an order number, a date, a name). Write the \
-    goal so the agent supplies the CURRENT/appropriate value at run time (e.g. "…using \
-    today's date", "…for the requested order"), and NEVER bake the one recorded value \
-    into the goal as if it were fixed.
+    When a candidate lists parameters, those fields change each run (an order number, \
+    a date, a name). Write the goal so the agent supplies the CURRENT/appropriate value \
+    at run time (e.g. "…using today's date", "…for the requested order"), and NEVER \
+    bake the one recorded value into the goal as if it were fixed.
 
     A candidate marked "moves data between apps" copies from one app and pastes into \
     another — the highest-value kind of task to automate (tedious, error-prone, clearly \
@@ -276,8 +275,8 @@ public struct WorkflowCurator: Sendable {
             var line = "[\(index)] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps)"
             line += " · seen \(waste.occurrences)× (~\(waste.estimatedSecondsPerRun)s each)"
             if !steps.isEmpty { line += " · steps: \(steps)" }
-            let parameterCount = waste.recipe.steps.filter { $0.isParameter }.count
-            if parameterCount > 0 { line += " · \(parameterCount) value(s) change each run" }
+            let parameters = parameterPromptSummaries(for: waste.recipe.steps)
+            if !parameters.isEmpty { line += " · " + parameters.joined(separator: "; ") }
             // The canonical high-value automatable routine: data moved between apps.
             if WasteDetector.hasCrossAppCopyPaste(waste.recipe.steps) { line += " · moves data between apps" }
             lines.append(line)
@@ -286,6 +285,33 @@ public struct WorkflowCurator: Sendable {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    private static func parameterPromptSummaries(for steps: [RecipeStep]) -> [String] {
+        let parameterSteps = steps.filter(\.isParameter)
+        guard !parameterSteps.isEmpty else { return [] }
+        return parameterSteps.prefix(4).map { step in
+            let field = parameterDisplayName(step.parameterKey) ?? parameterDisplayName(step.ocrAnchor) ?? "field"
+            let kind = step.parameterKind?.rawValue ?? "freeText"
+            var summary = "parameter \(field) (\(kind)) changes each run"
+            if !step.sourceStepIDs.isEmpty {
+                summary += " from earlier selected/copied value"
+            }
+            return summary
+        }
+    }
+
+    private static func parameterDisplayName(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        let spaced = raw
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spaced.isEmpty, !PrivacyRules.isSensitiveText(spaced) else { return nil }
+        return spaced
+            .split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
     }
 
     /// Parses the reply, tolerating prose or code fences. Returns nil ONLY when the
