@@ -272,6 +272,9 @@ struct NotchView: View {
                 .foregroundStyle(Color.cascadeAgent)
             NotchStatusDot(color: recording ? Color.cascadeRecDot : Color.cascadeText4, pulsing: recording)
             NotchStatusDot(color: voiceDotColor, pulsing: voiceState != .idle)
+            if let offer = model.proactiveOffer, offer.level >= .ambient {
+                NotchStatusDot(color: Color.cascadeAgent, pulsing: offer.level >= .passive)
+            }
         }
         .padding(.horizontal, 14)
         .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
@@ -300,6 +303,25 @@ struct NotchView: View {
             Text(Date.now, format: .dateTime.weekday(.abbreviated).month(.abbreviated).day())
                 .font(.cascadeMono(11, .medium))
                 .foregroundStyle(Color.cascadeText3)
+
+            if let offer = model.proactiveOffer, offer.level >= .passive {
+                Button(action: { model.acceptProactiveOffer() }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: offer.level == .action ? "bolt.fill" : "sparkle.magnifyingglass")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(String(offer.title.prefix(34)))
+                            .font(.cascadeMono(10, .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(Color.cascadeAgent)
+                    .padding(.horizontal, CascadeMetrics.s2 + 2)
+                    .padding(.vertical, CascadeMetrics.s1 + 1)
+                    .background(Color.cascadeAgent.opacity(0.13), in: Capsule())
+                    .overlay(Capsule().stroke(Color.cascadeAgent.opacity(0.28), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help(offer.detail)
+            }
 
             Button { model.showSettings = true } label: {
                 Image(systemName: "gearshape").font(.system(size: 13, weight: .semibold))

@@ -116,6 +116,18 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
+    public enum ProactiveMode: String, CaseIterable, Sendable {
+        case off
+        case quiet
+        case askFirst
+    }
+
+    public enum ProactiveAppControl: String, Sendable {
+        case neverSuggest
+        case onlyInCascade
+        case savedAgentsOnly
+    }
+
     @Published public var selectedTab: Tab = .reel
     @Published public var showSettings = false
     /// First-run setup: permissions + keys, shown once over everything until
@@ -132,6 +144,26 @@ public final class CascadeAppModel: ObservableObject {
         didSet { Self.persist(dismissedNextActionOfferKeys, key: Self.dismissedNextActionOffersKey, defaults: defaultsStore) }
     }
     static let dismissedNextActionOffersKey = "cascade.dismissedNextActionOffers"
+    @Published private var snoozedProactiveOfferKeys: Set<String> {
+        didSet { Self.persist(snoozedProactiveOfferKeys, key: Self.snoozedProactiveOffersKey, defaults: defaultsStore) }
+    }
+    static let snoozedProactiveOffersKey = "cascade.snoozedProactiveOffers"
+    @Published private var alwaysOfferProactiveKeys: Set<String> {
+        didSet { Self.persist(alwaysOfferProactiveKeys, key: Self.alwaysOfferProactiveKey, defaults: defaultsStore) }
+    }
+    static let alwaysOfferProactiveKey = "cascade.alwaysOfferProactive"
+    @Published private var neverSuggestApps: Set<String> {
+        didSet { Self.persist(neverSuggestApps, key: Self.neverSuggestAppsKey, defaults: defaultsStore) }
+    }
+    static let neverSuggestAppsKey = "cascade.proactive.neverSuggestApps"
+    @Published private var onlyInCascadeApps: Set<String> {
+        didSet { Self.persist(onlyInCascadeApps, key: Self.onlyInCascadeAppsKey, defaults: defaultsStore) }
+    }
+    static let onlyInCascadeAppsKey = "cascade.proactive.onlyInCascadeApps"
+    @Published private var savedAgentsOnlyApps: Set<String> {
+        didSet { Self.persist(savedAgentsOnlyApps, key: Self.savedAgentsOnlyAppsKey, defaults: defaultsStore) }
+    }
+    static let savedAgentsOnlyAppsKey = "cascade.proactive.savedAgentsOnlyApps"
     @Published private var dismissedLearningOpportunityKeys: Set<String> {
         didSet { Self.persist(dismissedLearningOpportunityKeys, key: Self.dismissedLearningOpportunitiesKey, defaults: defaultsStore) }
     }
@@ -168,6 +200,10 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var curatedWaste: [CuratedAgent] = []
     @Published public private(set) var learningOpportunities: [LearningOpportunity] = []
     @Published public private(set) var proactiveNextActionOffer: NextActionPredictor.Prediction?
+    @Published public private(set) var proactiveOffer: ProactiveOffer?
+    @Published public var proactiveMode: ProactiveMode {
+        didSet { defaultsStore.set(proactiveMode.rawValue, forKey: Self.proactiveModeKey) }
+    }
     @Published public private(set) var agents: [CascadeAgent] = []
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
     @Published public private(set) var conversation: [QATurn] = []
@@ -249,6 +285,7 @@ public final class CascadeAppModel: ObservableObject {
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
     static let valueMonthlyActionBudgetKey = "cascade.value.monthlyActionBudget"
     static let valueMonthlyCostCentsBudgetKey = "cascade.value.monthlyCostCentsBudget"
+    static let proactiveModeKey = "cascade.proactive.mode"
 
     static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
         defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
@@ -439,8 +476,15 @@ public final class CascadeAppModel: ObservableObject {
         // stale `cascade.cuEffort = "low"` a prior build's picker may have persisted.
         cuEffort = "medium"
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
+        proactiveMode = defaults.string(forKey: Self.proactiveModeKey)
+            .flatMap(ProactiveMode.init(rawValue:)) ?? .askFirst
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         dismissedNextActionOfferKeys = Self.restoreSet(key: Self.dismissedNextActionOffersKey, defaults: defaults)
+        snoozedProactiveOfferKeys = Self.restoreSet(key: Self.snoozedProactiveOffersKey, defaults: defaults)
+        alwaysOfferProactiveKeys = Self.restoreSet(key: Self.alwaysOfferProactiveKey, defaults: defaults)
+        neverSuggestApps = Self.restoreSet(key: Self.neverSuggestAppsKey, defaults: defaults)
+        onlyInCascadeApps = Self.restoreSet(key: Self.onlyInCascadeAppsKey, defaults: defaults)
+        savedAgentsOnlyApps = Self.restoreSet(key: Self.savedAgentsOnlyAppsKey, defaults: defaults)
         dismissedLearningOpportunityKeys = Self.restoreSet(key: Self.dismissedLearningOpportunitiesKey, defaults: defaults)
         showOnboarding = !defaults.bool(forKey: Self.onboardedKey)
         recorder = ContextRecorder(
@@ -572,10 +616,11 @@ public final class CascadeAppModel: ObservableObject {
             } else {
                 detectedWaste = rawDetectedWaste
                 // Only genuinely repeated, time-saving workflows (the automatable filter)
-                // reach the curator and the manager's review queue.
-	                curatedWaste = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0) })
-	                proactiveNextActionOffer = nil
-	            }
+	                // reach the curator and the manager's review queue.
+		                curatedWaste = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0) })
+		                proactiveNextActionOffer = nil
+		                proactiveOffer = nil
+		            }
 	            await refreshLearningOpportunities(from: detectedWaste)
 	            statusLine = recorder.status.message
         } catch {
@@ -5248,39 +5293,11 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public nonisolated static func nextActionTokens(for events: [InputEvent]) -> [String] {
-        events.map(nextActionToken)
+        NextActionPredictor.tokens(for: events, webAppIdentity: Self.webAppIdentity)
     }
 
     public nonisolated static func nextActionToken(for event: InputEvent) -> String {
-        let app = event.appName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let appKey = app.isEmpty ? "unknown" : app
-        switch event.kind {
-        case .key:
-            let modifiers = event.modifiers.sorted().joined(separator: "+")
-            let key = event.key ?? "unknown"
-            return modifiers.isEmpty ? "key:\(key)@\(appKey)" : "key:\(modifiers)+\(key)@\(appKey)"
-        case .type:
-            return "type@\(appKey)"
-        case .click, .doubleClick, .rightClick:
-            let label = nextActionClickLabel(for: event)
-            return "\(event.kind.rawValue):\(label)@\(appKey)"
-        case .scroll:
-            return "scroll@\(appKey)"
-        }
-    }
-
-    private nonisolated static func nextActionClickLabel(for event: InputEvent) -> String {
-        if let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
-            return text
-        }
-        if let label = AXTargetDescriptorV2.decode(event.targetDescriptor)?.label.trimmingCharacters(in: .whitespacesAndNewlines),
-           !label.isEmpty {
-            return label
-        }
-        if let descriptor = event.targetDescriptor?.trimmingCharacters(in: .whitespacesAndNewlines), !descriptor.isEmpty {
-            return descriptor
-        }
-        return "unlabeled"
+        NextActionPredictor.token(for: event, webAppIdentity: Self.webAppIdentity)
     }
 
     public nonisolated static func userIsActivelyTyping(events: [InputEvent], now: Date, window: TimeInterval = 6) -> Bool {
@@ -5296,34 +5313,447 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func dismissProactiveNextActionOffer() {
-        guard let offer = proactiveNextActionOffer else { return }
-        dismissedNextActionOfferKeys.insert(Self.nextActionOfferDismissalKey(for: offer.token))
+        guard proactiveNextActionOffer != nil || proactiveOffer != nil else { return }
+        let signature = proactiveOffer?.signature
+            ?? proactiveNextActionOffer.map { "next-action:\($0.token)" }
+            ?? "unknown"
+        dismissedNextActionOfferKeys.insert(Self.nextActionOfferDismissalKey(for: signature))
         proactiveNextActionOffer = nil
+        proactiveOffer = nil
         recentNextActionDismissals += 1
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "proactive.dismiss",
+                detail: Self.proactiveDecisionAuditDetail(signature: signature, reason: "not_this")
+            ))
+        }
     }
 
     static func nextActionOfferDismissalKey(for token: String) -> String {
-        AuditIdentity.hash("next-action:\(token)")
+        let signaturePrefixes = ["next-action:", "agent:", "skill:", "repetition:", "struggle:", "rewind:", "background-web:"]
+        if signaturePrefixes.contains(where: { token.hasPrefix($0) }) {
+            return AuditIdentity.hash(token)
+        }
+        return AuditIdentity.hash("next-action:\(token)")
+    }
+
+    public func acceptProactiveOffer() {
+        guard let offer = proactiveOffer else { return }
+        proactiveNextActionOffer = nil
+        proactiveOffer = nil
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "proactive.accept",
+                detail: Self.proactiveOfferAuditDetail(offer, state: "accepted")
+            ))
+        }
+        switch offer.source {
+        case .savedAgent:
+            if let id = offer.relatedAgentID, let agent = agents.first(where: { $0.id == id }) {
+                deployAgent(agent)
+            }
+        case .appSkill:
+            selectedTab = .cascades
+            if let name = offer.skillName {
+                dock.show(title: "Skill ready", detail: "Use \(name) with the current app.")
+            }
+        case .rewindQuestion, .struggle:
+            beginUseDeviceIntent(source: "proactive")
+        case .backgroundWebAgent:
+            _ = createSandboxAgent(task: offer.task ?? offer.title)
+        case .liveRepetition:
+            selectedTab = .manager
+            if let start = offer.rangeStart, let end = offer.rangeEnd {
+                Task { [weak self] in
+                    guard let self else { return }
+                    if let curated = try? await self.orchestrator.curateRange(
+                        from: start,
+                        to: end,
+                        statedIntent: offer.detail,
+                        webAppIdentity: Self.webAppIdentity
+                    ) {
+                        if !self.taughtForReview.contains(where: { $0.signature == curated.signature }) {
+                            self.taughtForReview.insert(curated, at: 0)
+                        }
+                        self.dock.show(title: "Ready for review", detail: "Cascade prepared “\(curated.name)”.")
+                        _ = try? await self.store.appendAudit(AuditEvent(
+                            actor: "system",
+                            action: "proactive.offer",
+                            detail: Self.proactiveOfferAuditDetail(offer, state: "curated")
+                        ))
+                    }
+                }
+            }
+        case .nextAction:
+            dock.show(title: offer.title, detail: offer.detail)
+        }
+    }
+
+    public func snoozeProactiveOffer() {
+        guard let offer = proactiveOffer else { return }
+        snoozedProactiveOfferKeys.insert(Self.nextActionOfferDismissalKey(for: offer.signature))
+        proactiveNextActionOffer = nil
+        proactiveOffer = nil
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "proactive.snooze",
+                detail: Self.proactiveOfferAuditDetail(offer, state: "snoozed")
+            ))
+        }
+    }
+
+    public func alwaysOfferProactiveSuggestion() {
+        guard let offer = proactiveOffer else { return }
+        alwaysOfferProactiveKeys.insert(Self.nextActionOfferDismissalKey(for: offer.signature))
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "proactive.accept",
+                detail: Self.proactiveOfferAuditDetail(offer, state: "always_offer")
+            ))
+        }
+    }
+
+    public func setProactiveControl(_ control: ProactiveAppControl, enabled: Bool, appName: String) {
+        let key = Self.proactiveAppKey(appName)
+        switch control {
+        case .neverSuggest:
+            if enabled { neverSuggestApps.insert(key) } else { neverSuggestApps.remove(key) }
+        case .onlyInCascade:
+            if enabled { onlyInCascadeApps.insert(key) } else { onlyInCascadeApps.remove(key) }
+        case .savedAgentsOnly:
+            if enabled { savedAgentsOnlyApps.insert(key) } else { savedAgentsOnlyApps.remove(key) }
+        }
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "proactive.snooze",
+                detail: "scope=app control=\(Self.safeAuditToken(control.rawValue)) appKey=\(Self.safeAuditToken(key)) enabled=\(enabled)"
+            ))
+        }
     }
 
     private func refreshProactiveNextActionOffer(now: Date) async {
-        let events = ((try? await store.recentInputEvents(limit: 80)) ?? []).reversed()
-        let orderedEvents = Array(events)
-        let secondsSinceLastOffer = lastNextActionOfferAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-        let offer = NextActionPredictor().proactiveOffer(
-            history: Self.nextActionTokens(for: orderedEvents),
-            secondsSinceLastOffer: secondsSinceLastOffer,
-            recentDismissals: recentNextActionDismissals,
-            userIsActivelyTyping: Self.userIsActivelyTyping(events: orderedEvents, now: now)
-        )
-        if let offer, dismissedNextActionOfferKeys.contains(Self.nextActionOfferDismissalKey(for: offer.token)) {
+        guard proactiveMode != .off else {
             proactiveNextActionOffer = nil
+            proactiveOffer = nil
             return
         }
-        proactiveNextActionOffer = offer
-        if offer != nil {
-            lastNextActionOfferAt = now
+        let events = ((try? await store.recentInputEvents(limit: 160)) ?? []).reversed()
+        let orderedEvents = Array(events)
+        let activeEvent = orderedEvents.last
+        let activeContext = contexts.first
+        let activeAppKey = Self.proactiveAppKey(activeEvent?.appName ?? activeContext?.appName ?? "")
+        if neverSuggestApps.contains(activeAppKey)
+            || (onlyInCascadeApps.contains(activeAppKey) && selectedTab == .reel) {
+            await appendProactiveSuppression(reason: "control.app", signature: activeAppKey)
+            proactiveNextActionOffer = nil
+            proactiveOffer = nil
+            return
         }
+        let secondsSinceLastOffer = lastNextActionOfferAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let predictor = NextActionPredictor()
+        let prediction = predictor.predict(
+            events: orderedEvents,
+            webAppIdentity: Self.webAppIdentity,
+            activeContext: activeContext
+        )
+        let liveRepetition = LiveRepetitionDetector().detect(
+            events: orderedEvents,
+            webAppIdentity: Self.webAppIdentity,
+            now: activeEvent?.capturedAt ?? now
+        )
+        let struggle = StruggleDetector().detect(events: orderedEvents, contexts: contexts)
+        let selector = ProactiveHelpSelector()
+        let candidates = selector.candidates(
+            prediction: prediction,
+            liveRepetition: liveRepetition,
+            struggle: struggle,
+            recentEvents: orderedEvents,
+            agents: agents,
+            appSkills: appSkills,
+            preferenceModel: suggestionPreferenceModel(),
+            dismissedSignatures: dismissedNextActionOfferKeys,
+            browserWorkflowsAllowed: backgroundAgents.count < Self.maxConcurrentSandboxAgents,
+            webAppIdentity: Self.webAppIdentity
+        )
+        let filteredCandidates = savedAgentsOnlyApps.contains(activeAppKey)
+            ? candidates.filter { $0.kind == .savedAgent }
+            : candidates
+        guard var selectedOffer = filteredCandidates.first?.offer else {
+            proactiveNextActionOffer = nil
+            proactiveOffer = nil
+            return
+        }
+        if proactiveMode == .quiet, selectedOffer.level == .action {
+            selectedOffer = ProactiveOffer(
+                id: selectedOffer.id,
+                source: selectedOffer.source,
+                level: .passive,
+                title: selectedOffer.title,
+                detail: selectedOffer.detail,
+                actionTitle: selectedOffer.actionTitle,
+                signature: selectedOffer.signature,
+                confidence: selectedOffer.confidence,
+                score: selectedOffer.score,
+                evidence: selectedOffer.evidence,
+                prediction: selectedOffer.prediction,
+                relatedAgentID: selectedOffer.relatedAgentID,
+                skillName: selectedOffer.skillName,
+                task: selectedOffer.task,
+                rangeStart: selectedOffer.rangeStart,
+                rangeEnd: selectedOffer.rangeEnd
+            )
+        }
+        let signatureKey = Self.nextActionOfferDismissalKey(for: selectedOffer.signature)
+        let gateContext = InterruptibilityContext(
+            confidence: selectedOffer.confidence,
+            secondsSinceLastOffer: secondsSinceLastOffer,
+            recentDismissals: recentNextActionDismissals,
+            userIsActivelyTyping: Self.userIsActivelyTyping(events: orderedEvents, now: now),
+            isPrivacySensitive: Self.isPrivacySensitive(event: activeEvent, context: activeContext),
+            secureInputActive: startsSubsystems ? SecureInputGuard.isActive() : false,
+            modifierHeavyKeySequence: Self.hasRecentModifierHeavySequence(events: orderedEvents, now: now),
+            draggingOrSelecting: Self.looksLikeDragOrSelection(events: orderedEvents, now: now),
+            agentRunning: agentRunning,
+            assistTaskRunning: assistTaskRunning,
+            stopRequested: driver.runState.isStopRequested,
+            permissionsHealthy: !startsSubsystems || (permissionDiagnostics.screenRecording && permissionDiagnostics.accessibility && permissionDiagnostics.inputMonitoring),
+            noisySurface: Self.isNoisySurface(event: activeEvent, context: activeContext),
+            meetingOrFullscreenOrPrivateSurface: Self.isPrivateOrMeetingSurface(event: activeEvent, context: activeContext),
+            perAppSnoozed: false,
+            perSignatureSnoozed: snoozedProactiveOfferKeys.contains(signatureKey),
+            recentlyDismissedSignature: dismissedNextActionOfferKeys.contains(signatureKey),
+            boundary: Self.interruptibilityBoundary(events: orderedEvents, now: now),
+            repeatedNoEffectOrErrorPlateau: struggle?.kind == .repeatedClick || struggle?.kind == .repeatedError,
+            requiresBoundary: startsSubsystems && !alwaysOfferProactiveKeys.contains(signatureKey)
+        )
+        let decision = InterruptibilityGate().decide(gateContext)
+        await appendProactiveSignal(
+            prediction: prediction,
+            liveRepetition: liveRepetition,
+            struggle: struggle,
+            selectedOffer: selectedOffer,
+            decision: decision,
+            activeEvent: activeEvent,
+            activeContext: activeContext
+        )
+        guard decision == .offer else {
+            proactiveNextActionOffer = nil
+            proactiveOffer = nil
+            return
+        }
+        proactiveNextActionOffer = selectedOffer.prediction ?? prediction
+        proactiveOffer = selectedOffer
+        lastNextActionOfferAt = now
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "system",
+            action: "proactive.offer",
+            detail: Self.proactiveOfferAuditDetail(selectedOffer, state: "shown")
+        ))
+        if selectedOffer.level >= .passive {
+            dock.show(title: selectedOffer.title, detail: selectedOffer.detail)
+        }
+    }
+
+    private func appendProactiveSuppression(reason: String, signature: String) async {
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "system",
+            action: "proactive.signal",
+            detail: Self.proactiveSignalAuditDetail(
+                ProactiveSignal(
+                    kind: .suppression,
+                    reason: reason,
+                    confidence: 0,
+                    signature: signature,
+                    featureSummary: ["suppressed"]
+                )
+            )
+        ))
+    }
+
+    private func appendProactiveSignal(
+        prediction: NextActionPredictor.Prediction?,
+        liveRepetition: LiveRepetitionCandidate?,
+        struggle: StruggleSignal?,
+        selectedOffer: ProactiveOffer,
+        decision: InterruptibilityGate.Decision,
+        activeEvent: InputEvent?,
+        activeContext: RecordedContext?
+    ) async {
+        let reason: String
+        switch decision {
+        case .offer:
+            reason = "candidate.selected"
+        case .suppress(let code):
+            reason = code
+        }
+        let kind: ProactiveSignal.Kind
+        if selectedOffer.source == .liveRepetition {
+            kind = .repetition
+        } else if selectedOffer.source == .struggle || struggle != nil {
+            kind = .struggle
+        } else {
+            kind = .prediction
+        }
+        var features: [String] = []
+        if let prediction {
+            features.append("prediction=\(Self.safeAuditToken(prediction.humanLabel))")
+            features.append("evidence=\(prediction.evidenceCount)")
+        }
+        if let liveRepetition {
+            features.append("repeats=\(liveRepetition.occurrences)")
+            features.append("stage=\(Self.safeAuditToken(liveRepetition.stage.rawValue))")
+        }
+        if let struggle {
+            features.append("struggle=\(Self.safeAuditToken(struggle.kind.rawValue))")
+        }
+        let appName = activeEvent?.appName ?? activeContext?.appName
+        let window = activeEvent?.windowTitle ?? activeContext?.windowTitle
+        let signal = ProactiveSignal(
+            kind: kind,
+            reason: reason,
+            confidence: selectedOffer.confidence,
+            signature: selectedOffer.signature,
+            featureSummary: features,
+            appName: appName.map { Self.safeAuditToken($0) },
+            windowHash: window.map(Self.auditHash)
+        )
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "system",
+            action: "proactive.signal",
+            detail: Self.proactiveSignalAuditDetail(signal)
+        ))
+        if case .suppress = decision {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "system",
+                action: "proactive.offer",
+                detail: Self.proactiveOfferAuditDetail(selectedOffer, state: "suppressed") + " reason=\(Self.safeAuditToken(reason))"
+            ))
+        }
+    }
+
+    private nonisolated static func proactiveAppKey(_ appName: String) -> String {
+        let trimmed = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return AuditIdentity.safeToken(trimmed.isEmpty ? "unknown" : trimmed.lowercased())
+    }
+
+    private nonisolated static func isPrivacySensitive(event: InputEvent?, context: RecordedContext?) -> Bool {
+        if let event,
+           PrivacyRules.isSensitive(appName: event.appName, bundleIdentifier: event.bundleIdentifier, windowTitle: event.windowTitle) {
+            return true
+        }
+        if let context, PrivacyRules.isSensitive(context) {
+            return true
+        }
+        return false
+    }
+
+    private nonisolated static func isNoisySurface(event: InputEvent?, context: RecordedContext?) -> Bool {
+        if let event, WasteDetector.isNoisySurface(appName: event.appName, bundleIdentifier: event.bundleIdentifier) {
+            return true
+        }
+        if let context, WasteDetector.isNoisySurface(appName: context.appName, bundleIdentifier: context.bundleIdentifier) {
+            return true
+        }
+        return false
+    }
+
+    private nonisolated static func isPrivateOrMeetingSurface(event: InputEvent?, context: RecordedContext?) -> Bool {
+        let text = [
+            event?.appName, event?.bundleIdentifier, event?.windowTitle,
+            context?.appName, context?.bundleIdentifier, context?.windowTitle
+        ]
+            .compactMap { $0?.lowercased() }
+            .joined(separator: " ")
+        guard !text.isEmpty else { return false }
+        let markers = ["zoom", "meet", "teams", "webex", "fullscreen", "full screen", "private browsing", "incognito", "password", "1password", "keychain"]
+        return markers.contains { text.contains($0) }
+    }
+
+    private nonisolated static func hasRecentModifierHeavySequence(events: [InputEvent], now: Date, window: TimeInterval = 4) -> Bool {
+        let recentKeys = events.suffix(6).filter { event in
+            event.kind == .key && now.timeIntervalSince(event.capturedAt) <= window
+        }
+        guard recentKeys.count >= 2 else { return false }
+        return recentKeys.allSatisfy { event in
+            let modifiers = Set(event.modifiers.map { $0.lowercased() })
+            return !modifiers.isDisjoint(with: ["command", "control", "option"])
+        }
+    }
+
+    private nonisolated static func looksLikeDragOrSelection(events: [InputEvent], now: Date, window: TimeInterval = 4) -> Bool {
+        let recent = events.suffix(8).filter { now.timeIntervalSince($0.capturedAt) <= window }
+        guard recent.count >= 3 else { return false }
+        let clicks = recent.filter { [.click, .doubleClick, .rightClick].contains($0.kind) }
+        let shiftKeys = recent.filter { $0.modifiers.map { $0.lowercased() }.contains("shift") }
+        if clicks.count >= 3 {
+            let points = Set(clicks.map { "\(Int(($0.x ?? 0) / 10)):\(Int(($0.y ?? 0) / 10))" })
+            return points.count >= 3
+        }
+        return shiftKeys.count >= 2
+    }
+
+    private nonisolated static func interruptibilityBoundary(events: [InputEvent], now: Date) -> InterruptibilityContext.Boundary? {
+        guard let last = events.last else { return .userOpenedCascade }
+        let age = now.timeIntervalSince(last.capturedAt)
+        if age >= 2.0 && age <= 20.0 { return .idleAfterAction }
+        if isCompletionControl(last) { return .completionControl }
+        guard events.count >= 2 else { return nil }
+        let previous = events[events.count - 2]
+        if previous.appName != last.appName || previous.windowTitle != last.windowTitle {
+            return .appOrWindowSwitch
+        }
+        return nil
+    }
+
+    private nonisolated static func isCompletionControl(_ event: InputEvent) -> Bool {
+        if event.kind == .key {
+            let key = event.key?.lowercased()
+            let modifiers = Set(event.modifiers.map { $0.lowercased() })
+            return (key == "s" && modifiers.contains("command"))
+                || (key == "return" && (modifiers.contains("command") || modifiers.contains("control")))
+        }
+        guard [.click, .doubleClick, .rightClick].contains(event.kind) else { return false }
+        let label = WasteDetector.normalizedActionLabel(event.text)
+        let controls: Set<String> = ["apply", "archive", "complete", "done", "download", "export", "finish", "ok", "publish", "save", "send", "submit"]
+        return controls.contains(label)
+            || controls.contains { label.hasPrefix("\($0) ") }
+    }
+
+    private nonisolated static func proactiveSignalAuditDetail(_ signal: ProactiveSignal) -> String {
+        var parts = [
+            "kind=\(safeAuditToken(signal.kind.rawValue))",
+            "reason=\(safeAuditToken(signal.reason))",
+            String(format: "confidence=%.2f", signal.confidence),
+            "signatureHash=\(auditHash(signal.signature))",
+            "featuresHash=\(auditHash(signal.featureSummary.joined(separator: "|")))"
+        ]
+        if let appName = signal.appName { parts.append("app=\(safeAuditToken(appName))") }
+        if let windowHash = signal.windowHash { parts.append("windowHash=\(safeAuditToken(windowHash))") }
+        return parts.joined(separator: " ")
+    }
+
+    private nonisolated static func proactiveOfferAuditDetail(_ offer: ProactiveOffer, state: String) -> String {
+        var parts = [
+            "state=\(safeAuditToken(state))",
+            "source=\(safeAuditToken(offer.source.rawValue))",
+            "level=\(offer.level.rawValue)",
+            String(format: "confidence=%.2f", offer.confidence),
+            String(format: "score=%.3f", offer.score),
+            "signatureHash=\(auditHash(offer.signature))",
+            "evidenceHash=\(auditHash(offer.evidence.joined(separator: "|")))"
+        ]
+        if let id = offer.relatedAgentID { parts.append("agentID=\(id)") }
+        if let skillName = offer.skillName { parts.append(textAuditDetail("skill", skillName)) }
+        return parts.joined(separator: " ")
+    }
+
+    private nonisolated static func proactiveDecisionAuditDetail(signature: String, reason: String) -> String {
+        "signatureHash=\(auditHash(signature)) reason=\(safeAuditToken(reason))"
     }
 
     /// The curated proposals still awaiting review — the review surface's source of

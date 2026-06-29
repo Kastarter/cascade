@@ -1,5 +1,6 @@
 import AgentOrchestrator
 import CascadeMemory
+import ComputerUseKit
 import Foundation
 import ProviderKit
 import SandboxKit
@@ -85,6 +86,17 @@ private func waitForRanking(_ condition: () -> Bool, maxTries: Int = 500) async 
     }
 }
 
+@MainActor
+private func waitForAuditAction(_ action: String, in store: CascadeStore, maxTries: Int = 500) async throws {
+    var tries = 0
+    while tries < maxTries {
+        let audit = (try? await store.recentAudit(limit: 40)) ?? []
+        if audit.contains(where: { $0.action == action }) { return }
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+}
+
 @MainActor @Test
 func explicitOptOutRefreshPreservesCuratedOrderAndDisablesProactiveOffer() async throws {
     let (model, store, defaults) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
@@ -130,7 +142,8 @@ func defaultRefreshSurfacesDismissibleProactiveNextActionOffer() async throws {
 
     await model.refreshAll()
     let offer = try #require(model.proactiveNextActionOffer)
-    let suppressionKey = CascadeAppModel.nextActionOfferDismissalKey(for: offer.token)
+    let selectedSignature = model.proactiveOffer?.signature ?? offer.token
+    let suppressionKey = CascadeAppModel.nextActionOfferDismissalKey(for: selectedSignature)
 
     #expect(defaults.stringArray(forKey: CascadeAppModel.dismissedNextActionOffersKey)?.contains(suppressionKey) != true)
 
@@ -138,6 +151,7 @@ func defaultRefreshSurfacesDismissibleProactiveNextActionOffer() async throws {
 
     #expect(model.proactiveNextActionOffer == nil)
     #expect(defaults.stringArray(forKey: CascadeAppModel.dismissedNextActionOffersKey)?.contains(suppressionKey) == true)
+    try await waitForAuditAction("proactive.dismiss", in: store)
 }
 
 @MainActor @Test
@@ -153,4 +167,80 @@ func defaultProactiveNextActionOfferUsesDescriptorHumanLabel() async throws {
     #expect(!offer.token.contains(fixture.descriptor))
     #expect(!offer.token.contains("schemaVersion"))
     #expect(!offer.token.contains("{"))
+}
+
+@Test
+func proactiveHelpSelectorRanksSavedAgentPrefixBeforeGenericNextAction() {
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(order: 0, kind: .click, text: "Refund", appName: "Safari"),
+        RecipeStep(order: 1, kind: .key, key: "a", modifiers: ["command"], appName: "Safari"),
+        RecipeStep(order: 2, kind: .click, text: "Send", appName: "Safari"),
+    ])
+    let agent = CascadeAgent(
+        id: 42,
+        name: "Refund reply",
+        source: .detected,
+        signature: "refund-reply",
+        recipe: recipe,
+        apps: ["Safari"],
+        estimatedSeconds: 90,
+        estimatedSecondsPerRun: 45,
+        evidenceCount: 3
+    )
+    let recent = [
+        InputEvent(id: 1, capturedAt: rankingBase, kind: .click, text: "Refund", appName: "Safari"),
+        InputEvent(id: 2, capturedAt: rankingBase.addingTimeInterval(1), kind: .key, key: "a", modifiers: ["command"], appName: "Safari"),
+    ]
+    let prediction = NextActionPredictor.Prediction(token: "click:Send@Safari", confidence: 0.92, support: 3)
+
+    var preference = PreferenceModel()
+    preference.record(agent.signature, accepted: true)
+    let candidates = ProactiveHelpSelector().candidates(
+        prediction: prediction,
+        liveRepetition: nil,
+        struggle: nil,
+        recentEvents: recent,
+        agents: [agent],
+        appSkills: AppSkillRegistry(),
+        preferenceModel: preference
+    )
+
+    #expect(candidates.first?.kind == .savedAgent)
+    #expect(candidates.contains { $0.kind == .nextAction })
+}
+
+@MainActor @Test
+func proactiveAcceptAndSnoozeWriteAuditRows() async throws {
+    let (acceptModel, acceptStore, _) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
+    try await acceptStore.insertInputEvents(rankingWorkflowEvents())
+    await acceptModel.refreshAll()
+    _ = try #require(acceptModel.proactiveOffer)
+
+    acceptModel.acceptProactiveOffer()
+    try await waitForAuditAction("proactive.accept", in: acceptStore)
+
+    let (snoozeModel, snoozeStore, defaults) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
+    try await snoozeStore.insertInputEvents(rankingWorkflowEvents())
+    await snoozeModel.refreshAll()
+    let offer = try #require(snoozeModel.proactiveOffer)
+
+    snoozeModel.snoozeProactiveOffer()
+    try await waitForAuditAction("proactive.snooze", in: snoozeStore)
+
+    #expect(defaults.stringArray(forKey: CascadeAppModel.snoozedProactiveOffersKey)?.contains(CascadeAppModel.nextActionOfferDismissalKey(for: offer.signature)) == true)
+}
+
+@MainActor @Test
+func liveRepetitionAcceptUsesCurateRangeFallbackWindow() async throws {
+    let (model, store, _) = try makeRankingModel(curatorReply: "")
+    try await store.insertInputEvents(rankingWorkflowEvents())
+
+    await model.refreshAll()
+    let offer = try #require(model.proactiveOffer)
+    #expect(offer.source == .liveRepetition)
+
+    model.acceptProactiveOffer()
+    try await waitForRanking { !model.taughtForReview.isEmpty }
+
+    #expect(model.taughtForReview.first?.source.evidence.isEmpty == false)
 }

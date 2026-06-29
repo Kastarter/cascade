@@ -19,6 +19,120 @@ public struct ActionEpisode: Equatable, Sendable {
     public let boundaryReasons: [ActionEpisodeBoundaryReason]
 }
 
+public struct LiveRepetitionCandidate: Equatable, Sendable {
+    public enum Stage: String, Sendable, Equatable {
+        case quiet
+        case actionable
+    }
+
+    public let stage: Stage
+    public let signature: String
+    public let occurrences: Int
+    public let startAt: Date
+    public let endAt: Date
+    public let eventIDs: [Int64]
+    public let evidenceLabels: [String]
+
+    public init(
+        stage: Stage,
+        signature: String,
+        occurrences: Int,
+        startAt: Date,
+        endAt: Date,
+        eventIDs: [Int64],
+        evidenceLabels: [String]
+    ) {
+        self.stage = stage
+        self.signature = signature
+        self.occurrences = occurrences
+        self.startAt = startAt
+        self.endAt = endAt
+        self.eventIDs = eventIDs
+        self.evidenceLabels = evidenceLabels
+    }
+}
+
+public struct LiveRepetitionDetector: Sendable {
+    public let window: TimeInterval
+    public let quietThreshold: Int
+    public let actionableThreshold: Int
+    public let segmenter: ActionEpisodeSegmenter
+
+    public init(
+        window: TimeInterval = 15 * 60,
+        quietThreshold: Int = 2,
+        actionableThreshold: Int = 3,
+        segmenter: ActionEpisodeSegmenter = ActionEpisodeSegmenter(maxIdleGap: 180)
+    ) {
+        self.window = max(5 * 60, window)
+        self.quietThreshold = max(2, quietThreshold)
+        self.actionableThreshold = max(self.quietThreshold + 1, actionableThreshold)
+        self.segmenter = segmenter
+    }
+
+    public func detect(
+        events: [InputEvent],
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        now: Date? = nil
+    ) -> LiveRepetitionCandidate? {
+        let ordered = WasteDetector.collapsedActionEvents(events)
+            .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+            .filter { !WasteDetector.isNoisySurface(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier) }
+            .sorted {
+                if $0.capturedAt == $1.capturedAt { return $0.id < $1.id }
+                return $0.capturedAt < $1.capturedAt
+            }
+        guard let newest = now ?? ordered.last?.capturedAt else { return nil }
+        let recent = ordered.filter { newest.timeIntervalSince($0.capturedAt) <= window }
+        guard recent.count >= 4 else { return nil }
+        let eventsByID = Dictionary(recent.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let episodes = segmenter
+            .segment(recent, surface: webAppIdentity)
+            .map { episode in episode.eventIDs.compactMap { eventsByID[$0] } }
+            .filter { WasteDetector.isAutomatableActionInstance($0) }
+        guard episodes.count >= quietThreshold else { return nil }
+
+        var grouped: [String: [[InputEvent]]] = [:]
+        for episode in episodes {
+            let signature = Self.signature(for: episode, webAppIdentity: webAppIdentity)
+            guard !signature.isEmpty else { continue }
+            grouped[signature, default: []].append(episode)
+        }
+        guard let best = grouped.max(by: { lhs, rhs in
+            if lhs.value.count != rhs.value.count { return lhs.value.count < rhs.value.count }
+            let lEnd = lhs.value.last?.last?.capturedAt ?? .distantPast
+            let rEnd = rhs.value.last?.last?.capturedAt ?? .distantPast
+            if lEnd != rEnd { return lEnd < rEnd }
+            return lhs.key > rhs.key
+        }), best.value.count >= quietThreshold else { return nil }
+
+        let newestInstance = best.value.max { lhs, rhs in
+            (lhs.last?.capturedAt ?? .distantPast) < (rhs.last?.capturedAt ?? .distantPast)
+        } ?? best.value[best.value.count - 1]
+        guard let start = newestInstance.first?.capturedAt,
+              let end = newestInstance.last?.capturedAt else { return nil }
+        return LiveRepetitionCandidate(
+            stage: best.value.count >= actionableThreshold ? .actionable : .quiet,
+            signature: best.key,
+            occurrences: best.value.count,
+            startAt: start,
+            endAt: end,
+            eventIDs: newestInstance.map(\.id),
+            evidenceLabels: newestInstance.map(NextActionPredictor.humanLabel).prefix(3).map { $0 }
+        )
+    }
+
+    private static func signature(
+        for episode: [InputEvent],
+        webAppIdentity: (@Sendable (InputEvent) -> String?)?
+    ) -> String {
+        episode.map { event in
+            let surface = webAppIdentity?(event) ?? event.appName
+            return WasteDetector.actionToken(event, surface: surface)
+        }.joined(separator: "|")
+    }
+}
+
 /// Splits low-level input into task-shaped episodes before routine mining.
 /// Pure and deterministic: callers provide recorded events and an optional
 /// surface resolver, and the segmenter returns ordered episode metadata only.

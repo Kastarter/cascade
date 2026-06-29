@@ -1146,6 +1146,26 @@ public struct WasteDetector: Sendable {
     /// detector couldn't tell one routine from another in that app. The label is
     /// already recorded in `InputEvent.text`; an unlabeled click degrades to the old
     /// coarse `click@app` token.
+    public static func actionToken(_ event: InputEvent, surface: String) -> String {
+        token(event, surface: surface)
+    }
+
+    public static func normalizedActionLabel(_ text: String?) -> String {
+        normalizedLabel(text)
+    }
+
+    public static func isNoisySurface(appName: String, bundleIdentifier: String?) -> Bool {
+        isNoisyApp(appName: appName, bundleIdentifier: bundleIdentifier)
+    }
+
+    public static func isAutomatableActionInstance(_ instance: [InputEvent]) -> Bool {
+        isAutomatableInstance(instance)
+    }
+
+    public static func collapsedActionEvents(_ events: [InputEvent]) -> [InputEvent] {
+        collapsingScrollBursts(events)
+    }
+
     static func token(_ event: InputEvent, surface: String) -> String {
         switch event.kind {
         case .key:
