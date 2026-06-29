@@ -16,6 +16,25 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 
 ## Continuation log (latest first)
 
+### 2026-06-29 — session 3: ran SEQ-05/13/14/15, then hit usage limit
+- **Relaunched** the self-contained script as run `wf_844b5f93-b9d` (task `wqy88noyy`). It skipped the
+  already-committed SEQs and **committed + pushed SEQ-05, 13, 14, 15** (build-green each):
+  `9905f44` (seq-05), `a730e06` (seq-13), `ff2f6f4` (seq-14), `3e5b488` (seq-15). HEAD is now `3e5b488`,
+  in sync with `origin/feat/production-grade` (0/0).
+  - SEQ-14's Fix stage reported `pushed=false` (transient DNS failure resolving github.com) but SEQ-15's
+    push carried its commits to origin — nothing is local-only.
+  - Note for agents: in the managed sandbox plain `swift build` is blocked by sandbox-exec; the Fix
+    stage verified the gate with `swift build --disable-sandbox`. HEAD is still genuinely green.
+- **Hard stop at SEQ-16:** the inference gateway started returning `502 You've hit your usage limit …
+  try again at 10:58 AM`. SEQ-16 failed at the Audit stage; **SEQ-17→31 all failed at Plan.** No commits
+  past SEQ-15. **Remaining work: SEQ-16 → SEQ-31 (16 SEQs).**
+- **Cleanup done:** SEQ-16's Implement stage had left the tree dirty (audit_failed does NOT auto-revert).
+  Discarded those uncommitted edits with `git stash -u && git stash drop`. Tree is clean at `3e5b488`.
+- **Next:** after the limit resets (~10:58 AM 2026-06-29) re-launch the same script — it will skip
+  SEQ-01–15 via the Plan git-log pre-check and resume at SEQ-16. A one-shot relaunch was scheduled in
+  the Claude Code session for ~11:02 AM (fires only if that session stays open; otherwise re-launch
+  manually with `Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js" })`).
+
 ### 2026-06-29 — session 2: push-as-you-go + self-contained script
 - **Session 1 closed mid-SEQ-13.** The previous Claude Code process exited while working SEQ-13; its
   half-done working-tree edits were discarded (`git reset --hard HEAD`). Committed SEQs were intact.
@@ -36,9 +55,8 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 The workflow is **still running**. Committed so far on `feat/production-grade`:
 
 ```
-SEQ-01 02 03 04 06 07 08 09 10 11 12   ← committed (build-green)
-SEQ-05                                  ← NOT committed (skipped / no targets / reverted — see final report)
-SEQ-13…31                               ← pending / in progress
+SEQ-01 02 03 04 05 06 07 08 09 10 11 12 13 14 15   ← committed + pushed (build-green); HEAD = 3e5b488 (seq-15)
+SEQ-16…31                                          ← pending (blocked by usage limit at SEQ-16; resumes after reset)
 ```
 
 - HEAD advances as each SEQ lands (latest `feat(seq-NN …)` / docs commit); the commit gate guarantees
