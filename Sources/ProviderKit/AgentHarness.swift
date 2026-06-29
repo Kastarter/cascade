@@ -20,9 +20,45 @@ public enum HarnessCall: Sendable, Equatable {
     case searchFiles(query: String, folder: String?)
     case listFolder(path: String)
     case readFile(path: String)
+    case readFileSnippet(path: String, options: ReadFileOptions)
     case runCommand(String)
     case runAppleScript(String)
     case writeFile(path: String, content: String)
+
+    public struct ReadFileOptions: Sendable, Equatable {
+        public let query: String?
+        public let startLine: Int?
+        public let lineCount: Int?
+        public let maxChars: Int?
+
+        public init(query: String? = nil, startLine: Int? = nil, lineCount: Int? = nil, maxChars: Int? = nil) {
+            let trimmedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            self.query = trimmedQuery.isEmpty ? nil : trimmedQuery
+            self.startLine = startLine
+            self.lineCount = lineCount
+            self.maxChars = maxChars
+        }
+
+        var hasControls: Bool {
+            query != nil || startLine != nil || lineCount != nil || maxChars != nil
+        }
+
+        static func from(input: [String: Any]) -> ReadFileOptions {
+            ReadFileOptions(
+                query: input["query"] as? String,
+                startLine: Self.int(input["startLine"] ?? input["start_line"]),
+                lineCount: Self.int(input["lineCount"] ?? input["line_count"]),
+                maxChars: Self.int(input["maxChars"] ?? input["max_chars"])
+            )
+        }
+
+        private static func int(_ value: Any?) -> Int? {
+            if let value = value as? Int { return value }
+            if let value = value as? NSNumber { return value.intValue }
+            if let value = value as? String { return Int(value) }
+            return nil
+        }
+    }
 
     public init?(name: String, input: [String: Any]) {
         switch name {
@@ -31,7 +67,9 @@ public enum HarnessCall: Sendable, Equatable {
         case "list_folder":
             self = .listFolder(path: input["path"] as? String ?? "")
         case "read_file":
-            self = .readFile(path: input["path"] as? String ?? "")
+            let path = input["path"] as? String ?? ""
+            let options = ReadFileOptions.from(input: input)
+            self = options.hasControls ? .readFileSnippet(path: path, options: options) : .readFile(path: path)
         case "run_command":
             self = .runCommand(input["command"] as? String ?? "")
         case "run_applescript":
@@ -46,7 +84,7 @@ public enum HarnessCall: Sendable, Equatable {
     /// Tools in the power tier need the user's explicit Settings opt-in.
     public var isPower: Bool {
         switch self {
-        case .searchFiles, .listFolder, .readFile: false
+        case .searchFiles, .listFolder, .readFile, .readFileSnippet: false
         case .runCommand, .runAppleScript, .writeFile: true
         }
     }
@@ -55,7 +93,7 @@ public enum HarnessCall: Sendable, Equatable {
         switch self {
         case .searchFiles: "search_files"
         case .listFolder: "list_folder"
-        case .readFile: "read_file"
+        case .readFile, .readFileSnippet: "read_file"
         case .runCommand: "run_command"
         case .runAppleScript: "run_applescript"
         case .writeFile: "write_file"
@@ -72,6 +110,13 @@ public enum HarnessCall: Sendable, Equatable {
             fields.append("folderHash=\(folder.map(Self.hash) ?? "none")")
         case .listFolder(let path), .readFile(let path):
             fields.append("pathHash=\(Self.hash(path))")
+        case .readFileSnippet(let path, let options):
+            fields.append("pathHash=\(Self.hash(path))")
+            fields.append("scoped=true")
+            if let query = options.query { fields.append("queryHash=\(Self.hash(query))") }
+            if let startLine = options.startLine { fields.append("startLine=\(max(1, startLine))") }
+            if let lineCount = options.lineCount { fields.append("lineCount=\(max(1, lineCount))") }
+            if let maxChars = options.maxChars { fields.append("maxChars=\(max(1, maxChars))") }
         case .runCommand(let command):
             fields.append("commandHash=\(Self.hash(command))")
         case .runAppleScript(let script):
@@ -92,6 +137,12 @@ public enum HarnessCall: Sendable, Equatable {
             detail = folder.map { "\(query) in \($0)" } ?? query
         case .listFolder(let path), .readFile(let path):
             detail = path
+        case .readFileSnippet(let path, let options):
+            var parts = [path]
+            if let query = options.query { parts.append("query: \(query)") }
+            if let startLine = options.startLine { parts.append("start line: \(startLine)") }
+            if let lineCount = options.lineCount { parts.append("lines: \(lineCount)") }
+            detail = parts.joined(separator: " · ")
         case .runCommand(let command):
             detail = command
         case .runAppleScript(let script):
@@ -178,7 +229,9 @@ public enum AgentHarness {
         case .listFolder(let path):
             return listFolder(path: path)
         case .readFile(let path):
-            return readFile(path: path)
+            return readFile(path: path, options: nil)
+        case .readFileSnippet(let path, let options):
+            return readFile(path: path, options: options)
         case .runCommand(let command):
             return await runCommand(command)
         case .runAppleScript(let script):
@@ -250,7 +303,7 @@ public enum AgentHarness {
     /// door around the user's privacy rules.
     static let readCap = 24_000
 
-    private static func readFile(path: String) -> String {
+    private static func readFile(path: String, options: HarnessCall.ReadFileOptions?) -> String {
         let expanded = expand(path)
         if let reason = sensitivePathReason(expanded) { return reason }
         guard FileManager.default.fileExists(atPath: expanded) else { return "No such file: \(expanded)" }
@@ -263,13 +316,60 @@ public enum AgentHarness {
         if PrivacyRules.isSensitiveText(expanded) || PrivacyRules.isSensitiveText(text) {
             return privacyRefusal("file")
         }
-        let content = text.count > readCap
-            ? String(text.prefix(readCap)) + "\n…[truncated — \(data.count) bytes total]"
-            : text
-        // File content is untrusted external text. If it looks like it carries
-        // instructions for the agent, spotlight it so the model treats it as data,
-        // not commands (indirect prompt-injection defense — SEQ-12).
-        return InjectionGuard.guardedUntrusted(content, source: "file \(expanded)")
+        let scoped = scopedFileContent(text, options: options)
+        let cap = max(256, min(options?.maxChars ?? readCap, readCap))
+        let content = scoped.count > cap
+            ? String(scoped.prefix(cap)) + "\n...[truncated - \(data.count) bytes total]"
+            : scoped
+        return InjectionGuard.renderEnvelope(
+            trust: .untrustedFile,
+            source: canonicalize(expanded),
+            acquiredByTool: "read_file",
+            payload: content
+        )
+    }
+
+    private static func scopedFileContent(_ text: String, options: HarnessCall.ReadFileOptions?) -> String {
+        guard let options, options.hasControls else { return text }
+        let allLines = text.components(separatedBy: .newlines)
+        var selected: [(lineNumber: Int, text: String)]
+        if let startLine = options.startLine {
+            let start = max(1, startLine) - 1
+            let count = max(1, min(options.lineCount ?? 120, 500))
+            selected = Array(allLines.enumerated().dropFirst(start).prefix(count))
+                .map { (lineNumber: $0.offset + 1, text: $0.element) }
+        } else {
+            selected = allLines.enumerated().map { (lineNumber: $0.offset + 1, text: $0.element) }
+        }
+        if let query = options.query {
+            let tokens = queryTokens(query)
+            if !tokens.isEmpty {
+                let matches = selected.enumerated().filter { _, line in
+                    let normalized = InjectionGuard.normalizedForDetection(line.text)
+                    return tokens.allSatisfy { normalized.contains($0) }
+                }
+                if !matches.isEmpty {
+                    var keep = Set<Int>()
+                    for (index, _) in matches {
+                        for offset in -2...2 {
+                            let candidate = index + offset
+                            if selected.indices.contains(candidate) { keep.insert(candidate) }
+                        }
+                    }
+                    selected = keep.sorted().map { selected[$0] }
+                }
+            }
+        }
+        let rendered = selected.map { line in
+            "\(line.lineNumber): \(line.text)"
+        }.joined(separator: "\n")
+        return rendered.isEmpty ? "(no matching text in requested snippet)" : rendered
+    }
+
+    private static func queryTokens(_ query: String) -> [String] {
+        InjectionGuard.normalizedForDetection(query)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
     }
 
     // MARK: - Power tier

@@ -20,12 +20,25 @@ public final class AssistMemory {
         /// instead of archived — a stale "I lost sight of the screen" from
         /// yesterday must never poison future calls.
         public let ok: Bool
+        /// Conversation history helps resolve references but is not a fresh
+        /// authorization channel for power or irreversible actions.
+        public let provenance: ContentTrust
+        public let safeForControl: Bool
 
-        public init(user: String, assistant: String, at: Date = Date(), ok: Bool = true) {
+        public init(
+            user: String,
+            assistant: String,
+            at: Date = Date(),
+            ok: Bool = true,
+            provenance: ContentTrust = .trustedUserInstruction,
+            safeForControl: Bool = false
+        ) {
             self.user = user
             self.assistant = assistant
             self.at = at
             self.ok = ok
+            self.provenance = provenance
+            self.safeForControl = safeForControl
         }
     }
 
@@ -70,11 +83,25 @@ public final class AssistMemory {
     /// Records one finished exchange. Older successful turns beyond the active
     /// window are folded into the compacted archive (persisted); failed turns
     /// (`ok: false`) age out of the window and disappear.
-    public func remember(user: String, assistant: String, at: Date = Date(), ok: Bool = true) {
+    public func remember(
+        user: String,
+        assistant: String,
+        at: Date = Date(),
+        ok: Bool = true,
+        provenance: ContentTrust = .trustedUserInstruction,
+        safeForControl: Bool = false
+    ) {
         let u = Self.capped(user, at: Self.userCharacterLimit)
         let a = Self.capped(assistant, at: Self.assistantCharacterLimit)
         guard !u.isEmpty else { return }
-        turns.append(Turn(user: u, assistant: a.isEmpty ? "(no reply)" : a, at: at, ok: ok))
+        turns.append(Turn(
+            user: u,
+            assistant: a.isEmpty ? "(no reply)" : a,
+            at: at,
+            ok: ok,
+            provenance: provenance,
+            safeForControl: safeForControl
+        ))
         compactIfNeeded()
     }
 
@@ -138,7 +165,9 @@ public final class AssistMemory {
         guard !archived.isEmpty else { return }
 
         let chunk = archived
-            .map { "User: \(Self.snippet($0.user))\nCascade: \(Self.snippet($0.assistant))" }
+            .map {
+                "User: \(Self.snippet($0.user))\nCascade: \(Self.snippet($0.assistant))\nContext provenance: \($0.provenance.rawValue); safeForControl=false"
+            }
             .joined(separator: "\n")
         let merged = [compactedArchive, chunk].compactMap { $0 }.joined(separator: "\n")
         compactedArchive = String(merged.suffix(Self.archiveCharacterLimit))

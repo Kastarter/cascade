@@ -70,7 +70,9 @@ func readOnlyToolsWorkWithoutTheToggle() async throws {
     let listing = await AgentHarness.perform(.listFolder(path: dir), powerEnabled: false)
     #expect(listing.contains("note.txt"))
     let content = await AgentHarness.perform(.readFile(path: dir + "/note.txt"), powerEnabled: false)
-    #expect(content == "hello cascade")
+    let envelope = try observationEnvelope(from: content)
+    #expect(envelope.trust == .untrustedFile)
+    #expect(envelope.payload == "hello cascade")
 }
 
 // MARK: - run_command / run_applescript (power on)
@@ -125,6 +127,25 @@ func readFileTruncatesHugeFiles() async throws {
 }
 
 @Test
+func readFileSupportsScopedSnippets() async throws {
+    let dir = try tempDir()
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let path = dir + "/notes.txt"
+    try (1...12).map { "line \($0) \(($0 == 8) ? "needle" : "ordinary")" }
+        .joined(separator: "\n")
+        .write(toFile: path, atomically: true, encoding: .utf8)
+
+    let result = await AgentHarness.perform(
+        .readFileSnippet(path: path, options: .init(query: "needle", startLine: nil, lineCount: nil, maxChars: 500)),
+        powerEnabled: false
+    )
+    let envelope = try observationEnvelope(from: result)
+    #expect(envelope.trust == .untrustedFile)
+    #expect(envelope.payload.contains("8: line 8 needle"))
+    #expect(!envelope.payload.contains("1: line 1"))
+}
+
+@Test
 func readFileRefusesSensitiveContent() async throws {
     let dir = try tempDir()
     defer { try? FileManager.default.removeItem(atPath: dir) }
@@ -132,6 +153,12 @@ func readFileRefusesSensitiveContent() async throws {
     let result = await AgentHarness.perform(.readFile(path: dir + "/secrets.txt"), powerEnabled: false)
     #expect(result.contains("privacy"))
     #expect(!result.contains("hunter2"))
+}
+
+private func observationEnvelope(from rendered: String) throws -> ObservationEnvelope {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try decoder.decode(ObservationEnvelope.self, from: Data(rendered.utf8))
 }
 
 @Test

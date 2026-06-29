@@ -151,6 +151,27 @@ func backgroundWebAuditDescriptorsNeverPersistSandboxRawValues() {
     }
 }
 
+@Test
+func backgroundWebObservationAuditDescriptorIsHashOnly() {
+    let info = InjectionGuard.EnvelopeAuditInfo(
+        trust: .untrustedWebDOM,
+        source: "https://example.invalid/private?token=secret",
+        acquiredByTool: "read_page",
+        injectionScore: 6,
+        injectionReasons: ["instruction_override", "direct_tool_name"],
+        payloadHash: "abc123"
+    )
+    let detail = BackgroundWebAgent.observationAuditDescriptor(tool: "read_page", info: info)
+
+    #expect(detail.contains("tool=read_page"))
+    #expect(detail.contains("trust=untrustedWebDOM"))
+    #expect(detail.contains("sourceHash="))
+    #expect(detail.contains("payloadHash=abc123"))
+    #expect(detail.contains("score=6"))
+    #expect(!detail.contains("secret"))
+    #expect(!detail.contains("example.invalid/private"))
+}
+
 // MARK: - Efficiency parity: state-change classification gates both circuit-breakers
 
 @Test

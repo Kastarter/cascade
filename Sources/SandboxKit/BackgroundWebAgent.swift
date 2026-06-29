@@ -117,6 +117,13 @@ public final class BackgroundWebAgent {
         onAudit?(action, Self.taggedDetail(tag: auditTag, detail))
     }
 
+    private func auditObservationResultIfNeeded(tool: String, result: String) {
+        guard let info = InjectionGuard.envelopeAuditInfo(from: result) else { return }
+        guard info.injectionScore > 0 else { return }
+        audit("trust.untrusted_seen", Self.observationAuditDescriptor(tool: tool, info: info))
+        audit("injection.suspected", Self.observationAuditDescriptor(tool: tool, info: info))
+    }
+
     /// Prefixes `detail` with the run tag (pure, so the format is unit-tested).
     nonisolated static func taggedDetail(tag: String, _ detail: String) -> String {
         tag.isEmpty ? detail : "[\(tag)] \(detail)"
@@ -359,19 +366,21 @@ public final class BackgroundWebAgent {
         // no-effect. Incremented in the sink/harness/leftover sites, read + reset
         // once per loop iteration.
         var turnStateChanges = 0
+        let webPolicy = WebHarnessPolicyContext(originalTask: originalTask, subtask: sub.task)
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
-            harnessProvider: { [weak self, sandbox] name, input in
+            harnessProvider: { [weak self, sandbox, webPolicy] name, input in
                 // Using any tool IS acting (reading/clicking/filling) — not the model
                 // narrating instead of working, so it must clear the firmer-retry guard.
                 acted = true
                 if name == "click_text" || name == "fill_field" { turnStateChanges += 1 }
-                let result = await WebHarness.run(name, input, sandbox: sandbox)
+                let result = await WebHarness.run(name, input, sandbox: sandbox, policyContext: webPolicy)
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
                 if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
                 self?.audit("sandbox.tool", Self.sandboxToolAuditDescriptor(name: name, input: input, result: result))
+                self?.auditObservationResultIfNeeded(tool: name, result: result)
                 return result
             },
             extraTools: WebHarness.toolDefinitions()
@@ -572,6 +581,7 @@ public final class BackgroundWebAgent {
         // DOM-first grounder (UI-TARS snapshot fallback only if an OpenRouter key is
         // set). Scout pulls web skills the same way the Claude path does.
         let grounder = WebDOMGrounder(sandbox: sandbox, fallback: Self.snapshotFallbackGrounder())
+        let webPolicy = WebHarnessPolicyContext(originalTask: originalTask, subtask: sub.task)
         // The on-screen harness (file/shell + recall), wrapped with this run's STOP
         // gate + tagged audit so a background file/shell/recall call is supervised
         // exactly like a click. The owner's closure is pure execution.
@@ -611,7 +621,7 @@ public final class BackgroundWebAgent {
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height),
-            note: await scoutWebContext()
+            note: await scoutWebContext(policyContext: webPolicy)
         )
 
         let maxSteps = 80
@@ -726,7 +736,7 @@ public final class BackgroundWebAgent {
             // Proactive context (the web Set-of-Marks push): the page text + the
             // clickable/fillable elements, every turn, so the weak planner names
             // targets that exist and the DOM grounder hits them.
-            let note = [steerNote, nudge, await scoutWebContext()].compactMap { $0 }.joined(separator: "\n\n")
+            let note = [steerNote, nudge, await scoutWebContext(policyContext: webPolicy)].compactMap { $0 }.joined(separator: "\n\n")
             step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
             count += 1
         }
@@ -735,11 +745,13 @@ public final class BackgroundWebAgent {
 
     /// The page's text + clickable/fillable elements, pushed to Scout each turn
     /// (the web analog of the on-screen AX-label push) so it names real targets.
-    private func scoutWebContext() async -> String? {
-        let page = await sandbox.readPageText()
-        let interactives = await sandbox.listInteractives()
+    private func scoutWebContext(policyContext: WebHarnessPolicyContext) async -> String? {
+        let page = await WebHarness.run("read_page", [:], sandbox: sandbox, policyContext: policyContext)
+        let interactives = await WebHarness.run("list_interactives", [:], sandbox: sandbox, policyContext: policyContext)
         var parts: [String] = []
-        if !page.hasPrefix("Couldn't read") { parts.append("PAGE NOW:\n" + String(page.prefix(1600))) }
+        auditObservationResultIfNeeded(tool: "read_page", result: page)
+        auditObservationResultIfNeeded(tool: "list_interactives", result: interactives)
+        if !page.hasPrefix("Couldn't read") { parts.append("PAGE NOW:\n" + String(page.prefix(1800))) }
         if !interactives.hasPrefix("No interactive"), !interactives.hasPrefix("Couldn't") {
             parts.append("CLICKABLE / FILLABLE NOW (name one of these to click or fill):\n" + String(interactives.prefix(1200)))
         }
@@ -1017,6 +1029,20 @@ public final class BackgroundWebAgent {
         }
         parts.append("resultChars=\(result.count)")
         parts.append("resultHash=\(auditHash(result))")
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func observationAuditDescriptor(tool: String, info: InjectionGuard.EnvelopeAuditInfo) -> String {
+        var parts = [
+            "tool=\(safeAuditToken(tool))",
+            "trust=\(safeAuditToken(info.trust.rawValue))",
+            "sourceHash=\(auditHash(info.source))",
+            "payloadHash=\(safeAuditToken(info.payloadHash))",
+            "score=\(info.injectionScore)",
+        ]
+        if !info.injectionReasons.isEmpty {
+            parts.append("reasons=\(info.injectionReasons.map(safeAuditToken).joined(separator: ","))")
+        }
         return parts.joined(separator: " ")
     }
 
