@@ -208,11 +208,14 @@ public final class ContextRecorder: ObservableObject {
     private var options: Options
     private var rewind: RewindRecorder?
     private let input: InputRecorder
-    private var retentionTask: Task<Void, Never>?
+    private let maintenanceScheduler: RecorderMaintenanceScheduler
     private var idleHeartbeatTask: Task<Void, Never>?
     private var activationObserver: NSObjectProtocol?
+    private var powerObserver: NSObjectProtocol?
+    private var thermalObserver: NSObjectProtocol?
     private var lastActivationCaptureAt = Date.distantPast
     private var captureScheduler = CaptureScheduler()
+    private var cadenceController = RecorderCadenceController()
     private var scheduledCaptureTasks: [CaptureReason: Task<Void, Never>] = [:]
 
     public var configuration: Options { options }
@@ -232,6 +235,7 @@ public final class ContextRecorder: ObservableObject {
         self.observer = observer
         self.options = options
         self.input = InputRecorder(store: store, policy: options.capturePolicy)
+        self.maintenanceScheduler = RecorderMaintenanceScheduler(store: store)
         let permissions = PermissionProbe.currentStatus()
         status = ContextRecorderStatus(
             running: false,
@@ -279,6 +283,7 @@ public final class ContextRecorder: ObservableObject {
             store: store,
             indexWorkGraph: options.indexWorkGraph,
             structuredContent: options.structuredContent,
+            maintenanceScheduler: maintenanceScheduler,
             policy: options.capturePolicy
         ) { [weak self] context in
             Task { @MainActor in
@@ -307,6 +312,7 @@ public final class ContextRecorder: ObservableObject {
         startRetention()
         startIdleHeartbeat()
         startActivationCapture()
+        startPowerObservers()
     }
 
     /// Event-driven capture: the moment the user switches apps is exactly the
@@ -332,6 +338,50 @@ public final class ContextRecorder: ObservableObject {
         handleInputActivity(InputActivity(kind: .appActivated, appName: observer.latest.appName, bundleIdentifier: observer.latest.bundleIdentifier, windowTitle: observer.latest.windowTitle))
     }
 
+    private func startPowerObservers() {
+        guard powerObserver == nil, thermalObserver == nil else { return }
+        refreshPowerBudget()
+        powerObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshPowerBudget() }
+        }
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshPowerBudget() }
+        }
+    }
+
+    private func stopPowerObservers() {
+        if let powerObserver {
+            NotificationCenter.default.removeObserver(powerObserver)
+            self.powerObserver = nil
+        }
+        if let thermalObserver {
+            NotificationCenter.default.removeObserver(thermalObserver)
+            self.thermalObserver = nil
+        }
+    }
+
+    private func refreshPowerBudget() {
+        cadenceController.updatePower(
+            lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
+            thermalCondition: RecorderThermalCondition(ProcessInfo.processInfo.thermalState)
+        )
+        updateRecorderBudget()
+    }
+
+    private func updateRecorderBudget() {
+        let budget = cadenceController.budget()
+        rewind?.updateBudget(budget)
+        Task { await maintenanceScheduler.updateBudget(budget) }
+    }
+
     public func pause() {
         stopEngine()
         status.running = false
@@ -339,16 +389,19 @@ public final class ContextRecorder: ObservableObject {
     }
 
     private func stopEngine() {
-        retentionTask?.cancel()
-        retentionTask = nil
         idleHeartbeatTask?.cancel()
         idleHeartbeatTask = nil
+        Task {
+            await maintenanceScheduler.stop()
+            await maintenanceScheduler.runOnce(reason: .quit)
+        }
         for task in scheduledCaptureTasks.values { task.cancel() }
         scheduledCaptureTasks.removeAll()
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
             self.activationObserver = nil
         }
+        stopPowerObservers()
         input.onActivity = nil
         input.stop()
         guard let recorder = rewind else { return }
@@ -359,15 +412,11 @@ public final class ContextRecorder: ObservableObject {
     /// Background loop enforcing local retention (7 days / ≤5GB by default): prune
     /// the DB and delete the frame files it reports, on launch and then hourly.
     private func startRetention() {
-        retentionTask?.cancel()
-        let store = self.store
-        retentionTask = Task.detached(priority: .background) {
-            while !Task.isCancelled {
-                if let removed = try? await store.prune() {
-                    for path in removed { FrameStore.delete(path) }
-                }
-                try? await Task.sleep(for: .seconds(3600))
-            }
+        let budget = cadenceController.budget()
+        Task {
+            await maintenanceScheduler.updateBudget(budget)
+            await maintenanceScheduler.start()
+            await maintenanceScheduler.runOnce(reason: .idle)
         }
     }
 
@@ -375,9 +424,14 @@ public final class ContextRecorder: ObservableObject {
         idleHeartbeatTask?.cancel()
         idleHeartbeatTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(CaptureScheduler.idleHeartbeatInterval))
+                let interval = await MainActor.run { self.cadenceController.budget().heartbeatInterval }
+                try? await Task.sleep(for: .seconds(interval))
                 await MainActor.run {
-                    guard self.status.running, self.captureScheduler.admits(reason: .idleHeartbeat) else { return }
+                    self.updateRecorderBudget()
+                    let budget = self.cadenceController.budget()
+                    guard self.status.running,
+                          budget.admitsCapture,
+                          self.captureScheduler.admits(reason: .idleHeartbeat) else { return }
                     self.scheduleCapture(reason: .idleHeartbeat, delay: 0)
                 }
             }
@@ -385,7 +439,12 @@ public final class ContextRecorder: ObservableObject {
     }
 
     private func handleInputActivity(_ activity: InputActivity) {
-        guard status.running, let decision = captureScheduler.schedule(for: activity) else { return }
+        cadenceController.record(activity: activity.kind, at: activity.capturedAt)
+        updateRecorderBudget()
+        let budget = cadenceController.budget()
+        guard status.running,
+              budget.admitsCapture,
+              let decision = captureScheduler.schedule(for: activity) else { return }
         scheduleCapture(reason: decision.reason, delay: decision.delay)
     }
 
@@ -396,6 +455,7 @@ public final class ContextRecorder: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
             }
             guard let self, !Task.isCancelled else { return }
+            await MainActor.run { self.updateRecorderBudget() }
             await self.rewind?.capture(reason: reason)
             if self.rewind == nil {
                 _ = await self.captureNow(reason: reason)
@@ -584,7 +644,10 @@ public final class ContextRecorder: ObservableObject {
             // explicit/on-demand captures are searchable too, matching the
             // continuous recorder path.
             if let ocrText, !ocrText.isEmpty {
-                try? await store.indexEmbedding(contextID: inserted.id, text: ocrText)
+                await maintenanceScheduler.enqueueSemanticIndexing(contextID: inserted.id, text: ocrText)
+                Task {
+                    await self.maintenanceScheduler.flushSemanticIndexing()
+                }
             }
             let detail = Self.captureAuditDetail(appName: inserted.appName, ocrChars: ocrText?.count)
             _ = try await store.appendAudit(AuditEvent(actor: "system", action: "context.capture", detail: detail))

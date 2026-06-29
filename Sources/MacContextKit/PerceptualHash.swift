@@ -221,6 +221,31 @@ public enum PerceptualHash {
         return regions
     }
 
+    public static func normalizedChangedRegion(
+        changedCellsMask: UInt16,
+        padding: CGFloat = 0.04
+    ) -> CGRect? {
+        let grid = gridDimension
+        var union: CGRect?
+        let cellWidth = CGFloat(1) / CGFloat(grid)
+        let cellHeight = CGFloat(1) / CGFloat(grid)
+        for index in 0..<(grid * grid) where (changedCellsMask & (1 << UInt16(index))) != 0 {
+            let row = index / grid
+            let col = index % grid
+            let rect = CGRect(
+                x: CGFloat(col) * cellWidth,
+                y: CGFloat(row) * cellHeight,
+                width: cellWidth,
+                height: cellHeight
+            )
+            union = union.map { $0.union(rect) } ?? rect
+        }
+        guard let union else { return nil }
+        return union
+            .insetBy(dx: -padding, dy: -padding)
+            .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
     /// Renders `image` into a `width x height` 8-bit grayscale buffer using a CPU
     /// context with low-quality interpolation (fast, and identical across runs).
     private static func grayscaleSamples(from image: CGImage) -> [UInt8]? {

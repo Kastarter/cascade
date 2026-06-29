@@ -37,15 +37,39 @@ struct CapturedDisplayMetadata: Sendable, Equatable, Codable {
     }
 }
 
+enum FrameOCRMode: String, Sendable, Equatable, Codable {
+    case fullFrame = "full_frame"
+    case changedRegion = "changed_region"
+    case sparseAXFullFrame = "sparse_ax_full_frame"
+    case auditFullFrame = "audit_full_frame"
+}
+
 struct ChangedFrame: Sendable {
     let jpeg: Data
     let signature: FrameSignature
     let width: Int
     let height: Int
     let display: CapturedDisplayMetadata?
+    let ocrMode: FrameOCRMode
+    let ocrRegion: CGRect?
+    let ocrPixelsRequested: Int
 }
 
 enum RecorderMetadataJSON {
+    private struct RegionPayload: Encodable {
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+
+        init(_ rect: CGRect) {
+            self.x = Double(rect.minX)
+            self.y = Double(rect.minY)
+            self.width = Double(rect.width)
+            self.height = Double(rect.height)
+        }
+    }
+
     private struct SignaturePayload: Encodable {
         let dHash: String
         let combinedGridHash: String
@@ -70,8 +94,18 @@ enum RecorderMetadataJSON {
         let captureReason: String?
         let display: CapturedDisplayMetadata?
         let signature: SignaturePayload?
+        let ocrMode: String?
+        let ocrRegion: RegionPayload?
+        let ocrPixelsRequested: Int?
         let structured: StructuredContentExporter.Metadata?
         let privacy: FrameRedactor.Metadata?
+
+        private enum CodingKeys: String, CodingKey {
+            case rewind, w, h, ax, captureReason, display, signature, structured, privacy
+            case ocrMode = "ocr_mode"
+            case ocrRegion = "ocr_region"
+            case ocrPixelsRequested = "ocr_pixels_requested"
+        }
     }
 
     private struct CapturePayload: Encodable {
@@ -92,26 +126,16 @@ enum RecorderMetadataJSON {
         reason: CaptureReason? = nil,
         display: CapturedDisplayMetadata? = nil,
         signature: FrameSignature? = nil,
+        ocrMode: FrameOCRMode? = nil,
+        ocrRegion: CGRect? = nil,
+        ocrPixelsRequested: Int? = nil,
         structured: StructuredContentExporter.Metadata?,
         privacy: FrameRedactor.Metadata? = nil
     ) -> String {
-        if reason == nil, display == nil, signature == nil, structured == nil, privacy == nil {
+        if reason == nil, display == nil, signature == nil, ocrMode == nil, ocrRegion == nil, ocrPixelsRequested == nil, structured == nil, privacy == nil {
             return "{\"rewind\":true,\"w\":\(width),\"h\":\(height),\"ax\":\(axCount)}"
         }
         let signaturePayload = signature.map(SignaturePayload.init)
-        guard structured != nil || privacy != nil else {
-            return encode(RewindPayload(
-                rewind: true,
-                w: width,
-                h: height,
-                ax: axCount,
-                captureReason: reason?.rawValue,
-                display: display,
-                signature: signaturePayload,
-                structured: nil,
-                privacy: nil
-            ))
-        }
         return encode(RewindPayload(
             rewind: true,
             w: width,
@@ -120,6 +144,9 @@ enum RecorderMetadataJSON {
             captureReason: reason?.rawValue,
             display: display,
             signature: signaturePayload,
+            ocrMode: ocrMode?.rawValue,
+            ocrRegion: ocrRegion.map(RegionPayload.init),
+            ocrPixelsRequested: ocrPixelsRequested,
             structured: structured,
             privacy: privacy
         ))
@@ -200,11 +227,13 @@ public enum FrameStore {
     /// Re-encodes arbitrary image data (e.g. a PNG from the single-shot path) to
     /// JPEG and persists it.
     public static func save(imageData: Data, compression: CGFloat = 0.6) -> String? {
-        guard let rep = NSBitmapImageRep(data: imageData),
-              let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: compression]) else {
-            return nil
+        autoreleasepool {
+            guard let rep = NSBitmapImageRep(data: imageData),
+                  let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: compression]) else {
+                return nil
+            }
+            return save(jpeg: jpeg)
         }
-        return save(jpeg: jpeg)
     }
 
     public static func delete(_ path: String) {
@@ -223,6 +252,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     private var lastGrid: [UInt64]?
     private var scheduler = CaptureScheduler()
     private var display: CapturedDisplayMetadata?
+    private var frameOrdinal = 0
 
     init(engine: RewindEngine, threshold: Int, onStop: @escaping @Sendable (Error?) -> Void) {
         self.engine = engine
@@ -235,39 +265,60 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid else { return }
-        // Skip idle/blank/suspended frames — SCStream still delivers these, but
-        // they carry no new content and reading the status flag is cheaper than
-        // hashing them.
-        guard isComplete(sampleBuffer) else { return }
-        guard let pixelBuffer = sampleBuffer.imageBuffer else { return }
+        guard let result = autoreleasepool(invoking: { () -> (ChangedFrame, Bool)? in
+            guard type == .screen, sampleBuffer.isValid else { return nil }
+            // Skip idle/blank/suspended frames — SCStream still delivers these, but
+            // they carry no new content and reading the status flag is cheaper than
+            // hashing them.
+            guard isComplete(sampleBuffer) else { return nil }
+            guard let pixelBuffer = sampleBuffer.imageBuffer else { return nil }
 
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return nil }
 
-        // Change-aware dedup: per-region hashes, so a small but real change (a
-        // new message in an otherwise static window) defeats the skip instead
-        // of being averaged away by a whole-frame hash.
-        let previousGrid = lastGrid
-        let grid = PerceptualHash.gridHashes(cgImage)
-        let changedCellsMask = PerceptualHash.changedCellsMask(current: grid, previous: previousGrid, threshold: threshold)
-        let visuallyChanged = previousGrid.map { !PerceptualHash.isDuplicateGrid(grid, of: $0, threshold: threshold) } ?? true
-        lastGrid = grid
-        let signature = FrameSignature(
-            dHash: PerceptualHash.dHash(cgImage),
-            combinedGridHash: PerceptualHash.combinedHash(grid),
-            gridDHash: grid,
-            blockHash: PerceptualHash.blockMeanHash(cgImage),
-            changedCellsMask: changedCellsMask
-        )
+            // Change-aware dedup: per-region hashes, so a small but real change (a
+            // new message in an otherwise static window) defeats the skip instead
+            // of being averaged away by a whole-frame hash.
+            let previousGrid = lastGrid
+            let grid = PerceptualHash.gridHashes(cgImage)
+            let changedCellsMask = PerceptualHash.changedCellsMask(current: grid, previous: previousGrid, threshold: threshold)
+            let visuallyChanged = previousGrid.map { !PerceptualHash.isDuplicateGrid(grid, of: $0, threshold: threshold) } ?? true
+            lastGrid = grid
+            frameOrdinal += 1
+            let signature = FrameSignature(
+                dHash: PerceptualHash.dHash(cgImage),
+                combinedGridHash: PerceptualHash.combinedHash(grid),
+                gridDHash: grid,
+                blockHash: PerceptualHash.blockMeanHash(cgImage),
+                changedCellsMask: changedCellsMask
+            )
 
-        guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
-            .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
-            return
-        }
-        let frame = ChangedFrame(jpeg: jpeg, signature: signature, width: cgImage.width, height: cgImage.height, display: display)
+            guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
+                .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
+                return nil
+            }
+            let ocrPlan = Self.ocrPlan(
+                previousGrid: previousGrid,
+                changedCellsMask: changedCellsMask,
+                width: cgImage.width,
+                height: cgImage.height,
+                frameOrdinal: frameOrdinal
+            )
+            let frame = ChangedFrame(
+                jpeg: jpeg,
+                signature: signature,
+                width: cgImage.width,
+                height: cgImage.height,
+                display: display,
+                ocrMode: ocrPlan.mode,
+                ocrRegion: ocrPlan.region,
+                ocrPixelsRequested: ocrPlan.pixelsRequested
+            )
+            let shouldHeartbeat = visuallyChanged && scheduler.admits(reason: .streamHeartbeat)
+            return (frame, shouldHeartbeat)
+        }) else { return }
+        let (frame, shouldHeartbeat) = result
         let engine = self.engine
-        let shouldHeartbeat = visuallyChanged && scheduler.admits(reason: .streamHeartbeat)
         Task {
             await engine.updateLatest(frame)
             if shouldHeartbeat {
@@ -290,6 +341,29 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
             return true
         }
         return status == .complete
+    }
+
+    private static func ocrPlan(
+        previousGrid: [UInt64]?,
+        changedCellsMask: UInt16,
+        width: Int,
+        height: Int,
+        frameOrdinal: Int
+    ) -> (mode: FrameOCRMode, region: CGRect?, pixelsRequested: Int) {
+        let fullPixels = max(1, width * height)
+        guard previousGrid != nil else {
+            return (.fullFrame, nil, fullPixels)
+        }
+        if frameOrdinal % 60 == 0 {
+            return (.auditFullFrame, nil, fullPixels)
+        }
+        let changedCells = changedCellsMask.nonzeroBitCount
+        guard changedCells > 0, changedCells <= 3,
+              let region = PerceptualHash.normalizedChangedRegion(changedCellsMask: changedCellsMask) else {
+            return (.fullFrame, nil, fullPixels)
+        }
+        let roiPixels = Int((CGFloat(fullPixels) * region.width * region.height).rounded(.up))
+        return (.changedRegion, region, max(1, roiPixels))
     }
 }
 
@@ -327,6 +401,76 @@ enum OCRLineBuilder {
     }
 }
 
+actor RecorderMaintenanceScheduler {
+    private static let intervalSeconds: Int64 = 3600
+    private static let catchUpLimit = 24
+
+    private let store: CascadeStore
+    private var budget: RecorderCadenceBudget = .normal
+    private var pendingSemanticIndex: [Int64: String] = [:]
+    private var task: Task<Void, Never>?
+
+    init(store: CascadeStore) {
+        self.store = store
+    }
+
+    func start() {
+        guard task == nil else { return }
+        task = Task.detached(priority: .background) { [weak self] in
+            while !Task.isCancelled {
+                await self?.runOnce(reason: .idle)
+                try? await Task.sleep(
+                    for: .seconds(Self.intervalSeconds),
+                    tolerance: .seconds(300)
+                )
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+    }
+
+    func updateBudget(_ budget: RecorderCadenceBudget) {
+        self.budget = budget
+    }
+
+    func enqueueSemanticIndexing(contextID: Int64, text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        pendingSemanticIndex[contextID] = trimmed
+    }
+
+    func runOnce(reason: CascadeStoreMaintenanceReason = .idle) async {
+        if let removed = try? await store.prune() {
+            for path in removed { FrameStore.delete(path) }
+        }
+        try? await store.performMaintenance(reason: reason)
+        await flushSemanticIndexing()
+    }
+
+    func flushSemanticIndexing() async {
+        guard budget.allowsSemanticIndexing else { return }
+        var work = pendingSemanticIndex
+        pendingSemanticIndex.removeAll()
+        if let catchUp = try? await store.unindexedRecentContexts(limit: Self.catchUpLimit) {
+            for context in catchUp {
+                if let text = context.ocrText, !text.isEmpty {
+                    work[context.id] = text
+                }
+            }
+        }
+        guard !work.isEmpty else { return }
+        let store = self.store
+        await Task.detached(priority: .utility) {
+            for (contextID, text) in work {
+                try? await store.indexEmbedding(contextID: contextID, text: text)
+            }
+        }.value
+    }
+}
+
 /// Serializes the expensive work (OCR + storage) per changed frame. Actor
 /// isolation *is* the serialization; `ingest` coalesces to the latest pending
 /// frame so a slow OCR pass can't pile up a backlog.
@@ -339,7 +483,9 @@ actor RewindEngine {
     private let store: CascadeStore
     private let indexWorkGraph: Bool
     private let structuredContent: Bool
+    private let maintenanceScheduler: RecorderMaintenanceScheduler?
     private var policy: CapturePrivacyPolicy
+    private var budget: RecorderCadenceBudget = .normal
     private let onMoment: @Sendable (RecordedContext) -> Void
     private var latest: ChangedFrame?
     private var pending: PendingFrame?
@@ -361,12 +507,14 @@ actor RewindEngine {
         store: CascadeStore,
         indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
+        maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
     ) {
         self.store = store
         self.indexWorkGraph = indexWorkGraph
         self.structuredContent = structuredContent
+        self.maintenanceScheduler = maintenanceScheduler
         self.policy = policy
         self.onMoment = onMoment
     }
@@ -375,15 +523,31 @@ actor RewindEngine {
         self.policy = policy
     }
 
+    func updateBudget(_ budget: RecorderCadenceBudget) {
+        self.budget = budget
+    }
+
     func updateLatest(_ frame: ChangedFrame) {
+        if processing,
+           let pending,
+           pending.frame.jpeg.count + frame.jpeg.count > budget.pendingFrameByteBudget {
+            latest = nil
+            return
+        }
         latest = frame
     }
 
     /// Stores the newest stream frame for an admitted scheduler reason. Keeps only
     /// the newest pending request while OCR is in flight, so backlog remains bounded.
     func captureLatest(reason: CaptureReason) async {
+        guard budget.admitsCapture else { return }
         guard let frame = latest else { return }
+        guard frame.jpeg.count <= budget.pendingFrameByteBudget else {
+            latest = nil
+            return
+        }
         pending = PendingFrame(frame: frame, reason: reason)
+        latest = nil
         guard !processing else { return }
         processing = true
         while let next = pending {
@@ -431,8 +595,23 @@ actor RewindEngine {
         // windows where OCR is the load-bearing channel.
         let axRich = axText.count >= Self.sparseAXThreshold
 
-        let recognitionLevel: VNRequestTextRecognitionLevel = axRich ? .fast : .accurate
-        let ocrBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: frame.jpeg, level: recognitionLevel)
+        var ocrMode = frame.ocrMode
+        var ocrRegion = frame.ocrRegion
+        if !axRich {
+            ocrMode = .sparseAXFullFrame
+            ocrRegion = nil
+        }
+        let ocrPixelsRequested = ocrRegion == nil
+            ? max(1, frame.width * frame.height)
+            : frame.ocrPixelsRequested
+        let recognitionLevel: VNRequestTextRecognitionLevel = budget.ocrPolicy == .fastOnly ? .fast : (axRich ? .fast : .accurate)
+        let maxDecodeDimension = recognitionLevel == .fast && axRich ? 1280 : nil
+        let ocrBoxes = ScreenTextRecognizer.recognizeBoxes(
+            inImageData: frame.jpeg,
+            level: recognitionLevel,
+            regionOfInterest: ocrRegion,
+            maxDecodeDimension: maxDecodeDimension
+        )
         var redactedOCRBoxes = ocrBoxes
         let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
         var ocrText = structured.readingOrderText
@@ -442,6 +621,7 @@ actor RewindEngine {
         // do one native-resolution pass (rate-limited) for the focused window
         // instead of trusting the 1920px-capped stream frame with small text.
         if !axRich,
+           budget.allowsNativeResolutionOCR,
            Date().timeIntervalSince(lastNativeOCRAt) >= Self.nativeOCRInterval,
            let pid = snapshot.processIdentifier,
            let windowRect = await MainActor.run(body: { ScreenCaptureUtility.focusedWindowNormalizedRect(pid: pid) }),
@@ -521,6 +701,9 @@ actor RewindEngine {
                 reason: reason,
                 display: frame.display,
                 signature: signature,
+                ocrMode: ocrMode,
+                ocrRegion: ocrRegion,
+                ocrPixelsRequested: ocrPixelsRequested,
                 structured: structuredMetadata,
                 privacy: redacted.metadata
             ),
@@ -563,9 +746,8 @@ actor RewindEngine {
                 changedCellsMask: signature.changedCellsMask,
                 textDigest: signature.textDigest.map { Int64(bitPattern: $0) }
             ))
-            // Semantic recall: index the moment's text locally (best-effort).
             if !mergedText.isEmpty {
-                try? await store.indexEmbedding(contextID: inserted.id, text: mergedText)
+                await maintenanceScheduler?.enqueueSemanticIndexing(contextID: inserted.id, text: mergedText)
             }
             lastStoredBucket = bucket
             lastStoredSignature = signature
@@ -642,6 +824,7 @@ final class RewindRecorder {
         fps: Int32 = 1,
         indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
+        maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
     ) {
@@ -649,6 +832,7 @@ final class RewindRecorder {
             store: store,
             indexWorkGraph: indexWorkGraph,
             structuredContent: structuredContent,
+            maintenanceScheduler: maintenanceScheduler,
             policy: policy,
             onMoment: onMoment
         )
@@ -661,6 +845,10 @@ final class RewindRecorder {
 
     func updatePolicy(_ policy: CapturePrivacyPolicy) {
         Task { await engine.updatePolicy(policy) }
+    }
+
+    func updateBudget(_ budget: RecorderCadenceBudget) {
+        Task { await engine.updateBudget(budget) }
     }
 
     func start() async throws {

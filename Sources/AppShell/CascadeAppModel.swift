@@ -516,6 +516,7 @@ public final class CascadeAppModel: ObservableObject {
         recorder.$status
             .compactMap(\.latestContext)
             .removeDuplicates { $0.id == $1.id }
+            .debounce(for: .milliseconds(250), scheduler: RunLoop.main)
             .sink { [weak self] context in self?.ingestLiveMoment(context) }
             .store(in: &cancellables)
         dock.objectWillChange
