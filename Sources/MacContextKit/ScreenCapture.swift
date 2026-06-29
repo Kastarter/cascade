@@ -199,29 +199,27 @@ public enum ScreenCaptureUtility {
     public static func focusedWindowNormalizedRect(pid: pid_t) -> CGRect? {
         guard AXIsProcessTrusted() else { return nil }
         let appRef = AXUIElementCreateApplication(pid)
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
-              let focusedRef else { return nil }
-        return focusedWindowNormalizedRect(focusedWindowRef: focusedRef)
+        AXClient.setMessagingTimeout(appRef)
+        guard case .success(let window) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
+            return nil
+        }
+        return focusedWindowNormalizedRect(window: window)
     }
 
     static func focusedWindowNormalizedRect(focusedWindowRef: CFTypeRef?) -> CGRect? {
         guard let window = decodeAXElement(focusedWindowRef) else { return nil }
-        var positionRef: CFTypeRef?
-        var sizeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
-              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
-              let positionRef, let sizeRef else { return nil }
-        guard let origin = decodeAXPoint(positionRef),
-              let size = decodeAXSize(sizeRef),
-              size.width > 1, size.height > 1 else { return nil }
+        return focusedWindowNormalizedRect(window: window)
+    }
+
+    private static func focusedWindowNormalizedRect(window: AXUIElement) -> CGRect? {
+        guard case .success(let frame) = AXClient.frame(window) else { return nil }
 
         // AX coordinates are global top-left; CGDisplayBounds matches that space.
         let mouse = NSEvent.mouseLocation
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main,
-              let displayID = screen.displayID else { return nil }
-        let displayBounds = CGDisplayBounds(displayID)
-        let windowRect = CGRect(origin: origin, size: size).intersection(displayBounds)
+              let mapper = DisplayCoordinateMapper(screen: screen) else { return nil }
+        let displayBounds = mapper.cgBounds
+        let windowRect = frame.intersection(displayBounds)
         guard !windowRect.isEmpty else { return nil }
         return CGRect(
             x: (windowRect.minX - displayBounds.minX) / displayBounds.width,
@@ -377,21 +375,17 @@ public enum ScreenCaptureUtility {
     }
 
     private static func outputPixelSize(for display: SCDisplay) -> (Int, Int) {
-        let scale = nsScreensByDisplayID()[display.displayID]?.backingScaleFactor
-            ?? NSScreen.main?.backingScaleFactor
-            ?? 2.0
-        let nativeWidth = max(1, Int((CGFloat(display.width) * scale).rounded()))
-        let nativeHeight = max(1, Int((CGFloat(display.height) * scale).rounded()))
-
-        if nativeWidth >= nativeHeight {
-            let width = min(nativeWidth, maxPixelDimension)
-            let height = Int((CGFloat(width) * CGFloat(nativeHeight) / CGFloat(nativeWidth)).rounded())
-            return (max(width, 1), max(height, 1))
-        } else {
-            let height = min(nativeHeight, maxPixelDimension)
-            let width = Int((CGFloat(height) * CGFloat(nativeWidth) / CGFloat(nativeHeight)).rounded())
-            return (max(width, 1), max(height, 1))
+        if let screen = nsScreensByDisplayID()[display.displayID],
+           let mapper = DisplayCoordinateMapper(screen: screen) {
+            return mapper.outputPixelSize(maxDimension: maxPixelDimension)
         }
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        return DisplayCoordinateMapper.outputPixelSize(
+            widthPoints: CGFloat(display.width),
+            heightPoints: CGFloat(display.height),
+            backingScaleFactor: scale,
+            maxDimension: maxPixelDimension
+        )
     }
 
     private static func pngData(from cgImage: CGImage) -> Data? {
@@ -416,7 +410,11 @@ public enum ScreenCaptureUtility {
     }
 
     private static func appKitFrame(for display: SCDisplay) -> CGRect {
-        nsScreensByDisplayID()[display.displayID]?.frame ?? cgFrame(of: display)
+        if let screen = nsScreensByDisplayID()[display.displayID],
+           let mapper = DisplayCoordinateMapper(screen: screen) {
+            return mapper.appKitFrame
+        }
+        return cgFrame(of: display)
     }
 
     private static func cgFrame(of display: SCDisplay) -> CGRect {

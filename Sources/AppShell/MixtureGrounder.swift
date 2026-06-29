@@ -110,6 +110,7 @@ public struct MixtureGrounder: VisualGrounder {
     private let previousAnchor: VerifiedGroundingAnchor?
     private let candidateFailureCounts: [String: Int]
     private let onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)?
+    private let onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)?
     private let groundingCache: GroundingCache?
     private let cacheMode: GroundingCacheMode
     private let cacheContextProvider: @Sendable () async -> AppWindowSnapshot
@@ -136,6 +137,7 @@ public struct MixtureGrounder: VisualGrounder {
         cacheContextProvider: @escaping @Sendable () async -> AppWindowSnapshot = {
             await MainActor.run { AppWindowObserver.snapshot() }
         },
+        onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)? = nil,
         onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
         self.base = base
@@ -147,6 +149,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.groundingCache = groundingCache
         self.cacheMode = cacheMode
         self.cacheContextProvider = cacheContextProvider
+        self.onRuntimeProfile = onRuntimeProfile
         self.onVerifierOutcome = onVerifierOutcome
     }
 
@@ -516,12 +519,14 @@ public struct MixtureGrounder: VisualGrounder {
         displayHeightPoints: Int
     ) async -> GroundingResult? {
         let appHints = await runtimeHintsForFrontmostApp()
+        let runtimeProfile = await runtimeProfileForFrontmost()
         let axCandidates = await MainActor.run {
             ScreenElementIndex.accessibilityCandidates(
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints,
                 policy: Self.trustPolicy,
-                appSkillHints: appHints
+                appSkillHints: appHints,
+                runtimeProfile: runtimeProfile
             )
         }
         let ocrCandidates = await Task.detached {
@@ -921,6 +926,16 @@ public struct MixtureGrounder: VisualGrounder {
         }
     }
 
+    private func runtimeProfileForFrontmost() async -> AXRuntimeProfile? {
+        await MainActor.run {
+            let profile = AXElementResolver.runtimeProfileForFrontmost()
+            if let profile {
+                Task { await onRuntimeProfile?(profile) }
+            }
+            return profile
+        }
+    }
+
     /// Resolve `target` against the frontmost app's accessibility tree, returning a
     /// display-local AppKit point (the executor's space) — or nil to fall back to
     /// the visual grounder. AX/NSWorkspace/NSScreen are main-thread surfaces, so the
@@ -961,6 +976,13 @@ public struct MixtureGrounder: VisualGrounder {
         if skill?.axUnreliable == true {
             return nil
         }
+        let runtimeProfile = AXElementResolver.runtimeProfileForFrontmost()
+        if runtimeProfile?.isSparse == true {
+            if let runtimeProfile {
+                Task { await onRuntimeProfile?(runtimeProfile) }
+            }
+            return nil
+        }
         guard let match = AXElementResolver.find(label: target),
               match.score >= minAXScore else { return nil }
         // Map the matched element center (CG-global, top-left) into the display-local
@@ -984,7 +1006,8 @@ public struct MixtureGrounder: VisualGrounder {
             bounds: candidateBounds,
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints,
-            appSkillHints: skill?.hints
+            appSkillHints: skill?.hints,
+            runtimeProfile: runtimeProfile
         ) else { return nil }
         let candidateID = "ax:\(Self.indexHash(match.role + "|" + match.title))"
 
@@ -1024,13 +1047,17 @@ public struct MixtureGrounder: VisualGrounder {
     nonisolated static func displayLocalPoint(
         cgGlobalCenter c: CGPoint, displayCGBounds bounds: CGRect, displayHeightPoints: Int
     ) -> CGPoint? {
-        guard bounds.width > 0, bounds.height > 0,
-              c.x >= bounds.minX - 1, c.x <= bounds.maxX + 1,
-              c.y >= bounds.minY - 1, c.y <= bounds.maxY + 1 else { return nil }
-        let localX = c.x - bounds.minX
-        let localYFromTop = c.y - bounds.minY
-        let localYFromBottom = CGFloat(displayHeightPoints) - localYFromTop
-        return CGPoint(x: localX, y: localYFromBottom)
+        guard bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0,
+              displayHeightPoints > 0
+        else { return nil }
+        let mapper = DisplayCoordinateMapper(
+            displayID: CGMainDisplayID(),
+            appKitFrame: CGRect(x: 0, y: 0, width: bounds.width, height: CGFloat(displayHeightPoints)),
+            cgBounds: bounds,
+            backingScaleFactor: 1
+        )
+        return mapper.screenLocalAppKit(fromCGGlobal: c)
     }
 
     /// CG-global bounds of the display the screenshot came from. The capture path is
@@ -1045,9 +1072,8 @@ public struct MixtureGrounder: VisualGrounder {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { dims($0) && NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.screens.first(where: dims)
-        guard let screen else { return nil }
-        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-        return CGDisplayBounds(id ?? CGMainDisplayID())
+        guard let screen, let mapper = DisplayCoordinateMapper(screen: screen) else { return nil }
+        return mapper.cgBounds
     }
 
     private static func verifierCandidates(

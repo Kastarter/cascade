@@ -504,6 +504,7 @@ public final class WebSandboxComputerUseActuator: ComputerUseActuator, @unchecke
         ComputerUseHealth(
             ready: true,
             permissions: CapturePermissionStatus(screenRecording: true, accessibility: true, inputMonitoring: true),
+            secureInputEnabled: false,
             message: "Web sandbox is ready."
         )
     }

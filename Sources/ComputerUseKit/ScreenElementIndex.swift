@@ -335,9 +335,11 @@ public enum ScreenElementIndex {
             bounds: Bounds,
             displayWidthPoints: Int,
             displayHeightPoints: Int,
-            appSkillHints: AppSkillRuntimeHints? = nil
+            appSkillHints: AppSkillRuntimeHints? = nil,
+            runtimeProfile: AXRuntimeProfile? = nil
         ) -> Bool {
             guard appSkillHints?.axUnreliable != true else { return false }
+            guard runtimeProfile?.isSparse != true else { return false }
             guard score >= minAXScore else { return false }
             guard isActionableAXRole(axRole) else { return false }
             guard bounds.isValid else { return false }
@@ -373,9 +375,11 @@ public enum ScreenElementIndex {
         displayHeightPoints: Int,
         limit: Int = 48,
         policy: TrustPolicy = .default,
-        appSkillHints: AppSkillRuntimeHints? = nil
+        appSkillHints: AppSkillRuntimeHints? = nil,
+        runtimeProfile: AXRuntimeProfile? = nil
     ) -> [Candidate] {
         guard appSkillHints?.axUnreliable != true else { return [] }
+        guard runtimeProfile?.isSparse != true else { return [] }
         guard let displayBounds = captureDisplayBounds(
             widthPoints: displayWidthPoints,
             heightPoints: displayHeightPoints
@@ -402,7 +406,8 @@ public enum ScreenElementIndex {
                 bounds: bounds,
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints,
-                appSkillHints: appSkillHints
+                appSkillHints: appSkillHints,
+                runtimeProfile: runtimeProfile
             ) else { return nil }
             let confidence = min(1, max(0.72, max(match.score, policy.minAXScore) / 3))
             return Candidate(
@@ -792,9 +797,8 @@ private extension ScreenElementIndex {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { dims($0) && NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.screens.first(where: dims)
-        guard let screen else { return nil }
-        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-        return CGDisplayBounds(id ?? CGMainDisplayID())
+        guard let screen, let mapper = DisplayCoordinateMapper(screen: screen) else { return nil }
+        return mapper.cgBounds
     }
 
     static func displayLocalPoint(
@@ -802,13 +806,13 @@ private extension ScreenElementIndex {
         displayCGBounds bounds: CGRect,
         displayHeightPoints: Int
     ) -> CGPoint? {
-        guard bounds.width > 0, bounds.height > 0,
-              point.x >= bounds.minX - 1, point.x <= bounds.maxX + 1,
-              point.y >= bounds.minY - 1, point.y <= bounds.maxY + 1 else { return nil }
-        let localX = point.x - bounds.minX
-        let localYFromTop = point.y - bounds.minY
-        let localYFromBottom = CGFloat(displayHeightPoints) - localYFromTop
-        return CGPoint(x: localX, y: localYFromBottom)
+        let mapper = DisplayCoordinateMapper(
+            displayID: CGMainDisplayID(),
+            appKitFrame: CGRect(x: 0, y: 0, width: bounds.width, height: CGFloat(displayHeightPoints)),
+            cgBounds: bounds,
+            backingScaleFactor: 1
+        )
+        return mapper.screenLocalAppKit(fromCGGlobal: point)
     }
 
     static func drawMarks(

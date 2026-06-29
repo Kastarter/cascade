@@ -175,4 +175,54 @@ struct AXElementResolverTests {
         let summary = AXElementResolver.interactableSummary(many, limit: 3)
         #expect(summary?.components(separatedBy: ", ").count == 3)
     }
+
+    @Test func runtimeProfileSparseThresholds() {
+        let sparse = AXRuntimeProfile(
+            bundleIdentifier: "com.example.Canvas",
+            appName: "Canvas",
+            sampledNodeCount: 8,
+            actionableRoleCount: 1,
+            labeledActionableCount: 0,
+            identifierCount: 0,
+            frameFailureCount: 0,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0
+        )
+        let rich = AXRuntimeProfile(
+            bundleIdentifier: "com.example.Native",
+            appName: "Native",
+            sampledNodeCount: 80,
+            actionableRoleCount: 20,
+            labeledActionableCount: 15,
+            identifierCount: 6,
+            frameFailureCount: 1,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0.05
+        )
+
+        #expect(sparse.isSparse)
+        #expect(sparse.shouldRetryManualAccessibility)
+        #expect(!rich.isSparse)
+        #expect(!rich.shouldRetryManualAccessibility)
+    }
+
+    @Test func runtimeProfileAuditDetailIsSanitized() {
+        let profile = AXRuntimeProfile(
+            bundleIdentifier: "com.secret.App",
+            appName: "Secret App",
+            sampledNodeCount: 20,
+            actionableRoleCount: 2,
+            labeledActionableCount: 1,
+            identifierCount: 0,
+            frameFailureCount: 9,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0.50,
+            manualAccessibilityAttempted: true
+        )
+
+        #expect(profile.safeAuditDetail.contains("sparse=true"))
+        #expect(profile.safeAuditDetail.contains("manualAccessibility=true"))
+        #expect(!profile.safeAuditDetail.contains("Secret App"))
+        #expect(!profile.safeAuditDetail.contains("com.secret.App"))
+    }
 }
