@@ -62,11 +62,12 @@ private func savedExperienceAgent(in store: CascadeStore, recipe: AgentRecipe = 
         source: .detected,
         signature: "mail-invoice-copy",
         recipe: recipe,
-        apps: ["Mail"],
-        estimatedSecondsPerRun: 45,
-        goal: "Copy invoice totals into the tracker."
-    ))
-}
+	        apps: ["Mail"],
+	        estimatedSecondsPerRun: 45,
+	        evidenceIDs: [501, 502],
+	        goal: "Copy invoice totals into the tracker."
+	    ))
+	}
 
 @MainActor
 private func finishSandboxRun(
@@ -105,9 +106,10 @@ func enabledLedgerRecordsSandboxSuccess() async throws {
     #expect(cases.first?.outcome == .success)
     #expect(cases.first?.verificationSignal == .completed)
     #expect(cases.first?.failureKind == nil)
-    #expect(cases.first?.appName == "Mail")
-    #expect(cases.first?.goalPattern == "Copy invoice totals into the tracker.")
-    #expect(cases.first?.recipeSignature == "mail-invoice-copy")
+	    #expect(cases.first?.appName == "Mail")
+	    #expect(cases.first?.goalPattern == "Copy invoice totals into the tracker.")
+	    #expect(cases.first?.recipeSignature == "mail-invoice-copy")
+	    #expect(cases.first?.evidenceIDs == [501, 502])
 }
 
 @MainActor @Test
@@ -120,10 +122,11 @@ func enabledLedgerRecordsOnScreenSuccess() async throws {
     let cases = try await store.agentExperienceCases()
     #expect(try await store.agent(id: agent.id)?.runCount == 1)
     #expect(cases.count == 1)
-    #expect(cases.first?.outcome == .success)
-    #expect(cases.first?.verificationSignal == .completed)
-    #expect(cases.first?.goalPattern == "Copy invoice totals into the tracker.")
-}
+	    #expect(cases.first?.outcome == .success)
+	    #expect(cases.first?.verificationSignal == .completed)
+	    #expect(cases.first?.goalPattern == "Copy invoice totals into the tracker.")
+	    #expect(cases.first?.evidenceIDs == [501, 502])
+	}
 
 @MainActor @Test
 func enabledLedgerRecordsStoppedFailedRefusedModalNoEffectAndStepLimitSandboxRuns() async throws {

@@ -42,13 +42,14 @@ private func record(
     explicitAskOnly: Bool = false,
     steps: [String] = [],
     approved: Bool = false,
-    successes: Int = 0,
-    failures: Int = 0,
-    evidence: Set<String> = [],
-    quarantined: Bool = false,
-    archived: Bool = false
-) throws -> SkillConsolidator.LearnedSkillRecord {
-    SkillConsolidator.LearnedSkillRecord(
+	    successes: Int = 0,
+	    failures: Int = 0,
+	    evidence: Set<String> = [],
+	    sourceCases: Set<String> = [],
+	    quarantined: Bool = false,
+	    archived: Bool = false
+	) throws -> SkillConsolidator.LearnedSkillRecord {
+	    SkillConsolidator.LearnedSkillRecord(
         id: id,
         skill: try parsedSkill(
             name: name,
@@ -59,12 +60,13 @@ private func record(
         ),
         humanSteps: steps,
         approved: approved,
-        successCount: successes,
-        failureCount: failures,
-        evidenceIDs: evidence,
-        quarantined: quarantined,
-        archived: archived
-    )
+	        successCount: successes,
+	        failureCount: failures,
+	        evidenceIDs: evidence,
+	        sourceCaseIDs: sourceCases.isEmpty ? evidence : sourceCases,
+	        quarantined: quarantined,
+	        archived: archived
+	    )
 }
 
 private func jsonArray(_ values: [String]) -> String {
@@ -99,16 +101,19 @@ struct SkillConsolidatorTests {
                 "Type numeric dimensions into modal fields"
             ],
             successes: 1,
-            evidence: ["moment-2", "moment-3"]
-        )
+	            evidence: ["moment-2", "moment-3"],
+	            sourceCases: ["case-1"]
+	        )
 
         let result = SkillConsolidator().evaluate(candidate, against: [existing])
 
-        #expect(result.action == .reviseExisting(existingID: "blender-modeling"))
-        #expect((result.bestMatch?.total ?? 0.0) >= 0.68)
-        #expect(result.bestMatch?.explicitAskOnly == 1.0)
-        #expect(result.bestMatch?.approvedStatus == 0.65)
-    }
+	        #expect(result.action == .reviseExisting(existingID: "blender-modeling"))
+	        #expect((result.bestMatch?.total ?? 0.0) >= 0.68)
+	        #expect(result.bestMatch?.explicitAskOnly == 1.0)
+	        #expect(result.bestMatch?.approvedStatus == 0.65)
+	        #expect(result.sourceCaseIDs == ["case-1"])
+	        #expect(result.successCount == 1)
+	    }
 
     @Test func unrelatedSameAppSkillsStaySeparate() throws {
         let existing = try record(
@@ -133,8 +138,9 @@ struct SkillConsolidatorTests {
                 "Start animation render"
             ],
             successes: 1,
-            evidence: ["render-1"]
-        )
+	            evidence: ["render-1"],
+	            sourceCases: ["case-render"]
+	        )
 
         let result = SkillConsolidator().evaluate(candidate, against: [existing])
 
@@ -177,21 +183,22 @@ struct SkillConsolidatorTests {
             name: "healthy-candidate",
             useWhen: "Create Blender mesh primitives",
             steps: ["Open Add Mesh with Shift A"],
-            successes: 1
-        )
+	            successes: 1,
+	            sourceCases: ["case-healthy"]
+	        )
         #expect(consolidator.evaluate(healthyCandidate, against: [quarantined]).action == .newSkill)
 
         let failedCandidate = try record(
             id: "failed-candidate",
             name: "failed-candidate",
             useWhen: "Create Blender mesh primitives",
-            failures: 2
-        )
-        if case .quarantine(let reason) = consolidator.evaluate(failedCandidate, against: [active]).action {
-            #expect(reason.contains("failure"))
-        } else {
-            #expect(false, "Expected failure-dominated candidate to quarantine.")
-        }
+	            failures: 2
+	        )
+	        if case .quarantine(let reason) = consolidator.evaluate(failedCandidate, against: [active]).action {
+	            #expect(reason.contains("failure"))
+	        } else {
+	            #expect(Bool(false), "Expected failure-dominated candidate to quarantine.")
+	        }
     }
 
     @Test func scoringIsStableAcrossInputOrder() throws {
@@ -219,8 +226,9 @@ struct SkillConsolidatorTests {
             useWhen: "Create Blender mesh primitives",
             steps: ["Open Add Mesh with Shift A", "Scale objects with S", "Confirm modal values with Enter"],
             successes: 1,
-            evidence: ["same-1", "same-2"]
-        )
+	            evidence: ["same-1", "same-2"],
+	            sourceCases: ["case-same"]
+	        )
         let consolidator = SkillConsolidator()
 
         let forward = consolidator.evaluate(candidate, against: [beta, alpha])
@@ -230,27 +238,57 @@ struct SkillConsolidatorTests {
         #expect(forward == reversed)
     }
 
-    @Test func exactLowerSignalDuplicateArchivesCandidate() throws {
+	    @Test func exactLowerSignalDuplicateArchivesCandidate() throws {
+	        let existing = try record(
+	            id: "proven-existing",
+	            name: "proven-existing",
+	            useWhen: "Create Blender mesh primitives",
+	            steps: ["Open Add Mesh with Shift A", "Scale objects with S"],
+	            approved: true,
+	            successes: 6,
+	            evidence: ["moment-1", "moment-2"]
+	        )
+	        let candidate = try record(
+	            id: "redundant-draft",
+	            name: "redundant-draft",
+	            useWhen: "Create Blender mesh primitives",
+	            steps: ["Open Add Mesh with Shift A", "Scale objects with S"],
+	            successes: 1,
+	            evidence: ["moment-1", "moment-2"],
+	            sourceCases: ["case-redundant"]
+	        )
+
+	        let result = SkillConsolidator().evaluate(candidate, against: [existing])
+
+	        #expect(result.action == .archiveCandidate(existingID: "proven-existing"))
+	        #expect((result.bestMatch?.total ?? 0.0) >= 0.84)
+	    }
+
+    @Test func missingVerifiedSourceCaseQuarantinesBeforeMerge() throws {
         let existing = try record(
             id: "proven-existing",
             name: "proven-existing",
             useWhen: "Create Blender mesh primitives",
-            steps: ["Open Add Mesh with Shift A", "Scale objects with S"],
+            steps: ["Open Add Mesh with Shift A"],
             approved: true,
-            successes: 6,
-            evidence: ["moment-1", "moment-2"]
+            successes: 4,
+            evidence: ["moment-1"]
         )
         let candidate = try record(
-            id: "redundant-draft",
-            name: "redundant-draft",
+            id: "draft-without-case",
+            name: "draft-without-case",
             useWhen: "Create Blender mesh primitives",
-            steps: ["Open Add Mesh with Shift A", "Scale objects with S"],
-            evidence: ["moment-1", "moment-2"]
+            steps: ["Open Add Mesh with Shift A"],
+            successes: 1
         )
 
         let result = SkillConsolidator().evaluate(candidate, against: [existing])
 
-        #expect(result.action == .archiveCandidate(existingID: "proven-existing"))
-        #expect((result.bestMatch?.total ?? 0.0) >= 0.84)
-    }
+	        if case .quarantine(let reason) = result.action {
+	            #expect(reason.contains("verified source case"))
+	            #expect(result.requiredEvidence.contains("source_case_id"))
+	        } else {
+	            #expect(Bool(false), "Expected source-case-gated quarantine.")
+	        }
+	    }
 }

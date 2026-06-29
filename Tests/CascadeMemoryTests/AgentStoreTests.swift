@@ -93,17 +93,19 @@ func agentRecipeAndAppsRoundTrip() async throws {
         source: .detected,
         signature: "mail>numbers",
         recipe: recipe,
-        apps: ["Mail", "Numbers"],
-        estimatedSeconds: 90,
-        evidenceCount: 4
-    ))
+	        apps: ["Mail", "Numbers"],
+	        estimatedSeconds: 90,
+	        evidenceCount: 4,
+	        evidenceIDs: [11, 12, 13, 14]
+	    ))
 
     #expect(saved.id > 0)
     let reread = try await store.agent(id: saved.id)
     #expect(reread?.recipe == recipe)
-    #expect(reread?.apps == ["Mail", "Numbers"])
-    #expect(reread?.estimatedSeconds == 90)
-}
+	    #expect(reread?.apps == ["Mail", "Numbers"])
+	    #expect(reread?.estimatedSeconds == 90)
+	    #expect(reread?.evidenceIDs == [11, 12, 13, 14])
+	}
 
 @Test
 func upsertDedupesBySignature() async throws {
@@ -113,17 +115,19 @@ func upsertDedupesBySignature() async throws {
     let second = try await store.upsertAgent(CascadeAgent(
         name: "Updated",
         source: .detected,
-        signature: "sig-x",
-        recipe: AgentRecipe(steps: [RecipeStep(order: 0, kind: .click, x: 5, y: 5, appName: "Safari")]),
-        evidenceCount: 9
-    ))
+	        signature: "sig-x",
+	        recipe: AgentRecipe(steps: [RecipeStep(order: 0, kind: .click, x: 5, y: 5, appName: "Safari")]),
+	        evidenceCount: 9,
+	        evidenceIDs: [41, 42]
+	    ))
 
     #expect(first.id == second.id) // same row, not a duplicate
     let all = try await store.agents()
-    #expect(all.count == 1)
-    #expect(all.first?.name == "Updated")
-    #expect(all.first?.evidenceCount == 9)
-}
+	    #expect(all.count == 1)
+	    #expect(all.first?.name == "Updated")
+	    #expect(all.first?.evidenceCount == 9)
+	    #expect(all.first?.evidenceIDs == [41, 42])
+	}
 
 @Test
 func markRunEnableAndDelete() async throws {

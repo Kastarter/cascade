@@ -3,6 +3,41 @@ import Foundation
 /// Pure scoring helper for learned-skill review. It never reads or writes
 /// SKILL.md files; callers decide how to present or persist the returned action.
 public struct SkillConsolidator: Sendable {
+    public enum SkillRisk: String, Sendable, Equatable {
+        case low
+        case medium
+        case high
+        case safety
+    }
+
+    public struct SkillConsolidationCandidate: Sendable, Equatable {
+        public let targetSlug: String
+        public let appName: String
+        public let sourceCaseIDs: [String]
+        public let proposedMarkdown: String
+        public let mergeReason: String
+        public let predictedRisk: SkillRisk
+        public let requiredEvidence: [String]
+
+        public init(
+            targetSlug: String,
+            appName: String,
+            sourceCaseIDs: [String],
+            proposedMarkdown: String,
+            mergeReason: String,
+            predictedRisk: SkillRisk,
+            requiredEvidence: [String]
+        ) {
+            self.targetSlug = targetSlug
+            self.appName = appName
+            self.sourceCaseIDs = sourceCaseIDs
+            self.proposedMarkdown = proposedMarkdown
+            self.mergeReason = mergeReason
+            self.predictedRisk = predictedRisk
+            self.requiredEvidence = requiredEvidence
+        }
+    }
+
     public struct Thresholds: Sendable {
         public let revise: Double
         public let archive: Double
@@ -27,6 +62,9 @@ public struct SkillConsolidator: Sendable {
         public let successCount: Int
         public let failureCount: Int
         public let evidenceIDs: Set<String>
+        public let sourceCaseIDs: Set<String>
+        public let risk: SkillRisk
+        public let status: AppSkillStatus
         public let quarantined: Bool
         public let archived: Bool
 
@@ -38,6 +76,9 @@ public struct SkillConsolidator: Sendable {
             successCount: Int = 0,
             failureCount: Int = 0,
             evidenceIDs: Set<String> = [],
+            sourceCaseIDs: Set<String> = [],
+            risk: SkillRisk = .low,
+            status: AppSkillStatus = .active,
             quarantined: Bool = false,
             archived: Bool = false
         ) {
@@ -48,8 +89,11 @@ public struct SkillConsolidator: Sendable {
             self.successCount = max(0, successCount)
             self.failureCount = max(0, failureCount)
             self.evidenceIDs = evidenceIDs
-            self.quarantined = quarantined
-            self.archived = archived
+            self.sourceCaseIDs = sourceCaseIDs
+            self.risk = risk
+            self.status = status
+            self.quarantined = quarantined || status == .quarantined
+            self.archived = archived || status == .archived
         }
     }
 
@@ -77,6 +121,12 @@ public struct SkillConsolidator: Sendable {
         public let action: Action
         public let bestMatch: OverlapScore?
         public let activeExistingIDs: [String]
+        public let sourceCaseIDs: [String]
+        public let successCount: Int
+        public let failureCount: Int
+        public let predictedRisk: SkillRisk
+        public let requiredEvidence: [String]
+        public let mergeReason: String
     }
 
     private let thresholds: Thresholds
@@ -94,18 +144,25 @@ public struct SkillConsolidator: Sendable {
         successCount: Int = 0,
         failureCount: Int = 0,
         evidenceIDs: Set<String> = [],
+        sourceCaseIDs: Set<String> = [],
+        risk: SkillRisk = .low,
+        status: AppSkillStatus? = nil,
         quarantined: Bool = false,
         archived: Bool = false
     ) -> LearnedSkillRecord? {
         guard let skill = AppSkillRegistry.parseSkill(markdown: markdown, path: path, source: source) else { return nil }
+        let effectiveSourceCases = sourceCaseIDs.isEmpty ? Set(skill.sourceCaseIDs) : sourceCaseIDs
         return LearnedSkillRecord(
             id: id,
             skill: skill,
             humanSteps: inferredHumanSteps(from: skill.instructions),
             approved: approved,
-            successCount: successCount,
-            failureCount: failureCount,
-            evidenceIDs: evidenceIDs,
+            successCount: max(successCount, skill.successCount),
+            failureCount: max(failureCount, skill.failureCount),
+            evidenceIDs: evidenceIDs.isEmpty ? Set(skill.sourceCaseIDs) : evidenceIDs,
+            sourceCaseIDs: effectiveSourceCases,
+            risk: riskFrom(metadata: skill.riskClass) ?? risk,
+            status: status ?? skill.status,
             quarantined: quarantined,
             archived: archived
         )
@@ -120,6 +177,13 @@ public struct SkillConsolidator: Sendable {
                     skill: skill,
                     humanSteps: Self.inferredHumanSteps(from: skill.instructions),
                     approved: skill.source == "user"
+                        && skill.status == .active,
+                    successCount: skill.successCount,
+                    failureCount: skill.failureCount,
+                    evidenceIDs: Set(skill.sourceCaseIDs),
+                    sourceCaseIDs: Set(skill.sourceCaseIDs),
+                    risk: Self.riskFrom(metadata: skill.riskClass) ?? .low,
+                    status: skill.status
                 )
             }
     }
@@ -129,55 +193,119 @@ public struct SkillConsolidator: Sendable {
         let activeIDs = active.map(\.id)
 
         if candidate.quarantined {
-            return Result(
+            return result(
+                for: candidate,
                 action: .quarantine(reason: "candidate is already quarantined"),
                 bestMatch: nil,
-                activeExistingIDs: activeIDs
+                activeExistingIDs: activeIDs,
+                mergeReason: "candidate status is quarantined"
             )
         }
         if candidate.archived {
-            return Result(
+            return result(
+                for: candidate,
                 action: .quarantine(reason: "candidate is already archived"),
                 bestMatch: nil,
-                activeExistingIDs: activeIDs
+                activeExistingIDs: activeIDs,
+                mergeReason: "candidate status is archived"
+            )
+        }
+        if hasUnresolvedSafetyEvidence(candidate) {
+            return result(
+                for: candidate,
+                action: .quarantine(reason: "candidate includes unresolved safety or permission evidence"),
+                bestMatch: nil,
+                activeExistingIDs: activeIDs,
+                mergeReason: "safety/permission evidence requires human review",
+                requiredEvidence: ["verified safe completion", "explicit permission boundary"]
             )
         }
         if isFailureDominated(candidate) {
-            return Result(
+            return result(
+                for: candidate,
                 action: .quarantine(reason: "candidate failure history dominates successes"),
                 bestMatch: nil,
-                activeExistingIDs: activeIDs
+                activeExistingIDs: activeIDs,
+                mergeReason: "failure history dominates successes",
+                requiredEvidence: ["at least one verified success case after the failure"]
+            )
+        }
+        if candidate.successCount == 0 || candidate.sourceCaseIDs.isEmpty {
+            return result(
+                for: candidate,
+                action: .quarantine(reason: "verified source case required before consolidation"),
+                bestMatch: nil,
+                activeExistingIDs: activeIDs,
+                mergeReason: "missing verified success source case",
+                requiredEvidence: ["verified_success_case", "source_case_id"]
             )
         }
 
         guard let best = bestMatch(for: candidate, in: active) else {
-            return Result(action: .newSkill, bestMatch: nil, activeExistingIDs: activeIDs)
+            return result(
+                for: candidate,
+                action: .newSkill,
+                bestMatch: nil,
+                activeExistingIDs: activeIDs,
+                mergeReason: "no active similar skill matched"
+            )
         }
         guard best.score.total >= thresholds.revise else {
-            return Result(action: .newSkill, bestMatch: best.score, activeExistingIDs: activeIDs)
+            return result(
+                for: candidate,
+                action: .newSkill,
+                bestMatch: best.score,
+                activeExistingIDs: activeIDs,
+                mergeReason: "overlap below revision threshold"
+            )
         }
 
         if best.score.total >= thresholds.archive,
            !addsNovelSignal(candidate, beyond: best.record),
            qualityScore(candidate) < qualityScore(best.record) {
-            return Result(
+            return result(
+                for: candidate,
                 action: .archiveCandidate(existingID: best.record.id),
                 bestMatch: best.score,
-                activeExistingIDs: activeIDs
+                activeExistingIDs: activeIDs,
+                mergeReason: "active skill already covers this draft with stronger verified signal"
             )
         }
 
-        return Result(
+        return result(
+            for: candidate,
             action: .reviseExisting(existingID: best.record.id),
             bestMatch: best.score,
-            activeExistingIDs: activeIDs
+            activeExistingIDs: activeIDs,
+            mergeReason: "verified draft overlaps an active skill and adds reusable signal"
         )
     }
 
     public func activeSkills(from records: [LearnedSkillRecord]) -> [LearnedSkillRecord] {
         records
-            .filter { $0.approved && !$0.quarantined && !$0.archived && !isFailureDominated($0) }
+            .filter { $0.approved && $0.status == .active && !$0.quarantined && !$0.archived && !isFailureDominated($0) }
             .sorted(by: stableOrder)
+    }
+
+    private func result(
+        for candidate: LearnedSkillRecord,
+        action: Action,
+        bestMatch: OverlapScore?,
+        activeExistingIDs: [String],
+        mergeReason: String,
+        requiredEvidence: [String] = []
+    ) -> Result {
+        Result(
+            action: action,
+            bestMatch: bestMatch,
+            activeExistingIDs: activeExistingIDs,
+            sourceCaseIDs: Array(candidate.sourceCaseIDs).sorted(),
+            successCount: candidate.successCount,
+            failureCount: candidate.failureCount,
+            predictedRisk: predictedRisk(for: candidate),
+            requiredEvidence: requiredEvidence,
+            mergeReason: mergeReason
+        )
     }
 
     private func bestMatch(
@@ -275,15 +403,30 @@ public struct SkillConsolidator: Sendable {
         return record.failureCount >= (record.successCount * 2 + 1)
     }
 
-    private func addsNovelSignal(_ candidate: LearnedSkillRecord, beyond existing: LearnedSkillRecord) -> Bool {
-        let candidateSteps = Set(candidate.humanSteps.map(Self.normalizedStep).filter { !$0.isEmpty })
-        let existingSteps = Set(existing.humanSteps.map(Self.normalizedStep).filter { !$0.isEmpty })
-        if !candidateSteps.subtracting(existingSteps).isEmpty { return true }
-        if !candidate.evidenceIDs.subtracting(existing.evidenceIDs).isEmpty { return true }
-        let candidateUseWhen = Self.tokens(in: candidate.skill.useWhen)
-        let existingUseWhen = Self.tokens(in: existing.skill.useWhen)
-        return !candidateUseWhen.subtracting(existingUseWhen).isEmpty
+    private func hasUnresolvedSafetyEvidence(_ record: LearnedSkillRecord) -> Bool {
+        let text = "\(record.skill.markdown)\n\(record.skill.description)\n\(record.skill.useWhen)".lowercased()
+        let markers = [
+            "unsafe_action", "secure_input", "permission_denied", "safety refusal",
+            "bypass permission", "disable security", "keychain", "password"
+        ]
+        return markers.contains { text.contains($0) }
     }
+
+    private func predictedRisk(for record: LearnedSkillRecord) -> SkillRisk {
+        if record.risk == .safety || hasUnresolvedSafetyEvidence(record) { return .safety }
+        if record.failureCount >= thresholds.failureQuarantineCount { return .high }
+        if record.failureCount > 0 { return .medium }
+        return record.risk
+    }
+
+    private func addsNovelSignal(_ candidate: LearnedSkillRecord, beyond existing: LearnedSkillRecord) -> Bool {
+	        let candidateSteps = Set(candidate.humanSteps.map(Self.normalizedStep).filter { !$0.isEmpty })
+	        let existingSteps = Set(existing.humanSteps.map(Self.normalizedStep).filter { !$0.isEmpty })
+	        if !candidateSteps.subtracting(existingSteps).isEmpty { return true }
+	        let candidateUseWhen = Self.tokens(in: candidate.skill.useWhen)
+	        let existingUseWhen = Self.tokens(in: existing.skill.useWhen)
+	        return !candidateUseWhen.subtracting(existingUseWhen).isEmpty
+	    }
 
     private func stableOrder(_ lhs: LearnedSkillRecord, _ rhs: LearnedSkillRecord) -> Bool {
         let lhsKey = "\(Self.normalizedPhrase(lhs.skill.name))\u{0}\(lhs.id)"
@@ -333,6 +476,11 @@ public struct SkillConsolidator: Sendable {
         }
         if current.count > 1, !stopwords.contains(current) { tokens.insert(current) }
         return tokens
+    }
+
+    private static func riskFrom(metadata: String?) -> SkillRisk? {
+        guard let metadata else { return nil }
+        return SkillRisk(rawValue: metadata.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     private static func jaccard<T: Hashable>(_ lhs: Set<T>, _ rhs: Set<T>) -> Double {

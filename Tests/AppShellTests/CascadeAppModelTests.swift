@@ -125,10 +125,17 @@ func refreshAllCuratesDetectedWorkflows() async throws {
     // (≥3×, real time) kept it → curator judged + named it → it's what the
     // manager's review queue shows.
     #expect(model.detectedWaste.count == 1)
-    #expect(model.curatedWaste.count == 1)
-    #expect(model.curatedWaste.first?.name == "Reply to refund emails with the policy link")
-    #expect(model.pendingCuratedAgents.count == 1) // nothing approved or declined yet
-}
+	    #expect(model.curatedWaste.count == 1)
+	    #expect(model.curatedWaste.first?.name == "Reply to refund emails with the policy link")
+	    #expect(model.pendingCuratedAgents.count == 1) // nothing approved or declined yet
+	    #expect(model.learningOpportunities.contains { $0.kind == .repeatedWorkflow })
+
+	    let opportunity = try #require(model.learningOpportunities.first { $0.kind == .repeatedWorkflow })
+	    model.focusLearningOpportunity(opportunity)
+	    #expect(model.selectedTab == .manager)
+	    model.dismissLearningOpportunity(opportunity)
+	    #expect(!model.learningOpportunities.contains { $0.id == opportunity.id })
+	}
 
 @MainActor @Test
 func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
