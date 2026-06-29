@@ -128,7 +128,12 @@ public struct WebDOMGrounder: VisualGrounder {
                     candidateID: candidate.candidateID,
                     markNumber: candidate.markNumber,
                     displayBounds: candidate.displayBounds,
-                    imageBounds: candidate.imageBounds
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.nearbyOCRText,
+                    ocrDistancePoints: candidate.ocrDistancePoints,
+                    agreeingSources: candidate.agreeingSources
                 )
             },
             selectedIndex: result.selectedIndex,

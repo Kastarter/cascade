@@ -1521,9 +1521,9 @@ public final class CascadeAppModel: ObservableObject {
             return .secureInput
         case .targetNotFound:
             return .targetNotFound
-        case .groundingMiss:
+        case .groundingMiss, .lowConfidenceGrounding:
             return .groundingMiss
-        case .noEffect:
+        case .noEffect, .effectMismatch:
             return .noEffect
         case .staleFrameBatch:
             return .staleFrameBatch
@@ -1531,7 +1531,7 @@ public final class CascadeAppModel: ObservableObject {
             return .modalBlocked
         case .verificationUnavailable:
             return .verificationUnavailable
-        case .validatorIncomplete:
+        case .validatorIncomplete, .preconditionFailed, .verifierDisagreement:
             return .verifierRejected
         case .transportFailure:
             return .toolError
@@ -2643,7 +2643,7 @@ public final class CascadeAppModel: ObservableObject {
         }
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
-        let verifyCandidates = d.bool(forKey: Self.experimentalGroundingVerifierKey)
+        let verifyCandidates = (d.object(forKey: Self.experimentalGroundingVerifierKey) as? Bool) ?? mixture
         return mixture ? MixtureGrounder(
             base: base,
             skills: appSkills,
@@ -2665,6 +2665,19 @@ public final class CascadeAppModel: ObservableObject {
                     actor: "agent",
                     action: "grounding.verifier",
                     detail: Self.groundingVerifierAuditDetail(outcome)
+                ))
+                guard outcome.verifierResult.verdict != .accept else { return }
+                let appName = await MainActor.run { AppWindowObserver.snapshot().appName }
+                let tokens = TrajectorySketch.normalizedGoalTokens(from: outcome.target)
+                guard !tokens.isEmpty, appName != "Unknown app" else { return }
+                _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
+                    appName: appName,
+                    normalizedGoalTokens: Array(tokens.prefix(10)),
+                    failureKind: .groundingMiss,
+                    firstBadAction: "ground \(outcome.target)",
+                    targetHash: outcome.selectedCandidateHash ?? Self.auditHash(outcome.target),
+                    stateSummary: "verifier=\(outcome.verifierResult.verdict.rawValue) failure=\(outcome.verifierResult.failureKind?.rawValue ?? "none") source=\(outcome.selectedSource?.rawValue ?? "unknown")",
+                    repairHint: "Re-describe the visible target once and prefer independent AX/OCR agreement over the rejected source."
                 ))
             }
         ) : base
@@ -4152,13 +4165,17 @@ public final class CascadeAppModel: ObservableObject {
     nonisolated static func actionCritiqueAuditDetail(
         toolName: String,
         verdict: ActionCritique.Verdict,
-        reason: String
+        reason: String,
+        failureKind: CascadeMemory.AgentFailureKind? = .unsafeAction
     ) -> String {
-        [
+        var parts = [
             "tool=\(safeAuditToken(toolName))",
             "verdict=\(safeAuditToken(verdict.rawValue))",
+            "failureKind=\(safeAuditToken(failureKind?.rawValue ?? "unsafe_action"))",
+            "recoveryAction=\(safeAuditToken(AgentRecoveryPolicy.plan(for: .unsafeActionRefused).terminal.rawValue))",
             textAuditDetail("reason", reason),
-        ].joined(separator: " ")
+        ]
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func assistPlanAuditDetail(_ plan: AgentTaskPlan) -> String {
@@ -4415,11 +4432,15 @@ public final class CascadeAppModel: ObservableObject {
         failureKind: CascadeMemory.AgentFailureKind?,
         evidenceName: String,
         evidence: String,
-        skill: AppSkill?
+        skill: AppSkill?,
+        postEffect: String? = nil,
+        expectedEffect: String? = nil
     ) -> String {
         var parts = [
             "status=\(safeAuditToken(status))",
             "actionKind=\(safeAuditToken(actionKind))",
+            "postEffect=\(safeAuditToken(postEffect ?? status))",
+            "expectedEffect=\(safeAuditToken(expectedEffect ?? actionKind))",
             "\(safeAuditToken(evidenceName))Chars=\(evidence.count)",
             "\(safeAuditToken(evidenceName))Hash=\(auditHash(evidence))",
             "failureKind=\(safeAuditToken(failureKind?.rawValue ?? "none"))",
@@ -4467,14 +4488,21 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func groundingVerifierAuditDetail(_ outcome: MixtureGrounder.VerifierOutcome) -> String {
         let failure = outcome.verifierResult.failureKind?.rawValue ?? "none"
-        return [
+        var parts = [
             "verdict=\(safeAuditToken(outcome.verifierResult.verdict.rawValue))",
             "outcome=\(safeAuditToken(outcome.auditOutcome))",
             "failure=\(safeAuditToken(failure))",
             "confidence=\(String(format: "%.2f", outcome.verifierResult.confidence))",
             "candidates=\(outcome.candidateCount)",
-            textAuditDetail("target", outcome.target),
-        ].joined(separator: " ")
+            textAuditDetail("target", outcome.target)
+        ]
+        if let selectedSource = outcome.selectedSource {
+            parts.append("selectedSource=\(safeAuditToken(selectedSource.rawValue))")
+        }
+        if let selectedCandidateHash = outcome.selectedCandidateHash {
+            parts.append("selectedCandidateHash=\(safeAuditToken(selectedCandidateHash))")
+        }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func harnessDeniedWatchedAppAuditDetail(toolName: String, watchedApp: String) -> String {
@@ -4944,6 +4972,47 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
+    struct ActionEffectValidation: Sendable, Equatable {
+        let postEffect: String
+        let status: String
+        let failureKind: CascadeMemory.AgentFailureKind?
+        let expectedEffect: String
+    }
+
+    nonisolated static func validateActionEffect(
+        goal: String,
+        action: CUAction,
+        before: [UInt64]?,
+        after: [UInt64]?,
+        expectedEffect: String
+    ) -> ActionEffectValidation {
+        if let before, let after,
+           !PerceptualHash.isDuplicateGrid(after, of: before, threshold: 2) {
+            return ActionEffectValidation(
+                postEffect: "verified",
+                status: "verified",
+                failureKind: nil,
+                expectedEffect: expectedEffect
+            )
+        }
+        switch action {
+        case .wait, .screenshot, .zoom:
+            return ActionEffectValidation(
+                postEffect: "unavailable",
+                status: "unavailable",
+                failureKind: .verificationUnavailable,
+                expectedEffect: expectedEffect
+            )
+        default:
+            return ActionEffectValidation(
+                postEffect: before != nil && after != nil ? "mismatch" : "unavailable",
+                status: before != nil && after != nil ? "failed" : "unavailable",
+                failureKind: before != nil && after != nil ? .noEffect : .verificationUnavailable,
+                expectedEffect: expectedEffect
+            )
+        }
+    }
+
     private func verifyPostAction(_ action: CUAction) async {
         switch action {
         case .openApp(let name):
@@ -4963,7 +5032,9 @@ public final class CascadeAppModel: ObservableObject {
                     failureKind: passed ? nil : .wrongStartState,
                     evidenceName: "target",
                     evidence: name,
-                    skill: frontmostSkill()
+                    skill: frontmostSkill(),
+                    postEffect: passed ? "verified" : "mismatch",
+                    expectedEffect: "frontmost_app"
                 )
             ))
         case .type(let text):
@@ -4977,7 +5048,9 @@ public final class CascadeAppModel: ObservableObject {
                         failureKind: .verificationUnavailable,
                         evidenceName: "text",
                         evidence: text,
-                        skill: frontmostSkill()
+                        skill: frontmostSkill(),
+                        postEffect: "unavailable",
+                        expectedEffect: "focused_ax_value"
                     )
                 ))
                 return
@@ -4991,7 +5064,9 @@ public final class CascadeAppModel: ObservableObject {
                     failureKind: contains ? nil : .verifierRejected,
                     evidenceName: "text",
                     evidence: text,
-                    skill: frontmostSkill()
+                    skill: frontmostSkill(),
+                    postEffect: contains ? "verified" : "mismatch",
+                    expectedEffect: "focused_ax_value"
                 )
             ))
         case .openURL(let url):
@@ -5004,7 +5079,9 @@ public final class CascadeAppModel: ObservableObject {
                     failureKind: .verificationUnavailable,
                     evidenceName: "url",
                     evidence: url,
-                    skill: frontmostSkill()
+                    skill: frontmostSkill(),
+                    postEffect: "unavailable",
+                    expectedEffect: "browser_url_or_page_text"
                 )
             ))
         default:

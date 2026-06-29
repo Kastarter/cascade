@@ -9,7 +9,7 @@ import Testing
 
 @MainActor
 private func makeAssistGrounderModel(
-    verifierEnabled: Bool,
+    verifierEnabled: Bool?,
     baseResult: GroundingResult
 ) throws -> (model: CascadeAppModel, store: CascadeStore) {
     let path = FileManager.default.temporaryDirectory
@@ -17,7 +17,9 @@ private func makeAssistGrounderModel(
     let store = try CascadeStore(path: path)
     let defaults = UserDefaults(suiteName: "CascadeAssistGrounder-\(UUID().uuidString)")!
     defaults.set(true, forKey: "cascade.mixtureGrounding")
-    defaults.set(verifierEnabled, forKey: CascadeAppModel.experimentalGroundingVerifierKey)
+    if let verifierEnabled {
+        defaults.set(verifierEnabled, forKey: CascadeAppModel.experimentalGroundingVerifierKey)
+    }
     let model = try CascadeAppModel(
         store: store,
         orchestrator: CascadeOrchestrator(store: store),
@@ -30,7 +32,7 @@ private func makeAssistGrounderModel(
 }
 
 @MainActor @Test
-func assistGrounderDefaultLeavesVerifierOffAndReturnsLegacyPoint() async throws {
+func assistGrounderExplicitOptOutLeavesVerifierOffAndReturnsLegacyPoint() async throws {
     let oldPoint = CGPoint(x: 1_200, y: 320)
     let (model, store) = try makeAssistGrounderModel(
         verifierEnabled: false,
@@ -50,6 +52,29 @@ func assistGrounderDefaultLeavesVerifierOffAndReturnsLegacyPoint() async throws 
 
     #expect(selected == oldPoint)
     #expect(!audit.contains { $0.action == "grounding.verifier" })
+}
+
+@MainActor @Test
+func assistGrounderDefaultEnablesVerifierWhenMixtureIsActive() async throws {
+    let (model, store) = try makeAssistGrounderModel(
+        verifierEnabled: nil,
+        baseResult: groundingResult([
+            groundingCandidate(point: CGPoint(x: 1_200, y: 320), rawModel: "Send")
+        ])
+    )
+
+    let grounder = try #require(model.assistGrounder())
+    let result = await grounder.groundResult(
+        screenshot: Data(),
+        target: "Send",
+        displayWidthPoints: 1_000,
+        displayHeightPoints: 700
+    )
+    let audit = try await store.recentAudit()
+
+    #expect(result.selectedPoint == nil)
+    #expect(audit.first?.action == "grounding.verifier")
+    #expect(audit.first?.detail.contains("verdict=reject") == true)
 }
 
 @MainActor @Test

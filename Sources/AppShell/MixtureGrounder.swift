@@ -85,17 +85,23 @@ public struct MixtureGrounder: VisualGrounder {
         public let outcome: VerifiedGroundingOutcome
         public let verifierResult: GroundingVerifierResult
         public let candidateCount: Int
+        public let selectedSource: GroundingSource?
+        public let selectedCandidateHash: String?
 
         public init(
             target: String,
             outcome: VerifiedGroundingOutcome,
             verifierResult: GroundingVerifierResult,
-            candidateCount: Int
+            candidateCount: Int,
+            selectedSource: GroundingSource? = nil,
+            selectedCandidateHash: String? = nil
         ) {
             self.target = target
             self.outcome = outcome
             self.verifierResult = verifierResult
             self.candidateCount = candidateCount
+            self.selectedSource = selectedSource
+            self.selectedCandidateHash = selectedCandidateHash
         }
     }
 
@@ -281,8 +287,24 @@ public struct MixtureGrounder: VisualGrounder {
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints
             )
+            let ambiguityOptions = Self.ambiguityOptions(
+                from: options,
+                indexedResult: indexedResult,
+                axCandidate: axCandidate,
+                target: target,
+                candidateFailureCounts: candidateFailureCounts
+            )
             let baseResult: GroundingResult
-            if let indexedResult {
+            if ambiguityOptions.sampleCount > options.sampleCount {
+                let visualResult = await base.groundResult(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints,
+                    options: ambiguityOptions
+                )
+                baseResult = Self.mergedGroundingResult(indexedResult, visualResult)
+            } else if let indexedResult {
                 baseResult = indexedResult
             } else {
                 baseResult = await base.groundResult(
@@ -293,7 +315,7 @@ public struct MixtureGrounder: VisualGrounder {
                     options: options
                 )
             }
-            let selection = Self.selectVerifiedCandidate(
+            var selection = Self.selectVerifiedCandidate(
                 axCandidate: axCandidate,
                 baseResult: baseResult,
                 target: target,
@@ -302,10 +324,108 @@ public struct MixtureGrounder: VisualGrounder {
                 previousAnchor: previousAnchor,
                 candidateFailureCounts: candidateFailureCounts
             )
+            if selection.verifierResult.verdict != .accept,
+               ambiguityOptions.sampleCount == options.sampleCount,
+               options.sampleCount < 3 {
+                let visualResult = await base.groundResult(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints,
+                    options: Self.escalatedGroundingOptions(from: options)
+                )
+                let retriedBase = Self.mergedGroundingResult(visualResult, indexedResult ?? baseResult)
+                selection = Self.selectVerifiedCandidate(
+                    axCandidate: axCandidate,
+                    baseResult: retriedBase,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints,
+                    previousAnchor: previousAnchor,
+                    candidateFailureCounts: candidateFailureCounts
+                )
+            }
             await recordVerifierOutcomeIfNeeded(selection, target: target)
             await storeGroundingCacheResult(selection.result, key: key)
             return selection.result
         }
+    }
+
+    private static func ambiguityOptions(
+        from options: GroundingRequestOptions,
+        indexedResult: GroundingResult?,
+        axCandidate: GroundingVerifierCandidate?,
+        target: String,
+        candidateFailureCounts: [String: Int]
+    ) -> GroundingRequestOptions {
+        guard options.sampleCount < 3 else { return options }
+        guard shouldEscalateForAmbiguity(
+            indexedResult: indexedResult,
+            axCandidate: axCandidate,
+            target: target,
+            risk: options.risk,
+            candidateFailureCounts: candidateFailureCounts
+        ) else { return options }
+        return escalatedGroundingOptions(from: options)
+    }
+
+    private static func escalatedGroundingOptions(from options: GroundingRequestOptions) -> GroundingRequestOptions {
+        GroundingRequestOptions(
+            sampleCount: 3,
+            maxDispersion: min(options.maxDispersion, 24),
+            minimumConfidence: max(options.minimumConfidence, 0.72),
+            risk: options.risk,
+            priorityRegions: options.priorityRegions,
+            useRegionBudgeting: options.useRegionBudgeting,
+            hostedMode: options.hostedMode
+        )
+    }
+
+    private static func shouldEscalateForAmbiguity(
+        indexedResult: GroundingResult?,
+        axCandidate: GroundingVerifierCandidate?,
+        target: String,
+        risk: GroundingActionRisk,
+        candidateFailureCounts: [String: Int]
+    ) -> Bool {
+        if risk == .high || risk == .destructive { return true }
+        if !candidateFailureCounts.isEmpty { return true }
+        if looksGenericTarget(target) { return true }
+        if (indexedResult?.alternativeCount ?? 0) > 0 { return true }
+        if let axCandidate,
+           let selected = indexedResult?.selectedCandidate,
+           selected.source != axCandidate.candidate.source,
+           !pointsAgree(selected.point, axCandidate.candidate.point) {
+            return true
+        }
+        return false
+    }
+
+    private static func looksGenericTarget(_ target: String) -> Bool {
+        let tokens = Set(target.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty })
+        guard !tokens.isEmpty else { return false }
+        let generic: Set<String> = [
+            "button", "field", "box", "input", "next", "continue", "submit",
+            "send", "ok", "done", "cancel", "delete", "search", "link", "tab"
+        ]
+        return !tokens.isDisjoint(with: generic) && tokens.count <= 4
+    }
+
+    private static func mergedGroundingResult(_ lhs: GroundingResult?, _ rhs: GroundingResult?) -> GroundingResult {
+        let candidates = [lhs, rhs].compactMap { $0 }.flatMap(\.candidates)
+        guard !candidates.isEmpty else { return GroundingResult() }
+        let selectedID = lhs?.selectedCandidateID ?? rhs?.selectedCandidateID ?? candidates.first?.candidateID
+        let selectedIndex = selectedID.flatMap { id in candidates.firstIndex { $0.candidateID == id } } ?? 0
+        return GroundingResult(
+            candidates: candidates,
+            selectedIndex: selectedIndex,
+            selectedCandidateID: selectedID,
+            verifierVerdict: lhs?.verifierVerdict ?? rhs?.verifierVerdict,
+            verifierFailureKind: lhs?.verifierFailureKind ?? rhs?.verifierFailureKind,
+            alternativeCount: max((lhs?.alternativeCount ?? 0) + (rhs?.alternativeCount ?? 0), candidates.count - 1)
+        )
     }
 
     private enum CacheProbe {
@@ -452,7 +572,12 @@ public struct MixtureGrounder: VisualGrounder {
                     candidateID: candidate.candidateID,
                     markNumber: candidate.markNumber,
                     displayBounds: candidate.displayBounds,
-                    imageBounds: candidate.imageBounds
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.nearbyOCRText,
+                    ocrDistancePoints: candidate.ocrDistancePoints,
+                    agreeingSources: candidate.agreeingSources
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -479,7 +604,12 @@ public struct MixtureGrounder: VisualGrounder {
                     candidateID: candidate.candidateID,
                     markNumber: candidate.markNumber,
                     displayBounds: candidate.displayBounds,
-                    imageBounds: candidate.imageBounds
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.nearbyOCRText,
+                    ocrDistancePoints: candidate.ocrDistancePoints,
+                    agreeingSources: candidate.agreeingSources
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -501,17 +631,29 @@ public struct MixtureGrounder: VisualGrounder {
         target: String
     ) async {
         guard let onVerifierOutcome else { return }
-        switch selection.outcome {
-        case .rejected, .abstained:
-            await onVerifierOutcome(VerifierOutcome(
-                target: target,
-                outcome: selection.outcome,
-                verifierResult: selection.verifierResult,
-                candidateCount: selection.result.candidates.count
-            ))
-        case .selected, .drifted, .ambiguous, .demote, .retryNextCandidate:
-            break
+        await onVerifierOutcome(VerifierOutcome(
+            target: target,
+            outcome: selection.outcome,
+            verifierResult: selection.verifierResult,
+            candidateCount: selection.result.candidates.count,
+            selectedSource: selection.result.selectedCandidate?.source,
+            selectedCandidateHash: Self.auditHash(
+                selection.result.selectedCandidate?.candidateID
+                    ?? selection.result.selectedCandidate?.rawModel
+                    ?? selection.result.selectedCandidateID
+                    ?? selection.result.selectedCandidate?.label
+            )
+        ))
+    }
+
+    private static func auditHash(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
         }
+        return String(format: "%016llx", hash)
     }
 
     /// Region grounding (the "where is X" highlight) first tries a deterministic
@@ -580,11 +722,18 @@ public struct MixtureGrounder: VisualGrounder {
             )
         )
         guard !indexed.isEmpty else { return nil }
-        if let selected = ScreenElementIndex.bestCandidate(for: target, in: indexed, policy: Self.trustPolicy) {
+        let ranked = ScreenElementIndex.rankedCandidates(
+            for: target,
+            in: indexed,
+            policy: Self.trustPolicy,
+            within: 0.35,
+            limit: 5
+        )
+        if !ranked.isEmpty {
             return Self.groundingResult(
-                from: selected,
-                reason: "clickable-map \(selected.source.rawValue) label match",
-                alternativeCount: max(0, indexed.count - 1)
+                from: ranked,
+                reason: "clickable-map ranked label match",
+                totalCandidateCount: indexed.count
             )
         }
         guard let markedJPEG = ScreenElementIndex.renderMarkedJPEG(
@@ -606,31 +755,50 @@ public struct MixtureGrounder: VisualGrounder {
     }
 
     private static func groundingResult(
-        from selected: ScreenElementIndex.IndexedCandidate,
+        from ranked: [ScreenElementIndex.RankedCandidate],
         reason: String,
-        alternativeCount: Int
+        totalCandidateCount: Int
     ) -> GroundingResult {
-        let source: GroundingSource = selected.source == .accessibility ? .accessibility : .ocr
+        let candidates = ranked.map { rankedCandidate -> GroundingCandidate in
+            let selected = rankedCandidate.candidate
+            let source = Self.groundingSource(selected.source)
+            let agreeingSources = selected.contributingSources.compactMap(Self.groundingSource)
+            return GroundingCandidate(
+                point: selected.center,
+                region: selected.bounds.cgRect,
+                confidence: min(1, max(selected.confidence, rankedCandidate.score / 3)),
+                source: source,
+                coordinateSpace: .displayLocalAppKitPoints,
+                rawModel: selected.label,
+                reason: "\(reason) \(selected.source.rawValue) score \(String(format: "%.2f", rankedCandidate.score))",
+                candidateID: selected.id,
+                markNumber: selected.mark.number,
+                displayBounds: selected.bounds.cgRect,
+                imageBounds: selected.imageBounds?.cgRect,
+                role: selected.role.rawValue,
+                label: selected.label,
+                nearbyOCRText: selected.label,
+                ocrDistancePoints: selected.source == .ocr ? 0 : nil,
+                agreeingSources: agreeingSources.filter { $0 != source }
+            )
+        }
         return GroundingResult(
-            candidates: [
-                GroundingCandidate(
-                    point: selected.center,
-                    region: selected.bounds.cgRect,
-                    confidence: selected.confidence,
-                    source: source,
-                    coordinateSpace: .displayLocalAppKitPoints,
-                    rawModel: selected.label,
-                    reason: reason,
-                    candidateID: selected.id,
-                    markNumber: selected.mark.number,
-                    displayBounds: selected.bounds.cgRect,
-                    imageBounds: selected.imageBounds?.cgRect
-                )
-            ],
+            candidates: candidates,
             selectedIndex: 0,
-            selectedCandidateID: selected.id,
-            alternativeCount: alternativeCount
+            selectedCandidateID: candidates.first?.candidateID,
+            alternativeCount: max(0, totalCandidateCount - 1)
         )
+    }
+
+    private static func groundingSource(_ source: ScreenElementIndex.Source) -> GroundingSource {
+        switch source {
+        case .accessibility:
+            return .accessibility
+        case .visual:
+            return .visualModel
+        case .ocr:
+            return .ocr
+        }
     }
 
     private static func markedCandidates(
@@ -1142,10 +1310,11 @@ public struct MixtureGrounder: VisualGrounder {
             GroundingVerifierCandidate(
                 id: candidate.candidateID ?? "base:\(index)",
                 candidate: candidate,
-                label: candidate.rawModel,
-                nearbyOCRText: candidate.rawModel,
-                ocrDistancePoints: candidate.dispersion,
-                agreeingSources: Self.agreeingSources(for: candidate, axCandidate: axCandidate)
+                role: candidate.role,
+                label: candidate.label ?? candidate.rawModel,
+                nearbyOCRText: candidate.nearbyOCRText ?? candidate.rawModel,
+                ocrDistancePoints: candidate.ocrDistancePoints ?? candidate.dispersion,
+                agreeingSources: candidate.agreeingSources + Self.agreeingSources(for: candidate, axCandidate: axCandidate)
             )
         }
 

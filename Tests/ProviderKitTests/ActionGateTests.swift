@@ -128,4 +128,28 @@ struct ActionGateTests {
         #expect(critique?.failureKind == CascadeMemory.AgentFailureKind.unsafeAction)
         #expect(PromptActionCritic.parse(#"{"verdict":"approve","reason":"ok"}"#)?.verdict == .approve)
     }
+
+    @Test func preActionVerifierClassifiesRiskyHarnessURLAndGroundingSignals() {
+        let shell = PreActionVerifier.verify(harnessToolName: "run_command")
+        #expect(shell.risk == .high)
+        #expect(shell.failureKind == .unsafeAction)
+        #expect(shell.triggerReasons.contains("shell"))
+        #expect(shell.triggerReasons.contains("power_harness_tool"))
+
+        let write = PreActionVerifier.verify(harnessToolName: "write_file")
+        #expect(write.risk == .high)
+        #expect(write.failureKind == .unsafeAction)
+        #expect(write.triggerReasons.contains("file_write"))
+
+        let externalURL = PreActionVerifier.verify(action: .openURL("https://example.com/dashboard"))
+        #expect(externalURL.risk == .high)
+        #expect(externalURL.failureKind == .unsafeAction)
+        #expect(externalURL.triggerReasons.contains("external_url"))
+
+        let grounding = PreActionVerifier.verify(lowConfidenceGrounding: true, alternativeCount: 2)
+        #expect(grounding.risk == .high)
+        #expect(grounding.failureKind == .groundingMiss)
+        #expect(grounding.triggerReasons.contains("low_confidence_grounding"))
+        #expect(grounding.triggerReasons.contains("ambiguous_grounding"))
+    }
 }

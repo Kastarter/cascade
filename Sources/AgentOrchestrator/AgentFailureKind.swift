@@ -22,6 +22,10 @@ public enum AgentFailureKind: String, Sendable, Equatable, CaseIterable, Codable
     case transportFailure       // network/model/IPC transport error
     case unsafeActionRefused    // a guardrail refused an irreversible/destructive act
     case parameterNeedsLiveValue // a replay step needed a fresh value it couldn't trust
+    case lowConfidenceGrounding // verifier could not trust the selected target
+    case preconditionFailed     // pre-action verifier found the action's precondition false
+    case effectMismatch         // process verifier saw the wrong/no post-action effect
+    case verifierDisagreement   // independent verifier evidence disagreed
     case stepLimit              // hit the per-episode step cap
     case timeout                // wall-clock budget exceeded
     case userStop               // the user pressed STOP
@@ -31,10 +35,10 @@ public enum AgentFailureKind: String, Sendable, Equatable, CaseIterable, Codable
     public var category: Category {
         switch self {
         case .wrongStartState, .permissionMissing, .secureInput: .environment
-        case .targetNotFound, .groundingMiss: .grounding
-        case .noEffect, .staleFrameBatch: .effect
+        case .targetNotFound, .groundingMiss, .lowConfidenceGrounding: .grounding
+        case .noEffect, .staleFrameBatch, .effectMismatch: .effect
         case .unexpectedModal: .modal
-        case .verificationUnavailable, .validatorIncomplete: .verification
+        case .verificationUnavailable, .validatorIncomplete, .preconditionFailed, .verifierDisagreement: .verification
         case .transportFailure: .transport
         case .unsafeActionRefused: .safety
         case .parameterNeedsLiveValue, .artifactWrongLane: .policy
@@ -59,7 +63,7 @@ public enum AgentFailureKind: String, Sendable, Equatable, CaseIterable, Codable
         switch auditAction {
         case "recipe.pause.wrongstate": self = .wrongStartState
         case "recipe.pause.modal": self = .unexpectedModal
-        case "recipe.unverified", "assist.noeffect", "sandbox.noeffect": self = .noEffect
+        case "recipe.unverified", "assist.noeffect", "sandbox.noeffect", "assist.noeffect.verifier": self = .noEffect
         case "recipe.verify.unavailable": self = .verificationUnavailable
         case "recipe.parameter": self = .parameterNeedsLiveValue
         case "assist.stalled", "sandbox.stalled": self = .stepLimit
@@ -80,6 +84,20 @@ public enum AgentFailureKind: String, Sendable, Equatable, CaseIterable, Codable
         case "assist.validate", "sandbox.verify":
             guard detail.uppercased().hasPrefix("INCOMPLETE") else { return nil }
             self = .validatorIncomplete
+        case "assist.verify.action":
+            guard detail.contains("status=failed") || detail.contains("postEffect=mismatch") else { return nil }
+            if detail.contains("failureKind=no_effect") || detail.contains("postEffect=mismatch") {
+                self = .effectMismatch
+            } else {
+                self = .preconditionFailed
+            }
+        case "grounding.verifier":
+            guard detail.contains("verdict=reject") || detail.contains("verdict=abstain") else { return nil }
+            if detail.contains("failure=ambiguous") {
+                self = .verifierDisagreement
+            } else {
+                self = .lowConfidenceGrounding
+            }
         default:
             guard let kind = AgentFailureKind(auditAction: auditAction) else { return nil }
             self = kind

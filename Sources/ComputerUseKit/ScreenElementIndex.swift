@@ -205,6 +205,16 @@ public enum ScreenElementIndex {
         }
     }
 
+    public struct RankedCandidate: Sendable, Equatable {
+        public let candidate: IndexedCandidate
+        public let score: Double
+
+        public init(candidate: IndexedCandidate, score: Double) {
+            self.candidate = candidate
+            self.score = score
+        }
+    }
+
     public struct Configuration: Sendable, Equatable {
         public let overlapThreshold: Double
         public let containmentThreshold: Double
@@ -547,20 +557,39 @@ public enum ScreenElementIndex {
         in candidates: [IndexedCandidate],
         policy: TrustPolicy = .default
     ) -> IndexedCandidate? {
+        rankedCandidates(for: target, in: candidates, policy: policy, limit: 1).first?.candidate
+    }
+
+    public static func rankedCandidates(
+        for target: String,
+        in candidates: [IndexedCandidate],
+        policy: TrustPolicy = .default,
+        within margin: Double? = nil,
+        limit: Int = 5
+    ) -> [RankedCandidate] {
         let target = normalizedSearchLabel(target)
-        guard !target.isEmpty else { return nil }
-        var best: (candidate: IndexedCandidate, score: Double)?
-        for candidate in candidates where candidate.isSafeToClick {
+        guard !target.isEmpty else { return [] }
+        let ranked = candidates.compactMap { candidate -> RankedCandidate? in
+            guard candidate.isSafeToClick else { return nil }
             let score = textMatchScore(needle: target, candidate: normalizedSearchLabel(candidate.label)) * candidate.trust
-            guard score >= 1.30 else { continue }
-            if best == nil
-                || score > best!.score
-                || (score == best!.score && candidate.source.rank > best!.candidate.source.rank)
-                || (score == best!.score && candidate.source.rank == best!.candidate.source.rank && candidate.bounds.area < best!.candidate.bounds.area) {
-                best = (candidate, score)
-            }
+            guard score >= 1.30 else { return nil }
+            return RankedCandidate(candidate: candidate, score: score)
         }
-        return best?.candidate
+        .sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            if $0.candidate.source.rank != $1.candidate.source.rank {
+                return $0.candidate.source.rank > $1.candidate.source.rank
+            }
+            if $0.candidate.bounds.area != $1.candidate.bounds.area {
+                return $0.candidate.bounds.area < $1.candidate.bounds.area
+            }
+            return $0.candidate.id < $1.candidate.id
+        }
+        guard let bestScore = ranked.first?.score else { return [] }
+        let bounded = margin.map { margin in
+            ranked.filter { bestScore - $0.score <= margin }
+        } ?? ranked
+        return Array(bounded.prefix(max(1, limit)))
     }
 
     public static func candidate(markNumber: Int, in candidates: [IndexedCandidate]) -> IndexedCandidate? {

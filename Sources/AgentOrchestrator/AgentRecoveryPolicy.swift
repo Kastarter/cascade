@@ -61,14 +61,22 @@ public enum AgentRecoveryPolicy {
             RecoveryPlan(first: .reharvestAX, second: .regroundVisual, terminal: .escalate)
         case .groundingMiss:
             RecoveryPlan(first: .reharvestAX, second: .regroundVisual, terminal: .pauseForUser)
+        case .lowConfidenceGrounding:
+            RecoveryPlan(first: .reharvestAX, second: .regroundVisual, terminal: .pauseForUser)
         case .noEffect:
             RecoveryPlan(first: .recapture, second: .alternateTarget, terminal: .escalate)
+        case .effectMismatch:
+            RecoveryPlan(first: .recapture, second: .rerunVerifier, terminal: .escalate)
         case .staleFrameBatch:
             RecoveryPlan(first: .recapture, terminal: .escalate)
         case .unexpectedModal:
             RecoveryPlan(first: .safeDismiss, terminal: .pauseForUser)
         case .validatorIncomplete:
             RecoveryPlan(first: .diagnosticProbe, second: .rerunVerifier, terminal: .failWithReason)
+        case .preconditionFailed:
+            RecoveryPlan(first: .diagnosticProbe, terminal: .pauseForUser)
+        case .verifierDisagreement:
+            RecoveryPlan(first: .rerunVerifier, second: .diagnosticProbe, terminal: .pauseForUser)
         case .verificationUnavailable:
             RecoveryPlan(first: .recapture, terminal: .failWithReason)
         case .transportFailure:

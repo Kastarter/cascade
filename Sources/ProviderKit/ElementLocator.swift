@@ -200,7 +200,12 @@ public struct ElementLocator: Sendable {
                     candidateID: candidate.id,
                     markNumber: candidate.markNumber,
                     displayBounds: candidate.displayBounds,
-                    imageBounds: candidate.imageBounds
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.label,
+                    ocrDistancePoints: 0,
+                    agreeingSources: [candidate.source]
                 )
             ],
             selectedIndex: 0,

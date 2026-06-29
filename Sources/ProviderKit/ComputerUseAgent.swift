@@ -303,6 +303,9 @@ public final class ComputerUseAgent {
     public private(set) var lastGroundDispersion: Double?
     public private(set) var lastGroundRisk: GroundingActionRisk?
     public private(set) var lastRiskyVisualClick: RiskyVisualGroundingClick?
+    public private(set) var lastGroundFailureReason: String?
+    private var targetRefinementAttempts: [String: Int] = [:]
+    private var lastPreActionBlock: (target: String?, message: String, audit: String)?
 
     /// Paste-key gate state (see `pasteRefusal`): does the goal's own wording ask
     /// for clipboard work, and has the agent itself copied something this episode
@@ -637,6 +640,8 @@ public final class ComputerUseAgent {
         episodePrunedImages = 0
         episodeCompactedToolResults = 0
         currentToolDefinitionCount = 0
+        targetRefinementAttempts = [:]
+        lastPreActionBlock = nil
         currentGoal = goal
         goalAsksForPaste = Self.goalMentionsClipboard(goal)
         goalAsksForDestruction = Self.goalMentionsDestruction(goal)
@@ -864,6 +869,9 @@ public final class ComputerUseAgent {
         lastGroundDispersion = nil
         lastGroundRisk = nil
         lastRiskyVisualClick = nil
+        lastGroundFailureReason = nil
+        lastPreActionBlock = nil
+        let safeStructuralToolUseIndices = isStructural ? Self.safeStructuralToolUseIndices(in: content) : nil
         let groundCache = await pregroundTargets(in: content)
         for (index, block) in content.enumerated() {
             switch block["type"] as? String {
@@ -877,9 +885,29 @@ public final class ComputerUseAgent {
                 let input = block["input"] as? [String: Any] ?? [:]
                 switch block["name"] as? String {
                 case "open_app":
-                    if let app = input["name"] as? String { actions.append(.openApp(app)) }
+                    if let app = input["name"] as? String {
+                        let action = CUAction.openApp(app)
+                        if let id = block["id"] as? String,
+                           let critique = await actionCritique(for: action),
+                           critique.verdict != .approve {
+                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
+                            rememberPreActionBlock(target: nil, critique: critique, toolName: "open_app")
+                        } else {
+                            actions.append(action)
+                        }
+                    }
                 case "open_url":
-                    if let url = input["url"] as? String { actions.append(.openURL(url)) }
+                    if let url = input["url"] as? String {
+                        let action = CUAction.openURL(url)
+                        if let id = block["id"] as? String,
+                           let critique = await actionCritique(for: action),
+                           critique.verdict != .approve {
+                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
+                            rememberPreActionBlock(target: nil, critique: critique, toolName: "open_url")
+                        } else {
+                            actions.append(action)
+                        }
+                    }
                 case "use_skill":
                     // Resolved right here — no screen action needed. The text is
                     // delivered as this id's tool_result (inline below, or via
@@ -901,6 +929,13 @@ public final class ComputerUseAgent {
                     // the chain runs together rather than one block at a time.
                     if let expanded = parseFillField(input) { actions.append(contentsOf: expanded) }
                 case "fill_target":
+                    if let safeStructuralToolUseIndices,
+                       !safeStructuralToolUseIndices.contains(index) {
+                        if let id = block["id"] as? String {
+                            toolResultOverrides[id] = "Deferred until the next screenshot so this target can be grounded against the updated screen."
+                        }
+                        continue
+                    }
                     // The runtime grounds the named target (UI-TARS/Claude) and
                     // expands to the same click → cmd+a → type → submit batch. On a
                     // grounding miss, tell the model so it re-describes or clicks
@@ -909,11 +944,17 @@ public final class ComputerUseAgent {
                         actions.append(contentsOf: expanded)
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
-                        toolResultOverrides[id] = isStructural
-                            ? "Couldn't locate “\(target)” on the screen. Describe it more specifically — its visible label, role, or the text next to it — or name a different on-screen landmark."
-                            : "Couldn't locate “\(target)” on the screen. Describe it more specifically, or click it directly with the computer tool."
+                        toolResultOverrides[id] = preActionBlockToolResult(target: target)
+                            ?? groundingFailureToolResult(target: target, structural: isStructural)
                     }
                 case "click_target":
+                    if let safeStructuralToolUseIndices,
+                       !safeStructuralToolUseIndices.contains(index) {
+                        if let id = block["id"] as? String {
+                            toolResultOverrides[id] = "Deferred until the next screenshot so this target can be grounded against the updated screen."
+                        }
+                        continue
+                    }
                     // Structural grounding (structural mode only): the runtime locates
                     // the named target and clicks it. On a miss, tell the model so it
                     // re-describes — answered inline (no wasted screenshot turn).
@@ -921,10 +962,21 @@ public final class ComputerUseAgent {
                         actions.append(action)
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
-                        toolResultOverrides[id] = "Couldn't locate “\(target)” on the screen. Describe it more specifically — its visible label, role, or the text next to it — or name a different on-screen landmark. Do not repeat the same description."
+                        toolResultOverrides[id] = preActionBlockToolResult(target: target)
+                            ?? groundingFailureToolResult(target: target, structural: true)
                     }
                 case "type_text":
-                    if let text = input["text"] as? String { actions.append(.type(text)) }
+                    if let text = input["text"] as? String {
+                        let action = CUAction.type(text)
+                        if let id = block["id"] as? String,
+                           let critique = await actionCritique(for: action),
+                           critique.verdict != .approve {
+                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
+                            rememberPreActionBlock(target: nil, critique: critique, toolName: "type_text")
+                        } else {
+                            actions.append(action)
+                        }
+                    }
                 case "press_key":
                     // Same structural paste gate as the computer tool's key action:
                     // a bare cmd+v pastes the USER's clipboard, not the agent's.
@@ -935,18 +987,23 @@ public final class ComputerUseAgent {
 	                            toolResultOverrides[id] = refusal.text
 	                            onActionRefused?(refusal.audit)
 	                            Self.logger.info("refused action: \(refusal.audit)")
-	                        } else if let id = block["id"] as? String,
-	                                  let critique = await actionCritique(for: action),
-	                                  critique.verdict != .approve {
-	                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
-	                            if critique.verdict == .refuse {
-	                                onActionRefused?("critic refused action — \(critique.reason)")
-	                            }
-	                        } else {
-	                            actions.append(action)
-	                        }
+		                        } else if let id = block["id"] as? String,
+		                                  let critique = await actionCritique(for: action),
+		                                  critique.verdict != .approve {
+		                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
+		                            rememberPreActionBlock(target: nil, critique: critique, toolName: "press_key")
+		                        } else {
+		                            actions.append(action)
+		                        }
                     }
                 case "scroll":
+                    if let safeStructuralToolUseIndices,
+                       !safeStructuralToolUseIndices.contains(index) {
+                        if let id = block["id"] as? String {
+                            toolResultOverrides[id] = "Deferred until the next screenshot so this target can be grounded against the updated screen."
+                        }
+                        continue
+                    }
                     // Scroll over a named target (grounded) or, with no target, the
                     // center of the screen.
                     if let action = await groundedScroll(input, cache: groundCache) { actions.append(action) }
@@ -975,16 +1032,14 @@ public final class ComputerUseAgent {
 	                        toolResultOverrides[id] = refusal.text
 	                        onActionRefused?(refusal.audit)
 	                        Self.logger.info("refused action: \(refusal.audit)")
-	                    } else if let id = block["id"] as? String,
-	                              let critique = await actionCritique(for: action),
-	                              critique.verdict != .approve {
-	                        toolResultOverrides[id] = Self.critiqueToolResult(critique)
-	                        if critique.verdict == .refuse {
-	                            onActionRefused?("critic refused action — \(critique.reason)")
-	                        }
-	                    } else {
-	                        actions.append(action)
-	                    }
+		                    } else if let id = block["id"] as? String,
+		                              let critique = await actionCritique(for: action),
+		                              critique.verdict != .approve {
+		                        toolResultOverrides[id] = Self.critiqueToolResult(critique)
+		                        rememberPreActionBlock(target: nil, critique: critique, toolName: "computer")
+		                    } else {
+		                        actions.append(action)
+		                    }
                 }
             default:
                 break
@@ -1137,6 +1192,17 @@ public final class ComputerUseAgent {
         let result = await groundCached(target, frame: frame, cache: cache)
         recordGrounding(result, target: target)
         guard result.isActionable(), let point = result.selectedPoint else { return nil }
+        let lowConfidence = result.selectedCandidate.map {
+            $0.confidence < Self.minimumConfidence(for: .visual, source: $0.source)
+        } ?? true
+        if let critique = await actionCritique(
+            for: .type(text),
+            lowConfidenceGrounding: lowConfidence || result.isAbstainedOrRejected,
+            alternativeCount: result.alternativeCount
+        ), critique.verdict != .approve {
+            rememberPreActionBlock(target: target, critique: critique, toolName: "fill_target")
+            return nil
+        }
         // The grounder returns display-local AppKit points already — do NOT scale.
         return Self.fillActions(at: point, text: text, double: (input["click"] as? String) == "double", submit: input["submit"] as? String)
     }
@@ -1149,7 +1215,9 @@ public final class ComputerUseAgent {
     /// are the three that take a "target": click_target, fill_target, scroll.
     func pregroundTargets(in content: [[String: Any]]) async -> [String: GroundingResult] {
         guard isStructural, let frame = lastFrameJPEG, let g = grounder else { return [:] }
-        let targets = Set(content.compactMap { block -> String? in
+        let safeIndices = Self.safeStructuralToolUseIndices(in: content)
+        let targets = Set(content.enumerated().compactMap { index, block -> String? in
+            guard safeIndices.contains(index) else { return nil }
             guard block["type"] as? String == "tool_use",
                   let name = block["name"] as? String,
                   name == "click_target" || name == "fill_target" || name == "scroll",
@@ -1175,6 +1243,44 @@ public final class ComputerUseAgent {
             for await r in group { cache[r.0] = r.1 }
         }
         return cache
+    }
+
+    nonisolated static func safeStructuralToolUseIndices(in content: [[String: Any]]) -> Set<Int> {
+        var allowed = Set<Int>()
+        var mustRefreshBeforeNextGroundedTarget = false
+        var sawFill = false
+        for (index, block) in content.enumerated() {
+            guard block["type"] as? String == "tool_use",
+                  let name = block["name"] as? String else {
+                continue
+            }
+            let input = block["input"] as? [String: Any] ?? [:]
+            let hasTarget = (input["target"] as? String)?.isEmpty == false
+            let isGroundedTarget = name == "click_target" || name == "fill_target" || (name == "scroll" && hasTarget)
+            let isFill = name == "fill_target"
+            if isGroundedTarget {
+                if mustRefreshBeforeNextGroundedTarget { break }
+                if sawFill && !isFill { break }
+            }
+            allowed.insert(index)
+            if isFill { sawFill = true }
+            if structuralToolMutatesLayout(name: name, input: input) {
+                mustRefreshBeforeNextGroundedTarget = true
+            }
+        }
+        return allowed
+    }
+
+    private nonisolated static func structuralToolMutatesLayout(name: String, input: [String: Any]) -> Bool {
+        switch name {
+        case "open_app", "open_url", "click_target":
+            return true
+        case "press_key":
+            let key = (input["key"] as? String)?.lowercased() ?? ""
+            return key.contains("return") || key.contains("enter") || key.contains("tab") || looksExternallySignificant(key)
+        default:
+            return false
+        }
     }
 
     /// Ground a named target, consulting the per-turn concurrent-grounding `cache`
@@ -1247,7 +1353,12 @@ public final class ComputerUseAgent {
                     candidateID: candidate.candidateID,
                     markNumber: candidate.markNumber,
                     displayBounds: candidate.displayBounds,
-                    imageBounds: candidate.imageBounds
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.nearbyOCRText,
+                    ocrDistancePoints: candidate.ocrDistancePoints,
+                    agreeingSources: candidate.agreeingSources
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -1421,7 +1532,12 @@ public final class ComputerUseAgent {
                     candidateID: candidate.candidateID,
                     markNumber: candidate.markNumber,
                     displayBounds: mappedDisplayBounds,
-                    imageBounds: candidate.imageBounds
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.nearbyOCRText,
+                    ocrDistancePoints: candidate.ocrDistancePoints,
+                    agreeingSources: candidate.agreeingSources
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -1444,6 +1560,23 @@ public final class ComputerUseAgent {
         let result = await groundCached(target, frame: frame, cache: cache, options: options)
         recordGrounding(result, target: target, risk: route.risk)
         guard Self.allowsGroundedAction(result, route: route), let point = result.selectedPoint else { return nil }
+        let action: CUAction
+        switch input["click"] as? String {
+        case "double": action = .doubleClick(x: point.x, y: point.y)
+        case "right": action = .rightClick(x: point.x, y: point.y)
+        default: action = .click(x: point.x, y: point.y)
+        }
+        let lowConfidence = result.selectedCandidate.map {
+            $0.confidence < Self.minimumConfidence(for: route.risk, source: $0.source)
+        } ?? true
+        if let critique = await actionCritique(
+            for: action,
+            lowConfidenceGrounding: lowConfidence || result.isAbstainedOrRejected,
+            alternativeCount: result.alternativeCount
+        ), critique.verdict != .approve {
+            rememberPreActionBlock(target: target, critique: critique, toolName: "click_target")
+            return nil
+        }
         if let candidate = result.selectedCandidate, Self.isRiskyVisualClick(candidate, route: route) {
             lastRiskyVisualClick = RiskyVisualGroundingClick(
                 target: target,
@@ -1455,11 +1588,7 @@ public final class ComputerUseAgent {
             )
         }
         // The grounder returns display-local AppKit points already — do NOT scale.
-        switch input["click"] as? String {
-        case "double": return .doubleClick(x: point.x, y: point.y)
-        case "right": return .rightClick(x: point.x, y: point.y)
-        default: return .click(x: point.x, y: point.y)
-        }
+        return action
     }
 
     /// Grounds a `scroll` call (structural mode). A named target scrolls over that
@@ -1495,10 +1624,14 @@ public final class ComputerUseAgent {
             let failure = result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
             let dispersion = candidate.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
             let actionable = result.isActionable(minConfidence: Self.minimumConfidence(for: risk, source: candidate.source)) ? "hit" : "blocked"
-            if actionable == "blocked", lastGroundMiss == nil { lastGroundMiss = target }
+            if actionable == "blocked", lastGroundMiss == nil {
+                lastGroundMiss = target
+                lastGroundFailureReason = result.abstainReason ?? "low_confidence"
+            }
             appendGroundLog("\(actionable) \"\(target)\" source=\(candidate.source.rawValue)\(id)\(mark) confidence=\(String(format: "%.2f", candidate.confidence))\(dispersion) risk=\(risk.rawValue) @(\(Int(point.x)),\(Int(point.y))) alternatives=\(result.alternativeCount)\(verdict)\(failure)\(reason)")
         } else {
             if lastGroundMiss == nil { lastGroundMiss = target }
+            lastGroundFailureReason = result.abstainReason ?? "target_not_found"
             let verdict = result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
             let failure = result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
             appendGroundLog("miss \"\(target)\" risk=\(risk.rawValue) alternatives=\(result.alternativeCount)\(verdict)\(failure)")
@@ -1602,6 +1735,15 @@ public final class ComputerUseAgent {
             .replacingOccurrences(of: "\r", with: " ")
             .prefix(48)
             .description
+    }
+
+    private nonisolated static func fnv1a64(_ value: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(hash, radix: 36)
     }
 
     // MARK: - Tool definitions (shared + structural)
@@ -2119,8 +2261,16 @@ public final class ComputerUseAgent {
         return nil
     }
 
-    private func actionCritique(for action: CUAction) async -> ActionCritique? {
-        let reasons = Self.actionCriticTriggerReasons(for: action)
+    private func actionCritique(
+        for action: CUAction,
+        lowConfidenceGrounding: Bool = false,
+        alternativeCount: Int = 0
+    ) async -> ActionCritique? {
+        let reasons = Self.actionCriticTriggerReasons(
+            for: action,
+            lowConfidenceGrounding: lowConfidenceGrounding,
+            alternativeCount: alternativeCount
+        )
         guard !reasons.isEmpty, let actionCritic else { return nil }
         return await actionCritic.critique(ActionCritiqueRequest(
             goal: currentGoal,
@@ -2139,28 +2289,15 @@ public final class ComputerUseAgent {
         noEffectCount: Int = 0,
         liveValueFailure: Bool = false
     ) -> [String] {
-        var reasons: [String] = []
-        if let harnessToolName, ["run_command", "run_applescript", "write_file"].contains(harnessToolName) {
-            reasons.append("power_harness_tool")
-        }
-        if let action {
-            switch action {
-            case .key(let combo) where isIrreversibleCombo(combo):
-                reasons.append("irreversible_key")
-            case .key(let combo) where looksExternallySignificant(combo):
-                reasons.append("external_side_effect_key")
-            case .type(let text) where looksExternallySignificant(text):
-                reasons.append("external_side_effect_text")
-            default:
-                break
-            }
-        }
-        if lowConfidenceGrounding { reasons.append("low_confidence_grounding") }
-        if alternativeCount > 0 { reasons.append("ambiguous_grounding") }
-        if groundingMissCount >= 2 { reasons.append("repeated_grounding_miss") }
-        if noEffectCount >= 2 { reasons.append("repeated_no_effect") }
-        if liveValueFailure { reasons.append("parameter_needs_live_value") }
-        return Array(Set(reasons)).sorted()
+        PreActionVerifier.verify(
+            action: action,
+            harnessToolName: harnessToolName,
+            lowConfidenceGrounding: lowConfidenceGrounding,
+            alternativeCount: alternativeCount,
+            groundingMissCount: groundingMissCount,
+            noEffectCount: noEffectCount,
+            liveValueFailure: liveValueFailure
+        ).triggerReasons
     }
 
     nonisolated public static func shouldTriggerActionCritic(
@@ -2214,6 +2351,41 @@ public final class ComputerUseAgent {
         case .askUser:
             "Pause and ask the user before acting: \(critique.reason)"
         }
+    }
+
+    private func rememberPreActionBlock(
+        target: String?,
+        critique: ActionCritique,
+        toolName: String
+    ) {
+        let failureKind = critique.failureKind?.rawValue ?? "unsafe_action"
+        let message = Self.critiqueToolResult(critique)
+        let audit = "tool=\(toolName) verdict=\(critique.verdict.rawValue) failureKind=\(failureKind) reasonHash=\(Self.fnv1a64(critique.reason))"
+        lastPreActionBlock = (target, message, audit)
+        onActionRefused?(audit)
+    }
+
+    private func preActionBlockToolResult(target: String?) -> String? {
+        guard let block = lastPreActionBlock else { return nil }
+        if let blockTarget = block.target, let target, blockTarget != target { return nil }
+        lastPreActionBlock = nil
+        return block.message
+    }
+
+    private func groundingFailureToolResult(target: String, structural: Bool) -> String {
+        let normalized = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let reason = lastGroundFailureReason ?? "target_not_found"
+        let key = "\(normalized)|\(reason)"
+        let attempts = targetRefinementAttempts[key, default: 0]
+        targetRefinementAttempts[key] = attempts + 1
+        let evidence = lastGroundLog.map { " Current grounding evidence: \($0)." } ?? ""
+        if attempts == 0 {
+            let lane = structural
+                ? "Issue one more refined target description using a visible label, role, or nearby text; do not repeat the same description."
+                : "Describe it more specifically, or click it directly with the computer tool."
+            return "Grounding verifier could not accept “\(target)” (\(reason)).\(evidence) \(lane)"
+        }
+        return "Grounding verifier rejected the same target again (\(reason)). Stop re-describing “\(target)” and choose a different visible control, open the relevant menu/panel, or ask the user for help."
     }
 
     /// The teaching refusal for an irreversible system/app key — quitting the app

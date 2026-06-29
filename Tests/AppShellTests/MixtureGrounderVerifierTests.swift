@@ -64,6 +64,79 @@ struct MixtureGrounderVerifierTests {
         )
     }
 
+    @Test func verifierAcceptedCandidateUsesSingleDefaultSample() async {
+        let recorder = RecordingGrounder(results: [
+            result([
+                candidate(point: CGPoint(x: 320, y: 240), rawModel: "Quarterly Budget title", dispersion: 3)
+            ])
+        ])
+        let grounder = MixtureGrounder(
+            base: recorder,
+            skills: .init(),
+            verifyCandidates: true
+        )
+
+        let result = await grounder.groundResult(
+            screenshot: Data(),
+            target: "Quarterly Budget title",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700
+        )
+
+        #expect(result.selectedPoint == CGPoint(x: 320, y: 240))
+        #expect(await recorder.sampleCounts() == [1])
+    }
+
+    @Test func verifierRejectRetriesWithThreeSamples() async {
+        let recorder = RecordingGrounder(results: [
+            result([
+                candidate(point: CGPoint(x: 1200, y: 240), rawModel: "Quarterly Budget title", dispersion: 3)
+            ]),
+            result([
+                candidate(point: CGPoint(x: 320, y: 240), rawModel: "Quarterly Budget title", dispersion: 3)
+            ]),
+        ])
+        let grounder = MixtureGrounder(
+            base: recorder,
+            skills: .init(),
+            verifyCandidates: true
+        )
+
+        let result = await grounder.groundResult(
+            screenshot: Data(),
+            target: "Quarterly Budget title",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700
+        )
+
+        #expect(result.selectedPoint == CGPoint(x: 320, y: 240))
+        #expect(await recorder.sampleCounts() == [1, 3])
+    }
+
+    @Test func priorGroundingFailureStartsWithThreeSamples() async {
+        let recorder = RecordingGrounder(results: [
+            result([
+                candidate(point: CGPoint(x: 320, y: 240), rawModel: "Quarterly Budget title", dispersion: 3)
+            ])
+        ])
+        let grounder = MixtureGrounder(
+            base: recorder,
+            skills: .init(),
+            verifyCandidates: true,
+            candidateFailureCounts: ["base:0": 1]
+        )
+
+        let result = await grounder.groundResult(
+            screenshot: Data(),
+            target: "Quarterly Budget title",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700
+        )
+
+        #expect(result.selectedPoint == CGPoint(x: 320, y: 240))
+        #expect(await recorder.sampleCounts() == [3])
+    }
+
     @Test func enabledRejectsOffscreenAndPassiveCandidates() {
         let offscreen = MixtureGrounder.selectVerifiedCandidate(
             axCandidate: nil,
@@ -237,5 +310,59 @@ private struct StubGrounder: VisualGrounder {
         displayHeightPoints: Int
     ) async -> GroundingResult {
         result ?? GroundingResult.legacy(point: point)
+    }
+}
+
+private actor RecordingGrounder: VisualGrounder {
+    private var results: [GroundingResult]
+    private var observedSampleCounts: [Int] = []
+
+    init(results: [GroundingResult]) {
+        self.results = results
+    }
+
+    func sampleCounts() -> [Int] {
+        observedSampleCounts
+    }
+
+    func ground(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> CGPoint? {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ).selectedPoint
+    }
+
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            options: .default
+        )
+    }
+
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult {
+        observedSampleCounts.append(options.sampleCount)
+        guard !results.isEmpty else { return GroundingResult() }
+        return results.count == 1 ? results[0] : results.removeFirst()
     }
 }
