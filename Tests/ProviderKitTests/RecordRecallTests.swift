@@ -15,6 +15,15 @@ private func sha256Prefix(_ value: String) -> String {
     SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
 }
 
+private struct ReverseRecordReranker: RecordReranker {
+    func rerank(query: String, candidates: [RecordChunkCandidate], limit: Int) -> [RecordRerankResult] {
+        candidates
+            .sorted { $0.contextID > $1.contextID }
+            .prefix(limit)
+            .map { RecordRerankResult(candidate: $0, score: Double($0.contextID)) }
+    }
+}
+
 // MARK: - search_record
 
 @Test
@@ -63,6 +72,60 @@ func recallSearchFiltersSensitiveMoments() async throws {
     let out = await RecordRecall(store: store).perform(.search(query: "unicorn"))
     #expect(out.contains("No recorded moments match"))
     #expect(!out.contains("unicorn vault"))
+}
+
+@Test
+func recallDefaultsToNoRerankerForAgentCallers() throws {
+    let store = try makeStore()
+    #expect(!RecordRecall(store: store).hasReranker)
+}
+
+@Test
+func recallSearchRerankerPreservesRecordedContextCitationIDs() async throws {
+    let store = try makeStore()
+    let first = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Notes",
+        ocrText: "alpha handoff note"))
+    let second = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Notes",
+        ocrText: "alpha handoff decision"))
+
+    let out = await RecordRecall(store: store, reranker: ReverseRecordReranker()).perform(.search(query: "alpha handoff"))
+    let lines = out.components(separatedBy: "\n")
+
+    #expect(lines.first?.contains("[#\(second.id)]") == true)
+    #expect(out.contains("[#\(first.id)]"))
+    #expect(out.contains("[#\(second.id)]"))
+}
+
+@Test
+func heuristicRecordRerankerScoresPhraseTitleAndCoverage() {
+    let base = Date(timeIntervalSince1970: 1_800_000_000)
+    let weak = RecordChunkCandidate(
+        contextID: 1,
+        text: "alpha notes",
+        title: "Inbox",
+        appName: "Mail",
+        capturedAt: base,
+        baseRank: 0,
+        baseScore: 0.02
+    )
+    let strong = RecordChunkCandidate(
+        contextID: 2,
+        text: "budget details for the project",
+        title: "Project Alpha Budget",
+        appName: "Numbers",
+        capturedAt: base.addingTimeInterval(-60),
+        baseRank: 1,
+        baseScore: 0.01
+    )
+
+    let ranked = HeuristicRecordReranker().rerank(query: "project alpha budget", candidates: [weak, strong], limit: 2)
+
+    #expect(ranked.first?.candidate.contextID == strong.contextID)
+    #expect(ranked[0].score > ranked[1].score)
 }
 
 // MARK: - get_timeframe

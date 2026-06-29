@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 import ProviderKit
 import Testing
@@ -48,4 +49,16 @@ func answersWithoutSourcesHaveNoCitations() {
 func citationsAreCappedAtFour() {
     let answer = RecordSearchAnswerer.parseCitations(from: "x\nSOURCES: #1, #2, #3, #4, #5, #6")
     #expect(answer.citedMomentIDs.count == 4)
+}
+
+@Test
+func recordSearchAnswererConfiguresHeuristicRecallRerankerWithoutNetwork() throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeRecordAnswererTests-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+    let answerer = RecordSearchAnswerer(store: store)
+
+    #expect(answerer.usesRerankedRecall)
+    #expect(answerer.configuredToolDefinitions().contains { ($0["name"] as? String) == "search_record" })
 }

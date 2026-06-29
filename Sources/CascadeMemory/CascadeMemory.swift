@@ -48,6 +48,16 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public struct HybridContextCandidate: Equatable, Sendable {
+    public let candidate: RankFusion.FusedCandidate
+    public let context: RecordedContext
+
+    public init(candidate: RankFusion.FusedCandidate, context: RecordedContext) {
+        self.candidate = candidate
+        self.context = context
+    }
+}
+
 public struct AuditEvent: Identifiable, Codable, Equatable, Sendable {
     public let id: Int64
     public let createdAt: Date
@@ -732,6 +742,9 @@ public actor CascadeStore {
                     if indexWorkGraph, let row = rows.last {
                         try linkWorkGraphEntities(for: row)
                     }
+                    if let row = rows.last {
+                        try upsertMemoryEvent(for: row)
+                    }
                     try resetStatement(statement)
                     try clearBindings(statement)
                 }
@@ -934,13 +947,38 @@ public actor CascadeStore {
     /// `candidatePool` is how deep each lane is read before fusing (wider than
     /// `limit` so a moment ranked, say, #20 in keyword but #2 in meaning can still
     /// win the fused top-N). Only the fused top-`limit` is hydrated to rows.
-    public func hybridContexts(matching query: String, limit: Int = 12, candidatePool: Int = 40) throws -> [RecordedContext] {
+    public func hybridRankedCandidates(
+        matching query: String,
+        limit: Int = 12,
+        candidatePool: Int = 40,
+        now: Date = Date()
+    ) throws -> [RankFusion.FusedCandidate] {
         let keyword = try lexicalRankedIDs(matching: query, limit: candidatePool)
         let semantic = try semanticRankedIDs(matching: query, limit: candidatePool)
+        let memory = try memoryRankedIDs(matching: query, limit: candidatePool, now: now)
         // Both empty → no match; one empty → RRF degenerates to the other lane's
         // order (still correct, no special-casing). Fuse and hydrate the winners.
-        let fused = RankFusion.reciprocalRankFusion([keyword, semantic], limit: limit)
-        return try fused.compactMap { try context(id: $0) }
+        return RankFusion.reciprocalRankFusion([
+            .init(.lexical, ids: keyword),
+            .init(.vector, ids: semantic),
+            .init(.memory, ids: memory),
+        ], limit: limit)
+    }
+
+    public func hybridContextCandidates(
+        matching query: String,
+        limit: Int = 12,
+        candidatePool: Int = 40,
+        now: Date = Date()
+    ) throws -> [HybridContextCandidate] {
+        try hybridRankedCandidates(matching: query, limit: limit, candidatePool: candidatePool, now: now)
+            .compactMap { candidate in
+                try context(id: candidate.id).map { HybridContextCandidate(candidate: candidate, context: $0) }
+            }
+    }
+
+    public func hybridContexts(matching query: String, limit: Int = 12, candidatePool: Int = 40) throws -> [RecordedContext] {
+        try hybridContextCandidates(matching: query, limit: limit, candidatePool: candidatePool).map(\.context)
     }
 
     /// The keyword lane's ranking as bare moment ids, best BM25 match first, for
@@ -1838,6 +1876,28 @@ public actor CascadeStore {
         CREATE TRIGGER IF NOT EXISTS recorded_context_visual_embedding_ad
         AFTER DELETE ON recorded_context BEGIN
             DELETE FROM context_visual_embedding WHERE context_id = old.id;
+        END;
+
+        CREATE TABLE IF NOT EXISTS memory_event (
+            context_id INTEGER PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            app_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            entities_json TEXT NOT NULL,
+            importance REAL NOT NULL,
+            last_accessed_at TEXT,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            links_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_event_time
+            ON memory_event(captured_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_event_importance
+            ON memory_event(importance DESC, captured_at DESC);
+        CREATE TRIGGER IF NOT EXISTS recorded_context_memory_event_ad
+        AFTER DELETE ON recorded_context BEGIN
+            DELETE FROM memory_event WHERE context_id = old.id;
         END;
         """, db: db)
 

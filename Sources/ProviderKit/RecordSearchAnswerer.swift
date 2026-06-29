@@ -46,7 +46,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         includeStructuredContent: Bool = false
     ) {
         self.store = store
-        self.recall = RecordRecall(store: store)
+        self.recall = RecordRecall(store: store, reranker: HeuristicRecordReranker())
         self.keyStore = keyStore
         self.model = model
         self.maxHops = maxHops
@@ -56,6 +56,8 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     public func configuredToolDefinitions() -> [[String: Any]] {
         RecordRecall.toolDefinitions(includeStructuredContent: includeStructuredContent)
     }
+
+    public var usesRerankedRecall: Bool { recall.hasReranker }
 
     // MARK: - Public entry
 

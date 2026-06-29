@@ -58,3 +58,24 @@ func hybridSearchSurfacesSemanticMatchAlongsideAKeywordHit() async throws {
         #expect(hits.contains { $0.id == semantic.id })
     }
 }
+
+@Test
+func hybridRankedCandidatesExposeMemoryLaneProvenance() async throws {
+    let store = try makeHybridStore()
+    let moment = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Notes",
+        windowTitle: "Aperture Delta",
+        ocrText: "Aperture Delta project owner status and deadline"))
+
+    let candidates = try await store.hybridRankedCandidates(
+        matching: "aperture deadline",
+        limit: 5,
+        now: moment.capturedAt.addingTimeInterval(60)
+    )
+    let fused = try #require(candidates.first { $0.id == moment.id })
+
+    #expect(fused.memoryRank != nil)
+    #expect(fused.finalScore > 0)
+    #expect(fused.contributions.contains { $0.lane == .memory })
+}

@@ -19,11 +19,15 @@ import OSLog
 /// retrieval behaviour and the `[#id]` line format stay identical across both.
 public struct RecordRecall: Sendable {
     private let store: CascadeStore
+    private let reranker: (any RecordReranker)?
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "record-recall")
 
-    public init(store: CascadeStore) {
+    public init(store: CascadeStore, reranker: (any RecordReranker)? = nil) {
         self.store = store
+        self.reranker = reranker
     }
+
+    public var hasReranker: Bool { reranker != nil }
 
     /// The recall tool names, for routing a tool call to `perform`.
     public static func toolNames(includeStructuredContent: Bool = false) -> Set<String> {
@@ -192,14 +196,9 @@ public struct RecordRecall: Sendable {
         switch call {
         case .search(let query):
             guard !query.isEmpty else { return "search_record needs a query." }
-            // Run the keyword (BM25) and semantic (cosine) lanes in parallel and
-            // fuse with Reciprocal Rank Fusion — NOT a fallback chain. A moment the
-            // keyword lane missed but meaning ranked highly surfaces even when
-            // keyword search also returned hits; the model shouldn't have to know
-            // our retrieval quirks.
-            let hits = (try? await store.hybridContexts(matching: query, limit: 12)) ?? []
-            let visible = hits.filter { !PrivacyRules.isSensitive($0) }
+            let visible = await searchContexts(query: query, limit: 12, candidatePool: reranker == nil ? 40 : 80)
             guard !visible.isEmpty else { return "No recorded moments match “\(query)”. Try different words or a timeframe." }
+            try? await store.markMemoryEventsAccessed(visible.map(\.id))
             return visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n")
 
         case .timeframe(let startISO, let endISO):
@@ -217,6 +216,7 @@ public struct RecordRecall: Sendable {
             guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
                 return "No accessible moment #\(id)."
             }
+            try? await store.markMemoryEventsAccessed([moment.id])
             var out = Self.line(for: moment, textCap: 2_000)
             // Neighbors give the model the surrounding story without another hop.
             let neighbors = ((try? await store.contexts(
@@ -238,6 +238,7 @@ public struct RecordRecall: Sendable {
                   let structured = Self.structuredMetadata(from: metadata) else {
                 return "No structured metadata recorded for moment #\(id). Capture structured content must be enabled first."
             }
+            try? await store.markMemoryEventsAccessed([moment.id])
             return Self.structureLine(for: moment, structured: structured)
 
         case .sessions(let startISO, let endISO):
@@ -265,6 +266,34 @@ public struct RecordRecall: Sendable {
     }
 
     // MARK: - Formatting (the [#id] line the model reads and cites)
+
+    private func searchContexts(query: String, limit: Int, candidatePool: Int) async -> [RecordedContext] {
+        guard let candidates = try? await store.hybridContextCandidates(matching: query, limit: candidatePool, candidatePool: candidatePool) else {
+            return []
+        }
+        let visible = candidates
+            .map { ($0.candidate, $0.context) }
+            .filter { !PrivacyRules.isSensitive($0.1) }
+        guard let reranker else {
+            return Array(visible.prefix(limit).map { $0.1 })
+        }
+
+        let contextsByID = Dictionary(uniqueKeysWithValues: visible.map { ($0.1.id, $0.1) })
+        let chunkCandidates = visible.enumerated().map { index, pair in
+            let context = pair.1
+            return RecordChunkCandidate(
+                contextID: context.id,
+                text: context.ocrText ?? "",
+                title: context.windowTitle,
+                appName: context.appName,
+                capturedAt: context.capturedAt,
+                baseRank: index,
+                baseScore: pair.0.finalScore
+            )
+        }
+        return reranker.rerank(query: query, candidates: chunkCandidates, limit: limit)
+            .compactMap { contextsByID[$0.candidate.contextID] }
+    }
 
     /// "[#42] 14:03 Mail — Inbox | text…" — the id the model can cite or inspect.
     static func line(for context: RecordedContext, textCap: Int) -> String {
