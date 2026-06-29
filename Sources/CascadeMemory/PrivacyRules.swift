@@ -7,40 +7,45 @@ import Foundation
 /// (`MacContextKit`) and downstream consumers (`WasteDetection`) can gate on it
 /// without depending on each other.
 public enum PrivacyRules {
-    /// Keywords that mark a moment as off-limits. Matched case-insensitively
-    /// across app name, bundle id, window title, and OCR text.
-    public static let sensitiveKeywords = [
+    public static let defaultSensitiveKeywords = [
         "bank", "health", "medical", "legal", "dating", "incognito", "private browsing",
         "password", "1password", "keychain", "wallet"
     ]
 
+    /// Keywords that mark a moment as off-limits. Matched case-insensitively
+    /// across app name, bundle id, window title, and OCR text.
+    public static let sensitiveKeywords = defaultSensitiveKeywords
+
+    public static let defaultPolicy = CapturePrivacyPolicy.default
+
     public static func isSensitive(_ context: RecordedContext) -> Bool {
-        let haystack = [
-            context.appName,
-            context.bundleIdentifier ?? "",
-            context.windowTitle ?? "",
-            context.ocrText ?? ""
-        ].joined(separator: " ").lowercased()
-        return sensitiveKeywords.contains { haystack.contains($0) }
+        !defaultPolicy.decision(
+            appName: context.appName,
+            bundleIdentifier: context.bundleIdentifier,
+            windowTitle: context.windowTitle,
+            text: context.ocrText
+        ).allowed
     }
 
     /// Cheaper pre-OCR gate: checks only app/bundle/window so we can drop a frame
     /// before paying for OCR. The full `isSensitive(_:)` re-checks once OCR text
     /// is available.
     public static func isSensitive(appName: String, bundleIdentifier: String?, windowTitle: String?) -> Bool {
-        let haystack = [
-            appName,
-            bundleIdentifier ?? "",
-            windowTitle ?? ""
-        ].joined(separator: " ").lowercased()
-        return sensitiveKeywords.contains { haystack.contains($0) }
+        !defaultPolicy.decision(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle
+        ).allowed
     }
 
     /// Gate for a single piece of captured text (e.g. the AX label of a clicked
     /// element) when the surrounding app/window already passed: the text itself
     /// must not smuggle a sensitive phrase into the store.
     public static func isSensitiveText(_ text: String) -> Bool {
-        let haystack = text.lowercased()
-        return sensitiveKeywords.contains { haystack.contains($0) }
+        defaultPolicy.isSensitiveText(text)
+    }
+
+    public static func redactingSensitiveKeywords(in text: String) -> String {
+        defaultPolicy.redactingSensitiveKeywords(in: text)
     }
 }

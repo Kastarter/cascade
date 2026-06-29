@@ -112,7 +112,8 @@ public extension CascadeStore {
     /// Indexes a moment's text for semantic recall. Non-fatal best-effort —
     /// a missing embedding asset just means keyword search carries that moment.
     func indexEmbedding(contextID: Int64, text: String) throws {
-        if let vector = SemanticEmbedder.vector(for: text) {
+        let safeText = CascadeStore.sanitizeStoredText(text) ?? ""
+        if let vector = SemanticEmbedder.vector(for: safeText) {
             try withStatement("INSERT OR REPLACE INTO context_embedding (context_id, vector) VALUES (?, ?);") { statement in
                 sqlite3_bind_int64(statement, 1, contextID)
                 let blob = SemanticEmbedder.blob(from: vector)
@@ -130,9 +131,9 @@ public extension CascadeStore {
                     .sorted { lhs, rhs in
                         lhs.lineIndex == rhs.lineIndex ? lhs.source < rhs.source : lhs.lineIndex < rhs.lineIndex
                     }
-                    .map(\.text)
+                    .compactMap { CascadeStore.sanitizeStoredText($0.text) }
             } ?? []
-        let chunks = SemanticTextChunker.chunks(text: text, visualLines: visualLines)
+        let chunks = SemanticTextChunker.chunks(text: safeText, visualLines: visualLines)
         try withStatement("DELETE FROM context_chunk_embedding WHERE context_id = ?;") { statement in
             sqlite3_bind_int64(statement, 1, contextID)
             try stepDone(statement)

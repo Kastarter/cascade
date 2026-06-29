@@ -380,7 +380,7 @@ public final class ComputerUseAgent {
     """
 
     private static let harnessPowerNote = """
-    You can also automate directly: run_command executes a zsh command, run_applescript \
+    You can also automate directly: run_command executes one allowlisted executable with literal argv, run_applescript \
     drives scriptable apps, and write_file writes a text file. PICK ONE LANE PER STEP \
     AND COMMIT: if a step is file work, do it entirely with these tools; if it's screen \
     work, do it entirely on screen — mixing both on the same artifact wastes turns and \
@@ -388,13 +388,12 @@ public final class ComputerUseAgent {
     its artifact to that app's UI: editing a look-alike file on disk does not check off, \
     reply to, or update anything inside Notes, Mail, or any other app — that is the \
     file lane completing the WRONG artifact, not the task. CREATING FILES AND FOLDERS IS FILE WORK: build the file with \
-    its final name directly at its destination in ONE command (write_file for \
-    text/markdown; run_command with textutil for .docx/.rtf, e.g. \
-    `printf '%s' "..." > /tmp/t.txt && textutil -convert docx /tmp/t.txt -output \
-    ~/Desktop/folder/name.docx`), then `open` the file — never create an untitled \
-    document in an app and fight the Save dialog when one command places the finished \
-    file. Prefer plain shell over AppleScript when both work: AppleScript pauses for a \
-    per-app consent prompt the first time it touches an app. Bulk or data-heavy work in \
+    its final name directly at its destination in ONE tool call (write_file for \
+    text/markdown; use app-specific scripting for rich document formats), then open \
+    the file on screen — never create an untitled \
+    document in an app and fight the Save dialog when one tool call places the finished \
+    file. Prefer write_file or structured commands for plain file/data work. AppleScript pauses for a \
+    per-app consent prompt the first time it touches an app, but is the right lane for scriptable-app state. Bulk or data-heavy work in \
     Excel, Numbers, Mail, or Finder should be ONE script, not hundreds of clicks — but \
     that is DATA work only: building something the user asked to watch being made (a \
     deck, a 3D scene, a design) is screen work in that app's UI, never a script target. \
@@ -1343,10 +1342,10 @@ public final class ComputerUseAgent {
         defs.append(contentsOf: [
             [
                 "name": "run_command",
-                "description": "Run one zsh command on this Mac and get its output (25s limit; destructive commands like sudo or rm -rf / are refused; the user sees the command live for supervision, while the audit row stores only a safe descriptor/hash). Use it for bulk file work, data processing, or anything a shell does better than clicking.",
+                "description": "Run one allowlisted executable with literal argv and get its output (25s limit). Shell syntax is refused: no pipes, redirects, substitutions, variables, globs, aliases, or inline scripts. The user sees the command live for supervision; audit stores only a safe descriptor/hash.",
                 "input_schema": [
                     "type": "object",
-                    "properties": ["command": ["type": "string", "description": "The zsh command"]],
+                    "properties": ["command": ["type": "string", "description": "Executable plus literal arguments, e.g. `echo hello` or `ls -la ~/Desktop`"]],
                     "required": ["command"],
                 ],
             ],
@@ -1361,11 +1360,11 @@ public final class ComputerUseAgent {
             ],
             [
                 "name": "write_file",
-                "description": "Write a text file inside the user's home folder (creates parent folders; overwrites). Use it to save results, drafts, scripts, or data the user asked for.",
+                "description": "Write a text file inside Cascade's harness workspace or session scratch root (creates parent folders; overwrites). Use it to save results, drafts, scripts, or data the user asked for.",
                 "input_schema": [
                     "type": "object",
                     "properties": [
-                        "path": ["type": "string", "description": "Destination path under ~, e.g. ~/Desktop/notes.md"],
+                        "path": ["type": "string", "description": "Destination path under the allowed harness workspace/scratch root"],
                         "content": ["type": "string", "description": "The full file content"],
                     ],
                     "required": ["path", "content"],

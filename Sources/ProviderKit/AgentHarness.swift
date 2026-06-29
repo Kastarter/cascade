@@ -1,5 +1,6 @@
 import CascadeMemory
 import CryptoKit
+import Darwin
 import Foundation
 
 /// Which direct-Mac tools the assist agent is offered alongside the computer tool.
@@ -306,6 +307,12 @@ public enum AgentHarness {
 
     /// Why a command is refused, or nil when it may run.
     public static func denialReason(for command: String) -> String? {
+        if let refusal = guardrailDenialReason(for: command) { return refusal }
+        if let refusal = structuredCommand(for: command).refusal { return refusal }
+        return nil
+    }
+
+    private static func guardrailDenialReason(for command: String) -> String? {
         let normalized = command.lowercased()
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
@@ -329,7 +336,10 @@ public enum AgentHarness {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "run_command needs a command." }
         if let denial = denialReason(for: trimmed) { return denial }
-        let result = await run("/bin/zsh", ["-c", trimmed], cwd: NSHomeDirectory(), timeout: 25)
+        guard let parsed = structuredCommand(for: trimmed).command else {
+            return "run_command only accepts an allowlisted executable plus literal argv; shell syntax is refused."
+        }
+        let result = await run(parsed.executable, parsed.arguments, cwd: NSHomeDirectory(), timeout: 25)
         var text = capped(result.output)
         if result.status != 0 {
             text += text.isEmpty ? "(exit \(result.status))" : "\n(exit \(result.status))"
@@ -340,7 +350,7 @@ public enum AgentHarness {
     private static func runAppleScript(_ script: String) async -> String {
         let trimmed = script.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "run_applescript needs a script." }
-        if let denial = denialReason(for: trimmed) { return denial }
+        if let denial = guardrailDenialReason(for: trimmed) { return denial }
         let result = await run("/usr/bin/osascript", ["-e", trimmed], timeout: 30)
         let text = capped(result.output)
         if result.status != 0 {
@@ -349,30 +359,235 @@ public enum AgentHarness {
         return text.isEmpty ? "(script ran — no return value)" : text
     }
 
-    /// Roots the power tier may write into. Containment is checked against the
-    /// *canonical* (symlink-resolved) destination, so a symlinked parent can't
-    /// redirect a write outside these roots (CWE-61).
-    private static let writeRoots = [NSHomeDirectory(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"]
+    public static func allowedWorkspaceRoot() -> String {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        let root = base.appendingPathComponent("Cascade/HarnessWorkspace", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return canonicalize(root.path)
+    }
+
+    public static func allowedSessionScratchRoot() -> String {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("CascadeHarnessScratch", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return canonicalize(root.path)
+    }
+
+    private static var writeRoots: [String] {
+        [allowedWorkspaceRoot(), allowedSessionScratchRoot()]
+    }
 
     /// Writes only where the user's own files live — home, temp dirs — never
     /// into system paths or through a symlink that escapes them.
     private static func writeFile(path: String, content: String) -> String {
-        let canonical = canonicalize(path)
-        // Resolve symlinks BEFORE the protected-path and containment checks: a
-        // symlinked parent must not disguise the real destination (e.g.
-        // `~/work/link -> ~/.ssh`, then `write ~/work/link/config`).
-        if let reason = sensitivePathReason(canonical) { return reason }
-        guard isInsideAllowedRoot(canonical, writeRoots) else {
-            return "write_file only writes inside the user's home folder or temp dirs — not \(canonical)."
+        let expanded = expand(path)
+        let destination = URL(fileURLWithPath: expanded)
+        if let reason = sensitivePathReason(expanded) { return reason }
+        guard let prepared = prepareWriteDestination(destination.path) else {
+            return "write_file only writes inside Cascade's harness workspace or session scratch root — not \(expanded)."
         }
-        let url = URL(fileURLWithPath: canonical)
+        if let reason = sensitivePathReason(prepared.path) { return reason }
         do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try content.write(to: url, atomically: true, encoding: .utf8)
-            return "Wrote \(content.utf8.count) bytes to \(canonical)."
+            try atomicWrite(content: content, to: prepared)
+            return "Wrote \(content.utf8.count) bytes to \(prepared.path)."
         } catch {
-            return "Couldn't write \(canonical): \(error.localizedDescription)"
+            return "Couldn't write \(prepared.path): \(error.localizedDescription)"
         }
+    }
+
+    private struct StructuredCommand {
+        let executable: String
+        let arguments: [String]
+    }
+
+    private static let allowedExecutables: [String: String] = [
+        "echo": "/bin/echo",
+        "printf": "/usr/bin/printf",
+        "pwd": "/bin/pwd",
+        "ls": "/bin/ls",
+        "grep": "/usr/bin/grep",
+        "find": "/usr/bin/find",
+        "wc": "/usr/bin/wc",
+        "shasum": "/usr/bin/shasum",
+        "true": "/usr/bin/true",
+        "false": "/usr/bin/false",
+        "stat": "/usr/bin/stat",
+    ]
+
+    private static func structuredCommand(for command: String) -> (command: StructuredCommand?, refusal: String?) {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return (nil, "run_command needs a command.") }
+        guard let tokens = tokenizeStructuredCommand(trimmed) else {
+            return (nil, "run_command only accepts a single allowlisted executable plus literal argv; pipes, redirects, substitutions, globs, variables, aliases, and inline shell syntax are refused.")
+        }
+        guard let executableToken = tokens.first else { return (nil, "run_command needs a command.") }
+        let executable: String?
+        if executableToken.contains("/") {
+            let canonical = canonicalize(executableToken)
+            executable = allowedExecutables.values.contains(canonical) ? canonical : nil
+        } else {
+            executable = allowedExecutables[executableToken]
+        }
+        guard let executable else {
+            return (nil, "run_command executable is not allowlisted. Use one of: \(allowedExecutables.keys.sorted().joined(separator: ", ")).")
+        }
+        for argument in tokens.dropFirst() {
+            if let refusal = commandArgumentRefusal(argument) { return (nil, refusal) }
+        }
+        return (StructuredCommand(executable: executable, arguments: Array(tokens.dropFirst())), nil)
+    }
+
+    private static func tokenizeStructuredCommand(_ command: String) -> [String]? {
+        let refused = CharacterSet(charactersIn: "|&;<>()$`\\\n\r*?[]{}")
+        if command.rangeOfCharacter(from: refused) != nil { return nil }
+        var tokens: [String] = []
+        var current = ""
+        var quote: Character?
+        for character in command {
+            if let active = quote {
+                if character == active {
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
+                continue
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+            } else if character.isWhitespace {
+                if !current.isEmpty {
+                    tokens.append(current)
+                    current = ""
+                }
+            } else {
+                current.append(character)
+            }
+        }
+        guard quote == nil else { return nil }
+        if !current.isEmpty { tokens.append(current) }
+        return tokens.isEmpty ? nil : tokens
+    }
+
+    private static func commandArgumentRefusal(_ argument: String) -> String? {
+        if PrivacyRules.isSensitiveText(argument) {
+            return privacyRefusal("command argument")
+        }
+        guard looksPathLike(argument) else { return nil }
+        let expanded = expand(argument)
+        return sensitivePathReason(expanded)
+    }
+
+    private static func looksPathLike(_ argument: String) -> Bool {
+        argument.hasPrefix("/")
+            || argument.hasPrefix("~")
+            || argument.hasPrefix("./")
+            || argument.hasPrefix("../")
+            || argument.contains("/")
+    }
+
+    private struct PreparedWriteDestination {
+        let path: String
+        let directory: String
+        let fileName: String
+    }
+
+    private static func prepareWriteDestination(_ path: String) -> PreparedWriteDestination? {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let parentURL = url.deletingLastPathComponent()
+        let fileName = url.lastPathComponent
+        guard !fileName.isEmpty, fileName != "." && fileName != ".." else { return nil }
+        guard let parent = prepareCanonicalDirectory(parentURL.path) else { return nil }
+        let destination = (parent as NSString).appendingPathComponent(fileName)
+        guard isInsideAllowedRoot(destination, writeRoots) else { return nil }
+        guard !isSymlink(path: destination) else { return nil }
+        return PreparedWriteDestination(path: destination, directory: parent, fileName: fileName)
+    }
+
+    private static func prepareCanonicalDirectory(_ directory: String) -> String? {
+        let expanded = expand(directory)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: expanded) {
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: expanded, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+            let canonical = canonicalize(expanded)
+            guard isInsideAllowedRoot(canonical, writeRoots) else { return nil }
+            return canonical
+        }
+
+        var existing = expanded
+        var tail: [String] = []
+        while existing != "/", !existing.isEmpty, !fm.fileExists(atPath: existing) {
+            let url = URL(fileURLWithPath: existing)
+            let component = url.lastPathComponent
+            guard !component.isEmpty, component != "." && component != ".." else { return nil }
+            tail.insert(component, at: 0)
+            let parent = url.deletingLastPathComponent().path
+            if parent == existing { break }
+            existing = parent
+        }
+        let canonicalExisting = canonicalize(existing)
+        guard isInsideAllowedRoot(canonicalExisting, writeRoots) else { return nil }
+        var candidate = canonicalExisting
+        for component in tail {
+            candidate = (candidate as NSString).appendingPathComponent(component)
+            if isSymlink(path: candidate) { return nil }
+        }
+        do {
+            try fm.createDirectory(atPath: expanded, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        let canonical = canonicalize(expanded)
+        guard isInsideAllowedRoot(canonical, writeRoots) else { return nil }
+        return canonical
+    }
+
+    private static func atomicWrite(content: String, to destination: PreparedWriteDestination) throws {
+        let tempName = ".\(destination.fileName).\(UUID().uuidString).tmp"
+        let tempPath = (destination.directory as NSString).appendingPathComponent(tempName)
+        let flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW
+        let fd = open(tempPath, flags, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var closeNeeded = true
+        defer {
+            if closeNeeded { close(fd) }
+            try? FileManager.default.removeItem(atPath: tempPath)
+        }
+        let data = Data(content.utf8)
+        try data.withUnsafeBytes { rawBuffer in
+            guard var base = rawBuffer.baseAddress else { return }
+            var remaining = rawBuffer.count
+            while remaining > 0 {
+                let written = Darwin.write(fd, base, remaining)
+                guard written > 0 else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+                remaining -= written
+                base = base.advanced(by: written)
+            }
+        }
+        fsync(fd)
+        guard close(fd) == 0 else {
+            closeNeeded = false
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        closeNeeded = false
+        guard rename(tempPath, destination.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard isInsideAllowedRoot(canonicalize(destination.path), writeRoots), !isSymlink(path: destination.path) else {
+            try? FileManager.default.removeItem(atPath: destination.path)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))
+        }
+    }
+
+    private static func isSymlink(path: String) -> Bool {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return false }
+        return (st.st_mode & S_IFMT) == S_IFLNK
     }
 
     // MARK: - Plumbing

@@ -32,8 +32,15 @@ public enum AuditChain: Sendable {
     /// different field splits can NEVER produce the same string — e.g.
     /// `(action:"a", detail:"b\u{1f}c")` and `(action:"a\u{1f}b", detail:"c")`
     /// encode differently. Order is fixed for cross-process/version reproducibility.
-    public static func canonicalForm(createdAt: String, actor: String, action: String, detail: String) -> String {
-        [createdAt, actor, action, detail]
+    public static func canonicalForm(
+        createdAt: String,
+        actor: String,
+        action: String,
+        detail: String,
+        redactionVersion: String = "",
+        keyID: String? = nil
+    ) -> String {
+        [createdAt, actor, action, detail, redactionVersion, keyID ?? ""]
             .map { "\($0.utf8.count):\($0)" }
             .joined(separator: "\u{1f}")
     }
@@ -91,6 +98,22 @@ public struct NullAuditAnchor: AuditAnchorStore {
     public init() {}
     public func load(database id: String) -> AuditHead? { nil }
     public func save(_ head: AuditHead, database id: String) {}
+}
+
+public protocol AuditSigner: Sendable {
+    var keyID: String { get }
+    func sign(eventHash: String) -> String?
+    func verify(signature: String?, eventHash: String, keyID: String) -> Bool
+}
+
+public struct NullAuditSigner: AuditSigner {
+    public static let keyID = "none"
+    public init() {}
+    public var keyID: String { Self.keyID }
+    public func sign(eventHash: String) -> String? { nil }
+    public func verify(signature: String?, eventHash: String, keyID: String) -> Bool {
+        keyID == Self.keyID && signature == nil
+    }
 }
 
 /// In-memory anchor for tests — persists across `CascadeStore` reopens when the

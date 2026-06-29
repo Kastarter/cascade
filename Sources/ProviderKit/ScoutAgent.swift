@@ -192,7 +192,7 @@ public final class ScoutAgent {
             lines.append("- search_files {\"action\":\"search_files\",\"query\":\"…\",\"folder\":\"~/Desktop\"} · read_file {\"action\":\"read_file\",\"path\":\"…\"} · list_folder {\"action\":\"list_folder\",\"path\":\"…\"} — find/read files instead of clicking through Finder (folder optional).")
         }
         if t.contains("run_command") {
-            lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
+            lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} runs one allowlisted executable with literal argv (no shell syntax) · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
         }
         if t.contains("search_record") {
             lines.append("- search_record {\"action\":\"search_record\",\"query\":\"…\"} · inspect_moment {\"action\":\"inspect_moment\",\"id\":<n>} — recall what the user already saw on screen EARLIER (use when the goal refers to something not on screen now).")

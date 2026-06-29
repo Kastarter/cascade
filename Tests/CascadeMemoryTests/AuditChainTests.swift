@@ -18,6 +18,22 @@ private func rawExec(_ path: String, _ sql: String) {
     sqlite3_exec(db, sql, nil, nil, nil)
 }
 
+private func rawStrings(_ path: String, _ sql: String) -> [String] {
+    var db: OpaquePointer?
+    guard sqlite3_open(path, &db) == SQLITE_OK else { return [] }
+    defer { sqlite3_close(db) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+    defer { sqlite3_finalize(statement) }
+    var values: [String] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+        if let cString = sqlite3_column_text(statement, 0) {
+            values.append(String(cString: cString))
+        }
+    }
+    return values
+}
+
 // MARK: - Pure chain math
 
 @Test
@@ -32,6 +48,16 @@ func auditHashIsDeterministicAndSensitive() {
     #expect(a.count == 64)          // hex SHA-256
     // A different predecessor yields a different hash even for identical content.
     #expect(AuditChain.hash(prev: a, canonical: canonical) != a)
+
+    let versioned = AuditChain.canonicalForm(
+        createdAt: "t",
+        actor: "x",
+        action: "agent.run",
+        detail: "d",
+        redactionVersion: PIIDetector.redactionVersion,
+        keyID: "none"
+    )
+    #expect(AuditChain.hash(prev: AuditChain.genesis, canonical: versioned) != a)
 }
 
 // MARK: - Store-level chain
@@ -63,12 +89,14 @@ func unchainedOnlyAuditRowsAreUntrusted() async throws {
 
 @Test
 func appendedAuditRowsFormAnIntactChain() async throws {
-    let (store, _) = try makeStore()
+    let (store, path) = try makeStore()
     for detail in ["opened reel", "ran agent", "approved cascade", "exported audit"] {
         _ = try await store.appendAudit(AuditEvent(actor: "employee", action: "ui.action", detail: detail))
     }
     #expect(try await store.verifyAuditChain() == .intact(verified: 4))
     #expect(try await store.latestAuditHash() != nil)
+    #expect(rawStrings(path, "SELECT redaction_version FROM audit_event LIMIT 1;").first == PIIDetector.redactionVersion)
+    #expect(rawStrings(path, "SELECT key_id FROM audit_event LIMIT 1;").first == "none")
 }
 
 @Test
@@ -86,6 +114,56 @@ func mutatingAnAuditRowBreaksTheChain() async throws {
     } else {
         Issue.record("expected a broken chain after a row was mutated")
     }
+}
+
+@Test
+func mutatingAuditMetadataBreaksTheChain() async throws {
+    let (store, path) = try makeStore()
+    let id = try await store.appendAudit(AuditEvent(actor: "x", action: "y", detail: "safe detail")).id
+
+    rawExec(path, "UPDATE audit_event SET redaction_version='old-version' WHERE id=\(id);")
+    let fresh = try CascadeStore(path: path)
+    if case .broken(let atID) = try await fresh.verifyAuditChain() {
+        #expect(atID == id)
+    } else {
+        Issue.record("expected redaction_version tampering to break the chain")
+    }
+}
+
+@Test
+func tamperingAuditSignatureBreaksTheChain() async throws {
+    let (store, path) = try makeStore()
+    let id = try await store.appendAudit(AuditEvent(actor: "x", action: "y", detail: "safe detail")).id
+
+    rawExec(path, "UPDATE audit_event SET signature='forged' WHERE id=\(id);")
+    let fresh = try CascadeStore(path: path)
+    if case .broken(let atID) = try await fresh.verifyAuditChain() {
+        #expect(atID == id)
+    } else {
+        Issue.record("expected signature tampering to break the chain")
+    }
+}
+
+@Test
+func legacyAuditDatabaseMigratesMetadataColumns() throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeLegacyAudit-\(UUID().uuidString).sqlite").path
+    rawExec(path, """
+    CREATE TABLE audit_event (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        prev_hash TEXT,
+        event_hash TEXT
+    );
+    """)
+
+    _ = try CascadeStore(path: path)
+    #expect(rawStrings(path, "SELECT name FROM pragma_table_info('audit_event') WHERE name='redaction_version';").first == "redaction_version")
+    #expect(rawStrings(path, "SELECT name FROM pragma_table_info('audit_event') WHERE name='key_id';").first == "key_id")
+    #expect(rawStrings(path, "SELECT name FROM pragma_table_info('audit_event') WHERE name='signature';").first == "signature")
 }
 
 // MARK: - External anchor (truncation / wholesale rewrite)

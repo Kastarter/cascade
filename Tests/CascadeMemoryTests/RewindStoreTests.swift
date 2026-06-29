@@ -41,10 +41,10 @@ func searchEmptyOrPunctuationOnlyQueryReturnsNothing() async throws {
 @Test
 func searchWithPunctuationDoesNotThrow() async throws {
     let store = try makeStore()
-    _ = try await store.insert(RecordedContext(source: .screen, appName: "Mail", ocrText: "ping user@example.com today"))
+    _ = try await store.insert(RecordedContext(source: .screen, appName: "Mail", ocrText: "ping alpha.example today"))
 
-    // Tokenizes to user/example/com — all present — without an FTS syntax error.
-    let hits = try await store.searchContexts(query: "user@example.com")
+    // Tokenizes to alpha/example — all present — without an FTS syntax error.
+    let hits = try await store.searchContexts(query: "alpha.example")
     #expect(hits.count == 1)
 }
 

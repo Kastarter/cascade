@@ -135,6 +135,33 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public enum InputEventSanitizer {
+    public static func typedShape(for text: String) -> String {
+        "typed \(text.count) chars"
+    }
+
+    public static func sanitize(text: String?, kind: InputEventKind) -> String? {
+        guard let text, !text.isEmpty else { return nil }
+        if kind == .type {
+            if text.range(of: #"^typed \d+ chars$"#, options: .regularExpression) != nil {
+                return text
+            }
+            return typedShape(for: text)
+        }
+        if PrivacyRules.isSensitiveText(text) { return nil }
+        let redacted = PIIDetector.redact(text, includeNames: false, highConfidenceOnly: false).redacted
+        let keywordRedacted = PrivacyRules.redactingSensitiveKeywords(in: redacted)
+        return keywordRedacted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : keywordRedacted
+    }
+
+    public static func sanitize(descriptor: String?) -> String? {
+        guard let descriptor, !descriptor.isEmpty else { return nil }
+        if PrivacyRules.isSensitiveText(descriptor) { return nil }
+        let redacted = PIIDetector.redact(descriptor, includeNames: false, highConfidenceOnly: false).redacted
+        return PrivacyRules.redactingSensitiveKeywords(in: redacted)
+    }
+}
+
 public struct OCRLine: Codable, Equatable, Sendable {
     public let contextID: Int64
     public let lineIndex: Int
@@ -674,11 +701,17 @@ public actor CascadeStore {
     private let connection: SQLiteConnection
     private let path: String
     private let auditAnchor: AuditAnchorStore
+    private let auditSigner: AuditSigner
     private var batchBindFailureInjector: CascadeBatchBindFailureInjector?
 
-    public init(path: String? = nil, auditAnchor: AuditAnchorStore = NullAuditAnchor()) throws {
+    public init(
+        path: String? = nil,
+        auditAnchor: AuditAnchorStore = NullAuditAnchor(),
+        auditSigner: AuditSigner = NullAuditSigner()
+    ) throws {
         self.path = path ?? Self.defaultDatabasePath()
         self.auditAnchor = auditAnchor
+        self.auditSigner = auditSigner
         try Self.ensureParentDirectory(for: self.path)
 
         var handle: OpaquePointer?
@@ -725,19 +758,20 @@ public actor CascadeStore {
                 var rows: [RecordedContext] = []
                 rows.reserveCapacity(contexts.count)
                 for (index, context) in contexts.enumerated() {
-                    try bindContext(context, at: index, in: statement)
+                    let sanitized = Self.sanitizedContext(context)
+                    try bindContext(sanitized, at: index, in: statement)
                     try stepDone(statement)
                     rows.append(RecordedContext(
                         id: sqlite3_last_insert_rowid(connection.db),
-                        capturedAt: context.capturedAt,
-                        source: context.source,
-                        appName: context.appName,
-                        bundleIdentifier: context.bundleIdentifier,
-                        windowTitle: context.windowTitle,
-                        ocrText: context.ocrText,
-                        imagePath: context.imagePath,
-                        metadataJSON: context.metadataJSON,
-                        frameHash: context.frameHash
+                        capturedAt: sanitized.capturedAt,
+                        source: sanitized.source,
+                        appName: sanitized.appName,
+                        bundleIdentifier: sanitized.bundleIdentifier,
+                        windowTitle: sanitized.windowTitle,
+                        ocrText: sanitized.ocrText,
+                        imagePath: sanitized.imagePath,
+                        metadataJSON: sanitized.metadataJSON,
+                        frameHash: sanitized.frameHash
                     ))
                     if indexWorkGraph, let row = rows.last {
                         try linkWorkGraphEntities(for: row)
@@ -1478,14 +1512,26 @@ public actor CascadeStore {
         // Strip high-confidence secrets/PII from the detail before it touches the
         // log: an audit trail must prove who/what/when without becoming a place
         // emails, cards, SSNs, or API keys come to rest (OWASP logging guidance).
-        let detail = PIIDetector.redact(event.detail).redacted
+        let detail = Self.sanitizeStoredText(event.detail) ?? ""
+        let redactionVersion = PIIDetector.redactionVersion
+        let keyID = auditSigner.keyID
         // Link this row to the chain head so any later mutation/deletion is evident.
         let prev = (try latestAuditHash()) ?? AuditChain.genesis
         let canonical = AuditChain.canonicalForm(
-            createdAt: createdAt, actor: event.actor, action: event.action, detail: detail
+            createdAt: createdAt,
+            actor: event.actor,
+            action: event.action,
+            detail: detail,
+            redactionVersion: redactionVersion,
+            keyID: keyID
         )
         let eventHash = AuditChain.hash(prev: prev, canonical: canonical)
-        let sql = "INSERT INTO audit_event (created_at, actor, action, detail, prev_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?);"
+        let signature = auditSigner.sign(eventHash: eventHash)
+        let sql = """
+        INSERT INTO audit_event
+            (created_at, actor, action, detail, prev_hash, event_hash, key_id, signature, redaction_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
         try withStatement(sql) { statement in
             bind(createdAt, at: 1, in: statement)
             bind(event.actor, at: 2, in: statement)
@@ -1493,6 +1539,9 @@ public actor CascadeStore {
             bind(detail, at: 4, in: statement)
             bind(prev, at: 5, in: statement)
             bind(eventHash, at: 6, in: statement)
+            bind(keyID, at: 7, in: statement)
+            bind(signature, at: 8, in: statement)
+            bind(redactionVersion, at: 9, in: statement)
             try stepDone(statement)
         }
         // Mirror the new chain head to the out-of-band anchor so truncation /
@@ -1531,7 +1580,7 @@ public actor CascadeStore {
     /// anchor to catch truncation / rewrites that keep the chain self-consistent.
     public func verifyAuditChain() throws -> AuditChainStatus {
         let sql = """
-        SELECT id, created_at, actor, action, detail, prev_hash, event_hash
+        SELECT id, created_at, actor, action, detail, prev_hash, event_hash, key_id, signature, redaction_version
         FROM audit_event ORDER BY id ASC;
         """
         let scan: (status: AuditChainStatus?, verified: Int, head: String, seenAny: Bool, firstUnchainedID: Int64?) = try withStatement(sql) { statement in
@@ -1555,6 +1604,12 @@ public actor CascadeStore {
                 let action = text(statement, 3) ?? ""
                 let detail = text(statement, 4) ?? ""
                 let prevHash = text(statement, 5) ?? ""
+                let keyID = text(statement, 7) ?? ""
+                let signature = text(statement, 8)
+                let redactionVersion = text(statement, 9) ?? ""
+                guard !redactionVersion.isEmpty, !keyID.isEmpty else {
+                    return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID)
+                }
                 if !seenChained {
                     if prevHash != AuditChain.genesis { return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID) }
                     seenChained = true
@@ -1562,9 +1617,17 @@ public actor CascadeStore {
                     return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID)
                 }
                 let canonical = AuditChain.canonicalForm(
-                    createdAt: createdAt, actor: actor, action: action, detail: detail
+                    createdAt: createdAt,
+                    actor: actor,
+                    action: action,
+                    detail: detail,
+                    redactionVersion: redactionVersion,
+                    keyID: keyID
                 )
                 if AuditChain.hash(prev: prevHash, canonical: canonical) != storedHash {
+                    return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID)
+                }
+                if !auditSigner.verify(signature: signature, eventHash: storedHash, keyID: keyID) {
                     return (.broken(atID: id), verified, lastHash, seenAny, firstUnchainedID)
                 }
                 expectedPrev = storedHash
@@ -1704,7 +1767,10 @@ public actor CascadeStore {
             action TEXT NOT NULL,
             detail TEXT NOT NULL,
             prev_hash TEXT,
-            event_hash TEXT
+            event_hash TEXT,
+            key_id TEXT,
+            signature TEXT,
+            redaction_version TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_audit_event_created_at
             ON audit_event(created_at DESC);
@@ -1727,6 +1793,9 @@ public actor CascadeStore {
         // Tamper-evident audit chain columns for databases created before they existed.
         try? execute("ALTER TABLE audit_event ADD COLUMN prev_hash TEXT;", db: db)
         try? execute("ALTER TABLE audit_event ADD COLUMN event_hash TEXT;", db: db)
+        try? execute("ALTER TABLE audit_event ADD COLUMN key_id TEXT;", db: db)
+        try? execute("ALTER TABLE audit_event ADD COLUMN signature TEXT;", db: db)
+        try? execute("ALTER TABLE audit_event ADD COLUMN redaction_version TEXT;", db: db)
 
         // Full-text search over recorded moments. External-content FTS5 indexes the
         // text columns of `recorded_context` (no duplicated content); triggers keep
@@ -2124,20 +2193,76 @@ public actor CascadeStore {
         try bindChecked(context.frameHash, at: 10, in: statement)
     }
 
+    private static func sanitizedContext(_ context: RecordedContext) -> RecordedContext {
+        RecordedContext(
+            id: context.id,
+            capturedAt: context.capturedAt,
+            source: context.source,
+            appName: sanitizeStoredText(context.appName) ?? context.appName,
+            bundleIdentifier: sanitizeStoredText(context.bundleIdentifier),
+            windowTitle: sanitizeStoredText(context.windowTitle),
+            ocrText: sanitizeStoredText(context.ocrText),
+            imagePath: context.imagePath,
+            metadataJSON: context.metadataJSON,
+            frameHash: context.frameHash
+        )
+    }
+
+    static func sanitizeStoredText(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let piiRedacted = redactPIIForStorage(text)
+        let keywordRedacted = PrivacyRules.redactingSensitiveKeywords(in: piiRedacted)
+        return keywordRedacted.isEmpty ? nil : keywordRedacted
+    }
+
+    private static func redactPIIForStorage(_ text: String) -> String {
+        let findings = PIIDetector.findings(in: text, includeNames: false)
+        guard !findings.isEmpty else { return text }
+
+        var redacted = text
+        for finding in findings.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            let replacement = finding.type == .url
+                ? privacySafeURLText(finding.text)
+                : finding.type.placeholder
+            redacted.replaceSubrange(finding.range, with: replacement)
+        }
+        return redacted
+    }
+
+    private static func privacySafeURLText(_ rawValue: String) -> String {
+        guard let url = URL(string: rawValue),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            return PIIType.url.placeholder
+        }
+
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = host
+        components.port = url.port
+        if !url.path.isEmpty, url.path != "/" {
+            components.path = url.path
+        }
+        return components.string ?? "\(scheme)://\(host)"
+    }
+
     private func bindInputEvent(_ event: InputEvent, at rowIndex: Int, in statement: OpaquePointer) throws {
         try batchBindFailureInjector?(.inputEvent, rowIndex)
+        let sanitizedText = InputEventSanitizer.sanitize(text: event.text, kind: event.kind)
+        let sanitizedDescriptor = InputEventSanitizer.sanitize(descriptor: event.targetDescriptor)
         try bindChecked(DateCodec.string(from: event.capturedAt), at: 1, in: statement)
         try bindChecked(EventStoreLayout.capturedMilliseconds(for: event.capturedAt), at: 2, in: statement)
         try bindChecked(event.kind.rawValue, at: 3, in: statement)
         try bindChecked(event.x, at: 4, in: statement)
         try bindChecked(event.y, at: 5, in: statement)
-        try bindChecked(event.text, at: 6, in: statement)
+        try bindChecked(sanitizedText, at: 6, in: statement)
         try bindChecked(event.key, at: 7, in: statement)
         try bindChecked(event.modifiers.isEmpty ? nil : event.modifiers.joined(separator: ","), at: 8, in: statement)
         try bindChecked(event.appName, at: 9, in: statement)
         try bindChecked(event.bundleIdentifier, at: 10, in: statement)
         try bindChecked(event.windowTitle, at: 11, in: statement)
-        try bindChecked(event.targetDescriptor, at: 12, in: statement)
+        try bindChecked(sanitizedDescriptor, at: 12, in: statement)
     }
 
     private func lastError() -> String {

@@ -53,6 +53,7 @@ public struct PIIFinding: Equatable, Sendable {
 /// automated detector catches everything — so this is a recall layer in front of
 /// the existing `PrivacyRules` drop list, not a replacement for it.
 public enum PIIDetector {
+    public static let redactionVersion = "pii-redaction-v1"
 
     // MARK: - Public API
 

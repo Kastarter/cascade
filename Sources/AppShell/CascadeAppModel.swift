@@ -191,6 +191,13 @@ public final class CascadeAppModel: ObservableObject {
         didSet { defaultsStore.set(powerHarnessEnabled, forKey: Self.powerHarnessKey) }
     }
     private static let powerHarnessKey = "cascade.powerHarness"
+    @Published public var capturePrivacyPolicy: CapturePrivacyPolicy = .default {
+        didSet {
+            Self.persistCapturePrivacyPolicy(capturePrivacyPolicy, defaults: defaultsStore)
+            recorder.updateCapturePolicy(capturePrivacyPolicy)
+        }
+    }
+    private static let capturePrivacyPolicyKey = "cascade.capturePrivacyPolicy"
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
     static let experimentalEpisodeMiningKey = "cascade.experimentalEpisodeMining"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
@@ -216,6 +223,18 @@ public final class CascadeAppModel: ObservableObject {
 
     static func experimentalWorkGraphIndexEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalWorkGraphIndexKey)
+    }
+
+    private static func restoreCapturePrivacyPolicy(defaults: UserDefaults) -> CapturePrivacyPolicy {
+        guard let data = defaults.data(forKey: capturePrivacyPolicyKey),
+              let policy = try? CapturePrivacyPolicy.importJSONData(data) else { return .default }
+        return policy
+    }
+
+    private static func persistCapturePrivacyPolicy(_ policy: CapturePrivacyPolicy, defaults: UserDefaults) {
+        if let data = try? policy.exportedJSONData() {
+            defaults.set(data, forKey: capturePrivacyPolicyKey)
+        }
     }
 
     /// Thinking effort for the on-screen cursor agent — "medium" (Anthropic's
@@ -335,6 +354,7 @@ public final class CascadeAppModel: ObservableObject {
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
+        let initialCapturePolicy = Self.restoreCapturePrivacyPolicy(defaults: defaults)
         // Production store anchors its audit-chain head in the Keychain so
         // truncation/rewrite of the local audit log is detectable. Tests inject a
         // store and never hit this path.
@@ -343,6 +363,7 @@ public final class CascadeAppModel: ObservableObject {
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)
+        capturePrivacyPolicy = initialCapturePolicy
         // The "Cursor agent speed" picker was removed and CLAUDE.md puts effort:low
         // "off the table" (it makes the agent dumb), so pin medium — ignoring any
         // stale `cascade.cuEffort = "low"` a prior build's picker may have persisted.
@@ -355,7 +376,8 @@ public final class CascadeAppModel: ObservableObject {
             store: store,
             options: ContextRecorder.Options(
                 indexWorkGraph: experimentalWorkGraphIndex,
-                structuredContent: experimentalStructuredContent
+                structuredContent: experimentalStructuredContent,
+                capturePolicy: initialCapturePolicy
             )
         )
         dock = ControlDockModel()
@@ -5461,6 +5483,29 @@ public final class CascadeAppModel: ObservableObject {
         permissionDiagnostics = PermissionProbe.diagnostics()
         autoStartIfPermitted()
         statusLine = recorder.status.message
+    }
+
+    public func setCapturePrivateMode(_ enabled: Bool) {
+        var policy = capturePrivacyPolicy
+        policy.privateModeEnabled = enabled
+        capturePrivacyPolicy = policy
+        statusLine = enabled ? "Recording paused by private mode." : recorder.status.message
+    }
+
+    public func exportCapturePolicyToPasteboard() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(capturePrivacyPolicy.exportedJSONString(), forType: .string)
+        statusLine = "Capture policy JSON copied."
+    }
+
+    public func importCapturePolicyFromPasteboard() {
+        guard let json = NSPasteboard.general.string(forType: .string),
+              let policy = try? CapturePrivacyPolicy.importJSONString(json) else {
+            statusLine = "Clipboard does not contain a valid capture policy JSON document."
+            return
+        }
+        capturePrivacyPolicy = policy
+        statusLine = "Capture policy imported."
     }
 
     /// Prepends a freshly recorded moment to the Reel, newest-first, capped so the

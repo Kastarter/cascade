@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 @testable import MacContextKit
 @testable import ProviderKit
 
+@Suite(.serialized)
 struct GroundingCacheIntegrationTests {
     @Test
     func experimentalGroundingCacheDefaultsOffAndLeavesGroundingUncached() async throws {

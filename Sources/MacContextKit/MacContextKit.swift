@@ -188,10 +188,16 @@ public final class ContextRecorder: ObservableObject {
     public struct Options: Equatable, Sendable {
         public var indexWorkGraph: Bool
         public var structuredContent: Bool
+        public var capturePolicy: CapturePrivacyPolicy
 
-        public init(indexWorkGraph: Bool = false, structuredContent: Bool = false) {
+        public init(
+            indexWorkGraph: Bool = false,
+            structuredContent: Bool = false,
+            capturePolicy: CapturePrivacyPolicy = .default
+        ) {
             self.indexWorkGraph = indexWorkGraph
             self.structuredContent = structuredContent
+            self.capturePolicy = capturePolicy
         }
     }
 
@@ -199,7 +205,7 @@ public final class ContextRecorder: ObservableObject {
 
     private let store: CascadeStore
     private let observer: AppWindowObserver
-    private let options: Options
+    private var options: Options
     private var rewind: RewindRecorder?
     private let input: InputRecorder
     private var retentionTask: Task<Void, Never>?
@@ -211,11 +217,21 @@ public final class ContextRecorder: ObservableObject {
 
     public var configuration: Options { options }
 
+    public func updateCapturePolicy(_ policy: CapturePrivacyPolicy) {
+        options.capturePolicy = policy
+        input.updatePolicy(policy)
+        rewind?.updatePolicy(policy)
+        if policy.privateModeEnabled, status.running {
+            pause()
+            status.message = "Recording paused by private mode."
+        }
+    }
+
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
         self.store = store
         self.observer = observer
         self.options = options
-        self.input = InputRecorder(store: store)
+        self.input = InputRecorder(store: store, policy: options.capturePolicy)
         let permissions = PermissionProbe.currentStatus()
         status = ContextRecorderStatus(
             running: false,
@@ -251,6 +267,10 @@ public final class ContextRecorder: ObservableObject {
             status.message = "Open Settings to grant Screen Recording before recording."
             return
         }
+        guard !options.capturePolicy.privateModeEnabled else {
+            status.message = "Recording paused by private mode."
+            return
+        }
         guard rewind == nil else { return }
         status.running = true
         status.message = "Recording local context."
@@ -258,7 +278,8 @@ public final class ContextRecorder: ObservableObject {
         let recorder = RewindRecorder(
             store: store,
             indexWorkGraph: options.indexWorkGraph,
-            structuredContent: options.structuredContent
+            structuredContent: options.structuredContent,
+            policy: options.capturePolicy
         ) { [weak self] context in
             Task { @MainActor in
                 guard let self else { return }
@@ -393,11 +414,11 @@ public final class ContextRecorder: ObservableObject {
         let snapshot = observer.refresh()
         // Same privacy boundary as the continuous recorder — the one-shot path
         // must not store what the rewind would refuse. Pre-OCR gate on app/window…
-        guard !PrivacyRules.isSensitive(
+        guard options.capturePolicy.decision(
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier,
             windowTitle: snapshot.windowTitle
-        ) else {
+        ).allowed else {
             status.message = "Skipped a sensitive moment."
             return nil
         }
@@ -412,6 +433,7 @@ public final class ContextRecorder: ObservableObject {
         var displayMetadata: CapturedDisplayMetadata?
         var ocrBoxes: [ScreenTextRecognizer.TextBox] = []
         var axTextForLines = ""
+        var privacyMetadata: FrameRedactor.Metadata?
         if canCaptureScreen,
            let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false) {
             source = .screen
@@ -426,16 +448,7 @@ public final class ContextRecorder: ObservableObject {
                 ocrBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: png)
                 let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
                 if !structured.readingOrderText.isEmpty { ocrText = structured.readingOrderText }
-                imagePath = Self.saveFrame(png)
             }
-        }
-        let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, let capturedImageData {
-            StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(
-                ocrBoxes.isEmpty ? ScreenTextRecognizer.recognizeBoxes(inImageData: capturedImageData) : ocrBoxes,
-                topLeftOrigin: false
-            ))
-        } else {
-            nil
         }
         // Same exact-text channel as the continuous recorder: AX text leads,
         // OCR fills in what the tree can't see.
@@ -445,6 +458,42 @@ public final class ContextRecorder: ObservableObject {
             let merged = AXTextHarvester.merge(ax: axText, ocr: ocrText ?? "")
             if !merged.isEmpty { ocrText = merged }
         }
+        if let reason = FrameRedactor.wholeFrameDropReason(
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle,
+            rawText: ocrText ?? "",
+            policy: options.capturePolicy
+        ) {
+            status.message = "Skipped a sensitive moment (\(reason))."
+            return nil
+        }
+        if let imageData = capturedImageData {
+            guard let redacted = FrameRedactor.redact(
+                imageData: imageData,
+                boxes: ocrBoxes,
+                policy: options.capturePolicy
+            ) else {
+                status.message = "Could not redact captured frame."
+                return nil
+            }
+            capturedImageData = redacted.imageData
+            ocrBoxes = redacted.boxes
+            privacyMetadata = redacted.metadata
+            imagePath = FrameStore.save(jpeg: redacted.imageData)
+            let redactedOCR = ScreenContentStructurer.structure(redacted.boxes, topLeftOrigin: false).readingOrderText
+            let redactedAX = FrameRedactor.redactedText(axTextForLines, policy: options.capturePolicy)
+            axTextForLines = redactedAX
+            let merged = AXTextHarvester.merge(ax: redactedAX, ocr: redactedOCR)
+            if !merged.isEmpty { ocrText = merged }
+        } else if let text = ocrText {
+            ocrText = FrameRedactor.redactedText(text, policy: options.capturePolicy)
+        }
+        let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, !ocrBoxes.isEmpty {
+            StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false))
+        } else {
+            nil
+        }
 
         let metadata = RecorderMetadataJSON.capture(
             processIdentifier: snapshot.processIdentifier,
@@ -453,7 +502,8 @@ public final class ContextRecorder: ObservableObject {
             height: samplePixelHeight,
             reason: reason,
             display: displayMetadata,
-            structured: structuredMetadata
+            structured: structuredMetadata,
+            privacy: privacyMetadata
         )
         let context = RecordedContext(
             source: source,
@@ -466,7 +516,12 @@ public final class ContextRecorder: ObservableObject {
         )
         // …and the full gate once OCR text exists: a sensitive frame is deleted,
         // never stored.
-        if PrivacyRules.isSensitive(context) {
+        if !options.capturePolicy.decision(
+            appName: context.appName,
+            bundleIdentifier: context.bundleIdentifier,
+            windowTitle: context.windowTitle,
+            text: context.ocrText
+        ).allowed {
             if let imagePath { try? FileManager.default.removeItem(atPath: imagePath) }
             status.message = "Skipped a sensitive moment."
             return nil

@@ -2396,6 +2396,9 @@ private struct SettingsScreen: View {
                 section("PERMISSIONS", trailing: "local capture & control") {
                     permissionsCard
                 }
+                section("CAPTURE POLICY", trailing: "privacy controls") {
+                    PrivacyPolicyCard(model: model)
+                }
                 section("AGENT HARNESS", trailing: "direct-Mac tools, fully audited") {
                     HarnessCard(model: model)
                 }
@@ -2466,6 +2469,44 @@ private struct SettingsScreen: View {
     }
 }
 
+private struct PrivacyPolicyCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Private mode").font(.cascadeSans(15, .semibold))
+                        Text(model.capturePrivacyPolicy.privateModeEnabled ? "Capture is paused." : "Capture follows the local policy.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { model.capturePrivacyPolicy.privateModeEnabled },
+                        set: { model.setCapturePrivateMode($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Managed JSON").font(.cascadeSans(15, .semibold))
+                        Text("\(model.capturePrivacyPolicy.deniedBundleIdentifiers.count) bundle rules · \(model.capturePrivacyPolicy.deniedWindowTitleKeywords.count) title rules")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Button("Import") { model.importCapturePolicyFromPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                    Button("Export") { model.exportCapturePolicyToPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+            }
+        }
+    }
+}
+
 /// The assist agent's direct-Mac tools: the always-on read-only tier, and the
 /// opt-in Power harness that lets it run commands, scripts, and file writes.
 private struct HarnessCard: View {
@@ -2487,7 +2528,7 @@ private struct HarnessCard: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Power harness").font(.cascadeSans(15, .semibold))
-                        Text("run_command · run_applescript · write_file — the agent can run shell commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Commands and scripts are shown live for supervision; audit rows store safe descriptors, hashes, and byte counts. Destructive commands (sudo, rm -rf /, …) are refused, and Esc stops it mid-run.")
+                        Text("run_command · run_applescript · write_file — the agent can run allowlisted argv-safe commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Commands and scripts are shown live for supervision; audit rows store safe descriptors, hashes, and byte counts. Shell syntax, destructive commands, and protected paths are refused, and Esc stops it mid-run.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()

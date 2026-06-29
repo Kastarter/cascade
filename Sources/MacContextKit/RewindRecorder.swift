@@ -71,6 +71,7 @@ enum RecorderMetadataJSON {
         let display: CapturedDisplayMetadata?
         let signature: SignaturePayload?
         let structured: StructuredContentExporter.Metadata?
+        let privacy: FrameRedactor.Metadata?
     }
 
     private struct CapturePayload: Encodable {
@@ -81,6 +82,7 @@ enum RecorderMetadataJSON {
         let captureReason: String?
         let display: CapturedDisplayMetadata?
         let structured: StructuredContentExporter.Metadata?
+        let privacy: FrameRedactor.Metadata?
     }
 
     static func rewind(
@@ -90,13 +92,14 @@ enum RecorderMetadataJSON {
         reason: CaptureReason? = nil,
         display: CapturedDisplayMetadata? = nil,
         signature: FrameSignature? = nil,
-        structured: StructuredContentExporter.Metadata?
+        structured: StructuredContentExporter.Metadata?,
+        privacy: FrameRedactor.Metadata? = nil
     ) -> String {
-        if reason == nil, display == nil, signature == nil, structured == nil {
+        if reason == nil, display == nil, signature == nil, structured == nil, privacy == nil {
             return "{\"rewind\":true,\"w\":\(width),\"h\":\(height),\"ax\":\(axCount)}"
         }
         let signaturePayload = signature.map(SignaturePayload.init)
-        guard let structured else {
+        guard structured != nil || privacy != nil else {
             return encode(RewindPayload(
                 rewind: true,
                 w: width,
@@ -105,7 +108,8 @@ enum RecorderMetadataJSON {
                 captureReason: reason?.rawValue,
                 display: display,
                 signature: signaturePayload,
-                structured: nil
+                structured: nil,
+                privacy: nil
             ))
         }
         return encode(RewindPayload(
@@ -116,7 +120,8 @@ enum RecorderMetadataJSON {
             captureReason: reason?.rawValue,
             display: display,
             signature: signaturePayload,
-            structured: structured
+            structured: structured,
+            privacy: privacy
         ))
     }
 
@@ -127,9 +132,10 @@ enum RecorderMetadataJSON {
         height: Int? = nil,
         reason: CaptureReason? = nil,
         display: CapturedDisplayMetadata? = nil,
-        structured: StructuredContentExporter.Metadata?
+        structured: StructuredContentExporter.Metadata?,
+        privacy: FrameRedactor.Metadata? = nil
     ) -> String {
-        guard let structured else {
+        guard structured != nil || privacy != nil else {
             return encode(CapturePayload(
                 processIdentifier: processIdentifier,
                 cursorScreen: cursorScreen,
@@ -137,7 +143,8 @@ enum RecorderMetadataJSON {
                 h: height,
                 captureReason: reason?.rawValue,
                 display: display,
-                structured: nil
+                structured: nil,
+                privacy: nil
             ))
         }
         return encode(CapturePayload(
@@ -147,7 +154,8 @@ enum RecorderMetadataJSON {
             h: height,
             captureReason: reason?.rawValue,
             display: display,
-            structured: structured
+            structured: structured,
+            privacy: privacy
         ))
     }
 
@@ -331,6 +339,7 @@ actor RewindEngine {
     private let store: CascadeStore
     private let indexWorkGraph: Bool
     private let structuredContent: Bool
+    private var policy: CapturePrivacyPolicy
     private let onMoment: @Sendable (RecordedContext) -> Void
     private var latest: ChangedFrame?
     private var pending: PendingFrame?
@@ -352,12 +361,18 @@ actor RewindEngine {
         store: CascadeStore,
         indexWorkGraph: Bool = false,
         structuredContent: Bool = false,
+        policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
     ) {
         self.store = store
         self.indexWorkGraph = indexWorkGraph
         self.structuredContent = structuredContent
+        self.policy = policy
         self.onMoment = onMoment
+    }
+
+    func updatePolicy(_ policy: CapturePrivacyPolicy) {
+        self.policy = policy
     }
 
     func updateLatest(_ frame: ChangedFrame) {
@@ -391,11 +406,11 @@ actor RewindEngine {
 
         // Cheap pre-OCR privacy gate on app/bundle/window — drop sensitive surfaces
         // before paying for OCR or writing a frame to disk.
-        if PrivacyRules.isSensitive(
+        if !policy.decision(
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier,
             windowTitle: snapshot.windowTitle
-        ) {
+        ).allowed {
             return
         }
 
@@ -415,13 +430,9 @@ actor RewindEngine {
 
         let recognitionLevel: VNRequestTextRecognitionLevel = axRich ? .fast : .accurate
         let ocrBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: frame.jpeg, level: recognitionLevel)
+        var redactedOCRBoxes = ocrBoxes
         let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
         var ocrText = structured.readingOrderText
-        let structuredMetadata: StructuredContentExporter.Metadata? = if structuredContent {
-            StructuredContentExporter.metadata(from: structured)
-        } else {
-            nil
-        }
         var nativeOCRLines: [ScreenTextRecognizer.TextBox] = []
 
         // Canvas/web window with little AX text → OCR is the only channel, so
@@ -443,14 +454,41 @@ actor RewindEngine {
             }
         }
 
-        let mergedText = AXTextHarvester.merge(ax: axText, ocr: ocrText)
+        let rawMergedText = AXTextHarvester.merge(ax: axText, ocr: ocrText)
+        if FrameRedactor.wholeFrameDropReason(
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle,
+            rawText: rawMergedText,
+            policy: policy
+        ) != nil {
+            return
+        }
+        guard let redacted = FrameRedactor.redact(imageData: frame.jpeg, boxes: ocrBoxes, policy: policy) else { return }
+        redactedOCRBoxes = redacted.boxes
+        ocrText = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false).readingOrderText
+        let redactedAXText = FrameRedactor.redactedText(axText, policy: policy)
+        nativeOCRLines = nativeOCRLines.map {
+            ScreenTextRecognizer.TextBox(
+                text: FrameRedactor.redactedText($0.text, policy: policy),
+                boundingBox: $0.boundingBox,
+                confidence: $0.confidence
+            )
+        }
+        let structuredRedacted = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false)
+        let structuredMetadata: StructuredContentExporter.Metadata? = if structuredContent {
+            StructuredContentExporter.metadata(from: structuredRedacted)
+        } else {
+            nil
+        }
+        let mergedText = AXTextHarvester.merge(ax: redactedAXText, ocr: ocrText)
         var signature = frame.signature
         signature.textDigest = Self.textDigest(mergedText)
         let bucket = Self.bucket(for: snapshot)
         if isDuplicate(bucket: bucket, signature: signature) {
             return
         }
-        guard let imagePath = FrameStore.save(jpeg: frame.jpeg) else { return }
+        guard let imagePath = FrameStore.save(jpeg: redacted.imageData) else { return }
 
         let context = RecordedContext(
             source: .screen,
@@ -466,22 +504,26 @@ actor RewindEngine {
                 reason: reason,
                 display: frame.display,
                 signature: signature,
-                structured: structuredMetadata
+                structured: structuredMetadata,
+                privacy: redacted.metadata
             ),
             frameHash: Int64(bitPattern: signature.combinedGridHash)
         )
 
-        // Re-check with OCR text now available — if anything sensitive surfaced in
-        // the captured text, drop the frame entirely (delete the file, don't store).
-        if PrivacyRules.isSensitive(context) {
+        if !policy.decision(
+            appName: context.appName,
+            bundleIdentifier: context.bundleIdentifier,
+            windowTitle: context.windowTitle,
+            text: context.ocrText
+        ).allowed {
             FrameStore.delete(imagePath)
             return
         }
 
         do {
             let inserted = try await store.insert(context, indexWorkGraph: indexWorkGraph)
-            var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: ocrBoxes, source: "vision")
-            lines += OCRLineBuilder.axLines(contextID: inserted.id, text: axText, startingAt: lines.count)
+            var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: redactedOCRBoxes, source: "vision")
+            lines += OCRLineBuilder.axLines(contextID: inserted.id, text: redactedAXText, startingAt: lines.count)
             if !nativeOCRLines.isEmpty {
                 lines += OCRLineBuilder.visionLines(contextID: inserted.id, boxes: nativeOCRLines, source: "vision_native_crop")
             }
@@ -574,12 +616,14 @@ final class RewindRecorder {
         fps: Int32 = 1,
         indexWorkGraph: Bool = false,
         structuredContent: Bool = false,
+        policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
     ) {
         self.engine = RewindEngine(
             store: store,
             indexWorkGraph: indexWorkGraph,
             structuredContent: structuredContent,
+            policy: policy,
             onMoment: onMoment
         )
         self.threshold = threshold
@@ -588,6 +632,10 @@ final class RewindRecorder {
 
     /// Whether a capture stream is currently live.
     var isRunning: Bool { stream != nil }
+
+    func updatePolicy(_ policy: CapturePrivacyPolicy) {
+        Task { await engine.updatePolicy(policy) }
+    }
 
     func start() async throws {
         guard stream == nil else { return }

@@ -61,6 +61,7 @@ public final class InputRecorder: @unchecked Sendable {
     }
 
     private let store: CascadeStore
+    private var policy: CapturePrivacyPolicy
     private let logger = Logger(subsystem: "com.humain.cascade", category: "input")
 
     private let contextLock = NSLock()
@@ -88,8 +89,16 @@ public final class InputRecorder: @unchecked Sendable {
 
     public var onActivity: (@Sendable (InputActivity) -> Void)?
 
-    public init(store: CascadeStore) {
+    public init(store: CascadeStore, policy: CapturePrivacyPolicy = .default) {
         self.store = store
+        self.policy = policy
+    }
+
+    public func updatePolicy(_ policy: CapturePrivacyPolicy) {
+        contextLock.lock()
+        self.policy = policy
+        currentContext.isSensitive = policy.privateModeEnabled
+        contextLock.unlock()
     }
 
     public var isRunning: Bool { tap != nil }
@@ -248,10 +257,12 @@ public final class InputRecorder: @unchecked Sendable {
     /// smuggle a sensitive phrase out of an otherwise unflagged window.
     private func resolveClickLabel(at point: CGPoint, when: Date) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, let hit = Self.axClickTarget(atCG: point),
-                  !PrivacyRules.isSensitiveText(hit.label) else { return }
+            guard let self, let hit = Self.axClickTarget(atCG: point) else { return }
+            let label = InputEventSanitizer.sanitize(text: hit.label, kind: .click)
+            let descriptor = InputEventSanitizer.sanitize(descriptor: hit.descriptor)
+            guard label != nil || descriptor != nil else { return }
             self.labelLock.lock()
-            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: hit.label, descriptor: hit.descriptor))
+            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: label ?? "", descriptor: descriptor))
             if self.clickLabels.count > 64 { self.clickLabels.removeFirst(self.clickLabels.count - 64) }
             self.labelLock.unlock()
         }
@@ -411,7 +422,14 @@ public final class InputRecorder: @unchecked Sendable {
         var typedAt = Date()
         func flushTyped() {
             guard !typed.isEmpty, let location = typedWhere else { return }
-            events.append(InputEvent(capturedAt: typedAt, kind: .type, text: typed, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+            events.append(InputEvent(
+                capturedAt: typedAt,
+                kind: .type,
+                text: InputEventSanitizer.typedShape(for: typed),
+                appName: location.app,
+                bundleIdentifier: location.bundle,
+                windowTitle: location.window
+            ))
             emitActivity(.typingRun, at: typedAt, in: location)
             typed = ""
             typedWhere = nil
@@ -434,13 +452,13 @@ public final class InputRecorder: @unchecked Sendable {
                 // cascade can re-find the target by identity, not stale pixels.
                 let hit = takeClickTarget(at: at, x: x, y: y)
                 if hit == nil { logger.debug("click stored without AX label in \(location.app, privacy: .public)") }
-                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+	                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
                 emitActivity(.click, at: at, in: location)
             case .rightClick(let x, let y, let at, let location):
                 flushTyped()
                 let hit = takeClickTarget(at: at, x: x, y: y)
                 if hit == nil { logger.debug("right-click stored without AX label in \(location.app, privacy: .public)") }
-                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+	                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
                 emitActivity(.click, at: at, in: location)
             case .scroll(let x, let y, let dx, let dy, let at, let location):
                 flushTyped()
@@ -475,7 +493,7 @@ public final class InputRecorder: @unchecked Sendable {
             app: snapshot.appName,
             bundle: bundle,
             window: snapshot.windowTitle,
-            isSensitive: PrivacyRules.isSensitive(appName: snapshot.appName, bundleIdentifier: bundle, windowTitle: snapshot.windowTitle),
+	            isSensitive: !policy.decision(appName: snapshot.appName, bundleIdentifier: bundle, windowTitle: snapshot.windowTitle).allowed,
             isOwnApp: bundle == Bundle.main.bundleIdentifier
         )
         contextLock.lock()
