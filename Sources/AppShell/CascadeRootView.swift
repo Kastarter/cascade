@@ -1958,6 +1958,15 @@ private struct ManagerScreen: View {
         model.agents.map(\.runCount).reduce(0, +)
     }
 
+    private var costPerRunText: String {
+        String(format: "$%.2f", model.valueSummary.costPerCompletedRunUSD)
+    }
+
+    private var sloText: String {
+        let rate = Int(((model.sloSnapshot?.successRate ?? 1.0) * 100).rounded())
+        return "\(rate)%"
+    }
+
     /// Sample counts per app, biggest first — where the recorded time actually went.
     private var appUsage: [(app: String, bundle: String?, count: Int)] {
         var counts: [String: (bundle: String?, count: Int)] = [:]
@@ -1982,6 +1991,8 @@ private struct ManagerScreen: View {
                     MetricCard(value: "~\(minutesOnTheTable)m", label: "On the table")
                     MetricCard(value: "\(appsObserved)", label: "Apps observed")
                     MetricCard(value: "\(model.agents.count)", label: "Agents approved")
+                    MetricCard(value: costPerRunText, label: "Cost / run")
+                    MetricCard(value: sloText, label: "SLO pass rate")
                     MetricCard(value: "0", label: "Raw screenshots")
                 }
                 reviewQueueSection
@@ -2399,6 +2410,12 @@ private struct SettingsScreen: View {
                 section("CAPTURE POLICY", trailing: "privacy controls") {
                     PrivacyPolicyCard(model: model)
                 }
+                section("PRIVACY OUTBOX", trailing: "employee data rights") {
+                    PrivacyOutboxCard(model: model)
+                }
+                section("AUDIT EXPORT", trailing: "SIEM and release gates") {
+                    AuditExportCard(model: model)
+                }
                 section("AGENT HARNESS", trailing: "direct-Mac tools, fully audited") {
                     HarnessCard(model: model)
                 }
@@ -2490,10 +2507,18 @@ private struct PrivacyPolicyCard: View {
                     .toggleStyle(.switch)
                 }
                 Divider().overlay(Color.cascadeBorder)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Managed controls").font(.cascadeSans(15, .semibold))
+                    Text(managedControls)
+                        .font(.cascadeSans(12))
+                        .foregroundStyle(Color.cascadeText2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider().overlay(Color.cascadeBorder)
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Managed JSON").font(.cascadeSans(15, .semibold))
-                        Text("\(model.capturePrivacyPolicy.deniedBundleIdentifiers.count) bundle rules · \(model.capturePrivacyPolicy.deniedWindowTitleKeywords.count) title rules")
+                        Text("\(model.capturePrivacyPolicy.deniedBundleIdentifiers.count) bundle rules · \(model.capturePrivacyPolicy.deniedWindowTitleKeywords.count) title rules · \(model.capturePrivacyPolicy.deniedURLHosts.count) site rules")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()
@@ -2504,6 +2529,137 @@ private struct PrivacyPolicyCard: View {
                 }
             }
         }
+    }
+
+    private var managedControls: String {
+        let policy = model.capturePrivacyPolicy
+        let controls = [
+            ("Recording", policy.recordingAvailable),
+            ("Background", policy.backgroundWebRunsAvailable),
+            ("Schedules", policy.scheduledRunsAvailable),
+            ("Power harness", policy.powerHarnessAvailable),
+            ("Record recall", policy.recordRecallAvailable),
+            ("Irreversible guard", policy.forceIrreversibleActionGuard),
+        ]
+        return controls.map { "\($0.0): \($0.1 ? "on" : "blocked")" }.joined(separator: " · ")
+    }
+}
+
+private struct PrivacyOutboxCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Captured summary").font(.cascadeSans(15, .semibold))
+                        Text(summaryLine)
+                            .font(.cascadeSans(12))
+                            .foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Button("Export manifest") { model.exportPrivacyManifestToPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                    Button("Delete all") { model.deletePrivacyData() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+                if let summary = model.privacySummary, !summary.buckets.isEmpty {
+                    Divider().overlay(Color.cascadeBorder)
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(summary.buckets.prefix(3).enumerated()), id: \.offset) { _, bucket in
+                            HStack {
+                                Text(bucket.appName)
+                                    .font(.cascadeSans(12, .medium))
+                                    .foregroundStyle(Color.cascadeText)
+                                Spacer()
+                                Text("\(bucket.count) moments")
+                                    .font(.cascadeMono(11))
+                                    .foregroundStyle(Color.cascadeText3)
+                            }
+                        }
+                    }
+                }
+                HStack(spacing: CascadeMetrics.s2) {
+                    CascadeTag(model.capturePrivacyPolicy.privateModeEnabled ? "Private mode on" : "Private mode off", tone: model.capturePrivacyPolicy.privateModeEnabled ? .cascadeWarn : .cascadeGood)
+                    Text("Exports omit OCR, image paths, metadata JSON, and input text.")
+                        .font(.cascadeSans(11))
+                        .foregroundStyle(Color.cascadeText3)
+                }
+            }
+        }
+    }
+
+    private var summaryLine: String {
+        guard let summary = model.privacySummary else { return "No captured summary loaded yet." }
+        let megabytes = Double(summary.estimatedFrameBytes) / 1_000_000.0
+        let start = summary.firstCapturedAt?.formatted(date: .abbreviated, time: .shortened) ?? "none"
+        let end = summary.lastCapturedAt?.formatted(date: .abbreviated, time: .shortened) ?? "none"
+        return "\(summary.totalContexts) moments · \(String(format: "%.1f", megabytes)) MB frames · \(start) to \(end)"
+    }
+}
+
+private struct AuditExportCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Agent audit export").font(.cascadeSans(15, .semibold))
+                        Text(auditLine)
+                            .font(.cascadeSans(12))
+                            .foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Menu("Copy") {
+                        Button("SIEM JSONL") { model.exportAgentAuditToPasteboard(format: .siemJSONL) }
+                        Button("OTel JSON") { model.exportAgentAuditToPasteboard(format: .otelJSON) }
+                        Button("CSV") { model.exportAgentAuditToPasteboard(format: .csv) }
+                        Button("Reliability JSONL") { model.exportAgentAuditToPasteboard(format: .reliabilityJSONL) }
+                        Button("Manifest JSON") { model.exportAgentAuditToPasteboard(format: .manifestJSON) }
+                    }
+                    .buttonStyle(CascadeQuietButtonStyle())
+                    Button("Copy SLO") { model.copySLOSnapshotToPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(spacing: CascadeMetrics.s3) {
+                    MetricPill(title: "Runs", value: "\(model.sloSnapshot?.totalRuns ?? 0)")
+                    MetricPill(title: "SLO", value: model.sloSnapshot?.passesReleaseGate == false ? "Fail" : "Pass")
+                    MetricPill(title: "Cost/run", value: String(format: "$%.2f", model.valueSummary.costPerCompletedRunUSD))
+                }
+            }
+        }
+    }
+
+    private var auditLine: String {
+        switch model.auditIntegrityStatus {
+        case .trusted:
+            return "Trusted audit chain. Export uses safe trace attributes and a manifest."
+        case .untrusted:
+            return "Audit chain is untrusted. Enforcement blocks export when enabled."
+        case .verificationFailed(let reason):
+            return "Audit verification failed: \(reason)"
+        case .unchecked:
+            return "Audit chain has not been checked yet."
+        }
+    }
+}
+
+private struct MetricPill: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(value).font(.cascadeSans(15, .semibold))
+            Text(title).font(.cascadeMono(9, .semibold)).foregroundStyle(Color.cascadeText4)
+        }
+        .padding(.horizontal, CascadeMetrics.s3)
+        .padding(.vertical, CascadeMetrics.s2)
+        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

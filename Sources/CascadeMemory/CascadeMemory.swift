@@ -48,6 +48,118 @@ public struct RecordedContext: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public struct PrivacyDataScope: Codable, Equatable, Sendable {
+    public var source: ContextSource?
+    public var appName: String?
+    public var bundleIdentifier: String?
+    public var start: Date?
+    public var end: Date?
+
+    public init(
+        source: ContextSource? = nil,
+        appName: String? = nil,
+        bundleIdentifier: String? = nil,
+        start: Date? = nil,
+        end: Date? = nil
+    ) {
+        self.source = source
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.start = start
+        self.end = end
+    }
+}
+
+public struct PrivacySummaryBucket: Codable, Equatable, Sendable {
+    public let source: ContextSource
+    public let appName: String
+    public let bundleIdentifier: String?
+    public let count: Int
+    public let firstCapturedAt: Date
+    public let lastCapturedAt: Date
+    public let estimatedFrameBytes: Int64
+
+    public init(
+        source: ContextSource,
+        appName: String,
+        bundleIdentifier: String?,
+        count: Int,
+        firstCapturedAt: Date,
+        lastCapturedAt: Date,
+        estimatedFrameBytes: Int64
+    ) {
+        self.source = source
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.count = count
+        self.firstCapturedAt = firstCapturedAt
+        self.lastCapturedAt = lastCapturedAt
+        self.estimatedFrameBytes = estimatedFrameBytes
+    }
+}
+
+public struct PrivacySummary: Codable, Equatable, Sendable {
+    public let scope: PrivacyDataScope
+    public let totalContexts: Int
+    public let firstCapturedAt: Date?
+    public let lastCapturedAt: Date?
+    public let estimatedFrameBytes: Int64
+    public let buckets: [PrivacySummaryBucket]
+    public let policyVersion: String
+    public let retentionByDataClass: [String: CaptureRetentionPolicy]
+
+    public init(
+        scope: PrivacyDataScope,
+        totalContexts: Int,
+        firstCapturedAt: Date?,
+        lastCapturedAt: Date?,
+        estimatedFrameBytes: Int64,
+        buckets: [PrivacySummaryBucket],
+        policyVersion: String,
+        retentionByDataClass: [String: CaptureRetentionPolicy]
+    ) {
+        self.scope = scope
+        self.totalContexts = totalContexts
+        self.firstCapturedAt = firstCapturedAt
+        self.lastCapturedAt = lastCapturedAt
+        self.estimatedFrameBytes = estimatedFrameBytes
+        self.buckets = buckets
+        self.policyVersion = policyVersion
+        self.retentionByDataClass = retentionByDataClass
+    }
+}
+
+public struct PrivacyExportManifest: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let generatedAt: Date
+    public let summary: PrivacySummary
+    public let omittedFields: [String]
+
+    public init(
+        schemaVersion: Int = 1,
+        generatedAt: Date = Date(),
+        summary: PrivacySummary,
+        omittedFields: [String] = ["ocr_text", "image_path", "metadata_json", "input_event.text", "input_event.target_descriptor"]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.generatedAt = generatedAt
+        self.summary = summary
+        self.omittedFields = omittedFields
+    }
+}
+
+public struct PrivacyDeletionResult: Codable, Equatable, Sendable {
+    public let deletedContextCount: Int
+    public let deletedInputEventCount: Int
+    public let backingImagePaths: [String]
+
+    public init(deletedContextCount: Int, deletedInputEventCount: Int, backingImagePaths: [String]) {
+        self.deletedContextCount = deletedContextCount
+        self.deletedInputEventCount = deletedInputEventCount
+        self.backingImagePaths = backingImagePaths
+    }
+}
+
 public struct HybridContextCandidate: Equatable, Sendable {
     public let candidate: RankFusion.FusedCandidate
     public let context: RecordedContext
@@ -1168,6 +1280,170 @@ public actor CascadeStore {
         return removed
     }
 
+    public func privacySummary(
+        scope: PrivacyDataScope = PrivacyDataScope(),
+        policy: CapturePrivacyPolicy = .default
+    ) throws -> PrivacySummary {
+        let contexts = try privacyContexts(scope: scope, limit: 100_000)
+        let frameBytes = contexts.reduce(Int64(0)) { total, context in
+            total + (context.imagePath.flatMap { Self.fileSize(at: $0) } ?? 0)
+        }
+        var grouped: [String: [RecordedContext]] = [:]
+        for context in contexts {
+            let key = [context.source.rawValue, context.appName, context.bundleIdentifier ?? ""]
+                .joined(separator: "\u{1F}")
+            grouped[key, default: []].append(context)
+        }
+        let buckets = grouped.values.compactMap { rows -> PrivacySummaryBucket? in
+            guard let firstRow = rows.min(by: { $0.capturedAt < $1.capturedAt }),
+                  let lastRow = rows.max(by: { $0.capturedAt < $1.capturedAt }) else { return nil }
+            let bytes = rows.reduce(Int64(0)) { total, context in
+                total + (context.imagePath.flatMap { Self.fileSize(at: $0) } ?? 0)
+            }
+            return PrivacySummaryBucket(
+                source: firstRow.source,
+                appName: firstRow.appName,
+                bundleIdentifier: firstRow.bundleIdentifier,
+                count: rows.count,
+                firstCapturedAt: firstRow.capturedAt,
+                lastCapturedAt: lastRow.capturedAt,
+                estimatedFrameBytes: bytes
+            )
+        }
+        .sorted {
+            if $0.count != $1.count { return $0.count > $1.count }
+            if $0.appName != $1.appName { return $0.appName < $1.appName }
+            return $0.source.rawValue < $1.source.rawValue
+        }
+        return PrivacySummary(
+            scope: scope,
+            totalContexts: contexts.count,
+            firstCapturedAt: contexts.map(\.capturedAt).min(),
+            lastCapturedAt: contexts.map(\.capturedAt).max(),
+            estimatedFrameBytes: frameBytes,
+            buckets: buckets,
+            policyVersion: policy.version,
+            retentionByDataClass: policy.retentionByDataClass
+        )
+    }
+
+    public func privacyExportManifest(
+        scope: PrivacyDataScope = PrivacyDataScope(),
+        policy: CapturePrivacyPolicy = .default,
+        generatedAt: Date = Date()
+    ) throws -> PrivacyExportManifest {
+        PrivacyExportManifest(
+            generatedAt: generatedAt,
+            summary: try privacySummary(scope: scope, policy: policy)
+        )
+    }
+
+    public func deletePrivacyData(scope: PrivacyDataScope) throws -> PrivacyDeletionResult {
+        let contexts = try privacyContexts(scope: scope, limit: 100_000)
+        let imagePaths = contexts.compactMap(\.imagePath)
+        let deletedInputCount = try inputEventCount(scope: scope)
+        try withTransaction {
+            for context in contexts {
+                try withStatement("DELETE FROM recorded_context WHERE id = ?;") { statement in
+                    sqlite3_bind_int64(statement, 1, context.id)
+                    try stepDone(statement)
+                }
+            }
+            try deleteInputEvents(scope: scope)
+        }
+        return PrivacyDeletionResult(
+            deletedContextCount: contexts.count,
+            deletedInputEventCount: deletedInputCount,
+            backingImagePaths: imagePaths
+        )
+    }
+
+    private func privacyContexts(scope: PrivacyDataScope, limit: Int) throws -> [RecordedContext] {
+        let sql = """
+        SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
+               NULL, image_path, NULL, frame_hash
+        FROM recorded_context
+        WHERE (? IS NULL OR source = ?)
+          AND (? IS NULL OR app_name = ?)
+          AND (? IS NULL OR bundle_identifier = ?)
+          AND (? IS NULL OR captured_at >= ?)
+          AND (? IS NULL OR captured_at <= ?)
+        ORDER BY captured_at ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bindPrivacyScope(scope, in: statement)
+            sqlite3_bind_int(statement, 11, Int32(max(0, min(limit, Int(Int32.max)))))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
+    private func inputEventCount(scope: PrivacyDataScope) throws -> Int {
+        let sql = """
+        SELECT count(*)
+        FROM input_event
+        WHERE (? = 1)
+          AND (? IS NULL OR app_name = ?)
+          AND (? IS NULL OR bundle_identifier = ?)
+          AND (? IS NULL OR captured_at >= ?)
+          AND (? IS NULL OR captured_at <= ?);
+        """
+        return try withStatement(sql) { statement in
+            bindInputScope(scope, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int(statement, 0)) : 0
+        }
+    }
+
+    private func deleteInputEvents(scope: PrivacyDataScope) throws {
+        let sql = """
+        DELETE FROM input_event
+        WHERE (? = 1)
+          AND (? IS NULL OR app_name = ?)
+          AND (? IS NULL OR bundle_identifier = ?)
+          AND (? IS NULL OR captured_at >= ?)
+          AND (? IS NULL OR captured_at <= ?);
+        """
+        try withStatement(sql) { statement in
+            bindInputScope(scope, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    private func bindPrivacyScope(_ scope: PrivacyDataScope, in statement: OpaquePointer) {
+        let source = scope.source?.rawValue
+        bind(source, at: 1, in: statement)
+        bind(source, at: 2, in: statement)
+        bind(scope.appName, at: 3, in: statement)
+        bind(scope.appName, at: 4, in: statement)
+        bind(scope.bundleIdentifier, at: 5, in: statement)
+        bind(scope.bundleIdentifier, at: 6, in: statement)
+        let start = scope.start.map(DateCodec.string(from:))
+        let end = scope.end.map(DateCodec.string(from:))
+        bind(start, at: 7, in: statement)
+        bind(start, at: 8, in: statement)
+        bind(end, at: 9, in: statement)
+        bind(end, at: 10, in: statement)
+    }
+
+    private func bindInputScope(_ scope: PrivacyDataScope, in statement: OpaquePointer) {
+        let includeInput = scope.source == nil || scope.source == .input
+        bind(includeInput ? Int64(1) : Int64(0), at: 1, in: statement)
+        bind(scope.appName, at: 2, in: statement)
+        bind(scope.appName, at: 3, in: statement)
+        bind(scope.bundleIdentifier, at: 4, in: statement)
+        bind(scope.bundleIdentifier, at: 5, in: statement)
+        let start = scope.start.map(DateCodec.string(from:))
+        let end = scope.end.map(DateCodec.string(from:))
+        bind(start, at: 6, in: statement)
+        bind(start, at: 7, in: statement)
+        bind(end, at: 8, in: statement)
+        bind(end, at: 9, in: statement)
+    }
+
     // MARK: - Input events
 
     /// Batch-inserts recorded input events in one transaction.
@@ -1633,6 +1909,11 @@ public actor CascadeStore {
 
     private func chainedAuditCount() -> Int {
         Int(Self.scalarValue(connection.db, "SELECT count(*) FROM audit_event WHERE event_hash IS NOT NULL;"))
+    }
+
+    public func auditHead() throws -> AuditHead? {
+        guard let hash = try latestAuditHash() else { return nil }
+        return AuditHead(count: chainedAuditCount(), hash: hash)
     }
 
     /// Recompute the audit hash chain and report the first row that no longer

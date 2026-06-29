@@ -108,6 +108,48 @@ func reliabilityReportBuildsScenarioOutcomesFromLiveTraces() {
     ])
 }
 
+@Test
+func sloSnapshotAppliesSurfaceCostDurationAndLoopBudgets() {
+    let traces = [
+        trace(
+            id: "assist-ok",
+            surface: "assist",
+            rootStatus: .ok,
+            spans: [
+                TraceSpan(id: "assist-cost", parentID: "assist-ok-root", kind: .model, name: "model", startMs: 5, durationMs: 90, costUSD: 0.04),
+            ]
+        ),
+        trace(
+            id: "web-stall",
+            surface: "backgroundWeb",
+            rootStatus: .error,
+            rootFailure: .noEffect,
+            spans: [
+                TraceSpan(id: "web-noeffect", parentID: "web-stall-root", kind: .tool, name: "sandbox.noeffect", startMs: 5, durationMs: 400, status: .error, failureKind: .noEffect),
+            ]
+        ),
+    ]
+    var budgets = ReliabilityReport.Budgets()
+    budgets.minSuccessRatesBySurface = ["assist": 1.0, "backgroundWeb": 0.75]
+    budgets.maxNoEffectCount = 0
+    budgets.maxStallCount = 0
+    budgets.maxCostPerSuccessfulRunUSD = 0.01
+    budgets.maxDurationMs = 300
+
+    let snapshot = ReliabilityReport.sloSnapshot(from: traces, budgets: budgets)
+
+    #expect(snapshot.totalRuns == 2)
+    #expect(snapshot.successRate == 0.5)
+    #expect(snapshot.successRatesBySurface["assist"] == 1.0)
+    #expect(snapshot.successRatesBySurface["backgroundWeb"] == 0.0)
+    #expect(snapshot.noEffectCount == 1)
+    #expect(snapshot.maxDurationMs == 405)
+    #expect(!snapshot.passesReleaseGate)
+    #expect(snapshot.violations.contains { $0.contains("backgroundWeb success rate") })
+    #expect(snapshot.violations.contains { $0.contains("cost per successful run") })
+    #expect(snapshot.violations.contains { $0.contains("max duration") })
+}
+
 private func trace(
     id: String,
     surface: String,

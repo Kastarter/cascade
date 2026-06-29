@@ -1,4 +1,5 @@
 import AgentOrchestrator
+import CascadeMemory
 import Foundation
 import Testing
 
@@ -125,4 +126,80 @@ func csvEscapesFormulaPrefixedAuditFieldsBeforeQuoteEscaping() {
     #expect(AgentTraceCSVFieldEscaper.escape("\t=HYPERLINK(\"https://example.com\")") == "\"'\t=HYPERLINK(\"\"https://example.com\"\")\"")
     #expect(AgentTraceCSVFieldEscaper.escape("\r=HYPERLINK(\"https://example.com\")") == "\"'\r=HYPERLINK(\"\"https://example.com\"\")\"")
     #expect(AgentTraceCSVFieldEscaper.escape("  =SUM(1)") == "'  =SUM(1)")
+}
+
+@Test
+func auditExportPackageIncludesManifestAndAllFormatsWithoutRawDetails() throws {
+    let base = Date(timeIntervalSince1970: 1_800_000_000)
+    let events = [
+        AuditEvent(id: 1, createdAt: base, actor: "agent", action: "assist.task", detail: "Email Jane Secret about payroll"),
+        AuditEvent(id: 2, createdAt: base.addingTimeInterval(0.1), actor: "agent", action: "harness.read_file", detail: "/Users/example/payroll.txt"),
+        AuditEvent(id: 3, createdAt: base.addingTimeInterval(0.2), actor: "agent", action: "agent.run.completed", detail: "agentID=7 labelHash=abc"),
+    ]
+
+    let package = AgentAuditExportPackage.build(
+        trustedChronologicalEvents: events,
+        windowStart: base,
+        windowEnd: base.addingTimeInterval(1),
+        auditChainStatus: .intact(verified: 3),
+        auditHead: AuditHead(count: 3, hash: "abc")
+    )
+    let combined = AgentAuditExportFormat.allCases.map { package.content(format: $0) }.joined(separator: "\n")
+
+    #expect(package.manifest.auditChainTrusted)
+    #expect(package.manifest.auditChainStatus == "intact:3")
+    #expect(package.manifest.auditHead == AuditHead(count: 3, hash: "abc"))
+    #expect(package.manifest.traceCount == 1)
+    #expect(package.manifest.spanCount >= 2)
+    #expect(combined.contains("audit-1"))
+    #expect(!combined.contains("Jane Secret"))
+    #expect(!combined.contains("payroll.txt"))
+}
+
+@Test
+func valueSummaryCountsOnlyCompletedRunsAndAppliesBudgets() {
+    let agents = [
+        CascadeAgent(
+            id: 1,
+            name: "Completed",
+            source: .detected,
+            signature: "a",
+            recipe: AgentRecipe(steps: []),
+            estimatedSecondsPerRun: 120,
+            runCount: 2
+        ),
+        CascadeAgent(
+            id: 2,
+            name: "Never run",
+            source: .detected,
+            signature: "b",
+            recipe: AgentRecipe(steps: []),
+            estimatedSecondsPerRun: 300,
+            runCount: 0
+        ),
+    ]
+    let traces = [
+        AgentTrace(
+            traceID: "value",
+            goal: "g",
+            surface: "assist",
+            spans: [
+                TraceSpan(id: "value-root", parentID: nil, kind: .run, name: "run", startMs: 0, durationMs: 10),
+                TraceSpan(id: "tool", parentID: "value-root", kind: .tool, name: "click", startMs: 1, durationMs: 1, costUSD: 0.04),
+            ]
+        )
+    ]
+
+    let summary = AgentValueSummary.from(
+        agents: agents,
+        traces: traces,
+        hourlyRateUSD: 90,
+        budgets: AgentValueBudgets(monthlyRunLimit: 2, monthlyActionLimit: 1, monthlyCostCentsLimit: 4)
+    )
+
+    #expect(summary.completedRuns == 2)
+    #expect(summary.reclaimedSeconds == 240)
+    #expect(abs(summary.estimatedDollarValue - 6.0) < 0.0001)
+    #expect(summary.costPerCompletedRunUSD == 0.02)
+    #expect(summary.budgetExhausted)
 }
