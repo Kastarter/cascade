@@ -1347,6 +1347,8 @@ internal enum CascadeBatchInsertTable: Sendable {
 internal typealias CascadeBatchBindFailureInjector = @Sendable (CascadeBatchInsertTable, Int) throws -> Void
 
 public actor CascadeStore {
+    private static let ocrExcerptCharacterLimit = 512
+
     private let connection: SQLiteConnection
     private let path: String
     private let auditAnchor: AuditAnchorStore
@@ -1400,19 +1402,20 @@ public actor CascadeStore {
         guard !contexts.isEmpty else { return [] }
         let sql = """
         INSERT INTO recorded_context
-            (captured_at, captured_ms, source, app_name, bundle_identifier, window_title, ocr_text, image_path, metadata_json, frame_hash,
+            (captured_at, captured_ms, captured_day, source, app_name, bundle_identifier, window_title, ocr_text, ocr_excerpt, image_path, metadata_json, frame_hash,
              source_trust, raw_trust_label, injection_score, injection_reasons, user_confirmed, safe_to_show, safe_to_summarize, safe_for_control)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         return try withTransaction {
             try withStatement(sql) { statement in
                 var rows: [RecordedContext] = []
+                var manifests: [String: DayPartitionManifest] = [:]
                 rows.reserveCapacity(contexts.count)
                 for (index, context) in contexts.enumerated() {
                     let sanitized = Self.sanitizedContext(context)
                     try bindContext(sanitized, at: index, in: statement)
                     try stepDone(statement)
-                    rows.append(RecordedContext(
+                    let row = RecordedContext(
                         id: sqlite3_last_insert_rowid(connection.db),
                         capturedAt: sanitized.capturedAt,
                         source: sanitized.source,
@@ -1431,15 +1434,27 @@ public actor CascadeStore {
                         safeToShow: sanitized.safeToShow,
                         safeToSummarize: sanitized.safeToSummarize,
                         safeForControl: sanitized.safeForControl
-                    ))
-                    if indexWorkGraph, let row = rows.last {
+                    )
+                    rows.append(row)
+                    let capturedMilliseconds = EventStoreLayout.capturedMilliseconds(for: sanitized.capturedAt)
+                    let dayKey = EventStoreLayout.utcDayKey(capturedMilliseconds: capturedMilliseconds)
+                    var manifest = manifests[dayKey] ?? DayPartitionManifest(dayKey: dayKey)
+                    manifest.include(
+                        rowID: row.id,
+                        capturedMilliseconds: capturedMilliseconds,
+                        byteCount: sanitized.ocrText.map { Data($0.utf8).count } ?? 0,
+                        hasFrame: sanitized.imagePath != nil
+                    )
+                    manifests[dayKey] = manifest
+                    if indexWorkGraph {
                         try linkWorkGraphEntities(for: row)
                     }
-                    if let row = rows.last {
-                        try upsertMemoryEvent(for: row)
-                    }
+                    try upsertMemoryEvent(for: row)
                     try resetStatement(statement)
                     try clearBindings(statement)
+                }
+                for manifest in manifests.values {
+                    try upsertDayPartitionManifest(manifest)
                 }
                 return rows
             }
@@ -1455,11 +1470,16 @@ public actor CascadeStore {
         return "\(p)id, \(p)captured_at, \(p)source, \(p)app_name, \(p)bundle_identifier, \(p)window_title, \(p)ocr_text, \(p)image_path, \(p)metadata_json, \(p)frame_hash, \(p)source_trust, \(p)raw_trust_label, \(p)injection_score, \(p)injection_reasons, \(p)user_confirmed, \(p)safe_to_show, \(p)safe_to_summarize, \(p)safe_for_control"
     }
 
+    private static func contextColumnsWithOCR(_ ocrExpression: String, prefix: String = "") -> String {
+        let p = prefix.isEmpty ? "" : "\(prefix)."
+        return "\(p)id, \(p)captured_at, \(p)source, \(p)app_name, \(p)bundle_identifier, \(p)window_title, \(ocrExpression), \(p)image_path, \(p)metadata_json, \(p)frame_hash, \(p)source_trust, \(p)raw_trust_label, \(p)injection_score, \(p)injection_reasons, \(p)user_confirmed, \(p)safe_to_show, \(p)safe_to_summarize, \(p)safe_for_control"
+    }
+
     public func recentContexts(limit: Int = 40) throws -> [RecordedContext] {
         let sql = """
         SELECT \(Self.contextColumns())
         FROM recorded_context
-        ORDER BY captured_at DESC, id DESC
+        ORDER BY captured_ms DESC, id DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -1476,18 +1496,20 @@ public actor CascadeStore {
     /// heavy OCR/metadata payloads so a whole day's worth stays cheap to load.
     /// Grounds day-scale chat questions; use `recentContexts` when OCR is needed.
     public func contextTimeline(since: Date, limit: Int = 8000) throws -> [RecordedContext] {
+        let sinceMilliseconds = EventStoreLayout.capturedMilliseconds(for: since)
+        guard try hasDayPartitions(sinceMilliseconds: sinceMilliseconds) else { return [] }
         let sql = """
         SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
                NULL, image_path, NULL, frame_hash,
                source_trust, raw_trust_label, injection_score, injection_reasons,
                user_confirmed, safe_to_show, safe_to_summarize, safe_for_control
         FROM recorded_context
-        WHERE captured_at >= ?
-        ORDER BY captured_at DESC, id DESC
+        WHERE captured_ms >= ?
+        ORDER BY captured_ms DESC, id DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
-            bind(DateCodec.string(from: since), at: 1, in: statement)
+            bind(sinceMilliseconds, at: 1, in: statement)
             sqlite3_bind_int(statement, 2, Int32(limit))
             var rows: [RecordedContext] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -1502,21 +1524,23 @@ public actor CascadeStore {
     /// coverage across the whole window so the chat can answer about things seen
     /// at any point in the day, not just recently. Newest-first.
     public func contentSamples(since: Date, limit: Int = 48, excerptLength: Int = 400) throws -> [RecordedContext] {
+        let sinceMilliseconds = EventStoreLayout.capturedMilliseconds(for: since)
+        guard try hasDayPartitions(sinceMilliseconds: sinceMilliseconds) else { return [] }
         let sql = """
         SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
-               substr(ocr_text, 1, ?), image_path, NULL, frame_hash,
+               substr(ocr_excerpt, 1, ?), image_path, NULL, frame_hash,
                source_trust, raw_trust_label, injection_score, injection_reasons,
                user_confirmed, safe_to_show, safe_to_summarize, safe_for_control,
                MAX(length(ocr_text))
         FROM recorded_context
-        WHERE captured_at >= ? AND ocr_text IS NOT NULL AND length(ocr_text) > 0
-        GROUP BY substr(captured_at, 1, 13), app_name
-        ORDER BY captured_at DESC, id DESC
+        WHERE captured_ms >= ? AND ocr_text IS NOT NULL AND length(ocr_text) > 0
+        GROUP BY (captured_ms / 3600000), app_name
+        ORDER BY captured_ms DESC, id DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
             sqlite3_bind_int(statement, 1, Int32(excerptLength))
-            bind(DateCodec.string(from: since), at: 2, in: statement)
+            bind(sinceMilliseconds, at: 2, in: statement)
             sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [RecordedContext] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -1541,13 +1565,13 @@ public actor CascadeStore {
         let sql = """
         SELECT \(Self.contextColumns())
         FROM recorded_context
-        WHERE captured_at >= ? AND captured_at <= ?
-        ORDER BY captured_at ASC, id ASC
+        WHERE captured_ms >= ? AND captured_ms <= ?
+        ORDER BY captured_ms ASC, id ASC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
-            bind(DateCodec.string(from: start), at: 1, in: statement)
-            bind(DateCodec.string(from: end), at: 2, in: statement)
+            bind(EventStoreLayout.capturedMilliseconds(for: start), at: 1, in: statement)
+            bind(EventStoreLayout.capturedMilliseconds(for: end), at: 2, in: statement)
             sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [RecordedContext] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -1588,11 +1612,13 @@ public actor CascadeStore {
         guard !match.isEmpty else { return [] }
         let sql = """
         SELECT c.id, c.captured_at, c.source, c.app_name, c.bundle_identifier, c.window_title,
-               substr(c.ocr_text, 1, ?), c.image_path, NULL, c.frame_hash
+               substr(c.ocr_excerpt, 1, ?), c.image_path, NULL, c.frame_hash,
+               c.source_trust, c.raw_trust_label, c.injection_score, c.injection_reasons,
+               c.user_confirmed, c.safe_to_show, c.safe_to_summarize, c.safe_for_control
         FROM rewind_fts
         JOIN recorded_context c ON c.id = rewind_fts.rowid
         WHERE rewind_fts MATCH ?
-        ORDER BY bm25(rewind_fts), c.captured_at DESC
+        ORDER BY bm25(rewind_fts), c.captured_ms DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -1615,7 +1641,7 @@ public actor CascadeStore {
           AND length(c.ocr_text) > 0
           AND NOT EXISTS (SELECT 1 FROM context_embedding e WHERE e.context_id = c.id)
           AND NOT EXISTS (SELECT 1 FROM context_chunk_embedding ce WHERE ce.context_id = c.id)
-        ORDER BY c.captured_at DESC, c.id DESC
+        ORDER BY c.captured_ms DESC, c.id DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -1630,23 +1656,24 @@ public actor CascadeStore {
 
     /// Full-text search over the OCR text, window title, and app name of stored
     /// moments via the `rewind_fts` FTS5 index. Returns matches newest-first.
-    public func searchContexts(query: String, limit: Int = 80) throws -> [RecordedContext] {
+    public func searchContexts(query: String, limit: Int = 80, excerptLength: Int = 400) throws -> [RecordedContext] {
         let match = Self.ftsQuery(from: query)
         guard !match.isEmpty else { return [] }
         // MATCH must name the FTS table itself (an alias is read as a column), so
         // `rewind_fts` is left unaliased; `recorded_context` is aliased `c` to
         // disambiguate the text columns it shares with the index.
         let sql = """
-        SELECT \(Self.contextColumns(prefix: "c"))
+        SELECT \(Self.contextColumnsWithOCR("substr(c.ocr_excerpt, 1, ?)", prefix: "c"))
         FROM rewind_fts
         JOIN recorded_context c ON c.id = rewind_fts.rowid
         WHERE rewind_fts MATCH ?
-        ORDER BY c.captured_at DESC, c.id DESC
+        ORDER BY c.captured_ms DESC, c.id DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
-            bind(match, at: 1, in: statement)
-            sqlite3_bind_int(statement, 2, Int32(limit))
+            sqlite3_bind_int(statement, 1, Int32(excerptLength))
+            bind(match, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [RecordedContext] = []
             while sqlite3_step(statement) == SQLITE_ROW {
                 rows.append(decodeContext(statement))
@@ -1734,7 +1761,7 @@ public actor CascadeStore {
         FROM ocr_structure_fts
         JOIN recorded_context c ON c.id = ocr_structure_fts.rowid
         WHERE ocr_structure_fts MATCH ?
-        ORDER BY bm25(ocr_structure_fts), c.captured_at DESC
+        ORDER BY bm25(ocr_structure_fts), c.captured_ms DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -1760,57 +1787,129 @@ public actor CascadeStore {
     ) throws -> [String] {
         var removed: [String] = []
 
-        // Age-based prune.
-        let cutoff = DateCodec.string(from: Date().addingTimeInterval(-maxAge))
-        removed += try withStatement("SELECT image_path FROM recorded_context WHERE captured_at < ?;") { statement in
-            bind(cutoff, at: 1, in: statement)
-            var paths: [String] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                if let path = text(statement, 0) { paths.append(path) }
+        // Age-based prune in bounded millisecond chunks so long-running stores do
+        // not hold one broad write transaction over the entire event history.
+        let cutoffMilliseconds = EventStoreLayout.capturedMilliseconds(for: Date().addingTimeInterval(-maxAge))
+        if let oldest = try oldestCapturedMilliseconds(before: cutoffMilliseconds) {
+            for chunk in EventStoreLayout.retentionChunks(from: oldest, upTo: cutoffMilliseconds) {
+                var affectedDays: Set<String> = []
+                try withTransaction {
+                    removed += try imagePathsForContexts(in: chunk)
+                    affectedDays = try dayKeysForContexts(in: chunk)
+                    try deleteContexts(in: chunk)
+                    try deleteInputEvents(in: chunk)
+                }
+                try cleanupDetachedContextRows()
+                try rebuildDayPartitions(days: affectedDays)
+                try execute("PRAGMA wal_checkpoint(PASSIVE);")
             }
-            return paths
-        }
-        try withStatement("DELETE FROM recorded_context WHERE captured_at < ?;") { statement in
-            bind(cutoff, at: 1, in: statement)
-            try stepDone(statement)
         }
 
         // Size-based prune: keep newest moments until the frame-file budget is hit,
         // delete the older overflow.
-        let survivors = try withStatement("SELECT id, image_path FROM recorded_context ORDER BY captured_at DESC, id DESC;") { statement in
-            var rows: [(id: Int64, path: String?)] = []
+        let survivors = try withStatement("SELECT id, image_path, captured_day FROM recorded_context ORDER BY captured_ms DESC, id DESC;") { statement in
+            var rows: [(id: Int64, path: String?, day: String?)] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                rows.append((sqlite3_column_int64(statement, 0), text(statement, 1)))
+                rows.append((sqlite3_column_int64(statement, 0), text(statement, 1), text(statement, 2)))
             }
             return rows
         }
         var running: Int64 = 0
-        var overflow: [(id: Int64, path: String?)] = []
+        var overflow: [(id: Int64, path: String?, day: String?)] = []
         for row in survivors {
             running += row.path.flatMap { Self.fileSize(at: $0) } ?? 0
             if running > maxTotalBytes { overflow.append(row) }
         }
+        var overflowDays: Set<String> = []
         for row in overflow {
             try withStatement("DELETE FROM recorded_context WHERE id = ?;") { statement in
                 sqlite3_bind_int64(statement, 1, row.id)
                 try stepDone(statement)
             }
             if let path = row.path { removed.append(path) }
+            if let day = row.day { overflowDays.insert(day) }
+        }
+        if !overflowDays.isEmpty {
+            try cleanupDetachedContextRows()
+            try rebuildDayPartitions(days: overflowDays)
+            try execute("PRAGMA wal_checkpoint(PASSIVE);")
         }
 
-        // Recorded input ages out on the same age budget (no backing files).
-        try withStatement("DELETE FROM input_event WHERE captured_at < ?;") { statement in
+        return removed
+    }
+
+    private func oldestCapturedMilliseconds(before cutoff: Int64) throws -> Int64? {
+        let sql = """
+        SELECT MIN(captured_ms) FROM (
+            SELECT captured_ms FROM recorded_context WHERE captured_ms < ?
+            UNION ALL
+            SELECT captured_ms FROM input_event WHERE captured_ms < ?
+        );
+        """
+        return try withStatement(sql) { statement in
             bind(cutoff, at: 1, in: statement)
+            bind(cutoff, at: 2, in: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  sqlite3_column_type(statement, 0) != SQLITE_NULL else {
+                return nil
+            }
+            return sqlite3_column_int64(statement, 0)
+        }
+    }
+
+    private func imagePathsForContexts(in range: CapturedMillisecondsRange) throws -> [String] {
+        try withStatement("""
+        SELECT image_path FROM recorded_context
+        WHERE captured_ms >= ? AND captured_ms < ? AND image_path IS NOT NULL;
+        """) { statement in
+            bind(range.lowerBound, at: 1, in: statement)
+            bind(range.upperBound, at: 2, in: statement)
+            var paths: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let path = text(statement, 0) { paths.append(path) }
+            }
+            return paths
+        }
+    }
+
+    private func dayKeysForContexts(in range: CapturedMillisecondsRange) throws -> Set<String> {
+        try withStatement("""
+        SELECT DISTINCT captured_day FROM recorded_context
+        WHERE captured_ms >= ? AND captured_ms < ? AND captured_day IS NOT NULL;
+        """) { statement in
+            bind(range.lowerBound, at: 1, in: statement)
+            bind(range.upperBound, at: 2, in: statement)
+            var days: Set<String> = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let day = text(statement, 0) { days.insert(day) }
+            }
+            return days
+        }
+    }
+
+    private func deleteContexts(in range: CapturedMillisecondsRange) throws {
+        try withStatement("DELETE FROM recorded_context WHERE captured_ms >= ? AND captured_ms < ?;") { statement in
+            bind(range.lowerBound, at: 1, in: statement)
+            bind(range.upperBound, at: 2, in: statement)
             try stepDone(statement)
         }
-        // Embeddings follow their moments out.
+    }
+
+    private func deleteInputEvents(in range: CapturedMillisecondsRange) throws {
+        try withStatement("DELETE FROM input_event WHERE captured_ms >= ? AND captured_ms < ?;") { statement in
+            bind(range.lowerBound, at: 1, in: statement)
+            bind(range.upperBound, at: 2, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    private func cleanupDetachedContextRows() throws {
         try? execute("DELETE FROM context_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM context_chunk_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM context_visual_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM ocr_line WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM ocr_structure WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM frame_signature WHERE context_id NOT IN (SELECT id FROM recorded_context);")
-        return removed
     }
 
     public func performMaintenance(reason: CascadeStoreMaintenanceReason = .idle) throws {
@@ -1819,6 +1918,123 @@ public actor CascadeStore {
         if reason == .quit || reason == .admin {
             try execute("PRAGMA wal_checkpoint(TRUNCATE);")
         }
+    }
+
+    public func dayPartitionManifest(dayKey: String) throws -> DayPartitionManifest? {
+        try withStatement("""
+        SELECT day, min_ms, max_ms, row_count, ocr_bytes, frame_count, first_id, last_id, sealed_at
+        FROM day_partition
+        WHERE day = ?
+        LIMIT 1;
+        """) { statement in
+            bind(dayKey, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? decodeDayPartitionManifest(statement) : nil
+        }
+    }
+
+    public func dayPartitionManifests() throws -> [DayPartitionManifest] {
+        try withStatement("""
+        SELECT day, min_ms, max_ms, row_count, ocr_bytes, frame_count, first_id, last_id, sealed_at
+        FROM day_partition
+        ORDER BY day ASC;
+        """) { statement in
+            var rows: [DayPartitionManifest] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeDayPartitionManifest(statement))
+            }
+            return rows
+        }
+    }
+
+    private func hasDayPartitions(sinceMilliseconds: Int64) throws -> Bool {
+        try withStatement("SELECT 1 FROM day_partition WHERE max_ms >= ? LIMIT 1;") { statement in
+            bind(sinceMilliseconds, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW
+        }
+    }
+
+    private func upsertDayPartitionManifest(_ manifest: DayPartitionManifest) throws {
+        guard !manifest.isEmpty,
+              let minMilliseconds = manifest.firstCapturedMilliseconds,
+              let maxMilliseconds = manifest.lastCapturedMilliseconds,
+              let firstID = manifest.firstID,
+              let lastID = manifest.lastID else { return }
+        let sql = """
+        INSERT INTO day_partition
+            (day, min_ms, max_ms, row_count, ocr_bytes, frame_count, first_id, last_id, sealed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day) DO UPDATE SET
+            min_ms = MIN(day_partition.min_ms, excluded.min_ms),
+            max_ms = MAX(day_partition.max_ms, excluded.max_ms),
+            row_count = day_partition.row_count + excluded.row_count,
+            ocr_bytes = day_partition.ocr_bytes + excluded.ocr_bytes,
+            frame_count = day_partition.frame_count + excluded.frame_count,
+            first_id = CASE
+                WHEN excluded.min_ms < day_partition.min_ms
+                  OR (excluded.min_ms = day_partition.min_ms AND excluded.first_id < day_partition.first_id)
+                THEN excluded.first_id ELSE day_partition.first_id END,
+            last_id = CASE
+                WHEN excluded.max_ms > day_partition.max_ms
+                  OR (excluded.max_ms = day_partition.max_ms AND excluded.last_id > day_partition.last_id)
+                THEN excluded.last_id ELSE day_partition.last_id END,
+            sealed_at = COALESCE(excluded.sealed_at, day_partition.sealed_at);
+        """
+        try withStatement(sql) { statement in
+            bind(manifest.dayKey, at: 1, in: statement)
+            bind(minMilliseconds, at: 2, in: statement)
+            bind(maxMilliseconds, at: 3, in: statement)
+            sqlite3_bind_int(statement, 4, Int32(manifest.rowCount))
+            sqlite3_bind_int64(statement, 5, Int64(manifest.ocrByteCount))
+            sqlite3_bind_int(statement, 6, Int32(manifest.frameCount))
+            bind(firstID, at: 7, in: statement)
+            bind(lastID, at: 8, in: statement)
+            bind(manifest.sealedAt.map(DateCodec.string(from:)), at: 9, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    private func rebuildDayPartitions(days: Set<String>) throws {
+        guard !days.isEmpty else { return }
+        let sql = """
+        INSERT INTO day_partition
+            (day, min_ms, max_ms, row_count, ocr_bytes, frame_count, first_id, last_id, sealed_at)
+        SELECT captured_day,
+               MIN(captured_ms),
+               MAX(captured_ms),
+               COUNT(*),
+               COALESCE(SUM(length(COALESCE(ocr_text, ''))), 0),
+               COALESCE(SUM(CASE WHEN image_path IS NULL THEN 0 ELSE 1 END), 0),
+               MIN(id),
+               MAX(id),
+               NULL
+        FROM recorded_context
+        WHERE captured_day = ?
+        GROUP BY captured_day;
+        """
+        for day in days {
+            try withStatement("DELETE FROM day_partition WHERE day = ?;") { statement in
+                bind(day, at: 1, in: statement)
+                try stepDone(statement)
+            }
+            try withStatement(sql) { statement in
+                bind(day, at: 1, in: statement)
+                try stepDone(statement)
+            }
+        }
+    }
+
+    private func decodeDayPartitionManifest(_ statement: OpaquePointer) -> DayPartitionManifest {
+        DayPartitionManifest(
+            dayKey: text(statement, 0) ?? "",
+            rowCount: Int(sqlite3_column_int(statement, 3)),
+            byteCount: Int(sqlite3_column_int64(statement, 4)),
+            frameCount: Int(sqlite3_column_int(statement, 5)),
+            firstCapturedMilliseconds: int64(statement, 1),
+            lastCapturedMilliseconds: int64(statement, 2),
+            firstID: int64(statement, 6),
+            lastID: int64(statement, 7),
+            sealedAt: DateCodec.date(from: text(statement, 8))
+        )
     }
 
     internal func pragmaIntValue(_ name: String) throws -> Int64 {
@@ -1893,6 +2109,7 @@ public actor CascadeStore {
     public func deletePrivacyData(scope: PrivacyDataScope) throws -> PrivacyDeletionResult {
         let contexts = try privacyContexts(scope: scope, limit: 100_000)
         let imagePaths = contexts.compactMap(\.imagePath)
+        let affectedDays = Set(contexts.map { EventStoreLayout.utcDayKey(for: $0.capturedAt) })
         let deletedInputCount = try inputEventCount(scope: scope)
         try withTransaction {
             for context in contexts {
@@ -1903,6 +2120,7 @@ public actor CascadeStore {
             }
             try deleteInputEvents(scope: scope)
         }
+        try rebuildDayPartitions(days: affectedDays)
         return PrivacyDeletionResult(
             deletedContextCount: contexts.count,
             deletedInputEventCount: deletedInputCount,
@@ -1920,9 +2138,9 @@ public actor CascadeStore {
         WHERE (? IS NULL OR source = ?)
           AND (? IS NULL OR app_name = ?)
           AND (? IS NULL OR bundle_identifier = ?)
-          AND (? IS NULL OR captured_at >= ?)
-          AND (? IS NULL OR captured_at <= ?)
-        ORDER BY captured_at ASC, id ASC
+          AND (? IS NULL OR captured_ms >= ?)
+          AND (? IS NULL OR captured_ms <= ?)
+        ORDER BY captured_ms ASC, id ASC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -1943,8 +2161,8 @@ public actor CascadeStore {
         WHERE (? = 1)
           AND (? IS NULL OR app_name = ?)
           AND (? IS NULL OR bundle_identifier = ?)
-          AND (? IS NULL OR captured_at >= ?)
-          AND (? IS NULL OR captured_at <= ?);
+          AND (? IS NULL OR captured_ms >= ?)
+          AND (? IS NULL OR captured_ms <= ?);
         """
         return try withStatement(sql) { statement in
             bindInputScope(scope, in: statement)
@@ -1958,8 +2176,8 @@ public actor CascadeStore {
         WHERE (? = 1)
           AND (? IS NULL OR app_name = ?)
           AND (? IS NULL OR bundle_identifier = ?)
-          AND (? IS NULL OR captured_at >= ?)
-          AND (? IS NULL OR captured_at <= ?);
+          AND (? IS NULL OR captured_ms >= ?)
+          AND (? IS NULL OR captured_ms <= ?);
         """
         try withStatement(sql) { statement in
             bindInputScope(scope, in: statement)
@@ -1975,8 +2193,8 @@ public actor CascadeStore {
         bind(scope.appName, at: 4, in: statement)
         bind(scope.bundleIdentifier, at: 5, in: statement)
         bind(scope.bundleIdentifier, at: 6, in: statement)
-        let start = scope.start.map(DateCodec.string(from:))
-        let end = scope.end.map(DateCodec.string(from:))
+        let start = scope.start.map(EventStoreLayout.capturedMilliseconds(for:))
+        let end = scope.end.map(EventStoreLayout.capturedMilliseconds(for:))
         bind(start, at: 7, in: statement)
         bind(start, at: 8, in: statement)
         bind(end, at: 9, in: statement)
@@ -1990,8 +2208,8 @@ public actor CascadeStore {
         bind(scope.appName, at: 3, in: statement)
         bind(scope.bundleIdentifier, at: 4, in: statement)
         bind(scope.bundleIdentifier, at: 5, in: statement)
-        let start = scope.start.map(DateCodec.string(from:))
-        let end = scope.end.map(DateCodec.string(from:))
+        let start = scope.start.map(EventStoreLayout.capturedMilliseconds(for:))
+        let end = scope.end.map(EventStoreLayout.capturedMilliseconds(for:))
         bind(start, at: 6, in: statement)
         bind(start, at: 7, in: statement)
         bind(end, at: 8, in: statement)
@@ -2029,7 +2247,7 @@ public actor CascadeStore {
         let sql = """
         SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
-        ORDER BY captured_at DESC, id DESC
+        ORDER BY captured_ms DESC, id DESC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
@@ -2050,13 +2268,13 @@ public actor CascadeStore {
         let sql = """
         SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
-        WHERE captured_at >= ? AND captured_at <= ?
-        ORDER BY captured_at ASC, id ASC
+        WHERE captured_ms >= ? AND captured_ms <= ?
+        ORDER BY captured_ms ASC, id ASC
         LIMIT ?;
         """
         return try withStatement(sql) { statement in
-            bind(DateCodec.string(from: start), at: 1, in: statement)
-            bind(DateCodec.string(from: end), at: 2, in: statement)
+            bind(EventStoreLayout.capturedMilliseconds(for: start), at: 1, in: statement)
+            bind(EventStoreLayout.capturedMilliseconds(for: end), at: 2, in: statement)
             sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [InputEvent] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -2088,12 +2306,13 @@ public actor CascadeStore {
     }
 
     public func clickInputEvents(near date: Date, window: TimeInterval = 1.0, limit: Int = 20) throws -> [InputEvent] {
-        let start = DateCodec.string(from: date.addingTimeInterval(-window))
-        let end = DateCodec.string(from: date.addingTimeInterval(window))
+        let start = EventStoreLayout.capturedMilliseconds(for: date.addingTimeInterval(-window))
+        let end = EventStoreLayout.capturedMilliseconds(for: date.addingTimeInterval(window))
+        let target = EventStoreLayout.capturedMilliseconds(for: date)
         let sql = """
         SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
         FROM input_event
-        WHERE captured_at >= ? AND captured_at <= ?
+        WHERE captured_ms >= ? AND captured_ms <= ?
           AND kind IN ('click', 'doubleClick', 'rightClick')
         ORDER BY ABS(captured_ms - ?), id ASC
         LIMIT ?;
@@ -2101,7 +2320,7 @@ public actor CascadeStore {
         return try withStatement(sql) { statement in
             bind(start, at: 1, in: statement)
             bind(end, at: 2, in: statement)
-            bind(EventStoreLayout.capturedMilliseconds(for: date), at: 3, in: statement)
+            bind(target, at: 3, in: statement)
             sqlite3_bind_int(statement, 4, Int32(limit))
             var rows: [InputEvent] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -2866,12 +3085,14 @@ public actor CascadeStore {
         CREATE TABLE IF NOT EXISTS recorded_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             captured_at TEXT NOT NULL,
-            captured_ms INTEGER,
+            captured_ms INTEGER NOT NULL,
+            captured_day TEXT NOT NULL,
             source TEXT NOT NULL,
             app_name TEXT NOT NULL,
             bundle_identifier TEXT,
             window_title TEXT,
             ocr_text TEXT,
+            ocr_excerpt TEXT,
             image_path TEXT,
             metadata_json TEXT,
             frame_hash INTEGER,
@@ -2886,6 +3107,18 @@ public actor CascadeStore {
         );
         CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_at
             ON recorded_context(captured_at DESC);
+
+        CREATE TABLE IF NOT EXISTS day_partition (
+            day TEXT PRIMARY KEY,
+            min_ms INTEGER NOT NULL,
+            max_ms INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            ocr_bytes INTEGER NOT NULL DEFAULT 0,
+            frame_count INTEGER NOT NULL DEFAULT 0,
+            first_id INTEGER NOT NULL,
+            last_id INTEGER NOT NULL,
+            sealed_at TEXT
+        );
 
         CREATE TABLE IF NOT EXISTS audit_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2950,6 +3183,8 @@ public actor CascadeStore {
         try? execute("ALTER TABLE recorded_context ADD COLUMN image_path TEXT;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN frame_hash INTEGER;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN captured_ms INTEGER;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN captured_day TEXT;", db: db)
+        try? execute("ALTER TABLE recorded_context ADD COLUMN ocr_excerpt TEXT;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN source_trust TEXT NOT NULL DEFAULT 'untrustedScreen';", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN raw_trust_label TEXT;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN injection_score INTEGER NOT NULL DEFAULT 0;", db: db)
@@ -2959,8 +3194,21 @@ public actor CascadeStore {
         try? execute("ALTER TABLE recorded_context ADD COLUMN safe_to_summarize INTEGER NOT NULL DEFAULT 1;", db: db)
         try? execute("ALTER TABLE recorded_context ADD COLUMN safe_for_control INTEGER NOT NULL DEFAULT 0;", db: db)
         try execute("""
+        UPDATE recorded_context
+        SET captured_ms = COALESCE(CAST(ROUND((julianday(captured_at) - 2440587.5) * 86400000.0) AS INTEGER), 0)
+        WHERE captured_ms IS NULL;
+        UPDATE recorded_context
+        SET captured_day = COALESCE(strftime('%Y-%m-%d', captured_at), '1970-01-01')
+        WHERE captured_day IS NULL OR captured_day = '';
+        UPDATE recorded_context
+        SET ocr_excerpt = substr(ocr_text, 1, \(ocrExcerptCharacterLimit))
+        WHERE ocr_excerpt IS NULL AND ocr_text IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_ms
             ON recorded_context(captured_ms ASC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_recorded_context_captured_ms_desc
+            ON recorded_context(captured_ms DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_recorded_context_app_captured_ms
+            ON recorded_context(app_name, captured_ms DESC);
         """, db: db)
         try? execute("ALTER TABLE agents ADD COLUMN seconds_per_run INTEGER NOT NULL DEFAULT 0;", db: db)
         try? execute("ALTER TABLE agents ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;", db: db)
@@ -2970,6 +3218,11 @@ public actor CascadeStore {
         try? execute("ALTER TABLE agents ADD COLUMN demo_sketches_json TEXT NOT NULL DEFAULT '[]';", db: db)
         try? execute("ALTER TABLE input_event ADD COLUMN target_descriptor TEXT;", db: db)
         try? execute("ALTER TABLE input_event ADD COLUMN captured_ms INTEGER;", db: db)
+        try? execute("""
+        UPDATE input_event
+        SET captured_ms = COALESCE(CAST(ROUND((julianday(captured_at) - 2440587.5) * 86400000.0) AS INTEGER), 0)
+        WHERE captured_ms IS NULL;
+        """, db: db)
         // Tamper-evident audit chain columns for databases created before they existed.
         try? execute("ALTER TABLE audit_event ADD COLUMN prev_hash TEXT;", db: db)
         try? execute("ALTER TABLE audit_event ADD COLUMN event_hash TEXT;", db: db)
@@ -3009,7 +3262,7 @@ public actor CascadeStore {
         CREATE TABLE IF NOT EXISTS input_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             captured_at TEXT NOT NULL,
-            captured_ms INTEGER,
+            captured_ms INTEGER NOT NULL,
             kind TEXT NOT NULL,
             x REAL,
             y REAL,
@@ -3025,6 +3278,8 @@ public actor CascadeStore {
             ON input_event(captured_at DESC);
         CREATE INDEX IF NOT EXISTS idx_input_event_captured_ms
             ON input_event(captured_ms ASC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_input_event_bundle_captured_ms_kind
+            ON input_event(bundle_identifier, captured_ms ASC, kind);
 
         CREATE TABLE IF NOT EXISTS agents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3180,6 +3435,24 @@ public actor CascadeStore {
         """, db: db)
 
         try execute("""
+        DELETE FROM day_partition;
+        INSERT INTO day_partition
+            (day, min_ms, max_ms, row_count, ocr_bytes, frame_count, first_id, last_id, sealed_at)
+        SELECT captured_day,
+               MIN(captured_ms),
+               MAX(captured_ms),
+               COUNT(*),
+               COALESCE(SUM(length(COALESCE(ocr_text, ''))), 0),
+               COALESCE(SUM(CASE WHEN image_path IS NULL THEN 0 ELSE 1 END), 0),
+               MIN(id),
+               MAX(id),
+               NULL
+        FROM recorded_context
+        WHERE captured_day IS NOT NULL AND captured_ms IS NOT NULL
+        GROUP BY captured_day;
+        """, db: db)
+
+	        try execute("""
         CREATE TABLE IF NOT EXISTS agent_trace (
             trace_id TEXT PRIMARY KEY,
             started_at TEXT NOT NULL,
@@ -3539,10 +3812,11 @@ public actor CascadeStore {
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
         PRAGMA synchronous=NORMAL;
-        PRAGMA busy_timeout=2500;
+        PRAGMA busy_timeout=5000;
         PRAGMA temp_store=MEMORY;
+        PRAGMA cache_size=-20000;
         PRAGMA mmap_size=268435456;
-        PRAGMA wal_autocheckpoint=512;
+        PRAGMA wal_autocheckpoint=0;
         """, db: db)
     }
 
@@ -3611,24 +3885,32 @@ public actor CascadeStore {
 
     private func bindContext(_ context: RecordedContext, at rowIndex: Int, in statement: OpaquePointer) throws {
         try batchBindFailureInjector?(.recordedContext, rowIndex)
+        let capturedMilliseconds = EventStoreLayout.capturedMilliseconds(for: context.capturedAt)
         try bindChecked(DateCodec.string(from: context.capturedAt), at: 1, in: statement)
-        try bindChecked(EventStoreLayout.capturedMilliseconds(for: context.capturedAt), at: 2, in: statement)
-        try bindChecked(context.source.rawValue, at: 3, in: statement)
-        try bindChecked(context.appName, at: 4, in: statement)
-        try bindChecked(context.bundleIdentifier, at: 5, in: statement)
-        try bindChecked(context.windowTitle, at: 6, in: statement)
-        try bindChecked(context.ocrText, at: 7, in: statement)
-        try bindChecked(context.imagePath, at: 8, in: statement)
-        try bindChecked(context.metadataJSON, at: 9, in: statement)
-        try bindChecked(context.frameHash, at: 10, in: statement)
-        try bindChecked(context.sourceTrust, at: 11, in: statement)
-        try bindChecked(context.rawTrustLabel, at: 12, in: statement)
-        try bindChecked(Int64(context.injectionScore), at: 13, in: statement)
-        try bindChecked(context.injectionReasonsJSON, at: 14, in: statement)
-        try bindChecked(Int64(context.userConfirmed ? 1 : 0), at: 15, in: statement)
-        try bindChecked(Int64(context.safeToShow ? 1 : 0), at: 16, in: statement)
-        try bindChecked(Int64(context.safeToSummarize ? 1 : 0), at: 17, in: statement)
-        try bindChecked(Int64(context.safeForControl ? 1 : 0), at: 18, in: statement)
+        try bindChecked(capturedMilliseconds, at: 2, in: statement)
+        try bindChecked(EventStoreLayout.utcDayKey(capturedMilliseconds: capturedMilliseconds), at: 3, in: statement)
+        try bindChecked(context.source.rawValue, at: 4, in: statement)
+        try bindChecked(context.appName, at: 5, in: statement)
+        try bindChecked(context.bundleIdentifier, at: 6, in: statement)
+        try bindChecked(context.windowTitle, at: 7, in: statement)
+        try bindChecked(context.ocrText, at: 8, in: statement)
+        try bindChecked(Self.ocrExcerpt(from: context.ocrText), at: 9, in: statement)
+        try bindChecked(context.imagePath, at: 10, in: statement)
+        try bindChecked(context.metadataJSON, at: 11, in: statement)
+        try bindChecked(context.frameHash, at: 12, in: statement)
+        try bindChecked(context.sourceTrust, at: 13, in: statement)
+        try bindChecked(context.rawTrustLabel, at: 14, in: statement)
+        try bindChecked(Int64(context.injectionScore), at: 15, in: statement)
+        try bindChecked(context.injectionReasonsJSON, at: 16, in: statement)
+        try bindChecked(Int64(context.userConfirmed ? 1 : 0), at: 17, in: statement)
+        try bindChecked(Int64(context.safeToShow ? 1 : 0), at: 18, in: statement)
+        try bindChecked(Int64(context.safeToSummarize ? 1 : 0), at: 19, in: statement)
+        try bindChecked(Int64(context.safeForControl ? 1 : 0), at: 20, in: statement)
+    }
+
+    private static func ocrExcerpt(from text: String?) -> String? {
+        guard let text, !text.isEmpty else { return nil }
+        return String(text.prefix(ocrExcerptCharacterLimit))
     }
 
     private static func sanitizedContext(_ context: RecordedContext) -> RecordedContext {

@@ -485,6 +485,141 @@ actor RecorderMaintenanceScheduler {
     }
 }
 
+struct ContextWriteBufferItem: Sendable {
+    let context: RecordedContext
+    let structuredPayload: StructuredContentExporter.SidecarPayload?
+    let visionBoxes: [ScreenTextRecognizer.TextBox]
+    let axText: String
+    let nativeVisionBoxes: [ScreenTextRecognizer.TextBox]
+    let signature: FrameSignature
+    let semanticText: String?
+    let auditDetail: String
+}
+
+actor ContextWriteBuffer {
+    private let store: CascadeStore
+    private let indexWorkGraph: Bool
+    private let maintenanceScheduler: RecorderMaintenanceScheduler?
+    private let onMoment: @Sendable (RecordedContext) -> Void
+    private let flushThreshold: Int
+    private let flushIntervalNanoseconds: UInt64
+    private let logger = Logger(subsystem: "com.humain.cascade", category: "rewind")
+    private var pending: [ContextWriteBufferItem] = []
+    private var flushTask: Task<Void, Never>?
+    private var flushing = false
+
+    init(
+        store: CascadeStore,
+        indexWorkGraph: Bool,
+        maintenanceScheduler: RecorderMaintenanceScheduler?,
+        flushThreshold: Int = 4,
+        flushInterval: TimeInterval = 1.0,
+        onMoment: @escaping @Sendable (RecordedContext) -> Void
+    ) {
+        self.store = store
+        self.indexWorkGraph = indexWorkGraph
+        self.maintenanceScheduler = maintenanceScheduler
+        self.flushThreshold = max(1, flushThreshold)
+        self.flushIntervalNanoseconds = UInt64(max(0.01, flushInterval) * 1_000_000_000)
+        self.onMoment = onMoment
+    }
+
+    func enqueue(_ item: ContextWriteBufferItem) async {
+        pending.append(item)
+        if pending.count >= flushThreshold {
+            await flushPending(cancelScheduled: true)
+        } else {
+            scheduleFlush()
+        }
+    }
+
+    func flush() async {
+        await flushPending(cancelScheduled: true)
+    }
+
+    private func scheduleFlush() {
+        guard flushTask == nil, !flushing else { return }
+        let interval = flushIntervalNanoseconds
+        flushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: interval)
+            await self?.flushFromTimer()
+        }
+    }
+
+    private func flushFromTimer() async {
+        flushTask = nil
+        await flushPending(cancelScheduled: false)
+    }
+
+    private func flushPending(cancelScheduled: Bool) async {
+        if cancelScheduled {
+            flushTask?.cancel()
+            flushTask = nil
+        }
+        guard !flushing else { return }
+        flushing = true
+        defer {
+            flushing = false
+            if !pending.isEmpty {
+                scheduleFlush()
+            }
+        }
+
+        while !pending.isEmpty {
+            let batch = pending
+            pending.removeAll(keepingCapacity: true)
+            await write(batch)
+        }
+    }
+
+    private func write(_ batch: [ContextWriteBufferItem]) async {
+        do {
+            let insertedRows = try await store.insertContexts(batch.map(\.context), indexWorkGraph: indexWorkGraph)
+            for (item, inserted) in zip(batch, insertedRows) {
+                await writeSideEffects(for: inserted, item: item)
+            }
+        } catch {
+            for item in batch {
+                if let imagePath = item.context.imagePath {
+                    FrameStore.delete(imagePath)
+                }
+            }
+            logger.error("Rewind buffered insert failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func writeSideEffects(for inserted: RecordedContext, item: ContextWriteBufferItem) async {
+        if let payload = item.structuredPayload {
+            try? await store.insertOCRStructure(
+                contextID: inserted.id,
+                version: payload.version,
+                json: payload.json,
+                searchableText: payload.searchableText
+            )
+        }
+        var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: item.visionBoxes, source: "vision")
+        lines += OCRLineBuilder.axLines(contextID: inserted.id, text: item.axText, startingAt: lines.count)
+        if !item.nativeVisionBoxes.isEmpty {
+            lines += OCRLineBuilder.visionLines(contextID: inserted.id, boxes: item.nativeVisionBoxes, source: "vision_native_crop")
+        }
+        try? await store.insertOCRLines(lines)
+        try? await store.insertFrameSignature(StoredFrameSignature(
+            contextID: inserted.id,
+            dHash: Int64(bitPattern: item.signature.dHash),
+            combinedGridHash: Int64(bitPattern: item.signature.combinedGridHash),
+            gridHashes: item.signature.gridDHash.map { Int64(bitPattern: $0) },
+            blockHash: Int64(bitPattern: item.signature.blockHash),
+            changedCellsMask: item.signature.changedCellsMask,
+            textDigest: item.signature.textDigest.map { Int64(bitPattern: $0) }
+        ))
+        if let semanticText = item.semanticText {
+            await maintenanceScheduler?.enqueueSemanticIndexing(contextID: inserted.id, text: semanticText)
+        }
+        _ = try? await store.appendAudit(AuditEvent(actor: "system", action: "rewind.capture", detail: item.auditDetail))
+        onMoment(inserted)
+    }
+}
+
 /// Serializes the expensive work (OCR + storage) per changed frame. Actor
 /// isolation *is* the serialization; `ingest` coalesces to the latest pending
 /// frame so a slow OCR pass can't pile up a backlog.
@@ -498,6 +633,7 @@ actor RewindEngine {
     private let indexWorkGraph: Bool
     private let structuredContent: Bool
     private let maintenanceScheduler: RecorderMaintenanceScheduler?
+    private let writeBuffer: ContextWriteBuffer
     private var policy: CapturePrivacyPolicy
     private var budget: RecorderCadenceBudget = .normal
     private let onMoment: @Sendable (RecordedContext) -> Void
@@ -531,6 +667,12 @@ actor RewindEngine {
         self.maintenanceScheduler = maintenanceScheduler
         self.policy = policy
         self.onMoment = onMoment
+        self.writeBuffer = ContextWriteBuffer(
+            store: store,
+            indexWorkGraph: indexWorkGraph,
+            maintenanceScheduler: maintenanceScheduler,
+            onMoment: onMoment
+        )
     }
 
     func updatePolicy(_ policy: CapturePrivacyPolicy) {
@@ -539,6 +681,10 @@ actor RewindEngine {
 
     func updateBudget(_ budget: RecorderCadenceBudget) {
         self.budget = budget
+    }
+
+    func flushWrites() async {
+        await writeBuffer.flush()
     }
 
     func updateLatest(_ frame: ChangedFrame) {
@@ -735,51 +881,22 @@ actor RewindEngine {
             return
         }
 
-        do {
-            let inserted = try await store.insert(context, indexWorkGraph: indexWorkGraph)
-            if structuredContent,
-               let payload = StructuredContentExporter.sidecarPayload(from: structuredRedacted) {
-                try? await store.insertOCRStructure(
-                    contextID: inserted.id,
-                    version: payload.version,
-                    json: payload.json,
-                    searchableText: payload.searchableText
-                )
-            }
-            var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: redactedOCRBoxes, source: "vision")
-            lines += OCRLineBuilder.axLines(contextID: inserted.id, text: redactedAXText, startingAt: lines.count)
-            if !nativeOCRLines.isEmpty {
-                lines += OCRLineBuilder.visionLines(contextID: inserted.id, boxes: nativeOCRLines, source: "vision_native_crop")
-            }
-            try? await store.insertOCRLines(lines)
-            try? await store.insertFrameSignature(StoredFrameSignature(
-                contextID: inserted.id,
-                dHash: Int64(bitPattern: signature.dHash),
-                combinedGridHash: Int64(bitPattern: signature.combinedGridHash),
-                gridHashes: signature.gridDHash.map { Int64(bitPattern: $0) },
-                blockHash: Int64(bitPattern: signature.blockHash),
-                changedCellsMask: signature.changedCellsMask,
-                textDigest: signature.textDigest.map { Int64(bitPattern: $0) }
-            ))
-            if !mergedText.isEmpty {
-                await maintenanceScheduler?.enqueueSemanticIndexing(contextID: inserted.id, text: mergedText)
-            }
-            lastStoredBucket = bucket
-            lastStoredSignature = signature
-            _ = try? await store.appendAudit(AuditEvent(
-                actor: "system",
-                action: "rewind.capture",
-                detail: ContextRecorder.captureAuditDetail(
-                    appName: inserted.appName,
-                    axChars: axText.count,
-                    ocrChars: ocrText.count
-                )
-            ))
-            onMoment(inserted)
-        } catch {
-            FrameStore.delete(imagePath)
-            logger.error("Rewind insert failed: \(error.localizedDescription, privacy: .public)")
-        }
+        await writeBuffer.enqueue(ContextWriteBufferItem(
+            context: context,
+            structuredPayload: structuredContent ? StructuredContentExporter.sidecarPayload(from: structuredRedacted) : nil,
+            visionBoxes: redactedOCRBoxes,
+            axText: redactedAXText,
+            nativeVisionBoxes: nativeOCRLines,
+            signature: signature,
+            semanticText: mergedText.isEmpty ? nil : mergedText,
+            auditDetail: ContextRecorder.captureAuditDetail(
+                appName: context.appName,
+                axChars: axText.count,
+                ocrChars: ocrText.count
+            )
+        ))
+        lastStoredBucket = bucket
+        lastStoredSignature = signature
     }
 
     private func isDuplicate(bucket: String, signature: FrameSignature) -> Bool {
@@ -899,12 +1016,14 @@ final class RewindRecorder {
 
     func stop() async {
         stopping = true
-        guard let stream else { return }
-        self.stream = nil
-        self.output = nil
-        self.streamedDisplayID = nil
-        try? await stream.stopCapture()
-        logger.info("Rewind stream stopped.")
+        if let stream {
+            self.stream = nil
+            self.output = nil
+            self.streamedDisplayID = nil
+            try? await stream.stopCapture()
+            logger.info("Rewind stream stopped.")
+        }
+        await engine.flushWrites()
     }
 
     /// Follow the user across monitors: when the cursor lives on a different

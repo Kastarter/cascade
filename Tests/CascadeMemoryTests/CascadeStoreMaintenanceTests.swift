@@ -15,9 +15,10 @@ func storeAppliesPerformancePragmasOnOpen() async throws {
 
     #expect(try await store.pragmaIntValue("foreign_keys") == 1)
     #expect(try await store.pragmaIntValue("synchronous") == 1)
-    #expect(try await store.pragmaIntValue("busy_timeout") == 2500)
+    #expect(try await store.pragmaIntValue("busy_timeout") == 5000)
     #expect(try await store.pragmaIntValue("temp_store") == 2)
-    #expect(try await store.pragmaIntValue("wal_autocheckpoint") == 512)
+    #expect(try await store.pragmaIntValue("cache_size") < 0)
+    #expect(try await store.pragmaIntValue("wal_autocheckpoint") == 0)
 }
 
 @Test
