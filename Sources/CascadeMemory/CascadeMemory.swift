@@ -224,6 +224,134 @@ public struct AuditEvent: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public enum PreferenceEventKind: String, Codable, Sendable, Equatable, CaseIterable {
+    case agentProposed = "agent.proposed"
+    case agentApproved = "agent.approved"
+    case agentDeclined = "agent.declined"
+    case agentRunCompleted = "agent.run.completed"
+    case agentScheduleSet = "agent.schedule.set"
+    case agentScheduleCleared = "agent.schedule.cleared"
+    case agentEnabled = "agent.enabled"
+    case agentDisabled = "agent.disabled"
+    case agentDeleted = "agent.deleted"
+    case proactiveAccepted = "proactive.accept"
+    case proactiveSnoozed = "proactive.snooze"
+    case proactiveDismissed = "proactive.dismiss"
+    case proactiveOfferShown = "proactive.offer.shown"
+    case proactiveOfferSuppressed = "proactive.offer.suppressed"
+    case coldStartSet = "cold_start.set"
+    case personalizationCleared = "personalization.cleared"
+    case personalizationDisabled = "personalization.disabled"
+}
+
+public struct PreferenceEvent: Identifiable, Codable, Equatable, Sendable {
+    public let id: Int64
+    public let createdAt: Date
+    public let kind: PreferenceEventKind
+    public let reward: Double
+    public let surface: String?
+    public let appName: String?
+    public let workflowSignature: String?
+    public let agentID: Int64?
+    public let featureJSON: String
+    public let evidenceJSON: String?
+
+    public init(
+        id: Int64 = 0,
+        createdAt: Date = Date(),
+        kind: PreferenceEventKind,
+        reward: Double,
+        surface: String? = nil,
+        appName: String? = nil,
+        workflowSignature: String? = nil,
+        agentID: Int64? = nil,
+        featureJSON: String = "{}",
+        evidenceJSON: String? = nil
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.kind = kind
+        self.reward = max(-1, min(1, reward))
+        self.surface = surface
+        self.appName = appName
+        self.workflowSignature = workflowSignature
+        self.agentID = agentID
+        self.featureJSON = featureJSON.isEmpty ? "{}" : featureJSON
+        self.evidenceJSON = evidenceJSON
+    }
+}
+
+public struct RoutineProfile: Identifiable, Codable, Equatable, Sendable {
+    public let id: Int64
+    public let appName: String
+    public let surface: String
+    public let weekday: Int
+    public let hourBucket: Int
+    public let workflowSignature: String?
+    public let shown: Int
+    public let accepted: Int
+    public let dismissedSnoozed: Int
+    public let completed: Int
+    public let scheduled: Int
+    public let disabledDeleted: Int
+    public let lastSeenAt: Date
+    public let metadataJSON: String
+
+    public init(
+        id: Int64 = 0,
+        appName: String,
+        surface: String,
+        weekday: Int,
+        hourBucket: Int,
+        workflowSignature: String? = nil,
+        shown: Int = 0,
+        accepted: Int = 0,
+        dismissedSnoozed: Int = 0,
+        completed: Int = 0,
+        scheduled: Int = 0,
+        disabledDeleted: Int = 0,
+        lastSeenAt: Date = Date(),
+        metadataJSON: String = "{}"
+    ) {
+        self.id = id
+        self.appName = appName
+        self.surface = surface
+        self.weekday = weekday
+        self.hourBucket = hourBucket
+        self.workflowSignature = workflowSignature
+        self.shown = shown
+        self.accepted = accepted
+        self.dismissedSnoozed = dismissedSnoozed
+        self.completed = completed
+        self.scheduled = scheduled
+        self.disabledDeleted = disabledDeleted
+        self.lastSeenAt = lastSeenAt
+        self.metadataJSON = metadataJSON
+    }
+}
+
+public struct PersonalizationSnapshot: Codable, Equatable, Sendable {
+    public let eventCount: Int
+    public let routineProfileCount: Int
+    public let disabledSignatureCount: Int
+    public let disabledAppCount: Int
+    public let lastEventAt: Date?
+
+    public init(
+        eventCount: Int,
+        routineProfileCount: Int,
+        disabledSignatureCount: Int,
+        disabledAppCount: Int,
+        lastEventAt: Date?
+    ) {
+        self.eventCount = eventCount
+        self.routineProfileCount = routineProfileCount
+        self.disabledSignatureCount = disabledSignatureCount
+        self.disabledAppCount = disabledAppCount
+        self.lastEventAt = lastEventAt
+    }
+}
+
 // MARK: - Input events (the user's actual clicks/keys, recorded for workflow learning)
 
 public enum InputEventKind: String, Codable, Sendable {
@@ -2037,6 +2165,176 @@ public actor CascadeStore {
         }
     }
 
+    @discardableResult
+    public func appendPreferenceEvent(_ event: PreferenceEvent) throws -> PreferenceEvent {
+        let sanitized = Self.sanitizedPreferenceEvent(event)
+        let sql = """
+        INSERT INTO preference_event
+            (created_at, kind, reward, surface, app_name, workflow_signature, agent_id, feature_json, evidence_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        try withStatement(sql) { statement in
+            bind(DateCodec.string(from: sanitized.createdAt), at: 1, in: statement)
+            bind(sanitized.kind.rawValue, at: 2, in: statement)
+            bind(sanitized.reward, at: 3, in: statement)
+            bind(sanitized.surface, at: 4, in: statement)
+            bind(sanitized.appName, at: 5, in: statement)
+            bind(sanitized.workflowSignature, at: 6, in: statement)
+            bind(sanitized.agentID, at: 7, in: statement)
+            bind(sanitized.featureJSON, at: 8, in: statement)
+            bind(sanitized.evidenceJSON, at: 9, in: statement)
+            try stepDone(statement)
+        }
+        let stored = PreferenceEvent(
+            id: sqlite3_last_insert_rowid(connection.db),
+            createdAt: sanitized.createdAt,
+            kind: sanitized.kind,
+            reward: sanitized.reward,
+            surface: sanitized.surface,
+            appName: sanitized.appName,
+            workflowSignature: sanitized.workflowSignature,
+            agentID: sanitized.agentID,
+            featureJSON: sanitized.featureJSON,
+            evidenceJSON: sanitized.evidenceJSON
+        )
+        try upsertRoutineProfile(from: stored)
+        _ = try? appendAudit(AuditEvent(
+            actor: "system",
+            action: "preference.event",
+            detail: Self.preferenceAuditDetail(stored)
+        ))
+        _ = try? appendAudit(AuditEvent(
+            actor: "system",
+            action: "preference.updated",
+            detail: Self.preferenceAuditDetail(stored)
+        ))
+        return stored
+    }
+
+    public func recentPreferenceEvents(limit: Int = 500) throws -> [PreferenceEvent] {
+        let sql = """
+        SELECT id, created_at, kind, reward, surface, app_name, workflow_signature, agent_id, feature_json, evidence_json
+        FROM preference_event
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(limit))
+            var rows: [PreferenceEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodePreferenceEvent(statement))
+            }
+            return rows
+        }
+    }
+
+    public func preferenceEvents(
+        workflowSignature: String? = nil,
+        agentID: Int64? = nil,
+        limit: Int = 500
+    ) throws -> [PreferenceEvent] {
+        let storedSignature = workflowSignature.map(AuditIdentity.hash)
+        let sql = """
+        SELECT id, created_at, kind, reward, surface, app_name, workflow_signature, agent_id, feature_json, evidence_json
+        FROM preference_event
+        WHERE (? IS NULL OR workflow_signature = ?)
+          AND (? IS NULL OR agent_id = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(storedSignature, at: 1, in: statement)
+            bind(storedSignature, at: 2, in: statement)
+            bind(agentID, at: 3, in: statement)
+            bind(agentID, at: 4, in: statement)
+            sqlite3_bind_int(statement, 5, Int32(limit))
+            var rows: [PreferenceEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodePreferenceEvent(statement))
+            }
+            return rows
+        }
+    }
+
+    public func routineProfiles(limit: Int = 100) throws -> [RoutineProfile] {
+        let sql = """
+        SELECT id, app_name, surface, weekday, hour_bucket, workflow_signature,
+               shown, accepted, dismissed_snoozed, completed, scheduled, disabled_deleted,
+               last_seen_at, metadata_json
+        FROM routine_profile
+        ORDER BY last_seen_at DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(limit))
+            var rows: [RoutineProfile] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeRoutineProfile(statement))
+            }
+            return rows
+        }
+    }
+
+    public func personalizationSnapshot() throws -> PersonalizationSnapshot {
+        let eventCount = Int(Self.scalarValue(connection.db, "SELECT count(*) FROM preference_event;"))
+        let routineCount = Int(Self.scalarValue(connection.db, "SELECT count(*) FROM routine_profile;"))
+        let disabledSignatures = Int(Self.scalarValue(
+            connection.db,
+            "SELECT count(DISTINCT workflow_signature) FROM preference_event WHERE kind IN ('agent.disabled', 'agent.deleted') AND workflow_signature IS NOT NULL;"
+        ))
+        let disabledApps = Int(Self.scalarValue(
+            connection.db,
+            "SELECT count(DISTINCT app_name) FROM preference_event WHERE kind IN ('personalization.disabled', 'proactive.offer.suppressed') AND app_name IS NOT NULL;"
+        ))
+        let lastEventAt = try withStatement("SELECT created_at FROM preference_event ORDER BY created_at DESC, id DESC LIMIT 1;") { statement in
+            sqlite3_step(statement) == SQLITE_ROW ? DateCodec.date(from: text(statement, 0)) : nil
+        }
+        return PersonalizationSnapshot(
+            eventCount: eventCount,
+            routineProfileCount: routineCount,
+            disabledSignatureCount: disabledSignatures,
+            disabledAppCount: disabledApps,
+            lastEventAt: lastEventAt
+        )
+    }
+
+    public func clearPersonalization(workflowSignature: String? = nil, appName: String? = nil) throws {
+        let storedSignature = workflowSignature.map(AuditIdentity.hash)
+        let storedAppName = Self.sanitizePreferenceText(appName)
+        if workflowSignature == nil && appName == nil {
+            try execute("DELETE FROM preference_event; DELETE FROM routine_profile;")
+        } else {
+            let sql = """
+            DELETE FROM preference_event
+            WHERE (? IS NULL OR workflow_signature = ?)
+              AND (? IS NULL OR app_name = ?);
+            """
+            try withStatement(sql) { statement in
+                bind(storedSignature, at: 1, in: statement)
+                bind(storedSignature, at: 2, in: statement)
+                bind(storedAppName, at: 3, in: statement)
+                bind(storedAppName, at: 4, in: statement)
+                try stepDone(statement)
+            }
+            try withStatement("""
+            DELETE FROM routine_profile
+            WHERE (? IS NULL OR workflow_signature = ?)
+              AND (? IS NULL OR app_name = ?);
+            """) { statement in
+                bind(storedSignature, at: 1, in: statement)
+                bind(storedSignature, at: 2, in: statement)
+                bind(storedAppName, at: 3, in: statement)
+                bind(storedAppName, at: 4, in: statement)
+                try stepDone(statement)
+            }
+        }
+        _ = try? appendAudit(AuditEvent(
+            actor: "employee",
+            action: "preference.disabled",
+            detail: "signatureHash=\(AuditIdentity.hash(workflowSignature)) appHash=\(AuditIdentity.hash(appName))"
+        ))
+    }
+
     public func appendAudit(_ event: AuditEvent) throws -> AuditEvent {
         let createdAt = DateCodec.string(from: event.createdAt)
         // Strip high-confidence secrets/PII from the detail before it touches the
@@ -2318,6 +2616,49 @@ public actor CascadeStore {
         );
         CREATE INDEX IF NOT EXISTS idx_audit_event_created_at
             ON audit_event(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS preference_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            reward REAL NOT NULL,
+            surface TEXT,
+            app_name TEXT,
+            workflow_signature TEXT,
+            agent_id INTEGER,
+            feature_json TEXT NOT NULL,
+            evidence_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_preference_event_created_at
+            ON preference_event(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_preference_event_kind
+            ON preference_event(kind, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_preference_event_signature
+            ON preference_event(workflow_signature, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_preference_event_agent
+            ON preference_event(agent_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS routine_profile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_name TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            weekday INTEGER NOT NULL,
+            hour_bucket INTEGER NOT NULL,
+            workflow_signature TEXT NOT NULL DEFAULT '',
+            shown INTEGER NOT NULL DEFAULT 0,
+            accepted INTEGER NOT NULL DEFAULT 0,
+            dismissed_snoozed INTEGER NOT NULL DEFAULT 0,
+            completed INTEGER NOT NULL DEFAULT 0,
+            scheduled INTEGER NOT NULL DEFAULT 0,
+            disabled_deleted INTEGER NOT NULL DEFAULT 0,
+            last_seen_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(app_name, surface, weekday, hour_bucket, workflow_signature)
+        );
+        CREATE INDEX IF NOT EXISTS idx_routine_profile_app_hour
+            ON routine_profile(app_name, weekday, hour_bucket);
+        CREATE INDEX IF NOT EXISTS idx_routine_profile_signature
+            ON routine_profile(workflow_signature, weekday, hour_bucket);
         """, db: db)
 
         // Best-effort migrations for databases created before these columns existed.
@@ -3026,6 +3367,122 @@ public actor CascadeStore {
         )
     }
 
+    private static func sanitizedPreferenceEvent(_ event: PreferenceEvent) -> PreferenceEvent {
+        let appName = sanitizePreferenceText(event.appName)
+        let surface = sanitizePreferenceText(event.surface)
+        let signature = event.workflowSignature.map { AuditIdentity.hash($0) }
+        return PreferenceEvent(
+            id: event.id,
+            createdAt: event.createdAt,
+            kind: event.kind,
+            reward: event.reward,
+            surface: surface,
+            appName: appName,
+            workflowSignature: signature,
+            agentID: event.agentID,
+            featureJSON: sanitizePreferenceJSON(event.featureJSON) ?? "{}",
+            evidenceJSON: sanitizePreferenceJSON(event.evidenceJSON)
+        )
+    }
+
+    private static func sanitizePreferenceText(_ value: String?) -> String? {
+        guard let value = sanitizeStoredText(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        if PrivacyRules.isSensitiveText(value) { return "hash:\(AuditIdentity.hash(value))" }
+        return AuditIdentity.safeToken(value.lowercased())
+    }
+
+    private static func sanitizePreferenceJSON(_ json: String?) -> String? {
+        guard let json, !json.isEmpty else { return nil }
+        let piiRedacted = redactPIIForStorage(json)
+        let keywordRedacted = PrivacyRules.redactingSensitiveKeywords(in: piiRedacted)
+        guard !keywordRedacted.isEmpty else { return nil }
+        if keywordRedacted == json { return json }
+        return keywordRedacted
+    }
+
+    private func upsertRoutineProfile(from event: PreferenceEvent) throws {
+        let counts = Self.routineCounts(for: event.kind)
+        guard counts.shown + counts.accepted + counts.dismissedSnoozed + counts.completed + counts.scheduled + counts.disabledDeleted > 0 else {
+            return
+        }
+        let components = Calendar.current.dateComponents([.weekday, .hour], from: event.createdAt)
+        let weekday = components.weekday ?? 1
+        let hourBucket = components.hour ?? 0
+        let appName = event.appName ?? "unknown"
+        let surface = event.surface ?? "unknown"
+        let signature = event.workflowSignature ?? ""
+        let lastSeen = DateCodec.string(from: event.createdAt)
+        let sql = """
+        INSERT INTO routine_profile
+            (app_name, surface, weekday, hour_bucket, workflow_signature,
+             shown, accepted, dismissed_snoozed, completed, scheduled, disabled_deleted,
+             last_seen_at, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_name, surface, weekday, hour_bucket, workflow_signature) DO UPDATE SET
+            shown = shown + excluded.shown,
+            accepted = accepted + excluded.accepted,
+            dismissed_snoozed = dismissed_snoozed + excluded.dismissed_snoozed,
+            completed = completed + excluded.completed,
+            scheduled = scheduled + excluded.scheduled,
+            disabled_deleted = disabled_deleted + excluded.disabled_deleted,
+            last_seen_at = excluded.last_seen_at,
+            metadata_json = excluded.metadata_json;
+        """
+        try withStatement(sql) { statement in
+            bind(appName, at: 1, in: statement)
+            bind(surface, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(weekday))
+            sqlite3_bind_int(statement, 4, Int32(hourBucket))
+            bind(signature, at: 5, in: statement)
+            sqlite3_bind_int(statement, 6, Int32(counts.shown))
+            sqlite3_bind_int(statement, 7, Int32(counts.accepted))
+            sqlite3_bind_int(statement, 8, Int32(counts.dismissedSnoozed))
+            sqlite3_bind_int(statement, 9, Int32(counts.completed))
+            sqlite3_bind_int(statement, 10, Int32(counts.scheduled))
+            sqlite3_bind_int(statement, 11, Int32(counts.disabledDeleted))
+            bind(lastSeen, at: 12, in: statement)
+            bind(event.featureJSON, at: 13, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    private static func routineCounts(for kind: PreferenceEventKind) -> (
+        shown: Int,
+        accepted: Int,
+        dismissedSnoozed: Int,
+        completed: Int,
+        scheduled: Int,
+        disabledDeleted: Int
+    ) {
+        switch kind {
+        case .agentProposed, .proactiveOfferShown:
+            return (1, 0, 0, 0, 0, 0)
+        case .agentApproved, .proactiveAccepted, .agentEnabled, .coldStartSet:
+            return (0, 1, 0, 0, 0, 0)
+        case .agentDeclined, .proactiveSnoozed, .proactiveDismissed, .proactiveOfferSuppressed:
+            return (0, 0, 1, 0, 0, 0)
+        case .agentRunCompleted:
+            return (0, 0, 0, 1, 0, 0)
+        case .agentScheduleSet:
+            return (0, 0, 0, 0, 1, 0)
+        case .agentDisabled, .agentDeleted, .agentScheduleCleared, .personalizationCleared, .personalizationDisabled:
+            return (0, 0, 0, 0, 0, 1)
+        }
+    }
+
+    private static func preferenceAuditDetail(_ event: PreferenceEvent) -> String {
+        var parts = [
+            "kind=\(AuditIdentity.safeToken(event.kind.rawValue))",
+            String(format: "reward=%.2f", event.reward),
+            "signatureHash=\(AuditIdentity.hash(event.workflowSignature))"
+        ]
+        if let agentID = event.agentID { parts.append("agentID=\(agentID)") }
+        if let appName = event.appName { parts.append("app=\(AuditIdentity.safeToken(appName))") }
+        if let surface = event.surface { parts.append("surface=\(AuditIdentity.safeToken(surface))") }
+        return parts.joined(separator: " ")
+    }
+
     static func sanitizeStoredText(_ text: String?) -> String? {
         guard let text else { return nil }
         let piiRedacted = redactPIIForStorage(text)
@@ -3190,6 +3647,41 @@ public actor CascadeStore {
             contextCount: Int(sqlite3_column_int(statement, 6)),
             representativeContextID: sqlite3_column_int64(statement, 7),
             summaryText: text(statement, 8)
+        )
+    }
+
+    private func decodePreferenceEvent(_ statement: OpaquePointer) -> PreferenceEvent {
+        PreferenceEvent(
+            id: sqlite3_column_int64(statement, 0),
+            createdAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
+            kind: PreferenceEventKind(rawValue: text(statement, 2) ?? "") ?? .agentProposed,
+            reward: sqlite3_column_double(statement, 3),
+            surface: text(statement, 4),
+            appName: text(statement, 5),
+            workflowSignature: text(statement, 6),
+            agentID: int64(statement, 7),
+            featureJSON: text(statement, 8) ?? "{}",
+            evidenceJSON: text(statement, 9)
+        )
+    }
+
+    private func decodeRoutineProfile(_ statement: OpaquePointer) -> RoutineProfile {
+        let rawSignature = text(statement, 5) ?? ""
+        return RoutineProfile(
+            id: sqlite3_column_int64(statement, 0),
+            appName: text(statement, 1) ?? "unknown",
+            surface: text(statement, 2) ?? "unknown",
+            weekday: Int(sqlite3_column_int(statement, 3)),
+            hourBucket: Int(sqlite3_column_int(statement, 4)),
+            workflowSignature: rawSignature.isEmpty ? nil : rawSignature,
+            shown: Int(sqlite3_column_int(statement, 6)),
+            accepted: Int(sqlite3_column_int(statement, 7)),
+            dismissedSnoozed: Int(sqlite3_column_int(statement, 8)),
+            completed: Int(sqlite3_column_int(statement, 9)),
+            scheduled: Int(sqlite3_column_int(statement, 10)),
+            disabledDeleted: Int(sqlite3_column_int(statement, 11)),
+            lastSeenAt: DateCodec.date(from: text(statement, 12)) ?? Date(),
+            metadataJSON: text(statement, 13) ?? "{}"
         )
     }
 
