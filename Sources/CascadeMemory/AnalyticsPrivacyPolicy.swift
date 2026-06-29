@@ -83,6 +83,10 @@ public struct AnalyticsPrivacyPolicy: Sendable {
     public static let defaultAllowedCounters: Set<String> = [
         "agent.run.completed.count",
         "agent.run.failed.count",
+        "agent.value.completed_run.count",
+        "agent.value.model_cost_cents.count",
+        "agent.value.reclaimed_seconds.count",
+        "agent.value.tool_action.count",
         "agent.reclaimed_seconds.count",
         "input_event.count",
         "model.call.count",

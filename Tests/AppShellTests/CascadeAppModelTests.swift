@@ -79,6 +79,23 @@ private func waitForAudit(
     throw CocoaError(.fileReadNoSuchFile)
 }
 
+private func waitForAudit(
+    _ store: CascadeStore,
+    action: String,
+    detailContains needle: String,
+    maxTries: Int = 500
+) async throws -> AuditEvent {
+    var tries = 0
+    while tries < maxTries {
+        if let row = try await store.recentAudit(limit: 80).first(where: { $0.action == action && $0.detail.contains(needle) }) {
+            return row
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+    throw CocoaError(.fileReadNoSuchFile)
+}
+
 private func expectAuditDetail(_ detail: String, excludesRawIdentityContaining token: String) {
     #expect(!detail.lowercased().contains(token.lowercased()))
 }
@@ -245,6 +262,40 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
 
     // None of these finished the task, so "Reclaimed" must stay at zero.
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
+}
+
+@MainActor @Test
+func managedPolicyBlocksRecordingBackgroundRunsAndSchedules() async throws {
+    let (model, store) = try makeModel()
+    model.capturePrivacyPolicy = CapturePrivacyPolicy(
+        recordingAvailable: false,
+        backgroundWebRunsAvailable: false,
+        scheduledRunsAvailable: false
+    )
+
+    model.startRecording()
+    let recordingRow = try await waitForAudit(store, action: "policy.enforced", detailContains: "capability=recording")
+    #expect(recordingRow.detail.contains("capability=recording"))
+
+    #expect(!model.createSandboxAgent(task: "open https://example.com and summarize it"))
+    let backgroundRow = try await waitForAudit(store, action: "policy.enforced", detailContains: "capability=background_web_run")
+    #expect(backgroundRow.detail.contains("capability=background_web_run"))
+
+    let agent = try await deployedAgent(in: store)
+    model.setAgentSchedule(agent, schedule: "daily@09:05")
+    let scheduleRow = try await waitForAudit(store, action: "policy.enforced", detailContains: "capability=agent_schedule")
+    #expect(scheduleRow.detail.contains("capability=agent_schedule"))
+}
+
+@MainActor @Test
+func managedPolicyBlocksDeniedBackgroundSites() async throws {
+    let (model, store) = try makeModel()
+    model.capturePrivacyPolicy = CapturePrivacyPolicy(deniedURLHosts: ["example.com"])
+
+    #expect(!model.createSandboxAgent(task: "visit https://secure.example.com/report"))
+    let row = try await waitForAudit(store, action: "policy.enforced")
+    #expect(row.detail.contains("capability=background_web_run"))
+    #expect(row.detail.contains("reasonChars="))
 }
 
 @MainActor @Test

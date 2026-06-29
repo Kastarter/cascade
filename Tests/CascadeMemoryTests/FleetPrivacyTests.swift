@@ -95,3 +95,24 @@ func fleetManifestCarriesRequiredPolicyFields() {
     #expect(export.manifest.policyVersion == "policy-fixture")
     #expect(export.metrics == [FleetMetric(name: "tool.call.count", value: 6, wasClipped: false)])
 }
+
+@Test
+func fleetPolicyAllowsOnlyAggregateValueCounters() throws {
+    let policy = AnalyticsPrivacyPolicy(clippingBounds: FleetClippingBounds(minimum: 0, maximum: 1_000))
+    let data = try policy.serialize(candidates: [
+        "agent.value.completed_run.count": .counter(12),
+        "agent.value.reclaimed_seconds.count": .counter(3600),
+        "agent.value.model_cost_cents.count": .counter(125),
+        "agent.value.tool_action.count": .counter(88),
+        "agent.value.customer_name": .text("Jane Secret"),
+        "agent.value.invoice_payload": .payload("{\"token\":\"secret\"}")
+    ])
+    let json = String(decoding: data, as: UTF8.self)
+
+    #expect(json.contains("agent.value.completed_run.count"))
+    #expect(json.contains("agent.value.reclaimed_seconds.count"))
+    #expect(json.contains("agent.value.model_cost_cents.count"))
+    #expect(json.contains("agent.value.tool_action.count"))
+    #expect(!json.contains("Jane Secret"))
+    #expect(!json.contains("secret"))
+}

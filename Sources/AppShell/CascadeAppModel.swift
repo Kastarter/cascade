@@ -124,6 +124,15 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var reelClickMarkersByContextID: [Int64: [ReelClickMarker]] = [:]
     @Published public private(set) var audit: [AuditEvent] = []
     @Published public private(set) var auditIntegrityStatus: AuditIntegrityStatus = .unchecked
+    @Published public private(set) var privacySummary: PrivacySummary?
+    @Published public private(set) var sloSnapshot: ReliabilityReport.SLOSnapshot?
+    @Published public private(set) var valueSummary = AgentValueSummary(
+        completedRuns: 0,
+        reclaimedSeconds: 0,
+        modelToolCostUSD: 0,
+        toolActionCount: 0,
+        hourlyRateUSD: 75
+    )
     /// The raw recall layer: every repeated sequence the detector found, before the
     /// automatable filter and curation. Kept observable so the pipeline is testable.
     @Published public private(set) var detectedWaste: [DetectedWaste] = []
@@ -208,6 +217,10 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
+    static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
+    static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
+    static let valueMonthlyActionBudgetKey = "cascade.value.monthlyActionBudget"
+    static let valueMonthlyCostCentsBudgetKey = "cascade.value.monthlyCostCentsBudget"
 
     static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
         defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
@@ -498,6 +511,15 @@ public final class CascadeAppModel: ObservableObject {
                 audit = []
             }
             agents = try await orchestrator.agents()
+            let trustedTraces = try await recentTrustedAuditTraces()
+            sloSnapshot = ReliabilityReport.sloSnapshot(from: trustedTraces)
+            valueSummary = AgentValueSummary.from(
+                agents: agents,
+                traces: trustedTraces,
+                hourlyRateUSD: valueHourlyRateUSD,
+                budgets: valueBudgets
+            )
+            privacySummary = try await store.privacySummary(policy: capturePrivacyPolicy)
             let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
             let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
             let rawDetectedWaste = try await orchestrator.detectedWaste(
@@ -566,17 +588,86 @@ public final class CascadeAppModel: ObservableObject {
         dock.show(title: "Audit history untrusted", detail: untrustedAuditHistoryMessage)
     }
 
+    private var effectivePowerHarnessEnabled: Bool {
+        powerHarnessEnabled && capturePrivacyPolicy.powerHarnessAvailable
+    }
+
+    private var valueHourlyRateUSD: Double {
+        let value = defaultsStore.double(forKey: Self.valueHourlyRateKey)
+        return value > 0 ? value : 75
+    }
+
+    private var valueBudgets: AgentValueBudgets {
+        func positiveInt(_ key: String) -> Int? {
+            let value = defaultsStore.integer(forKey: key)
+            return value > 0 ? value : nil
+        }
+        return AgentValueBudgets(
+            monthlyRunLimit: positiveInt(Self.valueMonthlyRunBudgetKey),
+            monthlyActionLimit: positiveInt(Self.valueMonthlyActionBudgetKey),
+            monthlyCostCentsLimit: positiveInt(Self.valueMonthlyCostCentsBudgetKey)
+        )
+    }
+
+    private func recentTrustedAuditTraces(window: TimeInterval = 7 * 24 * 60 * 60) async throws -> [AgentTrace] {
+        let status = try await store.verifyAuditChain()
+        guard AgentAuditExportPackage.isTrusted(status) else { return [] }
+        let end = Date()
+        let start = end.addingTimeInterval(-window)
+        let events = try await store.auditWindowForTraceAssembly(from: start, to: end, enableTraceAssembly: true)
+        return AgentTraceBuilder.fromAuditEvents(events)
+    }
+
+    @discardableResult
+    private func refuseManagedPolicy(capability: String, reason: String) -> Bool {
+        let detail = Self.policyDecisionAuditDetail(capability: capability, decision: "blocked", reason: reason)
+        statusLine = "Managed policy blocked \(capability)."
+        teachMessage = statusLine
+        agentMessage = statusLine
+        dock.show(title: "Managed policy", detail: statusLine)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "policy", action: "policy.enforced", detail: detail)) }
+        return false
+    }
+
+    @discardableResult
+    private func refuseBudgetStart(capability: String) -> Bool {
+        let reason = valueSummary.budgetViolations.first ?? "budget_exhausted"
+        let detail = Self.policyDecisionAuditDetail(capability: capability, decision: "blocked", reason: reason)
+        statusLine = "Local budget blocked \(capability)."
+        teachMessage = statusLine
+        agentMessage = statusLine
+        dock.show(title: "Budget reached", detail: statusLine)
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "policy", action: "agent.budget.refused", detail: detail)) }
+        return false
+    }
+
+    private func backgroundStartsAvailable(capability: String) -> Bool {
+        guard !valueSummary.budgetExhausted else { return refuseBudgetStart(capability: capability) }
+        return true
+    }
+
     public func startRecording() {
+        guard capturePrivacyPolicy.recordingAvailable else {
+            recorder.pause()
+            refuseManagedPolicy(capability: "recording", reason: "recording_unavailable")
+            return
+        }
         userPaused = false
         refreshPermissionState()
         recorder.start()
-        Task { await refreshAll() }
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "recording.resumed", detail: "source=manual"))
+            await refreshAll()
+        }
     }
 
     public func pauseRecording() {
         userPaused = true
         recorder.pause()
-        Task { await refreshAll() }
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "recording.paused", detail: "source=manual"))
+            await refreshAll()
+        }
     }
 
     /// Always-on: begin recording automatically whenever Screen Recording is
@@ -585,12 +676,17 @@ public final class CascadeAppModel: ObservableObject {
     /// safe.
     private func autoStartIfPermitted() {
         guard startsSubsystems, !userPaused,
+              capturePrivacyPolicy.recordingAvailable,
               recorder.status.permissions.canRecordContext,
               !recorder.status.running else { return }
         recorder.start()
     }
 
     public func captureOnce() {
+        guard capturePrivacyPolicy.recordingAvailable else {
+            refuseManagedPolicy(capability: "capture_once", reason: "recording_unavailable")
+            return
+        }
         refreshPermissionState()
         recorder.captureOnce()
         Task {
@@ -760,6 +856,13 @@ public final class CascadeAppModel: ObservableObject {
     @discardableResult
     public func createSandboxAgent(task: String, forAgent agentID: Int64? = nil) -> Bool {
         let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard capturePrivacyPolicy.backgroundWebRunsAvailable else {
+            return refuseManagedPolicy(capability: "background_web_run", reason: "background_web_runs_unavailable")
+        }
+        if let reason = capturePrivacyPolicy.deniedURLReason(in: trimmed) {
+            return refuseManagedPolicy(capability: "background_web_run", reason: reason)
+        }
+        guard backgroundStartsAvailable(capability: "background_web_run") else { return false }
         // Too vague to act on — ask rather than letting the agent wander (e.g. off
         // googling "how to create an agent"). Also catch a topic-LESS request — a bare
         // verb ending in a dangling preposition ("research about", "look up", "find")
@@ -808,17 +911,33 @@ public final class CascadeAppModel: ObservableObject {
         // user's local files and recorded screen history, not just the web. Pure
         // execution here; the agent applies its own STOP gate + safe audit. Power
         // tools stay behind the user's Power-harness opt-in; recall is read-only.
-        runtime.harnessTier = powerHarnessEnabled ? .full : .readOnly
-        runtime.recallEnabled = true
+        runtime.harnessTier = effectivePowerHarnessEnabled ? .full : .readOnly
+        runtime.recallEnabled = capturePrivacyPolicy.recordRecallAvailable
         runtime.includeStructuredRecallContent = experimentalStructuredContent
         runtime.harnessProvider = { [weak self] name, input in
             guard let self else { return "Cascade is shutting down — stop." }
             guard self.trustedAuditHistoryForSensitiveAction() else { return self.untrustedAuditHistoryMessage }
             if RecordRecall.isRecallTool(name, includeStructuredContent: self.experimentalStructuredContent) {
+                guard self.capturePrivacyPolicy.recordRecallAvailable else {
+                    _ = try? await self.store.appendAudit(AuditEvent(
+                        actor: "policy",
+                        action: "policy.enforced",
+                        detail: Self.policyDecisionAuditDetail(capability: "record_recall", decision: "blocked", reason: "record_recall_unavailable")
+                    ))
+                    return "Managed policy has disabled record recall for agents."
+                }
                 return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
             }
             guard let call = HarnessCall(name: name, input: input) else { return "Unknown harness tool “\(name)”." }
-            return await AgentHarness.perform(call, powerEnabled: self.powerHarnessEnabled)
+            if let reason = self.deniedURLReason(inHarnessInput: input) {
+                _ = try? await self.store.appendAudit(AuditEvent(
+                    actor: "policy",
+                    action: "policy.enforced",
+                    detail: Self.policyDecisionAuditDetail(capability: "harness_url", decision: "blocked", reason: reason)
+                ))
+                return "Managed policy blocked this site."
+            }
+            return await AgentHarness.perform(call, powerEnabled: self.effectivePowerHarnessEnabled)
         }
         backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
@@ -1776,12 +1895,12 @@ public final class CascadeAppModel: ObservableObject {
             skillProvider: assistSkillProvider(goal: goal),
             // Direct-Mac tools beside the computer tool: find/read is always on;
             // run/script/write only with the user's Power harness opt-in.
-            harnessTier: powerHarnessEnabled ? .full : .readOnly,
+            harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
             // Let the agent recall what the user already saw on screen — the whole
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
-            recallEnabled: true,
+            recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
             includeStructuredRecallContent: experimentalStructuredContent,
             // Grounding split: the grounder locates named targets. In structural
             // mode it backs click_target/fill_target/scroll (the model never emits
@@ -1793,7 +1912,7 @@ public final class CascadeAppModel: ObservableObject {
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
         // the agent on Opus. Opt in via `cascade.guardIrreversibleActions`.
-        agent.guardIrreversibleActions = Self.guardIrreversibleEnabled()
+        agent.guardIrreversibleActions = capturePrivacyPolicy.forceIrreversibleActionGuard || Self.guardIrreversibleEnabled()
         agent.onUsage = { [store] usage in
             Task {
                 _ = try? await store.appendAudit(AuditEvent(
@@ -2056,8 +2175,8 @@ public final class CascadeAppModel: ObservableObject {
             skillProvider: assistSkillProvider(goal: goal),
             skillIndex: appSkills.indexText,
             harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
-            harnessTier: powerHarnessEnabled ? .full : .readOnly,
-            recallEnabled: true,
+            harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
+            recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
             includeStructuredRecallContent: experimentalStructuredContent
         )
         let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
@@ -2695,6 +2814,14 @@ public final class CascadeAppModel: ObservableObject {
             return "The user stopped this task. Do not continue — end now."
         }
         guard trustedAuditHistoryForSensitiveAction() else { return untrustedAuditHistoryMessage }
+        guard capturePrivacyPolicy.recordRecallAvailable else {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "policy",
+                action: "policy.enforced",
+                detail: Self.policyDecisionAuditDetail(capability: "record_recall", decision: "blocked", reason: "record_recall_unavailable")
+            ))
+            return "Managed policy has disabled record recall for agents."
+        }
         // Parse the Sendable call HERE (on the main actor) so the untyped
         // dictionary never crosses into RecordRecall's nonisolated executor.
         let call = RecordRecall.Call(name: name, input: input)
@@ -2715,6 +2842,14 @@ public final class CascadeAppModel: ObservableObject {
         guard trustedAuditHistoryForSensitiveAction() else { return untrustedAuditHistoryMessage }
         guard let call = HarnessCall(name: name, input: input) else {
             return "Unknown harness tool “\(name)”."
+        }
+        if let reason = deniedURLReason(inHarnessInput: input) {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "policy",
+                action: "policy.enforced",
+                detail: Self.policyDecisionAuditDetail(capability: "harness_url", decision: "blocked", reason: reason)
+            ))
+            return "Managed policy blocked this site."
         }
         // ONE-LANE enforcement, structural: scripting an app whose UI this task
         // has already been working on screen abandons work the user is watching
@@ -2739,7 +2874,7 @@ public final class CascadeAppModel: ObservableObject {
         // crawling script shows up in the log instead of being invisible.
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.\(name)", detail: auditDescriptor))
         let started = ContinuousClock.now
-        let result = await AgentHarness.perform(call, powerEnabled: powerHarnessEnabled)
+        let result = await AgentHarness.perform(call, powerEnabled: effectivePowerHarnessEnabled)
         let ms = Int(started.duration(to: .now) / .milliseconds(1))
         if ms >= 800 {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms - \(auditDescriptor)"))
@@ -3191,6 +3326,25 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func textAuditDetail(_ field: String, _ value: String?) -> String {
         AuditIdentity.descriptor(field, value)
+    }
+
+    nonisolated static func policyDecisionAuditDetail(capability: String, decision: String, reason: String) -> String {
+        [
+            "capability=\(safeAuditToken(capability))",
+            "decision=\(safeAuditToken(decision))",
+            textAuditDetail("reason", reason)
+        ].joined(separator: " ")
+    }
+
+    private func deniedURLReason(inHarnessInput input: [String: Any]) -> String? {
+        if let url = input["url"] as? String, let reason = capturePrivacyPolicy.deniedURLReason(in: url) {
+            return reason
+        }
+        let flattened = input
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+        return capturePrivacyPolicy.deniedURLReason(in: flattened)
     }
 
     nonisolated static func assistValidationAuditDetail(_ missing: String) -> String {
@@ -5527,6 +5681,14 @@ public final class CascadeAppModel: ObservableObject {
             guard agent.schedule == "daily@\(nowSlot)" else { continue }
             let key = "\(agent.id)@\(today)@\(nowSlot)"
             guard !firedScheduleKeys.contains(key) else { continue }
+            guard capturePrivacyPolicy.scheduledRunsAvailable else {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "policy",
+                    action: "policy.enforced",
+                    detail: Self.scheduleAuditDetail(agent: agent, schedule: agent.schedule, status: "blocked_policy")
+                ))
+                continue
+            }
             if Self.runsInBackground(apps: agent.apps) {
                 // Only consume the daily slot if it actually started — if the cap
                 // refused, leave the key unset so a later tick (this minute) retries.
@@ -5548,6 +5710,10 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func setAgentSchedule(_ agent: CascadeAgent, schedule: String?) {
+        guard schedule == nil || capturePrivacyPolicy.scheduledRunsAvailable else {
+            refuseManagedPolicy(capability: "agent_schedule", reason: "scheduled_runs_unavailable")
+            return
+        }
         Task {
             try? await store.setAgentSchedule(id: agent.id, schedule: schedule)
             _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.schedule.set", detail: Self.scheduleAuditDetail(agent: agent, schedule: schedule, status: "set")))
@@ -5672,12 +5838,14 @@ public final class CascadeAppModel: ObservableObject {
         policy.privateModeEnabled = enabled
         capturePrivacyPolicy = policy
         statusLine = enabled ? "Recording paused by private mode." : recorder.status.message
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "privacy.private_mode", detail: "enabled=\(enabled)")) }
     }
 
     public func exportCapturePolicyToPasteboard() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(capturePrivacyPolicy.exportedJSONString(), forType: .string)
         statusLine = "Capture policy JSON copied."
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "policy.exported", detail: "format=json")) }
     }
 
     public func importCapturePolicyFromPasteboard() {
@@ -5688,6 +5856,99 @@ public final class CascadeAppModel: ObservableObject {
         }
         capturePrivacyPolicy = policy
         statusLine = "Capture policy imported."
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "policy.imported", detail: "format=json version=\(Self.safeAuditToken(policy.version))"))
+            await refreshAll()
+        }
+    }
+
+    public func exportPrivacyManifestToPasteboard(scope: PrivacyDataScope = PrivacyDataScope()) {
+        Task {
+            do {
+                let manifest = try await store.privacyExportManifest(scope: scope, policy: capturePrivacyPolicy)
+                copyJSONToPasteboard(manifest)
+                statusLine = "Privacy manifest copied."
+                privacySummary = manifest.summary
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "employee",
+                    action: "privacy.exported",
+                    detail: "contexts=\(manifest.summary.totalContexts) omitted=\(manifest.omittedFields.count)"
+                ))
+            } catch {
+                statusLine = error.localizedDescription
+            }
+        }
+    }
+
+    public func deletePrivacyData(scope: PrivacyDataScope = PrivacyDataScope()) {
+        Task {
+            do {
+                let result = try await store.deletePrivacyData(scope: scope)
+                for path in result.backingImagePaths {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "employee",
+                    action: "privacy.deleted",
+                    detail: "contexts=\(result.deletedContextCount) inputEvents=\(result.deletedInputEventCount) files=\(result.backingImagePaths.count)"
+                ))
+                statusLine = "Deleted \(result.deletedContextCount) captured moments."
+                await refreshAll()
+            } catch {
+                statusLine = error.localizedDescription
+            }
+        }
+    }
+
+    public func exportAgentAuditToPasteboard(format: AgentAuditExportFormat = .siemJSONL) {
+        Task {
+            do {
+                let status = try await store.verifyAuditChain()
+                auditIntegrityStatus = Self.auditIntegrityStatus(from: status)
+                guard !auditIntegrityEnforcementEnabled || AgentAuditExportPackage.isTrusted(status) else {
+                    refuseManagedPolicy(capability: "audit_export", reason: "audit_chain_untrusted")
+                    return
+                }
+                let end = Date()
+                let start = end.addingTimeInterval(-7 * 24 * 60 * 60)
+                let events = try await store.auditWindowForTraceAssembly(from: start, to: end, enableTraceAssembly: true)
+                let package = AgentAuditExportPackage.build(
+                    trustedChronologicalEvents: events,
+                    windowStart: start,
+                    windowEnd: end,
+                    auditChainStatus: status,
+                    auditHead: try await store.auditHead()
+                )
+                let content = format == .manifestJSON ? package.manifestJSON() : package.content(format: format)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(content, forType: .string)
+                statusLine = "Agent audit \(format.rawValue) copied."
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "employee",
+                    action: "audit.exported",
+                    detail: "format=\(Self.safeAuditToken(format.rawValue)) traces=\(package.manifest.traceCount) spans=\(package.manifest.spanCount)"
+                ))
+            } catch {
+                statusLine = error.localizedDescription
+            }
+        }
+    }
+
+    public func copySLOSnapshotToPasteboard() {
+        let snapshot = sloSnapshot ?? ReliabilityReport.sloSnapshot(from: [])
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(snapshot.deterministicJSON(), forType: .string)
+        statusLine = "SLO snapshot copied."
+    }
+
+    private func copyJSONToPasteboard<T: Encodable>(_ value: T) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(value),
+              let string = String(data: data, encoding: .utf8) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
     }
 
     /// Prepends a freshly recorded moment to the Reel, newest-first, capped so the

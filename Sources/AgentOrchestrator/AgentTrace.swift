@@ -131,6 +131,11 @@ public struct AgentTrace: Sendable, Equatable, Codable {
             failureKind: failureKind,
             stepsAttempted: stepToolSpanCount,
             retries: retryCount,
+            targetTier: spans.compactMap { $0.attributes["target.tier"] ?? $0.attributes["targetTier"] }.last,
+            modalCount: Self.countSpans(namedLike: ["modal"], failureKind: .unexpectedModal, in: spans),
+            noEffectCount: Self.countSpans(namedLike: ["noeffect", "no_effect"], failureKind: .noEffect, in: spans),
+            validatorIncompleteCount: Self.countSpans(namedLike: ["validator", "verify"], failureKind: .validatorIncomplete, in: spans),
+            verificationFailureCount: Self.countSpans(namedLike: ["verify", "verification"], failureKind: .verificationUnavailable, in: spans),
             confidence: confidence,
             actualSuccess: confidence == nil ? nil : status == .success
         )
@@ -252,6 +257,240 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         return nil
     }
 
+    private static func countSpans(namedLike needles: [String], failureKind: AgentFailureKind, in spans: [TraceSpan]) -> Int {
+        spans.filter { span in
+            guard span.kind != .run else { return false }
+            if span.failureKind == failureKind { return true }
+            let name = span.name.lowercased()
+            return needles.contains { name.contains($0) }
+        }.count
+    }
+
+}
+
+public enum AgentAuditExportFormat: String, CaseIterable, Sendable, Codable {
+    case otelJSON = "otel_json"
+    case siemJSONL = "siem_jsonl"
+    case csv
+    case reliabilityJSONL = "reliability_jsonl"
+    case manifestJSON = "manifest_json"
+}
+
+public struct AgentAuditExportManifest: Sendable, Equatable, Codable {
+    public let schemaVersion: Int
+    public let generatedAt: Date
+    public let windowStart: Date
+    public let windowEnd: Date
+    public let auditChainStatus: String
+    public let auditChainTrusted: Bool
+    public let auditHead: AuditHead?
+    public let traceCount: Int
+    public let spanCount: Int
+    public let supportedFormats: [AgentAuditExportFormat]
+
+    public init(
+        schemaVersion: Int = 1,
+        generatedAt: Date = Date(),
+        windowStart: Date,
+        windowEnd: Date,
+        auditChainStatus: String,
+        auditChainTrusted: Bool,
+        auditHead: AuditHead?,
+        traceCount: Int,
+        spanCount: Int,
+        supportedFormats: [AgentAuditExportFormat] = AgentAuditExportFormat.allCases
+    ) {
+        self.schemaVersion = schemaVersion
+        self.generatedAt = generatedAt
+        self.windowStart = windowStart
+        self.windowEnd = windowEnd
+        self.auditChainStatus = auditChainStatus
+        self.auditChainTrusted = auditChainTrusted
+        self.auditHead = auditHead
+        self.traceCount = traceCount
+        self.spanCount = spanCount
+        self.supportedFormats = supportedFormats
+    }
+}
+
+public struct AgentAuditExportPackage: Sendable, Equatable {
+    public let manifest: AgentAuditExportManifest
+    public let traces: [AgentTrace]
+
+    public init(manifest: AgentAuditExportManifest, traces: [AgentTrace]) {
+        self.manifest = manifest
+        self.traces = traces
+    }
+
+    public static func build(
+        trustedChronologicalEvents events: [AuditEvent],
+        windowStart: Date,
+        windowEnd: Date,
+        auditChainStatus: AuditChainStatus,
+        auditHead: AuditHead?,
+        generatedAt: Date = Date()
+    ) -> AgentAuditExportPackage {
+        let traces = AgentTraceBuilder.fromAuditEvents(events)
+        let manifest = AgentAuditExportManifest(
+            generatedAt: generatedAt,
+            windowStart: windowStart,
+            windowEnd: windowEnd,
+            auditChainStatus: Self.statusString(auditChainStatus),
+            auditChainTrusted: Self.isTrusted(auditChainStatus),
+            auditHead: auditHead,
+            traceCount: traces.count,
+            spanCount: traces.reduce(0) { $0 + $1.spans.count }
+        )
+        return AgentAuditExportPackage(manifest: manifest, traces: traces)
+    }
+
+    public func content(format: AgentAuditExportFormat) -> String {
+        switch format {
+        case .otelJSON:
+            return traces.map { $0.otelJSON() }.joined(separator: "\n")
+        case .siemJSONL:
+            return traces.map { $0.siemJSONL() }.filter { !$0.isEmpty }.joined(separator: "\n")
+        case .csv:
+            return Self.combinedCSV(traces)
+        case .reliabilityJSONL:
+            return ReliabilityReport.fromTraces(traces).jsonl()
+        case .manifestJSON:
+            return Self.json(manifest)
+        }
+    }
+
+    public func manifestJSON() -> String {
+        Self.json(manifest)
+    }
+
+    public static func isTrusted(_ status: AuditChainStatus) -> Bool {
+        switch status {
+        case .intact, .empty:
+            true
+        case .broken, .truncated, .unchained:
+            false
+        }
+    }
+
+    public static func statusString(_ status: AuditChainStatus) -> String {
+        switch status {
+        case .intact(let verified):
+            return "intact:\(verified)"
+        case .broken(let id):
+            return "broken:\(id)"
+        case .truncated(let expected, let found):
+            return "truncated:\(expected):\(found)"
+        case .unchained(let firstID):
+            return "unchained:\(firstID)"
+        case .empty:
+            return "empty"
+        }
+    }
+
+    private static func combinedCSV(_ traces: [AgentTrace]) -> String {
+        guard let first = traces.first else {
+            return "trace_id,span_id,parent_span_id,kind,name,start_ms,duration_ms,status,failure_kind,cost_usd"
+        }
+        let header = first.csv().split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        let rows = traces.flatMap { trace in
+            trace.csv().split(separator: "\n", omittingEmptySubsequences: false).dropFirst().map(String.init)
+        }
+        return ([header] + rows).joined(separator: "\n")
+    }
+
+    private static func json<T: Encodable>(_ value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(value),
+              let string = String(data: data, encoding: .utf8) else { return "{}" }
+        return string
+    }
+}
+
+public struct AgentValueBudgets: Sendable, Equatable, Codable {
+    public var monthlyRunLimit: Int?
+    public var monthlyActionLimit: Int?
+    public var monthlyCostCentsLimit: Int?
+
+    public init(monthlyRunLimit: Int? = nil, monthlyActionLimit: Int? = nil, monthlyCostCentsLimit: Int? = nil) {
+        self.monthlyRunLimit = monthlyRunLimit
+        self.monthlyActionLimit = monthlyActionLimit
+        self.monthlyCostCentsLimit = monthlyCostCentsLimit
+    }
+}
+
+public struct AgentValueSummary: Sendable, Equatable, Codable {
+    public let completedRuns: Int
+    public let reclaimedSeconds: Int
+    public let modelToolCostUSD: Double
+    public let toolActionCount: Int
+    public let hourlyRateUSD: Double
+    public let estimatedDollarValue: Double
+    public let costPerCompletedRunUSD: Double
+    public let budgets: AgentValueBudgets
+    public let budgetViolations: [String]
+
+    public var budgetExhausted: Bool { !budgetViolations.isEmpty }
+
+    public init(
+        completedRuns: Int,
+        reclaimedSeconds: Int,
+        modelToolCostUSD: Double,
+        toolActionCount: Int,
+        hourlyRateUSD: Double,
+        budgets: AgentValueBudgets = AgentValueBudgets()
+    ) {
+        self.completedRuns = completedRuns
+        self.reclaimedSeconds = reclaimedSeconds
+        self.modelToolCostUSD = modelToolCostUSD
+        self.toolActionCount = toolActionCount
+        self.hourlyRateUSD = hourlyRateUSD
+        self.estimatedDollarValue = Double(reclaimedSeconds) / 3600.0 * hourlyRateUSD
+        self.costPerCompletedRunUSD = completedRuns > 0 ? modelToolCostUSD / Double(completedRuns) : 0
+        self.budgets = budgets
+        self.budgetViolations = Self.violations(
+            completedRuns: completedRuns,
+            toolActionCount: toolActionCount,
+            modelToolCostUSD: modelToolCostUSD,
+            budgets: budgets
+        )
+    }
+
+    public static func from(
+        agents: [CascadeAgent],
+        traces: [AgentTrace],
+        hourlyRateUSD: Double,
+        budgets: AgentValueBudgets = AgentValueBudgets()
+    ) -> AgentValueSummary {
+        AgentValueSummary(
+            completedRuns: agents.reduce(0) { $0 + $1.runCount },
+            reclaimedSeconds: agents.reduce(0) { $0 + ($1.estimatedSecondsPerRun * $1.runCount) },
+            modelToolCostUSD: traces.reduce(0) { $0 + $1.totalCostUSD },
+            toolActionCount: traces.reduce(0) { $0 + $1.stepToolSpanCount },
+            hourlyRateUSD: hourlyRateUSD,
+            budgets: budgets
+        )
+    }
+
+    private static func violations(
+        completedRuns: Int,
+        toolActionCount: Int,
+        modelToolCostUSD: Double,
+        budgets: AgentValueBudgets
+    ) -> [String] {
+        var failures: [String] = []
+        if let limit = budgets.monthlyRunLimit, completedRuns >= limit {
+            failures.append("monthly run budget \(completedRuns) >= \(limit)")
+        }
+        if let limit = budgets.monthlyActionLimit, toolActionCount >= limit {
+            failures.append("monthly action budget \(toolActionCount) >= \(limit)")
+        }
+        if let limit = budgets.monthlyCostCentsLimit, Int((modelToolCostUSD * 100.0).rounded(.up)) >= limit {
+            failures.append("monthly cost budget exceeded")
+        }
+        return failures
+    }
 }
 
 /// Builds local agent traces from the tamper-evident audit log. This is pure and
