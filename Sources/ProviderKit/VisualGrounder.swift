@@ -39,6 +39,7 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
     public let rawModel: String?
     public let latency: TimeInterval?
     public let dispersion: Double?
+    public let reason: String?
 
     public init(
         point: CGPoint?,
@@ -48,7 +49,8 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         coordinateSpace: GroundingCoordinateSpace,
         rawModel: String? = nil,
         latency: TimeInterval? = nil,
-        dispersion: Double? = nil
+        dispersion: Double? = nil,
+        reason: String? = nil
     ) {
         self.point = point
         self.region = region
@@ -58,6 +60,7 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         self.rawModel = rawModel
         self.latency = latency
         self.dispersion = dispersion
+        self.reason = reason
     }
 }
 

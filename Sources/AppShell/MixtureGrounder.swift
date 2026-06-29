@@ -192,6 +192,14 @@ public struct MixtureGrounder: VisualGrounder {
         displayHeightPoints: Int
     ) async -> GroundingResult {
         guard verifyCandidates else {
+            if let indexed = await screenElementIndexGrounding(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            ) {
+                return indexed
+            }
             guard groundingCache != nil else {
                 let start = ContinuousClock.now
                 let point = await ground(
@@ -361,7 +369,8 @@ public struct MixtureGrounder: VisualGrounder {
                     coordinateSpace: candidate.coordinateSpace,
                     rawModel: candidate.rawModel,
                     latency: candidate.latency,
-                    dispersion: candidate.dispersion
+                    dispersion: candidate.dispersion,
+                    reason: candidate.reason ?? "cached \(candidate.source.rawValue) candidate"
                 )
             },
             selectedIndex: result.selectedIndex
@@ -379,7 +388,8 @@ public struct MixtureGrounder: VisualGrounder {
                     coordinateSpace: candidate.coordinateSpace,
                     rawModel: candidate.rawModel,
                     latency: latency,
-                    dispersion: candidate.dispersion
+                    dispersion: candidate.dispersion,
+                    reason: candidate.reason
                 )
             },
             selectedIndex: result.selectedIndex
@@ -431,6 +441,175 @@ public struct MixtureGrounder: VisualGrounder {
             screenshot: screenshot, target: target,
             displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
         )
+    }
+
+    private func screenElementIndexGrounding(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult? {
+        let axCandidates = await MainActor.run {
+            Self.indexCandidatesFromAccessibility(
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+        }
+        let ocrCandidates = await Task.detached {
+            Self.indexCandidatesFromOCR(
+                screenshot: screenshot,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                target: target
+            )
+        }.value
+        let indexed = ScreenElementIndex.build(from: axCandidates + ocrCandidates)
+        guard let selected = Self.bestIndexedCandidate(for: target, in: indexed) else { return nil }
+        let point = CGPoint(x: selected.bounds.x + selected.bounds.width / 2, y: selected.bounds.y + selected.bounds.height / 2)
+        let source: GroundingSource = selected.source == .accessibility ? .accessibility : .ocr
+        let reason = "clickable-map \(selected.source.rawValue) label match"
+        return GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: point,
+                    region: CGRect(x: selected.bounds.x, y: selected.bounds.y, width: selected.bounds.width, height: selected.bounds.height),
+                    confidence: selected.confidence,
+                    source: source,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    rawModel: selected.label,
+                    reason: reason
+                )
+            ],
+            selectedIndex: 0
+        )
+    }
+
+    @MainActor
+    private static func indexCandidatesFromAccessibility(
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) -> [ScreenElementIndex.Candidate] {
+        guard let bounds = captureDisplayBounds(widthPoints: displayWidthPoints, heightPoints: displayHeightPoints) else {
+            return []
+        }
+        return AXElementResolver.interactables(limit: 48).compactMap { match in
+            guard let point = displayLocalPoint(
+                cgGlobalCenter: match.center,
+                displayCGBounds: bounds,
+                displayHeightPoints: displayHeightPoints
+            ) else { return nil }
+            let role = indexRole(fromAXRole: match.role)
+            let size = role == .textField ? CGSize(width: 180, height: 28) : CGSize(width: 96, height: 28)
+            return ScreenElementIndex.Candidate(
+                bounds: ScreenElementIndex.Bounds(
+                    x: Double(point.x - size.width / 2),
+                    y: Double(point.y - size.height / 2),
+                    width: Double(size.width),
+                    height: Double(size.height)
+                ),
+                label: match.title,
+                role: role,
+                source: .accessibility,
+                confidence: min(1, max(0.72, match.score / 3)),
+                trust: 0.95,
+                clickSafety: .safe
+            )
+        }
+    }
+
+    private static func indexCandidatesFromOCR(
+        screenshot: Data,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        target: String
+    ) -> [ScreenElementIndex.Candidate] {
+        ScreenTextRecognizer.recognizeBoxes(inImageData: screenshot, level: .fast).compactMap { box in
+            let text = box.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.count >= 2, text.count <= 80 else { return nil }
+            let rect = rectFromVisionBox(
+                box.boundingBox,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+            let role: ScreenElementIndex.Role = targetLooksFillable(target) ? .textField : .text
+            return ScreenElementIndex.Candidate(
+                bounds: ScreenElementIndex.Bounds(
+                    x: Double(rect.minX),
+                    y: Double(rect.minY),
+                    width: Double(rect.width),
+                    height: Double(rect.height)
+                ),
+                label: text,
+                role: role,
+                source: .ocr,
+                confidence: Double(box.confidence),
+                trust: role == .textField ? 0.68 : 0.45,
+                clickSafety: role == .textField ? .safe : .passive
+            )
+        }
+    }
+
+    private static func bestIndexedCandidate(
+        for target: String,
+        in candidates: [ScreenElementIndex.IndexedCandidate]
+    ) -> ScreenElementIndex.IndexedCandidate? {
+        let target = normalizedIndexLabel(target)
+        guard !target.isEmpty else { return nil }
+        var best: (candidate: ScreenElementIndex.IndexedCandidate, score: Double)?
+        for candidate in candidates where candidate.isSafeToClick {
+            let score = indexMatchScore(needle: target, candidate: normalizedIndexLabel(candidate.label)) * candidate.trust
+            guard score >= 1.30 else { continue }
+            if best == nil
+                || score > best!.score
+                || (score == best!.score && indexSourceRank(candidate.source) > indexSourceRank(best!.candidate.source))
+                || (score == best!.score && indexSourceRank(candidate.source) == indexSourceRank(best!.candidate.source) && candidate.bounds.area < best!.candidate.bounds.area) {
+                best = (candidate, score)
+            }
+        }
+        return best?.candidate
+    }
+
+    private static func indexSourceRank(_ source: ScreenElementIndex.Source) -> Int {
+        switch source {
+        case .accessibility: return 3
+        case .visual: return 2
+        case .ocr: return 1
+        }
+    }
+
+    private static func indexRole(fromAXRole role: String) -> ScreenElementIndex.Role {
+        switch role {
+        case "AXButton", "AXMenuBarItem": return .button
+        case "AXMenuItem": return .menuItem
+        case "AXLink": return .link
+        case "AXCheckBox", "AXRadioButton": return .checkbox
+        case "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox": return .textField
+        case "AXPopUpButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider": return .option
+        default: return .unknown
+        }
+    }
+
+    private static func targetLooksFillable(_ target: String) -> Bool {
+        let t = target.lowercased()
+        return t.contains("field") || t.contains("box") || t.contains("search") || t.contains("placeholder") || t.contains("input")
+    }
+
+    private static func normalizedIndexLabel(_ value: String) -> String {
+        value.lowercased()
+            .replacingOccurrences(of: #"\b(the|a|an|button|field|box|link|menu|item|placeholder|input)\b"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func indexMatchScore(needle: String, candidate: String) -> Double {
+        guard !needle.isEmpty, !candidate.isEmpty else { return 0 }
+        if needle == candidate { return 3 }
+        if candidate.contains(needle) || needle.contains(candidate) { return 2 }
+        let needleWords = Set(needle.split(separator: " "))
+        let candidateWords = Set(candidate.split(separator: " "))
+        guard !needleWords.isEmpty else { return 0 }
+        let overlap = Double(needleWords.intersection(candidateWords).count) / Double(needleWords.count)
+        return overlap >= 0.75 ? 1 + overlap : 0
     }
 
     /// Locate a target that is literal ON-SCREEN TEXT (document content, a heading, a
@@ -621,7 +800,9 @@ public struct MixtureGrounder: VisualGrounder {
                 point: point,
                 confidence: min(1, max(0, match.score / 3)),
                 source: .accessibility,
-                coordinateSpace: .displayLocalAppKitPoints
+                coordinateSpace: .displayLocalAppKitPoints,
+                rawModel: match.title,
+                reason: "accessibility label match score \(String(format: "%.2f", match.score))"
             ),
             role: match.role,
             label: match.title,

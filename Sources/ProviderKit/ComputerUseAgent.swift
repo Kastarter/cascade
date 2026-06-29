@@ -55,6 +55,48 @@ public struct CUStep: Sendable {
     }
 }
 
+public struct ComputerUseUsageSnapshot: Sendable, Equatable {
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var cacheReadTokens: Int
+    public var cacheWriteTokens: Int
+    public var imageTurns: Int
+    public var prunedImages: Int
+    public var toolDefinitions: Int
+    public var verifierCalls: Int
+
+    public init(
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cacheReadTokens: Int = 0,
+        cacheWriteTokens: Int = 0,
+        imageTurns: Int = 0,
+        prunedImages: Int = 0,
+        toolDefinitions: Int = 0,
+        verifierCalls: Int = 0
+    ) {
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.imageTurns = imageTurns
+        self.prunedImages = prunedImages
+        self.toolDefinitions = toolDefinitions
+        self.verifierCalls = verifierCalls
+    }
+
+    mutating func add(_ usage: ComputerUseUsageSnapshot) {
+        inputTokens += usage.inputTokens
+        outputTokens += usage.outputTokens
+        cacheReadTokens += usage.cacheReadTokens
+        cacheWriteTokens += usage.cacheWriteTokens
+        imageTurns = usage.imageTurns
+        prunedImages = usage.prunedImages
+        toolDefinitions = usage.toolDefinitions
+        verifierCalls += usage.verifierCalls
+    }
+}
+
 /// One piece of a streamed model reply, delivered in response order the moment
 /// its block finishes generating — actions execute while the rest of the reply
 /// is still being written, instead of after the full round trip.
@@ -93,6 +135,9 @@ public final class ComputerUseAgent {
     /// kept so `fill_target` can ground a named target against exactly what the
     /// model is looking at. Zoom crops never overwrite it.
     private var lastFrameJPEG: Data?
+    private var episodeUsage = ComputerUseUsageSnapshot()
+    private var episodePrunedImages = 0
+    private var currentToolDefinitionCount = 0
 
     private let effort: String
     /// Extra environment context appended to the system prompt (e.g. "you're in a web
@@ -167,6 +212,11 @@ public final class ComputerUseAgent {
     /// The summary text was already arriving in the deltas; it was being thrown away.
     public var onThinkingPulse: (@MainActor (String) -> Void)?
     private var lastThinkingPulse = ContinuousClock.now
+
+    public var onUsage: (@MainActor (ComputerUseUsageSnapshot) -> Void)?
+
+    public private(set) var lastGroundMiss: String?
+    public private(set) var lastGroundLog: String?
 
     /// Paste-key gate state (see `pasteRefusal`): does the goal's own wording ask
     /// for clipboard work, and has the agent itself copied something this episode
@@ -427,6 +477,9 @@ public final class ComputerUseAgent {
         messages = []
         pendingToolIDs = []
         toolResultOverrides = [:]
+        episodeUsage = ComputerUseUsageSnapshot()
+        episodePrunedImages = 0
+        currentToolDefinitionCount = 0
         goalAsksForPaste = Self.goalMentionsClipboard(goal)
         goalAsksForDestruction = Self.goalMentionsDestruction(goal)
         episodeCopied = false
@@ -589,6 +642,7 @@ public final class ComputerUseAgent {
             last["cache_control"] = ["type": "ephemeral", "ttl": "1h"]
             tools[tools.count - 1] = last
         }
+        currentToolDefinitionCount = tools.count
         var system = isStructural ? Self.structuralSystemPrompt : Self.systemPrompt
         switch harnessTier {
         case .off: break
@@ -628,6 +682,7 @@ public final class ComputerUseAgent {
             return CUStep(actions: [], text: "", done: true)
         }
         Self.logUsage(["usage": streamed.usage])
+        recordUsage(streamed.usage)
 
         let content = streamed.content
         messages.append(["role": "assistant", "content": content])
@@ -643,6 +698,8 @@ public final class ComputerUseAgent {
         // Behaviour-identical to the sequential path — same frame → same point — so
         // this is purely latency. The cache is consulted by the grounded* helpers
         // below; a single-target turn skips it and grounds inline as before.
+        lastGroundMiss = nil
+        lastGroundLog = nil
         let groundCache = await pregroundTargets(in: content)
         for (index, block) in content.enumerated() {
             switch block["type"] as? String {
@@ -882,11 +939,13 @@ public final class ComputerUseAgent {
     /// fill batch. Returns nil when there's no grounder, no frame, the call is
     /// malformed, or the grounder finds nothing — the caller then tells the model.
     /// `frame` defaults to the live frame; tests inject one to exercise the glue.
-    func expandFillTarget(_ input: [String: Any], frame: Data? = nil, cache: [String: CGPoint?]? = nil) async -> [CUAction]? {
+    func expandFillTarget(_ input: [String: Any], frame: Data? = nil, cache: [String: GroundingResult]? = nil) async -> [CUAction]? {
         guard grounder != nil, let frame = frame ?? lastFrameJPEG,
               let target = (input["target"] as? String), !target.isEmpty,
               let text = input["text"] as? String else { return nil }
-        guard let point = await groundCached(target, frame: frame, cache: cache) else { return nil }
+        let result = await groundCached(target, frame: frame, cache: cache)
+        recordGrounding(result, target: target)
+        guard let point = result.selectedPoint else { return nil }
         // The grounder returns display-local AppKit points already — do NOT scale.
         return Self.fillActions(at: point, text: text, double: (input["click"] as? String) == "double", submit: input["submit"] as? String)
     }
@@ -897,7 +956,7 @@ public final class ComputerUseAgent {
     /// turn is structural AND names MORE THAN ONE distinct target — a single target
     /// gains nothing from a task group and just grounds inline. The grounding kinds
     /// are the three that take a "target": click_target, fill_target, scroll.
-    func pregroundTargets(in content: [[String: Any]]) async -> [String: CGPoint?] {
+    func pregroundTargets(in content: [[String: Any]]) async -> [String: GroundingResult] {
         guard isStructural, let frame = lastFrameJPEG, let g = grounder else { return [:] }
         let targets = Set(content.compactMap { block -> String? in
             guard block["type"] as? String == "tool_use",
@@ -909,11 +968,11 @@ public final class ComputerUseAgent {
         })
         guard targets.count > 1 else { return [:] }
         let dw = displayW, dh = displayH
-        var cache: [String: CGPoint?] = [:]
-        await withTaskGroup(of: (String, CGPoint?).self) { group in
+        var cache: [String: GroundingResult] = [:]
+        await withTaskGroup(of: (String, GroundingResult).self) { group in
             for t in targets {
                 group.addTask {
-                    (t, await g.ground(screenshot: frame, target: t, displayWidthPoints: dw, displayHeightPoints: dh))
+                    (t, await g.groundResult(screenshot: frame, target: t, displayWidthPoints: dw, displayHeightPoints: dh))
                 }
             }
             for await r in group { cache[r.0] = r.1 }
@@ -926,22 +985,24 @@ public final class ComputerUseAgent {
     /// grounding live only on a cache miss. The cache stores the SAME frame's result
     /// the live call would return, so this is behaviour-identical to a direct ground
     /// — purely a latency win when multiple targets share one frame.
-    private func groundCached(_ target: String, frame: Data, cache: [String: CGPoint?]?) async -> CGPoint? {
+    private func groundCached(_ target: String, frame: Data, cache: [String: GroundingResult]?) async -> GroundingResult {
         if let cache, let cached = cache[target] { return cached }
-        return await grounder?.ground(
+        return await grounder?.groundResult(
             screenshot: frame, target: target,
             displayWidthPoints: displayW, displayHeightPoints: displayH
-        )
+        ) ?? GroundingResult()
     }
 
     /// Grounds a `click_target` call (structural mode) into a click action. The
     /// model NAMES the target; the runtime locates it and clicks. `frame` defaults
     /// to the live frame; tests inject one. Returns nil with no grounder/frame/
     /// target or on a grounding miss — the caller then tells the model.
-    func groundedClick(_ input: [String: Any], frame: Data? = nil, cache: [String: CGPoint?]? = nil) async -> CUAction? {
+    func groundedClick(_ input: [String: Any], frame: Data? = nil, cache: [String: GroundingResult]? = nil) async -> CUAction? {
         guard grounder != nil, let frame = frame ?? lastFrameJPEG,
               let target = (input["target"] as? String), !target.isEmpty else { return nil }
-        guard let point = await groundCached(target, frame: frame, cache: cache) else { return nil }
+        let result = await groundCached(target, frame: frame, cache: cache)
+        recordGrounding(result, target: target)
+        guard let point = result.selectedPoint else { return nil }
         // The grounder returns display-local AppKit points already — do NOT scale.
         switch input["click"] as? String {
         case "double": return .doubleClick(x: point.x, y: point.y)
@@ -953,16 +1014,45 @@ public final class ComputerUseAgent {
     /// Grounds a `scroll` call (structural mode). A named target scrolls over that
     /// element; with no target (or a miss) it scrolls over the center of the
     /// display. Never returns nil — a scroll always has a fallback point.
-    func groundedScroll(_ input: [String: Any], frame: Data? = nil, cache: [String: CGPoint?]? = nil) async -> CUAction? {
+    func groundedScroll(_ input: [String: Any], frame: Data? = nil, cache: [String: GroundingResult]? = nil) async -> CUAction? {
         let direction = (input["direction"] as? String) ?? "down"
         let amount = (input["amount"] as? NSNumber)?.intValue ?? 3
         var point = CGPoint(x: CGFloat(displayW) / 2, y: CGFloat(displayH) / 2)
         if grounder != nil, let frame = frame ?? lastFrameJPEG,
-           let target = (input["target"] as? String), !target.isEmpty,
-           let located = await groundCached(target, frame: frame, cache: cache) {
-            point = located  // grounder returns display-local AppKit points already
+           let target = (input["target"] as? String), !target.isEmpty {
+            let result = await groundCached(target, frame: frame, cache: cache)
+            recordGrounding(result, target: target)
+            if let located = result.selectedPoint {
+                point = located  // grounder returns display-local AppKit points already
+            }
         }
         return .scroll(x: point.x, y: point.y, direction: direction, amount: amount)
+    }
+
+    private func recordGrounding(_ result: GroundingResult, target: String) {
+        if let candidate = result.selectedCandidate, let point = candidate.point {
+            let reason = candidate.reason.map { " reason=\(Self.safeLogToken($0))" } ?? ""
+            appendGroundLog("hit \"\(target)\" source=\(candidate.source.rawValue) confidence=\(String(format: "%.2f", candidate.confidence)) @(\(Int(point.x)),\(Int(point.y)))\(reason)")
+        } else {
+            if lastGroundMiss == nil { lastGroundMiss = target }
+            appendGroundLog("miss \"\(target)\"")
+        }
+    }
+
+    private func appendGroundLog(_ line: String) {
+        if let existing = lastGroundLog, !existing.isEmpty {
+            lastGroundLog = existing + "; " + line
+        } else {
+            lastGroundLog = line
+        }
+    }
+
+    private nonisolated static func safeLogToken(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .prefix(48)
+            .description
     }
 
     // MARK: - Tool definitions (shared + structural)
@@ -1618,16 +1708,46 @@ public final class ComputerUseAgent {
         return out
     }
 
-    /// Rolling buffer (Anthropic's guidance): once screenshots exceed `threshold`,
-    /// replace all but the most recent `keep` with short text placeholders, bounding
-    /// the upload payload on long tasks while leaving short tasks untouched. The
-    /// 12→3 batch sizing means a prune (and its one-off cache rewrite) happens at
-    /// most every ~9 turns, keeping the prefix byte-identical in between.
-    private func pruneScreenshots(keep: Int = 3, threshold: Int = 12) {
-        messages = Self.pruned(messages, keep: keep, threshold: threshold)
+    private func recordUsage(_ rawUsage: [String: Any]) {
+        let incremental = Self.usageSnapshot(
+            from: rawUsage,
+            imageTurns: Self.imageTurnCount(in: messages),
+            prunedImages: episodePrunedImages,
+            toolDefinitions: currentToolDefinitionCount
+        )
+        episodeUsage.add(incremental)
+        onUsage?(episodeUsage)
     }
 
-    nonisolated static func pruned(_ messages: [[String: Any]], keep: Int = 3, threshold: Int = 12) -> [[String: Any]] {
+    nonisolated static func usageSnapshot(
+        from rawUsage: [String: Any],
+        imageTurns: Int,
+        prunedImages: Int,
+        toolDefinitions: Int,
+        verifierCalls: Int = 0
+    ) -> ComputerUseUsageSnapshot {
+        ComputerUseUsageSnapshot(
+            inputTokens: (rawUsage["input_tokens"] as? NSNumber)?.intValue ?? 0,
+            outputTokens: (rawUsage["output_tokens"] as? NSNumber)?.intValue ?? 0,
+            cacheReadTokens: (rawUsage["cache_read_input_tokens"] as? NSNumber)?.intValue ?? 0,
+            cacheWriteTokens: (rawUsage["cache_creation_input_tokens"] as? NSNumber)?.intValue ?? 0,
+            imageTurns: imageTurns,
+            prunedImages: prunedImages,
+            toolDefinitions: toolDefinitions,
+            verifierCalls: verifierCalls
+        )
+    }
+
+    /// Fixed image-window policy: keep at most the newest `keep` screenshot turns and
+    /// replace older images with text placeholders while preserving notes/tool text.
+    private func pruneScreenshots(keep: Int = 8, threshold: Int = 8) {
+        let before = Self.imageTurnCount(in: messages)
+        messages = Self.pruned(messages, keep: keep, threshold: threshold)
+        let after = Self.imageTurnCount(in: messages)
+        episodePrunedImages += max(0, before - after)
+    }
+
+    nonisolated static func pruned(_ messages: [[String: Any]], keep: Int = 8, threshold: Int = 8) -> [[String: Any]] {
         var imageTurns: [Int] = []
         for (index, message) in messages.enumerated() {
             guard let content = message["content"] as? [[String: Any]] else { continue }
@@ -1666,5 +1786,19 @@ public final class ComputerUseAgent {
             out[index]["content"] = content
         }
         return out
+    }
+
+    nonisolated static func imageTurnCount(in messages: [[String: Any]]) -> Int {
+        messages.reduce(0) { partial, message in
+            guard let content = message["content"] as? [[String: Any]] else { return partial }
+            let hasImage = content.contains { block in
+                if block["type"] as? String == "image" { return true }
+                if block["type"] as? String == "tool_result", let inner = block["content"] as? [[String: Any]] {
+                    return inner.contains { $0["type"] as? String == "image" }
+                }
+                return false
+            }
+            return partial + (hasImage ? 1 : 0)
+        }
     }
 }

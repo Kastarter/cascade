@@ -935,16 +935,57 @@ public final class CascadeAppModel: ObservableObject {
         verificationSignal: AgentExperienceVerificationSignal? = nil,
         failureKind: CascadeMemory.AgentFailureKind? = nil
     ) async {
+        let appName = Self.experienceAppName(for: agent)
+        let goalPattern = Self.experienceGoalPattern(for: agent, fallback: fallbackGoal)
+        let recipeSignature = Self.experienceRecipeSignature(for: agent)
         _ = try? await store.recordAgentExperience(AgentExperienceCase(
-            appName: Self.experienceAppName(for: agent),
-            goalPattern: Self.experienceGoalPattern(for: agent, fallback: fallbackGoal),
-            recipeSignature: Self.experienceRecipeSignature(for: agent),
+            appName: appName,
+            goalPattern: goalPattern,
+            recipeSignature: recipeSignature,
             outcome: outcome,
             verificationSignal: verificationSignal,
             failureKind: failureKind,
             evidenceIDs: [],
             actionCount: agent.recipe.steps.count
         ))
+        if outcome == .failure, let failureKind {
+            await recordAgentFailureMemory(
+                agent: agent,
+                appName: appName,
+                goalPattern: goalPattern,
+                recipeSignature: recipeSignature,
+                failureKind: failureKind
+            )
+        }
+    }
+
+    private func recordAgentFailureMemory(
+        agent: CascadeAgent,
+        appName: String,
+        goalPattern: String,
+        recipeSignature: String,
+        failureKind: CascadeMemory.AgentFailureKind
+    ) async {
+        let goalTokens = TrajectorySketch.normalizedGoalTokens(from: goalPattern).prefix(8)
+        let firstBadAction = agent.recipe.steps.sorted { $0.order < $1.order }.first.map(Self.failureMemoryActionDescriptor)
+        let target = agent.recipe.steps.lazy.compactMap { $0.targetDescriptor ?? $0.ocrAnchor }.first
+        let memory = AgentFailureMemory(
+            appName: appName,
+            normalizedGoalTokens: Array(goalTokens),
+            failureKind: failureKind,
+            firstBadAction: firstBadAction,
+            screenSignatureHash: Self.auditHash(recipeSignature),
+            targetHash: target.map(Self.auditHash),
+            repairHint: Self.failureMemoryRepairHint(for: failureKind),
+            recoveryEvidenceHash: nil
+        )
+        if let saved = try? await store.recordAgentFailureMemory(memory) {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "agent.failure_memory.saved",
+                detail: Self.failureMemorySavedAuditDetail(saved)
+            ))
+        }
     }
 
     nonisolated static func sandboxExperienceClassification(
@@ -1047,6 +1088,63 @@ public final class CascadeAppModel: ObservableObject {
 
     private static func experienceRecipeSignature(for agent: CascadeAgent) -> String {
         firstNonBlank(agent.signature, agent.name, "agent-\(agent.id)")
+    }
+
+    private static func failureMemoryActionDescriptor(_ step: RecipeStep) -> String {
+        switch step.kind {
+        case .activateApp:
+            return "activate_app"
+        case .click:
+            return "click"
+        case .doubleClick:
+            return "double_click"
+        case .rightClick:
+            return "right_click"
+        case .type:
+            return "type"
+        case .key:
+            return "key"
+        case .scroll:
+            return "scroll"
+        }
+    }
+
+    private static func failureMemoryRepairHint(for failureKind: CascadeMemory.AgentFailureKind) -> String {
+        switch failureKind {
+        case .targetNotFound, .groundingMiss:
+            return "Re-ground on a visible control label or nearby role before acting; do not reuse the old target."
+        case .noEffect:
+            return "If the screen does not change, switch strategy: choose a different visible control, menu, or shortcut."
+        case .wrongStartState, .staleFrameBatch:
+            return "Confirm the frontmost app and starting screen before replaying the learned steps."
+        case .verifierRejected:
+            return "Check the visible end state before declaring done; continue until the requested result is present."
+        case .verificationUnavailable:
+            return "Prefer deterministic visible evidence before relying on narration."
+        case .loginRequired:
+            return "Stop and ask for sign-in instead of looping behind an authentication wall."
+        case .modalBlocked:
+            return "Handle or dismiss the blocking dialog before continuing with the task."
+        case .permissionDenied, .secureInput:
+            return "Respect the permission or secure-input boundary and ask the user to take over."
+        case .unsafeAction:
+            return "Do not perform the unsafe action; explain the boundary and offer a safer alternative."
+        case .parameterNeedsLiveValue:
+            return "Ask for or retrieve the current live value before filling the parameter."
+        case .toolError, .timeout, .stepLimit, .userStop, .artifactWrongLane, .unknown:
+            return "Slow down, verify each visible step, and stop instead of repeating an uncertain action."
+        }
+    }
+
+    nonisolated static func failureMemorySavedAuditDetail(_ memory: AgentFailureMemory) -> String {
+        [
+            "id=\(memory.id)",
+            "failureKind=\(safeAuditToken(memory.failureKind.rawValue))",
+            "appHash=\(auditHash(memory.appName))",
+            "goalTokenCount=\(memory.normalizedGoalTokens.count)",
+            "targetHash=\(memory.targetHash ?? "none")",
+            "retainedScore=\(String(format: "%.2f", memory.retainedScore))",
+        ].joined(separator: " ")
     }
 
     private static func firstNonBlank(_ values: String?...) -> String {
@@ -1573,6 +1671,15 @@ public final class CascadeAppModel: ObservableObject {
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
         // the agent on Opus. Opt in via `cascade.guardIrreversibleActions`.
         agent.guardIrreversibleActions = Self.guardIrreversibleEnabled()
+        agent.onUsage = { [store] usage in
+            Task {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "assist.capture",
+                    detail: Self.assistCaptureAuditDetail(usage)
+                ))
+            }
+        }
         return agent
     }
 
@@ -1774,10 +1881,11 @@ public final class CascadeAppModel: ObservableObject {
 
         // Parity with the Opus path's harness: seed cross-turn memory, push the
         // frontmost app's skill (Scout can't pull), and pass the grounding note.
+        let initialNote = await initialScoutNote(goal: goal)
         var modelStart = ContinuousClock.now
         var step = await agent.begin(
             goal: goal, screenshot: firstScreenshotPNG, displayWidthPoints: dw, displayHeightPoints: dh,
-            conversation: assistMemory.historyForAPI(), note: scoutContextNote(),
+            conversation: assistMemory.historyForAPI(), note: initialNote,
             skill: scoutSkillPush(goal: goal)
         )
         modelTime += modelStart.duration(to: .now); count += 1
@@ -2037,13 +2145,14 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         wire(agent)
+        let initialNote = await initialAssistNote(goal: goal)
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
             displayWidthPoints: Int(screen.frame.width),
             displayHeightPoints: Int(screen.frame.height),
             conversation: assistMemory.historyForAPI(),
-            note: groundingNote(),
+            note: initialNote,
             skillIndex: appSkills.indexText
         )
         // begin() IS the first model turn; in-stream action time isn't model time.
@@ -2171,6 +2280,30 @@ public final class CascadeAppModel: ObservableObject {
                 if actionIndex < step.actions.count - 1 {
                     try? await Task.sleep(for: .milliseconds(120))
                 }
+            }
+
+            if let groundLog = agent.lastGroundLog {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "agent.ground",
+                    detail: Self.groundAuditDetail(groundLog)
+                ))
+            }
+            if let missed = agent.lastGroundMiss {
+                let controls = AXElementResolver.interactables(limit: 24)
+                let summary = AXElementResolver.interactableSummary(controls)
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "agent.ground.miss",
+                    detail: Self.groundMissAuditDetail(
+                        turn: count + 1,
+                        missedTarget: missed,
+                        controlCount: controls.count,
+                        labels: summary
+                    )
+                ))
+                let missNote = "Couldn't locate “\(missed)” on screen. Describe the visible target more specifically, using a label, role, or nearby text from the current screen."
+                nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
             }
 
             if let zoomRegion {
@@ -2442,6 +2575,98 @@ public final class CascadeAppModel: ObservableObject {
         return [groundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
     }
 
+    private func initialAssistNote(goal: String) async -> String? {
+        let snapshot = AppWindowObserver.snapshot()
+        let parts = [
+            groundingNote(),
+            await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
+            await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    private func initialScoutNote(goal: String) async -> String? {
+        let snapshot = AppWindowObserver.snapshot()
+        let parts = [
+            scoutContextNote(),
+            await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
+            await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    private func trajectorySketchNote(for goal: String, frontmostApp: String?) async -> String? {
+        guard defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey) else { return nil }
+        let successes = (try? await store.agentExperienceCases(
+            matching: AgentExperienceQuery(outcome: .success),
+            limit: 80
+        )) ?? []
+        guard !successes.isEmpty else { return nil }
+        let agents = (try? await store.agents()) ?? []
+        guard !agents.isEmpty else { return nil }
+
+        let builder = TrajectorySketchBuilder(maxActions: 6, maxAnchors: 4, maxChecks: 3, maxCorrections: 2)
+        let agentsBySignature = Dictionary(grouping: agents, by: \.signature)
+        let sketches = successes.compactMap { experience -> TrajectorySketch? in
+            guard !PrivacyRules.isSensitiveText(experience.goalPattern),
+                  let agent = agentsBySignature[experience.recipeSignature]?.first,
+                  !PrivacyRules.isSensitiveText(agent.name),
+                  agent.goal.map(PrivacyRules.isSensitiveText) != true else {
+                return nil
+            }
+            return builder.build(
+                goal: Self.experienceGoalPattern(for: agent, fallback: experience.goalPattern),
+                recipe: agent.recipe,
+                experiences: [experience]
+            )
+        }
+        guard let sketch = builder.rank(sketches, appName: frontmostApp, goal: goal).first else { return nil }
+        let score = sketch.relevanceScore(appName: frontmostApp, goal: goal)
+        guard score > 0.05 else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "agent.trajectory_sketch",
+            detail: Self.trajectorySketchAuditDetail(sketch: sketch, score: score)
+        ))
+        return """
+        PRIOR SUCCESSFUL LOCAL DEMO
+        Use this compact replay sketch as a hint, not as proof. Re-ground each target on the live screen before acting.
+        \(String(sketch.promptText.prefix(1200)))
+        """
+    }
+
+    private func failureMemoryNote(for goal: String, frontmostApp: String?) async -> String? {
+        guard defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey) else { return nil }
+        let appName = Self.normalizedFrontmostApp(frontmostApp)
+        let memories = (try? await store.agentFailureMemories(
+            matching: AgentFailureMemoryQuery(appName: appName),
+            limit: 40
+        )) ?? []
+        guard !memories.isEmpty else { return nil }
+        let queryTokens = Set(TrajectorySketch.normalizedGoalTokens(from: goal))
+        let ranked = memories
+            .map { memory in (memory: memory, score: Self.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: appName)) }
+            .filter { $0.score > 0 }
+            .sorted {
+                if $0.score == $1.score { return $0.memory.createdAt > $1.memory.createdAt }
+                return $0.score > $1.score
+            }
+            .prefix(2)
+        guard !ranked.isEmpty else { return nil }
+        let selected = ranked.map(\.memory)
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "agent.failure_memory.used",
+            detail: Self.failureMemoryUsedAuditDetail(selected)
+        ))
+        var lines = ["FAILURE REFLECTIONS"]
+        for memory in selected {
+            let action = memory.firstBadAction.map { " after \($0)" } ?? ""
+            lines.append("- prior \(memory.failureKind.rawValue)\(action): \(memory.repairHint)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// Validator stage (Phase 1) — a fresh-evidence second opinion on the model's
     /// "done", ported from the background agent's `verifyCompletion`. The model's
     /// claim is NOT trusted on its own (the audited "declared done but didn't"
@@ -2621,6 +2846,62 @@ public final class CascadeAppModel: ObservableObject {
         ].joined(separator: " ")
     }
 
+    nonisolated static func trajectorySketchAuditDetail(sketch: TrajectorySketch, score: Double) -> String {
+        [
+            "score=\(String(format: "%.2f", score))",
+            "sketchHash=\(auditHash(sketch.id))",
+            "appHash=\(auditHash(sketch.appName))",
+            "actionCount=\(sketch.firstActions.count)",
+            "anchorCount=\(sketch.safeAnchors.count)",
+            "checkCount=\(sketch.expectedChecks.count)",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func failureMemoryUsedAuditDetail(_ memories: [AgentFailureMemory]) -> String {
+        [
+            "count=\(memories.count)",
+            "ids=\(memories.map { String($0.id) }.joined(separator: ","))",
+            "failureKinds=\(memories.map { safeAuditToken($0.failureKind.rawValue) }.joined(separator: ","))",
+            "memoryHash=\(auditHash(memories.map { "\($0.id):\($0.failureKind.rawValue)" }.joined(separator: "|")))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func normalizedFrontmostApp(_ appName: String?) -> String? {
+        guard let appName = appName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !appName.isEmpty,
+              appName != "Unknown app" else {
+            return nil
+        }
+        return appName
+    }
+
+    nonisolated static func failureMemoryScore(
+        _ memory: AgentFailureMemory,
+        queryTokens: Set<String>,
+        frontmostApp: String?
+    ) -> Double {
+        var score = 0.0
+        if let frontmostApp {
+            let lhs = memory.appName.lowercased()
+            let rhs = frontmostApp.lowercased()
+            if lhs == rhs {
+                score += 2.0
+            } else if lhs.contains(rhs) || rhs.contains(lhs) {
+                score += 1.0
+            }
+        }
+        if !queryTokens.isEmpty {
+            let tokens = Set(memory.normalizedGoalTokens)
+            let overlap = tokens.intersection(queryTokens).count
+            if overlap > 0 {
+                score += Double(overlap) / Double(max(queryTokens.count, tokens.count))
+                score += Double(overlap) * 0.05
+            }
+        }
+        if memory.retainedScore < 0 { score += min(0.4, abs(memory.retainedScore) * 0.25) }
+        return score
+    }
+
     nonisolated static func auditHash(_ value: String?) -> String {
         AuditIdentity.hash(value)
     }
@@ -2635,6 +2916,41 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func assistValidationAuditDetail(_ missing: String) -> String {
         "status=incomplete \(textAuditDetail("missing", missing))"
+    }
+
+    nonisolated static func assistVerifyAuditDetail(
+        status: String,
+        actionKind: String,
+        failureKind: CascadeMemory.AgentFailureKind?,
+        evidenceName: String,
+        evidence: String,
+        skill: AppSkill?
+    ) -> String {
+        var parts = [
+            "status=\(safeAuditToken(status))",
+            "actionKind=\(safeAuditToken(actionKind))",
+            "\(safeAuditToken(evidenceName))Chars=\(evidence.count)",
+            "\(safeAuditToken(evidenceName))Hash=\(auditHash(evidence))",
+            "failureKind=\(safeAuditToken(failureKind?.rawValue ?? "none"))",
+        ]
+        if let skill {
+            parts.append(textAuditDetail("skill", skill.name))
+            parts.append("skillHints=\(skill.hints.inputPolicies.count)")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func assistCaptureAuditDetail(_ usage: ComputerUseUsageSnapshot) -> String {
+        [
+            "imageTurns=\(usage.imageTurns)",
+            "prunedImages=\(usage.prunedImages)",
+            "toolDefinitions=\(usage.toolDefinitions)",
+            "inputTokens=\(usage.inputTokens)",
+            "outputTokens=\(usage.outputTokens)",
+            "cacheReadTokens=\(usage.cacheReadTokens)",
+            "cacheWriteTokens=\(usage.cacheWriteTokens)",
+            "verifierCalls=\(usage.verifierCalls)",
+        ].joined(separator: " ")
     }
 
     nonisolated static func assistStalledAuditDetail(engine: String? = nil, text: String) -> String {
@@ -3050,6 +3366,7 @@ public final class CascadeAppModel: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(900))
                 }
             }
+            await verifyPostAction(action)
             return true
         } catch ComputerUseError.stopped {
             return false
@@ -3067,6 +3384,92 @@ public final class CascadeAppModel: ObservableObject {
             voice.speak("I need Accessibility and Input Monitoring permission to do that.")
             return false
         }
+    }
+
+    private func verifyPostAction(_ action: CUAction) async {
+        switch action {
+        case .openApp(let name):
+            let front = NSWorkspace.shared.frontmostApplication
+            let passed = Self.appMatches(
+                frontmostName: front?.localizedName,
+                frontmostBundle: front?.bundleIdentifier,
+                expectedName: name,
+                expectedBundle: nil
+            )
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "assist.verify.action",
+                detail: Self.assistVerifyAuditDetail(
+                    status: passed ? "verified" : "failed",
+                    actionKind: "open_app",
+                    failureKind: passed ? nil : .wrongStartState,
+                    evidenceName: "target",
+                    evidence: name,
+                    skill: frontmostSkill()
+                )
+            ))
+        case .type(let text):
+            guard let contains = Self.focusedAXValueContains(text) else {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "assist.verify.unavailable",
+                    detail: Self.assistVerifyAuditDetail(
+                        status: "unavailable",
+                        actionKind: "type",
+                        failureKind: .verificationUnavailable,
+                        evidenceName: "text",
+                        evidence: text,
+                        skill: frontmostSkill()
+                    )
+                ))
+                return
+            }
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "assist.verify.action",
+                detail: Self.assistVerifyAuditDetail(
+                    status: contains ? "verified" : "failed",
+                    actionKind: "type",
+                    failureKind: contains ? nil : .verifierRejected,
+                    evidenceName: "text",
+                    evidence: text,
+                    skill: frontmostSkill()
+                )
+            ))
+        case .openURL(let url):
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "assist.verify.unavailable",
+                detail: Self.assistVerifyAuditDetail(
+                    status: "unavailable",
+                    actionKind: "open_url",
+                    failureKind: .verificationUnavailable,
+                    evidenceName: "url",
+                    evidence: url,
+                    skill: frontmostSkill()
+                )
+            ))
+        default:
+            break
+        }
+    }
+
+    private static func focusedAXValueContains(_ text: String) -> Bool? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, AXIsProcessTrusted() else { return nil }
+        let system = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focused = focusedRef else { return nil }
+        let element = unsafeBitCast(focused, to: AXUIElement.self)
+        for attribute in [kAXValueAttribute, kAXSelectedTextAttribute] {
+            var valueRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, attribute as CFString, &valueRef) == .success,
+               let value = valueRef as? String {
+                return value.contains(trimmed)
+            }
+        }
+        return nil
     }
 
     private var lastNarrationAt = Date.distantPast

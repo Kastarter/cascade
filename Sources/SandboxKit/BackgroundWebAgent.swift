@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import ComputerUseKit
 import ProviderKit
 
 /// Runs a job entirely inside a `WebSandbox` — the isolated, background browser —
@@ -856,14 +857,15 @@ public final class BackgroundWebAgent {
     /// Maps a Computer Use action onto the web sandbox. The agent works in bottom-left
     /// AppKit coordinates; the page wants top-left, so y is flipped.
     private func apply(_ action: CUAction) async {
+        let actuator = WebSandboxComputerUseActuator(sandbox: sandbox)
         switch action {
         case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y), .tripleClick(let x, let y):
             guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
                 audit("sandbox.act", Self.invalidCoordinateDetail("click"))
                 return
             }
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.click(x: x, y: y)))
-            await sandbox.click(xTopLeft: CGFloat(point.x), yTopLeft: CGFloat(point.y))
+            let result = await actuator.execute(.click(x: Double(point.x), y: Double(point.y)))
+            audit("sandbox.act", result.auditDetail)
         case .drag(_, _, let toX, let toY):
             // No real drag in the JS bridge — landing on the destination is the
             // closest meaningful approximation.
@@ -871,28 +873,32 @@ public final class BackgroundWebAgent {
                 audit("sandbox.act", Self.invalidCoordinateDetail("drag"))
                 return
             }
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(actionKind: "drag"))
-            await sandbox.click(xTopLeft: CGFloat(point.x), yTopLeft: CGFloat(point.y))
+            let result = await actuator.execute(.drag(
+                fromX: Double(point.x), fromY: Double(point.y),
+                toX: Double(point.x), toY: Double(point.y)
+            ))
+            audit("sandbox.act", result.auditDetail)
         case .move(let x, let y):
             guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
                 audit("sandbox.act", Self.invalidCoordinateDetail("move"))
                 return
             }
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(actionKind: "move"))
-            await sandbox.moveCursor(toTopLeftX: CGFloat(point.x), y: CGFloat(point.y))
+            let result = await actuator.execute(.move(x: Double(point.x), y: Double(point.y)))
+            audit("sandbox.act", result.auditDetail)
         case .type(let text):
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.type(text)))
-            await sandbox.typeText(text)
+            let result = await actuator.execute(.typeText(text))
+            audit("sandbox.act", result.auditDetail)
         case .key(let combo):
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.key(combo)))
-            await sandbox.pressKey(combo)
+            let parsed = Self.parseKeyCombo(combo)
+            let result = await actuator.execute(.key(parsed.key, modifiers: parsed.modifiers))
+            audit("sandbox.act", result.auditDetail)
         case .scroll(_, _, let direction, let amount):
             guard let delta = Self.sandboxScrollDelta(direction: direction, amount: amount) else {
                 audit("sandbox.act", Self.invalidCoordinateDetail("scroll"))
                 return
             }
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(actionKind: "scroll"))
-            await sandbox.scroll(dy: CGFloat(delta))
+            let result = await actuator.execute(.scroll(deltaX: 0, deltaY: Double(delta)))
+            audit("sandbox.act", result.auditDetail)
         case .wait:
             try? await Task.sleep(for: .milliseconds(600))
         case .screenshot, .zoom:
@@ -902,10 +908,18 @@ public final class BackgroundWebAgent {
         case .openApp:
             break  // no apps inside the web sandbox
         case .openURL(let urlString):
-            audit("sandbox.act", Self.sandboxActionAuditDescriptor(.openURL(urlString)))
-            await sandbox.navigate(to: urlString)
-            try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
+            let result = await actuator.execute(.openURL(urlString))
+            audit("sandbox.act", result.auditDetail)
         }
+    }
+
+    nonisolated static func parseKeyCombo(_ combo: String) -> (key: String, modifiers: [String]) {
+        let parts = combo
+            .split(separator: "+")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let key = parts.last else { return (combo, []) }
+        return (key, Array(parts.dropLast()))
     }
 
     nonisolated static func sandboxTopLeftPoint(x: Double, y: Double) -> (x: Int, y: Int)? {

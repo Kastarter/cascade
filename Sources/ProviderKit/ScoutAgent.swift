@@ -288,12 +288,12 @@ public final class ScoutAgent {
         // miss/log the runner reads is deterministic. (Capture isolated locals; the
         // task closures can't touch actor state.)
         let g = grounder, dw = displayW, dh = displayH
-        var groundResults: [(idx: Int, target: String, point: CGPoint?)] = []
-        await withTaskGroup(of: (Int, String, CGPoint?).self) { group in
+        var groundResults: [(idx: Int, target: String, result: GroundingResult)] = []
+        await withTaskGroup(of: (Int, String, GroundingResult).self) { group in
             for (i, a) in batch.enumerated() {
                 guard let target = Self.groundTarget(of: a) else { continue }
                 group.addTask {
-                    (i, target, await g.ground(screenshot: screenshot, target: target, displayWidthPoints: dw, displayHeightPoints: dh))
+                    (i, target, await g.groundResult(screenshot: screenshot, target: target, displayWidthPoints: dw, displayHeightPoints: dh))
                 }
             }
             for await r in group { groundResults.append(r) }
@@ -301,9 +301,12 @@ public final class ScoutAgent {
         var grounded: [Int: CGPoint] = [:]
         var logs: [String] = []
         for r in groundResults.sorted(by: { $0.idx < $1.idx }) {
-            if let p = r.point, let safePoint = Self.safeGroundedPoint(p, displayWidth: dw, displayHeight: dh) {
+            if let candidate = r.result.selectedCandidate,
+               let p = candidate.point,
+               let safePoint = Self.safeGroundedPoint(p, displayWidth: dw, displayHeight: dh) {
                 grounded[r.idx] = safePoint
-                logs.append("hit \"\(r.target)\" @ (\(Int(safePoint.x)),\(Int(safePoint.y)))")
+                let reason = candidate.reason.map { " reason=\(Self.safeLogToken($0))" } ?? ""
+                logs.append("hit \"\(r.target)\" source=\(candidate.source.rawValue) confidence=\(String(format: "%.2f", candidate.confidence)) @(\(Int(safePoint.x)),\(Int(safePoint.y)))\(reason)")
             } else {
                 if lastGroundMiss == nil { lastGroundMiss = r.target }
                 logs.append("miss \"\(r.target)\"")
@@ -327,6 +330,14 @@ public final class ScoutAgent {
             return CUStep(actions: [], text: spoken.isEmpty && sawDone ? "Done." : spoken, done: sawDone)
         }
         return CUStep(actions: cuActions, text: spoken, done: false)
+    }
+
+    private nonisolated static func safeLogToken(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .prefix(48)
+            .description
     }
 
     /// Resolves one in-process tool call to a text result. use_skill goes through

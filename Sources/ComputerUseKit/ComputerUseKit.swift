@@ -99,6 +99,47 @@ public struct UseDeviceHotkey: Equatable, Sendable {
     }
 }
 
+public struct ComputerUseActionResult: Equatable, Sendable {
+    public enum Status: String, Equatable, Sendable {
+        case ok
+        case failed
+        case refused
+        case invalid
+    }
+
+    public let status: Status
+    public let actionKind: String
+    public let coordinateValid: Bool
+    public let failureKind: AgentFailureKind?
+    public let safeAuditAttributes: [String: String]
+
+    public init(
+        status: Status,
+        actionKind: String,
+        coordinateValid: Bool = true,
+        failureKind: AgentFailureKind? = nil,
+        safeAuditAttributes: [String: String] = [:]
+    ) {
+        self.status = status
+        self.actionKind = actionKind
+        self.coordinateValid = coordinateValid
+        self.failureKind = failureKind
+        self.safeAuditAttributes = safeAuditAttributes
+    }
+
+    public var auditDetail: String {
+        var attributes = safeAuditAttributes
+        attributes["kind"] = actionKind
+        attributes["status"] = status.rawValue
+        attributes["coordinateValid"] = coordinateValid ? "true" : "false"
+        if let failureKind { attributes["failureKind"] = failureKind.rawValue }
+        return attributes
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+    }
+}
+
 @MainActor
 public final class UseDeviceHotkeyMonitor: ObservableObject {
     public let pressed = PassthroughSubject<Void, Never>()
@@ -167,7 +208,32 @@ public final class UseDeviceHotkeyMonitor: ObservableObject {
 
 public protocol ComputerUseActuator: Sendable {
     func health() async -> ComputerUseHealth
+    func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult
     func perform(_ action: ComputerUseAction) async throws
+}
+
+public extension ComputerUseActuator {
+    func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult {
+        let base = ComputerUseActionResult(
+            status: action.coordinateValid ? .ok : .invalid,
+            actionKind: action.normalizedKind,
+            coordinateValid: action.coordinateValid,
+            safeAuditAttributes: action.safeAuditAttributes
+        )
+        guard action.coordinateValid else { return base }
+        do {
+            try await perform(action)
+            return base
+        } catch ComputerUseError.stopped {
+            return action.result(status: .refused, failureKind: .userStop)
+        } catch ComputerUseError.secureInput {
+            return action.result(status: .refused, failureKind: .secureInput)
+        } catch ComputerUseError.notReady {
+            return action.result(status: .failed, failureKind: .permissionDenied)
+        } catch {
+            return action.result(status: .failed, failureKind: .toolError)
+        }
+    }
 }
 
 public enum ComputerUseError: Error, LocalizedError {
@@ -183,6 +249,93 @@ public enum ComputerUseError: Error, LocalizedError {
         case .secureInput(let message): message
         case .stopped: "Stopped by the user before the action ran."
         }
+    }
+}
+
+public extension ComputerUseAction {
+    var normalizedKind: String {
+        switch self {
+        case .move: "move"
+        case .click: "click"
+        case .doubleClick: "doubleClick"
+        case .tripleClick: "tripleClick"
+        case .rightClick: "rightClick"
+        case .drag: "drag"
+        case .key: "key"
+        case .typeText: "typeText"
+        case .scroll: "scroll"
+        case .openURL: "openURL"
+        }
+    }
+
+    var coordinateValid: Bool {
+        switch self {
+        case .move(let x, let y),
+             .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            return x.isFinite && y.isFinite
+        case .drag(let fromX, let fromY, let toX, let toY):
+            return fromX.isFinite && fromY.isFinite && toX.isFinite && toY.isFinite
+        case .scroll(let deltaX, let deltaY):
+            return deltaX.isFinite && deltaY.isFinite
+        case .key, .typeText, .openURL:
+            return true
+        }
+    }
+
+    var safeAuditAttributes: [String: String] {
+        switch self {
+        case .move(let x, let y),
+             .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            return ["x": Self.coordinate(x), "y": Self.coordinate(y)]
+        case .drag(let fromX, let fromY, let toX, let toY):
+            return [
+                "fromX": Self.coordinate(fromX),
+                "fromY": Self.coordinate(fromY),
+                "toX": Self.coordinate(toX),
+                "toY": Self.coordinate(toY)
+            ]
+        case .key(let key, let modifiers):
+            return [
+                "key": AuditIdentity.safeToken(key),
+                "modifiers": modifiers.map(AuditIdentity.safeToken).joined(separator: "+")
+            ]
+        case .typeText(let text):
+            return [
+                "textChars": "\(text.count)",
+                "textHash": AuditIdentity.hash(text)
+            ]
+        case .scroll(let deltaX, let deltaY):
+            return ["deltaX": Self.coordinate(deltaX), "deltaY": Self.coordinate(deltaY)]
+        case .openURL(let url):
+            return [
+                "urlChars": "\(url.count)",
+                "urlHash": AuditIdentity.hash(url)
+            ]
+        }
+    }
+
+    func result(
+        status: ComputerUseActionResult.Status = .ok,
+        failureKind: AgentFailureKind? = nil,
+        extra: [String: String] = [:]
+    ) -> ComputerUseActionResult {
+        ComputerUseActionResult(
+            status: status,
+            actionKind: normalizedKind,
+            coordinateValid: coordinateValid,
+            failureKind: failureKind,
+            safeAuditAttributes: safeAuditAttributes.merging(extra) { _, new in new }
+        )
+    }
+
+    private static func coordinate(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.1f", value) : "invalid"
     }
 }
 

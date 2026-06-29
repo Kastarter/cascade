@@ -235,6 +235,114 @@ public struct AgentExperienceQuery: Sendable {
     }
 }
 
+public enum AgentFailureMemoryValidationError: Error, Equatable, LocalizedError, Sendable {
+    case blankApp
+    case blankGoalTokens
+    case blankRepairHint
+
+    public var errorDescription: String? {
+        switch self {
+        case .blankApp:
+            "Agent failure memory app cannot be blank."
+        case .blankGoalTokens:
+            "Agent failure memory requires at least one normalized goal token."
+        case .blankRepairHint:
+            "Agent failure memory requires a repair hint."
+        }
+    }
+}
+
+public struct AgentFailureMemory: Identifiable, Codable, Equatable, Sendable {
+    public let id: Int64
+    public let createdAt: Date
+    public let appName: String
+    public let normalizedGoalTokens: [String]
+    public let failureKind: AgentFailureKind
+    public let firstBadAction: String?
+    public let screenSignatureHash: String?
+    public let targetHash: String?
+    public let repairHint: String
+    public let recoveryEvidenceHash: String?
+    public let retainedScore: Double
+
+    public init(
+        id: Int64 = 0,
+        createdAt: Date = Date(),
+        appName: String,
+        normalizedGoalTokens: [String],
+        failureKind: AgentFailureKind,
+        firstBadAction: String? = nil,
+        screenSignatureHash: String? = nil,
+        targetHash: String? = nil,
+        repairHint: String,
+        recoveryEvidenceHash: String? = nil,
+        retainedScore: Double? = nil
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.appName = appName
+        self.normalizedGoalTokens = normalizedGoalTokens
+        self.failureKind = failureKind
+        self.firstBadAction = firstBadAction
+        self.screenSignatureHash = screenSignatureHash
+        self.targetHash = targetHash
+        self.repairHint = repairHint
+        self.recoveryEvidenceHash = recoveryEvidenceHash
+        self.retainedScore = retainedScore ?? Self.defaultRetainedScore(for: failureKind)
+    }
+
+    public func validatedForStorage() throws -> AgentFailureMemory {
+        let app = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !app.isEmpty else { throw AgentFailureMemoryValidationError.blankApp }
+        let tokens = normalizedGoalTokens
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty && !PrivacyRules.isSensitiveText($0) }
+        guard !tokens.isEmpty else { throw AgentFailureMemoryValidationError.blankGoalTokens }
+        let hint = repairHint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hint.isEmpty else { throw AgentFailureMemoryValidationError.blankRepairHint }
+        return AgentFailureMemory(
+            id: id,
+            createdAt: createdAt,
+            appName: app,
+            normalizedGoalTokens: Array(Set(tokens)).sorted(),
+            failureKind: failureKind,
+            firstBadAction: Self.safeOptional(firstBadAction),
+            screenSignatureHash: Self.safeOptional(screenSignatureHash),
+            targetHash: Self.safeOptional(targetHash),
+            repairHint: String(hint.prefix(180)),
+            recoveryEvidenceHash: Self.safeOptional(recoveryEvidenceHash),
+            retainedScore: retainedScore
+        )
+    }
+
+    private static func defaultRetainedScore(for failureKind: AgentFailureKind) -> Double {
+        AgentExperienceRetainedScorer.score(
+            outcome: .failure,
+            verificationSignal: nil,
+            failureKind: failureKind,
+            evidenceIDs: [],
+            actionCount: 1,
+            userFeedback: nil
+        )
+    }
+
+    private static func safeOptional(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(160))
+    }
+}
+
+public struct AgentFailureMemoryQuery: Sendable {
+    public var appName: String?
+    public var failureKind: AgentFailureKind?
+
+    public init(appName: String? = nil, failureKind: AgentFailureKind? = nil) {
+        self.appName = appName
+        self.failureKind = failureKind
+    }
+}
+
 public extension CascadeStore {
     @discardableResult
     func recordAgentExperience(_ experience: AgentExperienceCase) throws -> AgentExperienceCase {
@@ -362,9 +470,85 @@ public extension CascadeStore {
         }
     }
 
+    @discardableResult
+    func recordAgentFailureMemory(_ memory: AgentFailureMemory) throws -> AgentFailureMemory {
+        let valid = try memory.validatedForStorage()
+        let tokensJSON = Self.encodeGoalTokens(valid.normalizedGoalTokens)
+        try withStatement("""
+        INSERT INTO agent_failure_memory
+            (created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, repair_hint, recovery_evidence_hash, retained_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """) { statement in
+            ledgerBind(AgentExperienceDateCodec.string(from: valid.createdAt), at: 1, in: statement)
+            ledgerBind(valid.appName, at: 2, in: statement)
+            ledgerBind(tokensJSON, at: 3, in: statement)
+            ledgerBind(valid.failureKind.rawValue, at: 4, in: statement)
+            ledgerBind(valid.firstBadAction, at: 5, in: statement)
+            ledgerBind(valid.screenSignatureHash, at: 6, in: statement)
+            ledgerBind(valid.targetHash, at: 7, in: statement)
+            ledgerBind(valid.repairHint, at: 8, in: statement)
+            ledgerBind(valid.recoveryEvidenceHash, at: 9, in: statement)
+            sqlite3_bind_double(statement, 10, valid.retainedScore)
+            try stepDone(statement)
+        }
+        let id = try withStatement("SELECT last_insert_rowid();") { statement in
+            sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : Int64(0)
+        }
+        return AgentFailureMemory(
+            id: id,
+            createdAt: valid.createdAt,
+            appName: valid.appName,
+            normalizedGoalTokens: valid.normalizedGoalTokens,
+            failureKind: valid.failureKind,
+            firstBadAction: valid.firstBadAction,
+            screenSignatureHash: valid.screenSignatureHash,
+            targetHash: valid.targetHash,
+            repairHint: valid.repairHint,
+            recoveryEvidenceHash: valid.recoveryEvidenceHash,
+            retainedScore: valid.retainedScore
+        )
+    }
+
+    func agentFailureMemories(matching query: AgentFailureMemoryQuery = AgentFailureMemoryQuery(), limit: Int = 100) throws -> [AgentFailureMemory] {
+        var conditions: [String] = []
+        var values: [String] = []
+        if let appName = normalizedQueryValue(query.appName) {
+            conditions.append("app_name = ?")
+            values.append(appName)
+        }
+        if let failureKind = query.failureKind {
+            conditions.append("failure_kind = ?")
+            values.append(failureKind.rawValue)
+        }
+        let whereClause = conditions.isEmpty ? "" : "WHERE \(conditions.joined(separator: " AND "))"
+        return try withStatement("""
+        \(Self.agentFailureMemoryColumns)
+        FROM agent_failure_memory
+        \(whereClause)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?;
+        """) { statement in
+            for (index, value) in values.enumerated() {
+                ledgerBind(value, at: Int32(index + 1), in: statement)
+            }
+            sqlite3_bind_int(statement, Int32(values.count + 1), Int32(max(0, limit)))
+            var rows: [AgentFailureMemory] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(Self.decodeAgentFailureMemory(statement))
+            }
+            return rows
+        }
+    }
+
     private static var agentExperienceColumns: String {
         """
         SELECT id, created_at, app_name, goal_pattern, recipe_signature, skill_slug, outcome, verification_signal, failure_kind, evidence_ids_json, action_count, retained_score, user_feedback
+        """
+    }
+
+    private static var agentFailureMemoryColumns: String {
+        """
+        SELECT id, created_at, app_name, goal_tokens_json, failure_kind, first_bad_action, screen_signature_hash, target_hash, repair_hint, recovery_evidence_hash, retained_score
         """
     }
 
@@ -387,6 +571,22 @@ public extension CascadeStore {
         )
     }
 
+    private static func decodeAgentFailureMemory(_ statement: OpaquePointer) -> AgentFailureMemory {
+        AgentFailureMemory(
+            id: sqlite3_column_int64(statement, 0),
+            createdAt: AgentExperienceDateCodec.date(from: ledgerText(statement, 1)) ?? Date(),
+            appName: ledgerText(statement, 2) ?? "Unknown",
+            normalizedGoalTokens: decodeGoalTokens(ledgerText(statement, 3)),
+            failureKind: ledgerText(statement, 4).flatMap(AgentFailureKind.init(rawValue:)) ?? .unknown,
+            firstBadAction: ledgerText(statement, 5),
+            screenSignatureHash: ledgerText(statement, 6),
+            targetHash: ledgerText(statement, 7),
+            repairHint: ledgerText(statement, 8) ?? "",
+            recoveryEvidenceHash: ledgerText(statement, 9),
+            retainedScore: sqlite3_column_double(statement, 10)
+        )
+    }
+
     private static func encodeEvidenceIDs(_ ids: [Int64]) -> String {
         guard let data = try? JSONEncoder().encode(ids),
               let json = String(data: data, encoding: .utf8) else {
@@ -401,6 +601,22 @@ public extension CascadeStore {
             return []
         }
         return ids
+    }
+
+    private static func encodeGoalTokens(_ tokens: [String]) -> String {
+        guard let data = try? JSONEncoder().encode(tokens),
+              let json = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return json
+    }
+
+    private static func decodeGoalTokens(_ json: String?) -> [String] {
+        guard let json, let data = json.data(using: .utf8),
+              let tokens = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return tokens
     }
 
     private func normalizedQueryValue(_ value: String?) -> String? {

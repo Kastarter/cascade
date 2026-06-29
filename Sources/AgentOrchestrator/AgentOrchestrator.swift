@@ -102,11 +102,14 @@ public actor LocalMacDriver: AgentDriver {
     public func act(_ action: AgentAction) async throws {
         switch action {
         case .computerUse(let computerUseAction):
-            try await actuator.perform(computerUseAction)
+            let result = await actuator.execute(computerUseAction)
+            if result.status != .ok {
+                throw ComputerUseError.unsupported(result.failureKind?.rawValue ?? result.status.rawValue)
+            }
             _ = try await store.appendAudit(AuditEvent(
                 actor: "agent",
                 action: "computer.act",
-                detail: Self.computerActionAuditDetail(computerUseAction)
+                detail: result.auditDetail
             ))
         case .writeLocalArtifact(let title, let body):
             let url = try Self.writeArtifact(title: title, body: body)

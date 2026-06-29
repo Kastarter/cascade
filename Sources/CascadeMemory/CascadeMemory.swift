@@ -1863,6 +1863,22 @@ public actor CascadeStore {
             ON agent_experience_case(failure_kind);
         CREATE INDEX IF NOT EXISTS idx_agent_experience_case_recipe
             ON agent_experience_case(recipe_signature);
+
+        CREATE TABLE IF NOT EXISTS agent_failure_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            app_name TEXT NOT NULL,
+            goal_tokens_json TEXT NOT NULL,
+            failure_kind TEXT NOT NULL,
+            first_bad_action TEXT,
+            screen_signature_hash TEXT,
+            target_hash TEXT,
+            repair_hint TEXT NOT NULL,
+            recovery_evidence_hash TEXT,
+            retained_score REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_failure_memory_app_failure
+            ON agent_failure_memory(app_name, failure_kind, created_at DESC);
         """, db: db)
 
         // Native work graph storage. Entities and evidence links are separate so

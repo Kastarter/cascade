@@ -527,6 +527,21 @@ public enum AgentTraceBuilder {
             } else if event.action == "sandbox.verify" {
                 self.kind = .eval
                 self.name = "sandbox.verify"
+            } else if event.action.hasPrefix("assist.verify.") {
+                self.kind = .eval
+                self.name = event.action
+            } else if event.action == "assist.validate" {
+                self.kind = .eval
+                self.name = "assist.validate"
+            } else if event.action == "assist.capture" {
+                self.kind = .model
+                self.name = "assist.capture"
+            } else if event.action == "assist.noeffect" || event.action == "assist.stalled" {
+                self.kind = .eval
+                self.name = event.action
+            } else if event.action == "computer.act" || event.action == "computer.zoom" {
+                self.kind = .step
+                self.name = event.action
             } else if event.action == "recipe.step" {
                 self.kind = .step
                 self.name = "recipe.step"
@@ -542,9 +557,18 @@ public enum AgentTraceBuilder {
             } else if event.action == "agent.recall" {
                 self.kind = .retrieval
                 self.name = "agent.recall"
-            } else if event.action == "agent.ground" {
+            } else if event.action == "agent.ground" || event.action == "agent.ground.miss" {
                 self.kind = .retrieval
-                self.name = "agent.ground"
+                self.name = event.action
+            } else if event.action == "agent.trajectory_sketch" || event.action.hasPrefix("agent.failure_memory.") {
+                self.kind = .retrieval
+                self.name = event.action
+            } else if event.action == "grounding.verifier" {
+                self.kind = .eval
+                self.name = "grounding.verifier"
+            } else if event.action == "scout.ocr.marks" {
+                self.kind = .retrieval
+                self.name = "scout.ocr.marks"
             } else if event.action == "assist.timing" {
                 self.kind = .model
                 self.name = "assist.timing"
@@ -601,6 +625,17 @@ public enum AgentTraceBuilder {
         }
 
         private static func failureKind(for event: AuditEvent) -> AgentFailureKind? {
+            if event.action == "assist.verify.unavailable" {
+                return .verificationUnavailable
+            }
+            if event.action == "assist.verify.action", auditValue("status", in: event.detail) == "failed" {
+                return cascadeFailureKind(auditValue("failureKind", in: event.detail)) ?? .validatorIncomplete
+            }
+            if event.action == "grounding.verifier",
+               let failure = auditValue("failure", in: event.detail),
+               failure != "none" {
+                return cascadeFailureKind(failure) ?? .groundingMiss
+            }
             if event.action == "sandbox.verify", auditValue("status", in: event.detail) == "incomplete" {
                 return .validatorIncomplete
             }
@@ -615,6 +650,47 @@ public enum AgentTraceBuilder {
                 }
             }
             return AgentFailureKind(auditAction: event.action, detail: event.detail)
+        }
+
+        private static func cascadeFailureKind(_ raw: String?) -> AgentFailureKind? {
+            switch raw {
+            case "wrong_start_state":
+                return .wrongStartState
+            case "verifier_rejected":
+                return .validatorIncomplete
+            case "timeout":
+                return .timeout
+            case "tool_error":
+                return .transportFailure
+            case "target_not_found":
+                return .targetNotFound
+            case "grounding_miss":
+                return .groundingMiss
+            case "permission_denied":
+                return .permissionMissing
+            case "secure_input":
+                return .secureInput
+            case "login_required", "modal_blocked":
+                return .unexpectedModal
+            case "no_effect":
+                return .noEffect
+            case "stale_frame_batch":
+                return .staleFrameBatch
+            case "verification_unavailable":
+                return .verificationUnavailable
+            case "unsafe_action":
+                return .unsafeActionRefused
+            case "parameter_needs_live_value":
+                return .parameterNeedsLiveValue
+            case "step_limit":
+                return .stepLimit
+            case "user_stop":
+                return .userStop
+            case "artifact_wrong_lane":
+                return .artifactWrongLane
+            default:
+                return nil
+            }
         }
 
         private static func auditValue(_ key: String, in detail: String) -> String? {

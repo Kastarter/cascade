@@ -1,4 +1,6 @@
 import AppKit
+import ComputerUseKit
+import MacContextKit
 import WebKit
 
 enum SandboxCoordinate {
@@ -487,6 +489,85 @@ public final class WebSandbox: NSObject {
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "")
         return "'\(escaped)'"
+    }
+}
+
+@MainActor
+public final class WebSandboxComputerUseActuator: ComputerUseActuator, @unchecked Sendable {
+    private let sandbox: WebSandbox
+
+    public init(sandbox: WebSandbox) {
+        self.sandbox = sandbox
+    }
+
+    public func health() async -> ComputerUseHealth {
+        ComputerUseHealth(
+            ready: true,
+            permissions: CapturePermissionStatus(screenRecording: true, accessibility: true, inputMonitoring: true),
+            message: "Web sandbox is ready."
+        )
+    }
+
+    public func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult {
+        guard Self.isValidForSandbox(action) else {
+            return action.result(status: .invalid, failureKind: .targetNotFound, extra: ["surface": "webSandbox"])
+        }
+        do {
+            try await perform(action)
+            return action.result(extra: ["surface": "webSandbox"])
+        } catch ComputerUseError.stopped {
+            return action.result(status: .refused, failureKind: .userStop, extra: ["surface": "webSandbox"])
+        } catch {
+            return action.result(status: .failed, failureKind: .toolError, extra: ["surface": "webSandbox"])
+        }
+    }
+
+    public func perform(_ action: ComputerUseAction) async throws {
+        switch action {
+        case .move(let x, let y):
+            await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: CGFloat(y))
+        case .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: CGFloat(y))
+        case .drag(_, _, let toX, let toY):
+            await sandbox.click(xTopLeft: CGFloat(toX), yTopLeft: CGFloat(toY))
+        case .key(let key, let modifiers):
+            await sandbox.pressKey(Self.combo(key: key, modifiers: modifiers))
+        case .typeText(let text):
+            await sandbox.typeText(text)
+        case .scroll(_, let deltaY):
+            await sandbox.scroll(dy: CGFloat(deltaY))
+        case .openURL(let url):
+            await sandbox.navigate(to: url)
+            try? await Task.sleep(for: .milliseconds(800))
+        }
+    }
+
+    private nonisolated static func isValidForSandbox(_ action: ComputerUseAction) -> Bool {
+        guard action.coordinateValid else { return false }
+        switch action {
+        case .move(let x, let y),
+             .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            return SandboxCoordinate.pagePoint(x: CGFloat(x), y: CGFloat(y)) != nil
+        case .drag(_, _, let toX, let toY):
+            return SandboxCoordinate.pagePoint(x: CGFloat(toX), y: CGFloat(toY)) != nil
+        case .scroll(_, let deltaY):
+            return SandboxCoordinate.scrollDelta(CGFloat(deltaY)) != nil
+        case .key, .typeText, .openURL:
+            return true
+        }
+    }
+
+    private nonisolated static func combo(key: String, modifiers: [String]) -> String {
+        let prefix = modifiers.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "+")
+        return prefix.isEmpty ? key : "\(prefix)+\(key)"
     }
 }
 

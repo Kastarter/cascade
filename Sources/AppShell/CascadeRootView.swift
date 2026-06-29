@@ -1417,7 +1417,19 @@ private struct CascadesScreen: View {
     @ObservedObject var model: CascadeAppModel
 
     private var agentActivity: [AuditEvent] {
-        model.audit.filter { $0.action.hasPrefix("step.") || $0.action.hasPrefix("agent.") || $0.action == "computer.act" }
+        model.audit.filter(Self.isAgentActivity)
+    }
+
+    private static func isAgentActivity(_ event: AuditEvent) -> Bool {
+        let action = event.action
+        if action.hasPrefix("step.") || action.hasPrefix("agent.") || action.hasPrefix("assist.")
+            || action.hasPrefix("sandbox.") || action.hasPrefix("harness.") {
+            return true
+        }
+        return action == "computer.act"
+            || action == "computer.zoom"
+            || action == "grounding.verifier"
+            || action == "scout.ocr.marks"
     }
 
     /// Newly approved agent to flash + scroll to, so an approve never feels
@@ -2167,12 +2179,31 @@ private struct AgentActivityRow: View {
     let event: AuditEvent
 
     var body: some View {
+        let item = AgentActivityItem(event: event)
         HStack(spacing: CascadeMetrics.s3) {
-            Circle().fill(Color.cascadeAgent).frame(width: 7, height: 7)
-            Text(event.action.replacingOccurrences(of: ".", with: " ").uppercased())
-                .font(.cascadeMono(10, .semibold)).foregroundStyle(Color.cascadeText3)
-                .frame(width: 130, alignment: .leading)
-            Text(event.detail).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText).lineLimit(1)
+            Image(systemName: item.icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(item.tint)
+                .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: CascadeMetrics.s2) {
+                    Text(item.title.uppercased())
+                        .font(.cascadeMono(10, .semibold))
+                        .foregroundStyle(Color.cascadeText3)
+                    if let status = item.status {
+                        Text(status.uppercased())
+                            .font(.cascadeMono(9, .semibold))
+                            .foregroundStyle(item.tint)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(item.tint.opacity(0.12), in: Capsule())
+                    }
+                }
+                Text(item.detail)
+                    .font(.cascadeSans(13))
+                    .foregroundStyle(Color.cascadeText)
+                    .lineLimit(1)
+            }
             Spacer()
             Text(event.createdAt, style: .time).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
         }
@@ -2180,6 +2211,148 @@ private struct AgentActivityRow: View {
         .padding(.vertical, CascadeMetrics.s3)
         .background(Color.cascadePanel, in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
+}
+
+private struct AgentActivityItem {
+    let title: String
+    let detail: String
+    let icon: String
+    let tint: Color
+    let status: String?
+
+    init(event: AuditEvent) {
+        let action = event.action
+        let status = Self.value("status", in: event.detail) ?? Self.value("outcome", in: event.detail) ?? Self.value("verdict", in: event.detail)
+        self.status = status
+        switch action {
+        case "assist.timing", "sandbox.turn":
+            title = "Model turn"
+            detail = Self.modelDetail(action: action, detail: event.detail)
+            icon = "brain.head.profile"
+            tint = Color.cascadeAgent
+        case "assist.capture":
+            title = "Budget"
+            detail = Self.counts(event.detail, keys: ["imageTurns", "prunedImages", "inputTokens", "outputTokens"])
+            icon = "camera.metering.matrix"
+            tint = Color.cascadeAccent
+        case "agent.ground", "grounding.verifier":
+            title = "Grounding"
+            detail = Self.groundingDetail(event.detail)
+            icon = "scope"
+            tint = Color.cascadeAccent
+        case "agent.ground.miss":
+            title = "Grounding miss"
+            detail = Self.counts(event.detail, keys: ["turn", "controlCount", "missedTargetHash", "labelsHash"])
+            icon = "scope.badge.questionmark"
+            tint = Color.cascadeRecText
+        case "scout.ocr.marks":
+            title = "OCR marks"
+            detail = Self.counts(event.detail, keys: ["turn", "controlCount", "ocrLineCount", "ocrMarksHash"])
+            icon = "text.viewfinder"
+            tint = Color.cascadeAccentWarm
+        case "assist.verify.action", "assist.verify.unavailable", "assist.validate", "sandbox.verify":
+            title = "Verifier"
+            detail = Self.verifierDetail(event.detail)
+            icon = "checkmark.seal"
+            tint = status == "failed" || status == "incomplete" ? Color.cascadeRecText : Color.cascadeAccent
+        case "assist.noeffect", "assist.stalled", "sandbox.noeffect", "sandbox.stalled":
+            title = action.contains("noeffect") ? "No effect" : "Stall guard"
+            detail = Self.counts(event.detail, keys: ["turn", "noEffectStreak", "controlCount", "textHash"])
+            icon = "exclamationmark.triangle"
+            tint = Color.cascadeRecText
+        case "agent.action.refused", "sandbox.stopped":
+            title = action == "sandbox.stopped" ? "Stopped" : "Refusal"
+            detail = Self.safeSummary(for: action, detail: event.detail)
+            icon = "hand.raised"
+            tint = Color.cascadeRecText
+        case "agent.trajectory_sketch":
+            title = "Replay sketch"
+            detail = Self.counts(event.detail, keys: ["score", "sketchHash", "actionCount", "checkCount"])
+            icon = "point.topleft.down.curvedto.point.bottomright.up"
+            tint = Color.cascadeAgent
+        case "agent.failure_memory.used", "agent.failure_memory.saved":
+            title = action.hasSuffix(".used") ? "Failure memory" : "Saved reflection"
+            detail = Self.counts(event.detail, keys: ["count", "ids", "failureKinds", "memoryHash", "targetHash"])
+            icon = "arrow.counterclockwise.circle"
+            tint = Color.cascadeAccentWarm
+        case "agent.run.completed", "sandbox.done", "sandbox.task":
+            title = "Completion"
+            detail = Self.safeSummary(for: action, detail: event.detail)
+            icon = "checkmark.circle"
+            tint = Color.cascadeAccent
+        case "computer.act", "computer.zoom", "sandbox.act":
+            title = action == "computer.zoom" ? "Zoom" : "Tool action"
+            detail = Self.actionDetail(event.detail)
+            icon = "cursorarrow.click"
+            tint = Color.cascadeAgent
+        default:
+            if action.hasPrefix("harness.") || action == "sandbox.harness" {
+                title = "Harness"
+                detail = Self.safeSummary(for: action, detail: event.detail)
+                icon = "terminal"
+                tint = Color.cascadeAccent
+            } else if action.hasPrefix("step.") || action == "recipe.step" {
+                title = "Step"
+                detail = Self.safeSummary(for: action, detail: event.detail)
+                icon = "list.bullet.rectangle"
+                tint = Color.cascadeAgent
+            } else {
+                title = action.replacingOccurrences(of: ".", with: " ")
+                detail = Self.safeSummary(for: action, detail: event.detail)
+                icon = "circle.grid.cross"
+                tint = Color.cascadeText3
+            }
+        }
+    }
+
+    private static func modelDetail(action: String, detail: String) -> String {
+        if action == "assist.timing" {
+            return counts(detail, keys: ["total", "model", "actions", "turns", "effort"])
+        }
+        return safeSummary(for: action, detail: detail)
+    }
+
+    private static func groundingDetail(_ detail: String) -> String {
+        let fields = ["source", "confidence", "failure", "candidates", "groundHash", "targetHash"]
+        return counts(detail, keys: fields)
+    }
+
+    private static func verifierDetail(_ detail: String) -> String {
+        counts(detail, keys: ["status", "actionKind", "failureKind", "verdict", "outcome", "confidence", "targetHash"])
+    }
+
+    private static func actionDetail(_ detail: String) -> String {
+        counts(detail, keys: ["status", "actionKind", "kind", "coordinateValid", "failureKind", "surface", "region"])
+    }
+
+    private static func safeSummary(for action: String, detail: String) -> String {
+        let keyed = counts(detail, keys: ["status", "outcome", "failureKind", "agentID", "tool", "actionKind", "textHash", "taskHash", "labelHash"])
+        if keyed != "event recorded" { return keyed }
+        return action.replacingOccurrences(of: ".", with: " ") + " recorded"
+    }
+
+    private static func counts(_ detail: String, keys: [String]) -> String {
+        let parts = keys.compactMap { key -> String? in
+            guard let value = value(key, in: detail) else { return nil }
+            return "\(key)=\(safeToken(value))"
+        }
+        return parts.isEmpty ? "event recorded" : parts.joined(separator: " · ")
+    }
+
+    private static func value(_ key: String, in detail: String) -> String? {
+        let prefix = "\(key)="
+        return detail
+            .split(separator: " ")
+            .first { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+    }
+
+    private static func safeToken(_ value: String) -> String {
+        let safe = value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-" || character == ","
+        }
+        return safe.isEmpty ? "redacted" : String(safe.prefix(36))
     }
 }
 
