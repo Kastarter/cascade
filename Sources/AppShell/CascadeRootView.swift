@@ -1758,7 +1758,9 @@ private struct WasteCard: View {
 }
 
 private struct ProactiveNextActionCard: View {
-    let prediction: NextActionPredictor.Prediction
+    let offer: ProactiveOffer
+    let onAccept: () -> Void
+    let onSnooze: () -> Void
     let onDismiss: () -> Void
 
     var body: some View {
@@ -1771,22 +1773,34 @@ private struct ProactiveNextActionCard: View {
                     .background(Color.cascadeAgent.opacity(0.12), in: Circle())
                 VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
                     HStack(alignment: .firstTextBaseline) {
-                        Text("Likely next action").font(.cascadeSans(15, .semibold))
-                        CascadeTag("PROACTIVE", tone: .cascadeAgent)
+                        Text(offer.title).font(.cascadeSans(15, .semibold))
+                        CascadeTag(levelText, tone: .cascadeAgent)
                         Spacer()
                     }
-                    Text("Cascade expects you may \(actionText).")
+                    Text(offer.detail)
                         .font(.cascadeSans(13))
                         .foregroundStyle(Color.cascadeText)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("Evidence: seen \(prediction.support)x after this recent sequence · \(confidenceText) confidence.")
+                    Text(evidenceText)
                         .font(.cascadeSans(12))
                         .foregroundStyle(Color.cascadeText3)
                         .fixedSize(horizontal: false, vertical: true)
-                    HStack {
+                    HStack(spacing: CascadeMetrics.s2) {
                         Spacer()
+                        if offer.level == .action, let actionTitle = offer.actionTitle {
+                            Button(action: onAccept) {
+                                Label(actionTitle, systemImage: "bolt.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Color.cascadeAgent)
+                        }
+                        Button(action: onSnooze) {
+                            Label("Later", systemImage: "clock")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.cascadeText3)
                         Button(action: onDismiss) {
-                            Label("Dismiss", systemImage: "xmark")
+                            Label("Not this", systemImage: "xmark")
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(Color.cascadeText3)
@@ -1796,52 +1810,19 @@ private struct ProactiveNextActionCard: View {
         }
     }
 
-    private var confidenceText: String {
-        "\(Int((prediction.confidence * 100).rounded()))%"
+    private var levelText: String {
+        switch offer.level {
+        case .auditOnly: "AUDIT"
+        case .ambient: "AMBIENT"
+        case .passive: "PROACTIVE"
+        case .action: "ACTION"
+        }
     }
 
-    private var actionText: String {
-        let parts = prediction.token.split(separator: "@", maxSplits: 1).map(String.init)
-        let action = parts.first ?? prediction.token
-        let appSuffix = parts.count > 1 ? " in \(parts[1])" : ""
-        if action.hasPrefix("click:") {
-            return "click \(cleanLabel(String(action.dropFirst("click:".count))))\(appSuffix)"
-        }
-        if action.hasPrefix("doubleClick:") {
-            return "double-click \(cleanLabel(String(action.dropFirst("doubleClick:".count))))\(appSuffix)"
-        }
-        if action.hasPrefix("rightClick:") {
-            return "right-click \(cleanLabel(String(action.dropFirst("rightClick:".count))))\(appSuffix)"
-        }
-        if action.hasPrefix("key:") {
-            return "press \(cleanKey(String(action.dropFirst("key:".count))))\(appSuffix)"
-        }
-        if action == "type" {
-            return "type\(appSuffix)"
-        }
-        if action == "scroll" {
-            return "scroll\(appSuffix)"
-        }
-        return "continue with \(action)\(appSuffix)"
-    }
-
-    private func cleanLabel(_ label: String) -> String {
-        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty || trimmed == "unlabeled" ? "the next control" : "\"\(trimmed)\""
-    }
-
-    private func cleanKey(_ key: String) -> String {
-        key.split(separator: "+")
-            .map { part in
-                switch part.lowercased() {
-                case "command": return "Command"
-                case "control": return "Control"
-                case "option": return "Option"
-                case "shift": return "Shift"
-                default: return String(part).capitalized
-                }
-            }
-            .joined(separator: " + ")
+    private var evidenceText: String {
+        let confidence = "\(Int((offer.confidence * 100).rounded()))%"
+        let evidence = offer.evidence.prefix(3).joined(separator: " · ")
+        return evidence.isEmpty ? "\(confidence) confidence." : "\(confidence) confidence · \(evidence)"
     }
 }
 
@@ -2071,13 +2052,13 @@ private struct ManagerScreen: View {
         }
     }
 
-	    /// The manager's review queue: the genuinely repeated, time-saving workflows
-    /// Cascade caught, each judged and named by the curator. Approve to land a ready
-    /// agent in the employee's Cascades; dismiss to never see it again.
-    private var reviewQueueSection: some View {
-        let hasProactiveOffer = model.proactiveNextActionOffer != nil
-        let pendingCount = model.pendingCuratedAgents.count + (hasProactiveOffer ? 1 : 0)
-        return VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+		    /// The manager's review queue: the genuinely repeated, time-saving workflows
+	    /// Cascade caught, each judged and named by the curator. Approve to land a ready
+	    /// agent in the employee's Cascades; dismiss to never see it again.
+	    private var reviewQueueSection: some View {
+	        let hasProactiveOffer = model.proactiveOffer != nil
+	        let pendingCount = model.pendingCuratedAgents.count + (hasProactiveOffer ? 1 : 0)
+	        return VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
             SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(pendingCount) pending")
             if let note = model.managerReviewNote {
                 HStack(spacing: CascadeMetrics.s2) {
@@ -2091,12 +2072,14 @@ private struct ManagerScreen: View {
                 .background(Color.cascadeAgent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .transition(.opacity)
             }
-            if let offer = model.proactiveNextActionOffer {
-                ProactiveNextActionCard(
-                    prediction: offer,
-                    onDismiss: { model.dismissProactiveNextActionOffer() }
-                )
-            }
+	            if let offer = model.proactiveOffer {
+	                ProactiveNextActionCard(
+	                    offer: offer,
+	                    onAccept: { model.acceptProactiveOffer() },
+	                    onSnooze: { model.snoozeProactiveOffer() },
+	                    onDismiss: { model.dismissProactiveNextActionOffer() }
+	                )
+	            }
             if model.pendingCuratedAgents.isEmpty && !hasProactiveOffer {
                 CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
             } else {

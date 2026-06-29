@@ -178,6 +178,25 @@ public struct AppSkill: Sendable {
         }
     }
 
+    /// Lightweight live-surfacing score: app match is necessary, then `useWhen`
+    /// overlap with the latest action labels can lift a generic per-app skill into a
+    /// just-in-time suggestion. Pure so AppShell can rank without loading markdown.
+    public func relevance(
+        appName: String?,
+        bundleIdentifier: String?,
+        actionLabels: [String]
+    ) -> Double {
+        guard matches(appName: appName, bundleIdentifier: bundleIdentifier) else { return 0 }
+        let normalizedUseWhen = Self.normalized(useWhen)
+        let useWords = Set(normalizedUseWhen.split(separator: " ").filter { $0.count >= 4 })
+        guard !useWords.isEmpty else { return 0.62 }
+        let actionWords = Set(actionLabels.flatMap {
+            Self.normalized($0).split(separator: " ").filter { $0.count >= 4 }
+        })
+        let overlap = !useWords.isDisjoint(with: actionWords)
+        return overlap ? 0.78 : 0.62
+    }
+
     /// True when an input policy says this text must be delivered as physical
     /// key events (Blender-style modal numeric input that ignores AX insertion
     /// and clipboard paste).

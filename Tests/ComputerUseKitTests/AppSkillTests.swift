@@ -190,6 +190,17 @@ struct AppSkillTests {
         #expect(!skill.matches(appName: nil, bundleIdentifier: nil))
     }
 
+    @Test func relevanceCombinesAppMatchAndActionShape() throws {
+        let skill = try #require(parsed(blenderFixture.replacingOccurrences(
+            of: "description: Drives Blender's modal keyboard workflows.",
+            with: "description: Drives Blender modal keyboard workflows for numeric input."
+        )))
+
+        #expect(skill.relevance(appName: "Blender", bundleIdentifier: nil, actionLabels: ["press numeric input"]) > 0.7)
+        #expect(skill.relevance(appName: "Blender", bundleIdentifier: nil, actionLabels: ["click toolbar"]) >= 0.6)
+        #expect(skill.relevance(appName: "Safari", bundleIdentifier: nil, actionLabels: ["press numeric input"]) == 0)
+    }
+
     @Test func numericModalTextUsesPhysicalKeys() throws {
         let skill = try #require(parsed(blenderFixture))
         #expect(skill.shouldTypePhysicalKeys("3"))
