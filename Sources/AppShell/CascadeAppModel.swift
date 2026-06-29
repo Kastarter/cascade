@@ -370,6 +370,7 @@ public final class CascadeAppModel: ObservableObject {
     private let experimentalStructuredContent: Bool
     private let experimentalWorkGraphIndex: Bool
     private let visualGrounderOverride: (any VisualGrounder)?
+    private let localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -378,7 +379,8 @@ public final class CascadeAppModel: ObservableObject {
         startsSubsystems: Bool = true,
         appSkills initialAppSkills: AppSkillRegistry? = nil,
         learnedSkillDirectory: URL? = nil,
-        visualGrounderOverride: (any VisualGrounder)? = nil
+        visualGrounderOverride: (any VisualGrounder)? = nil,
+        localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
@@ -387,6 +389,7 @@ public final class CascadeAppModel: ObservableObject {
         self.experimentalStructuredContent = Self.experimentalStructuredContentEnabled(defaults: defaults)
         self.experimentalWorkGraphIndex = Self.experimentalWorkGraphIndexEnabled(defaults: defaults)
         self.visualGrounderOverride = visualGrounderOverride
+        self.localRegionNarrowerOverride = localRegionNarrowerOverride
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
@@ -2101,16 +2104,23 @@ public final class CascadeAppModel: ObservableObject {
         ) : base
     }
 
-    /// Region locator for the "where is X" highlight: the configured grounder
-    /// (UI-TARS — free/local) first, falling back to the proven Claude
-    /// ElementLocator on any miss (grounder off, unreachable, or not found). So the
-    /// highlight stops paying for Claude whenever UI-TARS is serving, and never
-    /// breaks when it isn't. See [[cascade-cu-downgrade-research]].
-    private func locateRegionGrounded(
+    /// Region locator for the "where is X" highlight: deterministic local AX/OCR
+    /// narrowing first, then the configured grounder, then the proven Claude
+    /// ElementLocator on any miss. This keeps common visible-text targets on-device
+    /// even when no visual grounder is configured.
+    func locateRegionGrounded(
         screenshot: Data, question: String,
         displayWidthPoints: Int, displayHeightPoints: Int,
         conversation: [(user: String, assistant: String)]
     ) async -> ElementRegion {
+        if let localRegion = await localRegionNarrowed(
+            screenshot: screenshot,
+            question: question,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ) {
+            return localRegion
+        }
         if let grounder = assistGrounder(),
            let region = await grounder.groundRegion(
                screenshot: screenshot, target: question,
@@ -2122,6 +2132,39 @@ public final class CascadeAppModel: ObservableObject {
             screenshot: screenshot, question: question,
             displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints,
             conversation: conversation
+        )
+    }
+
+    private func localRegionNarrowed(
+        screenshot: Data,
+        question: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> ElementRegion? {
+        if let localRegionNarrowerOverride {
+            return await localRegionNarrowerOverride(
+                screenshot,
+                question,
+                displayWidthPoints,
+                displayHeightPoints
+            )
+        }
+        let narrower = LocalRegionNarrower(
+            skills: appSkills,
+            onRuntimeProfile: { [store = self.store, profileBuffer = self.episodeSparseAXProfiles] profile in
+                profileBuffer.record(profile)
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "grounding.ax_profile",
+                    detail: profile.safeAuditDetail
+                ))
+            }
+        )
+        return await narrower.narrow(
+            screenshot: screenshot,
+            target: question,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
         )
     }
 
