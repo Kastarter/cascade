@@ -121,11 +121,8 @@ public struct MixtureGrounder: VisualGrounder {
     /// Cascade's own bundle id — its UI must never be an AX grounding target.
     static let cascadeBundleID = "com.humain.cascade"
 
-    static let clickableRoles: Set<String> = [
-        "AXButton", "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTextField",
-        "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton", "AXCheckBox",
-        "AXRadioButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider",
-    ]
+    static let trustPolicy = ScreenElementIndex.TrustPolicy.default
+    static let clickableRoles = ScreenElementIndex.TrustPolicy.default.actionableAXRoles
 
     public init(
         base: any VisualGrounder,
@@ -156,6 +153,7 @@ public struct MixtureGrounder: VisualGrounder {
     public func ground(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> CGPoint? {
+        let target = await targetWithRuntimeHints(target)
         guard verifyCandidates else {
             if !Self.namesCanvasConcept(target),
                let axPoint = await axGround(
@@ -191,16 +189,17 @@ public struct MixtureGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> GroundingResult {
+        let target = await targetWithRuntimeHints(target)
         guard verifyCandidates else {
-            if let indexed = await screenElementIndexGrounding(
-                screenshot: screenshot,
-                target: target,
-                displayWidthPoints: displayWidthPoints,
-                displayHeightPoints: displayHeightPoints
-            ) {
-                return indexed
-            }
             guard groundingCache != nil else {
+                if let indexed = await screenElementIndexGrounding(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints
+                ) {
+                    return indexed
+                }
                 let start = ContinuousClock.now
                 let point = await ground(
                     screenshot: screenshot,
@@ -221,7 +220,7 @@ public struct MixtureGrounder: VisualGrounder {
                 let elapsed = start.duration(to: ContinuousClock.now)
                 return GroundingResult.legacy(point: axPoint, latency: elapsed.mixtureTimeInterval)
             }
-            let result = await baseGroundingResult(
+            let result = await indexedOrBaseGroundingResult(
                 screenshot: screenshot,
                 target: target,
                 displayWidthPoints: displayWidthPoints,
@@ -250,12 +249,23 @@ public struct MixtureGrounder: VisualGrounder {
         case .miss:
             return GroundingResult()
         case .key(let key):
-            let baseResult = await base.groundResult(
+            let indexedResult = await screenElementIndexGrounding(
                 screenshot: screenshot,
                 target: target,
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints
             )
+            let baseResult: GroundingResult
+            if let indexedResult {
+                baseResult = indexedResult
+            } else {
+                baseResult = await base.groundResult(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints
+                )
+            }
             let selection = Self.selectVerifiedCandidate(
                 axCandidate: axCandidate,
                 baseResult: baseResult,
@@ -301,6 +311,45 @@ public struct MixtureGrounder: VisualGrounder {
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints
             )
+            await storeGroundingCacheResult(result, key: key)
+            return result
+        }
+    }
+
+    private func indexedOrBaseGroundingResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        let cacheProbe = await groundingCacheProbe(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        switch cacheProbe {
+        case .hit(let result):
+            return result
+        case .miss:
+            return GroundingResult()
+        case .key(let key):
+            let result: GroundingResult
+            if let indexed = await screenElementIndexGrounding(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            ) {
+                result = indexed
+            } else {
+                result = await base.groundResult(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints
+                )
+            }
             await storeGroundingCacheResult(result, key: key)
             return result
         }
@@ -370,10 +419,18 @@ public struct MixtureGrounder: VisualGrounder {
                     rawModel: candidate.rawModel,
                     latency: candidate.latency,
                     dispersion: candidate.dispersion,
-                    reason: candidate.reason ?? "cached \(candidate.source.rawValue) candidate"
+                    reason: candidate.reason ?? "cached \(candidate.source.rawValue) candidate",
+                    candidateID: candidate.candidateID,
+                    markNumber: candidate.markNumber,
+                    displayBounds: candidate.displayBounds,
+                    imageBounds: candidate.imageBounds
                 )
             },
-            selectedIndex: result.selectedIndex
+            selectedIndex: result.selectedIndex,
+            selectedCandidateID: result.selectedCandidateID,
+            verifierVerdict: result.verifierVerdict,
+            verifierFailureKind: result.verifierFailureKind,
+            alternativeCount: result.alternativeCount
         )
     }
 
@@ -389,10 +446,18 @@ public struct MixtureGrounder: VisualGrounder {
                     rawModel: candidate.rawModel,
                     latency: latency,
                     dispersion: candidate.dispersion,
-                    reason: candidate.reason
+                    reason: candidate.reason,
+                    candidateID: candidate.candidateID,
+                    markNumber: candidate.markNumber,
+                    displayBounds: candidate.displayBounds,
+                    imageBounds: candidate.imageBounds
                 )
             },
-            selectedIndex: result.selectedIndex
+            selectedIndex: result.selectedIndex,
+            selectedCandidateID: result.selectedCandidateID,
+            verifierVerdict: result.verifierVerdict,
+            verifierFailureKind: result.verifierFailureKind,
+            alternativeCount: result.alternativeCount
         )
     }
 
@@ -426,6 +491,7 @@ public struct MixtureGrounder: VisualGrounder {
     public func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? {
+        let target = await targetWithRuntimeHints(target)
         // On-screen TEXT (a document heading/section, a labeled link) is exactly what
         // the visual grounder misses — it's trained on UI CONTROLS, so "the student
         // evaluation section" in a PDF resolved to a toolbar button (the audited
@@ -449,39 +515,153 @@ public struct MixtureGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> GroundingResult? {
+        let appHints = await runtimeHintsForFrontmostApp()
         let axCandidates = await MainActor.run {
-            Self.indexCandidatesFromAccessibility(
+            ScreenElementIndex.accessibilityCandidates(
                 displayWidthPoints: displayWidthPoints,
-                displayHeightPoints: displayHeightPoints
+                displayHeightPoints: displayHeightPoints,
+                policy: Self.trustPolicy,
+                appSkillHints: appHints
             )
         }
         let ocrCandidates = await Task.detached {
-            Self.indexCandidatesFromOCR(
+            ScreenElementIndex.ocrCandidates(
                 screenshot: screenshot,
+                target: target,
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints,
-                target: target
+                policy: Self.trustPolicy
             )
         }.value
-        let indexed = ScreenElementIndex.build(from: axCandidates + ocrCandidates)
-        guard let selected = Self.bestIndexedCandidate(for: target, in: indexed) else { return nil }
-        let point = CGPoint(x: selected.bounds.x + selected.bounds.width / 2, y: selected.bounds.y + selected.bounds.height / 2)
+        let indexed = ScreenElementIndex.build(
+            from: Self.applyPreferredSourceHints(
+                axCandidates + ocrCandidates,
+                hints: appHints,
+                target: target
+            )
+        )
+        guard !indexed.isEmpty else { return nil }
+        if let selected = ScreenElementIndex.bestCandidate(for: target, in: indexed, policy: Self.trustPolicy) {
+            return Self.groundingResult(
+                from: selected,
+                reason: "clickable-map \(selected.source.rawValue) label match",
+                alternativeCount: max(0, indexed.count - 1)
+            )
+        }
+        guard let markedJPEG = ScreenElementIndex.renderMarkedJPEG(
+            screenshot: screenshot,
+            candidates: indexed,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ) else { return nil }
+        let marked = Self.markedCandidates(from: indexed)
+        let markedResult = await base.groundMarkedCandidate(
+            screenshot: markedJPEG,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            candidates: marked
+        )
+        guard !markedResult.candidates.isEmpty || markedResult.verifierVerdict != nil else { return nil }
+        return markedResult
+    }
+
+    private static func groundingResult(
+        from selected: ScreenElementIndex.IndexedCandidate,
+        reason: String,
+        alternativeCount: Int
+    ) -> GroundingResult {
         let source: GroundingSource = selected.source == .accessibility ? .accessibility : .ocr
-        let reason = "clickable-map \(selected.source.rawValue) label match"
         return GroundingResult(
             candidates: [
                 GroundingCandidate(
-                    point: point,
-                    region: CGRect(x: selected.bounds.x, y: selected.bounds.y, width: selected.bounds.width, height: selected.bounds.height),
+                    point: selected.center,
+                    region: selected.bounds.cgRect,
                     confidence: selected.confidence,
                     source: source,
                     coordinateSpace: .displayLocalAppKitPoints,
                     rawModel: selected.label,
-                    reason: reason
+                    reason: reason,
+                    candidateID: selected.id,
+                    markNumber: selected.mark.number,
+                    displayBounds: selected.bounds.cgRect,
+                    imageBounds: selected.imageBounds?.cgRect
                 )
             ],
-            selectedIndex: 0
+            selectedIndex: 0,
+            selectedCandidateID: selected.id,
+            alternativeCount: alternativeCount
         )
+    }
+
+    private static func markedCandidates(
+        from indexed: [ScreenElementIndex.IndexedCandidate]
+    ) -> [MarkedGroundingCandidate] {
+        indexed.map { candidate in
+            MarkedGroundingCandidate(
+                id: candidate.id,
+                markNumber: candidate.mark.number,
+                label: candidate.label,
+                role: candidate.role.rawValue,
+                source: candidate.source == .accessibility ? .accessibility : .ocr,
+                confidence: candidate.confidence,
+                isSafeToClick: candidate.isSafeToClick,
+                displayBounds: candidate.bounds.cgRect,
+                imageBounds: candidate.imageBounds?.cgRect
+            )
+        }
+    }
+
+    private func runtimeHintsForFrontmostApp() async -> AppSkillRuntimeHints? {
+        await MainActor.run {
+            let front = NSWorkspace.shared.frontmostApplication
+            return skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)?.hints
+        }
+    }
+
+    private func targetWithRuntimeHints(_ target: String) async -> String {
+        guard let hints = await runtimeHintsForFrontmostApp() else { return target }
+        return Self.applyTargetAliases(target, aliases: hints.targetAliases)
+    }
+
+    static func applyTargetAliases(_ target: String, aliases: [String: [String]]) -> String {
+        let normalizedTarget = normalizedIndexLabel(target)
+        guard !normalizedTarget.isEmpty else { return target }
+        for (canonical, rawAliases) in aliases {
+            let candidates = ([canonical] + rawAliases).map(normalizedIndexLabel).filter { !$0.isEmpty }
+            guard candidates.contains(where: { normalizedTarget == $0 || normalizedTarget.contains($0) }) else {
+                continue
+            }
+            return canonical
+        }
+        return target
+    }
+
+    private static func applyPreferredSourceHints(
+        _ candidates: [ScreenElementIndex.Candidate],
+        hints: AppSkillRuntimeHints?,
+        target: String
+    ) -> [ScreenElementIndex.Candidate] {
+        guard let preferred = hints?.preferredGroundingSource?.lowercased(), !preferred.isEmpty else {
+            return candidates
+        }
+        return candidates.map { candidate in
+            let sourceName = candidate.source.rawValue.lowercased()
+            let matches = preferred == sourceName
+                || (preferred == "ax" && candidate.source == .accessibility)
+                || (preferred == "accessibility" && candidate.source == .accessibility)
+            let adjustedTrust = matches ? min(1, candidate.trust * 1.12) : max(0, candidate.trust * 0.88)
+            return ScreenElementIndex.Candidate(
+                bounds: candidate.bounds,
+                imageBounds: candidate.imageBounds,
+                label: candidate.label,
+                role: candidate.role,
+                source: candidate.source,
+                confidence: candidate.confidence,
+                trust: adjustedTrust,
+                clickSafety: candidate.clickSafety
+            )
+        }
     }
 
     @MainActor
@@ -777,13 +957,12 @@ public struct MixtureGrounder: VisualGrounder {
         // sees the real target — defer to it.
         if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
         // Distrusted-AX apps (canvas/Electron) are the visual grounder's domain.
-        if let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier),
-           skill.axUnreliable {
+        let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+        if skill?.axUnreliable == true {
             return nil
         }
         guard let match = AXElementResolver.find(label: target),
-              match.score >= minAXScore,
-              Self.clickableRoles.contains(match.role) else { return nil }
+              match.score >= minAXScore else { return nil }
         // Map the matched element center (CG-global, top-left) into the display-local
         // AppKit point the executor consumes. Use the display the screenshot came
         // from — the cursor's — selected by matching the declared dimensions.
@@ -793,16 +972,33 @@ public struct MixtureGrounder: VisualGrounder {
         guard let point = Self.displayLocalPoint(
             cgGlobalCenter: match.center, displayCGBounds: bounds, displayHeightPoints: displayHeightPoints
         ) else { return nil }
+        let candidateBounds = ScreenElementIndex.Bounds(
+            x: Double(point.x - 48),
+            y: Double(point.y - 14),
+            width: 96,
+            height: 28
+        )
+        guard Self.trustPolicy.acceptsAXCandidate(
+            role: match.role,
+            score: match.score,
+            bounds: candidateBounds,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            appSkillHints: skill?.hints
+        ) else { return nil }
+        let candidateID = "ax:\(Self.indexHash(match.role + "|" + match.title))"
 
         return GroundingVerifierCandidate(
-            id: "ax:0",
+            id: candidateID,
             candidate: GroundingCandidate(
                 point: point,
                 confidence: min(1, max(0, match.score / 3)),
                 source: .accessibility,
                 coordinateSpace: .displayLocalAppKitPoints,
                 rawModel: match.title,
-                reason: "accessibility label match score \(String(format: "%.2f", match.score))"
+                reason: "accessibility label match score \(String(format: "%.2f", match.score))",
+                candidateID: candidateID,
+                displayBounds: candidateBounds.cgRect
             ),
             role: match.role,
             label: match.title,
@@ -860,7 +1056,7 @@ public struct MixtureGrounder: VisualGrounder {
     ) -> [GroundingVerifierCandidate] {
         var baseCandidates = baseResult.candidates.enumerated().map { index, candidate in
             GroundingVerifierCandidate(
-                id: "base:\(index)",
+                id: candidate.candidateID ?? "base:\(index)",
                 candidate: candidate,
                 label: candidate.rawModel,
                 nearbyOCRText: candidate.rawModel,
@@ -908,7 +1104,14 @@ public struct MixtureGrounder: VisualGrounder {
     ) -> VerifiedGroundingSelection {
         let selectedIndex = selectedID.flatMap { id in candidates.firstIndex { $0.id == id } }
         return VerifiedGroundingSelection(
-            result: GroundingResult(candidates: candidates.map(\.candidate), selectedIndex: selectedIndex),
+            result: GroundingResult(
+                candidates: candidates.map(\.candidate),
+                selectedIndex: selectedIndex,
+                selectedCandidateID: verifierResult.selectedCandidateID,
+                verifierVerdict: verifierResult.verdict,
+                verifierFailureKind: verifierResult.failureKind,
+                alternativeCount: max(0, candidates.count - (selectedIndex == nil ? 0 : 1))
+            ),
             outcome: outcome,
             verifierResult: verifierResult
         )
@@ -948,6 +1151,15 @@ public struct MixtureGrounder: VisualGrounder {
             return "\(candidate.role ?? "unknown"):\(label)"
         }
         return nil
+    }
+
+    private static func indexHash(_ value: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(hash, radix: 36)
     }
 }
 

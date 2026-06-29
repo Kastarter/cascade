@@ -15,7 +15,10 @@ struct GroundingResultTests {
                     coordinateSpace: .displayLocalAppKitPoints,
                     rawModel: "click(start_box='(128.5,256.25)')",
                     latency: 0.142,
-                    dispersion: 3.5
+                    dispersion: 3.5,
+                    candidateID: "se_1",
+                    markNumber: 4,
+                    displayBounds: CGRect(x: 120, y: 240, width: 40, height: 20)
                 ),
                 GroundingCandidate(
                     point: CGPoint(x: 130, y: 255),
@@ -27,7 +30,10 @@ struct GroundingResultTests {
                     dispersion: 5.25
                 ),
             ],
-            selectedIndex: 0
+            selectedIndex: 0,
+            selectedCandidateID: "se_1",
+            verifierVerdict: .accept,
+            alternativeCount: 1
         )
 
         let data = try JSONEncoder().encode(fixture)
@@ -35,6 +41,8 @@ struct GroundingResultTests {
 
         #expect(decoded == fixture)
         #expect(decoded.selectedCandidate == fixture.candidates[0])
+        #expect(decoded.selectedCandidateID == "se_1")
+        #expect(decoded.verifierVerdict == .accept)
     }
 
     @Test func legacyPointReturnsSelectedCandidatePoint() {
@@ -102,6 +110,34 @@ struct GroundingResultTests {
         #expect(legacyMiss.selectedCandidate?.confidence == 0)
         #expect(legacyMiss.selectedCandidate?.latency == 0.01)
         #expect(legacyMiss.legacyPoint == nil)
+    }
+
+    @Test func rejectedAndLowConfidenceResultsAreNotActionable() {
+        let candidate = GroundingCandidate(
+            point: CGPoint(x: 10, y: 10),
+            confidence: 0.9,
+            source: .accessibility,
+            coordinateSpace: .displayLocalAppKitPoints,
+            candidateID: "ax-save"
+        )
+        let rejected = GroundingResult(
+            candidates: [candidate],
+            selectedIndex: 0,
+            verifierVerdict: .reject,
+            verifierFailureKind: .passiveRole
+        )
+        #expect(!rejected.isActionable())
+        #expect(rejected.abstainReason == "passiveRole")
+
+        let weak = GroundingResult(candidates: [
+            GroundingCandidate(
+                point: CGPoint(x: 10, y: 10),
+                confidence: 0.1,
+                source: .visualModel,
+                coordinateSpace: .displayLocalAppKitPoints
+            )
+        ], selectedIndex: 0)
+        #expect(!weak.isActionable())
     }
 }
 

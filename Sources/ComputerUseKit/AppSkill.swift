@@ -67,17 +67,23 @@ public struct AppSkillRuntimeHints: Decodable, Sendable {
     /// agent clicks (no cursor restore) and be inside the app's window before
     /// bare key presses, or hotkeys land nowhere.
     public let keysFollowPointer: Bool
+    public let targetAliases: [String: [String]]
+    public let preferredGroundingSource: String?
 
     public init(
         appMatchers: AppMatchers? = nil,
         inputPolicies: [InputPolicy] = [],
         axUnreliable: Bool = false,
-        keysFollowPointer: Bool = false
+        keysFollowPointer: Bool = false,
+        targetAliases: [String: [String]] = [:],
+        preferredGroundingSource: String? = nil
     ) {
         self.appMatchers = appMatchers
         self.inputPolicies = inputPolicies
         self.axUnreliable = axUnreliable
         self.keysFollowPointer = keysFollowPointer
+        self.targetAliases = targetAliases
+        self.preferredGroundingSource = preferredGroundingSource
     }
 
     public init(from decoder: Decoder) throws {
@@ -86,10 +92,12 @@ public struct AppSkillRuntimeHints: Decodable, Sendable {
         inputPolicies = try container.decodeIfPresent([InputPolicy].self, forKey: .inputPolicies) ?? []
         axUnreliable = try container.decodeIfPresent(Bool.self, forKey: .axUnreliable) ?? false
         keysFollowPointer = try container.decodeIfPresent(Bool.self, forKey: .keysFollowPointer) ?? false
+        targetAliases = try container.decodeIfPresent([String: [String]].self, forKey: .targetAliases) ?? [:]
+        preferredGroundingSource = try container.decodeIfPresent(String.self, forKey: .preferredGroundingSource)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case appMatchers, inputPolicies, axUnreliable, keysFollowPointer
+        case appMatchers, inputPolicies, axUnreliable, keysFollowPointer, targetAliases, preferredGroundingSource
     }
 }
 

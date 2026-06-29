@@ -268,6 +268,17 @@ public final class CascadeAppModel: ObservableObject {
     /// instructions plus runtime policies, matched against the frontmost app.
     /// User files at App Support/Cascade/Skills override the bundled ones.
     private var appSkills: AppSkillRegistry
+    private var previousGroundingAnchor: MixtureGrounder.VerifiedGroundingAnchor?
+    private var groundingCandidateFailureCounts: [String: Int] = [:]
+    private struct GroundingSelectionEvidence: Sendable {
+        let app: String
+        let target: String
+        let source: GroundingSource
+        let candidateID: String
+        let confidence: Double
+        let screenChanged: Bool
+    }
+    private var episodeGroundingSelections: [GroundingSelectionEvidence] = []
     /// Rolling conversation memory for the voice/hotkey assistant — follow-up
     /// questions resolve against it ("now reply to the first one").
     public let assistMemory = AssistMemory()
@@ -1465,6 +1476,7 @@ public final class CascadeAppModel: ObservableObject {
         defer { assistTaskRunning = false; assistTaskGoal = nil }
         agentDidHighlight = false
         episodeAppActions = [:]
+        episodeGroundingSelections = []
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
 
@@ -1665,7 +1677,8 @@ public final class CascadeAppModel: ObservableObject {
             // mode it backs click_target/fill_target/scroll (the model never emits
             // coordinates); in coordinate mode it backs the optional fill_target aid.
             grounder: grounder,
-            groundingMode: mode
+            groundingMode: mode,
+            groundingCropProvider: Self.assistGroundingCropProvider()
         )
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
@@ -1681,6 +1694,81 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         return agent
+    }
+
+    private static func assistGroundingCropProvider() -> @Sendable (CGRect, Int, Int) async -> GroundingCrop? {
+        { rect, displayWidth, displayHeight in
+            let normalized = normalizedTopLeftRect(
+                displayLocalRect: rect,
+                displayWidth: displayWidth,
+                displayHeight: displayHeight
+            )
+            guard let jpeg = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: normalized) else {
+                return nil
+            }
+            return GroundingCrop(screenshot: jpeg, displayBounds: rect)
+        }
+    }
+
+    nonisolated static func normalizedTopLeftRect(
+        displayLocalRect rect: CGRect,
+        displayWidth: Int,
+        displayHeight: Int
+    ) -> CGRect {
+        let width = CGFloat(max(1, displayWidth))
+        let height = CGFloat(max(1, displayHeight))
+        let clamped = rect.intersection(CGRect(x: 0, y: 0, width: width, height: height))
+        guard !clamped.isNull, !clamped.isEmpty else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        return CGRect(
+            x: clamped.minX / width,
+            y: (height - clamped.maxY) / height,
+            width: clamped.width / width,
+            height: clamped.height / height
+        )
+    }
+
+    private func recordGroundingNoEffect(from agent: ComputerUseAgent) {
+        guard let id = agent.lastGroundCandidateID,
+              let source = agent.lastGroundSource,
+              let confidence = agent.lastGroundConfidence else { return }
+        groundingCandidateFailureCounts[id, default: 0] += 1
+        previousGroundingAnchor = MixtureGrounder.VerifiedGroundingAnchor(
+            score: confidence,
+            source: source,
+            hash: id,
+            verifiedAt: Date()
+        )
+        recordGroundingSelectionEvidence(from: agent, screenChanged: false)
+    }
+
+    private func recordGroundingVisibleEffect(from agent: ComputerUseAgent) {
+        guard let id = agent.lastGroundCandidateID,
+              let source = agent.lastGroundSource,
+              let confidence = agent.lastGroundConfidence else { return }
+        groundingCandidateFailureCounts[id] = 0
+        previousGroundingAnchor = MixtureGrounder.VerifiedGroundingAnchor(
+            score: confidence,
+            source: source,
+            hash: id,
+            verifiedAt: Date()
+        )
+        recordGroundingSelectionEvidence(from: agent, screenChanged: true)
+    }
+
+    private func recordGroundingSelectionEvidence(from agent: ComputerUseAgent, screenChanged: Bool) {
+        guard let id = agent.lastGroundCandidateID,
+              let source = agent.lastGroundSource,
+              let confidence = agent.lastGroundConfidence,
+              let target = agent.lastGroundTarget else { return }
+        let front = NSWorkspace.shared.frontmostApplication
+        episodeGroundingSelections.append(GroundingSelectionEvidence(
+            app: front?.localizedName ?? "Unknown",
+            target: target,
+            source: source,
+            candidateID: id,
+            confidence: confidence,
+            screenChanged: screenChanged
+        ))
     }
 
     /// Whether the structural grounding split is the active on-screen mode. ON by
@@ -1762,6 +1850,8 @@ public final class CascadeAppModel: ObservableObject {
             base: base,
             skills: appSkills,
             verifyCandidates: verifyCandidates,
+            previousAnchor: previousGroundingAnchor,
+            candidateFailureCounts: groundingCandidateFailureCounts,
             groundingCache: groundingCache,
             cacheMode: Self.structuralGroundingEnabled() ? .structural : .coordinate,
             onVerifierOutcome: { [store = self.store] outcome in
@@ -2355,17 +2445,19 @@ public final class CascadeAppModel: ObservableObject {
                     observedShot = recheck
                     observedHashes = Self.gridHashes(ofJPEG: recheck)
                 }
-                if let confirmed = observedHashes,
-                   !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
-                    // The effect just rendered late — the action DID work.
-                    noEffectTurns = 0
-                    _ = try? await store.appendAudit(AuditEvent(
+	                if let confirmed = observedHashes,
+	                   !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
+	                    // The effect just rendered late — the action DID work.
+	                    noEffectTurns = 0
+	                    recordGroundingVisibleEffect(from: agent)
+	                    _ = try? await store.appendAudit(AuditEvent(
                         actor: "agent", action: "assist.noeffect",
                         detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
                     ))
-                } else {
-                    noEffectTurns += 1
-                    if noEffectTurns >= 3 {
+	                } else {
+	                    noEffectTurns += 1
+	                    recordGroundingNoEffect(from: agent)
+	                    if noEffectTurns >= 3 {
                         _ = try? await store.appendAudit(AuditEvent(
                             actor: "agent", action: "assist.noeffect",
                             detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "stopping", noEffectStreak: noEffectTurns)
@@ -2456,9 +2548,10 @@ public final class CascadeAppModel: ObservableObject {
                         nudge! += "\n" + ocr
                     }
                 }
-            } else if actedThisTurn, !observationOnly, expectsChange {
-                noEffectTurns = 0
-            }
+	            } else if actedThisTurn, !observationOnly, expectsChange {
+	                noEffectTurns = 0
+	                recordGroundingVisibleEffect(from: agent)
+	            }
             // A copy-only/wait-only acting turn leaves noEffectTurns untouched.
             if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
@@ -4802,8 +4895,27 @@ public final class CascadeAppModel: ObservableObject {
               appSkills.skill(appName: app, bundleIdentifier: nil) == nil,
               !pendingLearnedSkills.contains(where: { $0.appName == app })
         else { return }
-        let memo = findings.map { "\($0.task) → \($0.result)" }.joined(separator: "\n")
+        let groundingMemo = Self.groundingEvidenceMemo(
+            episodeGroundingSelections.filter { $0.app == app && $0.screenChanged }
+        )
+        let memo = (findings.map { "\($0.task) → \($0.result)" } + groundingMemo).joined(separator: "\n")
         Task { await distillSkill(app: app, goal: goal, findingsMemo: memo, actionCount: count) }
+    }
+
+    private static func groundingEvidenceMemo(_ selections: [GroundingSelectionEvidence]) -> [String] {
+        guard !selections.isEmpty else { return [] }
+        let highConfidence = selections.filter { $0.confidence >= 0.72 }
+        guard !highConfidence.isEmpty else { return [] }
+        let grouped = Dictionary(grouping: highConfidence) {
+            "\($0.target.lowercased())|\($0.source.rawValue)"
+        }
+        return grouped.values
+            .filter { $0.count >= 1 }
+            .prefix(8)
+            .map { group in
+                let first = group[0]
+                return "Grounding evidence: target \"\(first.target)\" worked via \(first.source.rawValue) at confidence \(String(format: "%.2f", first.confidence)); candidate hash \(Self.safeAuditToken(first.candidateID)); screen changed after selection."
+            }
     }
 
     private func distillSkill(app: String, goal: String, findingsMemo: String, actionCount: Int) async {
@@ -4846,6 +4958,14 @@ public final class CascadeAppModel: ObservableObject {
     ```cascade-runtime-hints
     {"appMatchers": {"names": ["<App Name>"]}}
     ```
+
+    When the run evidence shows repeated or high-confidence grounding choices, you
+    MAY add these optional keys inside cascade-runtime-hints:
+    - "targetAliases": {"<canonical visible target>": ["<phrase the agent used>"]}
+    - "preferredGroundingSource": "accessibility" or "ocr"
+    - "axUnreliable": true only when the run proves AX was unreliable
+    - "keysFollowPointer": true only when keyboard input followed the pointer
+    Do not invent hints without evidence in the memo.
     """
 
     public func enqueueLearnedSkillForReview(_ skill: LearnedSkill) {

@@ -90,6 +90,20 @@ struct AppSkillTests {
         #expect(skill?.hints.inputPolicies.first?.maxLength == 12)
     }
 
+    @Test func parsesGroundingRuntimeHints() {
+        let markdown = blenderFixture.replacingOccurrences(
+            of: "\"keysFollowPointer\": true",
+            with: """
+            "keysFollowPointer": true,
+              "targetAliases": {"Title placeholder": ["title box", "heading field"]},
+              "preferredGroundingSource": "ocr"
+            """
+        )
+        let skill = parsed(markdown)
+        #expect(skill?.hints.targetAliases["Title placeholder"] == ["title box", "heading field"])
+        #expect(skill?.hints.preferredGroundingSource == "ocr")
+    }
+
     @Test func acceptsTipTourFenceWithUnknownKeys() {
         let skill = parsed(tiptourFixture)
         #expect(skill != nil)

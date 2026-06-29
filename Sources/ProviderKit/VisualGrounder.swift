@@ -29,6 +29,47 @@ public enum GroundingCoordinateSpace: String, Codable, Equatable, Sendable {
     case unknown
 }
 
+/// A candidate shown to a model with a visible Set-of-Mark label. ProviderKit keeps
+/// this shape independent of ComputerUseKit so prompt/parse code can use it without
+/// depending on AX/OCR inventory construction.
+public struct MarkedGroundingCandidate: Codable, Equatable, Sendable {
+    public let id: String
+    public let markNumber: Int
+    public let label: String
+    public let role: String
+    public let source: GroundingSource
+    public let confidence: Double
+    public let isSafeToClick: Bool
+    public let displayBounds: CGRect
+    public let imageBounds: CGRect?
+
+    public init(
+        id: String,
+        markNumber: Int,
+        label: String,
+        role: String,
+        source: GroundingSource,
+        confidence: Double,
+        isSafeToClick: Bool,
+        displayBounds: CGRect,
+        imageBounds: CGRect? = nil
+    ) {
+        self.id = id
+        self.markNumber = markNumber
+        self.label = label
+        self.role = role
+        self.source = source
+        self.confidence = confidence
+        self.isSafeToClick = isSafeToClick
+        self.displayBounds = displayBounds
+        self.imageBounds = imageBounds
+    }
+
+    public var center: CGPoint {
+        CGPoint(x: displayBounds.midX, y: displayBounds.midY)
+    }
+}
+
 /// One possible grounding answer for a named UI target.
 public struct GroundingCandidate: Codable, Equatable, Sendable {
     public let point: CGPoint?
@@ -40,6 +81,10 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
     public let latency: TimeInterval?
     public let dispersion: Double?
     public let reason: String?
+    public let candidateID: String?
+    public let markNumber: Int?
+    public let displayBounds: CGRect?
+    public let imageBounds: CGRect?
 
     public init(
         point: CGPoint?,
@@ -50,7 +95,11 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         rawModel: String? = nil,
         latency: TimeInterval? = nil,
         dispersion: Double? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        candidateID: String? = nil,
+        markNumber: Int? = nil,
+        displayBounds: CGRect? = nil,
+        imageBounds: CGRect? = nil
     ) {
         self.point = point
         self.region = region
@@ -61,6 +110,10 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         self.latency = latency
         self.dispersion = dispersion
         self.reason = reason
+        self.candidateID = candidateID
+        self.markNumber = markNumber
+        self.displayBounds = displayBounds
+        self.imageBounds = imageBounds
     }
 }
 
@@ -69,10 +122,26 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
 public struct GroundingResult: Codable, Equatable, Sendable {
     public let candidates: [GroundingCandidate]
     public let selectedIndex: Int?
+    public let selectedCandidateID: String?
+    public let verifierVerdict: GroundingVerifierVerdict?
+    public let verifierFailureKind: GroundingVerifierFailureKind?
+    public let alternativeCount: Int
 
-    public init(candidates: [GroundingCandidate] = [], selectedIndex: Int? = nil) {
+    public init(
+        candidates: [GroundingCandidate] = [],
+        selectedIndex: Int? = nil,
+        selectedCandidateID: String? = nil,
+        verifierVerdict: GroundingVerifierVerdict? = nil,
+        verifierFailureKind: GroundingVerifierFailureKind? = nil,
+        alternativeCount: Int? = nil
+    ) {
         self.candidates = candidates
         self.selectedIndex = selectedIndex
+        self.selectedCandidateID = selectedCandidateID
+            ?? selectedIndex.flatMap { candidates.indices.contains($0) ? candidates[$0].candidateID : nil }
+        self.verifierVerdict = verifierVerdict
+        self.verifierFailureKind = verifierFailureKind
+        self.alternativeCount = alternativeCount ?? max(0, candidates.count - (selectedIndex == nil ? 0 : 1))
     }
 
     public var selectedCandidate: GroundingCandidate? {
@@ -86,6 +155,23 @@ public struct GroundingResult: Codable, Equatable, Sendable {
 
     public var legacyPoint: CGPoint? {
         selectedPoint
+    }
+
+    public var isAbstainedOrRejected: Bool {
+        verifierVerdict == .abstain || verifierVerdict == .reject
+    }
+
+    public func isActionable(minConfidence: Double = 0.30) -> Bool {
+        guard let candidate = selectedCandidate, candidate.point != nil else { return false }
+        guard !isAbstainedOrRejected else { return false }
+        return candidate.confidence >= minConfidence
+    }
+
+    public var abstainReason: String? {
+        if let verifierFailureKind, verifierVerdict == .abstain || verifierVerdict == .reject {
+            return verifierFailureKind.rawValue
+        }
+        return selectedCandidate?.reason
     }
 
     public static func legacy(
@@ -105,6 +191,29 @@ public struct GroundingResult: Codable, Equatable, Sendable {
                 )
             ],
             selectedIndex: 0
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case candidates
+        case selectedIndex
+        case selectedCandidateID
+        case verifierVerdict
+        case verifierFailureKind
+        case alternativeCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let candidates = try container.decodeIfPresent([GroundingCandidate].self, forKey: .candidates) ?? []
+        let selectedIndex = try container.decodeIfPresent(Int.self, forKey: .selectedIndex)
+        self.init(
+            candidates: candidates,
+            selectedIndex: selectedIndex,
+            selectedCandidateID: try container.decodeIfPresent(String.self, forKey: .selectedCandidateID),
+            verifierVerdict: try container.decodeIfPresent(GroundingVerifierVerdict.self, forKey: .verifierVerdict),
+            verifierFailureKind: try container.decodeIfPresent(GroundingVerifierFailureKind.self, forKey: .verifierFailureKind),
+            alternativeCount: try container.decodeIfPresent(Int.self, forKey: .alternativeCount)
         )
     }
 }
@@ -161,6 +270,16 @@ public protocol VisualGrounder: Sendable {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> ElementRegion?
+
+    /// Optional Set-of-Mark path. Conformers that can ask the model to choose a mark
+    /// return a selected candidate directly; others inherit the empty fallback.
+    func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult
 }
 
 public extension VisualGrounder {
@@ -184,6 +303,14 @@ public extension VisualGrounder {
     func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? { nil }
+
+    func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult { GroundingResult() }
 }
 
 private extension Duration {
@@ -217,6 +344,22 @@ public struct ClaudeVisualGrounder: VisualGrounder {
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         ).point
+    }
+
+    public func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult {
+        await locator.guide(
+            screenshot: screenshot,
+            question: "click \(target)",
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            markedCandidates: candidates
+        ).result
     }
 }
 
@@ -318,6 +461,128 @@ public struct UITARSGrounder: VisualGrounder {
             imagePoint: space.point,
             imageW: space.imageW, imageH: space.imageH,
             displayW: displayWidthPoints, displayH: displayHeightPoints
+        )
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        let start = ContinuousClock.now
+        let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
+        guard let jpeg = Self.resizeJPEG(screenshot, toWidth: res.w, toHeight: res.h) else { return GroundingResult() }
+        guard let content = await callModel(jpeg: jpeg, target: target, declaredW: res.w, declaredH: res.h) else {
+            return GroundingResult()
+        }
+        guard let imagePoint = Self.parseBox(content) else {
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: nil,
+                        confidence: 0,
+                        source: .uiTars,
+                        coordinateSpace: .screenshotPixelsTopLeft,
+                        rawModel: content,
+                        latency: start.duration(to: ContinuousClock.now).timeInterval,
+                        reason: "ui-tars parse miss"
+                    )
+                ],
+                selectedIndex: 0,
+                verifierVerdict: .abstain,
+                verifierFailureKind: .missingPoint
+            )
+        }
+        let space = Self.resolveImageSpace(
+            parsed: imagePoint,
+            sentW: res.w,
+            sentH: res.h,
+            space: coordSpace
+        )
+        let point = Self.toDisplayPoint(
+            imagePoint: space.point,
+            imageW: space.imageW,
+            imageH: space.imageH,
+            displayW: displayWidthPoints,
+            displayH: displayHeightPoints
+        )
+        return GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: point,
+                    confidence: 0.82,
+                    source: .uiTars,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    rawModel: content,
+                    latency: start.duration(to: ContinuousClock.now).timeInterval,
+                    reason: "ui-tars coordinate"
+                )
+            ],
+            selectedIndex: 0
+        )
+    }
+
+    public func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult {
+        guard !candidates.isEmpty else { return GroundingResult() }
+        let start = ContinuousClock.now
+        let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
+        guard let jpeg = Self.resizeJPEG(screenshot, toWidth: res.w, toHeight: res.h) else { return GroundingResult() }
+        guard let content = await callModel(
+            jpeg: jpeg,
+            target: target,
+            declaredW: res.w,
+            declaredH: res.h,
+            prompt: Self.markPrompt(target: target, candidates: candidates)
+        ) else {
+            return GroundingResult()
+        }
+        guard let mark = Self.parseMarkID(content),
+              let selected = candidates.first(where: { $0.markNumber == mark }) else {
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: nil,
+                        confidence: 0,
+                        source: .uiTars,
+                        coordinateSpace: .displayLocalAppKitPoints,
+                        rawModel: content,
+                        latency: start.duration(to: ContinuousClock.now).timeInterval,
+                        reason: "ui-tars mark parse miss"
+                    )
+                ],
+                selectedIndex: nil,
+                verifierVerdict: .abstain,
+                verifierFailureKind: .noCandidates,
+                alternativeCount: candidates.count
+            )
+        }
+        return GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: selected.center,
+                    region: selected.displayBounds,
+                    confidence: max(0.78, selected.confidence),
+                    source: selected.source,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    rawModel: content,
+                    latency: start.duration(to: ContinuousClock.now).timeInterval,
+                    reason: "selected Set-of-Mark \(mark)",
+                    candidateID: selected.id,
+                    markNumber: selected.markNumber,
+                    displayBounds: selected.displayBounds,
+                    imageBounds: selected.imageBounds
+                )
+            ],
+            selectedIndex: 0,
+            selectedCandidateID: selected.id,
+            alternativeCount: max(0, candidates.count - 1)
         )
     }
 
@@ -424,7 +689,39 @@ public struct UITARSGrounder: VisualGrounder {
         """
     }
 
-    private func callModel(jpeg: Data, target: String, declaredW: Int, declaredH: Int) async -> String? {
+    static func markPrompt(target: String, candidates: [MarkedGroundingCandidate]) -> String {
+        let list = candidates.prefix(80).map {
+            "\($0.markNumber): \($0.label) [\($0.role), \($0.source.rawValue)]"
+        }.joined(separator: "\n")
+        return """
+        You are a GUI grounding model. The screenshot has visible numbered labels drawn \
+        on candidate UI elements. Locate the element described by:
+        "\(target)"
+        Choose exactly one candidate mark from the list. Respond with ONLY compact JSON \
+        like {"mark": 7}. If none matches, respond {"mark": null}.
+
+        Candidates:
+        \(list)
+        """
+    }
+
+    static func parseMarkID(_ text: String) -> Int? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let start = trimmed.firstIndex(of: "{"),
+           let end = trimmed.lastIndex(of: "}"),
+           let data = String(trimmed[start...end]).data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let mark = json["mark"] as? NSNumber { return mark.intValue }
+            if let mark = json["id"] as? NSNumber { return mark.intValue }
+            if let mark = json["mark"] as? String { return Int(mark.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return nil
+        }
+        let pattern = #"(?i)\b(?:mark|id|#)?\s*(\d{1,4})\b"#
+        guard let match = firstMatch(pattern, in: trimmed), let mark = match[1] else { return nil }
+        return Int(mark)
+    }
+
+    private func callModel(jpeg: Data, target: String, declaredW: Int, declaredH: Int, prompt: String? = nil) async -> String? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         // Short per-attempt cap: grounding normally returns in ~1s, so a connection
@@ -449,7 +746,7 @@ public struct UITARSGrounder: VisualGrounder {
             "messages": [[
                 "role": "user",
                 "content": [
-                    ["type": "text", "text": Self.prompt(target: target)],
+                    ["type": "text", "text": prompt ?? Self.prompt(target: target)],
                     ["type": "image_url", "image_url": ["url": dataURL]],
                 ],
             ]],

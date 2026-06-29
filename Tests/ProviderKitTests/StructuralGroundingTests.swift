@@ -21,6 +21,16 @@ struct StructuralGroundingTests {
         }
     }
 
+    struct ResultGrounder: VisualGrounder {
+        let result: GroundingResult
+        func ground(screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int) async -> CGPoint? {
+            result.selectedPoint
+        }
+        func groundResult(screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int) async -> GroundingResult {
+            result
+        }
+    }
+
     private let dummyFrame = Data([0xFF, 0xD8])  // stub grounder ignores content
 
     // MARK: isStructural — the fallback-safety contract
@@ -107,6 +117,28 @@ struct StructuralGroundingTests {
             cache: ["Save": .legacy(point: nil)]
         )
         #expect(action == nil)
+    }
+
+    @Test func groundedClickBlocksRejectedResultWithPoint() async {
+        let result = GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: CGPoint(x: 11, y: 22),
+                    confidence: 0.95,
+                    source: .accessibility,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    candidateID: "ax-dead"
+                )
+            ],
+            selectedIndex: 0,
+            verifierVerdict: .reject,
+            verifierFailureKind: .lowEvidence
+        )
+        let agent = ComputerUseAgent(grounder: ResultGrounder(result: result), groundingMode: .structural)
+
+        #expect(await agent.groundedClick(["target": "Save"], frame: dummyFrame) == nil)
+        #expect(agent.lastGroundMiss == "Save")
+        #expect(agent.lastGroundCandidateID == "ax-dead")
     }
 
     // MARK: groundedScroll — scroll over a named area (or the screen center)

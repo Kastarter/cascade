@@ -1,4 +1,8 @@
+import AppKit
 import Foundation
+import ImageIO
+import MacContextKit
+import Vision
 
 public enum ScreenElementIndex {
     public enum Source: String, Sendable, CaseIterable {
@@ -87,10 +91,17 @@ public enum ScreenElementIndex {
             guard smallerArea > 0 else { return 0 }
             return intersectionArea(with: other) / smallerArea
         }
+
+        public var cgRect: CGRect {
+            CGRect(x: x, y: y, width: width, height: height)
+        }
     }
 
     public struct Candidate: Sendable, Equatable {
         public let bounds: Bounds
+        /// Pixel bounds in the screenshot/model image, top-left origin. `bounds`
+        /// remains display-local AppKit points for executor compatibility.
+        public let imageBounds: Bounds?
         public let label: String
         public let role: Role
         public let source: Source
@@ -100,6 +111,7 @@ public enum ScreenElementIndex {
 
         public init(
             bounds: Bounds,
+            imageBounds: Bounds? = nil,
             label: String,
             role: Role,
             source: Source,
@@ -108,6 +120,7 @@ public enum ScreenElementIndex {
             clickSafety: ClickSafety? = nil
         ) {
             self.bounds = bounds
+            self.imageBounds = imageBounds
             self.label = label
             self.role = role
             self.source = source
@@ -132,6 +145,7 @@ public enum ScreenElementIndex {
     public struct IndexedCandidate: Sendable, Equatable {
         public let id: String
         public let bounds: Bounds
+        public let imageBounds: Bounds?
         public let label: String
         public let role: Role
         public let source: Source
@@ -145,9 +159,14 @@ public enum ScreenElementIndex {
             clickSafety == .safe && role.isInteractive
         }
 
+        public var center: CGPoint {
+            CGPoint(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
+        }
+
         public init(
             id: String,
             bounds: Bounds,
+            imageBounds: Bounds? = nil,
             label: String,
             role: Role,
             source: Source,
@@ -159,6 +178,7 @@ public enum ScreenElementIndex {
         ) {
             self.id = id
             self.bounds = bounds
+            self.imageBounds = imageBounds
             self.label = label
             self.role = role
             self.source = source
@@ -173,6 +193,7 @@ public enum ScreenElementIndex {
             IndexedCandidate(
                 id: id,
                 bounds: bounds,
+                imageBounds: imageBounds,
                 label: label,
                 role: role,
                 source: source,
@@ -202,6 +223,130 @@ public enum ScreenElementIndex {
         public static let `default` = Configuration()
     }
 
+    public struct TrustPolicy: Sendable, Equatable {
+        public let minAXScore: Double
+        public let maxCanvasAreaFraction: Double
+        public let maxAXSnapDistance: Double
+        public let maxAXSnapWidth: Double
+        public let maxAXSnapHeight: Double
+        public let actionableAXRoles: Set<String>
+        public let passiveAXRoles: Set<String>
+        public let canvasAXRoles: Set<String>
+
+        public init(
+            minAXScore: Double = 2,
+            maxCanvasAreaFraction: Double = 0.35,
+            maxAXSnapDistance: Double = 28,
+            maxAXSnapWidth: Double = 360,
+            maxAXSnapHeight: Double = 130,
+            actionableAXRoles: Set<String> = Self.defaultActionableAXRoles,
+            passiveAXRoles: Set<String> = Self.defaultPassiveAXRoles,
+            canvasAXRoles: Set<String> = Self.defaultCanvasAXRoles
+        ) {
+            self.minAXScore = minAXScore
+            self.maxCanvasAreaFraction = maxCanvasAreaFraction
+            self.maxAXSnapDistance = maxAXSnapDistance
+            self.maxAXSnapWidth = maxAXSnapWidth
+            self.maxAXSnapHeight = maxAXSnapHeight
+            self.actionableAXRoles = actionableAXRoles
+            self.passiveAXRoles = passiveAXRoles
+            self.canvasAXRoles = canvasAXRoles
+        }
+
+        public static let `default` = TrustPolicy()
+
+        public static let defaultActionableAXRoles: Set<String> = [
+            "AXButton", "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTextField",
+            "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton", "AXCheckBox",
+            "AXRadioButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider",
+            "AXIncrementor"
+        ]
+
+        public static let defaultPassiveAXRoles: Set<String> = [
+            "AXStaticText", "AXImage", "AXGroup", "AXLayoutArea", "AXSeparator"
+        ]
+
+        public static let defaultCanvasAXRoles: Set<String> = [
+            "AXCanvas", "AXWebArea"
+        ]
+
+        public func role(fromAXRole role: String) -> Role {
+            switch role {
+            case "AXButton", "AXMenuBarItem": return .button
+            case "AXMenuItem": return .menuItem
+            case "AXLink": return .link
+            case "AXCheckBox", "AXRadioButton": return .checkbox
+            case "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox": return .textField
+            case "AXPopUpButton", "AXTab", "AXDisclosureTriangle", "AXRow", "AXCell", "AXSlider", "AXIncrementor": return .option
+            case "AXStaticText": return .text
+            case "AXImage": return .image
+            case "AXGroup", "AXLayoutArea": return .container
+            default: return .unknown
+            }
+        }
+
+        public func isActionableAXRole(_ role: String) -> Bool {
+            actionableAXRoles.contains(role)
+        }
+
+        public func isPassiveAXRole(_ role: String) -> Bool {
+            passiveAXRoles.contains(role)
+        }
+
+        public func isCanvasAXRole(_ role: String) -> Bool {
+            canvasAXRoles.contains(role)
+        }
+
+        public func targetLooksFillable(_ target: String) -> Bool {
+            let t = target.lowercased()
+            return t.contains("field")
+                || t.contains("box")
+                || t.contains("search")
+                || t.contains("placeholder")
+                || t.contains("input")
+                || t.contains("cell")
+        }
+
+        public func clickSafety(role: Role, source: Source, target: String) -> ClickSafety {
+            switch source {
+            case .accessibility:
+                return role.isInteractive ? .safe : .passive
+            case .visual:
+                return role.isInteractive ? .safe : .passive
+            case .ocr:
+                return targetLooksFillable(target) && role == .textField ? .safe : .passive
+            }
+        }
+
+        public func trust(source: Source, role: Role, confidence: Double, target: String) -> Double {
+            switch source {
+            case .accessibility:
+                return role.isInteractive && confidence >= minAXScore / 3 ? 0.95 : 0.45
+            case .visual:
+                return 0.70
+            case .ocr:
+                return targetLooksFillable(target) && role == .textField ? 0.68 : 0.45
+            }
+        }
+
+        public func acceptsAXCandidate(
+            role axRole: String,
+            score: Double,
+            bounds: Bounds,
+            displayWidthPoints: Int,
+            displayHeightPoints: Int,
+            appSkillHints: AppSkillRuntimeHints? = nil
+        ) -> Bool {
+            guard appSkillHints?.axUnreliable != true else { return false }
+            guard score >= minAXScore else { return false }
+            guard isActionableAXRole(axRole) else { return false }
+            guard bounds.isValid else { return false }
+            let displayArea = Double(max(1, displayWidthPoints) * max(1, displayHeightPoints))
+            guard bounds.area / displayArea <= maxCanvasAreaFraction else { return false }
+            return true
+        }
+    }
+
     public static func build(
         from candidates: [Candidate],
         configuration: Configuration = .default
@@ -220,6 +365,186 @@ public enum ScreenElementIndex {
                 isSafeToClick: candidate.isSafeToClick)
             return candidate.withMark(mark)
         }
+    }
+
+    @MainActor
+    public static func accessibilityCandidates(
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        limit: Int = 48,
+        policy: TrustPolicy = .default,
+        appSkillHints: AppSkillRuntimeHints? = nil
+    ) -> [Candidate] {
+        guard appSkillHints?.axUnreliable != true else { return [] }
+        guard let displayBounds = captureDisplayBounds(
+            widthPoints: displayWidthPoints,
+            heightPoints: displayHeightPoints
+        ) else {
+            return []
+        }
+        return AXElementResolver.interactables(limit: limit).compactMap { match in
+            guard let point = displayLocalPoint(
+                cgGlobalCenter: match.center,
+                displayCGBounds: displayBounds,
+                displayHeightPoints: displayHeightPoints
+            ) else { return nil }
+            let role = policy.role(fromAXRole: match.role)
+            let size = role == .textField ? CGSize(width: 180, height: 28) : CGSize(width: 96, height: 28)
+            let bounds = Bounds(
+                x: Double(point.x - size.width / 2),
+                y: Double(point.y - size.height / 2),
+                width: Double(size.width),
+                height: Double(size.height)
+            )
+            guard policy.acceptsAXCandidate(
+                role: match.role,
+                score: max(match.score, policy.minAXScore),
+                bounds: bounds,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                appSkillHints: appSkillHints
+            ) else { return nil }
+            let confidence = min(1, max(0.72, max(match.score, policy.minAXScore) / 3))
+            return Candidate(
+                bounds: bounds,
+                label: match.title,
+                role: role,
+                source: .accessibility,
+                confidence: confidence,
+                trust: policy.trust(source: .accessibility, role: role, confidence: confidence, target: match.title),
+                clickSafety: policy.clickSafety(role: role, source: .accessibility, target: match.title)
+            )
+        }
+    }
+
+    public static func ocrCandidates(
+        from boxes: [ScreenTextRecognizer.TextBox],
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        imageWidthPixels: Int? = nil,
+        imageHeightPixels: Int? = nil,
+        policy: TrustPolicy = .default
+    ) -> [Candidate] {
+        boxes.compactMap { box in
+            let text = box.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.count >= 2, text.count <= 80 else { return nil }
+            let displayRect = rectFromVisionBox(
+                box.boundingBox,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+            let imageRect = imageBoundsFromVisionBox(
+                box.boundingBox,
+                imageWidthPixels: imageWidthPixels,
+                imageHeightPixels: imageHeightPixels
+            )
+            let role: Role = policy.targetLooksFillable(target) ? .textField : .text
+            let confidence = Double(box.confidence)
+            return Candidate(
+                bounds: Bounds(displayRect),
+                imageBounds: imageRect.map(Bounds.init),
+                label: text,
+                role: role,
+                source: .ocr,
+                confidence: confidence,
+                trust: policy.trust(source: .ocr, role: role, confidence: confidence, target: target),
+                clickSafety: policy.clickSafety(role: role, source: .ocr, target: target)
+            )
+        }
+    }
+
+    public static func ocrCandidates(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        level: VNRequestTextRecognitionLevel = .fast,
+        policy: TrustPolicy = .default
+    ) -> [Candidate] {
+        let boxes = ScreenTextRecognizer.recognizeBoxes(inImageData: screenshot, level: level)
+        let dimensions = imageDimensions(screenshot)
+        return ocrCandidates(
+            from: boxes,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            imageWidthPixels: dimensions?.width,
+            imageHeightPixels: dimensions?.height,
+            policy: policy
+        )
+    }
+
+    public static func bestCandidate(
+        for target: String,
+        in candidates: [IndexedCandidate],
+        policy: TrustPolicy = .default
+    ) -> IndexedCandidate? {
+        let target = normalizedLabelForSearch(target)
+        guard !target.isEmpty else { return nil }
+        var best: (candidate: IndexedCandidate, score: Double)?
+        for candidate in candidates where candidate.isSafeToClick {
+            let score = matchScore(needle: target, candidate: normalizedLabelForSearch(candidate.label)) * candidate.trust
+            guard score >= 1.30 else { continue }
+            if best == nil
+                || score > best!.score
+                || (score == best!.score && candidate.source.rank > best!.candidate.source.rank)
+                || (score == best!.score && candidate.source.rank == best!.candidate.source.rank && candidate.bounds.area < best!.candidate.bounds.area) {
+                best = (candidate, score)
+            }
+        }
+        return best?.candidate
+    }
+
+    public static func candidate(markNumber: Int, in candidates: [IndexedCandidate]) -> IndexedCandidate? {
+        candidates.first { $0.mark.number == markNumber }
+    }
+
+    public static func renderMarkedJPEG(
+        screenshot: Data,
+        candidates: [IndexedCandidate],
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        compression: Double = 0.85
+    ) -> Data? {
+        guard let image = NSImage(data: screenshot) else { return nil }
+        let dimensions = imageDimensions(screenshot)
+        let pixelWidth = dimensions?.width ?? max(1, Int(image.size.width.rounded()))
+        let pixelHeight = dimensions?.height ?? max(1, Int(image.size.height.rounded()))
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        rep.size = NSSize(width: pixelWidth, height: pixelHeight)
+        NSGraphicsContext.saveGraphicsState()
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
+            NSGraphicsContext.restoreGraphicsState()
+            return nil
+        }
+        NSGraphicsContext.current = context
+        image.draw(
+            in: NSRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight),
+            from: NSRect(origin: .zero, size: image.size),
+            operation: .copy,
+            fraction: 1
+        )
+        drawMarks(
+            candidates: candidates,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: compression])
     }
 }
 
@@ -301,6 +626,9 @@ private extension ScreenElementIndex {
         let bounds = ordered.dropFirst().reduce(ordered[0].bounds) { partial, candidate in
             partial.union(candidate.bounds)
         }
+        let imageBounds = ordered.compactMap(\.imageBounds).reduce(nil) { partial, candidate -> Bounds? in
+            partial?.union(candidate) ?? candidate
+        }
         let label = bestLabel(in: ordered, fallback: primary.label)
         let confidence = ordered.map(\.confidence).max() ?? primary.confidence
         let trust = ordered.map(\.trust).max() ?? primary.trust
@@ -314,6 +642,7 @@ private extension ScreenElementIndex {
         return IndexedCandidate(
             id: id,
             bounds: bounds,
+            imageBounds: imageBounds,
             label: label,
             role: primary.role,
             source: primary.source,
@@ -399,6 +728,142 @@ private extension ScreenElementIndex {
             .joined(separator: " ")
     }
 
+    static func normalizedLabelForSearch(_ value: String) -> String {
+        value.lowercased()
+            .replacingOccurrences(of: #"\b(the|a|an|button|field|box|link|menu|item|placeholder|input|control)\b"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func matchScore(needle: String, candidate: String) -> Double {
+        guard !needle.isEmpty, !candidate.isEmpty else { return 0 }
+        if needle == candidate { return 3 }
+        if candidate.contains(needle) || needle.contains(candidate) { return 2 }
+        let needleWords = Set(needle.split(separator: " "))
+        let candidateWords = Set(candidate.split(separator: " "))
+        guard !needleWords.isEmpty else { return 0 }
+        let overlap = Double(needleWords.intersection(candidateWords).count) / Double(needleWords.count)
+        return overlap >= 0.75 ? 1 + overlap : 0
+    }
+
+    static func rectFromVisionBox(
+        _ box: CGRect,
+        displayWidthPoints width: Int,
+        displayHeightPoints height: Int
+    ) -> CGRect {
+        CGRect(
+            x: box.minX * CGFloat(width),
+            y: box.minY * CGFloat(height),
+            width: box.width * CGFloat(width),
+            height: box.height * CGFloat(height)
+        )
+    }
+
+    static func imageBoundsFromVisionBox(
+        _ box: CGRect,
+        imageWidthPixels width: Int?,
+        imageHeightPixels height: Int?
+    ) -> CGRect? {
+        guard let width, let height, width > 0, height > 0 else { return nil }
+        return CGRect(
+            x: box.minX * CGFloat(width),
+            y: (1 - box.maxY) * CGFloat(height),
+            width: box.width * CGFloat(width),
+            height: box.height * CGFloat(height)
+        )
+    }
+
+    static func imageDimensions(_ data: Data) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        return (width.intValue, height.intValue)
+    }
+
+    @MainActor
+    static func captureDisplayBounds(widthPoints: Int, heightPoints: Int) -> CGRect? {
+        func dims(_ screen: NSScreen) -> Bool {
+            Int(screen.frame.width.rounded()) == widthPoints
+                && Int(screen.frame.height.rounded()) == heightPoints
+        }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { dims($0) && NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.screens.first(where: dims)
+        guard let screen else { return nil }
+        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        return CGDisplayBounds(id ?? CGMainDisplayID())
+    }
+
+    static func displayLocalPoint(
+        cgGlobalCenter point: CGPoint,
+        displayCGBounds bounds: CGRect,
+        displayHeightPoints: Int
+    ) -> CGPoint? {
+        guard bounds.width > 0, bounds.height > 0,
+              point.x >= bounds.minX - 1, point.x <= bounds.maxX + 1,
+              point.y >= bounds.minY - 1, point.y <= bounds.maxY + 1 else { return nil }
+        let localX = point.x - bounds.minX
+        let localYFromTop = point.y - bounds.minY
+        let localYFromBottom = CGFloat(displayHeightPoints) - localYFromTop
+        return CGPoint(x: localX, y: localYFromBottom)
+    }
+
+    static func drawMarks(
+        candidates: [IndexedCandidate],
+        pixelWidth: Int,
+        pixelHeight: Int,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) {
+        let sx = CGFloat(pixelWidth) / CGFloat(max(1, displayWidthPoints))
+        let sy = CGFloat(pixelHeight) / CGFloat(max(1, displayHeightPoints))
+        let stroke = NSColor.systemYellow
+        let fill = NSColor.systemYellow.withAlphaComponent(0.92)
+        let textAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .bold),
+            .foregroundColor: NSColor.black,
+        ]
+        for candidate in candidates.prefix(99) {
+            let rect: CGRect
+            if let imageBounds = candidate.imageBounds {
+                rect = CGRect(
+                    x: imageBounds.x,
+                    y: CGFloat(pixelHeight) - CGFloat(imageBounds.maxY),
+                    width: imageBounds.width,
+                    height: imageBounds.height
+                )
+            } else {
+                rect = CGRect(
+                    x: CGFloat(candidate.bounds.x) * sx,
+                    y: CGFloat(candidate.bounds.y) * sy,
+                    width: CGFloat(candidate.bounds.width) * sx,
+                    height: CGFloat(candidate.bounds.height) * sy
+                )
+            }
+            stroke.setStroke()
+            let path = NSBezierPath(rect: rect.insetBy(dx: -2, dy: -2))
+            path.lineWidth = 2
+            path.stroke()
+            let label = candidate.mark.label as NSString
+            let textSize = label.size(withAttributes: textAttrs)
+            let badge = CGRect(
+                x: rect.minX,
+                y: min(CGFloat(pixelHeight) - textSize.height - 4, rect.maxY + 2),
+                width: max(22, textSize.width + 8),
+                height: textSize.height + 4
+            )
+            fill.setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 5, yRadius: 5).fill()
+            label.draw(
+                in: badge.insetBy(dx: 4, dy: 2),
+                withAttributes: textAttrs
+            )
+        }
+    }
+
     static func quantized(_ value: Double) -> Int {
         guard value.isFinite else { return 0 }
         let rounded = value.rounded()
@@ -432,5 +897,16 @@ private extension Double {
     var clampedToUnit: Double {
         guard isFinite else { return 0 }
         return min(1, max(0, self))
+    }
+}
+
+private extension ScreenElementIndex.Bounds {
+    init(_ rect: CGRect) {
+        self.init(
+            x: Double(rect.minX),
+            y: Double(rect.minY),
+            width: Double(rect.width),
+            height: Double(rect.height)
+        )
     }
 }

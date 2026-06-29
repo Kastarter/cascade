@@ -1,13 +1,13 @@
 import CoreGraphics
 import Foundation
 
-public enum GroundingVerifierVerdict: String, Equatable, Sendable {
+public enum GroundingVerifierVerdict: String, Codable, Equatable, Sendable {
     case accept
     case reject
     case abstain
 }
 
-public enum GroundingVerifierFailureKind: String, Equatable, Sendable {
+public enum GroundingVerifierFailureKind: String, Codable, Equatable, Sendable {
     case noCandidates
     case missingPoint
     case offscreen

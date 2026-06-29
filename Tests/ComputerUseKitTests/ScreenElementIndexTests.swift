@@ -1,3 +1,4 @@
+import CoreGraphics
 import Testing
 
 @testable import ComputerUseKit
@@ -66,6 +67,29 @@ struct ScreenElementIndexTests {
 
         #expect(original.map(\.id) == shuffled.map(\.id))
         #expect(original.map(\.label) == ["First name", "Cancel", "Save"])
+    }
+
+    @Test func indexedCandidatesCarryDisplayAndImageBounds() {
+        let display = bounds(20, 30, 120, 40)
+        let image = bounds(40, 60, 240, 80)
+        let index = ScreenElementIndex.build(from: [
+            candidate(label: "Send", role: .button, source: .accessibility, bounds: display, imageBounds: image)
+        ])
+
+        #expect(index.first?.bounds == display)
+        #expect(index.first?.imageBounds == image)
+        #expect(index.first?.center == CGPoint(x: 80, y: 50))
+    }
+
+    @Test func bestCandidateUsesSharedTextTrustPolicy() {
+        let index = ScreenElementIndex.build(from: [
+            candidate(label: "Send", role: .text, source: .ocr, bounds: bounds(10, 10, 50, 20), trust: 0.45),
+            candidate(label: "Send", role: .button, source: .accessibility, bounds: bounds(10, 10, 80, 32), trust: 0.95),
+            candidate(label: "Settings", role: .button, source: .accessibility, bounds: bounds(120, 10, 80, 32), trust: 0.95),
+        ])
+
+        #expect(ScreenElementIndex.bestCandidate(for: "the send button", in: index)?.label == "Send")
+        #expect(ScreenElementIndex.bestCandidate(for: "missing", in: index) == nil)
     }
 
     @Test func markLabelsAreUniqueReadableAndInReadingOrder() {
@@ -155,6 +179,28 @@ struct ScreenElementIndexTests {
     ) -> ScreenElementIndex.Candidate {
         ScreenElementIndex.Candidate(
             bounds: bounds,
+            imageBounds: nil,
+            label: label,
+            role: role,
+            source: source,
+            confidence: confidence,
+            trust: trust,
+            clickSafety: clickSafety)
+    }
+
+    private func candidate(
+        label: String,
+        role: ScreenElementIndex.Role,
+        source: ScreenElementIndex.Source,
+        bounds: ScreenElementIndex.Bounds,
+        imageBounds: ScreenElementIndex.Bounds?,
+        confidence: Double = 0.90,
+        trust: Double? = nil,
+        clickSafety: ScreenElementIndex.ClickSafety? = nil
+    ) -> ScreenElementIndex.Candidate {
+        ScreenElementIndex.Candidate(
+            bounds: bounds,
+            imageBounds: imageBounds,
             label: label,
             role: role,
             source: source,
