@@ -11,6 +11,34 @@ import ProviderKit
 import SandboxKit
 import WasteDetection
 
+public struct VisualGrounderRuntimeStatus: Equatable, Sendable {
+    public let preset: GrounderPreset
+    public let backend: String
+    public let modelID: String
+    public let endpoint: String
+    public let coordSpace: UITARSGrounder.CoordSpace
+    public let probeStatus: String
+    public let lastMiniEvalScore: Double?
+
+    public init(
+        preset: GrounderPreset,
+        backend: String,
+        modelID: String,
+        endpoint: String,
+        coordSpace: UITARSGrounder.CoordSpace,
+        probeStatus: String,
+        lastMiniEvalScore: Double?
+    ) {
+        self.preset = preset
+        self.backend = backend
+        self.modelID = modelID
+        self.endpoint = endpoint
+        self.coordSpace = coordSpace
+        self.probeStatus = probeStatus
+        self.lastMiniEvalScore = lastMiniEvalScore
+    }
+}
+
 /// One real Q&A turn over local context — drives the Reel "Ask about this moment" thread.
 /// A moment an answer was grounded in — rendered as a proof chip under the
 /// reply; clicking it jumps the Reel to that exact point in time.
@@ -249,6 +277,15 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var groqKeyMessage = "Groq key is not connected (for the cheaper Groq models)."
     @Published public private(set) var hasOpenRouterKey = false
     @Published public private(set) var openRouterKeyMessage = "OpenRouter key is not connected (for hosted UI-TARS grounding)."
+    @Published public private(set) var visualGrounderRuntime = VisualGrounderRuntimeStatus(
+        preset: GrounderRegistry.preset(id: nil),
+        backend: "uitars",
+        modelID: GUIGrounderModel.uiTars15_7b,
+        endpoint: GrounderRegistry.defaultHostedEndpoint,
+        coordSpace: .smartResize,
+        probeStatus: "not run",
+        lastMiniEvalScore: nil
+    )
     @Published public private(set) var permissionDiagnostics = PermissionProbe.diagnostics()
     @Published public private(set) var screenAgentReady = false
     @Published public private(set) var screenAgentMessage = "Checking real-screen driver health."
@@ -2439,7 +2476,37 @@ public final class CascadeAppModel: ObservableObject {
         recordGroundingSelectionEvidence(from: agent, screenChanged: true)
     }
 
+    private func recordGroundingVisibleEffect(from agent: ScoutAgent) {
+        guard let id = agent.lastGroundCandidateID,
+              let source = agent.lastGroundSource,
+              let confidence = agent.lastGroundConfidence else { return }
+        groundingCandidateFailureCounts[id] = 0
+        previousGroundingAnchor = MixtureGrounder.VerifiedGroundingAnchor(
+            score: confidence,
+            source: source,
+            hash: id,
+            verifiedAt: Date()
+        )
+        recordGroundingSelectionEvidence(from: agent, screenChanged: true)
+    }
+
     private func recordGroundingSelectionEvidence(from agent: ComputerUseAgent, screenChanged: Bool) {
+        guard let id = agent.lastGroundCandidateID,
+              let source = agent.lastGroundSource,
+              let confidence = agent.lastGroundConfidence,
+              let target = agent.lastGroundTarget else { return }
+        let front = NSWorkspace.shared.frontmostApplication
+        episodeGroundingSelections.append(GroundingSelectionEvidence(
+            app: front?.localizedName ?? "Unknown",
+            target: target,
+            source: source,
+            candidateID: id,
+            confidence: confidence,
+            screenChanged: screenChanged
+        ))
+    }
+
+    private func recordGroundingSelectionEvidence(from agent: ScoutAgent, screenChanged: Bool) {
         guard let id = agent.lastGroundCandidateID,
               let source = agent.lastGroundSource,
               let confidence = agent.lastGroundConfidence,
@@ -2510,29 +2577,18 @@ public final class CascadeAppModel: ObservableObject {
         if let visualGrounderOverride {
             base = visualGrounderOverride
         } else {
-            switch d.string(forKey: "cascade.visualGrounder.backend") {
-            case "claude":
-                base = ClaudeVisualGrounder()
-            default:
-                // Default (and explicit "uitars"): hosted UI-TARS over OpenRouter.
-                // Requires the key; without it return nil → coordinate fallback.
-                guard let key = OpenRouterKeyStore().readKey(), !key.isEmpty else { return nil }
-                // The grounder is SWAPPABLE without a rebuild — point `…model` at
-                // UI-Venus-1.5 / Holo1.5 the moment a host serves them (OpenRouter doesn't
-                // yet; UI-TARS is the proven default). A swapped Qwen3-VL model emits in a
-                // different coord space → set `…coordSpace = "sent"` (or "normalized") and
-                // confirm with a live probe; a wrong space misses every click. The endpoint
-                // override is a NEW key, deliberately set: the old `…uitarsURL` once
-                // inherited a stale dead-localhost value and stalled every run.
-                let model = d.string(forKey: "cascade.visualGrounder.model") ?? GUIGrounderModel.uiTars15_7b
-                let endpoint = d.string(forKey: "cascade.visualGrounder.endpoint")
-                    .flatMap { $0.isEmpty ? nil : $0 } ?? "https://openrouter.ai/api/v1/chat/completions"
-                guard let url = URL(string: endpoint) else { return nil }
-                let space = UITARSGrounder.CoordSpace(
-                    rawValue: d.string(forKey: "cascade.visualGrounder.coordSpace") ?? ""
-                ) ?? .smartResize
-                base = UITARSGrounder(baseURL: url, model: model, apiKey: key, coordSpace: space)
-            }
+            let backend = d.string(forKey: "cascade.visualGrounder.backend")
+            let presetID = backend == "claude"
+                ? "claude"
+                : (d.string(forKey: "cascade.visualGrounder.preset") ?? GrounderRegistry.defaultPresetID)
+            guard let grounder = GrounderRegistry.makeGrounder(
+                presetID: presetID,
+                apiKey: OpenRouterKeyStore().readKey(),
+                endpointOverride: d.string(forKey: "cascade.visualGrounder.endpoint"),
+                modelOverride: d.string(forKey: "cascade.visualGrounder.model"),
+                coordSpaceOverride: d.string(forKey: "cascade.visualGrounder.coordSpace")
+            ) else { return nil }
+            base = grounder
         }
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
@@ -2833,14 +2889,35 @@ public final class CascadeAppModel: ObservableObject {
                         ))
                         return await scoutEnd(.stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way."), "noeffect-stall")
                     }
-                    _ = try? await store.appendAudit(AuditEvent(
-                        actor: "agent", action: "assist.noeffect",
-                        detail: Self.assistNoEffectAuditDetail(turn: count, status: "scout-no-effect", noEffectStreak: noEffectTurns)
-                    ))
-                }
-            } else if actedThisTurn, expectsChange {
-                noEffectTurns = 0
-            }
+	                    _ = try? await store.appendAudit(AuditEvent(
+	                        actor: "agent", action: "assist.noeffect",
+	                        detail: Self.assistNoEffectAuditDetail(turn: count, status: "scout-no-effect", noEffectStreak: noEffectTurns)
+	                    ))
+	                }
+                    if let risky = agent.lastRiskyVisualClick,
+                       let verifierNudge = await runVisualStateVerifier(
+                           goal: goal,
+                           risky: risky,
+                           screenshot: observedShot,
+                           turn: count,
+                           engine: "scout"
+                       ) {
+                        nudge = [nudge, verifierNudge].compactMap { $0 }.joined(separator: " ")
+                    }
+	            } else if actedThisTurn, expectsChange {
+	                noEffectTurns = 0
+                    recordGroundingVisibleEffect(from: agent)
+                    if let risky = agent.lastRiskyVisualClick,
+                       let verifierNudge = await runVisualStateVerifier(
+                           goal: goal,
+                           risky: risky,
+                           screenshot: observedShot,
+                           turn: count,
+                           engine: "scout"
+                       ) {
+                        nudge = [nudge, verifierNudge].compactMap { $0 }.joined(separator: " ")
+                    }
+	            }
             // A copy-only/wait-only turn (acted but expectsChange == false) leaves
             // noEffectTurns untouched: it neither failed nor proved progress.
             if let observedHashes { lastFrameHashes = observedHashes }
@@ -3204,10 +3281,10 @@ public final class CascadeAppModel: ObservableObject {
 	                    noEffectTurns = 0
 	                    recordGroundingVisibleEffect(from: agent)
 	                    _ = try? await store.appendAudit(AuditEvent(
-                        actor: "agent", action: "assist.noeffect",
-                        detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
-                    ))
-		                } else {
+	                        actor: "agent", action: "assist.noeffect",
+	                        detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
+	                    ))
+			                } else {
 		                    noEffectTurns += 1
 		                    recordGroundingNoEffect(from: agent)
 		                    if noEffectTurns >= 2, !noEffectVerifierUsed {
@@ -3311,12 +3388,32 @@ public final class CascadeAppModel: ObservableObject {
                     // (browsers excluded) inside ocrSetOfMarks.
                     if let ocr = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count, turn: count + 1) {
                         nudge! += "\n" + ocr
-                    }
+	                    }
+	                }
+                if actedThisTurn, expectsChange, let risky = agent.lastRiskyVisualClick,
+                   let verifierNudge = await runVisualStateVerifier(
+                       goal: goal,
+                       risky: risky,
+                       screenshot: observedShot,
+                       turn: count + 1,
+                       engine: "opus"
+                   ) {
+                    nudge = [nudge, verifierNudge].compactMap { $0 }.joined(separator: " ")
                 }
-	            } else if actedThisTurn, !observationOnly, expectsChange {
+            } else if actedThisTurn, !observationOnly, expectsChange {
 	                noEffectTurns = 0
 	                recordGroundingVisibleEffect(from: agent)
-	            }
+                if let risky = agent.lastRiskyVisualClick,
+                   let verifierNudge = await runVisualStateVerifier(
+                       goal: goal,
+                       risky: risky,
+                       screenshot: observedShot,
+                       turn: count + 1,
+                       engine: "opus"
+                   ) {
+                    nudge = [nudge, verifierNudge].compactMap { $0 }.joined(separator: " ")
+                }
+            }
             // A copy-only/wait-only acting turn leaves noEffectTurns untouched.
             if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
@@ -3704,6 +3801,69 @@ public final class CascadeAppModel: ObservableObject {
         return "Verifier state: \(result.state). Next: \(result.nextStrategy). Avoid: \(result.avoid)."
     }
 
+    private func runVisualStateVerifier(
+        goal: String,
+        risky: RiskyVisualGroundingClick,
+        screenshot: Data,
+        turn: Int,
+        engine: String
+    ) async -> String? {
+        guard hasAnthropicKey else {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "assist.verify_state",
+                detail: Self.visualStateVerifierUnavailableAuditDetail(turn: turn, engine: engine, risky: risky)
+            ))
+            return nil
+        }
+        let context = [scoutGroundingNote(), groundingNote()].compactMap { $0 }.joined(separator: "\n")
+        guard let result = try? await VisualStateVerifier().verify(
+            goal: goal,
+            clickTarget: risky.target,
+            expectedState: Self.expectedVisualState(for: risky),
+            currentScreenshotJPEG: screenshot,
+            visibleContext: context.isEmpty ? nil : context
+        ) else {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "assist.verify_state",
+                detail: Self.visualStateVerifierUnavailableAuditDetail(turn: turn, engine: engine, risky: risky)
+            ))
+            return nil
+        }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.verify_state",
+            detail: Self.visualStateVerifierAuditDetail(turn: turn, engine: engine, risky: risky, result: result)
+        ))
+        guard result.verdict == .negative else { return nil }
+        let appName = AppWindowObserver.snapshot().appName
+        let tokens = TrajectorySketch.normalizedGoalTokens(from: goal)
+        if !tokens.isEmpty, appName != "Unknown app" {
+            _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
+                appName: appName,
+                normalizedGoalTokens: Array(tokens.prefix(10)),
+                failureKind: .groundingMiss,
+                firstBadAction: "visual click \(risky.target)",
+                targetHash: Self.auditHash(risky.target),
+                stateSummary: result.state,
+                repairHint: result.nextStrategy
+            ))
+        }
+        return "Visual check: \(result.state). Try: \(result.nextStrategy)."
+    }
+
+    private static func expectedVisualState(for risky: RiskyVisualGroundingClick) -> String {
+        switch risky.risk {
+        case .destructive:
+            return "A confirmation, submitted state, sent item, navigation, or visible destructive-action result should appear."
+        case .high:
+            return "The intended menu, edit mode, context menu, or opened item should appear."
+        case .visual, .normal:
+            return "The clicked control should visibly focus, open, navigate, or change state."
+        }
+    }
+
     nonisolated static func actionSummary(_ actions: [CUAction]) -> String {
         let labels = actions.prefix(4).map { action -> String in
             switch action {
@@ -3848,6 +4008,42 @@ public final class CascadeAppModel: ObservableObject {
             textAuditDetail("state", result.state),
             textAuditDetail("nextStrategy", result.nextStrategy),
             textAuditDetail("avoid", result.avoid),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func visualStateVerifierAuditDetail(
+        turn: Int,
+        engine: String,
+        risky: RiskyVisualGroundingClick,
+        result: VisualStateVerifierResult
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "engine=\(safeAuditToken(engine))",
+            "verdict=\(safeAuditToken(result.verdict.rawValue))",
+            "source=\(safeAuditToken(risky.source.rawValue))",
+            "risk=\(safeAuditToken(risky.risk.rawValue))",
+            "confidence=\(String(format: "%.2f", risky.confidence))",
+            "dispersion=\(risky.dispersion.map { String(format: "%.1f", $0) } ?? "none")",
+            "targetHash=\(auditHash(risky.target))",
+            textAuditDetail("state", result.state),
+            textAuditDetail("nextStrategy", result.nextStrategy),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func visualStateVerifierUnavailableAuditDetail(
+        turn: Int,
+        engine: String,
+        risky: RiskyVisualGroundingClick
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "engine=\(safeAuditToken(engine))",
+            "verdict=unavailable",
+            "source=\(safeAuditToken(risky.source.rawValue))",
+            "risk=\(safeAuditToken(risky.risk.rawValue))",
+            "confidence=\(String(format: "%.2f", risky.confidence))",
+            "targetHash=\(auditHash(risky.target))",
         ].joined(separator: " ")
     }
 
@@ -7687,6 +7883,79 @@ public final class CascadeAppModel: ObservableObject {
         openRouterKeyMessage = hasOpenRouterKey
             ? "OpenRouter key connected — the on-screen agent grounds clicks with hosted UI-TARS."
             : "Paste your OpenRouter API key to ground the on-screen agent with hosted UI-TARS (Opus plans, UI-TARS locates)."
+        refreshVisualGrounderRuntimeStatus()
+    }
+
+    private func refreshVisualGrounderRuntimeStatus() {
+        let d = defaultsStore
+        let backend = d.string(forKey: "cascade.visualGrounder.backend") ?? "uitars"
+        let presetID = backend == "claude"
+            ? "claude"
+            : (d.string(forKey: "cascade.visualGrounder.preset") ?? GrounderRegistry.defaultPresetID)
+        let preset = GrounderRegistry.preset(id: presetID)
+        let model = d.string(forKey: "cascade.visualGrounder.model")
+            .flatMap { $0.isEmpty ? nil : $0 } ?? preset.modelID
+        let endpoint = d.string(forKey: "cascade.visualGrounder.endpoint")
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? (preset.endpointClass == .hosted ? GrounderRegistry.defaultHostedEndpoint : "http://localhost:8000/v1/chat/completions")
+        let coordSpace = UITARSGrounder.CoordSpace(
+            rawValue: d.string(forKey: "cascade.visualGrounder.coordSpace") ?? ""
+        ) ?? preset.coordinateSpace
+        let score = d.object(forKey: "cascade.visualGrounder.lastMiniEvalScore") as? Double
+        visualGrounderRuntime = VisualGrounderRuntimeStatus(
+            preset: preset,
+            backend: backend,
+            modelID: model,
+            endpoint: endpoint,
+            coordSpace: coordSpace,
+            probeStatus: d.string(forKey: "cascade.visualGrounder.coordProbeStatus") ?? "not run",
+            lastMiniEvalScore: score
+        )
+    }
+
+    public func selectVisualGrounderPreset(_ presetID: String) {
+        let preset = GrounderRegistry.preset(id: presetID)
+        defaultsStore.set(preset.id, forKey: "cascade.visualGrounder.preset")
+        defaultsStore.set(preset.endpointClass == .claude ? "claude" : "uitars", forKey: "cascade.visualGrounder.backend")
+        defaultsStore.set(preset.modelID, forKey: "cascade.visualGrounder.model")
+        defaultsStore.set(preset.coordinateSpace.rawValue, forKey: "cascade.visualGrounder.coordSpace")
+        if preset.endpointClass == .hosted {
+            defaultsStore.set(GrounderRegistry.defaultHostedEndpoint, forKey: "cascade.visualGrounder.endpoint")
+        } else if defaultsStore.string(forKey: "cascade.visualGrounder.endpoint")?.isEmpty != false {
+            defaultsStore.set("http://localhost:8000/v1/chat/completions", forKey: "cascade.visualGrounder.endpoint")
+        }
+        defaultsStore.set("not run", forKey: "cascade.visualGrounder.coordProbeStatus")
+        refreshVisualGrounderRuntimeStatus()
+    }
+
+    public func updateVisualGrounderEndpoint(_ endpoint: String) {
+        defaultsStore.set(endpoint.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "cascade.visualGrounder.endpoint")
+        defaultsStore.set("not run", forKey: "cascade.visualGrounder.coordProbeStatus")
+        refreshVisualGrounderRuntimeStatus()
+    }
+
+    public func updateVisualGrounderCoordSpace(_ rawValue: String) {
+        guard UITARSGrounder.CoordSpace(rawValue: rawValue) != nil else { return }
+        defaultsStore.set(rawValue, forKey: "cascade.visualGrounder.coordSpace")
+        defaultsStore.set("not run", forKey: "cascade.visualGrounder.coordProbeStatus")
+        refreshVisualGrounderRuntimeStatus()
+    }
+
+    public func runVisualGrounderCoordinateProbe() {
+        let coordSpace = visualGrounderRuntime.coordSpace
+        let output = GrounderRegistry.syntheticProbeOutput(for: coordSpace)
+        let probe = GrounderRegistry.probeCoordSpace(coordSpace: coordSpace, modelOutput: output)
+        let status: String
+        switch probe.status {
+        case .passed:
+            status = "passed \(coordSpace.rawValue)"
+        case .failed:
+            status = "failed \(coordSpace.rawValue)"
+        case .parseMiss:
+            status = "parse miss \(coordSpace.rawValue)"
+        }
+        defaultsStore.set(status, forKey: "cascade.visualGrounder.coordProbeStatus")
+        refreshVisualGrounderRuntimeStatus()
     }
 
     public func saveAnthropicKey(_ key: String) {

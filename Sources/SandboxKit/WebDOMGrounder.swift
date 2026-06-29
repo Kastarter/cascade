@@ -35,16 +35,116 @@ public struct WebDOMGrounder: VisualGrounder {
     public func ground(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> CGPoint? {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ).selectedPoint
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
         // DOM-first: free, exact, sees contenteditable. The viewport height flips the
         // top-left CSS point the DOM reports into the bottom-left space the sandbox
         // executor consumes (the same space WebSandbox.height defines).
         if let point = await sandbox.domGround(target: target, viewportHeight: CGFloat(displayHeightPoints)) {
-            return point
+            let rect = UITARSGrounder.boxAround(
+                point: point,
+                displayW: displayWidthPoints,
+                displayH: displayHeightPoints
+            )
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: point,
+                        region: rect,
+                        confidence: 0.96,
+                        source: .dom,
+                        coordinateSpace: .displayLocalAppKitPoints,
+                        reason: "dom label match",
+                        candidateID: "dom-\(Self.stableHash(target))",
+                        displayBounds: rect
+                    )
+                ],
+                selectedIndex: 0
+            )
         }
         // Visual fallback (UI-TARS on the snapshot) for what the DOM can't name.
-        return await fallback?.ground(
-            screenshot: screenshot, target: target,
-            displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        guard let fallback else {
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: nil,
+                        confidence: 0,
+                        source: .dom,
+                        coordinateSpace: .viewportCSSPixelsTopLeft,
+                        reason: "dom miss; no visual fallback"
+                    )
+                ],
+                selectedIndex: nil,
+                verifierVerdict: .abstain,
+                verifierFailureKind: .noCandidates
+            )
+        }
+        let result = await fallback.groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
         )
+        guard !result.candidates.isEmpty else {
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: nil,
+                        confidence: 0,
+                        source: .dom,
+                        coordinateSpace: .viewportCSSPixelsTopLeft,
+                        reason: "dom miss; visual fallback miss"
+                    )
+                ],
+                selectedIndex: nil,
+                verifierVerdict: result.verifierVerdict ?? .abstain,
+                verifierFailureKind: result.verifierFailureKind ?? .noCandidates
+            )
+        }
+        return GroundingResult(
+            candidates: result.candidates.map { candidate in
+                GroundingCandidate(
+                    point: candidate.point,
+                    region: candidate.region,
+                    confidence: candidate.confidence,
+                    source: candidate.source,
+                    coordinateSpace: candidate.coordinateSpace,
+                    rawModel: candidate.rawModel,
+                    latency: candidate.latency,
+                    dispersion: candidate.dispersion,
+                    reason: [candidate.reason, "dom fallback"].compactMap { $0 }.joined(separator: " "),
+                    candidateID: candidate.candidateID,
+                    markNumber: candidate.markNumber,
+                    displayBounds: candidate.displayBounds,
+                    imageBounds: candidate.imageBounds
+                )
+            },
+            selectedIndex: result.selectedIndex,
+            selectedCandidateID: result.selectedCandidateID,
+            verifierVerdict: result.verifierVerdict,
+            verifierFailureKind: result.verifierFailureKind,
+            alternativeCount: result.alternativeCount
+        )
+    }
+
+    private static func stableHash(_ value: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.lowercased().utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
     }
 }

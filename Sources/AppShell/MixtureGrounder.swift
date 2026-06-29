@@ -195,6 +195,22 @@ public struct MixtureGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> GroundingResult {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            options: .default
+        )
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult {
         let target = await targetWithRuntimeHints(target)
         guard verifyCandidates else {
             guard groundingCache != nil else {
@@ -207,14 +223,17 @@ public struct MixtureGrounder: VisualGrounder {
                     return indexed
                 }
                 let start = ContinuousClock.now
-                let point = await ground(
+                let result = await base.groundResult(
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
-                    displayHeightPoints: displayHeightPoints
+                    displayHeightPoints: displayHeightPoints,
+                    options: options
                 )
                 let elapsed = start.duration(to: ContinuousClock.now)
-                return GroundingResult.legacy(point: point, latency: elapsed.mixtureTimeInterval)
+                return result.selectedCandidate?.latency == nil
+                    ? Self.withLatency(result, elapsed.mixtureTimeInterval)
+                    : result
             }
             let start = ContinuousClock.now
             if !Self.namesCanvasConcept(target),
@@ -230,7 +249,8 @@ public struct MixtureGrounder: VisualGrounder {
                 screenshot: screenshot,
                 target: target,
                 displayWidthPoints: displayWidthPoints,
-                displayHeightPoints: displayHeightPoints
+                displayHeightPoints: displayHeightPoints,
+                options: options
             )
             let elapsed = start.duration(to: ContinuousClock.now)
             return result.selectedCandidate?.latency == nil
@@ -269,7 +289,8 @@ public struct MixtureGrounder: VisualGrounder {
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
-                    displayHeightPoints: displayHeightPoints
+                    displayHeightPoints: displayHeightPoints,
+                    options: options
                 )
             }
             let selection = Self.selectVerifiedCandidate(
@@ -326,7 +347,8 @@ public struct MixtureGrounder: VisualGrounder {
         screenshot: Data,
         target: String,
         displayWidthPoints: Int,
-        displayHeightPoints: Int
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions = .default
     ) async -> GroundingResult {
         let cacheProbe = await groundingCacheProbe(
             screenshot: screenshot,
@@ -353,7 +375,8 @@ public struct MixtureGrounder: VisualGrounder {
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
-                    displayHeightPoints: displayHeightPoints
+                    displayHeightPoints: displayHeightPoints,
+                    options: options
                 )
             }
             await storeGroundingCacheResult(result, key: key)
@@ -828,7 +851,8 @@ public struct MixtureGrounder: VisualGrounder {
         let verifierResult = GroundingVerifier().verify(verifierCandidates, context: context)
 
         guard let previousAnchor else {
-            if Self.shouldUseBestOfN(
+            if verifierResult.failureKind != .ambiguous,
+               Self.shouldUseBestOfN(
                 baseResult: baseResult,
                 verifierResult: verifierResult,
                 context: context,
@@ -859,7 +883,8 @@ public struct MixtureGrounder: VisualGrounder {
             $0.failureKind == nil && $0.score >= context.acceptThreshold
         }
         guard !strongScores.isEmpty else {
-            if let selectedID = Self.bestOfNCandidateID(
+            if verifierResult.failureKind != .ambiguous,
+               let selectedID = Self.bestOfNCandidateID(
                 from: verifierCandidates,
                 verifierResult: verifierResult,
                 context: context,
@@ -912,11 +937,14 @@ public struct MixtureGrounder: VisualGrounder {
                 verifierResult: verifierResult
             )
         case .retryNextCandidate:
+            let accepted = drift.selected.map {
+                Self.bestOfNAcceptedResult(selectedID: $0.id, verifierResult: verifierResult)
+            } ?? verifierResult
             return Self.selection(
                 from: verifierCandidates,
                 selectedID: drift.selected?.id,
                 outcome: .retryNextCandidate,
-                verifierResult: verifierResult
+                verifierResult: accepted
             )
         case .demote:
             return Self.selection(

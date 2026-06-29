@@ -208,10 +208,24 @@ public final class ScoutAgent {
     /// (450,438)` or `miss "New Document"`. Lets the audit show WHERE each grounded
     /// click landed (or that it found nothing), the visibility we were missing.
     public private(set) var lastGroundLog: String?
+    public private(set) var lastGroundTarget: String?
+    public private(set) var lastGroundCandidateID: String?
+    public private(set) var lastGroundSource: GroundingSource?
+    public private(set) var lastGroundConfidence: Double?
+    public private(set) var lastGroundDispersion: Double?
+    public private(set) var lastGroundRisk: GroundingActionRisk?
+    public private(set) var lastRiskyVisualClick: RiskyVisualGroundingClick?
 
     private func step(screenshot: Data, note: String? = nil, carried: String? = nil, hop: Int = 0, parseRetry: Bool = false) async -> CUStep {
         lastGroundMiss = nil
         lastGroundLog = nil
+        lastGroundTarget = nil
+        lastGroundCandidateID = nil
+        lastGroundSource = nil
+        lastGroundConfidence = nil
+        lastGroundDispersion = nil
+        lastGroundRisk = nil
+        lastRiskyVisualClick = nil
         var user = "Goal: \(goal)\n\nDecide the next action(s) and reply with the JSON object only."
         if let carried, !carried.isEmpty { user += "\n\nResults of your tool calls:\n" + carried }
         if let note, !note.isEmpty { user += "\n\n" + note }
@@ -292,8 +306,18 @@ public final class ScoutAgent {
         await withTaskGroup(of: (Int, String, GroundingResult).self) { group in
             for (i, a) in batch.enumerated() {
                 guard let target = Self.groundTarget(of: a) else { continue }
+                let route = ComputerUseAgent.riskRoute(
+                    target: target,
+                    click: a.kind == .doubleClick ? "double" : a.click
+                )
                 group.addTask {
-                    (i, target, await g.groundResult(screenshot: screenshot, target: target, displayWidthPoints: dw, displayHeightPoints: dh))
+                    (i, target, await g.groundResult(
+                        screenshot: screenshot,
+                        target: target,
+                        displayWidthPoints: dw,
+                        displayHeightPoints: dh,
+                        options: ComputerUseAgent.groundingOptions(for: route)
+                    ))
                 }
             }
             for await r in group { groundResults.append(r) }
@@ -301,15 +325,48 @@ public final class ScoutAgent {
         var grounded: [Int: CGPoint] = [:]
         var logs: [String] = []
         for r in groundResults.sorted(by: { $0.idx < $1.idx }) {
-            if let candidate = r.result.selectedCandidate,
+            let action = batch[r.idx]
+            let route = ComputerUseAgent.riskRoute(
+                target: r.target,
+                click: action.kind == .doubleClick ? "double" : action.click
+            )
+            if ComputerUseAgent.allowsGroundedAction(r.result, route: route),
+               let candidate = r.result.selectedCandidate,
                let p = candidate.point,
                let safePoint = Self.safeGroundedPoint(p, displayWidth: dw, displayHeight: dh) {
                 grounded[r.idx] = safePoint
+                lastGroundTarget = r.target
+                lastGroundCandidateID = candidate.candidateID ?? r.result.selectedCandidateID
+                lastGroundSource = candidate.source
+                lastGroundConfidence = candidate.confidence
+                lastGroundDispersion = candidate.dispersion
+                lastGroundRisk = route.risk
+                if (action.kind == .click || action.kind == .doubleClick),
+                   ComputerUseAgent.isRiskyVisualClick(candidate, route: route) {
+                    lastRiskyVisualClick = RiskyVisualGroundingClick(
+                        target: r.target,
+                        source: candidate.source,
+                        confidence: candidate.confidence,
+                        dispersion: candidate.dispersion,
+                        risk: route.risk,
+                        reason: candidate.reason
+                    )
+                }
                 let reason = candidate.reason.map { " reason=\(Self.safeLogToken($0))" } ?? ""
-                logs.append("hit \"\(r.target)\" source=\(candidate.source.rawValue) confidence=\(String(format: "%.2f", candidate.confidence)) @(\(Int(safePoint.x)),\(Int(safePoint.y)))\(reason)")
+                let id = (candidate.candidateID ?? r.result.selectedCandidateID).map { " id=\(Self.safeLogToken($0))" } ?? ""
+                let dispersion = candidate.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
+                let verdict = r.result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
+                let failure = r.result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
+                logs.append("hit \"\(r.target)\" source=\(candidate.source.rawValue)\(id) confidence=\(String(format: "%.2f", candidate.confidence))\(dispersion) risk=\(route.risk.rawValue) @(\(Int(safePoint.x)),\(Int(safePoint.y))) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)\(reason)")
             } else {
                 if lastGroundMiss == nil { lastGroundMiss = r.target }
-                logs.append("miss \"\(r.target)\"")
+                let candidate = r.result.selectedCandidate
+                let source = candidate.map { " source=\($0.source.rawValue)" } ?? ""
+                let confidence = candidate.map { " confidence=\(String(format: "%.2f", $0.confidence))" } ?? ""
+                let dispersion = candidate?.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
+                let verdict = r.result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
+                let failure = r.result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
+                logs.append("miss \"\(r.target)\"\(source)\(confidence)\(dispersion) risk=\(route.risk.rawValue) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)")
             }
         }
         lastGroundLog = logs.isEmpty ? nil : logs.joined(separator: "; ")

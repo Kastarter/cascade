@@ -137,6 +137,20 @@ public struct WasteDetector: Sendable {
         self.maxRunLength = maxRunLength
     }
 
+    public func groundingCorpusJSONL(
+        contexts: [RecordedContext],
+        inputEvents: [InputEvent],
+        recipe: AgentRecipe? = nil,
+        options: GroundingCorpusExporter.Options = .init()
+    ) throws -> String {
+        try GroundingCorpusExporter().jsonl(
+            clicks: inputEvents,
+            contexts: contexts,
+            recipe: recipe,
+            options: options
+        )
+    }
+
     public func detect(
         contexts: [RecordedContext],
         inputEvents: [InputEvent],
