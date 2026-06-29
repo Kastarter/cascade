@@ -81,6 +81,59 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
         }
     }
 
+    public struct Mutation: Equatable, Hashable, Sendable {
+        public let kind: String
+        public let targetRole: String
+        public let targetName: String
+        public let targetPath: String
+        public let attributeName: String
+        public let oldValueHash: String
+        public let newValueHash: String
+
+        public init(
+            kind: String = "",
+            targetRole: String = "",
+            targetName: String = "",
+            targetPath: String = "",
+            attributeName: String = "",
+            oldValueHash: String = "",
+            newValueHash: String = ""
+        ) {
+            self.kind = kind
+            self.targetRole = targetRole
+            self.targetName = targetName
+            self.targetPath = targetPath
+            self.attributeName = attributeName
+            self.oldValueHash = oldValueHash
+            self.newValueHash = newValueHash
+        }
+
+        public init(snapshot: Any?) {
+            let dict = WebStateSignature.dictionary(snapshot)
+            self.init(
+                kind: WebStateSignature.string(dict["kind"]) ?? WebStateSignature.string(dict["type"]) ?? "",
+                targetRole: WebStateSignature.string(dict["targetRole"]) ?? "",
+                targetName: WebStateSignature.string(dict["targetName"]) ?? "",
+                targetPath: WebStateSignature.string(dict["targetPath"]) ?? WebStateSignature.string(dict["path"]) ?? "",
+                attributeName: WebStateSignature.string(dict["attributeName"]) ?? WebStateSignature.string(dict["attribute"]) ?? "",
+                oldValueHash: WebStateSignature.string(dict["oldValueHash"]) ?? "",
+                newValueHash: WebStateSignature.string(dict["newValueHash"]) ?? ""
+            )
+        }
+
+        fileprivate var canonicalValue: [String: Any] {
+            [
+                "kind": kind,
+                "targetRole": targetRole,
+                "targetName": targetName,
+                "targetPath": targetPath,
+                "attributeName": attributeName,
+                "oldValueHash": oldValueHash,
+                "newValueHash": newValueHash
+            ]
+        }
+    }
+
     public let url: String
     public let title: String
     public let activeElement: ActiveElement
@@ -91,6 +144,7 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
     public let contentEditableTextHash: String
     public let ariaTextHash: String
     public let mutationSequence: Int
+    public let mutations: [Mutation]
     public let stableHash: String
 
     public init(
@@ -103,7 +157,8 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
         checkedSelectedHash: String,
         contentEditableTextHash: String,
         ariaTextHash: String,
-        mutationSequence: Int
+        mutationSequence: Int,
+        mutations: [Mutation] = []
     ) {
         self.url = url
         self.title = title
@@ -115,6 +170,7 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
         self.contentEditableTextHash = contentEditableTextHash
         self.ariaTextHash = ariaTextHash
         self.mutationSequence = mutationSequence
+        self.mutations = mutations
         self.stableHash = Self.hashCanonical([
             "url": url,
             "title": title,
@@ -125,7 +181,8 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
             "checkedSelectedHash": checkedSelectedHash,
             "contentEditableTextHash": contentEditableTextHash,
             "ariaTextHash": ariaTextHash,
-            "mutationSequence": mutationSequence
+            "mutationSequence": mutationSequence,
+            "mutations": mutations.map(\.canonicalValue)
         ])
     }
 
@@ -142,7 +199,8 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
             checkedSelectedHash: Self.hashField(snapshot, hashKey: "checkedSelectedHash", rawKeys: ["checkedSelected", "checkedSelectedState"]),
             contentEditableTextHash: Self.hashField(snapshot, hashKey: "contentEditableTextHash", rawKeys: ["contentEditableText", "contentEditable"]),
             ariaTextHash: Self.hashField(snapshot, hashKey: "ariaTextHash", rawKeys: ["ariaText", "ariaTexts"]),
-            mutationSequence: Self.integer(snapshot["mutationSequence"]) ?? 0
+            mutationSequence: Self.integer(snapshot["mutationSequence"]) ?? 0,
+            mutations: Self.array(snapshot["mutations"] ?? snapshot["mutationRing"]).map(Mutation.init(snapshot:))
         )
     }
 
@@ -150,13 +208,116 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
         let urlHash = Self.hashCanonical(url)
         let titleHash = Self.hashCanonical(title)
         let activeElementHash = Self.hashCanonical(activeElement.canonicalValue)
-        return "WebStateSignature(urlHash: \(urlHash), titleHash: \(titleHash), activeElementHash: \(activeElementHash), scroll: \(scroll), interactivesHash: \(interactivesHash), formValuesHash: \(formValuesHash), checkedSelectedHash: \(checkedSelectedHash), contentEditableTextHash: \(contentEditableTextHash), ariaTextHash: \(ariaTextHash), mutationSequence: \(mutationSequence), stableHash: \(stableHash))"
+        return "WebStateSignature(urlHash: \(urlHash), titleHash: \(titleHash), activeElementHash: \(activeElementHash), scroll: \(scroll), interactivesHash: \(interactivesHash), formValuesHash: \(formValuesHash), checkedSelectedHash: \(checkedSelectedHash), contentEditableTextHash: \(contentEditableTextHash), ariaTextHash: \(ariaTextHash), mutationSequence: \(mutationSequence), mutations: \(mutations.count), stableHash: \(stableHash))"
     }
+
+    public static let mutationObserverInstallScript = #"""
+    (() => {
+      if (window.__cascadeWebStateObserver) return;
+      const canonical = (value) => {
+        if (value === null || value === undefined) return "null";
+        if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+        if (typeof value === "object") {
+          return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
+        }
+        if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+        if (typeof value === "boolean") return value ? "true" : "false";
+        return JSON.stringify(String(value));
+      };
+      const hash = (value) => {
+        let h = 0xcbf29ce484222325n;
+        const bytes = new TextEncoder().encode(canonical(value));
+        for (const byte of bytes) {
+          h ^= BigInt(byte);
+          h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+        }
+        return "fnv64:" + h.toString(16).padStart(16, "0");
+      };
+      const clip = (text, max = 120) => String(text || "").replace(/\s+/g, " ").trim().slice(0, max);
+      const cssPath = (el) => {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
+        if (el.id) return "#" + CSS.escape(el.id);
+        const parts = [];
+        for (let node = el; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 6; node = node.parentElement) {
+          let part = node.localName || node.tagName.toLowerCase();
+          const parent = node.parentElement;
+          if (parent) part += ":nth-of-type(" + (Array.from(parent.children).filter((sibling) => sibling.localName === node.localName).indexOf(node) + 1) + ")";
+          parts.unshift(part);
+        }
+        return parts.join(">");
+      };
+      const targetInfo = (node) => {
+        const el = node && node.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+        return {
+          targetRole: clip(el?.getAttribute?.("role") || el?.localName || ""),
+          targetName: clip(el?.id || el?.getAttribute?.("name") || el?.getAttribute?.("aria-label") || ""),
+          targetPath: cssPath(el)
+        };
+      };
+      const pushMutation = (payload) => {
+        window.__cascadeWebStateMutationSequence = Number(window.__cascadeWebStateMutationSequence || 0) + 1;
+        const ring = window.__cascadeWebStateMutations || [];
+        ring.push(payload);
+        window.__cascadeWebStateMutations = ring.slice(-80);
+      };
+      window.__cascadeWebStateMutationSequence = Number(window.__cascadeWebStateMutationSequence || 0);
+      window.__cascadeWebStateMutations = window.__cascadeWebStateMutations || [];
+      window.__cascadeWebStateObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          const info = targetInfo(mutation.target);
+          if (mutation.type === "attributes") {
+            const nextValue = mutation.target?.getAttribute?.(mutation.attributeName || "") || "";
+            pushMutation({
+              kind: "attributes",
+              ...info,
+              attributeName: mutation.attributeName || "",
+              oldValueHash: hash(mutation.oldValue || ""),
+              newValueHash: hash(nextValue)
+            });
+          } else if (mutation.type === "characterData") {
+            pushMutation({
+              kind: "characterData",
+              ...info,
+              attributeName: "",
+              oldValueHash: hash(mutation.oldValue || ""),
+              newValueHash: hash(mutation.target?.data || "")
+            });
+          } else {
+            pushMutation({
+              kind: "childList",
+              ...info,
+              attributeName: "",
+              oldValueHash: "",
+              newValueHash: hash([mutation.addedNodes?.length || 0, mutation.removedNodes?.length || 0])
+            });
+          }
+        }
+      });
+      const root = document.documentElement || document;
+      window.__cascadeWebStateObserver.observe(root, {
+        attributes: true,
+        attributeOldValue: true,
+        childList: true,
+        characterData: true,
+        characterDataOldValue: true,
+        subtree: true
+      });
+    })();
+    """#
+
+    public static let mutationConsumeJavaScript = #"""
+    (() => {
+      const out = Array.isArray(window.__cascadeWebStateMutations) ? window.__cascadeWebStateMutations.slice() : [];
+      window.__cascadeWebStateMutations = [];
+      return out;
+    })();
+    """#
 
     /// JavaScript that returns a signature-ready dictionary from a live page.
     ///
-    /// It installs a page-local `MutationObserver` lazily and returns hashes for
-    /// mutable/sensitive collections, never raw form values or contenteditable text.
+    /// It returns hashes for mutable/sensitive collections, never raw form values
+    /// or contenteditable text. The mutation observer itself is installed by
+    /// `mutationObserverInstallScript` at document start.
     public static let javaScriptSnippet = #"""
     (() => {
       const canonical = (value) => {
@@ -179,19 +340,6 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
         }
         return "fnv64:" + h.toString(16).padStart(16, "0");
       };
-
-      if (!window.__cascadeWebStateObserver) {
-        window.__cascadeWebStateMutationSequence = 0;
-        window.__cascadeWebStateObserver = new MutationObserver((mutations) => {
-          window.__cascadeWebStateMutationSequence += mutations.length;
-        });
-        window.__cascadeWebStateObserver.observe(document.documentElement || document, {
-          attributes: true,
-          childList: true,
-          characterData: true,
-          subtree: true
-        });
-      }
 
       const clip = (text, max = 160) => String(text || "").replace(/\s+/g, " ").trim().slice(0, max);
       const cssPath = (el) => {
@@ -295,7 +443,8 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
         checkedSelectedHash: hash(checkedSelected),
         contentEditableTextHash: hash(contentEditableText),
         ariaTextHash: hash(ariaText),
-        mutationSequence: Number(window.__cascadeWebStateMutationSequence || 0)
+        mutationSequence: Number(window.__cascadeWebStateMutationSequence || 0),
+        mutations: Array.isArray(window.__cascadeWebStateMutations) ? window.__cascadeWebStateMutations.slice(-80) : []
       };
     })();
     """#
@@ -384,6 +533,10 @@ public struct WebStateSignature: Equatable, Sendable, CustomStringConvertible {
 
     fileprivate static func dictionary(_ value: Any?) -> [String: Any] {
         value as? [String: Any] ?? [:]
+    }
+
+    fileprivate static func array(_ value: Any?) -> [Any] {
+        value as? [Any] ?? []
     }
 
     fileprivate static func string(_ value: Any?) -> String? {

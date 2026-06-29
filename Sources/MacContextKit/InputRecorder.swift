@@ -36,6 +36,181 @@ public enum InputCaptureGate {
     }
 }
 
+public enum AXTargetDescriptorBuilder {
+    public static let actionableRoles: Set<String> = [
+        "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
+        "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton",
+        "AXCheckBox", "AXRadioButton", "AXTab", "AXOutlineRow", "AXStaticText",
+        "AXSlider", "AXDisclosureTriangle",
+    ]
+
+    public static func descriptor(for element: AXUIElement, fallbackLabel: String? = nil) -> AXTargetDescriptorV2 {
+        AXClient.setMessagingTimeout(element)
+        let role = string(element, kAXRoleAttribute as String)
+        let label = fallbackLabel ?? labelText(of: element) ?? ""
+        let value = string(element, kAXValueAttribute as String)
+        let frame = frame(of: element)
+        let ancestorPath = ancestors(of: element)
+        let sibling = siblingInfo(for: element)
+        let bucket = frame.map(frameBucketString)
+        let exactFrame = frame.map(frameString)
+        let subtree = subtreeShape(of: element, maxDepth: 2, maxNodes: 24)
+        let structuralPath = (ancestorPath + [role, String(sibling.index ?? -1)].compactMap { $0 }).joined(separator: "|")
+
+        return AXTargetDescriptorV2(
+            label: label,
+            role: role,
+            identifier: string(element, kAXIdentifierAttribute as String),
+            container: ancestorPath.last,
+            ancestorPath: ancestorPath,
+            siblingIndex: sibling.index,
+            neighborLabels: sibling.neighborLabels,
+            frameBucket: bucket,
+            frame: exactFrame,
+            valueHash: value.map(AuditIdentity.hash),
+            enabled: bool(element, kAXEnabledAttribute as String),
+            selected: bool(element, kAXSelectedAttribute as String),
+            focused: bool(element, kAXFocusedAttribute as String),
+            pathHash: structuralPath.isEmpty ? nil : AuditIdentity.hash(structuralPath),
+            subtree: subtree.summary,
+            subtreeHash: subtree.hash,
+            semanticHash: semanticHash(role: role, label: label)
+        )
+    }
+
+    public static func encodedDescriptor(for element: AXUIElement, fallbackLabel: String? = nil) -> String? {
+        let descriptor = descriptor(for: element, fallbackLabel: fallbackLabel)
+        guard descriptor.hasSignal else { return nil }
+        return descriptor.encodedJSON()
+    }
+
+    public static func labeledActionableAncestor(
+        from element: AXUIElement,
+        maxHops: Int = 4
+    ) -> (element: AXUIElement, label: String, descriptor: String?)? {
+        var current = element
+        for _ in 0..<maxHops {
+            let role = string(current, kAXRoleAttribute as String) ?? ""
+            if actionableRoles.contains(role),
+               let label = labelText(of: current),
+               !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return (
+                    current,
+                    String(label.prefix(80)),
+                    encodedDescriptor(for: current, fallbackLabel: String(label.prefix(80)))
+                )
+            }
+            guard let parent = parent(of: current) else { break }
+            current = parent
+        }
+        return nil
+    }
+
+    private static func string(_ element: AXUIElement, _ attribute: String) -> String? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: String.self) else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func bool(_ element: AXUIElement, _ attribute: String) -> Bool? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: Bool.self) else { return nil }
+        return value
+    }
+
+    private static func parent(of element: AXUIElement) -> AXUIElement? {
+        guard case .success(let parent) = AXClient.elementAttribute(element, kAXParentAttribute as String) else {
+            return nil
+        }
+        return parent
+    }
+
+    private static func labelText(of element: AXUIElement) -> String? {
+        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXHelpAttribute] {
+            if let text = string(element, attribute), !PrivacyRules.isSensitiveText(text) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    private static func frame(of element: AXUIElement) -> CGRect? {
+        guard case .success(let frame) = AXClient.frame(element) else { return nil }
+        return frame
+    }
+
+    private static func ancestors(of element: AXUIElement, maxDepth: Int = 6) -> [String] {
+        var out: [String] = []
+        var current = element
+        for _ in 0..<maxDepth {
+            guard let parent = parent(of: current) else { break }
+            let role = string(parent, kAXRoleAttribute as String) ?? ""
+            let title = labelText(of: parent) ?? ""
+            if let container = AXTargetDescriptor.container(role: role, title: title) {
+                out.insert(container, at: 0)
+            }
+            current = parent
+        }
+        return out
+    }
+
+    private static func siblingInfo(for element: AXUIElement) -> (index: Int?, neighborLabels: [String]) {
+        guard let parent = parent(of: element),
+              case .success(let children) = AXClient.children(parent),
+              let index = children.firstIndex(where: { CFEqual($0, element) }) else {
+            return (nil, [])
+        }
+        let labels = [index - 1, index + 1].compactMap { candidate -> String? in
+            guard children.indices.contains(candidate) else { return nil }
+            return labelText(of: children[candidate]).map { String($0.prefix(60)) }
+        }
+        return (index, labels)
+    }
+
+    private static func frameBucketString(_ frame: CGRect) -> String {
+        let bucket = UIStateSnapshot.FrameBucket(frame)
+        return "\(bucket.x),\(bucket.y),\(bucket.width),\(bucket.height)"
+    }
+
+    private static func frameString(_ frame: CGRect) -> String {
+        [
+            Int(frame.minX.rounded()),
+            Int(frame.minY.rounded()),
+            Int(frame.width.rounded()),
+            Int(frame.height.rounded()),
+        ].map(String.init).joined(separator: ",")
+    }
+
+    private static func subtreeShape(
+        of element: AXUIElement,
+        maxDepth: Int,
+        maxNodes: Int
+    ) -> (summary: String?, hash: String?) {
+        var parts: [String] = []
+        func walk(_ node: AXUIElement, depth: Int) {
+            guard depth <= maxDepth, parts.count < maxNodes else { return }
+            let role = string(node, kAXRoleAttribute as String) ?? "AXUnknown"
+            let labelHash = labelText(of: node).map(AuditIdentity.hash) ?? "none"
+            parts.append("\(depth):\(role):\(labelHash)")
+            guard depth < maxDepth, case .success(let children) = AXClient.children(node) else { return }
+            for child in children {
+                guard parts.count < maxNodes else { return }
+                walk(child, depth: depth + 1)
+            }
+        }
+        walk(element, depth: 0)
+        guard !parts.isEmpty else { return (nil, nil) }
+        return ("nodes=\(parts.count)", AuditIdentity.hash(parts.joined(separator: "|")))
+    }
+
+    private static func semanticHash(role: String?, label: String) -> String? {
+        let normalized = [role, label]
+            .compactMap { $0?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "|")
+        return normalized.isEmpty ? nil : AuditIdentity.hash(normalized)
+    }
+}
+
 public final class InputRecorder: @unchecked Sendable {
     private struct AppContext: Sendable {
         var app: String
@@ -300,37 +475,10 @@ public final class InputRecorder: @unchecked Sendable {
         AXUIElementSetMessagingTimeout(system, 0.3)
         var ref: AXUIElement?
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
-              var element = ref else { return nil }
-        let actionable: Set<String> = [
-            "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
-            "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton",
-            "AXCheckBox", "AXRadioButton", "AXTab", "AXOutlineRow", "AXStaticText",
-        ]
-        for _ in 0..<4 {
-            var roleRef: CFTypeRef?
-            let role = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success
-                ? (roleRef as? String ?? "") : ""
-            if actionable.contains(role) {
-                for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-                    var textRef: CFTypeRef?
-                    if AXUIElementCopyAttributeValue(element, attribute as CFString, &textRef) == .success,
-                       let text = textRef as? String,
-                       !text.trimmingCharacters(in: .whitespaces).isEmpty {
-                        var identifierRef: CFTypeRef?
-                        let identifier = AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &identifierRef) == .success
-                            ? (identifierRef as? String) : nil
-                        let descriptor = AXTargetDescriptor.encode(
-                            role: role, identifier: identifier, container: Self.containerLabel(of: element))
-                        return (String(text.prefix(80)), descriptor)
-                    }
-                }
-            }
-            var parentRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
-                  let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
-            element = (parent as! AXUIElement)
+              let element = ref else { return nil }
+        return AXTargetDescriptorBuilder.labeledActionableAncestor(from: element).map {
+            ($0.label, $0.descriptor)
         }
-        return nil
     }
 
     /// The clicked element's structural container — its parent's "role: title" via the

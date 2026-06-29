@@ -58,6 +58,11 @@ public final class WebSandbox: NSObject {
         // (the agent reuses it on later tasks instead of hitting the login wall again).
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.userContentController.addUserScript(WKUserScript(
+            source: WebStateSignature.mutationObserverInstallScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: WebSandbox.width, height: WebSandbox.height), configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         super.init()
@@ -138,6 +143,17 @@ public final class WebSandbox: NSObject {
             return WebStateSignature(snapshot: snapshot)
         } catch {
             return nil
+        }
+    }
+
+    public func consumeMutations() async -> [WebStateSignature.Mutation] {
+        do {
+            guard let result = try await webView.evaluateJavaScript(WebStateSignature.mutationConsumeJavaScript) as? [Any] else {
+                return []
+            }
+            return result.map(WebStateSignature.Mutation.init(snapshot:))
+        } catch {
+            return []
         }
     }
 

@@ -65,6 +65,7 @@ public final class BackgroundWebAgent {
     /// intentionally changing so no-effect detection fails open instead of treating
     /// an unreadable page as unchanged.
     private var pageSignatureFallbackGeneration = 0
+    private var scoutContextCache: (signature: String, context: String?)?
 
     // The current plan. Survives a login pause so `resume()` re-enters at
     // `nextIndex` with the earlier parts' findings intact.
@@ -197,6 +198,7 @@ public final class BackgroundWebAgent {
         skipped = []
         replannedSubtaskKeys = []
         droppedOriginalPlanForSteer = false
+        scoutContextCache = nil
         onUpdate(Update(status: "Planning…", snapshotPNG: nil, url: "", done: false, result: nil))
         plan = await planner.plan(for: task, in: .webSandbox)
         await execute(onUpdate: onUpdate)
@@ -469,6 +471,7 @@ public final class BackgroundWebAgent {
         // stall guard, so a stuck run ends early instead of spinning to the 80-step
         // cap. lastSignature is the page BEFORE this episode's first actions.
         var lastSignature = await pageSignature()
+        _ = await sandbox.consumeMutations()
         var noEffectTurns = 0
         var idleTurns = 0
         var step = await agent.begin(
@@ -552,7 +555,8 @@ public final class BackgroundWebAgent {
             // click that "succeeded" but changed nothing.
             if turnActed {
                 let signature = await pageSignature()
-                if signature == lastSignature {
+                let mutations = await sandbox.consumeMutations()
+                if signature == lastSignature && mutations.isEmpty {
                     noEffectTurns += 1
                     if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
                         audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
@@ -674,6 +678,7 @@ public final class BackgroundWebAgent {
 
         var acted = false
         var lastSignature = await pageSignature()
+        _ = await sandbox.consumeMutations()
         var noEffectTurns = 0
         var idleTurns = 0
         var step = await agent.begin(
@@ -681,7 +686,7 @@ public final class BackgroundWebAgent {
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height),
-            note: await scoutWebContext(policyContext: webPolicy)
+            note: await scoutWebContext(policyContext: webPolicy, forceRefresh: true)
         )
 
         let maxSteps = 80
@@ -752,9 +757,12 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(300))
             shot = await sandbox.snapshotPNG() ?? shot
 
+            var pageChangedThisTurn = false
             if turnActed {
                 let signature = await pageSignature()
-                if signature == lastSignature {
+                let mutations = await sandbox.consumeMutations()
+                pageChangedThisTurn = signature != lastSignature || !mutations.isEmpty
+                if signature == lastSignature && mutations.isEmpty {
                     noEffectTurns += 1
                     if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
                         audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
@@ -796,7 +804,7 @@ public final class BackgroundWebAgent {
             // Proactive context (the web Set-of-Marks push): the page text + the
             // clickable/fillable elements, every turn, so the weak planner names
             // targets that exist and the DOM grounder hits them.
-            let note = [steerNote, nudge, await scoutWebContext(policyContext: webPolicy)].compactMap { $0 }.joined(separator: "\n\n")
+            let note = [steerNote, nudge, await scoutWebContext(policyContext: webPolicy, forceRefresh: pageChangedThisTurn)].compactMap { $0 }.joined(separator: "\n\n")
             step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
             count += 1
         }
@@ -805,7 +813,11 @@ public final class BackgroundWebAgent {
 
     /// The page's text + clickable/fillable elements, pushed to Scout each turn
     /// (the web analog of the on-screen AX-label push) so it names real targets.
-    private func scoutWebContext(policyContext: WebHarnessPolicyContext) async -> String? {
+    private func scoutWebContext(policyContext: WebHarnessPolicyContext, forceRefresh: Bool = false) async -> String? {
+        let signature = await pageSignature()
+        if !forceRefresh, let cached = scoutContextCache, cached.signature == signature {
+            return cached.context
+        }
         let page = await WebHarness.run("read_page", [:], sandbox: sandbox, policyContext: policyContext)
         let interactives = await WebHarness.run("list_interactives", [:], sandbox: sandbox, policyContext: policyContext)
         var parts: [String] = []
@@ -815,7 +827,9 @@ public final class BackgroundWebAgent {
         if !interactives.hasPrefix("No interactive"), !interactives.hasPrefix("Couldn't") {
             parts.append("CLICKABLE / FILLABLE NOW (name one of these to click or fill):\n" + String(interactives.prefix(1200)))
         }
-        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+        let context = parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+        scoutContextCache = (signature, context)
+        return context
     }
 
     /// Optional visual fallback for the web grounder: hosted UI-TARS over OpenRouter,

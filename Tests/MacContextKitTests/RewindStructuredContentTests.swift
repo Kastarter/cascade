@@ -44,3 +44,37 @@ func optInSyntheticVisionBoxesProduceStructuredMetadata() throws {
     #expect(markdownTables.first?.contains("| Name | Q1 |") == true)
     #expect(csvTables.first?.contains("Acme,'=SUM(1)") == true)
 }
+
+@Test
+func rewindMetadataEncodesChangedRegionsAlongsideExistingFields() throws {
+    let signature = FrameSignature(
+        dHash: 1,
+        combinedGridHash: 2,
+        gridDHash: [3],
+        blockHash: 4,
+        changedCellsMask: 0b010
+    )
+    let json = RecorderMetadataJSON.rewind(
+        width: 300,
+        height: 210,
+        axCount: 12,
+        signature: signature,
+        ocrMode: .changedRegion,
+        ocrRegion: CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4),
+        ocrPixelsRequested: 25200,
+        changedRegions: [CGRect(x: 100, y: 70, width: 100, height: 70)],
+        structured: nil
+    )
+    let data = try #require(json.data(using: .utf8))
+    let root = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let signaturePayload = try #require(root["signature"] as? [String: Any])
+    let ocrRegion = try #require(root["ocr_region"] as? [String: Any])
+    let changedRegions = try #require(root["changed_regions"] as? [[String: Any]])
+
+    #expect(signaturePayload["changedCellsMask"] as? Int == 0b010)
+    #expect(root["ocr_mode"] as? String == FrameOCRMode.changedRegion.rawValue)
+    #expect(ocrRegion["width"] as? Double == 0.3)
+    #expect(changedRegions.count == 1)
+    #expect(changedRegions[0]["x"] as? Double == 100)
+    #expect(changedRegions[0]["height"] as? Double == 70)
+}

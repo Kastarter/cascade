@@ -164,6 +164,28 @@ struct AXElementResolverTests {
         #expect(summary == "“Save” (button), “Bold” (checkbox)")
     }
 
+    @Test func interactableSummaryReusesDescriptorHintsWhenPresent() {
+        let summary = AXElementResolver.interactableSummary([
+            AXElementResolver.Match(
+                center: .zero,
+                role: "AXGroup",
+                title: "Stale",
+                score: 0,
+                descriptor: AXTargetDescriptorV2(
+                    label: "Approve",
+                    role: "AXButton",
+                    identifier: "expense.approve",
+                    container: "AXRow: Q2 Expense",
+                    siblingIndex: 3,
+                    enabled: false,
+                    selected: true,
+                    focused: true
+                )
+            )
+        ])
+        #expect(summary == "“Approve” (button; id expense.approve; in AXRow: Q2 Expense; disabled; selected; focused; sibling 3)")
+    }
+
     @Test func interactableSummaryIsNilWhenEmpty() {
         // Canvas/Electron apps expose no AX controls — caller must degrade to a
         // plain nudge, so an empty harvest yields nil, not "".

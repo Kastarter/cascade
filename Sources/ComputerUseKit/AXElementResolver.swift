@@ -106,6 +106,21 @@ public enum AXElementResolver {
         public let role: String
         public let title: String
         public let score: Double
+        public let descriptor: AXTargetDescriptorV2?
+
+        public init(
+            center: CGPoint,
+            role: String,
+            title: String,
+            score: Double,
+            descriptor: AXTargetDescriptorV2? = nil
+        ) {
+            self.center = center
+            self.role = role
+            self.title = title
+            self.score = score
+            self.descriptor = descriptor
+        }
     }
 
     /// A recorded click target as a ranked tuple of coordinate-free locators
@@ -167,6 +182,7 @@ public enum AXElementResolver {
 
     private static let maxNodes = 1_400
     private static let maxDepth = 16
+    public static let defaultMinimumConfidence = 0.72
 
     /// Finds the best element matching `label` in the frontmost app's windows.
     /// Thin wrapper over `find(descriptor:)` for callers that only have a label —
@@ -182,44 +198,14 @@ public enum AXElementResolver {
     /// top-left) breaks ties toward where the click was recorded. Returns nil when
     /// Accessibility is unavailable or nothing scores above zero.
     public static func find(descriptor: Descriptor, near recorded: CGPoint? = nil) -> Match? {
-        // An identifier can match with no label, so don't require a non-empty label
-        // up front — `rank` decides per candidate.
-        guard !descriptor.label.isEmpty || !(descriptor.identifier ?? "").isEmpty,
-              AXIsProcessTrusted(),
-              let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.3)
-
-        var best: Match?
-        var bestRank = 0.0
-        var visited = 0
-        for window in windows(of: app) {
-            walk(window, depth: 0, visited: &visited) { element, role in
-                guard pointableRoles.contains(role) else { return }
-                let text = labelText(of: element)
-                let id = identifier(of: element)
-                // The container read climbs to the parent — do it lazily, only for
-                // candidates that already self-match and only when the recorded target
-                // HAS a container, so a heavy tree walk stays cheap.
-                let preMatch = (descriptor.identifier.map { !$0.isEmpty && $0 == id } ?? false)
-                    || matchScore(needle: normalize(descriptor.label), candidate: normalize(text ?? "")) > 0
-                guard preMatch else { return }
-                let container = descriptor.container == nil ? nil : containerLabel(of: element)
-                let candidate = Descriptor(label: text ?? "", role: role, identifier: id, container: container)
-                let score = rank(recorded: descriptor, candidate: candidate)
-                guard score > 0 else { return }
-                guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
-                let center = CGPoint(x: frame.midX, y: frame.midY)
-                // Distance only breaks ties between equally-scored candidates.
-                let distance = recorded.map { hypot(center.x - $0.x, center.y - $0.y) } ?? 0
-                let combined = score * 10_000 - min(distance, 9_999)
-                if best == nil || combined > bestRank {
-                    best = Match(center: center, role: role, title: text ?? "", score: score)
-                    bestRank = combined
-                }
-            }
-        }
-        return best
+        let recordedDescriptor = AXTargetDescriptorV2(
+            label: descriptor.label,
+            role: descriptor.role,
+            identifier: descriptor.identifier,
+            container: descriptor.container,
+            ancestorPath: descriptor.container.map { [$0] } ?? []
+        )
+        return find(recorded: recordedDescriptor, near: recorded)
     }
 
     /// Roles that are genuinely actionable controls — the `pointable` set minus
@@ -260,7 +246,14 @@ public enum AXElementResolver {
                 guard !seen.contains(dedupe) else { return }
                 guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
                 seen.insert(dedupe)
-                out.append(Match(center: CGPoint(x: frame.midX, y: frame.midY), role: role, title: String(text.prefix(60)), score: 0))
+                let descriptor = AXTargetDescriptorBuilder.descriptor(for: element, fallbackLabel: String(text.prefix(60)))
+                out.append(Match(
+                    center: CGPoint(x: frame.midX, y: frame.midY),
+                    role: role,
+                    title: String(text.prefix(60)),
+                    score: 0,
+                    descriptor: descriptor
+                ))
             }
         }
         return out
@@ -295,39 +288,80 @@ public enum AXElementResolver {
     /// Pure (testable); nil when there's nothing to push so the caller can degrade.
     public static func interactableSummary(_ matches: [Match], limit: Int = 40) -> String? {
         let items = matches.prefix(limit).map { match -> String in
-            let role = match.role.hasPrefix("AX") ? String(match.role.dropFirst(2)).lowercased() : match.role.lowercased()
-            return "“\(match.title)” (\(role))"
+            let descriptor = match.descriptor
+            let title = bounded(descriptor?.label ?? match.title, limit: 60) ?? ""
+            let role = shortRole(descriptor?.role ?? match.role)
+            var hints: [String] = [role]
+            if let identifier = bounded(descriptor?.identifier, limit: 48) {
+                hints.append("id \(identifier)")
+            }
+            if let container = bounded(descriptor?.container ?? descriptor?.ancestorPath.last, limit: 60) {
+                hints.append("in \(container)")
+            }
+            if let enabled = descriptor?.enabled, !enabled {
+                hints.append("disabled")
+            }
+            if descriptor?.selected == true {
+                hints.append("selected")
+            }
+            if descriptor?.focused == true {
+                hints.append("focused")
+            }
+            if let sibling = descriptor?.siblingIndex {
+                hints.append("sibling \(sibling)")
+            }
+            return "“\(title)” (\(hints.joined(separator: "; ")))"
         }
         return items.isEmpty ? nil : items.joined(separator: ", ")
     }
 
-    /// A cheap signature of the frontmost app's UI — focused element + the shape of
-    /// the focused window's tree. Compare before/after an action: if it didn't
-    /// change, the action almost certainly didn't land (tiptour's post-click check).
-    public static func frontmostFingerprint() -> Int {
-        guard AXIsProcessTrusted(),
-              let frontmost = NSWorkspace.shared.frontmostApplication else { return 0 }
-        let app = AXUIElementCreateApplication(frontmost.processIdentifier)
-        AXUIElementSetMessagingTimeout(app, 0.25)
+    private static func shortRole(_ role: String) -> String {
+        role.hasPrefix("AX") ? String(role.dropFirst(2)).lowercased() : role.lowercased()
+    }
 
-        var hasher = Hasher()
-        hasher.combine(frontmost.processIdentifier)
-        if let focused = element(of: app, attribute: kAXFocusedUIElementAttribute) {
-            hasher.combine(string(of: focused, kAXRoleAttribute) ?? "")
-            hasher.combine(labelText(of: focused) ?? "")
+    private static func bounded(_ value: String?, limit: Int) -> String? {
+        guard let value else { return nil }
+        let normalized = value
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return String(normalized.prefix(limit))
+    }
+
+    public static func frontmostState(limit: Int = 600, depth: Int = 10) -> UIStateSnapshot? {
+        guard AXIsProcessTrusted(),
+              let frontmost = NSWorkspace.shared.frontmostApplication else { return nil }
+        let app = AXUIElementCreateApplication(frontmost.processIdentifier)
+        AXClient.setMessagingTimeout(app)
+        let options = UIStateSnapshot.AXBuildOptions(nodeLimit: limit, maxDepth: depth)
+        if let focusedWindow = element(of: app, attribute: kAXFocusedWindowAttribute),
+           let snapshot = UIStateSnapshot.snapshot(fromAXRoot: focusedWindow, options: options) {
+            return snapshot
         }
-        if let window = element(of: app, attribute: kAXFocusedWindowAttribute) {
-            hasher.combine(string(of: window, kAXTitleAttribute) ?? "")
-            var visited = 0
-            var nodes = 0
-            walk(window, depth: 0, limit: 350, visited: &visited) { node, role in
-                nodes += 1
-                hasher.combine(role)
-                if nodes <= 60, let text = labelText(of: node) { hasher.combine(text) }
-            }
-            hasher.combine(nodes)
+        let roots = windows(of: app)
+        if !roots.isEmpty {
+            return UIStateSnapshot.snapshot(
+                fromAXRoots: roots,
+                rootKey: "frontmost|\(frontmost.processIdentifier)",
+                rootRole: "AXApplication",
+                rootTitle: frontmost.localizedName,
+                options: options
+            )
         }
-        return hasher.finalize()
+        return UIStateSnapshot.snapshot(
+            fromAXRoot: app,
+            options: options
+        )
+    }
+
+    public static func diff(_ before: UIStateSnapshot, _ after: UIStateSnapshot) -> UIStateDelta {
+        UIStateDelta.between(before, after)
+    }
+
+    /// Compatibility fingerprint derived from the deterministic snapshot root hash.
+    public static func frontmostFingerprint() -> Int {
+        guard let snapshot = frontmostState(limit: 350, depth: 10) else { return 0 }
+        return Int(truncatingIfNeeded: snapshot.rootHash)
     }
 
     /// Compact "role: title" label of the element at a CG global point — what the
@@ -399,10 +433,40 @@ public enum AXElementResolver {
         recorded: AXTargetDescriptorV2,
         candidates: [Candidate],
         near recordedPoint: CGPoint? = nil,
-        minimumConfidence: Double = 0.62
+        minimumConfidence: Double = defaultMinimumConfidence,
+        scoreCap: Double? = nil
     ) -> RankedCandidate? {
-        rank(recorded: recorded, candidates: candidates, near: recordedPoint)
-            .first { $0.confidence >= minimumConfidence }
+        let threshold = scoreCap ?? minimumConfidence
+        return rank(recorded: recorded, candidates: candidates, near: recordedPoint)
+            .first { $0.confidence >= threshold }
+    }
+
+    public static func find(
+        recorded: AXTargetDescriptorV2,
+        near recordedPoint: CGPoint? = nil,
+        minimumConfidence: Double = defaultMinimumConfidence,
+        scoreCap: Double? = nil
+    ) -> Match? {
+        guard recorded.hasSignal,
+              AXIsProcessTrusted(),
+              NSWorkspace.shared.frontmostApplication != nil else { return nil }
+        let candidates = liveCandidates()
+        guard let ranked = find(
+            recorded: recorded,
+            candidates: candidates,
+            near: recordedPoint,
+            minimumConfidence: minimumConfidence,
+            scoreCap: scoreCap
+        ),
+            let center = ranked.candidate.center else { return nil }
+        let descriptor = ranked.candidate.descriptor
+        return Match(
+            center: center,
+            role: descriptor.role ?? "",
+            title: descriptor.label,
+            score: ranked.confidence,
+            descriptor: descriptor
+        )
     }
 
     /// Ranks a live `candidate` against the recorded `descriptor`. 0 = no match (must
@@ -453,32 +517,20 @@ public enum AXElementResolver {
             score += weight * min(max(similarity(), 0), 1)
         }
 
-        add(0.22, active: recorded.identifier != nil) {
+        add(0.40, active: recorded.identifier != nil) {
             exactSimilarity(recorded.identifier, candidate.identifier)
         }
-        add(0.17, active: !recorded.label.isEmpty) {
-            matchScore(needle: normalize(recorded.label), candidate: normalize(candidate.label)) / 3.0
-        }
-        add(0.14, active: recorded.semanticHash != nil) {
-            exactSimilarity(recorded.semanticHash, candidate.semanticHash)
-        }
-        add(0.13, active: !recordedStructuralPath(recorded).isEmpty) {
-            pathSimilarity(recordedStructuralPath(recorded), recordedStructuralPath(candidate))
-        }
-        add(0.10, active: !recorded.neighborLabels.isEmpty) {
-            labelSetSimilarity(recorded.neighborLabels, candidate.neighborLabels)
-        }
-        add(0.07, active: recorded.subtreeHash != nil) {
-            exactSimilarity(recorded.subtreeHash, candidate.subtreeHash)
-        }
-        add(0.07, active: recorded.role != nil) {
+        add(0.15, active: recorded.role != nil) {
             exactSimilarity(recorded.role, candidate.role)
         }
-        add(0.05, active: recorded.siblingIndex != nil) {
-            siblingSimilarity(recorded.siblingIndex, candidate.siblingIndex)
+        add(0.20, active: !recorded.label.isEmpty) {
+            matchScore(needle: normalize(recorded.label), candidate: normalize(candidate.label)) / 3.0
         }
-        add(0.05, active: recorded.frameBucket != nil) {
-            exactSimilarity(recorded.frameBucket, candidate.frameBucket)
+        add(0.15, active: hasStructuralSignal(recorded)) {
+            structuralSimilarity(recorded, candidate)
+        }
+        add(0.10, active: recorded.frameBucket != nil || recorded.frame != nil) {
+            frameSimilarity(recorded, candidate)
         }
 
         return (score, available)
@@ -487,6 +539,15 @@ public enum AXElementResolver {
     private static func recordedStructuralPath(_ descriptor: AXTargetDescriptorV2) -> [String] {
         if !descriptor.ancestorPath.isEmpty { return descriptor.ancestorPath }
         return descriptor.container.map { [$0] } ?? []
+    }
+
+    private static func hasStructuralSignal(_ descriptor: AXTargetDescriptorV2) -> Bool {
+        !recordedStructuralPath(descriptor).isEmpty
+            || descriptor.pathHash != nil
+            || descriptor.subtreeHash != nil
+            || descriptor.semanticHash != nil
+            || !descriptor.neighborLabels.isEmpty
+            || descriptor.siblingIndex != nil
     }
 
     private static func exactSimilarity(_ recorded: String?, _ candidate: String?) -> Double {
@@ -524,6 +585,35 @@ public enum AXElementResolver {
         return 0
     }
 
+    private static func structuralSimilarity(_ recorded: AXTargetDescriptorV2, _ candidate: AXTargetDescriptorV2) -> Double {
+        var best = pathSimilarity(recordedStructuralPath(recorded), recordedStructuralPath(candidate))
+        best = max(best, exactSimilarity(recorded.pathHash, candidate.pathHash))
+        best = max(best, exactSimilarity(recorded.subtreeHash, candidate.subtreeHash) * 0.50)
+        best = max(best, exactSimilarity(recorded.semanticHash, candidate.semanticHash) * 0.30)
+        best = max(best, labelSetSimilarity(recorded.neighborLabels, candidate.neighborLabels) * 0.35)
+        best = max(best, siblingSimilarity(recorded.siblingIndex, candidate.siblingIndex) * 0.15)
+        return best
+    }
+
+    private static func frameSimilarity(_ recorded: AXTargetDescriptorV2, _ candidate: AXTargetDescriptorV2) -> Double {
+        if exactSimilarity(recorded.frameBucket, candidate.frameBucket) == 1 { return 1 }
+        if exactSimilarity(recorded.frame, candidate.frame) == 1 { return 1 }
+        guard let recordedBucket = bucketTuple(recorded.frameBucket),
+              let candidateBucket = bucketTuple(candidate.frameBucket) else { return 0 }
+        let distance = abs(recordedBucket.0 - candidateBucket.0)
+            + abs(recordedBucket.1 - candidateBucket.1)
+            + abs(recordedBucket.2 - candidateBucket.2)
+            + abs(recordedBucket.3 - candidateBucket.3)
+        return max(0, 1 - Double(distance) / 40.0)
+    }
+
+    private static func bucketTuple(_ value: String?) -> (Int, Int, Int, Int)? {
+        guard let value else { return nil }
+        let parts = value.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard parts.count == 4 else { return nil }
+        return (parts[0], parts[1], parts[2], parts[3])
+    }
+
     private static func distance(from recorded: CGPoint?, to candidate: CGPoint?) -> Double? {
         guard let recorded, let candidate else { return nil }
         return hypot(candidate.x - recorded.x, candidate.y - recorded.y)
@@ -555,6 +645,34 @@ public enum AXElementResolver {
             return []
         }
         return windows
+    }
+
+    private static func liveCandidates(limit: Int = maxNodes) -> [Candidate] {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
+        let app = AXUIElementCreateApplication(pid)
+        AXClient.setMessagingTimeout(app)
+        var candidates: [Candidate] = []
+        var visited = 0
+        for window in windows(of: app) {
+            walk(window, depth: 0, limit: limit, visited: &visited) { element, role in
+                guard pointableRoles.contains(role),
+                      let frame = frame(of: element),
+                      frame.width > 1,
+                      frame.height > 1 else { return }
+                let text = labelText(of: element) ?? ""
+                let descriptor = AXTargetDescriptorBuilder.descriptor(for: element, fallbackLabel: text)
+                let id = descriptor.identifier
+                    ?? descriptor.pathHash
+                    ?? "\(role)|\(descriptor.label)|\(candidates.count)"
+                candidates.append(Candidate(
+                    id: id,
+                    descriptor: descriptor,
+                    center: CGPoint(x: frame.midX, y: frame.midY)
+                ))
+            }
+            guard visited < limit else { break }
+        }
+        return candidates
     }
 
     private static func walk(
