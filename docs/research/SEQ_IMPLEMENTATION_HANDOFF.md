@@ -14,6 +14,23 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 - **Scope decisions (locked with the user):** finish *partial* items only · all 31 SEQs sequential ·
   build-gated commits · report at end · WIP checkpointed first.
 
+## Continuation log (latest first)
+
+### 2026-06-29 — session 2: push-as-you-go + self-contained script
+- **Session 1 closed mid-SEQ-13.** The previous Claude Code process exited while working SEQ-13; its
+  half-done working-tree edits were discarded (`git reset --hard HEAD`). Committed SEQs were intact.
+  This handoff was first written at that point.
+- **The 15 local commits were pushed** to `origin/feat/production-grade` (`e6e5275..0220857`). The
+  remote is now current with local — nothing is local-only anymore.
+- **Per-SEQ pushing added.** The Fix stage now runs `git push origin feat/production-grade` after each
+  green commit (best-effort: a push failure does NOT fail the SEQ — the commit is safe locally). The
+  run now **commits AND pushes** each SEQ as it lands.
+- **Script is now self-contained.** The 31-SEQ list is hardcoded as `const SEQS` inside the script (an
+  earlier relaunch crashed because `args` arrived as a string and the loop iterated its characters).
+  Launch with just `{ scriptPath }` — no `args` needed.
+- **Current run:** `wf_4454a193-007` (task `w7s1zi6d6`). Skips SEQ-01–12 (already committed), retries
+  SEQ-05, runs SEQ-13 → 31, committing + pushing each build-green result.
+
 ## Snapshot as of this handoff
 
 The workflow is **still running**. Committed so far on `feat/production-grade`:
@@ -24,7 +41,8 @@ SEQ-05                                  ← NOT committed (skipped / no targets 
 SEQ-13…31                               ← pending / in progress
 ```
 
-- HEAD: `c3deb1b feat(seq-12 …)` — `swift build` → **Build complete!** (green).
+- HEAD advances as each SEQ lands (latest `feat(seq-NN …)` / docs commit); the commit gate guarantees
+  HEAD always `swift build`s green.
 - Checkpoint before the run: `0bf61d2 checkpoint: WIP before SEQ partial-implementation pass`
   (this captured the user's prior uncommitted WIP — do not lose it).
 - A dirty working tree during the run is normal: it's the in-flight SEQ between its Implement and
@@ -64,7 +82,7 @@ Single background workflow, **sequential** loop SEQ-01 → SEQ-31. Per SEQ, four
 
 | What | Path / ID |
 | --- | --- |
-| Implementation workflow run ID | `wf_630c4e96-75f` (task `wgjli0t3f`) |
+| Implementation workflow run ID (current) | `wf_4454a193-007` (task `w7s1zi6d6`); prior: `wf_630c4e96-75f`, `wf_593b668a-6fc` |
 | Implementation workflow script | `…/cd1ecc14-…/workflows/scripts/seq-finish-partials-wf_630c4e96-75f.js` |
 | Status report (regenerated each audit) | `docs/research/IMPLEMENTATION_STATUS.md` |
 | Baseline audit raw data (per-technique) | `…/cd1ecc14-…/tasks/w261idjvs.output` |
@@ -75,18 +93,23 @@ Single background workflow, **sequential** loop SEQ-01 → SEQ-31. Per SEQ, four
 
 ## If the run dies — resume
 
-Two safe options (both idempotent because Plan skips already-committed SEQs):
+The script is **self-contained** (31-SEQ list hardcoded as `SEQS`; no `args`). Both options are
+idempotent because the Plan stage skips any SEQ that already has a `seq-NN` commit, and each green
+SEQ is committed **and pushed**.
 
-1. **Re-launch the same script** (simplest) — committed SEQs are skipped by the Plan pre-check; it
-   picks up at the first SEQ without a `seq-NN` commit.
+1. **Re-launch (simplest)** — skips committed SEQs via the Plan `git log` pre-check, picks up at the
+   first unfinished one:
    ```
-   Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js", args: <same 31-entry array> })
+   Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js" })
    ```
-2. **Resume the run** (replays cached agent results for finished stages, continues live):
+2. **Resume the run** (replays cached stages, continues live):
    ```
-   Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js", resumeFromRunId: "wf_630c4e96-75f" })
+   Workflow({ scriptPath: "…/seq-finish-partials-wf_630c4e96-75f.js", resumeFromRunId: "wf_4454a193-007" })
    ```
-The `args` array (31 × `{seq, file, slug}`) is in the script's original launch and in the plan file.
+   Do NOT resume if you've reset the tree out from under an in-flight SEQ — re-launch fresh instead.
+
+If a stop leaves a dirty tree mid-SEQ, clean it first: `git reset --hard HEAD` (discards only the
+aborted SEQ's machine-generated edits; committed SEQs and the user's WIP at `0bf61d2` are safe).
 
 ## Roll back
 
