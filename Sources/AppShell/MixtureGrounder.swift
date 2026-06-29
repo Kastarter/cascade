@@ -828,6 +828,25 @@ public struct MixtureGrounder: VisualGrounder {
         let verifierResult = GroundingVerifier().verify(verifierCandidates, context: context)
 
         guard let previousAnchor else {
+            if Self.shouldUseBestOfN(
+                baseResult: baseResult,
+                verifierResult: verifierResult,
+                context: context,
+                candidateFailureCounts: candidateFailureCounts
+            ), let selectedID = Self.bestOfNCandidateID(
+                from: verifierCandidates,
+                verifierResult: verifierResult,
+                context: context,
+                candidateFailureCounts: candidateFailureCounts
+            ) {
+                let accepted = Self.bestOfNAcceptedResult(selectedID: selectedID, verifierResult: verifierResult)
+                return Self.selection(
+                    from: verifierCandidates,
+                    selectedID: selectedID,
+                    outcome: .selected,
+                    verifierResult: accepted
+                )
+            }
             return Self.selection(
                 from: verifierCandidates,
                 selectedID: verifierResult.verdict == .accept ? verifierResult.selectedCandidateID : nil,
@@ -840,6 +859,20 @@ public struct MixtureGrounder: VisualGrounder {
             $0.failureKind == nil && $0.score >= context.acceptThreshold
         }
         guard !strongScores.isEmpty else {
+            if let selectedID = Self.bestOfNCandidateID(
+                from: verifierCandidates,
+                verifierResult: verifierResult,
+                context: context,
+                candidateFailureCounts: candidateFailureCounts
+            ) {
+                let accepted = Self.bestOfNAcceptedResult(selectedID: selectedID, verifierResult: verifierResult)
+                return Self.selection(
+                    from: verifierCandidates,
+                    selectedID: selectedID,
+                    outcome: .selected,
+                    verifierResult: accepted
+                )
+            }
             return Self.selection(
                 from: verifierCandidates,
                 selectedID: verifierResult.verdict == .accept ? verifierResult.selectedCandidateID : nil,
@@ -893,6 +926,20 @@ public struct MixtureGrounder: VisualGrounder {
                 verifierResult: verifierResult
             )
         case .ambiguous:
+            if let selectedID = Self.bestOfNCandidateID(
+                from: verifierCandidates,
+                verifierResult: verifierResult,
+                context: context,
+                candidateFailureCounts: candidateFailureCounts
+            ) {
+                let accepted = Self.bestOfNAcceptedResult(selectedID: selectedID, verifierResult: verifierResult)
+                return Self.selection(
+                    from: verifierCandidates,
+                    selectedID: selectedID,
+                    outcome: .selected,
+                    verifierResult: accepted
+                )
+            }
             return Self.selection(
                 from: verifierCandidates,
                 selectedID: nil,
@@ -1116,7 +1163,7 @@ public struct MixtureGrounder: VisualGrounder {
             result: GroundingResult(
                 candidates: candidates.map(\.candidate),
                 selectedIndex: selectedIndex,
-                selectedCandidateID: verifierResult.selectedCandidateID,
+                selectedCandidateID: selectedID ?? verifierResult.selectedCandidateID,
                 verifierVerdict: verifierResult.verdict,
                 verifierFailureKind: verifierResult.failureKind,
                 alternativeCount: max(0, candidates.count - (selectedIndex == nil ? 0 : 1))
@@ -1134,6 +1181,88 @@ public struct MixtureGrounder: VisualGrounder {
             return .rejected(result.failureKind)
         case .abstain:
             return .abstained(result.failureKind)
+        }
+    }
+
+    private static func shouldUseBestOfN(
+        baseResult: GroundingResult,
+        verifierResult: GroundingVerifierResult,
+        context: GroundingVerifierContext,
+        candidateFailureCounts: [String: Int]
+    ) -> Bool {
+        if verifierResult.verdict != .accept { return true }
+        if verifierResult.confidence < max(context.acceptThreshold + 0.04, 0.78) { return true }
+        return baseResult.alternativeCount > 0 && !candidateFailureCounts.isEmpty
+    }
+
+    private static func bestOfNCandidateID(
+        from candidates: [GroundingVerifierCandidate],
+        verifierResult: GroundingVerifierResult,
+        context: GroundingVerifierContext,
+        candidateFailureCounts: [String: Int]
+    ) -> String? {
+        let candidatesByID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
+        let ranked = verifierResult.scores
+            .compactMap { score -> (id: String, score: Double)? in
+                guard score.failureKind == nil,
+                      let candidate = candidatesByID[score.id],
+                      candidate.candidate.point != nil || candidate.candidate.region != nil else {
+                    return nil
+                }
+                let sourceBonus = Double(sourceRank(candidate.candidate.source)) * 0.03
+                let agreementBonus = min(0.12, Double(candidate.agreeingSources.count) * 0.04)
+                let confidenceBonus = min(0.12, max(0, candidate.candidate.confidence) * 0.12)
+                let failurePenalty = min(0.45, Double(candidateFailureCounts[score.id, default: 0]) * 0.18)
+                let centerPenalty: Double
+                if let point = candidate.candidate.point {
+                    let center = CGPoint(
+                        x: CGFloat(context.displayWidthPoints) / 2,
+                        y: CGFloat(context.displayHeightPoints) / 2
+                    )
+                    let normalizedDistance = Double(hypot(point.x - center.x, point.y - center.y))
+                        / max(1, hypot(Double(context.displayWidthPoints), Double(context.displayHeightPoints)))
+                    centerPenalty = min(0.08, normalizedDistance * 0.05)
+                } else {
+                    centerPenalty = 0
+                }
+                return (score.id, score.score + sourceBonus + agreementBonus + confidenceBonus - failurePenalty - centerPenalty)
+            }
+            .prefix(3)
+            .sorted {
+                if $0.score == $1.score { return $0.id < $1.id }
+                return $0.score > $1.score
+            }
+        return ranked.first?.id
+    }
+
+    private static func bestOfNAcceptedResult(
+        selectedID: String,
+        verifierResult: GroundingVerifierResult
+    ) -> GroundingVerifierResult {
+        let confidence = verifierResult.scores.first { $0.id == selectedID }?.score ?? verifierResult.confidence
+        return GroundingVerifierResult(
+            verdict: .accept,
+            selectedCandidateID: selectedID,
+            confidence: confidence,
+            failureKind: nil,
+            scores: verifierResult.scores
+        )
+    }
+
+    private static func sourceRank(_ source: GroundingSource) -> Int {
+        switch source {
+        case .accessibility:
+            return 5
+        case .dom:
+            return 4
+        case .ocr:
+            return 3
+        case .uiTars, .claude, .visualModel:
+            return 2
+        case .cache:
+            return 1
+        case .compatibility, .unknown:
+            return 0
         }
     }
 

@@ -132,3 +132,39 @@ func entityTimelineReturnsCitedContextsInTimeOrder() async throws {
     #expect(timeline.map(\.contextID) == [older.id, newer.id])
     #expect(timeline.map(\.evidenceSnippet) == ["older example.com/report", "newer example.com/report"])
 }
+
+@Test
+func planningPriorsIndexSkillsAndExperienceOutcomes() async throws {
+    let store = try makeWorkGraphStore()
+    try await store.indexPlanningSkill(
+        name: "Mail Reply",
+        appNames: ["Mail"],
+        useWhen: "reply to customer email",
+        dangerous: false
+    )
+    try await store.indexAgentExperienceOutcome(AgentExperienceCase(
+        appName: "Mail",
+        goalPattern: "reply to customer email",
+        recipeSignature: "mail-reply-recipe",
+        skillSlug: "Mail Reply",
+        outcome: .success,
+        verificationSignal: .verified,
+        actionCount: 4
+    ))
+    try await store.indexAgentExperienceOutcome(AgentExperienceCase(
+        appName: "Mail",
+        goalPattern: "send message from wrong thread",
+        recipeSignature: "bad-thread-recipe",
+        outcome: .failure,
+        failureKind: .groundingMiss,
+        actionCount: 2
+    ))
+
+    let priors = try await store.planningPriors(goal: "send message from wrong thread in Mail", appName: "Mail", limit: 8)
+    let relations = Set(priors.map(\.relation))
+
+    #expect(priors.contains { $0.kind == .skill && $0.displayName == "Mail Reply" })
+    #expect(relations.contains("uses_skill") || relations.contains("covers_app"))
+    #expect(priors.contains { $0.kind == .recipe && $0.weight > 0 })
+    #expect(priors.contains { $0.kind == .expectedEffect && $0.weight < 0 })
+}

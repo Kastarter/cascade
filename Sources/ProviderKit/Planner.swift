@@ -88,6 +88,147 @@ public protocol SingleStepPlanner: Sendable {
     func proposeNextStep(goal: String, contexts: [RecordedContext]) async throws -> ProposedStep
 }
 
+public struct ActionCritiqueRequest: Sendable, Equatable {
+    public let goal: String
+    public let actionSummary: String
+    public let screenSummary: String
+    public let triggerReasons: [String]
+
+    public init(goal: String, actionSummary: String, screenSummary: String = "", triggerReasons: [String] = []) {
+        self.goal = goal
+        self.actionSummary = actionSummary
+        self.screenSummary = screenSummary
+        self.triggerReasons = triggerReasons
+    }
+}
+
+public struct ActionCritique: Sendable, Equatable {
+    public enum Verdict: String, Sendable, Codable {
+        case approve
+        case revise
+        case refuse
+        case askUser
+    }
+
+    public let verdict: Verdict
+    public let failureKind: CascadeMemory.AgentFailureKind?
+    public let reason: String
+    public let saferInstruction: String?
+
+    public init(
+        verdict: Verdict,
+        failureKind: CascadeMemory.AgentFailureKind? = nil,
+        reason: String,
+        saferInstruction: String? = nil
+    ) {
+        self.verdict = verdict
+        self.failureKind = failureKind
+        self.reason = reason
+        self.saferInstruction = saferInstruction
+    }
+}
+
+public protocol ActionCritic: Sendable {
+    func critique(_ request: ActionCritiqueRequest) async -> ActionCritique
+}
+
+public struct PromptActionCritic: ActionCritic {
+    private let client: any MessageCompleting
+    private let model: String
+
+    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.haiku) {
+        self.client = client
+        self.model = model
+    }
+
+    public func critique(_ request: ActionCritiqueRequest) async -> ActionCritique {
+        let user = """
+        Goal: \(request.goal)
+        Proposed action: \(request.actionSummary)
+        Trigger reasons: \(request.triggerReasons.joined(separator: ", "))
+        Current state summary:
+        \(request.screenSummary.isEmpty ? "not provided" : request.screenSummary)
+
+        Predict whether this action is safe and likely to advance the goal. Reply ONLY JSON:
+        {"verdict":"approve|revise|refuse|askUser","reason":"...","saferInstruction":"optional"}
+        """
+        let raw = try? await client.complete(
+            system: "You are Cascade's pre-action GUI critic. Deterministic runtime gates are already enforced; approve unless the action is unsafe, likely wrong, or needs user clarification.",
+            user: user,
+            model: model,
+            maxTokens: 180
+        )
+        return raw.flatMap(Self.parse) ?? ActionCritique(verdict: .approve, reason: "critic unavailable")
+    }
+
+    public static func parse(_ raw: String) -> ActionCritique? {
+        guard let json = ClaudeSingleStepPlanner.extractJSONObject(raw),
+              let data = json.data(using: .utf8),
+              let dto = try? JSONDecoder().decode(DTO.self, from: data) else {
+            return nil
+        }
+        let verdictRaw = dto.verdict
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .lowercased()
+        let verdict: ActionCritique.Verdict
+        switch verdictRaw {
+        case "approve", "approved":
+            verdict = .approve
+        case "revise", "revision", "correct":
+            verdict = .revise
+        case "refuse", "refused", "deny", "denied":
+            verdict = .refuse
+        case "askuser", "ask", "clarify":
+            verdict = .askUser
+        default:
+            return nil
+        }
+        return ActionCritique(
+            verdict: verdict,
+            failureKind: parseFailureKind(dto.failureKind),
+            reason: dto.reason.trimmingCharacters(in: .whitespacesAndNewlines),
+            saferInstruction: normalizedOptional(dto.saferInstruction)
+                ?? normalizedOptional(dto.suggestion)
+        )
+    }
+
+    private struct DTO: Decodable {
+        let verdict: String
+        let reason: String
+        let saferInstruction: String?
+        let suggestion: String?
+        let failureKind: String?
+    }
+
+    private static func normalizedOptional(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func parseFailureKind(_ raw: String?) -> CascadeMemory.AgentFailureKind? {
+        guard let raw else { return nil }
+        let normalized = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch normalized {
+        case "unsafe_action", "unsafe_action_refused", "unsafeactionrefused":
+            return .unsafeAction
+        case "grounding_miss", "groundingmiss":
+            return .groundingMiss
+        case "no_effect", "noeffect":
+            return .noEffect
+        case "parameter_needs_live_value", "parameterneedslivevalue":
+            return .parameterNeedsLiveValue
+        default:
+            return CascadeMemory.AgentFailureKind(rawValue: normalized)
+        }
+    }
+}
+
 /// Asks Claude for exactly ONE reviewed next step, grounded in recent local
 /// context. The one-step truncation is a safety property (TipTour-style): the
 /// employee approves each step before it runs; the planner never returns a

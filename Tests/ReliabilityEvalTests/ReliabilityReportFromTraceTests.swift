@@ -10,6 +10,8 @@ func reliabilityReportBuildsScenarioOutcomesFromLiveTraces() {
             rootStatus: .ok,
             spans: [
                 TraceSpan(id: "completed-step", parentID: "completed-root", kind: .step, name: "plan", startMs: 10, durationMs: 1),
+                TraceSpan(id: "completed-subgoal-start", parentID: "completed-root", kind: .step, name: "assist.subgoal.start", startMs: 12, durationMs: 1),
+                TraceSpan(id: "completed-subgoal-verify", parentID: "completed-root", kind: .eval, name: "assist.subgoal.verify", startMs: 16, durationMs: 1),
                 TraceSpan(id: "completed-tool", parentID: "completed-root", kind: .tool, name: "read_file", startMs: 20, durationMs: 1),
             ]
         ),
@@ -81,7 +83,7 @@ func reliabilityReportBuildsScenarioOutcomesFromLiveTraces() {
     let report = ReliabilityReport.fromTraces(traces)
 
     #expect(report.outcomes == [
-        ScenarioOutcome(id: "completed", surface: "assist", status: .success, failureKind: nil, stepsAttempted: 2, retries: 0),
+        ScenarioOutcome(id: "completed", surface: "assist", status: .success, failureKind: nil, stepsAttempted: 3, retries: 0, subgoalCount: 1, subgoalsSucceeded: 1),
         ScenarioOutcome(id: "failed", surface: "assist", status: .failed, failureKind: .transportFailure, stepsAttempted: 1, retries: 0),
         ScenarioOutcome(id: "stopped", surface: "recipeReplay", status: .userStop, failureKind: .userStop, stepsAttempted: 1, retries: 0),
         ScenarioOutcome(id: "retried", surface: "backgroundWeb", status: .success, failureKind: .groundingMiss, stepsAttempted: 2, retries: 1),
@@ -101,6 +103,9 @@ func reliabilityReportBuildsScenarioOutcomesFromLiveTraces() {
         .groundingMiss: 1,
     ])
     #expect(report.totalRetries == 1)
+    #expect(report.subgoalCount == 1)
+    #expect(report.subgoalsSucceeded == 1)
+    #expect(report.subgoalSuccessRate == 1.0)
     #expect(report.retriesBySurface == [
         "assist": 0,
         "backgroundWeb": 1,
@@ -143,6 +148,9 @@ func sloSnapshotAppliesSurfaceCostDurationAndLoopBudgets() {
     #expect(snapshot.successRatesBySurface["assist"] == 1.0)
     #expect(snapshot.successRatesBySurface["backgroundWeb"] == 0.0)
     #expect(snapshot.noEffectCount == 1)
+    #expect(snapshot.redundantStepCount == 1)
+    #expect(snapshot.subgoalSuccessRate == 1.0)
+    #expect(snapshot.efficiencyQualityScore < 1.0)
     #expect(snapshot.maxDurationMs == 405)
     #expect(!snapshot.passesReleaseGate)
     #expect(snapshot.violations.contains { $0.contains("backgroundWeb success rate") })

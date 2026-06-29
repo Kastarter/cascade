@@ -371,6 +371,7 @@ public final class CascadeAppModel: ObservableObject {
     private let experimentalWorkGraphIndex: Bool
     private let visualGrounderOverride: (any VisualGrounder)?
     private let localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
+    private let actionCriticOverride: (any ActionCritic)?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -380,7 +381,8 @@ public final class CascadeAppModel: ObservableObject {
         appSkills initialAppSkills: AppSkillRegistry? = nil,
         learnedSkillDirectory: URL? = nil,
         visualGrounderOverride: (any VisualGrounder)? = nil,
-        localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil
+        localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
+        actionCriticOverride: (any ActionCritic)? = nil
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
@@ -390,6 +392,7 @@ public final class CascadeAppModel: ObservableObject {
         self.experimentalWorkGraphIndex = Self.experimentalWorkGraphIndexEnabled(defaults: defaults)
         self.visualGrounderOverride = visualGrounderOverride
         self.localRegionNarrowerOverride = localRegionNarrowerOverride
+        self.actionCriticOverride = actionCriticOverride
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
@@ -1716,17 +1719,30 @@ public final class CascadeAppModel: ObservableObject {
         // commands skip the round-trip entirely — a one-part plan runs exactly like
         // the old single loop. The conversation memo lets the planner split
         // follow-ups ("now reply to the first one") against what just happened.
-        let plan: [AgentSubtask]
+        let taskPlan: AgentTaskPlan
         if Self.isSinglePartCommand(goal) {
-            plan = [AgentSubtask(task: goal)]
+            taskPlan = AgentTaskPlan(originalTask: goal, subtasks: [AgentSubtask(task: goal)])
         } else {
             // Downgraded helper task: Groq llama-3.3-70b when a key is set, else
             // Anthropic haiku. Planning is text-only, so no Claude needed.
             let h = TextHelperModel.resolve()
-            plan = await AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache).plan(
-                for: goal, in: .onScreen, conversationContext: assistMemory.contextMemo()
+            let planningContext = [
+                assistMemory.contextMemo(),
+                await planningPriorNote(for: goal, frontmostApp: AppWindowObserver.snapshot().appName),
+            ].compactMap { $0 }.compactMap { value -> String? in
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }.joined(separator: "\n\n")
+            taskPlan = await AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache).taskPlan(
+                for: goal, in: .onScreen, conversationContext: planningContext
             )
         }
+        var plan = taskPlan.subtasks
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.plan",
+            detail: Self.assistPlanAuditDetail(taskPlan)
+        ))
         var findings: [(task: String, result: String)] = []
         var ranLongOn: String?
         var stalledOn: String?
@@ -1750,57 +1766,151 @@ public final class CascadeAppModel: ObservableObject {
             if let fresh = await freshShot() { shot = fresh }
         }
 
-        parts: for (index, sub) in plan.enumerated() {
+        var index = 0
+        parts: while index < plan.count {
             if driver.runState.isStopRequested || assistGeneration != gen { interrupted = true; break }
+            var sub = plan[index]
             let prefix = plan.count > 1 ? "Part \(index + 1)/\(plan.count) — " : ""
+            var replannedCurrent = false
 
-            // Jump straight to the part's app or site — instant, no vision round-trip.
-            if !sub.app.isEmpty {
-                await executeCU(.openApp(sub.app), on: screen)
-                shot = nil
-            } else if !sub.startURL.isEmpty {
-                await executeCU(.openURL(sub.startURL), on: screen)
-                shot = nil
-            }
-            if shot == nil {
-                try? await Task.sleep(for: .milliseconds(260))
-                shot = await freshShot()
-            }
-            guard let episodeShot = shot else {
-                teachMessage = "I lost sight of the screen — try again."
-                interrupted = true
-                break
-            }
+            subgoal: while true {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "assist.subgoal.start",
+                    detail: Self.assistSubgoalAuditDetail(index: index, total: plan.count, subtask: sub, status: "start")
+                ))
 
-            var attempt = await runAssistEpisode(
-                goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: false),
-                prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot, gen: gen
-            )
-            // The model replied without doing anything — usually narration or a
-            // question. One firmer retry on a fresh frame; its answer stands.
-            if case .finished(_, let acted) = attempt, !acted, !driver.runState.isStopRequested, assistGeneration == gen,
-               let retryShot = await freshShot() {
-                attempt = await runAssistEpisode(
-                    goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: true),
-                    prefix: prefix, screen: screen, firstScreenshotPNG: retryShot, gen: gen
+                // Jump straight to the part's app or site — instant, no vision round-trip.
+                if !sub.app.isEmpty {
+                    await executeCU(.openApp(sub.app), on: screen)
+                    shot = nil
+                } else if !sub.startURL.isEmpty {
+                    await executeCU(.openURL(sub.startURL), on: screen)
+                    shot = nil
+                }
+                if shot == nil {
+                    try? await Task.sleep(for: .milliseconds(260))
+                    shot = await freshShot()
+                }
+                guard let episodeShot = shot else {
+                    teachMessage = "I lost sight of the screen — try again."
+                    interrupted = true
+                    break parts
+                }
+
+                var attempt = await runAssistEpisode(
+                    goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: false),
+                    prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot, gen: gen
                 )
-            }
+                // The model replied without doing anything — usually narration or a
+                // question. One firmer retry on a fresh frame; its answer stands.
+                if case .finished(_, let acted) = attempt, !acted, !driver.runState.isStopRequested, assistGeneration == gen,
+                   let retryShot = await freshShot() {
+                    attempt = await runAssistEpisode(
+                        goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: true),
+                        prefix: prefix, screen: screen, firstScreenshotPNG: retryShot, gen: gen
+                    )
+                }
 
-            switch attempt {
-            case .finished(let text, _):
-                findings.append((task: sub.task, result: text))
-            case .stalled(let text):
-                // The part did NOT complete — moving on to the next part would
-                // build on a missing foundation. Stop here and say so honestly.
-                findings.append((task: sub.task, result: text))
-                stalledOn = sub.task
-                break parts
-            case .stopped, .failed:
-                interrupted = true  // the episode already surfaced why
-                break parts
-            case .stepLimit:
-                ranLongOn = sub.task
-                break parts
+                switch attempt {
+                case .finished(let text, _):
+                    let forceValidator = plan.count > 1 || sub.risk == .high || Self.onScreenBackendIsScout()
+                    let verification = await verifyAssistSubgoal(
+                        subtask: sub,
+                        claimed: text,
+                        screen: screen,
+                        forceValidator: forceValidator
+                    )
+                    if verification.passed {
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "assist.subgoal.verify",
+                            detail: Self.assistSubgoalAuditDetail(index: index, total: plan.count, subtask: sub, status: "passed")
+                        ))
+                        findings.append((task: sub.task, result: text))
+                        index += 1
+                        break subgoal
+                    }
+
+                    let reason = verification.reason ?? "subgoal evidence did not match the expected effect"
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "assist.subgoal.fail",
+                        detail: Self.assistSubgoalAuditDetail(
+                            index: index,
+                            total: plan.count,
+                            subtask: sub,
+                            status: "failed",
+                            failureKind: verification.failureKind,
+                            reason: reason
+                        )
+                    ))
+                    let recovery = Self.recoveryAction(for: verification.failureKind, attempt: 1)
+                    await recordAssistRecoveryMemory(
+                        goal: goal,
+                        subtask: sub,
+                        failureKind: verification.failureKind,
+                        reason: reason,
+                        recovery: recovery
+                    )
+                    if !replannedCurrent, Self.shouldReplanAssistSubgoal(failureKind: verification.failureKind) {
+                        let memo = AgentRecoveryMemo(
+                            failedSubtask: sub,
+                            failureKind: verification.failureKind,
+                            attemptedRecovery: recovery,
+                            targetHash: Self.auditHash(sub.task),
+                            stateSummary: reason,
+                            evidenceSummary: "claimed=\(String(text.prefix(180)))",
+                            completedFindings: findings.map { AgentTaskFinding(task: $0.task, result: $0.result) }
+                        )
+                        let h = TextHelperModel.resolve()
+                        let decision = await AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache).replan(
+                            originalTask: goal,
+                            memo: memo,
+                            environment: .onScreen,
+                            conversationContext: assistMemory.contextMemo()
+                        )
+                        switch decision {
+                        case .replaceCurrent(let replacement):
+                            plan[index] = replacement
+                            sub = replacement
+                            replannedCurrent = true
+                            shot = nil
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent",
+                                action: "assist.subgoal.replan",
+                                detail: Self.assistSubgoalAuditDetail(
+                                    index: index,
+                                    total: plan.count,
+                                    subtask: replacement,
+                                    status: "replace",
+                                    failureKind: verification.failureKind,
+                                    reason: reason
+                                )
+                            ))
+                            continue subgoal
+                        case .pause(let pauseReason):
+                            stalledOn = sub.task
+                            findings.append((task: sub.task, result: pauseReason))
+                            break parts
+                        }
+                    }
+                    findings.append((task: sub.task, result: reason))
+                    stalledOn = sub.task
+                    break parts
+                case .stalled(let text):
+                    // The part did NOT complete — moving on to the next part would
+                    // build on a missing foundation. Stop here and say so honestly.
+                    findings.append((task: sub.task, result: text))
+                    stalledOn = sub.task
+                    break parts
+                case .stopped, .failed:
+                    interrupted = true  // the episode already surfaced why
+                    break parts
+                case .stepLimit:
+                    ranLongOn = sub.task
+                    break parts
+                }
             }
             shot = nil  // every later part observes a fresh frame
         }
@@ -1828,6 +1938,120 @@ public final class CascadeAppModel: ObservableObject {
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: Self.textAuditDetail("goal", goal)))
         voice.done()
         await refreshAll()
+    }
+
+    private struct AssistSubgoalVerification: Sendable, Equatable {
+        let passed: Bool
+        let reason: String?
+        let failureKind: AgentOrchestrator.AgentFailureKind
+    }
+
+    private func verifyAssistSubgoal(
+        subtask: AgentSubtask,
+        claimed: String,
+        screen: NSScreen,
+        forceValidator: Bool
+    ) async -> AssistSubgoalVerification {
+        let snapshot = AppWindowObserver.snapshot()
+        var missing: [String] = []
+        var ocrText: String?
+
+        func visibleText() async -> String {
+            if let ocrText { return ocrText }
+            let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+            guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
+                ocrText = ""
+                return ""
+            }
+            let recognized = await ScreenTextRecognizer.recognize(inPNG: shot)
+            ocrText = recognized
+            return recognized
+        }
+
+        for effect in subtask.expectedEffects {
+            switch effect {
+            case .frontmostApp(let expected):
+                if !Self.containsCaseInsensitive(snapshot.appName, expected) {
+                    missing.append("frontmost app is not \(expected)")
+                }
+            case .windowTitleContains(let expected):
+                let title = snapshot.windowTitle ?? ""
+                if !Self.containsCaseInsensitive(title, expected) {
+                    missing.append("window title does not contain \(expected)")
+                }
+            case .visibleText(let expected):
+                let text = await visibleText()
+                if !Self.containsCaseInsensitive(text, expected) {
+                    missing.append("visible text does not include \(expected)")
+                }
+            case .urlContains(let expected):
+                let pageText = await visibleText()
+                let evidence = [snapshot.windowTitle ?? "", pageText].joined(separator: "\n")
+                if !Self.containsCaseInsensitive(evidence, expected) {
+                    missing.append("visible URL/title evidence does not include \(expected)")
+                }
+            case .artifactExists(let path):
+                let expanded = (path as NSString).expandingTildeInPath
+                if !FileManager.default.fileExists(atPath: expanded) {
+                    missing.append("artifact is missing")
+                }
+            case .noUnexpectedModal:
+                let title = (snapshot.windowTitle ?? "").lowercased()
+                if title.contains("alert") || title.contains("dialog") || title.contains("permission") {
+                    missing.append("unexpected modal may still be visible")
+                }
+            }
+        }
+
+        if !missing.isEmpty {
+            return AssistSubgoalVerification(
+                passed: false,
+                reason: missing.joined(separator: "; "),
+                failureKind: .validatorIncomplete
+            )
+        }
+        if forceValidator || subtask.expectedEffects.isEmpty {
+            if let reason = await validateAssistCompletion(goal: subtask.task, claimed: claimed, screen: screen, force: forceValidator) {
+                return AssistSubgoalVerification(passed: false, reason: reason, failureKind: .validatorIncomplete)
+            }
+        }
+        return AssistSubgoalVerification(passed: true, reason: nil, failureKind: .validatorIncomplete)
+    }
+
+    nonisolated static func containsCaseInsensitive(_ haystack: String, _ needle: String) -> Bool {
+        let cleanNeedle = needle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanNeedle.isEmpty else { return true }
+        return haystack.range(of: cleanNeedle, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    nonisolated static func shouldReplanAssistSubgoal(failureKind: AgentOrchestrator.AgentFailureKind) -> Bool {
+        switch failureKind {
+        case .validatorIncomplete, .groundingMiss, .noEffect:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func recordAssistRecoveryMemory(
+        goal: String,
+        subtask: AgentSubtask,
+        failureKind: AgentOrchestrator.AgentFailureKind,
+        reason: String,
+        recovery: RecoveryAction
+    ) async {
+        let appName = Self.normalizedFrontmostApp(AppWindowObserver.snapshot().appName) ?? subtask.app
+        guard !appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let tokens = TrajectorySketch.normalizedGoalTokens(from: goal)
+        guard !tokens.isEmpty else { return }
+        _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
+            appName: appName,
+            normalizedGoalTokens: Array(tokens.prefix(10)),
+            failureKind: Self.experienceFailureKind(for: failureKind),
+            firstBadAction: nil,
+            stateSummary: String(PIIDetector.redact(reason).redacted.prefix(180)),
+            repairHint: "Recovery rung: \(recovery.rawValue). Replan the current subgoal before advancing."
+        ))
     }
 
     private enum AssistEpisodeOutcome {
@@ -1910,7 +2134,8 @@ public final class CascadeAppModel: ObservableObject {
             // coordinates); in coordinate mode it backs the optional fill_target aid.
             grounder: grounder,
             groundingMode: mode,
-            groundingCropProvider: Self.assistGroundingCropProvider()
+            groundingCropProvider: Self.assistGroundingCropProvider(),
+            actionCritic: assistActionCritic()
         )
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
@@ -2018,6 +2243,13 @@ public final class CascadeAppModel: ObservableObject {
     /// STOP and a stray cmd+Q silently abandons the task. See `irreversibleRefusal`.
     static func guardIrreversibleEnabled() -> Bool {
         UserDefaults.standard.bool(forKey: "cascade.guardIrreversibleActions")
+    }
+
+    private func assistActionCritic() -> (any ActionCritic)? {
+        if let actionCriticOverride { return actionCriticOverride }
+        guard hasAnthropicKey else { return nil }
+        let helper = TextHelperModel.resolve()
+        return PromptActionCritic(client: helper.client, model: helper.model)
     }
 
     /// Builds the on-screen grounder. ON by default — opt out with
@@ -2933,6 +3165,39 @@ public final class CascadeAppModel: ObservableObject {
         }
         let displaySummary = call.displaySummary
         let auditDescriptor = call.auditDescriptor
+        let triggerReasons = ComputerUseAgent.actionCriticTriggerReasons(harnessToolName: name)
+        if !triggerReasons.isEmpty, let critique = await critiqueHarnessAction(
+            name: name,
+            displaySummary: displaySummary,
+            goal: goal,
+            triggerReasons: triggerReasons
+        ) {
+            switch critique.verdict {
+            case .approve:
+                break
+            case .revise:
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "agent.action.revised",
+                    detail: Self.actionCritiqueAuditDetail(toolName: name, verdict: critique.verdict, reason: critique.reason)
+                ))
+                return "Revise before running \(name): \(critique.saferInstruction ?? critique.reason)"
+            case .refuse:
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "agent.action.refused",
+                    detail: Self.actionCritiqueAuditDetail(toolName: name, verdict: critique.verdict, reason: critique.reason)
+                ))
+                return "Blocked by pre-action critic: \(critique.reason)"
+            case .askUser:
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "agent.action.ask_user",
+                    detail: Self.actionCritiqueAuditDetail(toolName: name, verdict: critique.verdict, reason: critique.reason)
+                ))
+                return "Pause and ask the user before running \(name): \(critique.reason)"
+            }
+        }
         if name == "run_applescript" {
             // First AppleScript touch of an app blocks on a macOS Automation
             // consent dialog — without this hint the agent just looks frozen.
@@ -2952,6 +3217,21 @@ public final class CascadeAppModel: ObservableObject {
             _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "harness.slow", detail: "\(name) took \(ms)ms - \(auditDescriptor)"))
         }
         return result
+    }
+
+    private func critiqueHarnessAction(
+        name: String,
+        displaySummary: String,
+        goal: String,
+        triggerReasons: [String]
+    ) async -> ActionCritique? {
+        guard let critic = assistActionCritic() else { return nil }
+        return await critic.critique(ActionCritiqueRequest(
+            goal: goal,
+            actionSummary: "harness \(name): \(displaySummary)",
+            screenSummary: groundingNote() ?? "",
+            triggerReasons: triggerReasons
+        ))
     }
 
     private func auditObservationResultIfNeeded(tool: String, result: String) async {
@@ -3004,6 +3284,7 @@ public final class CascadeAppModel: ObservableObject {
         let snapshot = AppWindowObserver.snapshot()
         let parts = [
             groundingNote(),
+            await planningPriorNote(for: goal, frontmostApp: snapshot.appName),
             await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
             await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
         ].compactMap { $0 }
@@ -3014,10 +3295,34 @@ public final class CascadeAppModel: ObservableObject {
         let snapshot = AppWindowObserver.snapshot()
         let parts = [
             scoutContextNote(),
+            await planningPriorNote(for: goal, frontmostApp: snapshot.appName),
             await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
             await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
         ].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    private func planningPriorNote(for goal: String, frontmostApp: String?) async -> String? {
+        guard defaultsStore.bool(forKey: Self.experimentalWorkGraphIndexKey) else { return nil }
+        for skill in appSkills.skills.prefix(80) {
+            _ = try? await skill.indexPlanningMetadata(in: store)
+        }
+        let priors = (try? await store.planningPriors(goal: goal, appName: frontmostApp, limit: 5)) ?? []
+        guard !priors.isEmpty else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "agent.work_graph.priors",
+            detail: "count=\(priors.count) priorHash=\(Self.auditHash(priors.map { "\($0.kind.rawValue):\($0.canonicalValue):\($0.relation)" }.joined(separator: "|")))"
+        ))
+        let lines = priors.map { prior -> String in
+            let direction = prior.weight < 0 ? "avoid" : "prefer"
+            return "- \(direction) \(prior.kind.rawValue) \(prior.displayName) via \(prior.relation)"
+        }
+        return """
+        WORK GRAPH PLANNING PRIORS
+        Use these as hints only; live screen evidence wins.
+        \(lines.joined(separator: "\n"))
+        """
     }
 
     private func trajectorySketchNote(for goal: String, frontmostApp: String?) async -> String? {
@@ -3106,8 +3411,8 @@ public final class CascadeAppModel: ObservableObject {
     /// watched success path Opus rarely needs. It is the reliability net for a
     /// downgraded thinker (Phase 3), which false-completes far more — build it now,
     /// switch it on then. See [[cascade-cu-downgrade-research]].
-    private func validateAssistCompletion(goal: String, claimed: String, screen: NSScreen) async -> String? {
-        guard UserDefaults.standard.bool(forKey: "cascade.assistValidator"), hasAnthropicKey else { return nil }
+    private func validateAssistCompletion(goal: String, claimed: String, screen: NSScreen, force: Bool = false) async -> String? {
+        guard (force || UserDefaults.standard.bool(forKey: "cascade.assistValidator")), hasAnthropicKey else { return nil }
         let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
         guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else { return nil }
         let onScreen = await ScreenTextRecognizer.recognize(inPNG: shot)
@@ -3330,6 +3635,53 @@ public final class CascadeAppModel: ObservableObject {
             "controlCount=\(controlCount)",
             "labelsHash=\(auditHash(labels))",
         ].joined(separator: " ")
+    }
+
+    nonisolated static func actionCritiqueAuditDetail(
+        toolName: String,
+        verdict: ActionCritique.Verdict,
+        reason: String
+    ) -> String {
+        [
+            "tool=\(safeAuditToken(toolName))",
+            "verdict=\(safeAuditToken(verdict.rawValue))",
+            textAuditDetail("reason", reason),
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func assistPlanAuditDetail(_ plan: AgentTaskPlan) -> String {
+        [
+            "planID=\(safeAuditToken(plan.id))",
+            "subgoalCount=\(plan.subtasks.count)",
+            "taskHash=\(auditHash(plan.originalTask))",
+            "risk=\(plan.subtasks.map { safeAuditToken($0.risk.rawValue) }.joined(separator: ","))",
+            "effectsHash=\(auditHash(plan.subtasks.flatMap { $0.expectedEffects.map(\.auditLabel) }.joined(separator: "|")))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func assistSubgoalAuditDetail(
+        index: Int,
+        total: Int,
+        subtask: AgentSubtask,
+        status: String,
+        failureKind: AgentOrchestrator.AgentFailureKind? = nil,
+        reason: String? = nil
+    ) -> String {
+        var parts = [
+            "index=\(index + 1)",
+            "total=\(total)",
+            "status=\(safeAuditToken(status))",
+            "taskHash=\(auditHash(subtask.task))",
+            "risk=\(safeAuditToken(subtask.risk.rawValue))",
+            "effectsHash=\(auditHash(subtask.expectedEffects.map(\.auditLabel).joined(separator: "|")))",
+        ]
+        if let failureKind {
+            parts.append("failureKind=\(safeAuditToken(failureKind.rawValue))")
+        }
+        if let reason {
+            parts.append(textAuditDetail("reason", reason))
+        }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func ocrMarksAuditDetail(

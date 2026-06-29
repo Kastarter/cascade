@@ -233,6 +233,8 @@ public final class ComputerUseAgent {
     /// grounder is present). The caller reads this to adapt its own flail nudges
     /// (push target NAMES to re-describe, not coordinates the model can't emit).
     public var isStructural: Bool { groundingMode == .structural && grounder != nil }
+    private let actionCritic: (any ActionCritic)?
+    private var currentGoal = ""
 
     /// Mid-stream delivery: when set, each completed text block and screen action
     /// is handed over the moment it finishes generating, so the caller acts while
@@ -536,7 +538,8 @@ public final class ComputerUseAgent {
         includeStructuredRecallContent: Bool = false,
         grounder: VisualGrounder? = nil,
         groundingMode: GroundingMode = .coordinate,
-        groundingCropProvider: (@Sendable (CGRect, Int, Int) async -> GroundingCrop?)? = nil
+        groundingCropProvider: (@Sendable (CGRect, Int, Int) async -> GroundingCrop?)? = nil,
+        actionCritic: (any ActionCritic)? = nil
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -553,6 +556,7 @@ public final class ComputerUseAgent {
         self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
         self.grounder = grounder
         self.groundingCropProvider = groundingCropProvider
+        self.actionCritic = actionCritic
         // Structural grounding needs a grounder to act on named targets; without
         // one, fall back to the coordinate computer tool so the agent still works.
         self.groundingMode = (groundingMode == .structural && grounder != nil) ? .structural : .coordinate
@@ -592,6 +596,7 @@ public final class ComputerUseAgent {
         episodePrunedImages = 0
         episodeCompactedToolResults = 0
         currentToolDefinitionCount = 0
+        currentGoal = goal
         goalAsksForPaste = Self.goalMentionsClipboard(goal)
         goalAsksForDestruction = Self.goalMentionsDestruction(goal)
         episodeCopied = false
@@ -884,13 +889,20 @@ public final class ComputerUseAgent {
                     if let combo = input["key"] as? String {
                         let action = CUAction.key(combo)
                         noteCopy(action)
-                        if let id = block["id"] as? String, let refusal = actionRefusal(for: action) {
-                            toolResultOverrides[id] = refusal.text
-                            onActionRefused?(refusal.audit)
-                            Self.logger.info("refused action: \(refusal.audit)")
-                        } else {
-                            actions.append(action)
-                        }
+	                        if let id = block["id"] as? String, let refusal = actionRefusal(for: action) {
+	                            toolResultOverrides[id] = refusal.text
+	                            onActionRefused?(refusal.audit)
+	                            Self.logger.info("refused action: \(refusal.audit)")
+	                        } else if let id = block["id"] as? String,
+	                                  let critique = await actionCritique(for: action),
+	                                  critique.verdict != .approve {
+	                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
+	                            if critique.verdict == .refuse {
+	                                onActionRefused?("critic refused action — \(critique.reason)")
+	                            }
+	                        } else {
+	                            actions.append(action)
+	                        }
                     }
                 case "scroll":
                     // Scroll over a named target (grounded) or, with no target, the
@@ -917,13 +929,20 @@ public final class ComputerUseAgent {
                     // Structural paste gate (the Keynote title-page incident,
                     // 2026-06-11): the prompt ban on bare cmd+v didn't hold —
                     // refuse it here and teach via the tool_result instead.
-                    if let id = block["id"] as? String, let refusal = actionRefusal(for: action) {
-                        toolResultOverrides[id] = refusal.text
-                        onActionRefused?(refusal.audit)
-                        Self.logger.info("refused action: \(refusal.audit)")
-                    } else {
-                        actions.append(action)
-                    }
+	                    if let id = block["id"] as? String, let refusal = actionRefusal(for: action) {
+	                        toolResultOverrides[id] = refusal.text
+	                        onActionRefused?(refusal.audit)
+	                        Self.logger.info("refused action: \(refusal.audit)")
+	                    } else if let id = block["id"] as? String,
+	                              let critique = await actionCritique(for: action),
+	                              critique.verdict != .approve {
+	                        toolResultOverrides[id] = Self.critiqueToolResult(critique)
+	                        if critique.verdict == .refuse {
+	                            onActionRefused?("critic refused action — \(critique.reason)")
+	                        }
+	                    } else {
+	                        actions.append(action)
+	                    }
                 }
             default:
                 break
@@ -1738,6 +1757,7 @@ public final class ComputerUseAgent {
             // must not execute mid-stream — skipping hands them to step()'s
             // post-pass, which answers with the teaching refusal.
             if actionRefusal(for: action) != nil { return .skipped }
+            if let critique = await actionCritique(for: action), critique.verdict != .approve { return .skipped }
             noteCopy(action)
             return await sink(.action(action)) ? .delivered : .aborted
         default:
@@ -1808,6 +1828,103 @@ public final class ComputerUseAgent {
         return nil
     }
 
+    private func actionCritique(for action: CUAction) async -> ActionCritique? {
+        let reasons = Self.actionCriticTriggerReasons(for: action)
+        guard !reasons.isEmpty, let actionCritic else { return nil }
+        return await actionCritic.critique(ActionCritiqueRequest(
+            goal: currentGoal,
+            actionSummary: Self.actionSummaryForCritic(action),
+            screenSummary: "",
+            triggerReasons: reasons
+        ))
+    }
+
+    nonisolated public static func actionCriticTriggerReasons(
+        for action: CUAction? = nil,
+        harnessToolName: String? = nil,
+        lowConfidenceGrounding: Bool = false,
+        alternativeCount: Int = 0,
+        groundingMissCount: Int = 0,
+        noEffectCount: Int = 0,
+        liveValueFailure: Bool = false
+    ) -> [String] {
+        var reasons: [String] = []
+        if let harnessToolName, ["run_command", "run_applescript", "write_file"].contains(harnessToolName) {
+            reasons.append("power_harness_tool")
+        }
+        if let action {
+            switch action {
+            case .key(let combo) where isIrreversibleCombo(combo):
+                reasons.append("irreversible_key")
+            case .key(let combo) where looksExternallySignificant(combo):
+                reasons.append("external_side_effect_key")
+            case .type(let text) where looksExternallySignificant(text):
+                reasons.append("external_side_effect_text")
+            default:
+                break
+            }
+        }
+        if lowConfidenceGrounding { reasons.append("low_confidence_grounding") }
+        if alternativeCount > 0 { reasons.append("ambiguous_grounding") }
+        if groundingMissCount >= 2 { reasons.append("repeated_grounding_miss") }
+        if noEffectCount >= 2 { reasons.append("repeated_no_effect") }
+        if liveValueFailure { reasons.append("parameter_needs_live_value") }
+        return Array(Set(reasons)).sorted()
+    }
+
+    nonisolated public static func shouldTriggerActionCritic(
+        for action: CUAction? = nil,
+        harnessToolName: String? = nil,
+        lowConfidenceGrounding: Bool = false,
+        alternativeCount: Int = 0,
+        groundingMissCount: Int = 0,
+        noEffectCount: Int = 0,
+        liveValueFailure: Bool = false
+    ) -> Bool {
+        !actionCriticTriggerReasons(
+            for: action,
+            harnessToolName: harnessToolName,
+            lowConfidenceGrounding: lowConfidenceGrounding,
+            alternativeCount: alternativeCount,
+            groundingMissCount: groundingMissCount,
+            noEffectCount: noEffectCount,
+            liveValueFailure: liveValueFailure
+        ).isEmpty
+    }
+
+    private nonisolated static func actionSummaryForCritic(_ action: CUAction) -> String {
+        switch action {
+        case .move(let x, let y): "move \(Int(x)),\(Int(y))"
+        case .click(let x, let y): "click \(Int(x)),\(Int(y))"
+        case .doubleClick(let x, let y): "double_click \(Int(x)),\(Int(y))"
+        case .tripleClick(let x, let y): "triple_click \(Int(x)),\(Int(y))"
+        case .rightClick(let x, let y): "right_click \(Int(x)),\(Int(y))"
+        case .drag: "drag"
+        case .type(let text): "type \(text.prefix(40))"
+        case .key(let key): "key \(key)"
+        case .scroll(_, _, let direction, let amount): "scroll \(direction) \(amount)"
+        case .wait: "wait"
+        case .screenshot: "screenshot"
+        case .openApp(let name): "open_app \(name)"
+        case .openURL(let url): "open_url \(url.prefix(64))"
+        case .zoom: "zoom"
+        case .highlight(_, _, _, _, let label): "highlight \(label)"
+        }
+    }
+
+    private nonisolated static func critiqueToolResult(_ critique: ActionCritique) -> String {
+        switch critique.verdict {
+        case .approve:
+            "Approved."
+        case .revise:
+            "Revise before acting: \(critique.saferInstruction ?? critique.reason)"
+        case .refuse:
+            "Blocked by pre-action critic: \(critique.reason)"
+        case .askUser:
+            "Pause and ask the user before acting: \(critique.reason)"
+        }
+    }
+
     /// The teaching refusal for an irreversible system/app key — quitting the app
     /// mid-task (abandoning the work surface and any unsaved state), force-quit,
     /// logging out, or emptying the Trash. None can be undone with cmd+z, so a
@@ -1852,6 +1969,13 @@ public final class ComputerUseAgent {
     nonisolated static func goalMentionsDestruction(_ goal: String) -> Bool {
         goal.range(
             of: #"(?i)(\b(quit|close|delete|trash|empty|remove|erase)\b|\bsign\s?out\b|\blog(?:ged|ging)?\b.{0,15}?\bout\b|force[\s-]?quit)"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    nonisolated static func looksExternallySignificant(_ value: String) -> Bool {
+        value.range(
+            of: #"(?i)\b(send|submit|pay|purchase|post|publish|invite|delete|remove|trash|archive|cancel|confirm|wire|transfer)\b"#,
             options: .regularExpression
         ) != nil
     }

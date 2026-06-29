@@ -25,6 +25,12 @@ public struct ScenarioOutcome: Sendable, Equatable, Codable {
     public let noEffectCount: Int
     public let validatorIncompleteCount: Int
     public let verificationFailureCount: Int
+    public let subgoalCount: Int
+    public let subgoalsSucceeded: Int
+    public let subgoalSuccessRate: Double
+    public let redundantStepCount: Int
+    public let wrongStartStateCount: Int
+    public let efficiencyQualityScore: Double
     public let confidence: Double?
     public let confidenceBucket: String?
     public let actualSuccess: Bool?
@@ -38,6 +44,11 @@ public struct ScenarioOutcome: Sendable, Equatable, Codable {
         noEffectCount: Int = 0,
         validatorIncompleteCount: Int = 0,
         verificationFailureCount: Int = 0,
+        subgoalCount: Int = 0,
+        subgoalsSucceeded: Int = 0,
+        redundantStepCount: Int = 0,
+        wrongStartStateCount: Int = 0,
+        efficiencyQualityScore: Double? = nil,
         confidence: Double? = nil,
         actualSuccess: Bool? = nil,
         calibrationOutcome: VerifierCalibrationOutcome? = nil
@@ -53,6 +64,20 @@ public struct ScenarioOutcome: Sendable, Equatable, Codable {
         self.noEffectCount = noEffectCount
         self.validatorIncompleteCount = validatorIncompleteCount
         self.verificationFailureCount = verificationFailureCount
+        self.subgoalCount = max(0, subgoalCount)
+        self.subgoalsSucceeded = min(max(0, subgoalsSucceeded), max(0, subgoalCount))
+        self.subgoalSuccessRate = Self.subgoalRate(succeeded: self.subgoalsSucceeded, total: self.subgoalCount)
+        self.redundantStepCount = max(0, redundantStepCount)
+        self.wrongStartStateCount = max(0, wrongStartStateCount)
+        self.efficiencyQualityScore = Self.clampScore(efficiencyQualityScore ?? Self.defaultEfficiencyQualityScore(
+            status: status,
+            subgoalSuccessRate: self.subgoalSuccessRate,
+            retries: retries,
+            noEffectCount: noEffectCount,
+            redundantStepCount: self.redundantStepCount,
+            wrongStartStateCount: self.wrongStartStateCount,
+            stepsAttempted: stepsAttempted
+        ))
         let clampedConfidence = confidence.map(VerifierCalibration.clampConfidence)
         self.confidence = clampedConfidence
         self.confidenceBucket = clampedConfidence.map { VerifierCalibration.bucketLabel(for: $0) }
@@ -76,10 +101,43 @@ public struct ScenarioOutcome: Sendable, Equatable, Codable {
         case noEffectCount = "no_effect_count"
         case validatorIncompleteCount = "validator_incomplete_count"
         case verificationFailureCount = "verification_failure_count"
+        case subgoalCount = "subgoal_count"
+        case subgoalsSucceeded = "subgoals_succeeded"
+        case subgoalSuccessRate = "subgoal_success_rate"
+        case redundantStepCount = "redundant_step_count"
+        case wrongStartStateCount = "wrong_start_state_count"
+        case efficiencyQualityScore = "efficiency_quality_score"
         case confidence
         case confidenceBucket = "confidence_bucket"
         case actualSuccess = "actual_success"
         case calibrationOutcome = "calibration_outcome"
+    }
+
+    private static func subgoalRate(succeeded: Int, total: Int) -> Double {
+        guard total > 0 else { return 1.0 }
+        return Double(succeeded) / Double(total)
+    }
+
+    private static func defaultEfficiencyQualityScore(
+        status: ScenarioStatus,
+        subgoalSuccessRate: Double,
+        retries: Int,
+        noEffectCount: Int,
+        redundantStepCount: Int,
+        wrongStartStateCount: Int,
+        stepsAttempted: Int
+    ) -> Double {
+        let successBase: Double = status == .success ? 1.0 : (status == .refused || status == .userStop ? 0.65 : 0.35)
+        let retryPenalty = min(0.20, Double(max(0, retries)) * 0.04)
+        let noEffectPenalty = min(0.20, Double(max(0, noEffectCount)) * 0.05)
+        let redundantPenalty = min(0.20, Double(max(0, redundantStepCount)) * 0.04)
+        let wrongStartPenalty = min(0.15, Double(max(0, wrongStartStateCount)) * 0.05)
+        let lengthPenalty = min(0.10, Double(max(0, stepsAttempted - 12)) * 0.005)
+        return clampScore((successBase * 0.65) + (subgoalSuccessRate * 0.35) - retryPenalty - noEffectPenalty - redundantPenalty - wrongStartPenalty - lengthPenalty)
+    }
+
+    private static func clampScore(_ value: Double) -> Double {
+        min(1.0, max(0.0, value.isFinite ? value : 0.0))
     }
 
     private static func defaultCalibrationOutcome(
@@ -222,6 +280,18 @@ public struct ReliabilityReport: Sendable {
     public var noEffectCount: Int { outcomes.reduce(0) { $0 + $1.noEffectCount } }
     public var validatorIncompleteCount: Int { outcomes.reduce(0) { $0 + $1.validatorIncompleteCount } }
     public var verificationFailureCount: Int { outcomes.reduce(0) { $0 + $1.verificationFailureCount } }
+    public var subgoalCount: Int { outcomes.reduce(0) { $0 + $1.subgoalCount } }
+    public var subgoalsSucceeded: Int { outcomes.reduce(0) { $0 + $1.subgoalsSucceeded } }
+    public var subgoalSuccessRate: Double {
+        guard subgoalCount > 0 else { return 1.0 }
+        return Double(subgoalsSucceeded) / Double(subgoalCount)
+    }
+    public var redundantStepCount: Int { outcomes.reduce(0) { $0 + $1.redundantStepCount } }
+    public var wrongStartStateCount: Int { outcomes.reduce(0) { $0 + $1.wrongStartStateCount } }
+    public var averageEfficiencyQualityScore: Double {
+        guard !outcomes.isEmpty else { return 1.0 }
+        return outcomes.reduce(0) { $0 + $1.efficiencyQualityScore } / Double(outcomes.count)
+    }
     public var stallCount: Int {
         outcomes.filter { outcome in
             outcome.failureKind == .stepLimit || outcome.failureKind == .timeout || outcome.status == .failed
@@ -275,6 +345,9 @@ public struct ReliabilityReport: Sendable {
         public var minSuccessRatesBySurface: [String: Double] = [:]
         public var maxFalseCompletionRate: Double = 0.0
         public var maxNoEffectCount: Int?
+        public var maxRedundantStepCount: Int?
+        public var minSubgoalSuccessRate: Double?
+        public var minEfficiencyQualityScore: Double?
         public var maxStallCount: Int?
         public var maxCostPerSuccessfulRunUSD: Double?
         public var maxDurationMs: Int?
@@ -308,6 +381,16 @@ public struct ReliabilityReport: Sendable {
         if let maxNoEffectCount = budgets.maxNoEffectCount, noEffectCount > maxNoEffectCount {
             failures.append("no-effect count \(noEffectCount) > \(maxNoEffectCount)")
         }
+        if let maxRedundantStepCount = budgets.maxRedundantStepCount, redundantStepCount > maxRedundantStepCount {
+            failures.append("redundant step count \(redundantStepCount) > \(maxRedundantStepCount)")
+        }
+        if let minSubgoalSuccessRate = budgets.minSubgoalSuccessRate, subgoalSuccessRate < minSubgoalSuccessRate {
+            failures.append(String(format: "subgoal success rate %.2f < %.2f", subgoalSuccessRate, minSubgoalSuccessRate))
+        }
+        if let minEfficiencyQualityScore = budgets.minEfficiencyQualityScore,
+           averageEfficiencyQualityScore < minEfficiencyQualityScore {
+            failures.append(String(format: "efficiency-quality score %.2f < %.2f", averageEfficiencyQualityScore, minEfficiencyQualityScore))
+        }
         if let maxStallCount = budgets.maxStallCount, stallCount > maxStallCount {
             failures.append("stall count \(stallCount) > \(maxStallCount)")
         }
@@ -325,6 +408,12 @@ public struct ReliabilityReport: Sendable {
         public let successRatesBySurface: [String: Double]
         public let falseCompletionRate: Double
         public let noEffectCount: Int
+        public let subgoalCount: Int
+        public let subgoalsSucceeded: Int
+        public let subgoalSuccessRate: Double
+        public let redundantStepCount: Int
+        public let wrongStartStateCount: Int
+        public let efficiencyQualityScore: Double
         public let stallCount: Int
         public let totalCostUSD: Double
         public let costPerSuccessfulRunUSD: Double
@@ -339,6 +428,12 @@ public struct ReliabilityReport: Sendable {
             successRatesBySurface: [String: Double],
             falseCompletionRate: Double,
             noEffectCount: Int,
+            subgoalCount: Int,
+            subgoalsSucceeded: Int,
+            subgoalSuccessRate: Double,
+            redundantStepCount: Int,
+            wrongStartStateCount: Int,
+            efficiencyQualityScore: Double,
             stallCount: Int,
             totalCostUSD: Double,
             costPerSuccessfulRunUSD: Double,
@@ -350,6 +445,12 @@ public struct ReliabilityReport: Sendable {
             self.successRatesBySurface = successRatesBySurface
             self.falseCompletionRate = falseCompletionRate
             self.noEffectCount = noEffectCount
+            self.subgoalCount = subgoalCount
+            self.subgoalsSucceeded = subgoalsSucceeded
+            self.subgoalSuccessRate = subgoalSuccessRate
+            self.redundantStepCount = redundantStepCount
+            self.wrongStartStateCount = wrongStartStateCount
+            self.efficiencyQualityScore = efficiencyQualityScore
             self.stallCount = stallCount
             self.totalCostUSD = totalCostUSD
             self.costPerSuccessfulRunUSD = costPerSuccessfulRunUSD
@@ -385,6 +486,12 @@ public struct ReliabilityReport: Sendable {
             successRatesBySurface: report.successRatesBySurface,
             falseCompletionRate: report.falseCompletionRate,
             noEffectCount: report.noEffectCount,
+            subgoalCount: report.subgoalCount,
+            subgoalsSucceeded: report.subgoalsSucceeded,
+            subgoalSuccessRate: report.subgoalSuccessRate,
+            redundantStepCount: report.redundantStepCount,
+            wrongStartStateCount: report.wrongStartStateCount,
+            efficiencyQualityScore: report.averageEfficiencyQualityScore,
             stallCount: report.stallCount,
             totalCostUSD: totalCost,
             costPerSuccessfulRunUSD: costPerSuccess,

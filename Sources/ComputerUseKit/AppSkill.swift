@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 
 // Ported from milind-soni/tiptour-macos `TipTour/Skills/MarkdownAppSkill.swift`
@@ -128,6 +129,20 @@ public struct AppSkill: Sendable {
 
     public var promptBlock: String {
         "App skill: \(name) — follow these instructions while working in this app:\n\(instructions)"
+    }
+
+    public var planningGraphAppNames: [String] {
+        hints.appMatchers?.names ?? []
+    }
+
+    @discardableResult
+    public func indexPlanningMetadata(in store: CascadeStore) async throws -> WorkGraphEntity {
+        try await store.indexPlanningSkill(
+            name: name,
+            appNames: planningGraphAppNames,
+            useWhen: useWhen,
+            dangerous: explicitAskOnly
+        )
     }
 
     public func matches(appName: String?, bundleIdentifier: String?) -> Bool {

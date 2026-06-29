@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 
+import CascadeMemory
 @testable import ProviderKit
 
 /// Pins the structural gates added after the Keynote title-page incident
@@ -105,5 +106,26 @@ struct ActionGateTests {
         #expect(!ComputerUseAgent.goalMentionsDestruction("title page for the market entry readout"))
         #expect(!ComputerUseAgent.goalMentionsDestruction("make a donut in Blender"))
         #expect(!ComputerUseAgent.goalMentionsDestruction("summarize today's meetings into Notes"))
+    }
+
+    @Test func actionCriticTriggersOnPowerHarnessAndAmbiguousGrounding() {
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(harnessToolName: "run_command"))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(harnessToolName: "run_applescript"))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(alternativeCount: 2))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(lowConfidenceGrounding: true))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(noEffectCount: 2))
+        #expect(!ComputerUseAgent.shouldTriggerActionCritic(harnessToolName: "read_file"))
+    }
+
+    @Test func promptActionCriticParsesVerdictsAndFailureKind() {
+        let critique = PromptActionCritic.parse("""
+        {"verdict":"ask_user","reason":"Needs confirmation","saferInstruction":"Ask first","failureKind":"unsafe_action"}
+        """)
+
+        #expect(critique?.verdict == .askUser)
+        #expect(critique?.reason == "Needs confirmation")
+        #expect(critique?.saferInstruction == "Ask first")
+        #expect(critique?.failureKind == CascadeMemory.AgentFailureKind.unsafeAction)
+        #expect(PromptActionCritic.parse(#"{"verdict":"approve","reason":"ok"}"#)?.verdict == .approve)
     }
 }

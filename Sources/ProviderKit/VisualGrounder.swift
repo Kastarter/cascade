@@ -543,8 +543,16 @@ public struct UITARSGrounder: VisualGrounder {
         ) else {
             return GroundingResult()
         }
-        guard let mark = Self.parseMarkID(content),
-              let selected = candidates.first(where: { $0.markNumber == mark }) else {
+        let marks = Self.parseMarkIDs(content)
+        let selectedMarks = marks
+            .reduce(into: [Int]()) { acc, mark in
+                if !acc.contains(mark) { acc.append(mark) }
+            }
+            .prefix(3)
+        let selectedCandidates = selectedMarks.compactMap { mark in
+            candidates.first(where: { $0.markNumber == mark })
+        }
+        guard let selected = selectedCandidates.first else {
             return GroundingResult(
                 candidates: [
                     GroundingCandidate(
@@ -563,26 +571,27 @@ public struct UITARSGrounder: VisualGrounder {
                 alternativeCount: candidates.count
             )
         }
+        let groundingCandidates = selectedCandidates.map { candidate in
+            GroundingCandidate(
+                point: candidate.center,
+                region: candidate.displayBounds,
+                confidence: max(0.78, candidate.confidence),
+                source: candidate.source,
+                coordinateSpace: .displayLocalAppKitPoints,
+                rawModel: content,
+                latency: start.duration(to: ContinuousClock.now).timeInterval,
+                reason: "ranked Set-of-Mark \(candidate.markNumber)",
+                candidateID: candidate.id,
+                markNumber: candidate.markNumber,
+                displayBounds: candidate.displayBounds,
+                imageBounds: candidate.imageBounds
+            )
+        }
         return GroundingResult(
-            candidates: [
-                GroundingCandidate(
-                    point: selected.center,
-                    region: selected.displayBounds,
-                    confidence: max(0.78, selected.confidence),
-                    source: selected.source,
-                    coordinateSpace: .displayLocalAppKitPoints,
-                    rawModel: content,
-                    latency: start.duration(to: ContinuousClock.now).timeInterval,
-                    reason: "selected Set-of-Mark \(mark)",
-                    candidateID: selected.id,
-                    markNumber: selected.markNumber,
-                    displayBounds: selected.displayBounds,
-                    imageBounds: selected.imageBounds
-                )
-            ],
+            candidates: groundingCandidates,
             selectedIndex: 0,
             selectedCandidateID: selected.id,
-            alternativeCount: max(0, candidates.count - 1)
+            alternativeCount: max(0, candidates.count - groundingCandidates.count)
         )
     }
 
@@ -697,8 +706,8 @@ public struct UITARSGrounder: VisualGrounder {
         You are a GUI grounding model. The screenshot has visible numbered labels drawn \
         on candidate UI elements. Locate the element described by:
         "\(target)"
-        Choose exactly one candidate mark from the list. Respond with ONLY compact JSON \
-        like {"mark": 7}. If none matches, respond {"mark": null}.
+        Choose up to three candidate marks ranked best-first from the list. Respond with \
+        ONLY compact JSON like {"marks": [7, 4, 9]}. If none matches, respond {"marks": []}.
 
         Candidates:
         \(list)
@@ -706,19 +715,38 @@ public struct UITARSGrounder: VisualGrounder {
     }
 
     static func parseMarkID(_ text: String) -> Int? {
+        parseMarkIDs(text).first
+    }
+
+    static func parseMarkIDs(_ text: String) -> [Int] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let start = trimmed.firstIndex(of: "{"),
            let end = trimmed.lastIndex(of: "}"),
            let data = String(trimmed[start...end]).data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let mark = json["mark"] as? NSNumber { return mark.intValue }
-            if let mark = json["id"] as? NSNumber { return mark.intValue }
-            if let mark = json["mark"] as? String { return Int(mark.trimmingCharacters(in: .whitespacesAndNewlines)) }
-            return nil
+            for key in ["marks", "ranked", "candidates"] {
+                if let values = json[key] as? [Any] {
+                    return values.compactMap(Self.parseMarkValue)
+                }
+            }
+            if let mark = json["mark"].flatMap(Self.parseMarkValue) { return [mark] }
+            if let mark = json["id"].flatMap(Self.parseMarkValue) { return [mark] }
+            return []
         }
         let pattern = #"(?i)\b(?:mark|id|#)?\s*(\d{1,4})\b"#
-        guard let match = firstMatch(pattern, in: trimmed), let mark = match[1] else { return nil }
-        return Int(mark)
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = trimmed as NSString
+        return regex.matches(in: trimmed, range: NSRange(location: 0, length: ns.length))
+            .compactMap { match in
+                guard match.numberOfRanges > 1 else { return nil }
+                return Int(ns.substring(with: match.range(at: 1)))
+            }
+    }
+
+    private static func parseMarkValue(_ value: Any) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
     }
 
     private func callModel(jpeg: Data, target: String, declaredW: Int, declaredH: Int, prompt: String? = nil) async -> String? {
