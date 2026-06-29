@@ -81,7 +81,11 @@ struct RealtimeVoiceEndpointPolicyTests {
         #expect(!RealtimeVoice.experimentalLocalVoiceEndpointingEnabled(defaults: defaults))
     }
 
-    @Test func enabledShortNoiseReleaseClearsInsteadOfCommit() {
+    @Test func enabledShortSpeechReleaseFailsOpenAndCommits() {
+        // Fail-open for push-to-talk: a short / unconfirmed utterance (below the
+        // VAD's min-speech bar) must NOT be silently dropped — the key release is
+        // the turn boundary. The captured audio is committed; genuine noise is
+        // rejected downstream from the TRANSCRIPT by VoiceFragmentGate.
         let sender = FakeRealtimeVoiceEventSender()
         let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
         sender.sendEvent(["type": "input_audio_buffer.clear"])
@@ -93,8 +97,40 @@ struct RealtimeVoiceEndpointPolicyTests {
         )
         let result = session.release()
 
+        #expect(result == .committed)
+        #expect(sender.eventTypes.contains("input_audio_buffer.append"))
+        #expect(sender.eventTypes.last == "input_audio_buffer.commit")
+    }
+
+    @Test func enabledQuietSpeechReleaseStillCommits() {
+        // The actual reported failure: a mic quiet enough that every frame scores
+        // below the energy gate's speech threshold was classified as "silence" and
+        // the whole turn was discarded → the agent took no request at all. Fail-open
+        // uploads and commits it anyway.
+        let sender = FakeRealtimeVoiceEventSender()
+        let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
+
+        // Peak ~0.006 — well under minSpeechPeak (0.05), so the gate never confirms.
+        feedRealtimeEndpoint(session, frames: Array(repeating: realtimeSpeechFrame(amplitude: 200), count: 20))
+        let result = session.release()
+
+        #expect(result == .committed)
+        #expect(sender.eventTypes.contains("input_audio_buffer.append"))
+        #expect(sender.eventTypes.last == "input_audio_buffer.commit")
+    }
+
+    @Test func enabledEmptyReleaseClears() {
+        // No audio captured at all (key tapped and released instantly): nothing to
+        // transcribe, so clear rather than commit an empty buffer.
+        let sender = FakeRealtimeVoiceEventSender()
+        let session = makeRealtimeEndpointSession(enabled: true, sender: sender)
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
+
+        let result = session.release()
+
         #expect(result == .cleared)
-        #expect(sender.eventTypes == ["input_audio_buffer.clear", "input_audio_buffer.clear"])
+        #expect(!sender.eventTypes.contains("input_audio_buffer.append"))
         #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
     }
 

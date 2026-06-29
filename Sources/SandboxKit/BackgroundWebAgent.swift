@@ -49,6 +49,7 @@ public final class BackgroundWebAgent {
     /// remains the fallback when there's no Groq key.
     private let groqKeyStore: GroqKeyStore
     private let groqVision: GroqVisionClient
+    private let scoutPlannerModel: String
     private let usesScout: Bool
     private let planner: AgentTaskPlanner
     /// Cheap second opinion that checks a claimed completion against the actual page.
@@ -140,7 +141,12 @@ public final class BackgroundWebAgent {
     ) {
         self.keyStore = keyStore
         self.groqKeyStore = groqKeyStore
-        self.groqVision = GroqVisionClient(keyStore: groqKeyStore)
+        // Same configurable planner backend as the on-screen Scout (cascade.scoutPlanner.*):
+        // Llama-4 Scout via Groq by default, or a multimodal OpenRouter model (e.g.
+        // qwen/qwen3.6-plus). Keeps the on-screen + background brains identical.
+        let scoutPlanner = ScoutPlannerBackend.resolve(groqKeyStore: groqKeyStore)
+        self.groqVision = scoutPlanner.vision
+        self.scoutPlannerModel = scoutPlanner.model
         self.model = model
         self.usesScout = Self.backgroundUsesScout(groqKeyStore: groqKeyStore)
         // The planner (≤5 subtasks + start URLs) and the completion verifier are
@@ -574,6 +580,7 @@ public final class BackgroundWebAgent {
         let agent = ScoutAgent(
             vision: groqVision,
             grounder: grounder,
+            model: scoutPlannerModel,
             environmentNote: Self.scoutSandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
             skillIndex: WebSkills.index(),

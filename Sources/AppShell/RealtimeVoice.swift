@@ -63,6 +63,9 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     private let policy: VoiceTurnEndpointPolicy
     private var gate: LocalVoiceActivityGate
     private var pendingSamples: [Int16] = []
+    /// Whether ANY audio reached the server this turn. Guards the fail-open
+    /// commit on release so a truly empty turn still clears.
+    private var hasUploadedAudio = false
     private let lock = NSLock()
 
     init(
@@ -83,13 +86,25 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
             return
         }
 
+        // Push-to-talk fail-open: upload the FULL turn so the heuristic energy
+        // VAD can never silently drop real speech. A quiet mic or soft onset
+        // scores below the speech threshold and used to be discarded as
+        // "silence" — so the user held Right ⌘, spoke, and the agent received
+        // NOTHING. The gate still consumes every frame, but only to maintain
+        // endpoint TIMING for release (commit-now vs a brief tail-wait); it no
+        // longer decides what reaches the server. Genuine noise is rejected
+        // downstream from the TRANSCRIPT by VoiceFragmentGate, which is the right
+        // layer for "is this a real request" — not an energy threshold that can
+        // eat a whole utterance.
         let samples = data.withUnsafeBytes { raw in
             Array(raw.bindMemory(to: Int16.self))
         }
-        let uploadFrames = drainUploadFrames(samples)
-        for frame in uploadFrames {
-            sender.appendAudio(base64: Self.base64(frame))
-        }
+        guard !samples.isEmpty else { return }
+        advanceGateTiming(samples)
+        lock.lock()
+        hasUploadedAudio = true
+        lock.unlock()
+        sender.appendAudio(base64: data.base64EncodedString())
     }
 
     func release() -> ReleaseResult {
@@ -98,19 +113,27 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
             return .committed
         }
 
-        let decision = endpointDecisionOnRelease()
-        switch decision {
-        case .clear:
-            clear()
-            return .cleared
-        case .appendOnly:
-            clear()
-            return .cleared
-        case .tailWait(let remainingMs):
-            return .tailWait(remainingMs: remainingMs)
+        switch endpointDecisionOnRelease() {
         case .commitNow:
             commit()
             return .committed
+        case .tailWait(let remainingMs):
+            return .tailWait(remainingMs: remainingMs)
+        case .clear, .appendOnly:
+            // The VAD didn't confirm enough contiguous speech — but the user
+            // explicitly ended the turn by releasing the key, so never silently
+            // discard it. Commit whatever audio we captured (the transcript-level
+            // VoiceFragmentGate filters noise); only a turn with NO audio at all
+            // clears.
+            lock.lock()
+            let hadAudio = hasUploadedAudio
+            lock.unlock()
+            if hadAudio {
+                commit()
+                return .committed
+            }
+            clear()
+            return .cleared
         }
     }
 
@@ -122,21 +145,21 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         sender.sendEvent(["type": "input_audio_buffer.clear"])
     }
 
-    private func drainUploadFrames(_ samples: [Int16]) -> [[Int16]] {
+    /// Feeds converted audio to the gate purely to advance endpoint TIMING
+    /// state; the gate's upload list is intentionally ignored because the
+    /// session now uploads the full turn directly (fail-open). Re-chunks into
+    /// the gate's fixed frame size and buffers the remainder across calls.
+    private func advanceGateTiming(_ samples: [Int16]) {
         lock.lock()
         defer { lock.unlock() }
 
         pendingSamples.append(contentsOf: samples)
         let samplesPerFrame = gate.configuration.samplesPerFrame
-        var uploadFrames: [[Int16]] = []
-
         while pendingSamples.count >= samplesPerFrame {
             let frame = Array(pendingSamples.prefix(samplesPerFrame))
             pendingSamples.removeFirst(samplesPerFrame)
-            uploadFrames.append(contentsOf: gate.ingestPCM16Frame(frame).uploadFrames)
+            _ = gate.ingestPCM16Frame(frame)
         }
-
-        return uploadFrames
     }
 
     private func endpointDecisionOnRelease() -> VoiceTurnEndpointPolicy.Decision {
@@ -165,11 +188,6 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         ))
     }
 
-    private static func base64(_ samples: [Int16]) -> String {
-        samples.withUnsafeBufferPointer { pointer in
-            Data(buffer: pointer).base64EncodedString()
-        }
-    }
 }
 
 /// Replaces the Apple Speech / AVSpeechSynthesizer voice with OpenAI **GPT-Realtime-2**:
@@ -210,6 +228,13 @@ public final class RealtimeVoice: ObservableObject {
     private let localVoiceEndpointingEnabled: Bool
     private var endpointSession: RealtimeVoiceEndpointSession?
     private var endpointCommitTask: Task<Void, Never>?
+    /// True between key-down and key-up. The connect → capture handshake is
+    /// async (the OpenAI socket isn't prewarmed), so on a cold start the user
+    /// can release the key before `startCapture()` runs. This flag lets that
+    /// in-flight task bail instead of starting a capture the release can no
+    /// longer end — which would wedge `state` at `.listening` and make every
+    /// subsequent press a silent no-op.
+    private var wantsToTalk = false
 
     private static let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
@@ -253,6 +278,7 @@ public final class RealtimeVoice: ObservableObject {
 
     public func beginTalking() {
         cancelPendingEndpointCommit()
+        wantsToTalk = true
         // Barge-in: cut the agent off and listen.
         if state == .working || (playerNode?.isPlaying ?? false) {
             stopPlayback()
@@ -264,11 +290,18 @@ public final class RealtimeVoice: ObservableObject {
         Task { @MainActor in
             guard await ensureMic() else { return }
             guard await ensureConnected() else { return }
+            // Cold WebSocket: the user may have already released the key while we
+            // were connecting. Starting a capture they can no longer end would
+            // wedge state at .listening and make the NEXT press a no-op. Bail and
+            // settle back to idle instead. (Main-actor serialized, so this guard
+            // and startCapture can't be split by a release.)
+            guard wantsToTalk else { state = .idle; return }
             startCapture()
         }
     }
 
     public func endTalking() {
+        wantsToTalk = false
         guard state == .listening else { return }
         stopCapture()
         guard let endpointSession else {

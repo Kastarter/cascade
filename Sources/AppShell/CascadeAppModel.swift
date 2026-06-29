@@ -1704,11 +1704,15 @@ public final class CascadeAppModel: ObservableObject {
         // Same in-process tool harness as the Opus path: use_skill (pull), the
         // file/shell harness, and record recall — shared providers, so Scout can
         // reach for them too (it may underuse pull-tools, but the capability is here).
+        // Planner backend is configurable via `cascade.scoutPlanner.*`: defaults to
+        // Llama-4 Scout via Groq (Groq's only capable multimodal model), or a
+        // multimodal model on OpenRouter (e.g. qwen/qwen3.6-plus). The grounder is
+        // configured separately (`cascade.visualGrounder.*`).
+        let planner = ScoutPlannerBackend.resolve(defaults: defaultsStore)
         let agent = ScoutAgent(
+            vision: planner.vision,
             grounder: grounder,
-            // Planner is Llama-4 Scout (the default) — Groq's only capable MULTIMODAL
-            // model. Maverick was removed from Groq and the smarter Groq models are
-            // text-only, so there's no smarter drop-in vision planner here right now.
+            model: planner.model,
             // The SAME environment context Opus gets — foreground-browser behavior note
             // + today's date — so the planner is told everything Opus is told (parity).
             environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),

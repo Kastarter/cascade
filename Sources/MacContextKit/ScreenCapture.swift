@@ -282,7 +282,10 @@ public enum ScreenCaptureUtility {
         configuration.height = height
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: max(fps, 1))
         configuration.queueDepth = 3
-        configuration.showsCursor = true
+        // Keep the cursor out of recorded memory frames: click positions are
+        // already captured as input events, and a baked-in cursor causes
+        // cursor-jitter false frame changes and OCR noise.
+        configuration.showsCursor = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: output)

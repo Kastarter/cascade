@@ -32,11 +32,7 @@ public enum ScreenTextRecognizer {
     /// common case where the Accessibility channel already owns the text, and
     /// reserve the slow `.accurate` model for frames where OCR is load-bearing.
     public static func recognize(in cgImage: CGImage, level: VNRequestTextRecognitionLevel = .accurate) -> String {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = level
-        // Language correction is an extra NLP pass that mostly helps the slower
-        // `.accurate` model; on the cheap `.fast` insurance pass it's wasted cost.
-        request.usesLanguageCorrection = (level == .accurate)
+        let request = makeTextRequest(level: level)
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
@@ -71,9 +67,7 @@ public enum ScreenTextRecognizer {
     /// canvas/Electron apps where the AX tree is blind). Accepts PNG or JPEG.
     public static func recognizeBoxes(inImageData data: Data, level: VNRequestTextRecognitionLevel = .accurate) -> [TextBox] {
         guard let cgImage = decode(imageData: data) else { return [] }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = level
-        request.usesLanguageCorrection = (level == .accurate)
+        let request = makeTextRequest(level: level)
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         guard (try? handler.perform([request])) != nil, let observations = request.results else { return [] }
         return observations.compactMap { obs in
@@ -149,6 +143,41 @@ public enum ScreenTextRecognizer {
         let vertical = box.midY > 0.66 ? "top" : (box.midY < 0.33 ? "bottom" : "middle")
         let horizontal = box.midX < 0.33 ? "left" : (box.midX > 0.66 ? "right" : "center")
         return "\(vertical) \(horizontal)"
+    }
+
+    // MARK: - Request configuration
+
+    /// Lower than Vision's default minimum text height (1/32 of the image
+    /// height) so small on-screen UI text — menu items, status bars, table
+    /// cells — is read instead of silently dropped, for a modest extra cost.
+    private static let minimumTextHeight: Float = 0.012
+
+    /// Builds a text-recognition request with the knobs that matter for screen
+    /// OCR, set consistently across both the line and box paths.
+    private static func makeTextRequest(level: VNRequestTextRecognitionLevel) -> VNRecognizeTextRequest {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = level
+        // Language correction is an extra NLP pass that mostly helps the slower
+        // `.accurate` model; on the cheap `.fast` insurance pass it's wasted cost.
+        request.usesLanguageCorrection = (level == .accurate)
+        request.minimumTextHeight = minimumTextHeight
+        // Vision defaults recognitionLanguages to ["en-US"] only, so non-Latin
+        // on-screen text (e.g. Arabic) comes back garbled or empty. Offer a
+        // measured set, narrowed to what this OS/recognition level supports so an
+        // unsupported code can't fail the request.
+        request.recognitionLanguages = supportedRecognitionLanguages(for: request)
+        return request
+    }
+
+    /// The app's primary locales, intersected with the languages Vision actually
+    /// supports for the request's configured level/revision. English fallback.
+    private static func supportedRecognitionLanguages(for request: VNRecognizeTextRequest) -> [String] {
+        let desired = ["en-US", "ar-SA"]
+        guard let supported = try? request.supportedRecognitionLanguages(), !supported.isEmpty else {
+            return ["en-US"]
+        }
+        let filtered = desired.filter { supported.contains($0) }
+        return filtered.isEmpty ? ["en-US"] : filtered
     }
 
     private static func decode(imageData data: Data) -> CGImage? {

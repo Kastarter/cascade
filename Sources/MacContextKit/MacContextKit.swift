@@ -412,6 +412,12 @@ public final class ContextRecorder: ObservableObject {
         }
         do {
             let inserted = try await store.insert(context, indexWorkGraph: options.indexWorkGraph)
+            // Semantic recall: index the moment's text locally (best-effort) so
+            // explicit/on-demand captures are searchable too, matching the
+            // continuous recorder path.
+            if let ocrText, !ocrText.isEmpty {
+                try? await store.indexEmbedding(contextID: inserted.id, text: ocrText)
+            }
             let detail = Self.captureAuditDetail(appName: inserted.appName, ocrChars: ocrText?.count)
             _ = try await store.appendAudit(AuditEvent(actor: "system", action: "context.capture", detail: detail))
             status.latestContext = inserted

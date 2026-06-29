@@ -35,6 +35,38 @@ public enum TextHelperModel {
     }
 }
 
+/// Resolves the Scout vision PLANNER backend — the on-screen + background thinker
+/// that SEES the screenshot and names targets. DEFAULT: Llama-4 Scout via Groq
+/// (Groq's only capable multimodal model). Override via UserDefaults to point the
+/// planner at any OpenAI-compatible MULTIMODAL endpoint (it MUST accept images, or
+/// every turn fails) — e.g. a Qwen3-VL model on OpenRouter:
+///   defaults write com.humain.cascade cascade.scoutPlanner.backend -string openrouter
+///   defaults write com.humain.cascade cascade.scoutPlanner.model   -string qwen/qwen3.6-plus
+/// Unset / "groq" keeps the proven Llama-4 Scout path. The grounder is configured
+/// separately (`cascade.visualGrounder.*`). See [[cascade-cu-downgrade-research]].
+public enum ScoutPlannerBackend {
+    public static func resolve(
+        defaults: UserDefaults = .standard,
+        groqKeyStore: GroqKeyStore = GroqKeyStore(),
+        openRouterKeyStore: OpenRouterKeyStore = OpenRouterKeyStore()
+    ) -> (vision: GroqVisionClient, model: String) {
+        switch defaults.string(forKey: "cascade.scoutPlanner.backend") {
+        case "openrouter":
+            let model = defaults.string(forKey: "cascade.scoutPlanner.model") ?? "qwen/qwen3.6-plus"
+            let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+            let client = GroqVisionClient(
+                endpoint: endpoint,
+                readKey: { openRouterKeyStore.readKey() },
+                extraHeaders: ["HTTP-Referer": "https://humain.com", "X-Title": "Cascade"]
+            )
+            return (vision: client, model: model)
+        default:
+            let model = defaults.string(forKey: "cascade.scoutPlanner.model") ?? GroqModel.llama4Scout
+            return (vision: GroqVisionClient(keyStore: groqKeyStore), model: model)
+        }
+    }
+}
+
 public enum GroqError: Error, LocalizedError {
     case missingKey
     case transport(String)
