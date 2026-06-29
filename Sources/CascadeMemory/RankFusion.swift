@@ -20,6 +20,7 @@ public enum RankFusion {
         case lexical
         case vector
         case memory
+        case structured
         case rerank
     }
 
@@ -51,6 +52,7 @@ public enum RankFusion {
         public let lexicalRank: Int?
         public let vectorRank: Int?
         public let memoryRank: Int?
+        public let structuredRank: Int?
         public let rerankScore: Double?
         public let contributions: [LaneContribution]
 
@@ -60,6 +62,7 @@ public enum RankFusion {
             lexicalRank: Int? = nil,
             vectorRank: Int? = nil,
             memoryRank: Int? = nil,
+            structuredRank: Int? = nil,
             rerankScore: Double? = nil,
             contributions: [LaneContribution] = []
         ) {
@@ -68,6 +71,7 @@ public enum RankFusion {
             self.lexicalRank = lexicalRank
             self.vectorRank = vectorRank
             self.memoryRank = memoryRank
+            self.structuredRank = structuredRank
             self.rerankScore = rerankScore
             self.contributions = contributions
         }
@@ -86,7 +90,7 @@ public enum RankFusion {
         k: Int = defaultK,
         limit: Int
     ) -> [Int64] {
-        let knownLanes: [Lane] = [.lexical, .vector, .memory]
+        let knownLanes: [Lane] = [.lexical, .vector, .memory, .structured]
         let ranked = lanes.enumerated().map { index, ids in
             RankedLane(index < knownLanes.count ? knownLanes[index] : .rerank, ids: ids)
         }
@@ -124,6 +128,7 @@ public enum RankFusion {
                 lexicalRank: contributions.first { $0.lane == .lexical }?.rank,
                 vectorRank: contributions.first { $0.lane == .vector }?.rank,
                 memoryRank: contributions.first { $0.lane == .memory }?.rank,
+                structuredRank: contributions.first { $0.lane == .structured }?.rank,
                 rerankScore: contributions.first { $0.lane == .rerank }?.score,
                 contributions: contributions.sorted { lhs, rhs in
                     lhs.lane.rawValue == rhs.lane.rawValue ? lhs.rank < rhs.rank : lhs.lane.rawValue < rhs.lane.rawValue

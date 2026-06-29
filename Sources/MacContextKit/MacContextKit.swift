@@ -429,6 +429,7 @@ public final class ContextRecorder: ObservableObject {
         var displayMetadata: CapturedDisplayMetadata?
         var ocrBoxes: [ScreenTextRecognizer.TextBox] = []
         var axTextForLines = ""
+        var axControls: [ScreenContentStructurer.AXControl] = []
         var privacyMetadata: FrameRedactor.Metadata?
         if canCaptureScreen,
            let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false) {
@@ -451,6 +452,9 @@ public final class ContextRecorder: ObservableObject {
         if let pid = snapshot.processIdentifier {
             let axText = await Task.detached { AXTextHarvester.text(forWindowOfPID: pid) }.value
             axTextForLines = axText
+            if options.structuredContent {
+                axControls = await Task.detached { AXTextHarvester.controls(forWindowOfPID: pid) }.value
+            }
             let merged = AXTextHarvester.merge(ax: axText, ocr: ocrText ?? "")
             if !merged.isEmpty { ocrText = merged }
         }
@@ -480,13 +484,49 @@ public final class ContextRecorder: ObservableObject {
             let redactedOCR = ScreenContentStructurer.structure(redacted.boxes, topLeftOrigin: false).readingOrderText
             let redactedAX = FrameRedactor.redactedText(axTextForLines, policy: options.capturePolicy)
             axTextForLines = redactedAX
+            axControls = axControls.map {
+                ScreenContentStructurer.AXControl(
+                    id: $0.id,
+                    kind: $0.kind,
+                    label: $0.label.map { FrameRedactor.redactedText($0, policy: options.capturePolicy) },
+                    value: $0.value.map { FrameRedactor.redactedText($0, policy: options.capturePolicy) },
+                    rect: $0.rect,
+                    confidence: $0.confidence
+                )
+            }
             let merged = AXTextHarvester.merge(ax: redactedAX, ocr: redactedOCR)
             if !merged.isEmpty { ocrText = merged }
         } else if let text = ocrText {
             ocrText = FrameRedactor.redactedText(text, policy: options.capturePolicy)
+            axControls = axControls.map {
+                ScreenContentStructurer.AXControl(
+                    id: $0.id,
+                    kind: $0.kind,
+                    label: $0.label.map { FrameRedactor.redactedText($0, policy: options.capturePolicy) },
+                    value: $0.value.map { FrameRedactor.redactedText($0, policy: options.capturePolicy) },
+                    rect: $0.rect,
+                    confidence: $0.confidence
+                )
+            }
+        } else if !axControls.isEmpty {
+            axControls = axControls.map {
+                ScreenContentStructurer.AXControl(
+                    id: $0.id,
+                    kind: $0.kind,
+                    label: $0.label.map { FrameRedactor.redactedText($0, policy: options.capturePolicy) },
+                    value: $0.value.map { FrameRedactor.redactedText($0, policy: options.capturePolicy) },
+                    rect: $0.rect,
+                    confidence: $0.confidence
+                )
+            }
         }
+        let structuredForStorage = ScreenContentStructurer.structure(
+            ocrBoxes,
+            topLeftOrigin: false,
+            axControls: axControls
+        )
         let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, !ocrBoxes.isEmpty {
-            StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false))
+            StructuredContentExporter.metadata(from: structuredForStorage)
         } else {
             nil
         }
@@ -524,6 +564,15 @@ public final class ContextRecorder: ObservableObject {
         }
         do {
             let inserted = try await store.insert(context, indexWorkGraph: options.indexWorkGraph)
+            if options.structuredContent,
+               let payload = StructuredContentExporter.sidecarPayload(from: structuredForStorage) {
+                try? await store.insertOCRStructure(
+                    contextID: inserted.id,
+                    version: payload.version,
+                    json: payload.json,
+                    searchableText: payload.searchableText
+                )
+            }
             var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: ocrBoxes, source: "vision")
             lines += OCRLineBuilder.axLines(contextID: inserted.id, text: axTextForLines, startingAt: lines.count)
             try? await store.insertOCRLines(lines)

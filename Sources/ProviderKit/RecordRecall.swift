@@ -12,6 +12,7 @@ import OSLog
 /// - `get_timeframe`   — everything between two timestamps, oldest first
 /// - `inspect_moment`  — one moment's full text plus its immediate neighbours
 /// - `inspect_structure` — structured reading order, key-values, and tables for one moment
+/// - `extract_table` / `extract_fields` — deterministic structured extraction
 ///
 /// This is the single implementation of those tools. Both the Ask panel's
 /// `RecordSearchAnswerer` (which answers questions about the record) and the
@@ -32,7 +33,9 @@ public struct RecordRecall: Sendable {
     /// The recall tool names, for routing a tool call to `perform`.
     public static func toolNames(includeStructuredContent: Bool = false) -> Set<String> {
         var names: Set<String> = ["search_record", "get_timeframe", "inspect_moment", "list_sessions"]
-        if includeStructuredContent { names.insert("inspect_structure") }
+        if includeStructuredContent {
+            names.formUnion(["inspect_structure", "extract_table", "extract_fields"])
+        }
         return names
     }
 
@@ -50,6 +53,8 @@ public struct RecordRecall: Sendable {
         case timeframe(startISO: String?, endISO: String?)
         case inspect(id: Int64?)
         case inspectStructure(id: Int64?)
+        case extractTable(id: Int64?, tableIndex: Int, format: String)
+        case extractFields(id: Int64?, query: String?)
         case sessions(startISO: String?, endISO: String?)
         case unknown(String)
 
@@ -64,6 +69,17 @@ public struct RecordRecall: Sendable {
                 self = .inspect(id: (input["id"] as? NSNumber)?.int64Value ?? (input["id"] as? Int).map(Int64.init))
             case "inspect_structure":
                 self = .inspectStructure(id: (input["id"] as? NSNumber)?.int64Value ?? (input["id"] as? Int).map(Int64.init))
+            case "extract_table":
+                self = .extractTable(
+                    id: Self.idValue(input),
+                    tableIndex: (input["table_index"] as? NSNumber)?.intValue ?? input["table_index"] as? Int ?? 0,
+                    format: (input["format"] as? String ?? "markdown").lowercased()
+                )
+            case "extract_fields":
+                self = .extractFields(
+                    id: Self.idValue(input),
+                    query: (input["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
             case "list_sessions":
                 self = .sessions(startISO: input["start_iso"] as? String, endISO: input["end_iso"] as? String)
             default:
@@ -84,6 +100,11 @@ public struct RecordRecall: Sendable {
                 detail = "tool=inspect_moment id=\(id.map(String.init) ?? "missing")"
             case .inspectStructure(let id):
                 detail = "tool=inspect_structure id=\(id.map(String.init) ?? "missing")"
+            case .extractTable(let id, let tableIndex, let format):
+                detail = "tool=extract_table id=\(id.map(String.init) ?? "missing") tableIndex=\(tableIndex) format=\(Self.safeToken(format))"
+            case .extractFields(let id, let query):
+                let q = query ?? ""
+                detail = "tool=extract_fields id=\(id.map(String.init) ?? "missing") queryLength=\(q.count) queryHash=\(Self.hash(q))"
             case .sessions(let start, let end):
                 detail = "tool=list_sessions start=\(Self.normalizedTimestamp(start)) end=\(Self.normalizedTimestamp(end))"
             case .unknown(let name):
@@ -110,6 +131,13 @@ public struct RecordRecall: Sendable {
                 character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
             }
             return token.isEmpty ? "unknown" : token
+        }
+
+        private static func idValue(_ input: [String: Any]) -> Int64? {
+            (input["id"] as? NSNumber)?.int64Value
+                ?? (input["id"] as? Int).map(Int64.init)
+                ?? (input["moment_id"] as? NSNumber)?.int64Value
+                ?? (input["moment_id"] as? Int).map(Int64.init)
         }
     }
 
@@ -163,6 +191,31 @@ public struct RecordRecall: Sendable {
                 "required": ["id"],
             ],
             ])
+            definitions.append([
+            "name": "extract_table",
+            "description": "Deterministically extract a structured table from one recorded moment. Use this before visual fallback when the user asks to copy or transform a table they saw.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "integer", "description": "Moment id from search_record or inspect_moment"],
+                    "table_index": ["type": "integer", "description": "Zero-based table index; defaults to 0"],
+                    "format": ["type": "string", "enum": ["markdown", "csv", "json"], "description": "Output format"],
+                ],
+                "required": ["id"],
+            ],
+            ])
+            definitions.append([
+            "name": "extract_fields",
+            "description": "Deterministically extract structured fields from one recorded moment, optionally filtered by a query such as invoice total, due date, or vendor.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "integer", "description": "Moment id from search_record or inspect_moment"],
+                    "query": ["type": "string", "description": "Optional field filter"],
+                ],
+                "required": ["id"],
+            ],
+            ])
         }
         definitions.append([
             "name": "list_sessions",
@@ -194,6 +247,10 @@ public struct RecordRecall: Sendable {
             [["id": 42]]
         case "inspect_structure":
             [["id": 42]]
+        case "extract_table":
+            [["id": 42, "table_index": 0, "format": "csv"]]
+        case "extract_fields":
+            [["id": 42, "query": "invoice total due date"]]
         case "list_sessions":
             [["start_iso": "2026-06-10T09:00:00Z", "end_iso": "2026-06-10T12:00:00Z"]]
         default:
@@ -257,6 +314,9 @@ public struct RecordRecall: Sendable {
             if !neighbors.isEmpty {
                 out += "\nNearby: " + neighbors.map { "[#\($0.id)] \(Self.time($0.capturedAt)) \($0.appName)" }.joined(separator: ", ")
             }
+            if let structured = await structuredMetadata(for: moment) {
+                out += "\n\nSTRUCTURE:\n" + Self.structureSummaryLine(structured)
+            }
             return Self.enveloped(out, source: "record moment #\(id)", tool: "inspect_moment")
 
         case .inspectStructure(let id):
@@ -264,8 +324,7 @@ public struct RecordRecall: Sendable {
             guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
                 return Self.status(.noResult, tool: "inspect_structure", kind: "not_accessible", message: "No accessible moment #\(id).")
             }
-            guard let metadata = moment.metadataJSON,
-                  let structured = Self.structuredMetadata(from: metadata) else {
+            guard let structured = await structuredMetadata(for: moment) else {
                 return Self.status(.noResult, tool: "inspect_structure", kind: "missing_structured_metadata", message: "No structured metadata recorded for moment #\(id). Capture structured content must be enabled first.")
             }
             try? await store.markMemoryEventsAccessed([moment.id])
@@ -274,6 +333,45 @@ public struct RecordRecall: Sendable {
                 source: "record structure #\(id)",
                 tool: "inspect_structure"
             )
+
+        case .extractTable(let id, let tableIndex, let format):
+            guard let id else { return Self.status(.error, tool: "extract_table", kind: "validation_error", message: "extract_table needs a numeric id.") }
+            guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
+                return Self.status(.noResult, tool: "extract_table", kind: "not_accessible", message: "No accessible moment #\(id).")
+            }
+            guard let structured = await structuredMetadata(for: moment), !structured.tables.isEmpty else {
+                return Self.status(.noResult, tool: "extract_table", kind: "missing_table", message: "No structured table recorded for moment #\(id).")
+            }
+            guard structured.tables.indices.contains(tableIndex) else {
+                return Self.status(.error, tool: "extract_table", kind: "validation_error", message: "Moment #\(id) has \(structured.tables.count) table(s); table_index \(tableIndex) is out of range.")
+            }
+            try? await store.markMemoryEventsAccessed([moment.id])
+            let table = structured.tables[tableIndex]
+            let output = TableExtraction(
+                contextID: moment.id,
+                tableIndex: tableIndex,
+                format: ["markdown", "csv", "json"].contains(format) ? format : "markdown",
+                rows: table.rows,
+                markdown: Self.markdownTable(table.rows),
+                csv: Self.csvTable(table.rows)
+            )
+            return Self.enveloped(Self.json(output), source: "record table #\(id)", tool: "extract_table")
+
+        case .extractFields(let id, let query):
+            guard let id else { return Self.status(.error, tool: "extract_fields", kind: "validation_error", message: "extract_fields needs a numeric id.") }
+            guard let moment = try? await store.context(id: id), !PrivacyRules.isSensitive(moment) else {
+                return Self.status(.noResult, tool: "extract_fields", kind: "not_accessible", message: "No accessible moment #\(id).")
+            }
+            guard let structured = await structuredMetadata(for: moment), !structured.keyValues.isEmpty else {
+                return Self.status(.noResult, tool: "extract_fields", kind: "missing_fields", message: "No structured fields recorded for moment #\(id).")
+            }
+            try? await store.markMemoryEventsAccessed([moment.id])
+            let filtered = Self.filteredFields(structured.keyValues, query: query)
+            guard !filtered.isEmpty else {
+                return Self.status(.noResult, tool: "extract_fields", kind: "no_matching_fields", message: "No structured fields in moment #\(id) match that query.")
+            }
+            let output = FieldExtraction(contextID: moment.id, query: query, fields: filtered)
+            return Self.enveloped(Self.json(output), source: "record fields #\(id)", tool: "extract_fields")
 
         case .sessions(let startISO, let endISO):
             guard let start = Self.date(from: startISO),
@@ -396,26 +494,191 @@ public struct RecordRecall: Sendable {
         let summary: String
         let readingOrder: String
         let keyValues: [StructuredKeyValue]
+        let blocks: [StructuredBlock]
+        let lists: [StructuredList]
         let markdownTables: [String]
         let csvTables: [String]
+        let tables: [StructuredTable]
 
         enum CodingKeys: String, CodingKey {
             case summary
             case readingOrder = "reading_order"
             case keyValues = "key_values"
+            case blocks
+            case lists
             case markdownTables = "markdown_tables"
             case csvTables = "csv_tables"
         }
+
+        init(
+            summary: String,
+            readingOrder: String,
+            keyValues: [StructuredKeyValue],
+            blocks: [StructuredBlock] = [],
+            lists: [StructuredList] = [],
+            markdownTables: [String],
+            csvTables: [String],
+            tables: [StructuredTable]
+        ) {
+            self.summary = summary
+            self.readingOrder = readingOrder
+            self.keyValues = keyValues
+            self.blocks = blocks
+            self.lists = lists
+            self.markdownTables = markdownTables
+            self.csvTables = csvTables
+            self.tables = tables
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            summary = try container.decode(String.self, forKey: .summary)
+            readingOrder = try container.decode(String.self, forKey: .readingOrder)
+            keyValues = try container.decodeIfPresent([StructuredKeyValue].self, forKey: .keyValues) ?? []
+            blocks = try container.decodeIfPresent([StructuredBlock].self, forKey: .blocks) ?? []
+            lists = try container.decodeIfPresent([StructuredList].self, forKey: .lists) ?? []
+            markdownTables = try container.decodeIfPresent([String].self, forKey: .markdownTables) ?? []
+            csvTables = try container.decodeIfPresent([String].self, forKey: .csvTables) ?? []
+            tables = markdownTables.enumerated().map { index, _ in
+                StructuredTable(index: index, rows: [])
+            }
+        }
     }
 
-    private struct StructuredKeyValue: Decodable {
+    private struct StructuredKeyValue: Codable {
         let key: String
         let value: String
+        let kind: String?
+
+        init(key: String, value: String, kind: String? = nil) {
+            self.key = key
+            self.value = value
+            self.kind = kind
+        }
+    }
+
+    private struct StructuredBlock: Decodable {
+        let kind: String
+        let text: String
+    }
+
+    private struct StructuredList: Decodable {
+        let items: [StructuredListItem]
+    }
+
+    private struct StructuredListItem: Decodable {
+        let text: String
+    }
+
+    private struct StructuredTable: Codable {
+        let index: Int
+        let rows: [[String]]
+    }
+
+    private struct SidecarStructure: Decodable {
+        let version: Int
+        let lines: [SidecarLine]
+        let blocks: [StructuredBlock]
+        let fields: [StructuredKeyValue]
+        let lists: [StructuredList]
+        let tables: [SidecarTable]
+
+        private enum CodingKeys: String, CodingKey {
+            case version
+            case lines
+            case blocks
+            case fields
+            case lists
+            case tables
+        }
+    }
+
+    private struct SidecarLine: Decodable {
+        let text: String
+    }
+
+    private struct SidecarTable: Decodable {
+        let rows: [[String]]
+    }
+
+    private struct TableExtraction: Encodable {
+        let contextID: Int64
+        let tableIndex: Int
+        let format: String
+        let rows: [[String]]
+        let markdown: String
+        let csv: String
+
+        enum CodingKeys: String, CodingKey {
+            case contextID = "context_id"
+            case tableIndex = "table_index"
+            case format
+            case rows
+            case markdown
+            case csv
+        }
+    }
+
+    private struct FieldExtraction: Encodable {
+        let contextID: Int64
+        let query: String?
+        let fields: [StructuredKeyValue]
+
+        enum CodingKeys: String, CodingKey {
+            case contextID = "context_id"
+            case query
+            case fields
+        }
+    }
+
+    private func structuredMetadata(for moment: RecordedContext) async -> StructuredMetadata? {
+        if let sidecar = try? await store.ocrStructure(contextID: moment.id),
+           let structured = Self.structuredMetadata(fromSidecar: sidecar.json) {
+            return structured
+        }
+        guard let metadata = moment.metadataJSON else { return nil }
+        return Self.structuredMetadata(from: metadata)
     }
 
     private static func structuredMetadata(from json: String) -> StructuredMetadata? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(StructuredEnvelope.self, from: data).structured
+    }
+
+    private static func structuredMetadata(fromSidecar json: String) -> StructuredMetadata? {
+        guard let data = json.data(using: .utf8),
+              let sidecar = try? JSONDecoder().decode(SidecarStructure.self, from: data) else {
+            return nil
+        }
+        let readingOrder = sidecar.lines.map(\.text).joined(separator: "\n")
+        let tables = sidecar.tables.enumerated().map { index, table in
+            StructuredTable(index: index, rows: table.rows)
+        }
+        let markdown = tables.map { markdownTable($0.rows) }
+        let csv = tables.map { csvTable($0.rows) }
+        let lineCount = sidecar.lines.count
+        let fieldCount = sidecar.fields.count
+        var parts = [
+            "\(lineCount) \(lineCount == 1 ? "line" : "lines")",
+            "\(fieldCount) \(fieldCount == 1 ? "field" : "fields")",
+            "\(tables.count) \(tables.count == 1 ? "table" : "tables")",
+        ]
+        if !sidecar.blocks.isEmpty {
+            parts.append("\(sidecar.blocks.count) \(sidecar.blocks.count == 1 ? "block" : "blocks")")
+        }
+        if !sidecar.lists.isEmpty {
+            parts.append("\(sidecar.lists.count) \(sidecar.lists.count == 1 ? "list" : "lists")")
+        }
+        return StructuredMetadata(
+            summary: "Structured content: \(parts.joined(separator: ", ")).",
+            readingOrder: readingOrder,
+            keyValues: sidecar.fields,
+            blocks: sidecar.blocks,
+            lists: sidecar.lists,
+            markdownTables: markdown,
+            csvTables: csv,
+            tables: tables
+        )
     }
 
     private static func structureLine(for context: RecordedContext, structured: StructuredMetadata) -> String {
@@ -431,7 +694,22 @@ public struct RecordRecall: Sendable {
             lines.append("")
             lines.append("Key-values:")
             for pair in structured.keyValues {
-                lines.append("- **\(pair.key)**: \(pair.value)")
+                let kind = pair.kind.map { " [\($0)]" } ?? ""
+                lines.append("- **\(pair.key)**: \(pair.value)\(kind)")
+            }
+        }
+        if !structured.blocks.isEmpty {
+            lines.append("")
+            lines.append("Blocks:")
+            for block in structured.blocks.prefix(12) {
+                lines.append("- \(block.kind): \(block.text)")
+            }
+        }
+        if !structured.lists.isEmpty {
+            lines.append("")
+            lines.append("Lists:")
+            for list in structured.lists.prefix(8) {
+                lines.append("- " + list.items.map(\.text).joined(separator: "; "))
             }
         }
         if !structured.markdownTables.isEmpty {
@@ -451,6 +729,92 @@ public struct RecordRecall: Sendable {
             }
         }
         return bounded(lines, maxBytes: 12_000, maxLines: 180)
+    }
+
+    private static func structureSummaryLine(_ structured: StructuredMetadata) -> String {
+        var lines = [structured.summary]
+        if !structured.keyValues.isEmpty {
+            lines.append("Fields: " + structured.keyValues.prefix(8).map { "\($0.key)=\($0.value)" }.joined(separator: "; "))
+        }
+        if !structured.markdownTables.isEmpty {
+            lines.append("Tables: " + structured.markdownTables.enumerated().map {
+                "table \($0.offset): \($0.element.components(separatedBy: "\n").first ?? "")"
+            }.joined(separator: "; "))
+        }
+        if !structured.lists.isEmpty {
+            lines.append("Lists: " + structured.lists.prefix(4).map { $0.items.map(\.text).joined(separator: "; ") }.joined(separator: " | "))
+        }
+        return bounded(lines, maxBytes: 2_500, maxLines: 36)
+    }
+
+    private static func filteredFields(_ fields: [StructuredKeyValue], query: String?) -> [StructuredKeyValue] {
+        let tokens = (query ?? "")
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
+        guard !tokens.isEmpty else { return fields }
+        return fields.filter { field in
+            let haystack = "\(field.key) \(field.value) \(field.kind ?? "")".lowercased()
+            return tokens.contains { haystack.contains($0) }
+        }
+    }
+
+    private static func markdownTable(_ rows: [[String]]) -> String {
+        let rows = normalizedRows(rows)
+        guard let header = rows.first else { return "" }
+        let separator = [String](repeating: "---", count: header.count)
+        return ([header, separator] + rows.dropFirst()).map { row in
+            "| " + row.map(markdownCell).joined(separator: " | ") + " |"
+        }.joined(separator: "\n")
+    }
+
+    private static func csvTable(_ rows: [[String]]) -> String {
+        normalizedRows(rows).map { row in
+            row.map(csvCell).joined(separator: ",")
+        }.joined(separator: "\n")
+    }
+
+    private static func normalizedRows(_ rows: [[String]]) -> [[String]] {
+        let count = rows.map(\.count).max() ?? 0
+        guard count > 0 else { return [] }
+        return rows.map { $0 + [String](repeating: "", count: max(0, count - $0.count)) }
+    }
+
+    private static func markdownCell(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "|", with: "\\|")
+            .replacingOccurrences(of: "\n", with: "<br>")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return escaped.isEmpty ? " " : escaped
+    }
+
+    private static func csvCell(_ value: String) -> String {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        let safe = formulaEscaped(normalized)
+        let escaped = safe.replacingOccurrences(of: "\"", with: "\"\"")
+        if escaped.contains(",") || escaped.contains("\"") {
+            return "\"\(escaped)\""
+        }
+        return escaped
+    }
+
+    private static func formulaEscaped(_ value: String) -> String {
+        guard let first = value.drop(while: { $0.isWhitespace }).first else { return value }
+        return ["=", "+", "-", "@"].contains(String(first)) ? "'" + value : value
+    }
+
+    private static func json<T: Encodable>(_ value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(value),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return string
     }
 
     private static func enveloped(_ payload: String, source: String, tool: String) -> String {

@@ -24,10 +24,34 @@ public enum StructuredContentExporter {
         public let value: String
     }
 
+    public struct MetadataBlock: Codable, Sendable, Equatable {
+        public let kind: String
+        public let text: String
+        public let evidenceLineIDs: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case kind
+            case text
+            case evidenceLineIDs = "evidence_line_ids"
+        }
+    }
+
+    public struct MetadataList: Codable, Sendable, Equatable {
+        public let items: [String]
+        public let evidenceLineIDs: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case items
+            case evidenceLineIDs = "evidence_line_ids"
+        }
+    }
+
     public struct Metadata: Codable, Sendable, Equatable {
         public let summary: String
         public let readingOrder: String
         public let keyValues: [MetadataKeyValue]
+        public let blocks: [MetadataBlock]
+        public let lists: [MetadataList]
         public let markdownTables: [String]
         public let csvTables: [String]
 
@@ -35,9 +59,17 @@ public enum StructuredContentExporter {
             case summary
             case readingOrder = "reading_order"
             case keyValues = "key_values"
+            case blocks
+            case lists
             case markdownTables = "markdown_tables"
             case csvTables = "csv_tables"
         }
+    }
+
+    public struct SidecarPayload: Sendable, Equatable {
+        public let version: Int
+        public let json: String
+        public let searchableText: String
     }
 
     private static let truncationMarker = "[truncated]"
@@ -108,12 +140,14 @@ public enum StructuredContentExporter {
         from structured: ScreenContentStructurer.Structured,
         budget: Budget = .summary
     ) -> String {
-        guard !structured.lines.isEmpty || !structured.keyValues.isEmpty || !structured.tables.isEmpty else {
+        guard !structured.lines.isEmpty || !structured.keyValues.isEmpty || !structured.tables.isEmpty || !structured.blocks.isEmpty || !structured.lists.isEmpty else {
             return bounded(["No structured content detected."], budget: budget)
         }
 
         let lineCount = structured.lines.count
         let pairCount = structured.keyValues.count
+        let blockCount = structured.blocks.count
+        let listCount = structured.lists.count
         let tableSummaries = structured.tables.enumerated().map { index, table in
             let rows = table.rows.count
             let columns = normalizedRows(table.rows).first?.count ?? table.columnCount
@@ -125,6 +159,12 @@ public enum StructuredContentExporter {
             "\(pairCount) \(pairCount == 1 ? "key-value" : "key-values")",
             "\(structured.tables.count) \(structured.tables.count == 1 ? "table" : "tables")",
         ]
+        if blockCount > 0 {
+            parts.append("\(blockCount) \(blockCount == 1 ? "block" : "blocks")")
+        }
+        if listCount > 0 {
+            parts.append("\(listCount) \(listCount == 1 ? "list" : "lists")")
+        }
         if !tableSummaries.isEmpty {
             parts.append(tableSummaries.joined(separator: "; "))
         }
@@ -143,6 +183,8 @@ public enum StructuredContentExporter {
         readingOrderBudget: Budget = Budget(maxBytes: 4_000, maxLines: 80),
         tableBudget: Budget = .table,
         maxKeyValues: Int = 40,
+        maxBlocks: Int = 12,
+        maxLists: Int = 8,
         maxTables: Int = 4
     ) -> Metadata {
         Metadata(
@@ -154,8 +196,38 @@ public enum StructuredContentExporter {
                     value: clipped($0.value, maxBytes: 320)
                 )
             },
+            blocks: structured.blocks.prefix(maxBlocks).map {
+                MetadataBlock(
+                    kind: $0.kind.rawValue,
+                    text: clipped($0.text.replacingOccurrences(of: "\n", with: " "), maxBytes: 360),
+                    evidenceLineIDs: $0.evidenceLineIDs
+                )
+            },
+            lists: structured.lists.prefix(maxLists).map {
+                MetadataList(
+                    items: $0.items.prefix(12).map { clipped($0.text, maxBytes: 220) },
+                    evidenceLineIDs: $0.evidenceLineIDs
+                )
+            },
             markdownTables: Array(markdownTables(from: structured, budget: tableBudget).prefix(maxTables)),
             csvTables: Array(csvTables(from: structured, budget: tableBudget).prefix(maxTables))
+        )
+    }
+
+    public static func sidecarPayload(from structured: ScreenContentStructurer.Structured) -> SidecarPayload? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(structured),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return SidecarPayload(
+            version: structured.version,
+            json: json,
+            searchableText: bounded(
+                structured.searchableText.components(separatedBy: .newlines),
+                budget: Budget(maxBytes: 24_000, maxLines: 400)
+            )
         )
     }
 

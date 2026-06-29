@@ -70,6 +70,37 @@ func exportsAlignedTableAsCSVWithEscapedCells() {
 }
 
 @Test
+func metadataCarriesBoundedBlocksAndLists() throws {
+    let structured = ScreenContentStructurer.structure([
+        exportBox("Invoice Summary", 0, 0, w: 180, h: 24),
+        exportBox("- Subtotal reviewed", 20, 60, w: 180),
+        exportBox("- Tax calculated", 20, 82, w: 160),
+    ])
+
+    let metadata = StructuredContentExporter.metadata(from: structured)
+    let payload = try JSONEncoder().encode(metadata)
+    let json = try #require(String(data: payload, encoding: .utf8))
+
+    #expect(metadata.blocks.contains { $0.kind == "heading" && $0.text.contains("Invoice Summary") })
+    #expect(metadata.lists.first?.items == ["Subtotal reviewed", "Tax calculated"])
+    #expect(json.contains("\"blocks\""))
+    #expect(json.contains("\"lists\""))
+}
+
+@Test
+func sidecarPayloadEncodesVersionedFullStructure() throws {
+    let structured = ScreenContentStructurer.structure([
+        exportBox("Invoice Total: $403,050", 0, 0, w: 180),
+    ])
+
+    let payload = try #require(StructuredContentExporter.sidecarPayload(from: structured))
+
+    #expect(payload.version == ScreenContentStructurer.currentVersion)
+    #expect(payload.json.contains("\"fields\""))
+    #expect(payload.searchableText.contains("Invoice Total"))
+}
+
+@Test
 func exportsCSVWithFormulaNeutralizedCells() {
     let table = ScreenContentStructurer.Table(rows: [
         ["A", "B", "C", "D", "E"],
