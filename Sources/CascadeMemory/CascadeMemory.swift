@@ -125,6 +125,102 @@ public struct InputEvent: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public struct OCRLine: Codable, Equatable, Sendable {
+    public let contextID: Int64
+    public let lineIndex: Int
+    public let source: String
+    public let text: String
+    public let x: Double?
+    public let y: Double?
+    public let width: Double?
+    public let height: Double?
+    public let confidence: Double?
+
+    public init(
+        contextID: Int64,
+        lineIndex: Int,
+        source: String,
+        text: String,
+        x: Double? = nil,
+        y: Double? = nil,
+        width: Double? = nil,
+        height: Double? = nil,
+        confidence: Double? = nil
+    ) {
+        self.contextID = contextID
+        self.lineIndex = lineIndex
+        self.source = source
+        self.text = text
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.confidence = confidence
+    }
+}
+
+public struct StoredFrameSignature: Codable, Equatable, Sendable {
+    public let contextID: Int64
+    public let dHash: Int64
+    public let combinedGridHash: Int64
+    public let gridHashes: [Int64]
+    public let blockHash: Int64
+    public let changedCellsMask: UInt16
+    public let textDigest: Int64?
+
+    public init(
+        contextID: Int64,
+        dHash: Int64,
+        combinedGridHash: Int64,
+        gridHashes: [Int64],
+        blockHash: Int64,
+        changedCellsMask: UInt16,
+        textDigest: Int64? = nil
+    ) {
+        self.contextID = contextID
+        self.dHash = dHash
+        self.combinedGridHash = combinedGridHash
+        self.gridHashes = gridHashes
+        self.blockHash = blockHash
+        self.changedCellsMask = changedCellsMask
+        self.textDigest = textDigest
+    }
+}
+
+public struct TimelineEpisode: Identifiable, Codable, Equatable, Sendable {
+    public let id: Int64
+    public let startAt: Date
+    public let endAt: Date
+    public let bundleIdentifier: String?
+    public let appName: String
+    public let windowTitleHint: String?
+    public let contextCount: Int
+    public let representativeContextID: Int64
+    public let summaryText: String?
+
+    public init(
+        id: Int64,
+        startAt: Date,
+        endAt: Date,
+        bundleIdentifier: String?,
+        appName: String,
+        windowTitleHint: String?,
+        contextCount: Int,
+        representativeContextID: Int64,
+        summaryText: String?
+    ) {
+        self.id = id
+        self.startAt = startAt
+        self.endAt = endAt
+        self.bundleIdentifier = bundleIdentifier
+        self.appName = appName
+        self.windowTitleHint = windowTitleHint
+        self.contextCount = contextCount
+        self.representativeContextID = representativeContextID
+        self.summaryText = summaryText
+    }
+}
+
 /// Canonical encoding for the stable AX locator recorded with a click — `role`,
 /// `identifier`, and the structural `container` (parent role+title) packed into one
 /// string so the replay cascade can rank candidates by identity (XCUIAutomation-style:
@@ -929,7 +1025,10 @@ public actor CascadeStore {
         }
         // Embeddings follow their moments out.
         try? execute("DELETE FROM context_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM context_chunk_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM context_visual_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM ocr_line WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM frame_signature WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         return removed
     }
 
@@ -1019,6 +1118,208 @@ public actor CascadeStore {
                 rows.append(decodeInputEvent(statement))
             }
             return rows
+        }
+    }
+
+    public func clickInputEvents(near date: Date, window: TimeInterval = 1.0, limit: Int = 20) throws -> [InputEvent] {
+        let start = DateCodec.string(from: date.addingTimeInterval(-window))
+        let end = DateCodec.string(from: date.addingTimeInterval(window))
+        let sql = """
+        SELECT id, captured_at, kind, x, y, text, key, modifiers, app_name, bundle_identifier, window_title, target_descriptor
+        FROM input_event
+        WHERE captured_at >= ? AND captured_at <= ?
+          AND kind IN ('click', 'doubleClick', 'rightClick')
+        ORDER BY ABS(captured_ms - ?), id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(start, at: 1, in: statement)
+            bind(end, at: 2, in: statement)
+            bind(EventStoreLayout.capturedMilliseconds(for: date), at: 3, in: statement)
+            sqlite3_bind_int(statement, 4, Int32(limit))
+            var rows: [InputEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeInputEvent(statement))
+            }
+            return rows
+        }
+    }
+
+    // MARK: - OCR lines + frame signatures
+
+    public func insertOCRLines(_ lines: [OCRLine]) throws {
+        guard !lines.isEmpty else { return }
+        let sql = """
+        INSERT OR REPLACE INTO ocr_line
+            (context_id, line_index, source, text, x, y, width, height, confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        try withTransaction {
+            try withStatement(sql) { statement in
+                for line in lines {
+                    sqlite3_bind_int64(statement, 1, line.contextID)
+                    sqlite3_bind_int(statement, 2, Int32(line.lineIndex))
+                    bind(line.source, at: 3, in: statement)
+                    bind(line.text, at: 4, in: statement)
+                    bind(line.x, at: 5, in: statement)
+                    bind(line.y, at: 6, in: statement)
+                    bind(line.width, at: 7, in: statement)
+                    bind(line.height, at: 8, in: statement)
+                    bind(line.confidence, at: 9, in: statement)
+                    try stepDone(statement)
+                    try resetStatement(statement)
+                    try clearBindings(statement)
+                }
+            }
+        }
+    }
+
+    public func ocrLines(contextID: Int64) throws -> [OCRLine] {
+        let sql = """
+        SELECT context_id, line_index, source, text, x, y, width, height, confidence
+        FROM ocr_line
+        WHERE context_id = ?
+        ORDER BY line_index ASC, source ASC;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, contextID)
+            var rows: [OCRLine] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(OCRLine(
+                    contextID: sqlite3_column_int64(statement, 0),
+                    lineIndex: Int(sqlite3_column_int(statement, 1)),
+                    source: text(statement, 2) ?? "unknown",
+                    text: text(statement, 3) ?? "",
+                    x: double(statement, 4),
+                    y: double(statement, 5),
+                    width: double(statement, 6),
+                    height: double(statement, 7),
+                    confidence: double(statement, 8)
+                ))
+            }
+            return rows
+        }
+    }
+
+    public func insertFrameSignature(_ signature: StoredFrameSignature) throws {
+        let sql = """
+        INSERT OR REPLACE INTO frame_signature
+            (context_id, dhash, combined_grid_hash, grid_hashes, block_hash, changed_cells_mask, text_digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+        """
+        try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, signature.contextID)
+            bind(signature.dHash, at: 2, in: statement)
+            bind(signature.combinedGridHash, at: 3, in: statement)
+            bind(signature.gridHashes.map(String.init).joined(separator: ","), at: 4, in: statement)
+            bind(signature.blockHash, at: 5, in: statement)
+            sqlite3_bind_int(statement, 6, Int32(signature.changedCellsMask))
+            bind(signature.textDigest, at: 7, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    public func frameSignature(contextID: Int64) throws -> StoredFrameSignature? {
+        let sql = """
+        SELECT context_id, dhash, combined_grid_hash, grid_hashes, block_hash, changed_cells_mask, text_digest
+        FROM frame_signature
+        WHERE context_id = ?
+        LIMIT 1;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int64(statement, 1, contextID)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            let hashes = (text(statement, 3) ?? "")
+                .split(separator: ",")
+                .compactMap { Int64($0) }
+            return StoredFrameSignature(
+                contextID: sqlite3_column_int64(statement, 0),
+                dHash: sqlite3_column_int64(statement, 1),
+                combinedGridHash: sqlite3_column_int64(statement, 2),
+                gridHashes: hashes,
+                blockHash: sqlite3_column_int64(statement, 4),
+                changedCellsMask: UInt16(sqlite3_column_int(statement, 5)),
+                textDigest: int64(statement, 6)
+            )
+        }
+    }
+
+    // MARK: - Timeline episodes
+
+    @discardableResult
+    public func refreshTimelineEpisodes(between start: Date, and end: Date, limit: Int = 5_000) throws -> [TimelineEpisode] {
+        let moments = try contexts(between: start, and: end, limit: limit)
+        let momentsByID = Dictionary(uniqueKeysWithValues: moments.map { ($0.id, $0) })
+        let episodes = SessionSegmenter.segment(moments).map { episode in
+            let summary = episode.momentIDs
+                .compactMap { momentsByID[$0]?.ocrText?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first(where: { !$0.isEmpty })
+                .map { String($0.prefix(400)) }
+            return TimelineEpisode(
+                id: episode.id,
+                startAt: episode.startedAt,
+                endAt: episode.endedAt,
+                bundleIdentifier: episode.bundleIdentifier,
+                appName: episode.appName,
+                windowTitleHint: episode.title,
+                contextCount: episode.momentCount,
+                representativeContextID: episode.id,
+                summaryText: summary
+            )
+        }
+        try withTransaction {
+            try withStatement("DELETE FROM timeline_episode WHERE start_at >= ? AND start_at <= ?;") { statement in
+                bind(DateCodec.string(from: start), at: 1, in: statement)
+                bind(DateCodec.string(from: end), at: 2, in: statement)
+                try stepDone(statement)
+            }
+            try insertTimelineEpisodes(episodes)
+        }
+        return episodes
+    }
+
+    public func timelineEpisodes(between start: Date, and end: Date, limit: Int = 200) throws -> [TimelineEpisode] {
+        let sql = """
+        SELECT id, start_at, end_at, bundle_identifier, app_name, window_title_hint, context_count, representative_context_id, summary_text
+        FROM timeline_episode
+        WHERE start_at >= ? AND start_at <= ?
+        ORDER BY start_at ASC, id ASC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(DateCodec.string(from: start), at: 1, in: statement)
+            bind(DateCodec.string(from: end), at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [TimelineEpisode] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeTimelineEpisode(statement))
+            }
+            return rows
+        }
+    }
+
+    private func insertTimelineEpisodes(_ episodes: [TimelineEpisode]) throws {
+        guard !episodes.isEmpty else { return }
+        let sql = """
+        INSERT OR REPLACE INTO timeline_episode
+            (id, start_at, end_at, bundle_identifier, app_name, window_title_hint, context_count, representative_context_id, summary_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        try withStatement(sql) { statement in
+            for episode in episodes {
+                sqlite3_bind_int64(statement, 1, episode.id)
+                bind(DateCodec.string(from: episode.startAt), at: 2, in: statement)
+                bind(DateCodec.string(from: episode.endAt), at: 3, in: statement)
+                bind(episode.bundleIdentifier, at: 4, in: statement)
+                bind(episode.appName, at: 5, in: statement)
+                bind(episode.windowTitleHint, at: 6, in: statement)
+                sqlite3_bind_int(statement, 7, Int32(episode.contextCount))
+                sqlite3_bind_int64(statement, 8, episode.representativeContextID)
+                bind(episode.summaryText, at: 9, in: statement)
+                try stepDone(statement)
+                try resetStatement(statement)
+                try clearBindings(statement)
+            }
         }
     }
 
@@ -1461,6 +1762,67 @@ public actor CascadeStore {
             vector BLOB NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS context_chunk_embedding (
+            context_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text_digest INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (context_id, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_chunk_embedding_context
+            ON context_chunk_embedding(context_id);
+
+        CREATE TABLE IF NOT EXISTS ocr_line (
+            context_id INTEGER NOT NULL,
+            line_index INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            text TEXT NOT NULL,
+            x REAL,
+            y REAL,
+            width REAL,
+            height REAL,
+            confidence REAL,
+            PRIMARY KEY (context_id, line_index, source),
+            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ocr_line_context
+            ON ocr_line(context_id, line_index);
+
+        CREATE TABLE IF NOT EXISTS frame_signature (
+            context_id INTEGER PRIMARY KEY,
+            dhash INTEGER NOT NULL,
+            combined_grid_hash INTEGER NOT NULL,
+            grid_hashes TEXT NOT NULL,
+            block_hash INTEGER NOT NULL,
+            changed_cells_mask INTEGER NOT NULL,
+            text_digest INTEGER,
+            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS timeline_episode (
+            id INTEGER PRIMARY KEY,
+            start_at TEXT NOT NULL,
+            end_at TEXT NOT NULL,
+            bundle_identifier TEXT,
+            app_name TEXT NOT NULL,
+            window_title_hint TEXT,
+            context_count INTEGER NOT NULL,
+            representative_context_id INTEGER NOT NULL,
+            summary_text TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_timeline_episode_start
+            ON timeline_episode(start_at ASC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_timeline_episode_bundle_time
+            ON timeline_episode(bundle_identifier, start_at ASC);
+
+        CREATE TRIGGER IF NOT EXISTS recorded_context_embedding_ad
+        AFTER DELETE ON recorded_context BEGIN
+            DELETE FROM context_embedding WHERE context_id = old.id;
+            DELETE FROM context_chunk_embedding WHERE context_id = old.id;
+            DELETE FROM ocr_line WHERE context_id = old.id;
+            DELETE FROM frame_signature WHERE context_id = old.id;
+        END;
+
         CREATE TABLE IF NOT EXISTS context_visual_embedding (
             context_id INTEGER NOT NULL,
             provider TEXT NOT NULL,
@@ -1793,6 +2155,20 @@ public actor CascadeStore {
             bundleIdentifier: text(statement, 9),
             windowTitle: text(statement, 10),
             targetDescriptor: text(statement, 11)
+        )
+    }
+
+    private func decodeTimelineEpisode(_ statement: OpaquePointer) -> TimelineEpisode {
+        TimelineEpisode(
+            id: sqlite3_column_int64(statement, 0),
+            startAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
+            endAt: DateCodec.date(from: text(statement, 2)) ?? Date(),
+            bundleIdentifier: text(statement, 3),
+            appName: text(statement, 4) ?? "Unknown",
+            windowTitleHint: text(statement, 5),
+            contextCount: Int(sqlite3_column_int(statement, 6)),
+            representativeContextID: sqlite3_column_int64(statement, 7),
+            summaryText: text(statement, 8)
         )
     }
 

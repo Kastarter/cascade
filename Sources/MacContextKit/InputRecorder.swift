@@ -86,6 +86,8 @@ public final class InputRecorder: @unchecked Sendable {
     private var workspaceObserver: NSObjectProtocol?
     private var stopped = true
 
+    public var onActivity: (@Sendable (InputActivity) -> Void)?
+
     public init(store: CascadeStore) {
         self.store = store
     }
@@ -410,6 +412,7 @@ public final class InputRecorder: @unchecked Sendable {
         func flushTyped() {
             guard !typed.isEmpty, let location = typedWhere else { return }
             events.append(InputEvent(capturedAt: typedAt, kind: .type, text: typed, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+            emitActivity(.typingRun, at: typedAt, in: location)
             typed = ""
             typedWhere = nil
         }
@@ -423,6 +426,7 @@ public final class InputRecorder: @unchecked Sendable {
             case .keyCombo(let key, let modifiers, let at, let location):
                 flushTyped()
                 events.append(InputEvent(capturedAt: at, kind: .key, key: key, modifiers: modifiers, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                emitActivity(.keyCombo, at: at, in: location)
             case .click(let x, let y, let double, let at, let location):
                 flushTyped()
                 // For clicks, `text` carries the clicked element's AX label and
@@ -431,21 +435,34 @@ public final class InputRecorder: @unchecked Sendable {
                 let hit = takeClickTarget(at: at, x: x, y: y)
                 if hit == nil { logger.debug("click stored without AX label in \(location.app, privacy: .public)") }
                 events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+                emitActivity(.click, at: at, in: location)
             case .rightClick(let x, let y, let at, let location):
                 flushTyped()
                 let hit = takeClickTarget(at: at, x: x, y: y)
                 if hit == nil { logger.debug("right-click stored without AX label in \(location.app, privacy: .public)") }
                 events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+                emitActivity(.click, at: at, in: location)
             case .scroll(let x, let y, let dx, let dy, let at, let location):
                 flushTyped()
                 let modifiers = ["\(Int(dx))", "\(Int(dy))"]
                 events.append(InputEvent(capturedAt: at, kind: .scroll, x: x, y: y, modifiers: modifiers, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                emitActivity(.scroll, at: at, in: location)
             }
         }
         flushTyped()
         if !events.isEmpty {
             try? await store.insertInputEvents(events)
         }
+    }
+
+    private func emitActivity(_ kind: InputActivityKind, at date: Date, in location: Where) {
+        onActivity?(InputActivity(
+            kind: kind,
+            capturedAt: date,
+            appName: location.app,
+            bundleIdentifier: location.bundle,
+            windowTitle: location.window
+        ))
     }
 
     // MARK: - Frontmost-app context (updated on main; read on the tap thread)
@@ -473,7 +490,13 @@ public final class InputRecorder: @unchecked Sendable {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshContext() }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.refreshContext()
+                let context = self.snapshotContext()
+                guard !context.isOwnApp, !context.isSensitive else { return }
+                self.emitActivity(.appActivated, at: Date(), in: Where(app: context.app, bundle: context.bundle, window: context.window))
+            }
         }
     }
 

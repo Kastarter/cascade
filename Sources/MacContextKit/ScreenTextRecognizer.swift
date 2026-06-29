@@ -55,9 +55,12 @@ public enum ScreenTextRecognizer {
     public struct TextBox: Sendable, Equatable {
         public let text: String
         public let boundingBox: CGRect
-        public init(text: String, boundingBox: CGRect) {
+        public let confidence: Float
+
+        public init(text: String, boundingBox: CGRect, confidence: Float = 1) {
             self.text = text
             self.boundingBox = boundingBox
+            self.confidence = confidence
         }
     }
 
@@ -71,8 +74,8 @@ public enum ScreenTextRecognizer {
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         guard (try? handler.perform([request])) != nil, let observations = request.results else { return [] }
         return observations.compactMap { obs in
-            guard let text = obs.topCandidates(1).first?.string else { return nil }
-            return TextBox(text: text, boundingBox: obs.boundingBox)
+            guard let candidate = obs.topCandidates(1).first else { return nil }
+            return TextBox(text: candidate.string, boundingBox: obs.boundingBox, confidence: candidate.confidence)
         }
     }
 

@@ -1,6 +1,31 @@
 import CoreGraphics
 import Foundation
 
+public struct FrameSignature: Sendable, Equatable, Codable {
+    public let dHash: UInt64
+    public let combinedGridHash: UInt64
+    public let gridDHash: [UInt64]
+    public let blockHash: UInt64
+    public let changedCellsMask: UInt16
+    public var textDigest: UInt64?
+
+    public init(
+        dHash: UInt64,
+        combinedGridHash: UInt64,
+        gridDHash: [UInt64],
+        blockHash: UInt64,
+        changedCellsMask: UInt16,
+        textDigest: UInt64? = nil
+    ) {
+        self.dHash = dHash
+        self.combinedGridHash = combinedGridHash
+        self.gridDHash = gridDHash
+        self.blockHash = blockHash
+        self.changedCellsMask = changedCellsMask
+        self.textDigest = textDigest
+    }
+}
+
 /// A cheap perceptual fingerprint of a frame, used to drop near-identical frames
 /// so an idle screen doesn't become a new "moment" every second. This is what
 /// bounds storage in the continuous recorder — only frames whose hash differs
@@ -38,6 +63,23 @@ public enum PerceptualHash {
                 }
                 bit += 1
             }
+        }
+        return hash
+    }
+
+    /// A second deterministic screen-content signature: downscale to an 8x8
+    /// luminance grid and compare each block to the global mean. This complements
+    /// dHash: dHash is edge/order-sensitive, while this catches broad block-level
+    /// brightness/layout changes without DCT complexity.
+    public static func blockMeanHash(_ image: CGImage) -> UInt64 {
+        let side = 8
+        guard let pixels = grayscaleSamples(from: image, width: side, height: side), !pixels.isEmpty else {
+            return 0
+        }
+        let mean = Double(pixels.reduce(0) { $0 + Int($1) }) / Double(pixels.count)
+        var hash: UInt64 = 0
+        for (index, pixel) in pixels.enumerated() where Double(pixel) >= mean {
+            hash |= (1 << UInt64(index))
         }
         return hash
     }
@@ -135,6 +177,22 @@ public enum PerceptualHash {
         return zip(candidate, previous).allSatisfy { hamming($0, $1) <= threshold }
     }
 
+    public static func changedCellsMask(
+        current: [UInt64],
+        previous: [UInt64]?,
+        threshold: Int = regionSkipThreshold
+    ) -> UInt16 {
+        guard let previous, current.count == previous.count, !current.isEmpty else {
+            let count = min(current.count, 16)
+            return count == 16 ? UInt16.max : UInt16((1 << count) - 1)
+        }
+        var mask: UInt16 = 0
+        for index in current.indices where index < 16 && hamming(current[index], previous[index]) > threshold {
+            mask |= (1 << UInt16(index))
+        }
+        return mask
+    }
+
     /// Returns row-major grid cells whose regional hashes changed beyond
     /// `threshold`, mapped into image coordinates for later cropped OCR.
     public static func diffRegions(
@@ -166,6 +224,10 @@ public enum PerceptualHash {
     /// Renders `image` into a `width x height` 8-bit grayscale buffer using a CPU
     /// context with low-quality interpolation (fast, and identical across runs).
     private static func grayscaleSamples(from image: CGImage) -> [UInt8]? {
+        grayscaleSamples(from: image, width: width, height: height)
+    }
+
+    private static func grayscaleSamples(from image: CGImage, width: Int, height: Int) -> [UInt8]? {
         let count = width * height
         var buffer = [UInt8](repeating: 0, count: count)
         let colorSpace = CGColorSpaceCreateDeviceGray()

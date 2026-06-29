@@ -203,8 +203,11 @@ public final class ContextRecorder: ObservableObject {
     private var rewind: RewindRecorder?
     private let input: InputRecorder
     private var retentionTask: Task<Void, Never>?
+    private var idleHeartbeatTask: Task<Void, Never>?
     private var activationObserver: NSObjectProtocol?
     private var lastActivationCaptureAt = Date.distantPast
+    private var captureScheduler = CaptureScheduler()
+    private var scheduledCaptureTasks: [CaptureReason: Task<Void, Never>] = [:]
 
     public var configuration: Options { options }
 
@@ -264,6 +267,9 @@ public final class ContextRecorder: ObservableObject {
             }
         }
         rewind = recorder
+        input.onActivity = { [weak self] activity in
+            Task { @MainActor in self?.handleInputActivity(activity) }
+        }
         Task { @MainActor in
             do {
                 try await recorder.start()
@@ -278,6 +284,7 @@ public final class ContextRecorder: ObservableObject {
         // recording.
         input.start()
         startRetention()
+        startIdleHeartbeat()
         startActivationCapture()
     }
 
@@ -299,9 +306,9 @@ public final class ContextRecorder: ObservableObject {
     private func handleAppActivated() {
         guard status.running else { return }
         Task { await rewind?.followCursorDisplay() }
-        guard Date().timeIntervalSince(lastActivationCaptureAt) > 1.5 else { return }
+        guard Date().timeIntervalSince(lastActivationCaptureAt) > 0.5 else { return }
         lastActivationCaptureAt = Date()
-        captureOnce()
+        handleInputActivity(InputActivity(kind: .appActivated, appName: observer.latest.appName, bundleIdentifier: observer.latest.bundleIdentifier, windowTitle: observer.latest.windowTitle))
     }
 
     public func pause() {
@@ -313,10 +320,15 @@ public final class ContextRecorder: ObservableObject {
     private func stopEngine() {
         retentionTask?.cancel()
         retentionTask = nil
+        idleHeartbeatTask?.cancel()
+        idleHeartbeatTask = nil
+        for task in scheduledCaptureTasks.values { task.cancel() }
+        scheduledCaptureTasks.removeAll()
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
             self.activationObserver = nil
         }
+        input.onActivity = nil
         input.stop()
         guard let recorder = rewind else { return }
         rewind = nil
@@ -338,14 +350,46 @@ public final class ContextRecorder: ObservableObject {
         }
     }
 
-    public func captureOnce() {
-        Task { _ = await captureNow() }
+    private func startIdleHeartbeat() {
+        idleHeartbeatTask?.cancel()
+        idleHeartbeatTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(CaptureScheduler.idleHeartbeatInterval))
+                await MainActor.run {
+                    guard self.status.running, self.captureScheduler.admits(reason: .idleHeartbeat) else { return }
+                    self.scheduleCapture(reason: .idleHeartbeat, delay: 0)
+                }
+            }
+        }
+    }
+
+    private func handleInputActivity(_ activity: InputActivity) {
+        guard status.running, let decision = captureScheduler.schedule(for: activity) else { return }
+        scheduleCapture(reason: decision.reason, delay: decision.delay)
+    }
+
+    private func scheduleCapture(reason: CaptureReason, delay: TimeInterval) {
+        scheduledCaptureTasks[reason]?.cancel()
+        scheduledCaptureTasks[reason] = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
+            }
+            guard let self, !Task.isCancelled else { return }
+            await self.rewind?.capture(reason: reason)
+            if self.rewind == nil {
+                _ = await self.captureNow(reason: reason)
+            }
+        }
+    }
+
+    public func captureOnce(reason: CaptureReason = .windowChanged) {
+        Task { _ = await captureNow(reason: reason) }
     }
 
     /// Awaitable single capture — used by the autonomous agent loop so it can
     /// observe the current screen (and its OCR) before planning the next step.
     @discardableResult
-    public func captureNow() async -> RecordedContext? {
+    public func captureNow(reason: CaptureReason = .windowChanged) async -> RecordedContext? {
         let snapshot = observer.refresh()
         // Same privacy boundary as the continuous recorder — the one-shot path
         // must not store what the rewind would refuse. Pre-OCR gate on app/window…
@@ -363,19 +407,31 @@ public final class ContextRecorder: ObservableObject {
         var capturedImageData: Data?
         var source: ContextSource = .app
         var isCursorScreen = false
+        var samplePixelWidth: Int?
+        var samplePixelHeight: Int?
+        var displayMetadata: CapturedDisplayMetadata?
+        var ocrBoxes: [ScreenTextRecognizer.TextBox] = []
+        var axTextForLines = ""
         if canCaptureScreen,
-           let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true) {
+           let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false) {
             source = .screen
             isCursorScreen = sample.isCursorScreen
-            if sample.hasText { ocrText = sample.ocrText }
+            samplePixelWidth = sample.pixelWidth
+            samplePixelHeight = sample.pixelHeight
+            if let displayID = sample.displayID, let bounds = sample.displayBounds {
+                displayMetadata = CapturedDisplayMetadata(id: displayID, bounds: bounds)
+            }
             if let png = sample.imagePNG {
                 capturedImageData = png
+                ocrBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: png)
+                let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
+                if !structured.readingOrderText.isEmpty { ocrText = structured.readingOrderText }
                 imagePath = Self.saveFrame(png)
             }
         }
         let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, let capturedImageData {
             StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(
-                ScreenTextRecognizer.recognizeBoxes(inImageData: capturedImageData),
+                ocrBoxes.isEmpty ? ScreenTextRecognizer.recognizeBoxes(inImageData: capturedImageData) : ocrBoxes,
                 topLeftOrigin: false
             ))
         } else {
@@ -385,6 +441,7 @@ public final class ContextRecorder: ObservableObject {
         // OCR fills in what the tree can't see.
         if let pid = snapshot.processIdentifier {
             let axText = await Task.detached { AXTextHarvester.text(forWindowOfPID: pid) }.value
+            axTextForLines = axText
             let merged = AXTextHarvester.merge(ax: axText, ocr: ocrText ?? "")
             if !merged.isEmpty { ocrText = merged }
         }
@@ -392,6 +449,10 @@ public final class ContextRecorder: ObservableObject {
         let metadata = RecorderMetadataJSON.capture(
             processIdentifier: snapshot.processIdentifier,
             cursorScreen: isCursorScreen,
+            width: samplePixelWidth,
+            height: samplePixelHeight,
+            reason: reason,
+            display: displayMetadata,
             structured: structuredMetadata
         )
         let context = RecordedContext(
@@ -412,6 +473,9 @@ public final class ContextRecorder: ObservableObject {
         }
         do {
             let inserted = try await store.insert(context, indexWorkGraph: options.indexWorkGraph)
+            var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: ocrBoxes, source: "vision")
+            lines += OCRLineBuilder.axLines(contextID: inserted.id, text: axTextForLines, startingAt: lines.count)
+            try? await store.insertOCRLines(lines)
             // Semantic recall: index the moment's text locally (best-effort) so
             // explicit/on-demand captures are searchable too, matching the
             // continuous recorder path.

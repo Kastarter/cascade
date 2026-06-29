@@ -35,6 +35,27 @@ public struct QATurn: Identifiable, Sendable {
     public var citations: [CitedMoment] = []
 }
 
+public struct ReelClickMarker: Identifiable, Sendable, Equatable {
+    public let id: Int64
+    public let capturedAt: Date
+    public let x: Double
+    public let y: Double
+    public let label: String?
+    public let targetDescriptor: String?
+
+    public init?(event: InputEvent) {
+        guard [.click, .doubleClick, .rightClick].contains(event.kind),
+              let x = event.x,
+              let y = event.y else { return nil }
+        self.id = event.id
+        self.capturedAt = event.capturedAt
+        self.x = x
+        self.y = y
+        self.label = event.text
+        self.targetDescriptor = event.targetDescriptor
+    }
+}
+
 /// A background agent running in the isolated web sandbox.
 public struct BackgroundAgentRun: Identifiable, Sendable {
     public let id: UUID
@@ -100,6 +121,7 @@ public final class CascadeAppModel: ObservableObject {
     @Published public private(set) var contexts: [RecordedContext] = []
     @Published public private(set) var searchResults: [RecordedContext] = []
     @Published public private(set) var searchQuery: String = ""
+    @Published public private(set) var reelClickMarkersByContextID: [Int64: [ReelClickMarker]] = [:]
     @Published public private(set) var audit: [AuditEvent] = []
     @Published public private(set) var auditIntegrityStatus: AuditIntegrityStatus = .unchecked
     /// The raw recall layer: every repeated sequence the detector found, before the
@@ -4703,6 +4725,16 @@ public final class CascadeAppModel: ObservableObject {
         contexts.insert(context, at: 0)
         if contexts.count > 200 {
             contexts.removeLast(contexts.count - 200)
+        }
+    }
+
+    public func refreshClickMarkers(near context: RecordedContext?) {
+        guard let context else { return }
+        if reelClickMarkersByContextID[context.id] != nil { return }
+        Task {
+            let events = (try? await store.clickInputEvents(near: context.capturedAt, window: 1.25, limit: 12)) ?? []
+            let markers = events.compactMap(ReelClickMarker.init(event:))
+            reelClickMarkersByContextID[context.id] = markers
         }
     }
 

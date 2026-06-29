@@ -21,42 +21,134 @@ import Vision
 
 /// A changed frame ready for OCR + storage. All fields are Sendable so it can
 /// cross from the stream delegate to the `RewindEngine` actor.
+struct CapturedDisplayMetadata: Sendable, Equatable, Codable {
+    let id: UInt32
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+
+    init(id: CGDirectDisplayID, bounds: CGRect) {
+        self.id = id
+        self.x = Double(bounds.minX)
+        self.y = Double(bounds.minY)
+        self.width = Double(bounds.width)
+        self.height = Double(bounds.height)
+    }
+}
+
 struct ChangedFrame: Sendable {
     let jpeg: Data
-    let hash: UInt64
+    let signature: FrameSignature
     let width: Int
     let height: Int
+    let display: CapturedDisplayMetadata?
 }
 
 enum RecorderMetadataJSON {
+    private struct SignaturePayload: Encodable {
+        let dHash: String
+        let combinedGridHash: String
+        let blockHash: String
+        let changedCellsMask: UInt16
+        let textDigest: String?
+
+        init(_ signature: FrameSignature) {
+            self.dHash = String(signature.dHash)
+            self.combinedGridHash = String(signature.combinedGridHash)
+            self.blockHash = String(signature.blockHash)
+            self.changedCellsMask = signature.changedCellsMask
+            self.textDigest = signature.textDigest.map(String.init)
+        }
+    }
+
     private struct RewindPayload: Encodable {
         let rewind: Bool
         let w: Int
         let h: Int
         let ax: Int
+        let captureReason: String?
+        let display: CapturedDisplayMetadata?
+        let signature: SignaturePayload?
         let structured: StructuredContentExporter.Metadata?
     }
 
     private struct CapturePayload: Encodable {
         let processIdentifier: Int32?
         let cursorScreen: Bool
+        let w: Int?
+        let h: Int?
+        let captureReason: String?
+        let display: CapturedDisplayMetadata?
         let structured: StructuredContentExporter.Metadata?
     }
 
-    static func rewind(width: Int, height: Int, axCount: Int, structured: StructuredContentExporter.Metadata?) -> String {
-        guard let structured else {
+    static func rewind(
+        width: Int,
+        height: Int,
+        axCount: Int,
+        reason: CaptureReason? = nil,
+        display: CapturedDisplayMetadata? = nil,
+        signature: FrameSignature? = nil,
+        structured: StructuredContentExporter.Metadata?
+    ) -> String {
+        if reason == nil, display == nil, signature == nil, structured == nil {
             return "{\"rewind\":true,\"w\":\(width),\"h\":\(height),\"ax\":\(axCount)}"
         }
-        return encode(RewindPayload(rewind: true, w: width, h: height, ax: axCount, structured: structured))
+        let signaturePayload = signature.map(SignaturePayload.init)
+        guard let structured else {
+            return encode(RewindPayload(
+                rewind: true,
+                w: width,
+                h: height,
+                ax: axCount,
+                captureReason: reason?.rawValue,
+                display: display,
+                signature: signaturePayload,
+                structured: nil
+            ))
+        }
+        return encode(RewindPayload(
+            rewind: true,
+            w: width,
+            h: height,
+            ax: axCount,
+            captureReason: reason?.rawValue,
+            display: display,
+            signature: signaturePayload,
+            structured: structured
+        ))
     }
 
-    static func capture(processIdentifier: Int32?, cursorScreen: Bool, structured: StructuredContentExporter.Metadata?) -> String {
+    static func capture(
+        processIdentifier: Int32?,
+        cursorScreen: Bool,
+        width: Int? = nil,
+        height: Int? = nil,
+        reason: CaptureReason? = nil,
+        display: CapturedDisplayMetadata? = nil,
+        structured: StructuredContentExporter.Metadata?
+    ) -> String {
         guard let structured else {
-            return """
-            {"processIdentifier":\(processIdentifier.map(String.init) ?? "null"),"cursorScreen":\(cursorScreen)}
-            """
+            return encode(CapturePayload(
+                processIdentifier: processIdentifier,
+                cursorScreen: cursorScreen,
+                w: width,
+                h: height,
+                captureReason: reason?.rawValue,
+                display: display,
+                structured: nil
+            ))
         }
-        return encode(CapturePayload(processIdentifier: processIdentifier, cursorScreen: cursorScreen, structured: structured))
+        return encode(CapturePayload(
+            processIdentifier: processIdentifier,
+            cursorScreen: cursorScreen,
+            w: width,
+            h: height,
+            captureReason: reason?.rawValue,
+            display: display,
+            structured: structured
+        ))
     }
 
     private static func encode<T: Encodable>(_ value: T) -> String {
@@ -121,11 +213,17 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     private let onStop: @Sendable (Error?) -> Void
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private var lastGrid: [UInt64]?
+    private var scheduler = CaptureScheduler()
+    private var display: CapturedDisplayMetadata?
 
     init(engine: RewindEngine, threshold: Int, onStop: @escaping @Sendable (Error?) -> Void) {
         self.engine = engine
         self.threshold = threshold
         self.onStop = onStop
+    }
+
+    func setDisplay(id: CGDirectDisplayID, bounds: CGRect) {
+        display = CapturedDisplayMetadata(id: id, bounds: bounds)
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -142,22 +240,32 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
         // Change-aware dedup: per-region hashes, so a small but real change (a
         // new message in an otherwise static window) defeats the skip instead
         // of being averaged away by a whole-frame hash.
+        let previousGrid = lastGrid
         let grid = PerceptualHash.gridHashes(cgImage)
-        if let last = lastGrid, PerceptualHash.isDuplicateGrid(grid, of: last) {
-            return // Every region near-identical to the last stored frame — drop.
-        }
+        let changedCellsMask = PerceptualHash.changedCellsMask(current: grid, previous: previousGrid, threshold: threshold)
+        let visuallyChanged = previousGrid.map { !PerceptualHash.isDuplicateGrid(grid, of: $0, threshold: threshold) } ?? true
         lastGrid = grid
-        // Frame signature folded from the grid we just computed — no second
-        // whole-frame downscale. (Dedup above keys off `grid`, not this value.)
-        let hash = PerceptualHash.combinedHash(grid)
+        let signature = FrameSignature(
+            dHash: PerceptualHash.dHash(cgImage),
+            combinedGridHash: PerceptualHash.combinedHash(grid),
+            gridDHash: grid,
+            blockHash: PerceptualHash.blockMeanHash(cgImage),
+            changedCellsMask: changedCellsMask
+        )
 
         guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
             .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
             return
         }
-        let frame = ChangedFrame(jpeg: jpeg, hash: hash, width: cgImage.width, height: cgImage.height)
+        let frame = ChangedFrame(jpeg: jpeg, signature: signature, width: cgImage.width, height: cgImage.height, display: display)
         let engine = self.engine
-        Task { await engine.ingest(frame) }
+        let shouldHeartbeat = visuallyChanged && scheduler.admits(reason: .streamHeartbeat)
+        Task {
+            await engine.updateLatest(frame)
+            if shouldHeartbeat {
+                await engine.captureLatest(reason: .streamHeartbeat)
+            }
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -177,16 +285,58 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     }
 }
 
+enum OCRLineBuilder {
+    static func visionLines(contextID: Int64, boxes: [ScreenTextRecognizer.TextBox], source: String) -> [OCRLine] {
+        ScreenContentStructurer.structure(boxes, topLeftOrigin: false).lines.enumerated().map { index, line in
+            let confidence: Double? = if line.boxes.isEmpty {
+                nil
+            } else {
+                Double(line.boxes.reduce(Float(0)) { $0 + $1.confidence } / Float(line.boxes.count))
+            }
+            return OCRLine(
+                contextID: contextID,
+                lineIndex: index,
+                source: source,
+                text: line.text,
+                x: Double(line.rect.minX),
+                y: Double(line.rect.minY),
+                width: Double(line.rect.width),
+                height: Double(line.rect.height),
+                confidence: confidence
+            )
+        }
+    }
+
+    static func axLines(contextID: Int64, text: String, startingAt startIndex: Int = 0) -> [OCRLine] {
+        text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .enumerated()
+            .map { index, line in
+                OCRLine(contextID: contextID, lineIndex: startIndex + index, source: "ax", text: line)
+            }
+    }
+}
+
 /// Serializes the expensive work (OCR + storage) per changed frame. Actor
 /// isolation *is* the serialization; `ingest` coalesces to the latest pending
 /// frame so a slow OCR pass can't pile up a backlog.
 actor RewindEngine {
+    private struct PendingFrame: Sendable {
+        let frame: ChangedFrame
+        let reason: CaptureReason
+    }
+
     private let store: CascadeStore
     private let indexWorkGraph: Bool
     private let structuredContent: Bool
     private let onMoment: @Sendable (RecordedContext) -> Void
-    private var pending: ChangedFrame?
+    private var latest: ChangedFrame?
+    private var pending: PendingFrame?
     private var processing = false
+    private var lastStoredBucket: String?
+    private var lastStoredSignature: FrameSignature?
     private var lastNativeOCRAt = Date.distantPast
     private let logger = Logger(subsystem: "com.humain.cascade", category: "rewind")
 
@@ -210,21 +360,25 @@ actor RewindEngine {
         self.onMoment = onMoment
     }
 
-    /// Accepts a changed frame. Keeps only the newest one while a frame is being
-    /// processed (coalesce-latest), so OCR backlog is bounded to one in-flight + one
-    /// pending frame.
-    func ingest(_ frame: ChangedFrame) async {
-        pending = frame
+    func updateLatest(_ frame: ChangedFrame) {
+        latest = frame
+    }
+
+    /// Stores the newest stream frame for an admitted scheduler reason. Keeps only
+    /// the newest pending request while OCR is in flight, so backlog remains bounded.
+    func captureLatest(reason: CaptureReason) async {
+        guard let frame = latest else { return }
+        pending = PendingFrame(frame: frame, reason: reason)
         guard !processing else { return }
         processing = true
         while let next = pending {
             pending = nil
-            await process(next)
+            await process(next.frame, reason: next.reason)
         }
         processing = false
     }
 
-    private func process(_ frame: ChangedFrame) async {
+    private func process(_ frame: ChangedFrame, reason: CaptureReason) async {
         let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
 
         // Never record Cascade itself — when our own UI is frontmost the captured
@@ -245,8 +399,6 @@ actor RewindEngine {
             return
         }
 
-        guard let imagePath = FrameStore.save(jpeg: frame.jpeg) else { return }
-
         // The exact-text channel: the focused window's accessibility tree.
         // Character-perfect for native apps, immune to the resolution cap.
         // (Thread-safe C API; this actor serializes the walks.)
@@ -261,18 +413,16 @@ actor RewindEngine {
         // windows where OCR is the load-bearing channel.
         let axRich = axText.count >= Self.sparseAXThreshold
 
-        // `recognize(inPNG:)` decodes via ImageIO, which handles JPEG bytes too.
-        var ocrText = await ScreenTextRecognizer.recognize(
-            inPNG: frame.jpeg, level: axRich ? .fast : .accurate
-        )
+        let recognitionLevel: VNRequestTextRecognitionLevel = axRich ? .fast : .accurate
+        let ocrBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: frame.jpeg, level: recognitionLevel)
+        let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
+        var ocrText = structured.readingOrderText
         let structuredMetadata: StructuredContentExporter.Metadata? = if structuredContent {
-            StructuredContentExporter.metadata(from: ScreenContentStructurer.structure(
-                ScreenTextRecognizer.recognizeBoxes(inImageData: frame.jpeg, level: axRich ? .fast : .accurate),
-                topLeftOrigin: false
-            ))
+            StructuredContentExporter.metadata(from: structured)
         } else {
             nil
         }
+        var nativeOCRLines: [ScreenTextRecognizer.TextBox] = []
 
         // Canvas/web window with little AX text → OCR is the only channel, so
         // do one native-resolution pass (rate-limited) for the focused window
@@ -282,14 +432,25 @@ actor RewindEngine {
            let pid = snapshot.processIdentifier,
            let windowRect = await MainActor.run(body: { ScreenCaptureUtility.focusedWindowNormalizedRect(pid: pid) }),
            let nativeCrop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(
-               normalizedRect: windowRect, maxDimension: 2400
-           ) {
+	               normalizedRect: windowRect, maxDimension: 2400
+	           ) {
             lastNativeOCRAt = Date()
-            let nativeText = await ScreenTextRecognizer.recognize(inPNG: nativeCrop)
-            if nativeText.count > ocrText.count { ocrText = nativeText }
+            let nativeBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: nativeCrop, level: .accurate)
+            let nativeText = ScreenContentStructurer.structure(nativeBoxes, topLeftOrigin: false).readingOrderText
+            if nativeText.count > ocrText.count {
+                ocrText = nativeText
+                nativeOCRLines = nativeBoxes
+            }
         }
 
         let mergedText = AXTextHarvester.merge(ax: axText, ocr: ocrText)
+        var signature = frame.signature
+        signature.textDigest = Self.textDigest(mergedText)
+        let bucket = Self.bucket(for: snapshot)
+        if isDuplicate(bucket: bucket, signature: signature) {
+            return
+        }
+        guard let imagePath = FrameStore.save(jpeg: frame.jpeg) else { return }
 
         let context = RecordedContext(
             source: .screen,
@@ -302,9 +463,12 @@ actor RewindEngine {
                 width: frame.width,
                 height: frame.height,
                 axCount: axText.count,
+                reason: reason,
+                display: frame.display,
+                signature: signature,
                 structured: structuredMetadata
             ),
-            frameHash: Int64(bitPattern: frame.hash)
+            frameHash: Int64(bitPattern: signature.combinedGridHash)
         )
 
         // Re-check with OCR text now available — if anything sensitive surfaced in
@@ -316,10 +480,27 @@ actor RewindEngine {
 
         do {
             let inserted = try await store.insert(context, indexWorkGraph: indexWorkGraph)
+            var lines = OCRLineBuilder.visionLines(contextID: inserted.id, boxes: ocrBoxes, source: "vision")
+            lines += OCRLineBuilder.axLines(contextID: inserted.id, text: axText, startingAt: lines.count)
+            if !nativeOCRLines.isEmpty {
+                lines += OCRLineBuilder.visionLines(contextID: inserted.id, boxes: nativeOCRLines, source: "vision_native_crop")
+            }
+            try? await store.insertOCRLines(lines)
+            try? await store.insertFrameSignature(StoredFrameSignature(
+                contextID: inserted.id,
+                dHash: Int64(bitPattern: signature.dHash),
+                combinedGridHash: Int64(bitPattern: signature.combinedGridHash),
+                gridHashes: signature.gridDHash.map { Int64(bitPattern: $0) },
+                blockHash: Int64(bitPattern: signature.blockHash),
+                changedCellsMask: signature.changedCellsMask,
+                textDigest: signature.textDigest.map { Int64(bitPattern: $0) }
+            ))
             // Semantic recall: index the moment's text locally (best-effort).
             if !mergedText.isEmpty {
                 try? await store.indexEmbedding(contextID: inserted.id, text: mergedText)
             }
+            lastStoredBucket = bucket
+            lastStoredSignature = signature
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "system",
                 action: "rewind.capture",
@@ -334,6 +515,39 @@ actor RewindEngine {
             FrameStore.delete(imagePath)
             logger.error("Rewind insert failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    private func isDuplicate(bucket: String, signature: FrameSignature) -> Bool {
+        guard let lastBucket = lastStoredBucket,
+              let last = lastStoredSignature,
+              lastBucket == bucket,
+              last.textDigest == signature.textDigest else {
+            return false
+        }
+        let combinedDistance = PerceptualHash.hamming(signature.combinedGridHash, last.combinedGridHash)
+        let blockDistance = PerceptualHash.hamming(signature.blockHash, last.blockHash)
+        return combinedDistance <= PerceptualHash.defaultSkipThreshold
+            && blockDistance <= PerceptualHash.defaultSkipThreshold
+    }
+
+    private static func bucket(for snapshot: AppWindowSnapshot) -> String {
+        [
+            snapshot.bundleIdentifier ?? snapshot.appName,
+            snapshot.windowTitle ?? "",
+        ].joined(separator: "\u{1F}")
+    }
+
+    static func textDigest(_ text: String) -> UInt64 {
+        let normalized = text
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in normalized.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return hash
     }
 }
 
@@ -389,6 +603,7 @@ final class RewindRecorder {
         ) else {
             return // Fail-closed (no permission / no display) — nothing started.
         }
+        output.setDisplay(id: made.displayID, bounds: made.displayBounds)
         // A pause could have arrived while we awaited stream creation.
         guard !stopping else {
             try? await made.stream.stopCapture()
@@ -399,6 +614,10 @@ final class RewindRecorder {
         self.output = output
         self.streamedDisplayID = made.displayID
         logger.info("Rewind stream started on display \(made.displayID).")
+    }
+
+    func capture(reason: CaptureReason) async {
+        await engine.captureLatest(reason: reason)
     }
 
     func stop() async {

@@ -621,7 +621,10 @@ private struct ReelScreen: View {
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.horizontal, CascadeMetrics.s4)
             .padding(.top, CascadeMetrics.s2)
-            SceneCard(context: selected)
+            SceneCard(
+                context: selected,
+                clickMarkers: selected.map { model.reelClickMarkersByContextID[$0.id] ?? [] } ?? []
+            )
             TransportBar(
                 isPlaying: $isPlaying,
                 speed: $speed,
@@ -647,6 +650,8 @@ private struct ReelScreen: View {
                 }
             )
         }
+        .onAppear { model.refreshClickMarkers(near: selected) }
+        .onChange(of: selected?.id) { _, _ in model.refreshClickMarkers(near: selected) }
     }
 
     private var headline: String {
@@ -678,10 +683,25 @@ private struct ReelScreen: View {
 
 private struct SceneCard: View {
     let context: RecordedContext?
+    let clickMarkers: [ReelClickMarker]
+
+    private struct DisplayMetadata: Decodable {
+        let id: UInt32?
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct SceneMetadata: Decodable {
+        let w: Int?
+        let h: Int?
+        let display: DisplayMetadata?
+    }
 
     @ViewBuilder var body: some View {
         if let context, let path = context.imagePath, let image = NSImage(contentsOfFile: path) {
-            screenshotCard(image)
+            screenshotCard(image, context: context)
         } else {
             panelCard
         }
@@ -690,7 +710,7 @@ private struct SceneCard: View {
     /// Full-width card, flush with the transport bar below, and the capture fills
     /// it edge-to-edge like fullscreen video — cropping a sliver of the frame when
     /// the aspect ratios differ rather than ever showing a letterbox.
-    private func screenshotCard(_ image: NSImage) -> some View {
+    private func screenshotCard(_ image: NSImage, context: RecordedContext) -> some View {
         ZStack(alignment: .topTrailing) {
             // Color.clear sized by the card + overlay/clipped keeps scaledToFill's
             // natural-size overflow from inflating the layout.
@@ -701,6 +721,7 @@ private struct SceneCard: View {
                         .scaledToFill()
                 }
                 .clipped()
+            clickOverlay(context: context, image: image)
             capturedBadge
                 .padding(CascadeMetrics.s4)
         }
@@ -712,6 +733,76 @@ private struct SceneCard: View {
                 .stroke(Color.cascadeBorderHi.opacity(0.55), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.4), radius: 22, y: 10)
+    }
+
+    private func clickOverlay(context: RecordedContext, image: NSImage) -> some View {
+        GeometryReader { geo in
+            ForEach(clickMarkers) { marker in
+                if let point = markerPoint(marker, context: context, image: image, container: geo.size) {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.cascadeRecText, lineWidth: 2)
+                            .frame(width: 22, height: 22)
+                        Circle()
+                            .fill(Color.cascadeRecDot)
+                            .frame(width: 6, height: 6)
+                    }
+                    .shadow(color: .black.opacity(0.65), radius: 4)
+                    .position(point)
+                    .help(marker.label ?? marker.targetDescriptor ?? "Click")
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func markerPoint(
+        _ marker: ReelClickMarker,
+        context: RecordedContext,
+        image: NSImage,
+        container: CGSize
+    ) -> CGPoint? {
+        guard container.width > 0, container.height > 0,
+              let metadata = metadata(for: context),
+              let display = metadata.display,
+              display.width > 0,
+              display.height > 0 else { return nil }
+
+        let normalizedX = (marker.x - display.x) / display.width
+        let normalizedY = 1 - ((marker.y - display.y) / display.height)
+        guard (0...1).contains(normalizedX), (0...1).contains(normalizedY) else { return nil }
+
+        let imageWidth = CGFloat(metadata.w ?? Int(image.size.width))
+        let imageHeight = CGFloat(metadata.h ?? Int(image.size.height))
+        guard imageWidth > 0, imageHeight > 0 else { return nil }
+
+        let imageAspect = imageWidth / imageHeight
+        let containerAspect = container.width / container.height
+        let drawWidth: CGFloat
+        let drawHeight: CGFloat
+        let offsetX: CGFloat
+        let offsetY: CGFloat
+        if containerAspect > imageAspect {
+            drawWidth = container.width
+            drawHeight = container.width / imageAspect
+            offsetX = 0
+            offsetY = (container.height - drawHeight) / 2
+        } else {
+            drawHeight = container.height
+            drawWidth = container.height * imageAspect
+            offsetX = (container.width - drawWidth) / 2
+            offsetY = 0
+        }
+        return CGPoint(
+            x: offsetX + CGFloat(normalizedX) * drawWidth,
+            y: offsetY + CGFloat(normalizedY) * drawHeight
+        )
+    }
+
+    private func metadata(for context: RecordedContext) -> SceneMetadata? {
+        guard let json = context.metadataJSON,
+              let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(SceneMetadata.self, from: data)
     }
 
     /// Fallback card (OCR text or idle) — full-width cinematic panel.

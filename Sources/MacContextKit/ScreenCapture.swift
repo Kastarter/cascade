@@ -27,6 +27,8 @@ public struct ScreenContextSample: Sendable, Equatable {
     public let frontBundleIdentifier: String?
     public let pixelWidth: Int
     public let pixelHeight: Int
+    public let displayID: CGDirectDisplayID?
+    public let displayBounds: CGRect?
     public let isCursorScreen: Bool
     /// Present only when explicitly requested; defaults to `nil` so we don't keep
     /// raw screenshots in memory during routine recording.
@@ -38,6 +40,8 @@ public struct ScreenContextSample: Sendable, Equatable {
         frontBundleIdentifier: String?,
         pixelWidth: Int,
         pixelHeight: Int,
+        displayID: CGDirectDisplayID? = nil,
+        displayBounds: CGRect? = nil,
         isCursorScreen: Bool,
         imagePNG: Data?
     ) {
@@ -46,6 +50,8 @@ public struct ScreenContextSample: Sendable, Equatable {
         self.frontBundleIdentifier = frontBundleIdentifier
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
+        self.displayID = displayID
+        self.displayBounds = displayBounds
         self.isCursorScreen = isCursorScreen
         self.imagePNG = imagePNG
     }
@@ -263,7 +269,7 @@ public enum ScreenCaptureUtility {
         output: SCStreamOutput & SCStreamDelegate,
         sampleHandlerQueue: DispatchQueue,
         fps: Int32 = 1
-    ) async throws -> (stream: SCStream, displayID: CGDirectDisplayID)? {
+    ) async throws -> (stream: SCStream, displayID: CGDirectDisplayID, displayBounds: CGRect)? {
         guard CGPreflightScreenCaptureAccess() else {
             logger.info("Rewind stream skipped — Screen Recording not granted (fail-closed).")
             return nil
@@ -290,7 +296,7 @@ public enum ScreenCaptureUtility {
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: output)
         try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleHandlerQueue)
-        return (stream, display.displayID)
+        return (stream, display.displayID, appKitFrame(for: display))
     }
 
     private static func capture(includeImage: Bool, includeOCR: Bool = true) async throws -> ScreenContextSample? {
@@ -328,6 +334,8 @@ public enum ScreenCaptureUtility {
             frontBundleIdentifier: front?.bundleIdentifier,
             pixelWidth: cgImage.width,
             pixelHeight: cgImage.height,
+            displayID: display.displayID,
+            displayBounds: appKitFrame(for: display),
             isCursorScreen: isCursorScreen,
             imagePNG: includeImage ? png : nil
         )

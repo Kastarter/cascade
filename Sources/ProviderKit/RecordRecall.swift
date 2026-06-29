@@ -245,15 +245,19 @@ public struct RecordRecall: Sendable {
                   let end = Self.date(from: endISO), end > start else {
                 return "list_sessions needs start_iso and end_iso (ISO-8601, end after start)."
             }
-            // Pull every visible moment in the window, then group into work
-            // sessions — privacy filtering happens here (the recall boundary),
-            // same as the other tools, so a sensitive moment can't anchor or pad
-            // a session.
-            let moments = ((try? await store.contexts(between: start, and: end, limit: 5_000)) ?? [])
-                .filter { !PrivacyRules.isSensitive($0) }
-            let episodes = SessionSegmenter.segment(moments)
-            guard !episodes.isEmpty else { return "No sessions recorded in that window." }
-            return episodes.map { Self.sessionLine(for: $0) }.joined(separator: "\n")
+            // Refresh materialized sessions from the deterministic segmenter, then
+            // read that session layer back. Sensitive frames are already dropped at
+            // recording time; this path keeps recall at the session level first.
+            let refreshed = try? await store.refreshTimelineEpisodes(between: start, and: end, limit: 5_000)
+            let episodes: [TimelineEpisode]
+            if let refreshed {
+                episodes = refreshed
+            } else {
+                episodes = (try? await store.timelineEpisodes(between: start, and: end)) ?? []
+            }
+            let visible = episodes.filter { !Self.isSensitive($0) }
+            guard !visible.isEmpty else { return "No sessions recorded in that window." }
+            return visible.map { Self.sessionLine(for: $0) }.joined(separator: "\n")
 
         case .unknown(let name):
             return "Unknown recall tool \(name)."
@@ -276,6 +280,20 @@ public struct RecordRecall: Sendable {
         let title = episode.title.map { " — \($0)" } ?? ""
         return "[#\(episode.id)] \(time(episode.startedAt))–\(time(episode.endedAt)) "
             + "(\(duration(episode.duration))) \(episode.appName)\(title) · \(episode.momentCount) moments"
+    }
+
+    static func sessionLine(for episode: TimelineEpisode) -> String {
+        let title = episode.windowTitleHint.map { " — \($0)" } ?? ""
+        return "[#\(episode.representativeContextID)] \(time(episode.startAt))–\(time(episode.endAt)) "
+            + "(\(duration(max(0, episode.endAt.timeIntervalSince(episode.startAt))))) \(episode.appName)\(title) · \(episode.contextCount) moments"
+    }
+
+    static func isSensitive(_ episode: TimelineEpisode) -> Bool {
+        PrivacyRules.isSensitive(
+            appName: episode.appName,
+            bundleIdentifier: episode.bundleIdentifier,
+            windowTitle: episode.windowTitleHint
+        ) || episode.summaryText.map(PrivacyRules.isSensitiveText) == true
     }
 
     /// Human session length: "<1m", "36m", "1h 04m".
