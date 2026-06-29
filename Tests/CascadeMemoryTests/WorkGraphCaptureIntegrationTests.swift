@@ -60,8 +60,11 @@ func optInContextInsertsIndexWorkGraphMentions() async throws {
     #expect(try await entityTimelineOrEmpty(store, kind: .window, canonicalValue: "roadmap sync").map(\.contextID) == [contextID])
     #expect(try await entityTimelineOrEmpty(store, kind: .url, canonicalValue: "https://example.com/pricing").map(\.contextID) == [contextID])
     #expect(try await entityTimelineOrEmpty(store, kind: .file, canonicalValue: "/Users/khalidsh/Reports/Q2.csv").map(\.contextID) == [contextID])
+    #expect(try await entityTimelineOrEmpty(store, kind: .folder, canonicalValue: "/Users/khalidsh/Reports").map(\.contextID) == [contextID])
     #expect(try await entityTimelineOrEmpty(store, kind: .date, canonicalValue: "2026-06-26").map(\.contextID) == [contextID])
     #expect(try await entityTimelineOrEmpty(store, kind: .person, canonicalValue: "ada lovelace").map(\.contextID) == [contextID])
+    #expect(try await entityTimelineOrEmpty(store, kind: .organization, canonicalValue: "example").map(\.contextID) == [contextID])
+    #expect(try await entityTimelineOrEmpty(store, kind: .project, canonicalValue: "reports").map(\.contextID) == [contextID])
 }
 
 @Test
@@ -139,4 +142,5 @@ func optInBatchRollbackRemovesPartialWorkGraphLinks() async throws {
     #expect(try await entityTimelineOrEmpty(store, kind: .url, canonicalValue: "https://example.com/pricing").isEmpty)
     #expect(try await entityTimelineOrEmpty(store, kind: .file, canonicalValue: "/Users/khalidsh/Reports/Q2.csv").isEmpty)
     #expect(try await entityTimelineOrEmpty(store, kind: .person, canonicalValue: "ada lovelace").isEmpty)
+    #expect(try await store.currentGraphEdges(limit: 10).isEmpty)
 }

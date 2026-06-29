@@ -359,7 +359,7 @@ actor RewindEngine {
 
     init(
         store: CascadeStore,
-        indexWorkGraph: Bool = false,
+        indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
@@ -640,7 +640,7 @@ final class RewindRecorder {
         store: CascadeStore,
         threshold: Int = PerceptualHash.defaultSkipThreshold,
         fps: Int32 = 1,
-        indexWorkGraph: Bool = false,
+        indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void

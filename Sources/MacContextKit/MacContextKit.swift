@@ -191,7 +191,7 @@ public final class ContextRecorder: ObservableObject {
         public var capturePolicy: CapturePrivacyPolicy
 
         public init(
-            indexWorkGraph: Bool = false,
+            indexWorkGraph: Bool = true,
             structuredContent: Bool = false,
             capturePolicy: CapturePrivacyPolicy = .default
         ) {

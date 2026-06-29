@@ -446,7 +446,7 @@ public final class CascadeAppModel: ObservableObject {
         recorder = ContextRecorder(
             store: store,
             options: ContextRecorder.Options(
-                indexWorkGraph: experimentalWorkGraphIndex,
+                indexWorkGraph: true,
                 structuredContent: experimentalStructuredContent,
                 capturePolicy: initialCapturePolicy
             )
