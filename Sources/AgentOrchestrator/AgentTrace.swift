@@ -1,44 +1,9 @@
 import CascadeMemory
 import Foundation
+import ProviderKit
 
-/// Token usage for one model call.
-public struct ModelUsage: Sendable, Equatable, Codable {
-    public var inputTokens: Int
-    public var outputTokens: Int
-    public var cacheReadTokens: Int
-    public var cacheWriteTokens: Int
-
-    public init(inputTokens: Int = 0, outputTokens: Int = 0, cacheReadTokens: Int = 0, cacheWriteTokens: Int = 0) {
-        self.inputTokens = inputTokens
-        self.outputTokens = outputTokens
-        self.cacheReadTokens = cacheReadTokens
-        self.cacheWriteTokens = cacheWriteTokens
-    }
-}
-
-/// Per-million-token pricing for a model, used to turn usage into a cost ledger.
-/// Defaults are ILLUSTRATIVE — update to the current published rates; the cost
-/// ledger's value is the structure, and callers can inject exact pricing.
-public struct ModelPricing: Sendable, Equatable {
-    public let inputPerMTok: Double
-    public let outputPerMTok: Double
-    public let cacheReadPerMTok: Double
-    public let cacheWritePerMTok: Double
-
-    public init(inputPerMTok: Double, outputPerMTok: Double, cacheReadPerMTok: Double, cacheWritePerMTok: Double) {
-        self.inputPerMTok = inputPerMTok
-        self.outputPerMTok = outputPerMTok
-        self.cacheReadPerMTok = cacheReadPerMTok
-        self.cacheWritePerMTok = cacheWritePerMTok
-    }
-
-    public func cost(_ usage: ModelUsage) -> Double {
-        (Double(usage.inputTokens) * inputPerMTok
-            + Double(usage.outputTokens) * outputPerMTok
-            + Double(usage.cacheReadTokens) * cacheReadPerMTok
-            + Double(usage.cacheWriteTokens) * cacheWritePerMTok) / 1_000_000.0
-    }
-}
+public typealias ModelUsage = ProviderKit.ModelUsage
+public typealias ModelPricing = ProviderKit.ModelPricing
 
 /// One node of an agent run trace: a run, a step, a model call, a tool call, a
 /// retrieval, or an eval. A span tree (parentID links) reconstructs the full run
@@ -95,12 +60,14 @@ public struct AgentTrace: Sendable, Equatable, Codable {
     public let traceID: String
     public let goal: String
     public let surface: String
+    public let startedAt: Date
     public let spans: [TraceSpan]
 
-    public init(traceID: String, goal: String, surface: String, spans: [TraceSpan]) {
+    public init(traceID: String, goal: String, surface: String, startedAt: Date = Date(), spans: [TraceSpan]) {
         self.traceID = traceID
         self.goal = goal
         self.surface = surface
+        self.startedAt = startedAt
         self.spans = spans
     }
 
@@ -166,53 +133,77 @@ public struct AgentTrace: Sendable, Equatable, Codable {
 
     // MARK: Exports
 
-    /// OTel-flavored JSON: one object per span with gen_ai.* semantic-convention
-    /// keys where applicable. Approximate, not a full OTLP envelope.
+    /// Collector-ready OTLP JSON envelope. Content-bearing GenAI attributes are
+    /// intentionally omitted; Cascade exports ids, hashes, counts, timings, and cost.
     public func otelJSON() -> String {
+        let otlpTraceID = Self.otelTraceID(traceID)
         let objects: [[String: Any]] = spans.map { span in
-            var attrs: [String: Any] = [
-                "cascade.trace_id": traceID,
-                "cascade.surface": surface,
-            ]
-            for (k, v) in span.attributes { attrs[k] = v }
-            if let usage = span.usage {
-                attrs["gen_ai.usage.input_tokens"] = usage.inputTokens
-                attrs["gen_ai.usage.output_tokens"] = usage.outputTokens
-                attrs["gen_ai.usage.cache_read_tokens"] = usage.cacheReadTokens
-            }
-            if let cost = span.costUSD { attrs["cascade.cost_usd"] = cost }
-            if let failure = span.failureKind { attrs["error.type"] = failure.rawValue }
+            let startNano = Self.unixNano(startedAt.addingTimeInterval(Double(span.startMs) / 1000.0))
+            let endNano = Self.unixNano(startedAt.addingTimeInterval(Double(span.startMs + span.durationMs) / 1000.0))
             var object: [String: Any] = [
+                "traceId": otlpTraceID,
+                "spanId": Self.otelSpanID(span.id),
                 "name": span.name,
-                "kind": span.kind.rawValue,
-                "span_id": span.id,
-                "start_ms": span.startMs,
-                "duration_ms": span.durationMs,
-                "status": span.status.rawValue,
-                "attributes": attrs,
+                "kind": "SPAN_KIND_INTERNAL",
+                "startTimeUnixNano": String(startNano),
+                "endTimeUnixNano": String(endNano),
+                "status": ["code": span.status == .ok ? "STATUS_CODE_OK" : "STATUS_CODE_ERROR"],
+                "attributes": Self.otelAttributes(traceID: traceID, surface: surface, span: span),
+                "events": Self.otelEvents(for: span),
             ]
-            if let parent = span.parentID { object["parent_span_id"] = parent }
+            if let parent = span.parentID {
+                object["parentSpanId"] = Self.otelSpanID(parent)
+            }
             return object
         }
-        let root: [String: Any] = ["trace_id": traceID, "goal": goal, "spans": objects]
+        let root: [String: Any] = [
+            "trace_id": traceID,
+            "resourceSpans": [[
+                "resource": ["attributes": [
+                    ["key": "service.name", "value": ["stringValue": "com.humain.cascade"]],
+                    ["key": "service.namespace", "value": ["stringValue": "Cascade"]],
+                ]],
+                "scopeSpans": [[
+                    "scope": ["name": "Cascade.AgentTrace", "version": "1"],
+                    "spans": objects,
+                ]],
+            ]],
+        ]
         return jsonString(root)
     }
 
     /// SIEM line-delimited JSON — one flat object per span per line.
     public func siemJSONL() -> String {
         spans.map { span in
+            let timestamp = Self.iso8601(startedAt.addingTimeInterval(Double(span.startMs) / 1000.0))
+            let usage = span.usage
             var object: [String: Any] = [
+                "timestamp": timestamp,
+                "product": "Cascade",
                 "trace_id": traceID,
-                "surface": surface,
                 "span_id": span.id,
-                "kind": span.kind.rawValue,
+                "surface": surface,
+                "actor": span.attributes["actor"] ?? "agent",
+                "span_kind": span.kind.rawValue,
+                "operation": Self.genAIOperation(for: span),
                 "name": span.name,
-                "start_ms": span.startMs,
                 "duration_ms": span.durationMs,
                 "status": span.status.rawValue,
+                "input_tokens": usage?.inputTokens ?? 0,
+                "cache_read_input_tokens": usage?.cacheReadTokens ?? 0,
+                "cache_creation_input_tokens": usage?.cacheWriteTokens ?? 0,
+                "output_tokens": usage?.outputTokens ?? 0,
+                "reasoning_output_tokens": usage?.reasoningTokens ?? 0,
+                "cost_microusd": Self.costMicrousd(for: span),
+                "redaction_policy": "content-ref-only",
             ]
             if let parent = span.parentID { object["parent_span_id"] = parent }
-            if let cost = span.costUSD { object["cost_usd"] = cost }
+            if let auditID = span.attributes["audit.id"] ?? span.attributes["audit_event_id"] {
+                object["audit_event_id"] = auditID
+            }
+            if let contextID = span.attributes["recorded_context_id"] ?? span.attributes["moment_id"] {
+                object["recorded_context_id"] = contextID
+            }
             if let failure = span.failureKind { object["failure_kind"] = failure.rawValue }
             return jsonString(object, sorted: true)
         }.joined(separator: "\n")
@@ -232,6 +223,38 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         return rows.joined(separator: "\n")
     }
 
+    public func csvBundleFiles() -> [String: String] {
+        [
+            "traces.csv": traceCSV(),
+            "spans.csv": spansCSV(),
+            "costs.csv": costsCSV(),
+            "evals.csv": evalsCSV(),
+        ]
+    }
+
+    public func exportManifestJSON(
+        policy: AgentTraceExportPolicy = .default,
+        auditChainStatus: String = "not_checked",
+        auditChainTrusted: Bool = false,
+        priceCardVersion: String = ModelPriceCard.defaultVersion
+    ) -> String {
+        let manifest = TraceRedactionManifest(
+            policy: policy,
+            generatedAt: Date(),
+            traceCount: 1,
+            spanCount: spans.count,
+            auditChainStatus: auditChainStatus,
+            auditChainTrusted: auditChainTrusted,
+            priceCardVersion: priceCardVersion
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(manifest),
+              let string = String(data: data, encoding: .utf8) else { return "{}" }
+        return string
+    }
+
     // MARK: Helpers
 
     private func jsonString(_ object: [String: Any], sorted: Bool = false) -> String {
@@ -239,6 +262,215 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: options),
               let string = String(data: data, encoding: .utf8) else { return "{}" }
         return string
+    }
+
+    private func traceCSV() -> String {
+        let endedAt = startedAt.addingTimeInterval(Double(durationMs) / 1000.0)
+        let appName = spans.compactMap { span in
+            span.attributes["app"] ?? span.attributes["app_name"]
+        }.first ?? ""
+        let modelDurationMs = spans
+            .filter { $0.kind == .model }
+            .reduce(0) { partial, span in partial + span.durationMs }
+        let toolDurationMs = spans
+            .filter { $0.kind == .tool }
+            .reduce(0) { partial, span in partial + span.durationMs }
+        let costMicrousd = spans.reduce(Int64(0)) { partial, span in
+            partial + Self.costMicrousd(for: span)
+        }
+        let fields = [
+            traceID,
+            Self.iso8601(startedAt),
+            Self.iso8601(endedAt),
+            surface,
+            appName,
+            succeeded ? "ok" : "failed",
+            failureKinds.first?.rawValue ?? "",
+            String(durationMs),
+            String(modelDurationMs),
+            String(toolDurationMs),
+            String(inputTokens),
+            String(cacheReadTokens),
+            String(outputTokens),
+            String(costMicrousd),
+        ]
+        return (["trace_id,started_at,ended_at,surface,app,status,failure_kind,duration_ms,model_duration_ms,tool_duration_ms,input_tokens,cache_read_input_tokens,output_tokens,cost_microusd"]
+            + [fields.map(AgentTraceCSVFieldEscaper.escape).joined(separator: ",")]).joined(separator: "\n")
+    }
+
+    private func spansCSV() -> String {
+        var rows = ["trace_id,span_id,parent_span_id,kind,name,status,failure_kind,duration_ms,model_provider,model_name,tool_name,audit_event_id"]
+        for span in spans {
+            let fields = [
+                traceID,
+                span.id,
+                span.parentID ?? "",
+                span.kind.rawValue,
+                span.name,
+                span.status.rawValue,
+                span.failureKind?.rawValue ?? "",
+                String(span.durationMs),
+                span.usage?.provider ?? span.attributes["model.provider"] ?? "",
+                span.usage?.model ?? span.attributes["model"] ?? "",
+                span.attributes["tool.name"] ?? (span.kind == .tool ? span.name : ""),
+                span.attributes["audit.id"] ?? "",
+            ]
+            rows.append(fields.map(AgentTraceCSVFieldEscaper.escape).joined(separator: ","))
+        }
+        return rows.joined(separator: "\n")
+    }
+
+    private func costsCSV() -> String {
+        var rows = ["trace_id,span_id,provider,model,response_id,price_card_version,input_tokens,cache_read_input_tokens,cache_creation_input_tokens,output_tokens,reasoning_output_tokens,cost_microusd"]
+        for span in spans where span.usage != nil || span.costUSD != nil {
+            let usage = span.usage
+            let fields = [
+                traceID,
+                span.id,
+                usage?.provider ?? "",
+                usage?.model ?? "",
+                usage?.responseID ?? "",
+                usage?.priceCardVersion ?? ModelPriceCard.defaultVersion,
+                String(usage?.inputTokens ?? 0),
+                String(usage?.cacheReadTokens ?? 0),
+                String(usage?.cacheWriteTokens ?? 0),
+                String(usage?.outputTokens ?? 0),
+                String(usage?.reasoningTokens ?? 0),
+                String(Self.costMicrousd(for: span)),
+            ]
+            rows.append(fields.map(AgentTraceCSVFieldEscaper.escape).joined(separator: ","))
+        }
+        return rows.joined(separator: "\n")
+    }
+
+    private func evalsCSV() -> String {
+        var rows = ["trace_id,span_id,evaluator_kind,evaluator_name,score_value,score_label,confidence,failure_kind"]
+        for span in spans where span.kind == .eval || span.attributes["eval.kind"] != nil || span.name.contains("verify") {
+            let fields = [
+                traceID,
+                span.id,
+                span.attributes["eval.kind"] ?? "verifier",
+                span.attributes["eval.name"] ?? span.name,
+                span.attributes["eval.score"] ?? "",
+                span.attributes["eval.label"] ?? (span.status == .ok ? "pass" : "fail"),
+                span.attributes["verifier.confidence"] ?? span.attributes["confidence"] ?? "",
+                span.failureKind?.rawValue ?? "",
+            ]
+            rows.append(fields.map(AgentTraceCSVFieldEscaper.escape).joined(separator: ","))
+        }
+        return rows.joined(separator: "\n")
+    }
+
+    private static func otelAttributes(traceID: String, surface: String, span: TraceSpan) -> [[String: Any]] {
+        var attrs = span.attributes
+        attrs["cascade.trace.id"] = traceID
+        attrs["cascade.span.id"] = span.id
+        attrs["cascade.trace.surface"] = surface
+        attrs["cascade.redaction.policy"] = "content-ref-only"
+        attrs["gen_ai.operation.name"] = genAIOperation(for: span)
+        if let failure = span.failureKind {
+            attrs["error.type"] = failure.rawValue
+        }
+        if let usage = span.usage {
+            if !usage.provider.isEmpty { attrs["gen_ai.provider.name"] = usage.provider }
+            if !usage.model.isEmpty { attrs["gen_ai.request.model"] = usage.model }
+            if !usage.model.isEmpty { attrs["gen_ai.response.model"] = usage.model }
+            if let responseID = usage.responseID { attrs["gen_ai.response.id"] = responseID }
+            attrs["gen_ai.usage.input_tokens"] = String(usage.inputTokens)
+            attrs["gen_ai.usage.output_tokens"] = String(usage.outputTokens)
+            attrs["gen_ai.usage.cache_read_input_tokens"] = String(usage.cacheReadTokens)
+            attrs["gen_ai.usage.cache_creation_input_tokens"] = String(usage.cacheWriteTokens)
+            attrs["gen_ai.usage.reasoning_output_tokens"] = String(usage.reasoningTokens)
+            attrs["cascade.cost_microusd"] = String(costMicrousd(for: span))
+            attrs["cascade.price_card.version"] = usage.priceCardVersion
+        } else if let cost = span.costUSD {
+            attrs["cascade.cost_microusd"] = String(Int64((cost * 1_000_000).rounded()))
+        }
+        if span.kind == .tool {
+            attrs["gen_ai.tool.name"] = attrs["tool.name"] ?? span.name
+            attrs["gen_ai.tool.type"] = attrs["tool.type"] ?? "local"
+        }
+        if span.kind == .eval {
+            attrs["gen_ai.evaluation.result"] = span.status == .ok ? "pass" : "fail"
+        }
+        let denied = [
+            "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
+            "gen_ai.tool.call.arguments", "gen_ai.tool.call.result", "prompt", "response",
+            "ocr_text", "image_path", "metadata_json", "detail",
+        ]
+        for key in denied { attrs.removeValue(forKey: key) }
+        return attrs.sorted { $0.key < $1.key }.map { key, value in
+            ["key": key, "value": ["stringValue": value]]
+        }
+    }
+
+    private static func otelEvents(for span: TraceSpan) -> [[String: Any]] {
+        guard span.kind == .eval || span.failureKind != nil else { return [] }
+        let name = span.kind == .eval ? "gen_ai.evaluation.result" : "exception"
+        return [[
+            "name": name,
+            "timeUnixNano": String(unixNano(Date())),
+            "attributes": span.failureKind.map { failure in
+                [["key": "error.type", "value": ["stringValue": failure.rawValue]]]
+            } ?? [],
+        ]]
+    }
+
+    private static func genAIOperation(for span: TraceSpan) -> String {
+        if let explicit = span.attributes["gen_ai.operation.name"] { return explicit }
+        switch span.kind {
+        case .run: return surfaceRunOperation(span.name)
+        case .model: return "chat"
+        case .tool: return "execute_tool"
+        case .retrieval: return "retrieval"
+        case .eval: return "evaluation"
+        case .step: return "invoke_workflow"
+        }
+    }
+
+    private static func surfaceRunOperation(_ name: String) -> String {
+        name.contains("recipe") ? "invoke_workflow" : "invoke_agent"
+    }
+
+    private static func costMicrousd(for span: TraceSpan) -> Int64 {
+        if let usage = span.usage, usage.costMicrousd > 0 { return usage.costMicrousd }
+        return span.costUSD.map { Int64(($0 * 1_000_000).rounded()) } ?? 0
+    }
+
+    private static func otelTraceID(_ value: String) -> String {
+        hexDigest(value, length: 32)
+    }
+
+    private static func otelSpanID(_ value: String) -> String {
+        hexDigest(value, length: 16)
+    }
+
+    private static func hexDigest(_ value: String, length: Int) -> String {
+        let bytes = Array(value.utf8)
+        var state: UInt64 = 0xcbf29ce484222325
+        for byte in bytes {
+            state ^= UInt64(byte)
+            state &*= 0x100000001b3
+        }
+        var output = ""
+        var cursor = state
+        while output.count < length {
+            output += String(format: "%016llx", cursor)
+            cursor ^= cursor << 13
+            cursor ^= cursor >> 7
+            cursor ^= cursor << 17
+        }
+        return String(output.prefix(length))
+    }
+
+    private static func unixNano(_ date: Date) -> Int64 {
+        Int64((date.timeIntervalSince1970 * 1_000_000_000).rounded())
+    }
+
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     private static func scenarioStatus(rootStatus: TraceSpan.Status, failureKind: AgentFailureKind?) -> ScenarioStatus {
@@ -340,6 +572,77 @@ public enum AgentAuditExportFormat: String, CaseIterable, Sendable, Codable {
     case csv
     case reliabilityJSONL = "reliability_jsonl"
     case manifestJSON = "manifest_json"
+    case diagnosticBundleMetadata = "diagnostic_bundle_metadata"
+}
+
+public struct AgentTraceExportPolicy: Sendable, Equatable, Codable {
+    public let name: String
+    public let includeScreenshots: Bool
+    public let includePrompts: Bool
+    public let includeToolPayloads: Bool
+    public let includeOCR: Bool
+    public let includeMetadataJSON: Bool
+    public let omittedFields: [String]
+
+    public init(
+        name: String = "content-ref-only",
+        includeScreenshots: Bool = false,
+        includePrompts: Bool = false,
+        includeToolPayloads: Bool = false,
+        includeOCR: Bool = false,
+        includeMetadataJSON: Bool = false,
+        omittedFields: [String] = [
+            "screenshots", "prompts", "tool_payloads", "ocr_text", "image_path",
+            "metadata_json", "gen_ai.input.messages", "gen_ai.output.messages",
+        ]
+    ) {
+        self.name = name
+        self.includeScreenshots = includeScreenshots
+        self.includePrompts = includePrompts
+        self.includeToolPayloads = includeToolPayloads
+        self.includeOCR = includeOCR
+        self.includeMetadataJSON = includeMetadataJSON
+        self.omittedFields = omittedFields
+    }
+
+    public static let `default` = AgentTraceExportPolicy()
+}
+
+public struct TraceRedactionManifest: Sendable, Equatable, Codable {
+    public let schemaVersion: Int
+    public let policy: AgentTraceExportPolicy
+    public let generatedAt: Date
+    public let appVersion: String
+    public let traceCount: Int
+    public let spanCount: Int
+    public let redactedFieldCounts: [String: Int]
+    public let auditChainStatus: String
+    public let auditChainTrusted: Bool
+    public let priceCardVersion: String
+
+    public init(
+        schemaVersion: Int = 1,
+        policy: AgentTraceExportPolicy = .default,
+        generatedAt: Date = Date(),
+        appVersion: String = "CascadeNative",
+        traceCount: Int,
+        spanCount: Int,
+        redactedFieldCounts: [String: Int] = [:],
+        auditChainStatus: String,
+        auditChainTrusted: Bool,
+        priceCardVersion: String = ModelPriceCard.defaultVersion
+    ) {
+        self.schemaVersion = schemaVersion
+        self.policy = policy
+        self.generatedAt = generatedAt
+        self.appVersion = appVersion
+        self.traceCount = traceCount
+        self.spanCount = spanCount
+        self.redactedFieldCounts = redactedFieldCounts
+        self.auditChainStatus = auditChainStatus
+        self.auditChainTrusted = auditChainTrusted
+        self.priceCardVersion = priceCardVersion
+    }
 }
 
 public struct AgentAuditExportManifest: Sendable, Equatable, Codable {
@@ -353,6 +656,7 @@ public struct AgentAuditExportManifest: Sendable, Equatable, Codable {
     public let traceCount: Int
     public let spanCount: Int
     public let supportedFormats: [AgentAuditExportFormat]
+    public let redactionManifest: TraceRedactionManifest
 
     public init(
         schemaVersion: Int = 1,
@@ -364,7 +668,8 @@ public struct AgentAuditExportManifest: Sendable, Equatable, Codable {
         auditHead: AuditHead?,
         traceCount: Int,
         spanCount: Int,
-        supportedFormats: [AgentAuditExportFormat] = AgentAuditExportFormat.allCases
+        supportedFormats: [AgentAuditExportFormat] = AgentAuditExportFormat.allCases,
+        redactionManifest: TraceRedactionManifest? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.generatedAt = generatedAt
@@ -376,6 +681,13 @@ public struct AgentAuditExportManifest: Sendable, Equatable, Codable {
         self.traceCount = traceCount
         self.spanCount = spanCount
         self.supportedFormats = supportedFormats
+        self.redactionManifest = redactionManifest ?? TraceRedactionManifest(
+            generatedAt: generatedAt,
+            traceCount: traceCount,
+            spanCount: spanCount,
+            auditChainStatus: auditChainStatus,
+            auditChainTrusted: auditChainTrusted
+        )
     }
 }
 
@@ -422,6 +734,8 @@ public struct AgentAuditExportPackage: Sendable, Equatable {
             return ReliabilityReport.fromTraces(traces).jsonl()
         case .manifestJSON:
             return Self.json(manifest)
+        case .diagnosticBundleMetadata:
+            return Self.json(manifest.redactionManifest)
         }
     }
 
@@ -455,13 +769,15 @@ public struct AgentAuditExportPackage: Sendable, Equatable {
 
     private static func combinedCSV(_ traces: [AgentTrace]) -> String {
         guard let first = traces.first else {
-            return "trace_id,span_id,parent_span_id,kind,name,start_ms,duration_ms,status,failure_kind,cost_usd"
+            return "traces.csv\ntrace_id,started_at,ended_at,surface,app,status,failure_kind,duration_ms,model_duration_ms,tool_duration_ms,input_tokens,cache_read_input_tokens,output_tokens,cost_microusd"
         }
-        let header = first.csv().split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
-        let rows = traces.flatMap { trace in
-            trace.csv().split(separator: "\n", omittingEmptySubsequences: false).dropFirst().map(String.init)
+        let bundle = first.csvBundleFiles().keys.sorted().map { name -> String in
+            let content = traces.map { $0.csvBundleFiles()[name] ?? "" }
+            let header = content.first?.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+            let rows = content.flatMap { $0.split(separator: "\n", omittingEmptySubsequences: false).dropFirst().map(String.init) }
+            return "# \(name)\n" + ([header] + rows).joined(separator: "\n")
         }
-        return ([header] + rows).joined(separator: "\n")
+        return bundle.joined(separator: "\n\n")
     }
 
     private static func json<T: Encodable>(_ value: T) -> String {
@@ -716,6 +1032,7 @@ public enum AgentTraceBuilder {
                 traceID: "audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
                 goal: "\(root.name)#audit-\(taskEvent.id > 0 ? String(taskEvent.id) : String(eventOrder))",
                 surface: root.surface ?? fallbackSurface,
+                startedAt: start,
                 spans: spans
             )
         }

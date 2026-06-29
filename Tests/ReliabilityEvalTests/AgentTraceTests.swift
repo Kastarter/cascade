@@ -19,6 +19,30 @@ private func sampleTrace() -> AgentTrace {
     return AgentTrace(traceID: "t-001", goal: "extract total", surface: "assist", spans: spans)
 }
 
+private func otelSpans(from obj: [String: Any]?) -> [[String: Any]]? {
+    guard
+        let resourceSpans = obj?["resourceSpans"] as? [[String: Any]],
+        let scopeSpans = resourceSpans.first?["scopeSpans"] as? [[String: Any]]
+    else {
+        return nil
+    }
+    return scopeSpans.first?["spans"] as? [[String: Any]]
+}
+
+private func otelStringAttributes(from span: [String: Any]?) -> [String: String] {
+    guard let attrs = span?["attributes"] as? [[String: Any]] else { return [:] }
+    return attrs.reduce(into: [:]) { result, attr in
+        guard
+            let key = attr["key"] as? String,
+            let value = attr["value"] as? [String: Any],
+            let stringValue = value["stringValue"] as? String
+        else {
+            return
+        }
+        result[key] = stringValue
+    }
+}
+
 @Test
 func rollupsAggregateUsageCostAndDuration() {
     let trace = sampleTrace()
@@ -73,13 +97,13 @@ func otelJSONIsValidAndCarriesSemanticKeys() throws {
     let json = sampleTrace().otelJSON()
     let obj = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
     #expect(obj?["trace_id"] as? String == "t-001")
-    let spans = obj?["spans"] as? [[String: Any]]
+    let spans = otelSpans(from: obj)
     #expect(spans?.count == 4)
     // The model span exposes gen_ai token attributes and the failure span error.type.
     let modelSpan = spans?.first { ($0["name"] as? String) == "act" }
-    let attrs = modelSpan?["attributes"] as? [String: Any]
-    #expect(attrs?["gen_ai.usage.input_tokens"] as? Int == 1200)
-    #expect(attrs?["error.type"] as? String == "noEffect")
+    let attrs = otelStringAttributes(from: modelSpan)
+    #expect(attrs["gen_ai.usage.input_tokens"] == "1200")
+    #expect(attrs["error.type"] == "noEffect")
 }
 
 @Test

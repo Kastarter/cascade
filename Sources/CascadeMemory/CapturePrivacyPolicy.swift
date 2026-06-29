@@ -34,6 +34,8 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
     public var scheduledRunsAvailable: Bool
     public var powerHarnessAvailable: Bool
     public var recordRecallAvailable: Bool
+    public var agentAuditExportAvailable: Bool
+    public var diagnosticBundleExportAvailable: Bool
     public var forceIrreversibleActionGuard: Bool
     public var sensitiveKeywords: [String]
     public var deniedAppNames: [String]
@@ -52,6 +54,8 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         case scheduledRunsAvailable
         case powerHarnessAvailable
         case recordRecallAvailable
+        case agentAuditExportAvailable
+        case diagnosticBundleExportAvailable
         case forceIrreversibleActionGuard
         case sensitiveKeywords
         case deniedAppNames
@@ -71,6 +75,8 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         scheduledRunsAvailable: Bool = true,
         powerHarnessAvailable: Bool = true,
         recordRecallAvailable: Bool = true,
+        agentAuditExportAvailable: Bool = true,
+        diagnosticBundleExportAvailable: Bool = false,
         forceIrreversibleActionGuard: Bool = false,
         sensitiveKeywords: [String] = PrivacyRules.defaultSensitiveKeywords,
         deniedAppNames: [String] = [],
@@ -88,6 +94,8 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         self.scheduledRunsAvailable = scheduledRunsAvailable
         self.powerHarnessAvailable = powerHarnessAvailable
         self.recordRecallAvailable = recordRecallAvailable
+        self.agentAuditExportAvailable = agentAuditExportAvailable
+        self.diagnosticBundleExportAvailable = diagnosticBundleExportAvailable
         self.forceIrreversibleActionGuard = forceIrreversibleActionGuard
         self.sensitiveKeywords = sensitiveKeywords
         self.deniedAppNames = deniedAppNames
@@ -108,6 +116,8 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         self.scheduledRunsAvailable = try container.decodeIfPresent(Bool.self, forKey: .scheduledRunsAvailable) ?? true
         self.powerHarnessAvailable = try container.decodeIfPresent(Bool.self, forKey: .powerHarnessAvailable) ?? true
         self.recordRecallAvailable = try container.decodeIfPresent(Bool.self, forKey: .recordRecallAvailable) ?? true
+        self.agentAuditExportAvailable = try container.decodeIfPresent(Bool.self, forKey: .agentAuditExportAvailable) ?? true
+        self.diagnosticBundleExportAvailable = try container.decodeIfPresent(Bool.self, forKey: .diagnosticBundleExportAvailable) ?? false
         self.forceIrreversibleActionGuard = try container.decodeIfPresent(Bool.self, forKey: .forceIrreversibleActionGuard) ?? false
         self.sensitiveKeywords = try container.decodeIfPresent([String].self, forKey: .sensitiveKeywords) ?? PrivacyRules.defaultSensitiveKeywords
         self.deniedAppNames = try container.decodeIfPresent([String].self, forKey: .deniedAppNames) ?? []

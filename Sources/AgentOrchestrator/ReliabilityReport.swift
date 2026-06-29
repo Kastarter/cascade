@@ -246,6 +246,10 @@ public struct ReliabilityReport: Sendable {
         ReliabilityReport(traces.map(\.scenarioOutcome))
     }
 
+    public static func topFailureClusters(from traces: [AgentTrace], minCount: Int = 2) -> [TraceFailureCluster] {
+        TraceFailureClusterer.clusters(from: traces, minCount: minCount)
+    }
+
     public var total: Int { outcomes.count }
     public var totalRetries: Int { outcomes.reduce(0) { $0 + $1.retries } }
 

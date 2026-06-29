@@ -2386,6 +2386,121 @@ public actor CascadeStore {
         """, db: db)
 
         try execute("""
+        CREATE TABLE IF NOT EXISTS agent_trace (
+            trace_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            surface TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            title TEXT NOT NULL,
+            goal_hash TEXT,
+            app_name TEXT,
+            bundle_identifier TEXT,
+            status TEXT NOT NULL,
+            failure_kind TEXT,
+            root_audit_event_id INTEGER REFERENCES audit_event(id),
+            total_input_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            total_output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cost_microusd INTEGER NOT NULL DEFAULT 0,
+            redaction_policy TEXT NOT NULL DEFAULT 'content-ref-only',
+            metadata_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_trace_started
+            ON agent_trace(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_trace_status_failure
+            ON agent_trace(status, failure_kind);
+
+        CREATE TABLE IF NOT EXISTS agent_span (
+            span_id TEXT PRIMARY KEY,
+            trace_id TEXT NOT NULL REFERENCES agent_trace(trace_id) ON DELETE CASCADE,
+            parent_span_id TEXT REFERENCES agent_span(span_id),
+            audit_event_id INTEGER REFERENCES audit_event(id),
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            duration_ms INTEGER,
+            status TEXT NOT NULL,
+            failure_kind TEXT,
+            gen_ai_operation TEXT,
+            model_provider TEXT,
+            model_name TEXT,
+            tool_name TEXT,
+            tool_type TEXT,
+            app_name TEXT,
+            recorded_context_id INTEGER REFERENCES recorded_context(id),
+            input_event_id INTEGER REFERENCES input_event(id),
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_microusd INTEGER NOT NULL DEFAULT 0,
+            prompt_sha256 TEXT,
+            response_sha256 TEXT,
+            attributes_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_span_trace_started
+            ON agent_span(trace_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS trace_event (
+            event_id TEXT PRIMARY KEY,
+            trace_id TEXT NOT NULL REFERENCES agent_trace(trace_id) ON DELETE CASCADE,
+            span_id TEXT REFERENCES agent_span(span_id) ON DELETE CASCADE,
+            audit_event_id INTEGER REFERENCES audit_event(id),
+            created_at TEXT NOT NULL,
+            name TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'info',
+            failure_kind TEXT,
+            attributes_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_trace_event_trace_created
+            ON trace_event(trace_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS model_cost_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL REFERENCES agent_trace(trace_id) ON DELETE CASCADE,
+            span_id TEXT NOT NULL REFERENCES agent_span(span_id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            response_id TEXT,
+            price_card_version TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_microusd INTEGER NOT NULL DEFAULT 0,
+            billable INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_cost_trace
+            ON model_cost_ledger(trace_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS trace_eval (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL REFERENCES agent_trace(trace_id) ON DELETE CASCADE,
+            span_id TEXT REFERENCES agent_span(span_id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            evaluator_kind TEXT NOT NULL,
+            evaluator_name TEXT NOT NULL,
+            score_value REAL,
+            score_label TEXT,
+            explanation_redacted TEXT,
+            confidence REAL,
+            failure_kind TEXT,
+            source_span_id TEXT REFERENCES agent_span(span_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trace_eval_trace_created
+            ON trace_eval(trace_id, created_at);
+        """, db: db)
+        try? execute("ALTER TABLE model_cost_ledger ADD COLUMN response_id TEXT;", db: db)
+        try? execute("ALTER TABLE trace_eval ADD COLUMN failure_kind TEXT;", db: db)
+
+        try execute("""
         CREATE TABLE IF NOT EXISTS agent_experience_case (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
