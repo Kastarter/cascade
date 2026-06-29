@@ -200,6 +200,32 @@ func contentSamplesPickTheRichestMomentPerAppPerHour() async throws {
 }
 
 @Test
+func previewReadsUseOCRExcerptWhileInspectionKeepsFullText() async throws {
+    let store = try makeStore()
+    let longText = String(repeating: "visible preview sentence ", count: 40)
+        + "full inspection tail"
+    let inserted = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSince1970: 1_900_000_100),
+        source: .screen,
+        appName: "PreviewApp",
+        ocrText: longText
+    ))
+
+    let samples = try await store.contentSamples(
+        since: Date(timeIntervalSince1970: 1_900_000_000),
+        excerptLength: 32
+    )
+    let searchHits = try await store.searchContexts(query: "preview", excerptLength: 32)
+    let relevant = try await store.relevantContexts(to: "where was the visible preview sentence?", excerptLength: 32)
+    let inspected = try #require(try await store.context(id: inserted.id))
+
+    #expect(samples.first?.ocrText == String(longText.prefix(32)))
+    #expect(searchHits.first?.ocrText == String(longText.prefix(32)))
+    #expect(relevant.first?.ocrText == String(longText.prefix(32)))
+    #expect(inspected.ocrText == longText)
+}
+
+@Test
 func relevantContextsMatchNaturalLanguageQuestions() async throws {
     let store = try makeStore()
     _ = try await store.insert(RecordedContext(

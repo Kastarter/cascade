@@ -111,9 +111,29 @@ func migrationAddsCapturedMillisecondsColumnsAndIndexes() async throws {
     let inputIndexes = try rawStrings(path, "SELECT name FROM pragma_index_list('input_event');")
 
     #expect(contextColumns.contains("captured_ms"))
+    #expect(contextColumns.contains("captured_day"))
+    #expect(contextColumns.contains("ocr_excerpt"))
     #expect(inputColumns.contains("captured_ms"))
     #expect(contextIndexes.contains("idx_recorded_context_captured_ms"))
+    #expect(contextIndexes.contains("idx_recorded_context_captured_ms_desc"))
+    #expect(contextIndexes.contains("idx_recorded_context_app_captured_ms"))
     #expect(inputIndexes.contains("idx_input_event_captured_ms"))
+    #expect(inputIndexes.contains("idx_input_event_bundle_captured_ms_kind"))
+}
+
+@Test
+func freshStoresCreateCoveringIndexesAndPartitionTable() async throws {
+    let path = makeLayoutStorePath("CascadeLayoutFresh")
+    _ = try CascadeStore(path: path)
+
+    let contextIndexes = try rawStrings(path, "SELECT name FROM pragma_index_list('recorded_context');")
+    let inputIndexes = try rawStrings(path, "SELECT name FROM pragma_index_list('input_event');")
+    let partitionColumns = try rawStrings(path, "SELECT name FROM pragma_table_info('day_partition');")
+
+    #expect(contextIndexes.contains("idx_recorded_context_captured_ms_desc"))
+    #expect(contextIndexes.contains("idx_recorded_context_app_captured_ms"))
+    #expect(inputIndexes.contains("idx_input_event_bundle_captured_ms_kind"))
+    #expect(partitionColumns == ["day", "min_ms", "max_ms", "row_count", "ocr_bytes", "frame_count", "first_id", "last_id", "sealed_at"])
 }
 
 @Test
@@ -161,4 +181,44 @@ func capturedMillisecondsWritesAndHelpersMirrorDateRanges() async throws {
     let storedInputMilliseconds = try rawInt64s(path, "SELECT captured_ms FROM input_event ORDER BY captured_ms ASC, id ASC;")
     #expect(storedContextMilliseconds == contexts.map { EventStoreLayout.capturedMilliseconds(for: $0.capturedAt) })
     #expect(storedInputMilliseconds == inputEvents.map { EventStoreLayout.capturedMilliseconds(for: $0.capturedAt) })
+}
+
+@Test
+func insertContextsCreatesAndMergesDayPartitionRows() async throws {
+    let path = makeLayoutStorePath("CascadeLayoutDay")
+    let store = try CascadeStore(path: path)
+    let day = Date(timeIntervalSince1970: 1_900_000_000)
+    let next = day.addingTimeInterval(86_400)
+    let inserted = try await store.insertContexts([
+        RecordedContext(capturedAt: day, source: .screen, appName: "Safari", ocrText: "one", imagePath: "/tmp/one.jpg"),
+        RecordedContext(capturedAt: day.addingTimeInterval(60), source: .screen, appName: "Safari", ocrText: "two"),
+        RecordedContext(capturedAt: next, source: .screen, appName: "Xcode", ocrText: "three")
+    ])
+
+    let firstDay = try #require(try await store.dayPartitionManifest(dayKey: EventStoreLayout.utcDayKey(for: day)))
+    let secondDay = try #require(try await store.dayPartitionManifest(dayKey: EventStoreLayout.utcDayKey(for: next)))
+
+    #expect(firstDay.rowCount == 2)
+    #expect(firstDay.byteCount == 6)
+    #expect(firstDay.frameCount == 1)
+    #expect(firstDay.firstID == inserted[0].id)
+    #expect(firstDay.lastID == inserted[1].id)
+    #expect(secondDay.rowCount == 1)
+}
+
+@Test
+func pruningRebuildsAffectedDayPartitions() async throws {
+    let path = makeLayoutStorePath("CascadeLayoutPruneDay")
+    let store = try CascadeStore(path: path)
+    let old = Date(timeIntervalSinceNow: -100 * 24 * 3600)
+    let fresh = Date()
+    _ = try await store.insertContexts([
+        RecordedContext(capturedAt: old, source: .screen, appName: "Old", ocrText: "expired", imagePath: "/tmp/expired.jpg"),
+        RecordedContext(capturedAt: fresh, source: .screen, appName: "Fresh", ocrText: "retained")
+    ])
+
+    _ = try await store.prune(maxAge: 7 * 24 * 3600)
+
+    #expect(try await store.dayPartitionManifest(dayKey: EventStoreLayout.utcDayKey(for: old)) == nil)
+    #expect(try await store.dayPartitionManifest(dayKey: EventStoreLayout.utcDayKey(for: fresh))?.rowCount == 1)
 }

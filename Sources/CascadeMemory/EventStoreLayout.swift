@@ -83,37 +83,48 @@ public struct CapturedMillisecondsRange: Equatable, Sendable {
 public struct DayPartitionManifest: Codable, Equatable, Sendable {
     public let dayKey: String
     public private(set) var rowCount: Int
-    public private(set) var byteCount: Int
+    public private(set) var ocrByteCount: Int
+    public private(set) var frameCount: Int
     public private(set) var firstCapturedMilliseconds: Int64?
     public private(set) var lastCapturedMilliseconds: Int64?
     public private(set) var firstID: Int64?
     public private(set) var lastID: Int64?
+    public private(set) var sealedAt: Date?
 
     public init(
         dayKey: String,
         rowCount: Int = 0,
         byteCount: Int = 0,
+        frameCount: Int = 0,
         firstCapturedMilliseconds: Int64? = nil,
         lastCapturedMilliseconds: Int64? = nil,
         firstID: Int64? = nil,
-        lastID: Int64? = nil
+        lastID: Int64? = nil,
+        sealedAt: Date? = nil
     ) {
         self.dayKey = dayKey
         self.rowCount = rowCount
-        self.byteCount = byteCount
+        self.ocrByteCount = byteCount
+        self.frameCount = frameCount
         self.firstCapturedMilliseconds = firstCapturedMilliseconds
         self.lastCapturedMilliseconds = lastCapturedMilliseconds
         self.firstID = firstID
         self.lastID = lastID
+        self.sealedAt = sealedAt
+    }
+
+    public var byteCount: Int {
+        ocrByteCount
     }
 
     public var isEmpty: Bool {
         rowCount == 0
     }
 
-    public mutating func include(rowID: Int64, capturedMilliseconds: Int64, byteCount: Int) {
+    public mutating func include(rowID: Int64, capturedMilliseconds: Int64, byteCount: Int, hasFrame: Bool = false) {
         rowCount += 1
-        self.byteCount += max(0, byteCount)
+        self.ocrByteCount += max(0, byteCount)
+        if hasFrame { frameCount += 1 }
 
         if firstCapturedMilliseconds == nil
             || capturedMilliseconds < (firstCapturedMilliseconds ?? capturedMilliseconds)
@@ -135,7 +146,11 @@ public struct DayPartitionManifest: Codable, Equatable, Sendable {
         guard !other.isEmpty else { return }
 
         rowCount += other.rowCount
-        byteCount += other.byteCount
+        ocrByteCount += other.ocrByteCount
+        frameCount += other.frameCount
+        if sealedAt == nil || (other.sealedAt ?? .distantPast) > (sealedAt ?? .distantPast) {
+            sealedAt = other.sealedAt
+        }
 
         if let otherFirstCaptured = other.firstCapturedMilliseconds, let otherFirstID = other.firstID,
            firstCapturedMilliseconds == nil

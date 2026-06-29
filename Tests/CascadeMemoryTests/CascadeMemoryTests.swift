@@ -78,4 +78,7 @@ func inputEventsBetweenReturnsOnlyTheBracketedRangeOldestFirst() async throws {
     let capped = try await store.inputEvents(between: base, and: base.addingTimeInterval(100), limit: 2)
     #expect(capped.count == 2)
     #expect(capped.map(\.appName) == ["App0", "App1"])
+
+    let near = try await store.clickInputEvents(near: base.addingTimeInterval(4.2), window: 1.0, limit: 3)
+    #expect(near.map(\.appName) == ["App4", "App5"])
 }
