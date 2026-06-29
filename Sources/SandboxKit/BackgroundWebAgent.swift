@@ -73,6 +73,7 @@ public final class BackgroundWebAgent {
     private var nextIndex = 0
     private var findings: [(task: String, result: String)] = []
     private var skipped: [AgentSubtask] = []
+    private var replannedSubtaskKeys: Set<String> = []
     /// Set once the first steer supersedes the auto-planned remainder — so later steers
     /// ADD to the queue instead of dropping the ones already queued.
     private var droppedOriginalPlanForSteer = false
@@ -194,6 +195,7 @@ public final class BackgroundWebAgent {
         nextIndex = 0
         findings = []
         skipped = []
+        replannedSubtaskKeys = []
         droppedOriginalPlanForSteer = false
         onUpdate(Update(status: "Planning…", snapshotPNG: nil, url: "", done: false, result: nil))
         plan = await planner.plan(for: task, in: .webSandbox)
@@ -231,6 +233,9 @@ public final class BackgroundWebAgent {
                 onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary))
                 return
             case .failed(let reason):
+                if await replanCurrentSubtaskIfPossible(sub: sub, failureReason: reason) {
+                    continue episodes
+                }
                 onUpdate(Update(status: reason, snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
                 return
             case .stopped:
@@ -253,6 +258,61 @@ public final class BackgroundWebAgent {
         case stepLimit
         case stopped
         case failed(String)
+    }
+
+    private func replanCurrentSubtaskIfPossible(sub: AgentSubtask, failureReason: String) async -> Bool {
+        guard let failureKind = Self.replannableFailureKind(from: failureReason) else { return false }
+        let key = "\(nextIndex):\(Self.auditHash(sub.task)):\(failureKind.rawValue)"
+        guard replannedSubtaskKeys.insert(key).inserted else { return false }
+        let recovery = Self.recoveryAction(for: failureKind, attempt: 1)
+        guard recovery.canRecover else { return false }
+        let page = await sandbox.readPageText()
+        let memo = AgentRecoveryMemo(
+            failedSubtask: sub,
+            failureKind: failureKind,
+            attemptedRecovery: recovery,
+            targetHash: Self.auditHash(sub.task),
+            stateSummary: String(failureReason.prefix(220)),
+            evidenceSummary: String(page.prefix(400)),
+            completedFindings: findings.map { AgentTaskFinding(task: $0.task, result: $0.result) }
+        )
+        switch await planner.replan(
+            originalTask: originalTask,
+            memo: memo,
+            environment: .webSandbox
+        ) {
+        case .replaceCurrent(let replacement):
+            plan[nextIndex] = replacement
+            audit("sandbox.subgoal.replan", Self.sandboxReplanAuditDescriptor(
+                failureKind: failureKind,
+                recoveryAction: recovery,
+                status: "replace",
+                reason: failureReason
+            ))
+            return true
+        case .pause(let reason):
+            audit("sandbox.subgoal.replan", Self.sandboxReplanAuditDescriptor(
+                failureKind: failureKind,
+                recoveryAction: recovery,
+                status: "pause",
+                reason: reason
+            ))
+            return false
+        }
+    }
+
+    nonisolated static func replannableFailureKind(from reason: String) -> AgentOrchestrator.AgentFailureKind? {
+        let lower = reason.lowercased()
+        if lower.contains("no effect") || lower.contains("stopped changing") || lower.contains("unchanged") {
+            return .noEffect
+        }
+        if lower.contains("couldn't find") || lower.contains("target") || lower.contains("ground") {
+            return .groundingMiss
+        }
+        if lower.contains("couldn't finish") || lower.contains("incomplete") || lower.contains("verify") {
+            return .validatorIncomplete
+        }
+        return nil
     }
 
     /// Runs one part as its own Computer Use episode. If the model stops without
@@ -1069,6 +1129,21 @@ public final class BackgroundWebAgent {
     nonisolated static func sandboxNoEffectAuditDescriptor(status: String, streak: Int) -> String {
         let action = recoveryAction(for: .noEffect, attempt: streak)
         return "status=\(safeAuditToken(status)) noEffectStreak=\(streak) recoveryAction=\(safeAuditToken(action.rawValue))"
+    }
+
+    nonisolated static func sandboxReplanAuditDescriptor(
+        failureKind: AgentOrchestrator.AgentFailureKind,
+        recoveryAction: RecoveryAction,
+        status: String,
+        reason: String
+    ) -> String {
+        [
+            "status=\(safeAuditToken(status))",
+            "failureKind=\(safeAuditToken(failureKind.rawValue))",
+            "recoveryAction=\(safeAuditToken(recoveryAction.rawValue))",
+            "reasonChars=\(reason.count)",
+            "reasonHash=\(auditHash(reason))",
+        ].joined(separator: " ")
     }
 
     nonisolated static func sandboxDoneAuditDescriptor(

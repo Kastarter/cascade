@@ -8,6 +8,10 @@ public enum WorkGraphEntityKind: String, CaseIterable, Codable, Sendable {
     case file
     case date
     case person
+    case skill
+    case recipe
+    case subgoalType = "subgoal_type"
+    case expectedEffect = "expected_effect"
 }
 
 public struct WorkGraphMention: Equatable, Sendable {
@@ -180,6 +184,31 @@ public struct WorkGraphEdge: Identifiable, Equatable, Sendable {
     public let validTo: Date?
     public let transactionFrom: Date
     public let transactionTo: Date?
+}
+
+public struct WorkGraphPlanningPrior: Equatable, Sendable {
+    public let kind: WorkGraphEntityKind
+    public let canonicalValue: String
+    public let displayName: String
+    public let relation: String
+    public let weight: Double
+    public let evidenceSnippet: String
+
+    public init(
+        kind: WorkGraphEntityKind,
+        canonicalValue: String,
+        displayName: String,
+        relation: String,
+        weight: Double,
+        evidenceSnippet: String
+    ) {
+        self.kind = kind
+        self.canonicalValue = canonicalValue
+        self.displayName = displayName
+        self.relation = relation
+        self.weight = weight
+        self.evidenceSnippet = evidenceSnippet
+    }
 }
 
 public enum WorkGraphExtractor {
@@ -678,6 +707,193 @@ public extension CascadeStore {
         return try graphEdge(sourceEntityID: sourceEntityID, targetEntityID: targetEntityID, relation: relation)
     }
 
+    @discardableResult
+    func indexPlanningSkill(
+        name: String,
+        appNames: [String] = [],
+        useWhen: String = "",
+        dangerous: Bool = false
+    ) throws -> WorkGraphEntity {
+        let skill = try upsertGraphEntity(
+            kind: .skill,
+            canonicalValue: name,
+            displayName: name,
+            aliases: [name],
+            aliasSource: "app_skill"
+        )
+        for appName in appNames {
+            let clean = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { continue }
+            let app = try upsertGraphEntity(kind: .app, canonicalValue: clean, displayName: clean, aliasSource: "app_skill")
+            _ = try upsertGraphEdge(
+                sourceEntityID: skill.id,
+                targetEntityID: app.id,
+                relation: "covers_app",
+                evidence: "\(name) covers \(clean)",
+                weight: 1.0
+            )
+        }
+        let trimmedUseWhen = useWhen.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedUseWhen.isEmpty {
+            let subgoal = try upsertGraphEntity(
+                kind: .subgoalType,
+                canonicalValue: trimmedUseWhen,
+                displayName: String(trimmedUseWhen.prefix(80)),
+                aliases: [trimmedUseWhen],
+                aliasSource: "app_skill"
+            )
+            _ = try upsertGraphEdge(
+                sourceEntityID: skill.id,
+                targetEntityID: subgoal.id,
+                relation: "has_subgoal",
+                evidence: trimmedUseWhen,
+                weight: 0.75
+            )
+        }
+        if dangerous {
+            let effect = try upsertGraphEntity(
+                kind: .expectedEffect,
+                canonicalValue: "dangerous",
+                displayName: "Dangerous action",
+                aliases: ["dangerous"],
+                aliasSource: "app_skill"
+            )
+            _ = try upsertGraphEdge(
+                sourceEntityID: skill.id,
+                targetEntityID: effect.id,
+                relation: "dangerous",
+                evidence: "\(name) is explicit-ask-only or mutates outside the UI",
+                weight: -1.0
+            )
+        }
+        return skill
+    }
+
+    @discardableResult
+    func indexAgentExperienceOutcome(_ experience: AgentExperienceCase) throws -> WorkGraphEntity {
+        let app = try upsertGraphEntity(
+            kind: .app,
+            canonicalValue: experience.appName,
+            displayName: experience.appName,
+            aliasSource: "experience"
+        )
+        let recipe = try upsertGraphEntity(
+            kind: .recipe,
+            canonicalValue: experience.recipeSignature,
+            displayName: experience.goalPattern,
+            aliases: [experience.recipeSignature, experience.goalPattern],
+            aliasSource: "experience"
+        )
+        _ = try upsertGraphEdge(
+            sourceEntityID: app.id,
+            targetEntityID: recipe.id,
+            relation: "has_subgoal",
+            evidence: "\(experience.outcome.rawValue): \(experience.goalPattern)",
+            weight: experience.retainedScore
+        )
+        if let skillSlug = experience.skillSlug {
+            let skill = try upsertGraphEntity(
+                kind: .skill,
+                canonicalValue: skillSlug,
+                displayName: skillSlug,
+                aliases: [skillSlug],
+                aliasSource: "experience"
+            )
+            _ = try upsertGraphEdge(
+                sourceEntityID: recipe.id,
+                targetEntityID: skill.id,
+                relation: "uses_skill",
+                evidence: "\(experience.goalPattern) used \(skillSlug)",
+                weight: max(0.1, experience.retainedScore)
+            )
+        }
+        if let signal = experience.verificationSignal {
+            let effect = try upsertGraphEntity(
+                kind: .expectedEffect,
+                canonicalValue: signal.rawValue,
+                displayName: signal.rawValue,
+                aliases: [signal.rawValue],
+                aliasSource: "experience"
+            )
+            _ = try upsertGraphEdge(
+                sourceEntityID: recipe.id,
+                targetEntityID: effect.id,
+                relation: "produces_effect",
+                evidence: "\(experience.goalPattern) produced \(signal.rawValue)",
+                weight: max(0.1, experience.retainedScore)
+            )
+        }
+        if let failure = experience.failureKind {
+            let effect = try upsertGraphEntity(
+                kind: .expectedEffect,
+                canonicalValue: failure.rawValue,
+                displayName: failure.rawValue,
+                aliases: [failure.rawValue],
+                aliasSource: "experience"
+            )
+            let relation = failure == .loginRequired ? "requires_login" : "produces_effect"
+            _ = try upsertGraphEdge(
+                sourceEntityID: recipe.id,
+                targetEntityID: effect.id,
+                relation: relation,
+                evidence: "\(experience.goalPattern) failed with \(failure.rawValue)",
+                weight: min(-0.1, experience.retainedScore)
+            )
+        }
+        return recipe
+    }
+
+    func planningPriors(goal: String, appName: String?, limit: Int = 8) throws -> [WorkGraphPlanningPrior] {
+        guard limit > 0 else { return [] }
+        let normalizedApp = WorkGraphNormalizer.normalizedAlias(appName ?? "")
+        let goalTokens = Set(WorkGraphNormalizer.normalizedAlias(goal).split(separator: " ").map(String.init))
+        let sql = """
+        SELECT e.kind, e.canonical_value, e.display_name,
+               COALESCE(edge.relation, '') AS relation,
+               COALESCE(edge.weight, 0.0) AS weight,
+               COALESCE(edge.evidence_snippet, '') AS evidence
+        FROM graph_entity e
+        LEFT JOIN graph_edge edge ON edge.source_entity_id = e.id OR edge.target_entity_id = e.id
+        LEFT JOIN graph_entity other ON
+             (edge.source_entity_id = e.id AND other.id = edge.target_entity_id)
+          OR (edge.target_entity_id = e.id AND other.id = edge.source_entity_id)
+        WHERE e.kind IN ('skill', 'recipe', 'subgoal_type', 'expected_effect')
+        ORDER BY abs(COALESCE(edge.weight, 0.0)) DESC, e.last_seen_at DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            sqlite3_bind_int(statement, 1, Int32(max(limit * 4, limit)))
+            var rows: [WorkGraphPlanningPrior] = []
+            var seen: Set<String> = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let kind = WorkGraphEntityKind(rawValue: workGraphText(statement, 0) ?? "") ?? .recipe
+                let canonical = workGraphText(statement, 1) ?? ""
+                let display = workGraphText(statement, 2) ?? ""
+                let relation = workGraphText(statement, 3) ?? ""
+                let evidence = workGraphText(statement, 5) ?? ""
+                let haystack = WorkGraphNormalizer.normalizedAlias([display, canonical, evidence, relation].joined(separator: " "))
+                let appMatches = normalizedApp.isEmpty || haystack.contains(normalizedApp)
+                let goalMatches = goalTokens.isEmpty || goalTokens.contains { haystack.contains($0) }
+                guard appMatches || goalMatches || relation == "dangerous" else { continue }
+                let key = "\(kind.rawValue):\(canonical):\(relation)"
+                guard seen.insert(key).inserted else { continue }
+                rows.append(WorkGraphPlanningPrior(
+                    kind: kind,
+                    canonicalValue: canonical,
+                    displayName: display,
+                    relation: relation.isEmpty ? "prior" : relation,
+                    weight: sqlite3_column_double(statement, 4),
+                    evidenceSnippet: evidence
+                ))
+            }
+            return Array(rows.sorted {
+                if ($0.weight < 0) != ($1.weight < 0) { return $0.weight < 0 }
+                if abs($0.weight) == abs($1.weight) { return $0.displayName < $1.displayName }
+                return abs($0.weight) > abs($1.weight)
+            }.prefix(limit))
+        }
+    }
+
     func graphEntity(kind: WorkGraphEntityKind, canonicalValue: String) throws -> WorkGraphEntity {
         let canonical = WorkGraphNormalizer.canonical(kind: kind, value: canonicalValue)
         let sql = """
@@ -798,11 +1014,11 @@ public extension CascadeStore {
 }
 
 private enum WorkGraphNormalizer {
-    static func canonical(kind: WorkGraphEntityKind, value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch kind {
-        case .app, .window, .person:
-            return normalizedAlias(trimmed)
+	    static func canonical(kind: WorkGraphEntityKind, value: String) -> String {
+	        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+	        switch kind {
+	        case .app, .window, .person, .skill, .recipe, .subgoalType, .expectedEffect:
+	            return normalizedAlias(trimmed)
         case .url:
             if let url = URL(string: trimmed), let canonical = canonicalURL(url) {
                 return canonical

@@ -47,6 +47,7 @@ enum ReplayEffect: Sendable, Equatable, Codable {
     case setTargetTier(String)
     case markVerified
     case markVerificationFailure
+    case wrongStartState
     case noEffect
 }
 
@@ -84,6 +85,10 @@ struct ReplayScenario: Sendable, Equatable, Codable {
     let allowedFailureKinds: [AgentFailureKind]
     let confidence: Double?
     let calibrationOutcome: VerifierCalibrationOutcome?
+    let subgoalCount: Int
+    let subgoalsSucceeded: Int?
+    let redundantStepCount: Int
+    let wrongStartStateCount: Int
 
     init(
         id: String,
@@ -96,7 +101,11 @@ struct ReplayScenario: Sendable, Equatable, Codable {
         healsOnRecovery: RecoveryAction? = nil,
         allowedFailureKinds: [AgentFailureKind] = [],
         confidence: Double? = nil,
-        calibrationOutcome: VerifierCalibrationOutcome? = nil
+        calibrationOutcome: VerifierCalibrationOutcome? = nil,
+        subgoalCount: Int = 0,
+        subgoalsSucceeded: Int? = nil,
+        redundantStepCount: Int = 0,
+        wrongStartStateCount: Int = 0
     ) {
         self.id = id
         self.surface = surface
@@ -109,5 +118,9 @@ struct ReplayScenario: Sendable, Equatable, Codable {
         self.allowedFailureKinds = allowedFailureKinds
         self.confidence = confidence
         self.calibrationOutcome = calibrationOutcome
+        self.subgoalCount = max(0, subgoalCount)
+        self.subgoalsSucceeded = subgoalsSucceeded
+        self.redundantStepCount = max(0, redundantStepCount)
+        self.wrongStartStateCount = max(0, wrongStartStateCount)
     }
 }

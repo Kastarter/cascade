@@ -139,6 +139,10 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         let failureKind = root?.failureKind ?? failureKinds.last
         let status = Self.scenarioStatus(rootStatus: rootStatus, failureKind: failureKind)
         let confidence = spans.compactMap { Self.confidence(from: $0.attributes) }.last
+        let noEffectCount = Self.countSpans(namedLike: ["noeffect", "no_effect"], failureKind: .noEffect, in: spans)
+        let subgoals = Self.subgoalMetrics(in: spans)
+        let redundantStepCount = Self.redundantStepCount(in: spans)
+        let wrongStartStateCount = Self.countSpans(namedLike: ["wrongstate", "wrong_start"], failureKind: .wrongStartState, in: spans)
         return ScenarioOutcome(
             id: traceID,
             surface: surface,
@@ -148,9 +152,13 @@ public struct AgentTrace: Sendable, Equatable, Codable {
             retries: retryCount,
             targetTier: spans.compactMap { $0.attributes["target.tier"] ?? $0.attributes["targetTier"] }.last,
             modalCount: Self.countSpans(namedLike: ["modal"], failureKind: .unexpectedModal, in: spans),
-            noEffectCount: Self.countSpans(namedLike: ["noeffect", "no_effect"], failureKind: .noEffect, in: spans),
+            noEffectCount: noEffectCount,
             validatorIncompleteCount: Self.countSpans(namedLike: ["validator", "verify"], failureKind: .validatorIncomplete, in: spans),
             verificationFailureCount: Self.countSpans(namedLike: ["verify", "verification"], failureKind: .verificationUnavailable, in: spans),
+            subgoalCount: subgoals.total,
+            subgoalsSucceeded: subgoals.succeeded,
+            redundantStepCount: redundantStepCount,
+            wrongStartStateCount: wrongStartStateCount,
             confidence: confidence,
             actualSuccess: confidence == nil ? nil : status == .success
         )
@@ -286,12 +294,41 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         return 0
     }
 
-    private static func countSpans(namedLike needles: [String], failureKind: AgentFailureKind, in spans: [TraceSpan]) -> Int {
+	    private static func countSpans(namedLike needles: [String], failureKind: AgentFailureKind, in spans: [TraceSpan]) -> Int {
+	        spans.filter { span in
+	            guard span.kind != .run else { return false }
+	            if span.failureKind == failureKind { return true }
+	            let name = span.name.lowercased()
+	            guard needles.contains(where: { name.contains($0) }) else { return false }
+	            switch failureKind {
+	            case .validatorIncomplete, .verificationUnavailable:
+	                let status = span.attributes["status"]?.lowercased()
+	                return span.status != .ok || status == "failed" || status == "incomplete"
+	            default:
+	                return true
+	            }
+	        }.count
+	    }
+
+    private static func subgoalMetrics(in spans: [TraceSpan]) -> (total: Int, succeeded: Int) {
+        let starts = spans.filter { $0.name == "assist.subgoal.start" }.count
+        let verifies = spans.filter { $0.name == "assist.subgoal.verify" && $0.status == .ok && $0.failureKind == nil }.count
+        let failures = spans.filter { $0.name == "assist.subgoal.fail" || ($0.name == "assist.subgoal.verify" && $0.failureKind != nil) }.count
+        let total = max(starts, verifies + failures)
+        return (total, min(verifies, total))
+    }
+
+    private static func redundantStepCount(in spans: [TraceSpan]) -> Int {
         spans.filter { span in
             guard span.kind != .run else { return false }
-            if span.failureKind == failureKind { return true }
             let name = span.name.lowercased()
-            return needles.contains { name.contains($0) }
+            if name.contains("redundant") || name.contains("repeated") { return true }
+            if name.contains("noeffect") || name.contains("no_effect") || name.contains("stalled") { return true }
+            if let status = span.attributes["status"]?.lowercased(),
+               status.contains("unchanged") || status.contains("stopping") {
+                return true
+            }
+            return false
         }.count
     }
 
@@ -807,6 +844,17 @@ public enum AgentTraceBuilder {
             } else if event.action == "sandbox.verify" {
                 self.kind = .eval
                 self.name = "sandbox.verify"
+            } else if event.action == "assist.plan" {
+                self.kind = .model
+                self.name = "assist.plan"
+            } else if event.action == "assist.subgoal.start" {
+                self.kind = .step
+                self.name = "assist.subgoal.start"
+            } else if event.action == "assist.subgoal.verify"
+                || event.action == "assist.subgoal.fail"
+                || event.action == "assist.subgoal.replan" {
+                self.kind = .eval
+                self.name = event.action
             } else if event.action.hasPrefix("assist.verify.") {
                 self.kind = .eval
                 self.name = event.action
@@ -919,6 +967,21 @@ public enum AgentTraceBuilder {
             if event.action == "sandbox.verify", auditValue("status", in: event.detail) == "incomplete" {
                 return .validatorIncomplete
             }
+            if event.action == "assist.subgoal.verify" {
+                switch auditValue("status", in: event.detail) {
+                case "failed", "incomplete":
+                    return cascadeFailureKind(auditValue("failureKind", in: event.detail))
+                        ?? cascadeFailureKind(auditValue("failure", in: event.detail))
+                        ?? .validatorIncomplete
+                default:
+                    return nil
+                }
+            }
+            if event.action == "assist.subgoal.fail" {
+                return cascadeFailureKind(auditValue("failureKind", in: event.detail))
+                    ?? cascadeFailureKind(auditValue("failure", in: event.detail))
+                    ?? .validatorIncomplete
+            }
             if event.action == "sandbox.done" {
                 switch auditValue("status", in: event.detail) {
                 case "transport_failure":
@@ -933,7 +996,29 @@ public enum AgentTraceBuilder {
         }
 
         private static func cascadeFailureKind(_ raw: String?) -> AgentFailureKind? {
-            switch raw {
+            let normalized = raw?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "-", with: "_")
+            switch normalized {
+            case "wrongstartstate", "wrong_start_state":
+                return .wrongStartState
+            case "validatorincomplete", "validator_incomplete":
+                return .validatorIncomplete
+            case "unsafeactionrefused", "unsafe_action_refused":
+                return .unsafeActionRefused
+            case "noeffect", "no_effect":
+                return .noEffect
+            case "groundingmiss", "grounding_miss":
+                return .groundingMiss
+            case "parameterneedslivevalue", "parameter_needs_live_value":
+                return .parameterNeedsLiveValue
+            case "artifactwronglane", "artifact_wrong_lane":
+                return .artifactWrongLane
+            default:
+                break
+            }
+            switch normalized {
             case "wrong_start_state":
                 return .wrongStartState
             case "verifier_rejected":
@@ -1027,6 +1112,11 @@ public enum AgentTraceBuilder {
         if event.action == "grounding.verifier",
            let outcome = auditValue("outcome", in: event.detail) {
             attributes["verifier.outcome"] = safeToken(outcome)
+        }
+        for key in ["status", "outcome", "failure", "failureKind", "recoveryAction"] {
+            if let value = auditValue(key, in: event.detail) {
+                attributes[key] = safeToken(value)
+            }
         }
         return attributes
     }

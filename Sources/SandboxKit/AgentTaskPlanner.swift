@@ -1,6 +1,45 @@
 import Foundation
 import OSLog
+import AgentOrchestrator
 import ProviderKit
+
+/// Observable state changes the executor/verifier can check after a subtask.
+public enum ExpectedEffect: Sendable, Equatable {
+    case frontmostApp(String)
+    case windowTitleContains(String)
+    case visibleText(String)
+    case urlContains(String)
+    case artifactExists(String)
+    case noUnexpectedModal
+
+    public var auditLabel: String {
+        switch self {
+        case .frontmostApp(let value): "frontmost_app:\(value)"
+        case .windowTitleContains(let value): "window_title:\(value)"
+        case .visibleText(let value): "visible_text:\(value)"
+        case .urlContains(let value): "url_contains:\(value)"
+        case .artifactExists(let value): "artifact_exists:\(value)"
+        case .noUnexpectedModal: "no_unexpected_modal"
+        }
+    }
+}
+
+public enum AgentSubtaskRisk: String, Sendable, Equatable, Codable, CaseIterable {
+    case low
+    case medium
+    case high
+
+    static func normalized(_ raw: String?) -> AgentSubtaskRisk {
+        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "high", "dangerous", "destructive", "external_side_effect", "external-side-effect":
+            .high
+        case "medium", "moderate", "risky", "uncertain":
+            .medium
+        default:
+            .low
+        }
+    }
+}
 
 /// One part of a job, sized so a single Computer Use episode can finish it within
 /// its own step budget.
@@ -20,14 +59,86 @@ public struct AgentSubtask: Sendable, Equatable {
     public let web: Bool
     /// For non-web sandbox parts: a short reason shown to the user.
     public let note: String
+    /// Deterministic or verifier-checkable state changes expected after this part.
+    public let expectedEffects: [ExpectedEffect]
+    /// Planner-estimated risk for choosing verifier/critic/replan depth.
+    public let risk: AgentSubtaskRisk
 
-    public init(task: String, startURL: String = "", app: String = "", web: Bool = true, note: String = "") {
+    public init(
+        task: String,
+        startURL: String = "",
+        app: String = "",
+        web: Bool = true,
+        note: String = "",
+        expectedEffects: [ExpectedEffect] = [],
+        risk: AgentSubtaskRisk = .low
+    ) {
         self.task = task
         self.startURL = startURL
         self.app = app
         self.web = web
         self.note = note
+        self.expectedEffects = expectedEffects
+        self.risk = risk
     }
+}
+
+public struct AgentTaskPlan: Sendable, Equatable {
+    public let id: String
+    public let originalTask: String
+    public let subtasks: [AgentSubtask]
+
+    public init(id: String = UUID().uuidString, originalTask: String, subtasks: [AgentSubtask]) {
+        self.id = id
+        self.originalTask = originalTask
+        self.subtasks = Array(subtasks.prefix(AgentTaskPlanner.maxSubtasks))
+    }
+}
+
+public struct AgentTaskFinding: Sendable, Equatable {
+    public let task: String
+    public let result: String
+
+    public init(task: String, result: String) {
+        self.task = task
+        self.result = result
+    }
+}
+
+public struct AgentRecoveryMemo: Sendable, Equatable {
+    public let failedSubtask: AgentSubtask
+    public let failureKind: AgentFailureKind
+    public let attemptedRecovery: RecoveryAction?
+    public let firstBadActionHash: String?
+    public let targetHash: String?
+    public let stateSummary: String
+    public let evidenceSummary: String
+    public let completedFindings: [AgentTaskFinding]
+
+    public init(
+        failedSubtask: AgentSubtask,
+        failureKind: AgentFailureKind,
+        attemptedRecovery: RecoveryAction? = nil,
+        firstBadActionHash: String? = nil,
+        targetHash: String? = nil,
+        stateSummary: String,
+        evidenceSummary: String = "",
+        completedFindings: [AgentTaskFinding] = []
+    ) {
+        self.failedSubtask = failedSubtask
+        self.failureKind = failureKind
+        self.attemptedRecovery = attemptedRecovery
+        self.firstBadActionHash = firstBadActionHash
+        self.targetHash = targetHash
+        self.stateSummary = stateSummary
+        self.evidenceSummary = evidenceSummary
+        self.completedFindings = completedFindings
+    }
+}
+
+public enum AgentReplanDecision: Sendable, Equatable {
+    case replaceCurrent(AgentSubtask)
+    case pause(String)
 }
 
 /// Splits a request into ordered, individually-runnable subtasks before the agent
@@ -48,8 +159,9 @@ public struct AgentTaskPlanner: Sendable {
     private let client: any MessageCompleting
     private let cachedClient: CachedMessageCompleter?
     private let model: String
-    static let promptVersion = "agent-task-planner.prompt.v1"
-    static let schemaVersion = "agent-task-planner.schema.v1"
+    static let promptVersion = "agent-task-planner.prompt.v2"
+    static let replanPromptVersion = "agent-task-replanner.prompt.v1"
+    static let schemaVersion = "agent-task-planner.schema.v2"
 
     public init(
         client: any MessageCompleting = AnthropicClient(),
@@ -73,6 +185,12 @@ public struct AgentTaskPlanner: Sendable {
     public func plan(
         for task: String, in environment: Environment, conversationContext: String = ""
     ) async -> [AgentSubtask] {
+        await taskPlan(for: task, in: environment, conversationContext: conversationContext).subtasks
+    }
+
+    public func taskPlan(
+        for task: String, in environment: Environment, conversationContext: String = ""
+    ) async -> AgentTaskPlan {
         let memo = conversationContext.trimmingCharacters(in: .whitespacesAndNewlines)
         let user = memo.isEmpty
             ? "Job: \(task)"
@@ -94,15 +212,49 @@ public struct AgentTaskPlanner: Sendable {
             }
         )
         if let raw, let parsed = Self.parse(raw) {
-            return Array(parsed.prefix(Self.maxSubtasks))
+            return AgentTaskPlan(originalTask: task, subtasks: parsed)
         }
         // Degrading to one subtask is safe but should never be invisible — a key,
         // network, or schema problem would otherwise just look like "worse plans".
         Self.logger.error("planner fell back to a single subtask — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
         switch environment {
-        case .webSandbox: return [AgentSubtask(task: task, startURL: Self.searchURL(for: task))]
-        case .onScreen: return [AgentSubtask(task: task)]
+        case .webSandbox: return AgentTaskPlan(originalTask: task, subtasks: [AgentSubtask(task: task, startURL: Self.searchURL(for: task))])
+        case .onScreen: return AgentTaskPlan(originalTask: task, subtasks: [AgentSubtask(task: task)])
         }
+    }
+
+    public func replan(
+        originalTask: String,
+        memo: AgentRecoveryMemo,
+        environment: Environment,
+        conversationContext: String = ""
+    ) async -> AgentReplanDecision {
+        let recovery = memo.attemptedRecovery ?? AgentRecoveryPolicy.plan(for: memo.failureKind).retryRungs.first
+        guard let recovery, recovery.canRecover else {
+            return .pause(Self.pauseReason(for: memo.failureKind, action: AgentRecoveryPolicy.plan(for: memo.failureKind).terminal))
+        }
+
+        let user = Self.replanPrompt(originalTask: originalTask, memo: memo, recovery: recovery, conversationContext: conversationContext)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.replanPromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "AgentTaskPlanner.replan"
+        )
+        let raw = try? await complete(
+            system: Self.replanSystemPrompt(for: environment),
+            user: user,
+            maxTokens: 500,
+            options: options,
+            validating: {
+                guard Self.parse($0)?.first != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
+        )
+        if let raw, let subtask = Self.parse(raw)?.first {
+            return .replaceCurrent(subtask)
+        }
+        return .replaceCurrent(Self.recoveryFallbackSubtask(from: memo, recovery: recovery))
     }
 
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "planner")
@@ -156,8 +308,13 @@ public struct AgentTaskPlanner: Sendable {
     a part truly cannot happen in a browser (controls a local desktop app, local \
     files, system settings) and put a short reason in "note".
 
+    - Include "expectedEffects" only for observable checks: frontmost_app, \
+    window_title_contains, visible_text, url_contains, artifact_exists, no_unexpected_modal.
+    - Set "risk" to low, medium, or high. High means irreversible, external side effect, \
+    payment/send/delete, or file/system mutation.
+
     Reply with ONLY this JSON, no prose:
-    {"subtasks":[{"task":"...","startURL":"https://...","web":true,"note":""}]}
+    {"subtasks":[{"task":"...","startURL":"https://...","web":true,"note":"","expectedEffects":[{"kind":"url_contains","value":"example.com"}],"risk":"low"}]}
     """
 
     static let onScreenPrompt = """
@@ -176,16 +333,57 @@ public struct AgentTaskPlanner: Sendable {
     full https:// page in "url" instead. Leave both "" when the part continues where \
     the previous part ends.
 
+    - Include "expectedEffects" only for observable checks: frontmost_app, \
+    window_title_contains, visible_text, url_contains, artifact_exists, no_unexpected_modal.
+    - Set "risk" to low, medium, or high. High means irreversible, external side effect, \
+    payment/send/delete, or file/system mutation.
+
     Reply with ONLY this JSON, no prose:
-    {"subtasks":[{"task":"...","app":"","url":""}]}
+    {"subtasks":[{"task":"...","app":"","url":"","expectedEffects":[{"kind":"frontmost_app","value":"Notes"}],"risk":"low"}]}
     """
+
+    static func replanSystemPrompt(for environment: Environment) -> String {
+        """
+        You repair one failed subtask for Cascade's bounded GUI agent. Return at most ONE \
+        replacement subtask that avoids repeating the failed target/action and follows the \
+        requested recovery rung. If recovery is not possible, return one subtask that gathers \
+        the minimum evidence needed to pause honestly.
+
+        \(systemPrompt(for: environment))
+        """
+    }
+
+    static func replanPrompt(
+        originalTask: String,
+        memo: AgentRecoveryMemo,
+        recovery: RecoveryAction,
+        conversationContext: String
+    ) -> String {
+        let findings = memo.completedFindings.enumerated().map { index, finding in
+            "\(index + 1). \(finding.task) -> \(finding.result)"
+        }.joined(separator: "\n")
+        return """
+        Original job: \(originalTask)
+        Failed subtask: \(memo.failedSubtask.task)
+        Failure kind: \(memo.failureKind.rawValue)
+        Recovery rung to try: \(recovery.rawValue)
+        First bad action hash: \(memo.firstBadActionHash ?? "none")
+        Target hash: \(memo.targetHash ?? "none")
+        Current state: \(memo.stateSummary)
+        Evidence: \(memo.evidenceSummary.isEmpty ? "none" : memo.evidenceSummary)
+        Completed findings:
+        \(findings.isEmpty ? "none" : findings)
+        Recent conversation:
+        \(conversationContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "none" : conversationContext)
+        """
+    }
 
     /// Parses the planner reply, tolerating prose or code fences around the JSON.
     static func parse(_ raw: String) -> [AgentSubtask]? {
         guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end,
               let data = String(raw[start...end]).data(using: .utf8),
               let dto = try? JSONDecoder().decode(PlanDTO.self, from: data) else { return nil }
-        let subtasks = dto.subtasks.compactMap { item -> AgentSubtask? in
+        let subtasks = dto.subtasks.prefix(Self.maxSubtasks).compactMap { item -> AgentSubtask? in
             let task = (item.task ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !task.isEmpty else { return nil }
             var url = (item.startURL ?? item.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -195,7 +393,9 @@ public struct AgentTaskPlanner: Sendable {
                 startURL: url,
                 app: (item.app ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                 web: item.web ?? true,
-                note: (item.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                note: (item.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                expectedEffects: (item.expectedEffects ?? []).compactMap(\.effect),
+                risk: AgentSubtaskRisk.normalized(item.risk)
             )
         }
         return subtasks.isEmpty ? nil : subtasks
@@ -272,6 +472,105 @@ public struct AgentTaskPlanner: Sendable {
             let app: String?
             let web: Bool?
             let note: String?
+            let expectedEffects: [ExpectedEffectDTO]?
+            let risk: String?
         }
+    }
+
+    private struct ExpectedEffectDTO: Decodable {
+        let effect: ExpectedEffect?
+
+        init(from decoder: Decoder) throws {
+            if let string = try? decoder.singleValueContainer().decode(String.self) {
+                effect = Self.parse(kind: string, value: nil)
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let explicitKind = try container.decodeIfPresent(String.self, forKey: .kind)
+            let typeKind = try container.decodeIfPresent(String.self, forKey: .type)
+            let nameKind = try container.decodeIfPresent(String.self, forKey: .name)
+            let kind = explicitKind ?? typeKind ?? nameKind
+            let valueField = try container.decodeIfPresent(String.self, forKey: .value)
+            let textField = try container.decodeIfPresent(String.self, forKey: .text)
+            let appField = try container.decodeIfPresent(String.self, forKey: .app)
+            let titleField = try container.decodeIfPresent(String.self, forKey: .title)
+            let urlField = try container.decodeIfPresent(String.self, forKey: .url)
+            let pathField = try container.decodeIfPresent(String.self, forKey: .path)
+            let value = valueField ?? textField ?? appField ?? titleField ?? urlField ?? pathField
+            effect = Self.parse(kind: kind, value: value)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case kind, type, name, value, text, app, title, url, path
+        }
+
+        private static func parse(kind rawKind: String?, value rawValue: String?) -> ExpectedEffect? {
+            let kind = (rawKind ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "-", with: "_")
+            let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch kind {
+            case "frontmost_app", "frontmostapp":
+                guard let value, !value.isEmpty else { return nil }
+                return .frontmostApp(value)
+            case "window_title_contains", "window_title", "windowtitlecontains":
+                guard let value, !value.isEmpty else { return nil }
+                return .windowTitleContains(value)
+            case "visible_text", "visibletext", "ocr_visible_text":
+                guard let value, !value.isEmpty else { return nil }
+                return .visibleText(value)
+            case "url_contains", "urlcontains":
+                guard let value, !value.isEmpty else { return nil }
+                return .urlContains(value)
+            case "artifact_exists", "artifactexists", "file_exists":
+                guard let value, !value.isEmpty else { return nil }
+                return .artifactExists(value)
+            case "no_unexpected_modal", "nounexpectedmodal", "no_modal":
+                return .noUnexpectedModal
+            default:
+                return nil
+            }
+        }
+    }
+
+    private static func pauseReason(for failureKind: AgentFailureKind, action: RecoveryAction) -> String {
+        "Recovery for \(failureKind.rawValue) reached \(action.rawValue); pause with the current evidence."
+    }
+
+    private static func recoveryFallbackSubtask(from memo: AgentRecoveryMemo, recovery: RecoveryAction) -> AgentSubtask {
+        let task = "Recover from \(snakeCase(memo.failureKind.rawValue)) while doing: \(memo.failedSubtask.task). Try \(recovery.rawValue), do not repeat the failed target/action, and pause if the screen still contradicts completion."
+        return AgentSubtask(
+            task: task,
+            startURL: memo.failedSubtask.startURL,
+            app: memo.failedSubtask.app,
+            web: memo.failedSubtask.web,
+            note: memo.failedSubtask.note,
+            expectedEffects: memo.failedSubtask.expectedEffects,
+            risk: maxRisk(memo.failedSubtask.risk, .medium)
+        )
+    }
+
+    private static func maxRisk(_ lhs: AgentSubtaskRisk, _ rhs: AgentSubtaskRisk) -> AgentSubtaskRisk {
+        func rank(_ risk: AgentSubtaskRisk) -> Int {
+            switch risk {
+            case .low: 0
+            case .medium: 1
+            case .high: 2
+            }
+        }
+        return rank(lhs) >= rank(rhs) ? lhs : rhs
+    }
+
+    private static func snakeCase(_ value: String) -> String {
+        var output = ""
+        for scalar in value.unicodeScalars {
+            if CharacterSet.uppercaseLetters.contains(scalar) {
+                if !output.isEmpty { output.append("_") }
+                output.append(String(scalar).lowercased())
+            } else {
+                output.append(String(scalar))
+            }
+        }
+        return output
     }
 }

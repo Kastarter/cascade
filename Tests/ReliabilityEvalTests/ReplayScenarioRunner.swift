@@ -9,9 +9,13 @@ enum ReplayScenarioRunner {
         var modalCount = state.modalTitle == nil ? 0 : 1
         var noEffectCount = 0
         var validatorIncompleteCount = 0
+        var redundantStepCount = scenario.redundantStepCount
+        var wrongStartStateCount = scenario.wrongStartStateCount
 
         func makeOutcome(status: ScenarioStatus, failureKind: AgentFailureKind?) -> ScenarioOutcome {
-            ScenarioOutcome(
+            let subgoalTotal = scenario.subgoalCount
+            let defaultSubgoalsSucceeded = status == .success ? subgoalTotal : max(0, subgoalTotal - 1)
+            return ScenarioOutcome(
                 id: scenario.id,
                 surface: scenario.surface,
                 status: status,
@@ -23,6 +27,10 @@ enum ReplayScenarioRunner {
                 noEffectCount: noEffectCount,
                 validatorIncompleteCount: validatorIncompleteCount,
                 verificationFailureCount: state.verificationFailures,
+                subgoalCount: subgoalTotal,
+                subgoalsSucceeded: scenario.subgoalsSucceeded ?? defaultSubgoalsSucceeded,
+                redundantStepCount: redundantStepCount,
+                wrongStartStateCount: wrongStartStateCount,
                 confidence: scenario.confidence,
                 actualSuccess: scenario.confidence == nil ? nil : status == .success,
                 calibrationOutcome: scenario.calibrationOutcome
@@ -41,7 +49,13 @@ enum ReplayScenarioRunner {
             if failure == .unexpectedModal, state.modalTitle == nil {
                 apply(.showModal("Unexpected dialog"), to: &state, modalCount: &modalCount)
             }
-            if failure == .noEffect { noEffectCount += 1 }
+            if failure == .noEffect {
+                noEffectCount += 1
+                redundantStepCount += 1
+            }
+            if failure == .wrongStartState {
+                wrongStartStateCount += 1
+            }
             if failure == .validatorIncomplete {
                 validatorIncompleteCount += 1
                 apply(.markVerificationFailure, to: &state, modalCount: &modalCount)
@@ -91,6 +105,8 @@ enum ReplayScenarioRunner {
         case .markVerificationFailure:
             state.verificationFailures += 1
             state.verified = false
+        case .wrongStartState:
+            state.fingerprint = "wrong-start"
         case .noEffect:
             break
         }
