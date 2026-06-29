@@ -365,6 +365,23 @@ private struct OnboardingScreen: View {
                             .disabled(claudeKey.isEmpty)
                         }
                     }
+                    step(number: 4, title: "Personalize", done: true,
+                         detail: "Optional local defaults for when Cascade surfaces suggestions and whether browser agents should be favored.") {
+                        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                            Picker("Suggestion timing", selection: $model.suggestionTimingPreference) {
+                                Text("Early").tag(CascadeAppModel.SuggestionTimingPreference.early)
+                                Text("Balanced").tag(CascadeAppModel.SuggestionTimingPreference.balanced)
+                                Text("Strong evidence").tag(CascadeAppModel.SuggestionTimingPreference.strongEvidence)
+                            }
+                            .pickerStyle(.segmented)
+                            Picker("Background agents", selection: $model.backgroundAgentPreference) {
+                                Text("Prefer").tag(CascadeAppModel.BackgroundAgentPreference.prefer)
+                                Text("Ask first").tag(CascadeAppModel.BackgroundAgentPreference.askFirst)
+                                Text("Avoid").tag(CascadeAppModel.BackgroundAgentPreference.avoid)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    }
                     footer
                 }
                 .padding(CascadeMetrics.s6)
@@ -2461,6 +2478,9 @@ private struct SettingsScreen: View {
                 section("PRIVACY OUTBOX", trailing: "employee data rights") {
                     PrivacyOutboxCard(model: model)
                 }
+                section("PERSONALIZATION", trailing: "local priors") {
+                    PersonalizationCard(model: model)
+                }
                 section("AUDIT EXPORT", trailing: "SIEM and release gates") {
                     AuditExportCard(model: model)
                 }
@@ -2689,6 +2709,61 @@ private struct AuditExportCard: View {
         case .unchecked:
             return "Audit chain has not been checked yet."
         }
+    }
+}
+
+private struct PersonalizationCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Local preference model").font(.cascadeSans(15, .semibold))
+                        Text(summaryLine)
+                            .font(.cascadeSans(12))
+                            .foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { model.personalizationEnabled },
+                        set: { model.personalizationEnabled = $0 }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                    Picker("Suggestion timing", selection: $model.suggestionTimingPreference) {
+                        Text("Early").tag(CascadeAppModel.SuggestionTimingPreference.early)
+                        Text("Balanced").tag(CascadeAppModel.SuggestionTimingPreference.balanced)
+                        Text("Strong evidence").tag(CascadeAppModel.SuggestionTimingPreference.strongEvidence)
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("Background agents", selection: $model.backgroundAgentPreference) {
+                        Text("Prefer").tag(CascadeAppModel.BackgroundAgentPreference.prefer)
+                        Text("Ask first").tag(CascadeAppModel.BackgroundAgentPreference.askFirst)
+                        Text("Avoid").tag(CascadeAppModel.BackgroundAgentPreference.avoid)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(spacing: CascadeMetrics.s3) {
+                    MetricPill(title: "Events", value: "\(model.personalizationSnapshot.eventCount)")
+                    MetricPill(title: "Routines", value: "\(model.personalizationSnapshot.routineProfileCount)")
+                    MetricPill(title: "Disabled", value: "\(model.personalizationSnapshot.disabledSignatureCount + model.personalizationSnapshot.disabledAppCount)")
+                    Spacer()
+                    Button("Clear all") { model.clearAllPersonalization() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+            }
+        }
+    }
+
+    private var summaryLine: String {
+        let last = model.personalizationSnapshot.lastEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "none"
+        return "Events and routine counters are stored locally. Last update: \(last)."
     }
 }
 

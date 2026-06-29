@@ -128,6 +128,18 @@ public final class CascadeAppModel: ObservableObject {
         case savedAgentsOnly
     }
 
+    public enum SuggestionTimingPreference: String, CaseIterable, Sendable {
+        case early
+        case balanced
+        case strongEvidence
+    }
+
+    public enum BackgroundAgentPreference: String, CaseIterable, Sendable {
+        case prefer
+        case askFirst
+        case avoid
+    }
+
     @Published public var selectedTab: Tab = .reel
     @Published public var showSettings = false
     /// First-run setup: permissions + keys, shown once over everything until
@@ -204,7 +216,27 @@ public final class CascadeAppModel: ObservableObject {
     @Published public var proactiveMode: ProactiveMode {
         didSet { defaultsStore.set(proactiveMode.rawValue, forKey: Self.proactiveModeKey) }
     }
+    @Published public var suggestionTimingPreference: SuggestionTimingPreference {
+        didSet {
+            defaultsStore.set(suggestionTimingPreference.rawValue, forKey: Self.suggestionTimingPreferenceKey)
+            applySuggestionTimingPreference()
+            Task { await recordColdStartPreference(kind: "suggestionTiming", value: suggestionTimingPreference.rawValue) }
+        }
+    }
+    @Published public var backgroundAgentPreference: BackgroundAgentPreference {
+        didSet {
+            defaultsStore.set(backgroundAgentPreference.rawValue, forKey: Self.backgroundAgentPreferenceKey)
+            Task { await recordColdStartPreference(kind: "backgroundAgent", value: backgroundAgentPreference.rawValue) }
+        }
+    }
     @Published public private(set) var agents: [CascadeAgent] = []
+    @Published public private(set) var personalizationSnapshot = PersonalizationSnapshot(
+        eventCount: 0,
+        routineProfileCount: 0,
+        disabledSignatureCount: 0,
+        disabledAppCount: 0,
+        lastEventAt: nil
+    )
     @Published public private(set) var answer: String = "Ask Cascade what happened in the local record."
     @Published public private(set) var conversation: [QATurn] = []
     @Published public private(set) var thinking = false
@@ -286,6 +318,8 @@ public final class CascadeAppModel: ObservableObject {
     static let valueMonthlyActionBudgetKey = "cascade.value.monthlyActionBudget"
     static let valueMonthlyCostCentsBudgetKey = "cascade.value.monthlyCostCentsBudget"
     static let proactiveModeKey = "cascade.proactive.mode"
+    static let suggestionTimingPreferenceKey = "cascade.personalization.suggestionTiming"
+    static let backgroundAgentPreferenceKey = "cascade.personalization.backgroundAgent"
 
     static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
         defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
@@ -419,6 +453,7 @@ public final class CascadeAppModel: ObservableObject {
     private var lastSettingsOpen = Date.distantPast
     private var lastNextActionOfferAt: Date?
     private var recentNextActionDismissals = 0
+    private var loggedCuratedProposalKeys: Set<String> = []
     /// Tracks an explicit Pause so always-on auto-start doesn't immediately undo it.
     private var userPaused = false
     /// False in tests/headless: the model is built with an injected store +
@@ -478,6 +513,10 @@ public final class CascadeAppModel: ObservableObject {
         onScreenBackend = defaults.string(forKey: "cascade.onScreenBackend") ?? "claude"
         proactiveMode = defaults.string(forKey: Self.proactiveModeKey)
             .flatMap(ProactiveMode.init(rawValue:)) ?? .askFirst
+        suggestionTimingPreference = defaults.string(forKey: Self.suggestionTimingPreferenceKey)
+            .flatMap(SuggestionTimingPreference.init(rawValue:)) ?? .balanced
+        backgroundAgentPreference = defaults.string(forKey: Self.backgroundAgentPreferenceKey)
+            .flatMap(BackgroundAgentPreference.init(rawValue:)) ?? .askFirst
         dismissedWasteSignatures = Self.restoreSet(key: Self.dismissedWasteKey, defaults: defaults)
         dismissedNextActionOfferKeys = Self.restoreSet(key: Self.dismissedNextActionOffersKey, defaults: defaults)
         snoozedProactiveOfferKeys = Self.restoreSet(key: Self.snoozedProactiveOffersKey, defaults: defaults)
@@ -602,17 +641,19 @@ public final class CascadeAppModel: ObservableObject {
                 budgets: valueBudgets
             )
             privacySummary = try await store.privacySummary(policy: capturePrivacyPolicy)
+            personalizationSnapshot = (try? await store.personalizationSnapshot()) ?? personalizationSnapshot
             let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
             let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
             let rawDetectedWaste = try await orchestrator.detectedWaste(
                 webAppIdentity: Self.webAppIdentity,
                 useEpisodeMining: episodeMiningEnabled
             )
-            let preferenceModel = suggestionPreferenceModel()
+            let preferenceModel = await suggestionPreferenceModel()
             if personalizationEnabled {
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
                 let curated = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0, using: preferenceModel) })
                 curatedWaste = Self.rankCuratedSuggestions(curated, using: preferenceModel)
+                await recordCuratedProposalsShown(curatedWaste)
                 await refreshProactiveNextActionOffer(now: Date())
             } else {
                 detectedWaste = rawDetectedWaste
@@ -1198,8 +1239,9 @@ public final class CascadeAppModel: ObservableObject {
 
     private func recordCompletedAgentRun(agentID: Int64, auditDetail: String) async {
         try? await store.markAgentRun(id: agentID)
+        let agent = try? await store.agent(id: agentID)
         if defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey),
-           let agent = try? await store.agent(id: agentID) {
+           let agent {
             await recordSuccessfulAgentExperience(for: agent, fallbackGoal: auditDetail)
         }
         _ = try? await store.appendAudit(AuditEvent(
@@ -1207,6 +1249,16 @@ public final class CascadeAppModel: ObservableObject {
             action: "agent.run.completed",
             detail: Self.completedRunAuditDetail(agentID: agentID, label: auditDetail)
         ))
+        await appendPreferenceEvent(
+            kind: .agentRunCompleted,
+            reward: 0.7,
+            surface: "agent.run",
+            appName: agent?.apps.first,
+            workflowSignature: agent?.signature,
+            agentID: agentID,
+            features: agent.map(Self.agentFeaturePayload) ?? ["candidateType": "savedAgent"],
+            evidence: (agent.map(Self.agentEvidencePayload) ?? [:]).merging(["labelHash": Self.auditHash(auditDetail)]) { current, _ in current }
+        )
     }
 
     private func recordSuccessfulAgentExperience(for agent: CascadeAgent, fallbackGoal: String) async {
@@ -5262,15 +5314,73 @@ public final class CascadeAppModel: ObservableObject {
 
     // MARK: - Agents built from recorded workflows
 
-    private func suggestionPreferenceModel() -> PreferenceModel {
-        var model = PreferenceModel()
-        for signature in agents.map(\.signature) {
-            model.record(signature, accepted: true)
-        }
+    private func suggestionPreferenceModel() async -> PreferenceModel {
+        let priors = Self.preferencePriors(
+            timing: suggestionTimingPreference,
+            background: backgroundAgentPreference
+        )
+        let events = (try? await store.recentPreferenceEvents(limit: 1_500)) ?? []
+        var model = PreferenceModel(events: events, priorAlpha: priors.alpha, priorBeta: priors.beta)
         for signature in dismissedWasteSignatures {
             model.record(signature, accepted: false)
         }
+        switch backgroundAgentPreference {
+        case .prefer:
+            model.record("backgroundCapable:true", reward: 0.6, weight: 1)
+        case .avoid:
+            model.record("backgroundCapable:true", reward: -0.8, weight: 1)
+        case .askFirst:
+            break
+        }
         return model
+    }
+
+    private nonisolated static func preferencePriors(
+        timing: SuggestionTimingPreference,
+        background: BackgroundAgentPreference
+    ) -> (alpha: Double, beta: Double) {
+        var alpha = 1.0
+        var beta = 1.0
+        switch timing {
+        case .early:
+            alpha += 0.45
+        case .strongEvidence:
+            beta += 0.65
+        case .balanced:
+            break
+        }
+        if background == .avoid { beta += 0.15 }
+        if background == .prefer { alpha += 0.10 }
+        return (alpha, beta)
+    }
+
+    private func applySuggestionTimingPreference() {
+        switch suggestionTimingPreference {
+        case .early:
+            if proactiveMode == .quiet { proactiveMode = .askFirst }
+        case .balanced:
+            break
+        case .strongEvidence:
+            proactiveMode = .quiet
+        }
+    }
+
+    private func recordColdStartPreference(kind: String, value: String) async {
+        await appendPreferenceEvent(
+            kind: .coldStartSet,
+            reward: 0.25,
+            surface: "settings.personalization",
+            appName: nil,
+            workflowSignature: "cold-start:\(kind)",
+            agentID: nil,
+            features: [
+                "candidateType": "coldStart",
+                "\(kind)Preference": value,
+                "timingPreference": suggestionTimingPreference.rawValue,
+                "backgroundPreference": backgroundAgentPreference.rawValue
+            ],
+            evidence: ["preferenceHash": Self.auditHash(value)]
+        )
     }
 
     private static func enabledByDefault(_ defaults: UserDefaults, key: String) -> Bool {
@@ -5289,6 +5399,15 @@ public final class CascadeAppModel: ObservableObject {
             candidates,
             key: \.signature,
             base: { $0.value },
+            context: {
+                PreferenceContext(
+                    appName: $0.apps.first,
+                    surface: "manager.review",
+                    candidateType: "curatedAgent",
+                    backgroundCapable: Self.runsInBackground(apps: $0.apps),
+                    privacyRiskBucket: ($0.source.quality?.privacyPenalty ?? 0) >= 0.25 ? "medium" : "low"
+                )
+            },
             using: model
         )
     }
@@ -5315,6 +5434,7 @@ public final class CascadeAppModel: ObservableObject {
 
     public func dismissProactiveNextActionOffer() {
         guard proactiveNextActionOffer != nil || proactiveOffer != nil else { return }
+        let dismissedOffer = proactiveOffer
         let signature = proactiveOffer?.signature
             ?? proactiveNextActionOffer.map { "next-action:\($0.token)" }
             ?? "unknown"
@@ -5328,6 +5448,18 @@ public final class CascadeAppModel: ObservableObject {
                 action: "proactive.dismiss",
                 detail: Self.proactiveDecisionAuditDetail(signature: signature, reason: "not_this")
             ))
+            if let dismissedOffer {
+                await appendPreferenceEvent(
+                    kind: .proactiveDismissed,
+                    reward: -0.55,
+                    surface: "proactive",
+                    appName: nil,
+                    workflowSignature: dismissedOffer.signature,
+                    agentID: dismissedOffer.relatedAgentID,
+                    features: Self.offerFeaturePayload(dismissedOffer, state: "dismissed"),
+                    evidence: Self.offerEvidencePayload(dismissedOffer)
+                )
+            }
         }
     }
 
@@ -5337,6 +5469,124 @@ public final class CascadeAppModel: ObservableObject {
             return AuditIdentity.hash(token)
         }
         return AuditIdentity.hash("next-action:\(token)")
+    }
+
+    private func appendPreferenceEvent(
+        kind: PreferenceEventKind,
+        reward: Double,
+        surface: String?,
+        appName: String?,
+        workflowSignature: String?,
+        agentID: Int64?,
+        features: [String: String],
+        evidence: [String: String] = [:]
+    ) async {
+        let event = PreferenceEvent(
+            kind: kind,
+            reward: reward,
+            surface: surface,
+            appName: appName,
+            workflowSignature: workflowSignature,
+            agentID: agentID,
+            featureJSON: Self.preferenceJSON(features),
+            evidenceJSON: evidence.isEmpty ? nil : Self.preferenceJSON(evidence)
+        )
+        _ = try? await store.appendPreferenceEvent(event)
+        if let snapshot = try? await store.personalizationSnapshot() {
+            personalizationSnapshot = snapshot
+        }
+    }
+
+    private nonisolated static func preferenceJSON(_ fields: [String: String]) -> String {
+        let sorted = Dictionary(uniqueKeysWithValues: fields.sorted { $0.key < $1.key })
+        guard let data = try? JSONEncoder().encode(sorted),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return json
+    }
+
+    private func recordCuratedProposalsShown(_ proposals: [CuratedAgent]) async {
+        for (index, proposal) in proposals.enumerated() {
+            let key = "\(proposal.signature)#\(index)"
+            guard loggedCuratedProposalKeys.insert(key).inserted else { continue }
+            await appendPreferenceEvent(
+                kind: .agentProposed,
+                reward: 0,
+                surface: "manager.review",
+                appName: proposal.apps.first,
+                workflowSignature: proposal.signature,
+                agentID: nil,
+                features: Self.curatedFeaturePayload(proposal, displayedRank: index + 1, score: proposal.value),
+                evidence: Self.curatedEvidencePayload(proposal)
+            )
+        }
+    }
+
+    private nonisolated static func curatedFeaturePayload(
+        _ curated: CuratedAgent,
+        displayedRank: Int? = nil,
+        score: Double? = nil
+    ) -> [String: String] {
+        var fields: [String: String] = [
+            "candidateType": "curatedAgent",
+            "backgroundCapable": runsInBackground(apps: curated.apps) ? "true" : "false",
+            "privacyRiskBucket": ((curated.source.quality?.privacyPenalty ?? 0) >= 0.25) ? "medium" : "low",
+            "appFamily": AuditIdentity.safeToken((curated.apps.first ?? "unknown").lowercased())
+        ]
+        if let displayedRank { fields["displayedRank"] = "\(displayedRank)" }
+        if let score { fields["score"] = String(format: "%.3f", score) }
+        return fields
+    }
+
+    private nonisolated static func curatedEvidencePayload(_ curated: CuratedAgent) -> [String: String] {
+        [
+            "nameHash": auditHash(curated.name),
+            "goalHash": auditHash(curated.goal),
+            "whyHash": auditHash(curated.why),
+            "evidenceCount": "\(curated.evidence.count)",
+            "evidenceHash": auditHash(curated.evidence.map(String.init).joined(separator: "|"))
+        ]
+    }
+
+    private nonisolated static func agentFeaturePayload(_ agent: CascadeAgent) -> [String: String] {
+        [
+            "candidateType": "savedAgent",
+            "backgroundCapable": runsInBackground(apps: agent.apps) ? "true" : "false",
+            "appFamily": AuditIdentity.safeToken((agent.apps.first ?? "unknown").lowercased()),
+            "runCount": "\(agent.runCount)",
+            "scheduled": agent.schedule == nil ? "false" : "true"
+        ]
+    }
+
+    private nonisolated static func agentEvidencePayload(_ agent: CascadeAgent) -> [String: String] {
+        [
+            "nameHash": auditHash(agent.name),
+            "goalHash": auditHash(agent.goal),
+            "evidenceCount": "\(agent.evidenceCount)",
+            "evidenceHash": auditHash(agent.evidenceIDs.map(String.init).joined(separator: "|"))
+        ]
+    }
+
+    private nonisolated static func offerFeaturePayload(_ offer: ProactiveOffer, state: String) -> [String: String] {
+        [
+            "candidateType": offer.source.rawValue,
+            "surfaceFamily": "proactive",
+            "state": state,
+            "backgroundCapable": offer.source == .backgroundWebAgent ? "true" : "false",
+            "privacyRiskBucket": offer.source == .backgroundWebAgent ? "medium" : "low",
+            "score": String(format: "%.3f", offer.score),
+            "confidence": String(format: "%.2f", offer.confidence)
+        ]
+    }
+
+    private nonisolated static func offerEvidencePayload(_ offer: ProactiveOffer) -> [String: String] {
+        [
+            "titleHash": auditHash(offer.title),
+            "detailHash": auditHash(offer.detail),
+            "evidenceCount": "\(offer.evidence.count)",
+            "evidenceHash": auditHash(offer.evidence.joined(separator: "|"))
+        ]
     }
 
     public func acceptProactiveOffer() {
@@ -5349,6 +5599,16 @@ public final class CascadeAppModel: ObservableObject {
                 action: "proactive.accept",
                 detail: Self.proactiveOfferAuditDetail(offer, state: "accepted")
             ))
+            await appendPreferenceEvent(
+                kind: .proactiveAccepted,
+                reward: 0.8,
+                surface: "proactive",
+                appName: nil,
+                workflowSignature: offer.signature,
+                agentID: offer.relatedAgentID,
+                features: Self.offerFeaturePayload(offer, state: "accepted"),
+                evidence: Self.offerEvidencePayload(offer)
+            )
         }
         switch offer.source {
         case .savedAgent:
@@ -5403,6 +5663,16 @@ public final class CascadeAppModel: ObservableObject {
                 action: "proactive.snooze",
                 detail: Self.proactiveOfferAuditDetail(offer, state: "snoozed")
             ))
+            await appendPreferenceEvent(
+                kind: .proactiveSnoozed,
+                reward: -0.45,
+                surface: "proactive",
+                appName: nil,
+                workflowSignature: offer.signature,
+                agentID: offer.relatedAgentID,
+                features: Self.offerFeaturePayload(offer, state: "snoozed"),
+                evidence: Self.offerEvidencePayload(offer)
+            )
         }
     }
 
@@ -5415,6 +5685,16 @@ public final class CascadeAppModel: ObservableObject {
                 action: "proactive.accept",
                 detail: Self.proactiveOfferAuditDetail(offer, state: "always_offer")
             ))
+            await appendPreferenceEvent(
+                kind: .proactiveAccepted,
+                reward: 1.0,
+                surface: "proactive",
+                appName: nil,
+                workflowSignature: offer.signature,
+                agentID: offer.relatedAgentID,
+                features: Self.offerFeaturePayload(offer, state: "always_offer"),
+                evidence: Self.offerEvidencePayload(offer)
+            )
         }
     }
 
@@ -5434,6 +5714,20 @@ public final class CascadeAppModel: ObservableObject {
                 action: "proactive.snooze",
                 detail: "scope=app control=\(Self.safeAuditToken(control.rawValue)) appKey=\(Self.safeAuditToken(key)) enabled=\(enabled)"
             ))
+            await appendPreferenceEvent(
+                kind: enabled ? .personalizationDisabled : .coldStartSet,
+                reward: enabled ? -1.0 : 0.2,
+                surface: "settings.proactive",
+                appName: appName,
+                workflowSignature: "app-control:\(control.rawValue):\(key)",
+                agentID: nil,
+                features: [
+                    "candidateType": "appControl",
+                    "control": control.rawValue,
+                    "enabled": enabled ? "true" : "false"
+                ],
+                evidence: ["appKeyHash": Self.auditHash(key)]
+            )
         }
     }
 
@@ -5469,6 +5763,8 @@ public final class CascadeAppModel: ObservableObject {
         )
         let struggle = StruggleDetector().detect(events: orderedEvents, contexts: contexts)
         let selector = ProactiveHelpSelector()
+        let preferenceModel = await suggestionPreferenceModel()
+        let routineProfiles = (try? await store.routineProfiles(limit: 200)) ?? []
         let candidates = selector.candidates(
             prediction: prediction,
             liveRepetition: liveRepetition,
@@ -5476,10 +5772,12 @@ public final class CascadeAppModel: ObservableObject {
             recentEvents: orderedEvents,
             agents: agents,
             appSkills: appSkills,
-            preferenceModel: suggestionPreferenceModel(),
+            preferenceModel: preferenceModel,
+            routineProfiles: routineProfiles,
             dismissedSignatures: dismissedNextActionOfferKeys,
             browserWorkflowsAllowed: backgroundAgents.count < Self.maxConcurrentSandboxAgents,
-            webAppIdentity: Self.webAppIdentity
+            webAppIdentity: Self.webAppIdentity,
+            now: now
         )
         let filteredCandidates = savedAgentsOnlyApps.contains(activeAppKey)
             ? candidates.filter { $0.kind == .savedAgent }
@@ -5555,6 +5853,16 @@ public final class CascadeAppModel: ObservableObject {
             action: "proactive.offer",
             detail: Self.proactiveOfferAuditDetail(selectedOffer, state: "shown")
         ))
+        await appendPreferenceEvent(
+            kind: .proactiveOfferShown,
+            reward: 0,
+            surface: "proactive",
+            appName: activeEvent?.appName ?? activeContext?.appName,
+            workflowSignature: selectedOffer.signature,
+            agentID: selectedOffer.relatedAgentID,
+            features: Self.offerFeaturePayload(selectedOffer, state: "shown"),
+            evidence: Self.offerEvidencePayload(selectedOffer)
+        )
         if selectedOffer.level >= .passive {
             dock.show(title: selectedOffer.title, detail: selectedOffer.detail)
         }
@@ -5574,6 +5882,19 @@ public final class CascadeAppModel: ObservableObject {
                 )
             )
         ))
+        await appendPreferenceEvent(
+            kind: .proactiveOfferSuppressed,
+            reward: -0.2,
+            surface: "proactive",
+            appName: nil,
+            workflowSignature: signature,
+            agentID: nil,
+            features: [
+                "candidateType": "suppression",
+                "reason": Self.safeAuditToken(reason)
+            ],
+            evidence: ["signatureHash": Self.auditHash(signature)]
+        )
     }
 
     private func appendProactiveSignal(
@@ -5634,6 +5955,16 @@ public final class CascadeAppModel: ObservableObject {
                 action: "proactive.offer",
                 detail: Self.proactiveOfferAuditDetail(selectedOffer, state: "suppressed") + " reason=\(Self.safeAuditToken(reason))"
             ))
+            await appendPreferenceEvent(
+                kind: .proactiveOfferSuppressed,
+                reward: -0.15,
+                surface: "proactive",
+                appName: appName,
+                workflowSignature: selectedOffer.signature,
+                agentID: selectedOffer.relatedAgentID,
+                features: Self.offerFeaturePayload(selectedOffer, state: "suppressed").merging(["reason": Self.safeAuditToken(reason)]) { current, _ in current },
+                evidence: Self.offerEvidencePayload(selectedOffer)
+            )
         }
     }
 
@@ -5891,6 +6222,16 @@ public final class CascadeAppModel: ObservableObject {
                     action: "agent.approved",
                     detail: Self.curatedAgentAuditDetail(curated, agentID: agent.id)
                 ))
+                await appendPreferenceEvent(
+                    kind: .agentApproved,
+                    reward: 1.0,
+                    surface: "manager.review",
+                    appName: curated.apps.first,
+                    workflowSignature: curated.signature,
+                    agentID: agent.id,
+                    features: Self.curatedFeaturePayload(curated, score: curated.value),
+                    evidence: Self.curatedEvidencePayload(curated)
+                )
                 flashManagerReviewNote("Approved “\(curated.name)” — it's now in the employee's Cascades, ready to deploy.")
             } catch {
                 flashManagerReviewNote("Couldn't approve “\(curated.name)”: \(error.localizedDescription)")
@@ -5905,12 +6246,34 @@ public final class CascadeAppModel: ObservableObject {
         clearTaughtForReview(signature: curated.signature)
         dismissedWasteSignatures.insert(curated.signature)
         flashManagerReviewNote("Dismissed “\(curated.name)” — you won't see it again.")
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: Self.curatedAgentAuditDetail(curated))) }
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(actor: "manager", action: "agent.declined", detail: Self.curatedAgentAuditDetail(curated)))
+            await appendPreferenceEvent(
+                kind: .agentDeclined,
+                reward: -1.0,
+                surface: "manager.review",
+                appName: curated.apps.first,
+                workflowSignature: curated.signature,
+                agentID: nil,
+                features: Self.curatedFeaturePayload(curated, score: curated.value),
+                evidence: Self.curatedEvidencePayload(curated)
+            )
+        }
     }
 
     public func setAgentEnabled(_ agent: CascadeAgent, enabled: Bool) {
         Task {
             try? await store.setAgentEnabled(id: agent.id, enabled: enabled)
+            await appendPreferenceEvent(
+                kind: enabled ? .agentEnabled : .agentDisabled,
+                reward: enabled ? 0.35 : -1.0,
+                surface: "agent.settings",
+                appName: agent.apps.first,
+                workflowSignature: agent.signature,
+                agentID: agent.id,
+                features: Self.agentFeaturePayload(agent).merging(["enabled": enabled ? "true" : "false"]) { current, _ in current },
+                evidence: Self.agentEvidencePayload(agent)
+            )
             await refreshAll()
         }
     }
@@ -5918,6 +6281,16 @@ public final class CascadeAppModel: ObservableObject {
     public func deleteAgent(_ agent: CascadeAgent) {
         Task {
             try? await store.deleteAgent(id: agent.id)
+            await appendPreferenceEvent(
+                kind: .agentDeleted,
+                reward: -1.0,
+                surface: "agent.settings",
+                appName: agent.apps.first,
+                workflowSignature: agent.signature,
+                agentID: agent.id,
+                features: Self.agentFeaturePayload(agent),
+                evidence: Self.agentEvidencePayload(agent)
+            )
             await refreshAll()
         }
     }
@@ -5954,17 +6327,53 @@ public final class CascadeAppModel: ObservableObject {
         using model: PreferenceModel? = nil,
         ranker: SuggestionRanker = SuggestionRanker()
     ) -> Bool {
-        let threshold = model.map {
-            ranker.personalizedThreshold(waste.signature, base: minRepeatsToAutomate, using: $0)
-        } ?? minRepeatsToAutomate
-        return waste.occurrences >= threshold
+        let threshold = personalizationThreshold(for: waste, using: model, ranker: ranker)
+        return waste.occurrences >= threshold.minRepeats
     }
 
     /// Represents real time — the cumulative observed seconds clear the floor, so a
     /// trivial sub-minute habit never reaches the queue even when the curator (which
     /// refines WORTH) is unavailable and would otherwise keep everything.
     nonisolated static func representsRealTime(_ waste: DetectedWaste) -> Bool {
-        waste.estimatedTotalSeconds >= minSecondsToReview
+        representsRealTime(waste, using: nil)
+    }
+
+    nonisolated static func representsRealTime(
+        _ waste: DetectedWaste,
+        using model: PreferenceModel?,
+        ranker: SuggestionRanker = SuggestionRanker()
+    ) -> Bool {
+        let threshold = personalizationThreshold(for: waste, using: model, ranker: ranker)
+        return waste.estimatedTotalSeconds >= threshold.minObservedSeconds
+    }
+
+    nonisolated static func personalizationThreshold(
+        for waste: DetectedWaste,
+        using model: PreferenceModel?,
+        ranker: SuggestionRanker = SuggestionRanker()
+    ) -> PersonalizationThreshold {
+        guard let model else {
+            return PersonalizationThreshold(
+                minRepeats: minRepeatsToAutomate,
+                minObservedSeconds: minSecondsToReview,
+                confidence: 0
+            )
+        }
+        let context = PreferenceContext(
+            appName: waste.apps.first,
+            surface: "manager.review",
+            candidateType: "detectedWaste",
+            hourBucket: Calendar.current.component(.hour, from: waste.lastSeenAt),
+            backgroundCapable: runsInBackground(apps: waste.apps),
+            privacyRiskBucket: (waste.quality?.privacyPenalty ?? 0) >= 0.25 ? "medium" : "low"
+        )
+        return ranker.personalizationThreshold(
+            waste.signature,
+            baseRepeats: minRepeatsToAutomate,
+            baseObservedSeconds: minSecondsToReview,
+            using: model,
+            context: context
+        )
     }
 
     nonisolated static func meetsQualityBar(_ waste: DetectedWaste) -> Bool {
@@ -5981,7 +6390,7 @@ public final class CascadeAppModel: ObservableObject {
     /// (and escalates to the full cursor-class runtime on drift), so every kind of
     /// repeated work can become an agent. `deployAgent` routes by app at deploy time.
     nonisolated static func isAutomatable(_ waste: DetectedWaste, using model: PreferenceModel? = nil) -> Bool {
-        meetsRepetitionBar(waste, using: model) && representsRealTime(waste) && meetsQualityBar(waste)
+        meetsRepetitionBar(waste, using: model) && representsRealTime(waste, using: model) && meetsQualityBar(waste)
     }
 
     /// The web app inside a browser an event happened on (Gmail, Notion, Figma…), so a
@@ -7176,6 +7585,19 @@ public final class CascadeAppModel: ObservableObject {
         Task {
             try? await store.setAgentSchedule(id: agent.id, schedule: schedule)
             _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.schedule.set", detail: Self.scheduleAuditDetail(agent: agent, schedule: schedule, status: "set")))
+            await appendPreferenceEvent(
+                kind: schedule == nil ? .agentScheduleCleared : .agentScheduleSet,
+                reward: schedule == nil ? -0.25 : 0.8,
+                surface: "agent.schedule",
+                appName: agent.apps.first,
+                workflowSignature: agent.signature,
+                agentID: agent.id,
+                features: Self.agentFeaturePayload(agent).merging([
+                    "schedule": schedule ?? "off",
+                    "scheduled": schedule == nil ? "false" : "true"
+                ]) { current, _ in current },
+                evidence: Self.agentEvidencePayload(agent)
+            )
             await refreshAll()
         }
     }
@@ -7188,6 +7610,60 @@ public final class CascadeAppModel: ObservableObject {
         defaultsStore.set(true, forKey: Self.onboardedKey)
         refreshPermissionState()
         startRecording()
+    }
+
+    public var personalizationEnabled: Bool {
+        get { Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey) }
+        set {
+            defaultsStore.set(newValue, forKey: Self.experimentalSuggestionRankingKey)
+            Task {
+                await appendPreferenceEvent(
+                    kind: newValue ? .coldStartSet : .personalizationDisabled,
+                    reward: newValue ? 0.2 : -1.0,
+                    surface: "settings.personalization",
+                    appName: nil,
+                    workflowSignature: "personalization.enabled",
+                    agentID: nil,
+                    features: [
+                        "candidateType": "personalizationControl",
+                        "enabled": newValue ? "true" : "false"
+                    ],
+                    evidence: [:]
+                )
+                await refreshAll()
+            }
+        }
+    }
+
+    public func clearAllPersonalization() {
+        dismissedWasteSignatures.removeAll()
+        dismissedNextActionOfferKeys.removeAll()
+        snoozedProactiveOfferKeys.removeAll()
+        alwaysOfferProactiveKeys.removeAll()
+        Task {
+            try? await store.clearPersonalization()
+            if let snapshot = try? await store.personalizationSnapshot() {
+                personalizationSnapshot = snapshot
+            }
+            await refreshAll()
+        }
+    }
+
+    public func clearPersonalization(signature: String? = nil, appName: String? = nil) {
+        if let signature { dismissedWasteSignatures.remove(signature) }
+        if let appName {
+            let key = Self.proactiveAppKey(appName)
+            neverSuggestApps.remove(key)
+            onlyInCascadeApps.remove(key)
+            savedAgentsOnlyApps.remove(key)
+        }
+        Task {
+            try? await store.clearPersonalization(workflowSignature: signature, appName: appName)
+            if let snapshot = try? await store.personalizationSnapshot() {
+                personalizationSnapshot = snapshot
+            }
+            await refreshAll()
+        }
     }
 
     public func toggleTheme() {

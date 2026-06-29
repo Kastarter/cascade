@@ -77,6 +77,31 @@ private let rankingCuratorKeepsTwo = """
 {"agents":[{"index":0,"name":"First workflow","why":"Repeated work.","goal":"Do the first workflow.","value":0.7},{"index":1,"name":"Second workflow","why":"Repeated work.","goal":"Do the second workflow.","value":0.7}]}
 """
 
+private func manualCurated(_ signature: String, app: String = "Mail") -> CuratedAgent {
+    let waste = DetectedWaste(
+        title: signature,
+        apps: [app],
+        occurrences: 3,
+        estimatedSecondsPerRun: 20,
+        estimatedTotalSeconds: 60,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .click, text: "Open", appName: app),
+            RecipeStep(order: 1, kind: .key, key: "return", modifiers: ["command"], appName: app),
+        ]),
+        evidence: [1, 2, 3],
+        confidence: 0.8,
+        signature: signature,
+        lastSeenAt: rankingBase
+    )
+    return CuratedAgent(
+        source: waste,
+        name: "Handle \(signature)",
+        why: "Repeated work.",
+        goal: "Handle the workflow.",
+        value: 0.75
+    )
+}
+
 @MainActor
 private func waitForRanking(_ condition: () -> Bool, maxTries: Int = 500) async throws {
     var tries = 0
@@ -92,6 +117,17 @@ private func waitForAuditAction(_ action: String, in store: CascadeStore, maxTri
     while tries < maxTries {
         let audit = (try? await store.recentAudit(limit: 40)) ?? []
         if audit.contains(where: { $0.action == action }) { return }
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+}
+
+@MainActor
+private func waitForPreferenceKind(_ kind: PreferenceEventKind, in store: CascadeStore, maxTries: Int = 500) async throws {
+    var tries = 0
+    while tries < maxTries {
+        let events = (try? await store.recentPreferenceEvents(limit: 100)) ?? []
+        if events.contains(where: { $0.kind == kind }) { return }
         try await Task.sleep(for: .milliseconds(10))
         tries += 1
     }
@@ -133,6 +169,36 @@ func defaultRefreshRanksAcceptedAndKeepsDeclinedOutOfReviewQueue() async throws 
     #expect(ranked.count == 1)
     #expect(ranked.first == accepted.signature)
     #expect(!ranked.contains(declined.signature))
+}
+
+@MainActor @Test
+func approveDeclineScheduleDisableAndDeleteWritePreferenceEvents() async throws {
+    let (model, store, _) = try makeRankingModel(curatorReply: rankingCuratorKeepsTwo)
+    let declined = manualCurated("declined-flow", app: "Mail")
+    let accepted = manualCurated("accepted-flow", app: "Safari")
+
+    model.approveCurated(accepted)
+    try await waitForPreferenceKind(.agentApproved, in: store)
+    try await waitForRanking { model.agents.contains { $0.signature == accepted.signature } }
+    let agent = try #require(model.agents.first { $0.signature == accepted.signature })
+
+    model.declineCurated(declined)
+    try await waitForPreferenceKind(.agentDeclined, in: store)
+    model.setAgentSchedule(agent, schedule: "daily@09:05")
+    try await waitForPreferenceKind(.agentScheduleSet, in: store)
+    model.setAgentEnabled(agent, enabled: false)
+    try await waitForPreferenceKind(.agentDisabled, in: store)
+    model.deleteAgent(agent)
+    try await waitForPreferenceKind(.agentDeleted, in: store)
+
+    let acceptedEvents = try await store.preferenceEvents(workflowSignature: accepted.signature, limit: 20)
+    let approved = try #require(acceptedEvents.first { $0.kind == .agentApproved })
+
+    #expect(acceptedEvents.contains { $0.kind == .agentScheduleSet })
+    #expect(acceptedEvents.contains { $0.kind == .agentDisabled })
+    #expect(acceptedEvents.contains { $0.kind == .agentDeleted })
+    #expect(approved.evidenceJSON?.contains(accepted.name) != true)
+    #expect(approved.evidenceJSON?.contains("nameHash") == true)
 }
 
 @MainActor @Test
