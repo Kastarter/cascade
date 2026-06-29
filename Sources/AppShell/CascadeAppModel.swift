@@ -1747,6 +1747,28 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
         driver.runState.reset()
+        let traceRecorder = CascadeAgentTraceRecorder(store: store)
+        let traceSnapshot = AppWindowObserver.snapshot()
+        let traceContext = try? await traceRecorder.beginTrace(TraceStart(
+            surface: "assist",
+            title: "assist.task",
+            goalHash: Self.auditHash(goal),
+            appName: traceSnapshot.appName,
+            bundleIdentifier: traceSnapshot.bundleIdentifier,
+            metadata: ["runtime": "runAssistTask"]
+        ))
+        let rootTraceSpan: SpanContext?
+        if let traceContext {
+            rootTraceSpan = try? await traceRecorder.beginSpan(SpanStart(
+                kind: .run,
+                name: "assist.task",
+                genAIOperation: "invoke_agent",
+                appName: traceSnapshot.appName,
+                attributes: ["goal.hash": Self.auditHash(goal)]
+            ), in: traceContext)
+        } else {
+            rootTraceSpan = nil
+        }
         assistTaskRunning = true
         assistTaskGoal = goal
         defer { assistTaskRunning = false; assistTaskGoal = nil }
@@ -1977,6 +1999,28 @@ public final class CascadeAppModel: ObservableObject {
         // Keep the agent's highlight up — erasing it at "Done" would defeat the
         // point of asking for it. The overlay fades it on its own timer.
         if !agentDidHighlight { guidanceOverlay.hide() }
+        let traceFailure: AgentOrchestrator.AgentFailureKind? = interrupted ? .stepLimit : (ranLongOn != nil || stalledOn != nil ? .stepLimit : nil)
+        let traceStatus: AgentStoredTraceStatus = traceFailure == nil ? .ok : .failed
+        if let rootTraceSpan {
+            try? await traceRecorder.endSpan(rootTraceSpan, SpanResult(
+                status: traceStatus,
+                failureKind: traceFailure,
+                attributes: [
+                    "subgoal.count": "\(plan.count)",
+                    "subgoal.completed_count": "\(findings.count)",
+                ]
+            ))
+        }
+        if let traceContext {
+            try? await traceRecorder.endTrace(traceContext, TraceResult(
+                status: traceStatus,
+                failureKind: traceFailure,
+                metadata: [
+                    "subgoal.count": "\(plan.count)",
+                    "subgoal.completed_count": "\(findings.count)",
+                ]
+            ))
+        }
         _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.task", detail: Self.textAuditDetail("goal", goal)))
         voice.done()
         await refreshAll()
