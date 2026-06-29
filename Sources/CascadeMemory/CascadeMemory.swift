@@ -715,6 +715,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public let siblingIndex: Int?
     public let neighborLabels: [String]
     public let frameBucket: String?
+    public let frame: String?
+    public let valueHash: String?
+    public let enabled: Bool?
+    public let selected: Bool?
+    public let focused: Bool?
+    public let pathHash: String?
+    public let subtree: String?
     public let subtreeHash: String?
     public let semanticHash: String?
 
@@ -728,6 +735,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         siblingIndex: Int? = nil,
         neighborLabels: [String] = [],
         frameBucket: String? = nil,
+        frame: String? = nil,
+        valueHash: String? = nil,
+        enabled: Bool? = nil,
+        selected: Bool? = nil,
+        focused: Bool? = nil,
+        pathHash: String? = nil,
+        subtree: String? = nil,
         subtreeHash: String? = nil,
         semanticHash: String? = nil
     ) {
@@ -740,6 +754,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         self.siblingIndex = siblingIndex
         self.neighborLabels = neighborLabels.compactMap(Self.cleaned)
         self.frameBucket = Self.cleaned(frameBucket)
+        self.frame = Self.cleaned(frame)
+        self.valueHash = Self.cleaned(valueHash)
+        self.enabled = enabled
+        self.selected = selected
+        self.focused = focused
+        self.pathHash = Self.cleaned(pathHash)
+        self.subtree = Self.cleaned(subtree)
         self.subtreeHash = Self.cleaned(subtreeHash)
         self.semanticHash = Self.cleaned(semanticHash)
     }
@@ -754,6 +775,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         case siblingIndex
         case neighborLabels
         case frameBucket
+        case frame
+        case valueHash
+        case enabled
+        case selected
+        case focused
+        case pathHash
+        case subtree
         case subtreeHash
         case semanticHash
     }
@@ -770,6 +798,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             siblingIndex: try container.decodeIfPresent(Int.self, forKey: .siblingIndex),
             neighborLabels: try container.decodeIfPresent([String].self, forKey: .neighborLabels) ?? [],
             frameBucket: try container.decodeIfPresent(String.self, forKey: .frameBucket),
+            frame: try container.decodeIfPresent(String.self, forKey: .frame),
+            valueHash: try container.decodeIfPresent(String.self, forKey: .valueHash),
+            enabled: try container.decodeIfPresent(Bool.self, forKey: .enabled),
+            selected: try container.decodeIfPresent(Bool.self, forKey: .selected),
+            focused: try container.decodeIfPresent(Bool.self, forKey: .focused),
+            pathHash: try container.decodeIfPresent(String.self, forKey: .pathHash),
+            subtree: try container.decodeIfPresent(String.self, forKey: .subtree),
             subtreeHash: try container.decodeIfPresent(String.self, forKey: .subtreeHash),
             semanticHash: try container.decodeIfPresent(String.self, forKey: .semanticHash)
         )
@@ -791,6 +826,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         siblingIndex: Int? = nil,
         neighborLabels: [String] = [],
         frameBucket: String? = nil,
+        frame: String? = nil,
+        valueHash: String? = nil,
+        enabled: Bool? = nil,
+        selected: Bool? = nil,
+        focused: Bool? = nil,
+        pathHash: String? = nil,
+        subtree: String? = nil,
         subtreeHash: String? = nil,
         semanticHash: String? = nil
     ) -> String? {
@@ -803,6 +845,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             siblingIndex: siblingIndex,
             neighborLabels: neighborLabels,
             frameBucket: frameBucket,
+            frame: frame,
+            valueHash: valueHash,
+            enabled: enabled,
+            selected: selected,
+            focused: focused,
+            pathHash: pathHash,
+            subtree: subtree,
             subtreeHash: subtreeHash,
             semanticHash: semanticHash
         )
@@ -823,6 +872,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
                     siblingIndex: descriptor.siblingIndex,
                     neighborLabels: descriptor.neighborLabels,
                     frameBucket: descriptor.frameBucket,
+                    frame: descriptor.frame,
+                    valueHash: descriptor.valueHash,
+                    enabled: descriptor.enabled,
+                    selected: descriptor.selected,
+                    focused: descriptor.focused,
+                    pathHash: descriptor.pathHash,
+                    subtree: descriptor.subtree,
                     subtreeHash: descriptor.subtreeHash,
                     semanticHash: descriptor.semanticHash
                 )
@@ -864,6 +920,13 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             || siblingIndex != nil
             || !neighborLabels.isEmpty
             || frameBucket != nil
+            || frame != nil
+            || valueHash != nil
+            || enabled != nil
+            || selected != nil
+            || focused != nil
+            || pathHash != nil
+            || subtree != nil
             || subtreeHash != nil
             || semanticHash != nil
     }

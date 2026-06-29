@@ -80,3 +80,57 @@ func deltaDetectsInsertAndRemoveChanges() {
     #expect(!delta.contains(.remove, key: "kept"))
     #expect(!delta.contains(.insert, key: "kept"))
 }
+
+@Test
+func axStableKeyPrefersIdentifierThenTitleThenPathFrameBucket() {
+    let identified = UIStateSnapshot.snapshot(fromAXNodes: [
+        UIStateSnapshot.AXNodeInput(identifier: "primary.save", role: "AXButton", title: "Save")
+    ])!
+    let titled = UIStateSnapshot.snapshot(fromAXNodes: [
+        UIStateSnapshot.AXNodeInput(role: "AXButton", title: " Save\nNow ")
+    ], rootKey: "AXWindow:Main")!
+    let bucket = UIStateSnapshot.FrameBucket(CGRect(x: 9, y: 17, width: 101, height: 33))
+    let fallback = UIStateSnapshot.stableKey(
+        identifier: nil,
+        role: "AXButton",
+        title: nil,
+        containerKey: nil,
+        treePath: "0/2",
+        frameBucket: bucket
+    )
+
+    #expect(identified.root.key == "id|primary.save")
+    #expect(titled.root.key == "label|axbutton|save now|axwindow:main")
+    #expect(fallback == "path|axbutton|0/2|1,2,13,4")
+}
+
+@Test
+func axBuilderRespectsNodeAndDepthLimits() {
+    let snapshot = UIStateSnapshot.snapshot(fromAXNodes: [
+        UIStateSnapshot.AXNodeInput(
+            role: "AXWindow",
+            title: "Main",
+            children: [
+                UIStateSnapshot.AXNodeInput(role: "AXButton", title: "One", children: [
+                    UIStateSnapshot.AXNodeInput(role: "AXStaticText", title: "Grandchild")
+                ]),
+                UIStateSnapshot.AXNodeInput(role: "AXButton", title: "Two")
+            ])
+    ], options: UIStateSnapshot.AXBuildOptions(nodeLimit: 2, maxDepth: 1))!
+
+    #expect(snapshot.root.children.count == 1)
+    #expect(snapshot.root.children[0].children.isEmpty)
+}
+
+@Test
+func deltaMeaningfulSummaryHashesKeysWithoutRawLabels() {
+    let before = root(children: [UIStateSnapshot.Node(key: "secret payroll approve button", role: "button", title: "Approve")])
+    let after = root(children: [UIStateSnapshot.Node(key: "secret payroll approve button", role: "button", title: "Approved")])
+    let delta = UIStateDelta.between(before, after)
+    let summary = delta.privacySafeSummary
+
+    #expect(delta.hasMeaningfulChange)
+    #expect(summary.contains("rename=1"))
+    #expect(!summary.contains("secret payroll"))
+    #expect(!summary.contains("approve button"))
+}

@@ -157,13 +157,47 @@ struct WebStateSignatureTests {
     @Test func javascriptSnippetReturnsSignatureShapeAndMutationSequence() {
         let snippet = WebStateSignature.javaScriptSnippet
 
-        #expect(snippet.contains("MutationObserver"))
+        #expect(!snippet.contains("new MutationObserver"))
         #expect(snippet.contains("mutationSequence"))
+        #expect(snippet.contains("mutations"))
         #expect(snippet.contains("formValuesHash"))
         #expect(snippet.contains("checkedSelectedHash"))
         #expect(snippet.contains("contentEditableTextHash"))
         #expect(snippet.contains("ariaTextHash"))
         #expect(!snippet.contains("password.value"))
+    }
+
+    @Test func mutationObserverInstallAndConsumeScriptsExposeBoundedRing() {
+        let install = WebStateSignature.mutationObserverInstallScript
+        let consume = WebStateSignature.mutationConsumeJavaScript
+
+        #expect(install.contains("new MutationObserver"))
+        #expect(install.contains("__cascadeWebStateMutations"))
+        #expect(install.contains("slice(-80)"))
+        #expect(install.contains("oldValueHash"))
+        #expect(install.contains("newValueHash"))
+        #expect(consume.contains("__cascadeWebStateMutations"))
+        #expect(consume.contains("window.__cascadeWebStateMutations = []"))
+    }
+
+    @Test func mutationRingContributesToStableHashWithoutRawValues() {
+        let base = WebStateSignature(snapshot: Self.baseFixture)
+        let changed = WebStateSignature(snapshot: Self.fixture(updating: [
+            "mutations": [[
+                "kind": "attributes",
+                "targetRole": "input",
+                "targetName": "employee",
+                "targetPath": "#employee",
+                "attributeName": "value",
+                "oldValueHash": "fnv64:aaaaaaaaaaaaaaaa",
+                "newValueHash": "fnv64:bbbbbbbbbbbbbbbb"
+            ]]
+        ]))
+
+        #expect(changed.mutations.count == 1)
+        #expect(changed.stableHash != base.stableHash)
+        #expect(String(describing: changed).contains("mutations: 1"))
+        #expect(!String(describing: changed).contains("Asha"))
     }
 
     private static var baseFixture: [String: Any] {

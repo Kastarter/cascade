@@ -1,3 +1,4 @@
+import ApplicationServices
 import CoreGraphics
 import Foundation
 
@@ -114,6 +115,130 @@ public struct UIStateSnapshot: Sendable, Equatable {
             return Int(rounded)
         }
     }
+
+    public struct AXBuildOptions: Sendable, Equatable {
+        public let nodeLimit: Int
+        public let maxDepth: Int
+        public let frameBucketSize: CGFloat
+
+        public init(nodeLimit: Int = 600, maxDepth: Int = 10, frameBucketSize: CGFloat = 8) {
+            self.nodeLimit = max(0, nodeLimit)
+            self.maxDepth = max(0, maxDepth)
+            self.frameBucketSize = frameBucketSize
+        }
+    }
+
+    /// Pure AX-like node input used by tests to pin stable-key and bound behavior
+    /// without requiring a live Accessibility tree.
+    public struct AXNodeInput: Sendable, Equatable {
+        public let identifier: String?
+        public let role: String?
+        public let title: String?
+        public let value: String?
+        public let isFocused: Bool
+        public let isSelected: Bool
+        public let isEnabled: Bool
+        public let frame: CGRect
+        public let children: [AXNodeInput]
+
+        public init(
+            identifier: String? = nil,
+            role: String? = nil,
+            title: String? = nil,
+            value: String? = nil,
+            isFocused: Bool = false,
+            isSelected: Bool = false,
+            isEnabled: Bool = true,
+            frame: CGRect = .zero,
+            children: [AXNodeInput] = []
+        ) {
+            self.identifier = identifier
+            self.role = role
+            self.title = title
+            self.value = value
+            self.isFocused = isFocused
+            self.isSelected = isSelected
+            self.isEnabled = isEnabled
+            self.frame = frame
+            self.children = children
+        }
+    }
+
+    public static func stableKey(
+        identifier: String?,
+        role: String?,
+        title: String?,
+        containerKey: String?,
+        treePath: String,
+        frameBucket: FrameBucket
+    ) -> String {
+        if let identifier = clean(identifier) {
+            return "id|\(identifier)"
+        }
+        let roleComponent = normalized(role) ?? "unknown"
+        if let titleComponent = normalized(title) {
+            return "label|\(roleComponent)|\(titleComponent)|\(normalized(containerKey) ?? "root")"
+        }
+        return "path|\(roleComponent)|\(treePath)|\(frameBucket.x),\(frameBucket.y),\(frameBucket.width),\(frameBucket.height)"
+    }
+
+    public static func snapshot(
+        fromAXNodes roots: [AXNodeInput],
+        rootKey: String = "ax-root",
+        rootRole: String? = "AXApplication",
+        rootTitle: String? = nil,
+        options: AXBuildOptions = AXBuildOptions()
+    ) -> UIStateSnapshot? {
+        guard options.nodeLimit > 0 else { return nil }
+        var remaining = options.nodeLimit
+        let children = roots.enumerated().compactMap { index, input in
+            buildNode(
+                input,
+                path: "\(index)",
+                containerKey: rootKey,
+                depth: 0,
+                remaining: &remaining,
+                options: options
+            )
+        }
+        if children.count == 1 {
+            return UIStateSnapshot(root: children[0])
+        }
+        return UIStateSnapshot(root: Node(key: rootKey, role: rootRole, title: rootTitle, children: children))
+    }
+
+    public static func snapshot(
+        fromAXRoot root: AXUIElement,
+        options: AXBuildOptions = AXBuildOptions()
+    ) -> UIStateSnapshot? {
+        snapshot(fromAXRoots: [root], options: options)
+    }
+
+    public static func snapshot(
+        fromAXRoots roots: [AXUIElement],
+        rootKey: String = "ax-root",
+        rootRole: String? = "AXApplication",
+        rootTitle: String? = nil,
+        options: AXBuildOptions = AXBuildOptions()
+    ) -> UIStateSnapshot? {
+        guard options.nodeLimit > 0 else { return nil }
+        var remaining = options.nodeLimit
+        let children = roots.enumerated().compactMap { index, element in
+            buildNode(
+                element,
+                path: "\(index)",
+                containerKey: rootKey,
+                parentFrame: nil,
+                depth: 0,
+                remaining: &remaining,
+                options: options
+            )
+        }
+        if children.count == 1 {
+            return UIStateSnapshot(root: children[0])
+        }
+        return UIStateSnapshot(root: Node(key: rootKey, role: rootRole, title: rootTitle, children: children))
+    }
 }
 
 public struct UIStateDelta: Sendable, Equatable {
@@ -161,6 +286,8 @@ public struct UIStateDelta: Sendable, Equatable {
 
     public let changes: [Change]
     public var isEmpty: Bool { changes.isEmpty }
+    public var hasMeaningfulChange: Bool { !changes.isEmpty }
+    public var privacySafeSummary: String { privacySafeSummary() }
 
     public init(changes: [Change]) {
         self.changes = changes
@@ -191,6 +318,18 @@ public struct UIStateDelta: Sendable, Equatable {
         changes.contains { $0.kind == kind && $0.key == key }
     }
 
+    public func privacySafeSummary(limit: Int = 6) -> String {
+        guard !changes.isEmpty else { return "none" }
+        let counts = Dictionary(grouping: changes, by: \.kind)
+            .map { "\($0.key.rawValue)=\($0.value.count)" }
+            .sorted()
+            .joined(separator: ",")
+        let examples = changes.prefix(max(0, limit)).map { change in
+            "\(change.kind.rawValue):\(Self.safeKeyHash(change.key))"
+        }.joined(separator: ",")
+        return examples.isEmpty ? "changes=\(counts)" : "changes=\(counts) keys=\(examples)"
+    }
+
     private static func classifyChanges(
         key: String,
         before: UIStateSnapshot.Node,
@@ -217,6 +356,10 @@ public struct UIStateDelta: Sendable, Equatable {
         }
         return changes
     }
+
+    private static func safeKeyHash(_ key: String) -> String {
+        String(StableHash.string(key), radix: 16)
+    }
 }
 
 private extension UIStateSnapshot.Node {
@@ -226,6 +369,162 @@ private extension UIStateSnapshot.Node {
             result.merge(child.flattenedByKey()) { _, new in new }
         }
         return result
+    }
+}
+
+private struct UIStateSnapshotBuildInput {
+    let identifier: String?
+    let role: String?
+    let title: String?
+    let value: String?
+    let isFocused: Bool
+    let isSelected: Bool
+    let isEnabled: Bool
+    let frame: CGRect
+}
+
+private extension UIStateSnapshot {
+    static func buildNode(
+        _ input: AXNodeInput,
+        path: String,
+        containerKey: String?,
+        depth: Int,
+        remaining: inout Int,
+        options: AXBuildOptions
+    ) -> Node? {
+        guard remaining > 0, depth <= options.maxDepth else { return nil }
+        remaining -= 1
+        let frameBucket = FrameBucket(input.frame, bucketSize: options.frameBucketSize)
+        let key = stableKey(
+            identifier: input.identifier,
+            role: input.role,
+            title: input.title,
+            containerKey: containerKey,
+            treePath: path,
+            frameBucket: frameBucket
+        )
+        let children: [Node]
+        if depth < options.maxDepth {
+            children = input.children.enumerated().compactMap { index, child in
+                buildNode(
+                    child,
+                    path: "\(path)/\(index)",
+                    containerKey: key,
+                    depth: depth + 1,
+                    remaining: &remaining,
+                    options: options
+                )
+            }
+        } else {
+            children = []
+        }
+        return Node(
+            key: key,
+            role: input.role,
+            title: input.title,
+            value: input.value,
+            isFocused: input.isFocused,
+            isSelected: input.isSelected,
+            isEnabled: input.isEnabled,
+            frame: input.frame,
+            frameBucketSize: options.frameBucketSize,
+            children: children
+        )
+    }
+
+    static func buildNode(
+        _ element: AXUIElement,
+        path: String,
+        containerKey: String?,
+        parentFrame: CGRect?,
+        depth: Int,
+        remaining: inout Int,
+        options: AXBuildOptions
+    ) -> Node? {
+        guard remaining > 0, depth <= options.maxDepth else { return nil }
+        remaining -= 1
+        AXClient.setMessagingTimeout(element)
+        let role = string(element, kAXRoleAttribute as String)
+        let title = firstString(element, [
+            kAXTitleAttribute as String,
+            kAXDescriptionAttribute as String,
+            kAXHelpAttribute as String
+        ])
+        let value = string(element, kAXValueAttribute as String)
+        let frame = (try? AXClient.frame(element, parentFrame: parentFrame).get()) ?? parentFrame ?? .zero
+        let frameBucket = FrameBucket(frame, bucketSize: options.frameBucketSize)
+        let key = stableKey(
+            identifier: string(element, kAXIdentifierAttribute as String),
+            role: role,
+            title: title,
+            containerKey: containerKey,
+            treePath: path,
+            frameBucket: frameBucket
+        )
+
+        let children: [Node]
+        if depth < options.maxDepth, case .success(let axChildren) = AXClient.children(element) {
+            children = axChildren.enumerated().compactMap { index, child in
+                buildNode(
+                    child,
+                    path: "\(path)/\(index)",
+                    containerKey: key,
+                    parentFrame: frame,
+                    depth: depth + 1,
+                    remaining: &remaining,
+                    options: options
+                )
+            }
+        } else {
+            children = []
+        }
+
+        return Node(
+            key: key,
+            role: role,
+            title: title,
+            value: value,
+            isFocused: bool(element, kAXFocusedAttribute as String) ?? false,
+            isSelected: bool(element, kAXSelectedAttribute as String) ?? false,
+            isEnabled: bool(element, kAXEnabledAttribute as String) ?? true,
+            frame: frame,
+            frameBucketSize: options.frameBucketSize,
+            children: children
+        )
+    }
+
+    static func string(_ element: AXUIElement, _ attribute: String) -> String? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: String.self) else { return nil }
+        return clean(value)
+    }
+
+    static func firstString(_ element: AXUIElement, _ attributes: [String]) -> String? {
+        for attribute in attributes {
+            if let value = string(element, attribute) { return value }
+        }
+        return nil
+    }
+
+    static func bool(_ element: AXUIElement, _ attribute: String) -> Bool? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: Bool.self) else { return nil }
+        return value
+    }
+
+    static func clean(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    static func normalized(_ value: String?) -> String? {
+        guard let value = clean(value) else { return nil }
+        let normalized = value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.isEmpty ? nil : normalized
     }
 }
 

@@ -50,6 +50,7 @@ struct ChangedFrame: Sendable {
     let width: Int
     let height: Int
     let display: CapturedDisplayMetadata?
+    let changedRegions: [CGRect]
     let ocrMode: FrameOCRMode
     let ocrRegion: CGRect?
     let ocrPixelsRequested: Int
@@ -97,6 +98,7 @@ enum RecorderMetadataJSON {
         let ocrMode: String?
         let ocrRegion: RegionPayload?
         let ocrPixelsRequested: Int?
+        let changedRegions: [RegionPayload]?
         let structured: StructuredContentExporter.Metadata?
         let privacy: FrameRedactor.Metadata?
 
@@ -105,6 +107,7 @@ enum RecorderMetadataJSON {
             case ocrMode = "ocr_mode"
             case ocrRegion = "ocr_region"
             case ocrPixelsRequested = "ocr_pixels_requested"
+            case changedRegions = "changed_regions"
         }
     }
 
@@ -129,10 +132,11 @@ enum RecorderMetadataJSON {
         ocrMode: FrameOCRMode? = nil,
         ocrRegion: CGRect? = nil,
         ocrPixelsRequested: Int? = nil,
+        changedRegions: [CGRect] = [],
         structured: StructuredContentExporter.Metadata?,
         privacy: FrameRedactor.Metadata? = nil
     ) -> String {
-        if reason == nil, display == nil, signature == nil, ocrMode == nil, ocrRegion == nil, ocrPixelsRequested == nil, structured == nil, privacy == nil {
+        if reason == nil, display == nil, signature == nil, ocrMode == nil, ocrRegion == nil, ocrPixelsRequested == nil, changedRegions.isEmpty, structured == nil, privacy == nil {
             return "{\"rewind\":true,\"w\":\(width),\"h\":\(height),\"ax\":\(axCount)}"
         }
         let signaturePayload = signature.map(SignaturePayload.init)
@@ -147,6 +151,7 @@ enum RecorderMetadataJSON {
             ocrMode: ocrMode?.rawValue,
             ocrRegion: ocrRegion.map(RegionPayload.init),
             ocrPixelsRequested: ocrPixelsRequested,
+            changedRegions: changedRegions.isEmpty ? nil : changedRegions.map(RegionPayload.init),
             structured: structured,
             privacy: privacy
         ))
@@ -282,6 +287,14 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
             let previousGrid = lastGrid
             let grid = PerceptualHash.gridHashes(cgImage)
             let changedCellsMask = PerceptualHash.changedCellsMask(current: grid, previous: previousGrid, threshold: threshold)
+            let changedRegions = previousGrid.map {
+                PerceptualHash.diffRegions(
+                    current: grid,
+                    previous: $0,
+                    threshold: threshold,
+                    imageSize: CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+                )
+            } ?? []
             let visuallyChanged = previousGrid.map { !PerceptualHash.isDuplicateGrid(grid, of: $0, threshold: threshold) } ?? true
             lastGrid = grid
             frameOrdinal += 1
@@ -310,6 +323,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
                 width: cgImage.width,
                 height: cgImage.height,
                 display: display,
+                changedRegions: changedRegions,
                 ocrMode: ocrPlan.mode,
                 ocrRegion: ocrPlan.region,
                 ocrPixelsRequested: ocrPlan.pixelsRequested
@@ -704,6 +718,7 @@ actor RewindEngine {
                 ocrMode: ocrMode,
                 ocrRegion: ocrRegion,
                 ocrPixelsRequested: ocrPixelsRequested,
+                changedRegions: frame.changedRegions,
                 structured: structuredMetadata,
                 privacy: redacted.metadata
             ),

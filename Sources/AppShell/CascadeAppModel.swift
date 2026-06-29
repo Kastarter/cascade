@@ -4558,7 +4558,8 @@ public final class CascadeAppModel: ObservableObject {
         step: RecipeStep,
         tier: RecipeTargetCacheTier? = nil,
         reason: String? = nil,
-        confidence: Double? = nil
+        confidence: Double? = nil,
+        deltaReason: String? = nil
     ) -> String {
         var parts = [
             "step=\(step.order)",
@@ -4568,6 +4569,7 @@ public final class CascadeAppModel: ObservableObject {
         if let tier { parts.append("tier=\(safeAuditToken(tier.rawValue))") }
         if let reason { parts.append("reason=\(safeAuditToken(reason))") }
         if let confidence { parts.append("confidence=\(String(format: "%.2f", confidence))") }
+        if let deltaReason { parts.append("delta=\(safeAuditToken(deltaReason))") }
         return parts.joined(separator: " ")
     }
 
@@ -6898,49 +6900,71 @@ public final class CascadeAppModel: ObservableObject {
 	                    // AX tier and fingerprint verification instead of false-pausing.
 	                    let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
 	                    let axUnreliable = stepSkill?.axUnreliable == true
-	                    let cacheSkipReason = Self.recipeTargetCacheSkipReason(step: step, axUnreliable: axUnreliable)
-	                    let cacheInitialFingerprint = cacheSkipReason == nil ? await Self.uiFingerprint() : 0
-	                    let targetCacheContext: RecipeTargetCacheContext?
-	                    if let cacheSkipReason {
-	                        targetCacheContext = nil
-	                        _ = try? await store.appendAudit(AuditEvent(
-	                            actor: "agent",
+		                    let cacheSkipReason = Self.recipeTargetCacheSkipReason(step: step, axUnreliable: axUnreliable)
+		                    let cacheInitialState = cacheSkipReason == nil ? await Self.uiState() : nil
+		                    let targetCacheContext: RecipeTargetCacheContext?
+		                    if let cacheSkipReason {
+		                        targetCacheContext = nil
+		                        _ = try? await store.appendAudit(AuditEvent(
+		                            actor: "agent",
 	                            action: "recipe.target_cache.skipped_sensitive",
-	                            detail: Self.recipeTargetCacheAuditDetail(step: step, reason: cacheSkipReason)
-	                        ))
-	                    } else {
-	                        targetCacheContext = await recipeTargetCacheContext(for: step, stateFingerprint: cacheInitialFingerprint)
-	                    }
-	                    if let targetCacheContext,
-	                       let cached = await recipeTargetCache.lookup(targetCacheContext) {
-	                        try await driver.act(.computerUse(.move(x: cached.point.x, y: cached.point.y)))
-	                        try? await Task.sleep(for: .milliseconds(320))
-	                        try await clickAction(step, at: cached.point)
-	                        if await Self.uiChanged(after: cacheInitialFingerprint) {
-	                            _ = await recipeTargetCache.promote(targetCacheContext, point: cached.point, tier: cached.tier)
-	                            unverifiedStreak = 0
-	                            _ = try? await store.appendAudit(AuditEvent(
-	                                actor: "agent",
-	                                action: "recipe.target_cache.hit",
-	                                detail: Self.recipeTargetCacheAuditDetail(step: step, tier: cached.tier, confidence: cached.confidence)
-	                            ))
-	                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
-	                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "cache")))
-	                            try? await Task.sleep(for: .milliseconds(500))
-	                            continue
-	                        }
-	                        let demoted = await recipeTargetCache.demote(targetCacheContext)
+		                            detail: Self.recipeTargetCacheAuditDetail(step: step, reason: cacheSkipReason)
+		                        ))
+		                    } else if let cacheInitialState {
+		                        targetCacheContext = await recipeTargetCacheContext(
+		                            for: step,
+		                            stateFingerprint: String(cacheInitialState.rootHash)
+		                        )
+		                    } else {
+		                        targetCacheContext = nil
+		                    }
+		                    if let targetCacheContext,
+		                       let cached = await recipeTargetCache.lookup(targetCacheContext) {
+		                        try await driver.act(.computerUse(.move(x: cached.point.x, y: cached.point.y)))
+		                        try? await Task.sleep(for: .milliseconds(320))
+		                        try await clickAction(step, at: cached.point)
+		                        let cacheVerification = await Self.verifyUIChange(after: cacheInitialState)
+		                        if cacheVerification.changed {
+		                            _ = await recipeTargetCache.promote(targetCacheContext, point: cached.point, tier: cached.tier)
+		                            unverifiedStreak = 0
+		                            _ = try? await store.appendAudit(AuditEvent(
+		                                actor: "agent",
+		                                action: "recipe.target_cache.hit",
+		                                detail: Self.recipeTargetCacheAuditDetail(
+		                                    step: step,
+		                                    tier: cached.tier,
+		                                    confidence: cached.confidence,
+		                                    deltaReason: cacheVerification.reason
+		                                )
+		                            ))
+		                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+		                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "cache")))
+		                            try? await Task.sleep(for: .milliseconds(500))
+		                            continue
+		                        } else if cacheVerification.unavailable {
+		                            unverifiedStreak = 0
+		                            if !verifyUnavailableLogged {
+		                                verifyUnavailableLogged = true
+		                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
+		                            }
+		                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+		                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "cache")))
+		                            try? await Task.sleep(for: .milliseconds(500))
+		                            continue
+		                        }
+		                        let demoted = await recipeTargetCache.demote(targetCacheContext)
 	                        _ = try? await store.appendAudit(AuditEvent(
 	                            actor: "agent",
 	                            action: "recipe.target_cache.demote",
 	                            detail: Self.recipeTargetCacheAuditDetail(
-	                                step: step,
-	                                tier: cached.tier,
-	                                reason: "no_effect",
-	                                confidence: demoted?.confidence
-	                            )
-	                        ))
-	                    }
+		                                step: step,
+		                                tier: cached.tier,
+		                                reason: cacheVerification.status.rawValue,
+		                                confidence: demoted?.confidence,
+		                                deltaReason: cacheVerification.reason
+		                            )
+		                        ))
+		                    }
 	                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
 	                    // recorded AX label in the live tree. Tier 2 (ocr): B4's ON-DEVICE
                     // OCR grounder — find the recorded target's text on the live frame
@@ -6978,47 +7002,65 @@ public final class CascadeAppModel: ObservableObject {
                         }
                         try await clickAction(step, at: target)
                     } else {
-                        let before = await Self.uiFingerprint()
-                        if before == 0, !verifyUnavailableLogged {
-                            verifyUnavailableLogged = true
-                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
-                        }
-	                        try await clickAction(step, at: target)
-	                        if await Self.uiChanged(after: before) {
-	                            unverifiedStreak = 0
-	                            if let targetCacheContext,
-	                               let cacheTier = RecipeTargetCacheTier(rawValue: tier) {
-	                                let promoted = await recipeTargetCache.promote(targetCacheContext, point: target, tier: cacheTier)
+	                        let before = await Self.uiState()
+	                        if before == nil, !verifyUnavailableLogged {
+	                            verifyUnavailableLogged = true
+	                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
+	                        }
+		                        try await clickAction(step, at: target)
+		                        let verification = await Self.verifyUIChange(after: before)
+		                        if verification.changed {
+		                            unverifiedStreak = 0
+		                            if let targetCacheContext,
+		                               let cacheTier = RecipeTargetCacheTier(rawValue: tier) {
+		                                let promoted = await recipeTargetCache.promote(targetCacheContext, point: target, tier: cacheTier)
+		                                _ = try? await store.appendAudit(AuditEvent(
+		                                    actor: "agent",
+		                                    action: "recipe.target_cache.promote",
+		                                    detail: Self.recipeTargetCacheAuditDetail(
+		                                        step: step,
+		                                        tier: cacheTier,
+		                                        confidence: promoted.confidence,
+		                                        deltaReason: verification.reason
+		                                    )
+		                                ))
+		                            }
+		                        } else if verification.unavailable {
+		                            unverifiedStreak = 0
+		                        } else {
+		                            // One corrective retry at the recorded coordinate (if the
+		                            // resolved target differed), then count the step unverified.
+		                            if target != recorded {
+		                                try await clickAction(step, at: recorded)
+		                            }
+		                            let retryVerification = await Self.verifyUIChange(after: before)
+		                            if retryVerification.changed {
+		                                unverifiedStreak = 0
+		                                if let targetCacheContext {
+		                                    let promoted = await recipeTargetCache.promote(targetCacheContext, point: recorded, tier: .recorded)
+		                                    _ = try? await store.appendAudit(AuditEvent(
+		                                        actor: "agent",
+		                                        action: "recipe.target_cache.promote",
+		                                        detail: Self.recipeTargetCacheAuditDetail(
+		                                            step: step,
+		                                            tier: .recorded,
+		                                            confidence: promoted.confidence,
+		                                            deltaReason: retryVerification.reason
+		                                        )
+		                                    ))
+		                                }
+		                            } else if retryVerification.unavailable {
+		                                unverifiedStreak = 0
+		                            } else {
+	                                unverifiedStreak += 1
+	                                let recovery = Self.recoveryAction(for: .noEffect, attempt: unverifiedStreak)
 	                                _ = try? await store.appendAudit(AuditEvent(
 	                                    actor: "agent",
-	                                    action: "recipe.target_cache.promote",
-	                                    detail: Self.recipeTargetCacheAuditDetail(step: step, tier: cacheTier, confidence: promoted.confidence)
+	                                    action: "recipe.unverified",
+	                                    detail: Self.recipeAuditDetail(step)
+	                                        + " recoveryAction=\(recovery.rawValue)"
+	                                        + " delta=\(Self.safeAuditToken(retryVerification.reason))"
 	                                ))
-	                            }
-	                        } else {
-	                            // One corrective retry at the recorded coordinate (if the
-	                            // resolved target differed), then count the step unverified.
-	                            if target != recorded {
-	                                try await clickAction(step, at: recorded)
-	                            }
-	                            if await Self.uiChanged(after: before) {
-	                                unverifiedStreak = 0
-	                                if let targetCacheContext {
-	                                    let promoted = await recipeTargetCache.promote(targetCacheContext, point: recorded, tier: .recorded)
-	                                    _ = try? await store.appendAudit(AuditEvent(
-	                                        actor: "agent",
-	                                        action: "recipe.target_cache.promote",
-	                                        detail: Self.recipeTargetCacheAuditDetail(step: step, tier: .recorded, confidence: promoted.confidence)
-	                                    ))
-	                                }
-	                            } else {
-                                unverifiedStreak += 1
-                                let recovery = Self.recoveryAction(for: .noEffect, attempt: unverifiedStreak)
-                                _ = try? await store.appendAudit(AuditEvent(
-                                    actor: "agent",
-                                    action: "recipe.unverified",
-                                    detail: Self.recipeAuditDetail(step) + " recoveryAction=\(recovery.rawValue)"
-                                ))
                                 if unverifiedStreak >= 2 {
                                     await escalateRecipeToAssist(
                                         agent,
@@ -7187,35 +7229,68 @@ public final class CascadeAppModel: ObservableObject {
         let (role, identifier, container) = AXTargetDescriptor.decode(step.targetDescriptor)
         // Need a label or a stable identifier to re-find the element by identity.
         guard !label.trimmingCharacters(in: .whitespaces).isEmpty || (identifier?.isEmpty == false) else { return nil }
-        let descriptor = AXElementResolver.Descriptor(label: label, role: role, identifier: identifier, container: container)
+        let descriptor = AXTargetDescriptorV2.decode(step.targetDescriptor, fallbackLabel: label)
+            ?? AXTargetDescriptorV2(
+                label: label,
+                role: role,
+                identifier: identifier,
+                container: container,
+                ancestorPath: container.map { [$0] } ?? []
+            )
         return await Task.detached(priority: .userInitiated) {
-            AXElementResolver.find(descriptor: descriptor, near: recorded)?.center
+            AXElementResolver.find(recorded: descriptor, near: recorded)?.center
         }.value
     }
 
-    private static func uiFingerprint() async -> Int {
-        await Task.detached(priority: .userInitiated) { AXElementResolver.frontmostFingerprint() }.value
+    private struct UIVerificationResult: Sendable, Equatable {
+        enum Status: String, Sendable {
+            case changed
+            case unchanged
+            case unavailable
+        }
+
+        let status: Status
+        let reason: String
+
+        var changed: Bool { status == .changed }
+        var unavailable: Bool { status == .unavailable }
     }
 
-    /// Polls (5 × 80ms) for the frontmost AX tree to differ from `before`. A zero
-    /// `before` means AX was unavailable — verification is skipped, not failed.
-    private static func uiChanged(after before: Int) async -> Bool {
-        guard before != 0 else { return true }
+    private static func uiState() async -> UIStateSnapshot? {
+        await Task.detached(priority: .userInitiated) {
+            AXElementResolver.frontmostState(limit: 600, depth: 10)
+        }.value
+    }
+
+    /// Polls for a meaningful AX delta. Missing AX remains a skip-open condition:
+    /// replay proceeds unverified rather than counting the step as a no-effect failure.
+    private static func verifyUIChange(after before: UIStateSnapshot?) async -> UIVerificationResult {
+        guard let before else {
+            return UIVerificationResult(status: .unavailable, reason: "ax_unavailable")
+        }
+        var lastSummary = "none"
         for _ in 0..<5 {
             try? await Task.sleep(for: .milliseconds(80))
-            if await uiFingerprint() != before { return true }
+            guard let after = await uiState() else {
+                return UIVerificationResult(status: .unavailable, reason: "ax_unavailable")
+            }
+            let delta = AXElementResolver.diff(before, after)
+            lastSummary = delta.privacySafeSummary
+            if delta.hasMeaningfulChange {
+                return UIVerificationResult(status: .changed, reason: lastSummary)
+            }
         }
-        return false
+        return UIVerificationResult(status: .unchanged, reason: lastSummary)
     }
 
-    private func recipeTargetCacheContext(for step: RecipeStep, stateFingerprint: Int) async -> RecipeTargetCacheContext {
+    private func recipeTargetCacheContext(for step: RecipeStep, stateFingerprint: String) async -> RecipeTargetCacheContext {
         let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
         return RecipeTargetCacheContext(
             actionKey: step.idempotentActionKey,
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier ?? step.bundleIdentifier,
             windowTitle: snapshot.windowTitle ?? step.windowTitleHint,
-            stateFingerprint: String(stateFingerprint)
+            stateFingerprint: stateFingerprint
         )
     }
 
