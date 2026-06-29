@@ -24,6 +24,271 @@ public enum AnthropicError: Error, LocalizedError {
     }
 }
 
+public struct AnthropicUsage: Sendable, Equatable {
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var cacheReadInputTokens: Int
+    public var cacheCreationInputTokens: Int
+
+    public init(
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cacheReadInputTokens: Int = 0,
+        cacheCreationInputTokens: Int = 0
+    ) {
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadInputTokens = cacheReadInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
+    }
+
+    public static func parse(_ raw: [String: Any]) -> AnthropicUsage {
+        AnthropicUsage(
+            inputTokens: Self.int(raw["input_tokens"]),
+            outputTokens: Self.int(raw["output_tokens"]),
+            cacheReadInputTokens: Self.int(raw["cache_read_input_tokens"]),
+            cacheCreationInputTokens: Self.int(raw["cache_creation_input_tokens"])
+        )
+    }
+
+    public var rawDictionary: [String: Any] {
+        [
+            "input_tokens": inputTokens,
+            "output_tokens": outputTokens,
+            "cache_read_input_tokens": cacheReadInputTokens,
+            "cache_creation_input_tokens": cacheCreationInputTokens,
+        ]
+    }
+
+    private static func int(_ value: Any?) -> Int {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        return 0
+    }
+}
+
+public struct AnthropicMessagesResponse {
+    public let content: [[String: Any]]
+    public let stopReason: String?
+    public let usage: AnthropicUsage
+    public let raw: [String: Any]
+
+    public var text: String {
+        content.compactMap { block in
+            (block["type"] as? String) == "text" ? block["text"] as? String : nil
+        }.joined()
+    }
+}
+
+public struct AnthropicTokenCount: Sendable, Equatable {
+    public let inputTokens: Int
+
+    public init(inputTokens: Int) {
+        self.inputTokens = inputTokens
+    }
+}
+
+public struct AnthropicMessagesClient: Sendable {
+    private let keyStore: AnthropicKeyStore
+    private let session: URLSession
+    private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    private let countEndpoint = URL(string: "https://api.anthropic.com/v1/messages/count_tokens")!
+
+    public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), session: URLSession = .shared) {
+        self.keyStore = keyStore
+        self.session = session
+    }
+
+    public func send(
+        model: String,
+        maxTokens: Int,
+        system: Any? = nil,
+        messages: [[String: Any]],
+        temperature: Double? = nil,
+        tools: [[String: Any]]? = nil,
+        toolChoice: [String: Any]? = nil,
+        thinking: [String: Any]? = nil,
+        outputConfig: [String: Any]? = nil,
+        betaHeader: String? = nil,
+        timeout: TimeInterval = 30
+    ) async throws -> AnthropicMessagesResponse {
+        guard let key = keyStore.readKey(), !key.isEmpty else { throw AnthropicError.missingKey }
+        let bodyData = try Self.bodyData(
+            model: model,
+            maxTokens: maxTokens,
+            system: system,
+            messages: messages,
+            temperature: temperature,
+            tools: tools,
+            toolChoice: toolChoice,
+            thinking: thinking,
+            outputConfig: outputConfig,
+            stream: false
+        )
+        var request = Self.request(
+            url: endpoint,
+            key: key,
+            bodyData: bodyData,
+            betaHeader: betaHeader,
+            timeout: timeout
+        )
+        request.httpMethod = "POST"
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw AnthropicError.transport(error.localizedDescription)
+        }
+        try Self.validate(response: response, data: data)
+        guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AnthropicError.emptyResponse
+        }
+        return Self.response(from: raw)
+    }
+
+    public func countTokens(
+        model: String,
+        maxTokens: Int,
+        system: Any? = nil,
+        messages: [[String: Any]],
+        temperature: Double? = nil,
+        tools: [[String: Any]]? = nil,
+        toolChoice: [String: Any]? = nil,
+        thinking: [String: Any]? = nil,
+        outputConfig: [String: Any]? = nil,
+        betaHeader: String? = nil,
+        timeout: TimeInterval = 20
+    ) async throws -> AnthropicTokenCount {
+        let bodyData = try Self.bodyData(
+            model: model,
+            maxTokens: maxTokens,
+            system: system,
+            messages: messages,
+            temperature: temperature,
+            tools: tools,
+            toolChoice: toolChoice,
+            thinking: thinking,
+            outputConfig: outputConfig,
+            stream: nil
+        )
+        return try await countTokens(bodyData: bodyData, betaHeader: betaHeader, timeout: timeout)
+    }
+
+    public func countTokens(bodyData: Data, betaHeader: String? = nil, timeout: TimeInterval = 20) async throws -> AnthropicTokenCount {
+        guard let key = keyStore.readKey(), !key.isEmpty else { throw AnthropicError.missingKey }
+        var request = Self.request(url: countEndpoint, key: key, bodyData: bodyData, betaHeader: betaHeader, timeout: timeout)
+        request.httpMethod = "POST"
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw AnthropicError.transport(error.localizedDescription)
+        }
+        try Self.validate(response: response, data: data)
+        guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AnthropicError.emptyResponse
+        }
+        return AnthropicTokenCount(inputTokens: Self.int(raw["input_tokens"]))
+    }
+
+    public static func body(
+        model: String,
+        maxTokens: Int,
+        system: Any? = nil,
+        messages: [[String: Any]],
+        temperature: Double? = nil,
+        tools: [[String: Any]]? = nil,
+        toolChoice: [String: Any]? = nil,
+        thinking: [String: Any]? = nil,
+        outputConfig: [String: Any]? = nil,
+        stream: Bool? = nil
+    ) -> [String: Any] {
+        var body: [String: Any] = [
+            "model": model,
+            "max_tokens": maxTokens,
+            "messages": messages,
+        ]
+        if let system { body["system"] = system }
+        if let temperature { body["temperature"] = temperature }
+        if let tools { body["tools"] = tools }
+        if let toolChoice { body["tool_choice"] = toolChoice }
+        if let thinking { body["thinking"] = thinking }
+        if let outputConfig { body["output_config"] = outputConfig }
+        if let stream { body["stream"] = stream }
+        return body
+    }
+
+    public static func bodyData(
+        model: String,
+        maxTokens: Int,
+        system: Any? = nil,
+        messages: [[String: Any]],
+        temperature: Double? = nil,
+        tools: [[String: Any]]? = nil,
+        toolChoice: [String: Any]? = nil,
+        thinking: [String: Any]? = nil,
+        outputConfig: [String: Any]? = nil,
+        stream: Bool? = nil
+    ) throws -> Data {
+        let object = body(
+            model: model,
+            maxTokens: maxTokens,
+            system: system,
+            messages: messages,
+            temperature: temperature,
+            tools: tools,
+            toolChoice: toolChoice,
+            thinking: thinking,
+            outputConfig: outputConfig,
+            stream: stream
+        )
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    }
+
+    public static func response(from raw: [String: Any]) -> AnthropicMessagesResponse {
+        AnthropicMessagesResponse(
+            content: raw["content"] as? [[String: Any]] ?? [],
+            stopReason: raw["stop_reason"] as? String,
+            usage: AnthropicUsage.parse(raw["usage"] as? [String: Any] ?? [:]),
+            raw: raw
+        )
+    }
+
+    public static func request(
+        url: URL,
+        key: String,
+        bodyData: Data,
+        betaHeader: String? = nil,
+        timeout: TimeInterval
+    ) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue(key, forHTTPHeaderField: "x-api-key")
+        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
+        if let betaHeader { request.setValue(betaHeader, forHTTPHeaderField: "anthropic-beta") }
+        request.httpBody = bodyData
+        return request
+    }
+
+    public static func validate(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw AnthropicError.transport("No HTTP response.")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw AnthropicError.http(http.statusCode, AnthropicClient.errorMessage(from: data, status: http.statusCode))
+        }
+    }
+
+    private static func int(_ value: Any?) -> Int {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        return 0
+    }
+}
+
 /// One non-streaming text completion. Abstracted so planners and answerers can be
 /// unit-tested without the network; `AnthropicClient` is the production conformer.
 public protocol MessageCompleting: Sendable {
@@ -140,10 +405,12 @@ public struct AnthropicClient: MessageCompleting {
     private let keyStore: AnthropicKeyStore
     private let session: URLSession
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    private let messagesClient: AnthropicMessagesClient
 
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), session: URLSession = .shared) {
         self.keyStore = keyStore
         self.session = session
+        self.messagesClient = AnthropicMessagesClient(keyStore: keyStore, session: session)
     }
 
     public func complete(
@@ -162,44 +429,19 @@ public struct AnthropicClient: MessageCompleting {
         maxTokens: Int = 1024,
         options: AnthropicCompletionOptions
     ) async throws -> String {
-        guard let key = keyStore.readKey(), !key.isEmpty else { throw AnthropicError.missingKey }
-
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue(AnthropicRequestVersions.messagesAPI, forHTTPHeaderField: "anthropic-version")
-        let body = try Self.completionBodyData(
-            system: system,
-            user: user,
+        let response = try await messagesClient.send(
             model: model,
             maxTokens: maxTokens,
-            options: options
+            system: system,
+            messages: [AnthropicMessageRequestBody.Message(role: "user", content: user).dictionary],
+            temperature: options.temperature
         )
-        request.httpBody = body
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw AnthropicError.transport(error.localizedDescription)
-        }
-
-        guard let http = response as? HTTPURLResponse else {
-            throw AnthropicError.transport("No HTTP response.")
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            throw AnthropicError.http(http.statusCode, Self.errorMessage(from: data, status: http.statusCode))
-        }
-
-        let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
-        let text = decoded.content.filter { $0.type == "text" }.compactMap(\.text).joined()
+        let text = response.text
         guard !text.isEmpty else { throw AnthropicError.emptyResponse }
         return text
     }
 
-    private static func errorMessage(from data: Data, status: Int) -> String {
+    static func errorMessage(from data: Data, status: Int) -> String {
         if let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: data) {
             return envelope.error.message
         }
@@ -213,14 +455,12 @@ public struct AnthropicClient: MessageCompleting {
         maxTokens: Int,
         options: AnthropicCompletionOptions
     ) throws -> Data {
-        try JSONEncoder().encode(
-            AnthropicMessageRequestBody(
-                model: model,
-                maxTokens: maxTokens,
-                temperature: options.temperature,
-                system: system,
-                messages: [.init(role: "user", content: user)]
-            )
+        try AnthropicMessagesClient.bodyData(
+            model: model,
+            maxTokens: maxTokens,
+            system: system,
+            messages: [AnthropicMessageRequestBody.Message(role: "user", content: user).dictionary],
+            temperature: options.temperature
         )
     }
 
@@ -256,5 +496,9 @@ struct AnthropicMessageRequestBody: Encodable, Sendable {
     struct Message: Encodable, Sendable {
         let role: String
         let content: String
+
+        var dictionary: [String: Any] {
+            ["role": role, "content": content]
+        }
     }
 }

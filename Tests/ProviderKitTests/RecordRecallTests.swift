@@ -52,7 +52,7 @@ func recallSearchEmptyQueryAsksForOne() async throws {
     // whitespace-only query becomes empty and trips the guard.
     let call = RecordRecall.Call(name: "search_record", input: ["query": "   "])
     let out = await RecordRecall(store: store).perform(call)
-    #expect(out == "search_record needs a query.")
+    #expect(out == #"{"kind":"validation_error","message":"search_record needs a query.","status":"error","tool":"search_record"}"#)
 }
 
 @Test
@@ -245,7 +245,7 @@ func recallInspectIncludesNeighbors() async throws {
 func recallInspectNeedsNumericId() async throws {
     let store = try makeStore()
     let out = await RecordRecall(store: store).perform(.inspect(id: nil))
-    #expect(out == "inspect_moment needs a numeric id.")
+    #expect(out == #"{"kind":"validation_error","message":"inspect_moment needs a numeric id.","status":"error","tool":"inspect_moment"}"#)
 }
 
 @Test

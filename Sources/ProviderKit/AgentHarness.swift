@@ -219,9 +219,7 @@ public enum AgentHarness {
 
     public static func perform(_ call: HarnessCall, powerEnabled: Bool) async -> String {
         if call.isPower, !powerEnabled {
-            return "The Power harness is OFF in Cascade's Settings, so this tool is disabled. "
-                + "Either do this on screen with the computer tool, or tell the user they can "
-                + "enable Settings → Agent harness → Power harness to let you run it directly."
+            return status(.refused, tool: call.toolName, kind: "power_harness_disabled", message: "The Power harness is OFF in Cascade's Settings, so this tool is disabled. Either do this on screen with the computer tool, or tell the user they can enable Settings → Agent harness → Power harness to let you run it directly.")
         }
         switch call {
         case .searchFiles(let query, let folder):
@@ -245,7 +243,7 @@ public enum AgentHarness {
 
     private static func searchFiles(query: String, folder: String?) async -> String {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "search_files needs a query." }
+        guard !trimmed.isEmpty else { return status(.error, tool: "search_files", kind: "validation_error", message: "search_files needs a query.") }
         guard !PrivacyRules.isSensitiveText(trimmed) else {
             return privacyRefusal("search query")
         }
@@ -259,9 +257,9 @@ public enum AgentHarness {
         }
         let paths = result.output.split(separator: "\n").map(String.init)
         let visible = paths.filter { sensitivePathReason($0) == nil }
-        guard !paths.isEmpty else { return "No files matched “\(trimmed)” under \(scope)." }
+        guard !paths.isEmpty else { return status(.noResult, tool: "search_files", kind: "no_matches", message: "No files matched “\(trimmed)” under \(scope).") }
         guard !visible.isEmpty else {
-            return "Matches were only in privacy-protected locations, so their paths stay local."
+            return status(.refused, tool: "search_files", kind: "privacy_refusal", message: "Matches were only in privacy-protected locations, so their paths stay local.")
         }
         let shown = visible.prefix(40)
         var text = shown.joined(separator: "\n")
@@ -274,11 +272,11 @@ public enum AgentHarness {
         if let reason = sensitivePathReason(expanded) { return reason }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory) else {
-            return "No such folder: \(expanded)"
+            return status(.noResult, tool: "list_folder", kind: "missing_folder", message: "No such folder: \(expanded)")
         }
-        guard isDirectory.boolValue else { return "\(expanded) is a file, not a folder — use read_file." }
+        guard isDirectory.boolValue else { return status(.error, tool: "list_folder", kind: "not_a_folder", message: "\(expanded) is a file, not a folder — use read_file.") }
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: expanded) else {
-            return "Couldn't list \(expanded) (no permission?)."
+            return status(.error, tool: "list_folder", kind: "read_failed", message: "Couldn't list \(expanded) (no permission?).")
         }
         let entries = names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             .filter { name in
@@ -291,7 +289,7 @@ public enum AgentHarness {
                 FileManager.default.fileExists(atPath: full, isDirectory: &isDir)
                 return isDir.boolValue ? name + "/" : name
             }
-        guard !entries.isEmpty else { return "\(expanded) is empty." }
+        guard !entries.isEmpty else { return status(.noResult, tool: "list_folder", kind: "empty_folder", message: "\(expanded) is empty.") }
         let shown = entries.prefix(200)
         var text = shown.joined(separator: "\n")
         if entries.count > shown.count { text += "\n…and \(entries.count - shown.count) more." }
@@ -306,12 +304,12 @@ public enum AgentHarness {
     private static func readFile(path: String, options: HarnessCall.ReadFileOptions?) -> String {
         let expanded = expand(path)
         if let reason = sensitivePathReason(expanded) { return reason }
-        guard FileManager.default.fileExists(atPath: expanded) else { return "No such file: \(expanded)" }
+        guard FileManager.default.fileExists(atPath: expanded) else { return status(.noResult, tool: "read_file", kind: "missing_file", message: "No such file: \(expanded)") }
         guard let data = FileManager.default.contents(atPath: expanded) else {
-            return "Couldn't read \(expanded) (no permission?)."
+            return status(.error, tool: "read_file", kind: "read_failed", message: "Couldn't read \(expanded) (no permission?).")
         }
         guard let text = String(data: data.prefix(readCap * 4), encoding: .utf8) else {
-            return "\(expanded) is binary (\(data.count) bytes) — read_file only reads text."
+            return status(.refused, tool: "read_file", kind: "binary_file", message: "\(expanded) is binary (\(data.count) bytes) — read_file only reads text.")
         }
         if PrivacyRules.isSensitiveText(expanded) || PrivacyRules.isSensitiveText(text) {
             return privacyRefusal("file")
@@ -421,11 +419,10 @@ public enum AgentHarness {
             return privacyRefusal("command")
         }
         if commandMentionsProtectedPath(normalized) {
-            return "That command references a protected local credential or Cascade data path, so it will not run."
+            return status(.refused, tool: "run_command", kind: "protected_path", message: "That command references a protected local credential or Cascade data path, so it will not run.")
         }
         for pattern in denyPatterns where normalized.range(of: pattern, options: .regularExpression) != nil {
-            return "That command matches Cascade's destructive-command deny-list and will not run. "
-                + "Pick a narrower, non-destructive command, or do it on screen where the user can watch."
+            return status(.refused, tool: "run_command", kind: "deny_list", message: "That command matches Cascade's destructive-command deny-list and will not run. Pick a narrower, non-destructive command, or do it on screen where the user can watch.")
         }
         return nil
     }
@@ -434,10 +431,10 @@ public enum AgentHarness {
 
     private static func runCommand(_ command: String) async -> String {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "run_command needs a command." }
+        guard !trimmed.isEmpty else { return status(.error, tool: "run_command", kind: "validation_error", message: "run_command needs a command.") }
         if let denial = denialReason(for: trimmed) { return denial }
         guard let parsed = structuredCommand(for: trimmed).command else {
-            return "run_command only accepts an allowlisted executable plus literal argv; shell syntax is refused."
+            return status(.refused, tool: "run_command", kind: "shell_syntax_refused", message: "run_command only accepts an allowlisted executable plus literal argv; shell syntax is refused.")
         }
         let result = await run(parsed.executable, parsed.arguments, cwd: NSHomeDirectory(), timeout: 25)
         var text = capped(result.output)
@@ -449,7 +446,7 @@ public enum AgentHarness {
 
     private static func runAppleScript(_ script: String) async -> String {
         let trimmed = script.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "run_applescript needs a script." }
+        guard !trimmed.isEmpty else { return status(.error, tool: "run_applescript", kind: "validation_error", message: "run_applescript needs a script.") }
         if let denial = guardrailDenialReason(for: trimmed) { return denial }
         let result = await run("/usr/bin/osascript", ["-e", trimmed], timeout: 30)
         let text = capped(result.output)
@@ -485,14 +482,14 @@ public enum AgentHarness {
         let destination = URL(fileURLWithPath: expanded)
         if let reason = sensitivePathReason(expanded) { return reason }
         guard let prepared = prepareWriteDestination(destination.path) else {
-            return "write_file only writes inside Cascade's harness workspace or session scratch root — not \(expanded)."
+            return status(.refused, tool: "write_file", kind: "outside_write_root", message: "write_file only writes inside Cascade's harness workspace or session scratch root — not \(expanded).")
         }
         if let reason = sensitivePathReason(prepared.path) { return reason }
         do {
             try atomicWrite(content: content, to: prepared)
             return "Wrote \(content.utf8.count) bytes to \(prepared.path)."
         } catch {
-            return "Couldn't write \(prepared.path): \(error.localizedDescription)"
+            return status(.error, tool: "write_file", kind: "write_failed", message: "Couldn't write \(prepared.path): \(error.localizedDescription)")
         }
     }
 
@@ -766,12 +763,12 @@ public enum AgentHarness {
         let components = URL(fileURLWithPath: expanded).standardizedFileURL.pathComponents
             .map { $0.lowercased() }
         if components.contains(where: { protectedPathComponents.contains($0) }) {
-            return "That path is in a protected local credential directory, so it stays local."
+            return status(.refused, tool: nil, kind: "protected_path", message: "That path is in a protected local credential directory, so it stays local.")
         }
         let lower = expanded.lowercased()
         let slashTerminated = lower.hasSuffix("/") ? lower : lower + "/"
         if protectedSubpaths.contains(where: { slashTerminated.contains($0) }) {
-            return "That path is in protected local application data, so it stays local."
+            return status(.refused, tool: nil, kind: "protected_path", message: "That path is in protected local application data, so it stays local.")
         }
         return nil
     }
@@ -781,8 +778,16 @@ public enum AgentHarness {
     }
 
     private static func privacyRefusal(_ noun: String) -> String {
-        "That \(noun) matches the user's privacy exclusions — its content stays local. "
-            + "Tell the user why if they asked for it directly."
+        status(.refused, tool: nil, kind: "privacy_refusal", message: "That \(noun) matches the user's privacy exclusions — its content stays local. Tell the user why if they asked for it directly.")
+    }
+
+    private static func status(
+        _ status: ToolResultStatusEnvelope.Status,
+        tool: String?,
+        kind: String,
+        message: String
+    ) -> String {
+        ToolResultStatusEnvelope.render(status, kind: kind, message: message, tool: tool)
     }
 
     private static func capped(_ text: String) -> String {

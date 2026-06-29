@@ -110,6 +110,21 @@ public struct AgentTrace: Sendable, Equatable, Codable {
     public var inputTokens: Int { spans.compactMap(\.usage).reduce(0) { $0 + $1.inputTokens } }
     public var outputTokens: Int { spans.compactMap(\.usage).reduce(0) { $0 + $1.outputTokens } }
     public var cacheReadTokens: Int { spans.compactMap(\.usage).reduce(0) { $0 + $1.cacheReadTokens } }
+    public var preflightInputTokens: Int {
+        spans.reduce(0) { partial, span in
+            partial + Self.intAttribute(["preflight.input_tokens", "preflightInputTokens"], in: span)
+        }
+    }
+    public var estimatedCostUSD: Double {
+        spans.reduce(0) { partial, span in
+            partial + Self.doubleAttribute(["preflight.cost_usd", "estimatedCostUSD", "estimatedCostUsd"], in: span)
+        }
+    }
+    public var cacheHitRatio: Double {
+        let total = inputTokens + cacheReadTokens
+        guard total > 0 else { return 0 }
+        return Double(cacheReadTokens) / Double(total)
+    }
     public var modelCallCount: Int { spans.filter { $0.kind == .model }.count }
     public var toolCallCount: Int { spans.filter { $0.kind == .tool }.count }
     public var durationMs: Int { spans.map { $0.startMs + $0.durationMs }.max() ?? 0 }
@@ -255,6 +270,20 @@ public struct AgentTrace: Sendable, Equatable, Codable {
             return VerifierCalibration.clampConfidence(value)
         }
         return nil
+    }
+
+    private static func intAttribute(_ keys: [String], in span: TraceSpan) -> Int {
+        for key in keys {
+            if let value = span.attributes[key].flatMap(Int.init) { return value }
+        }
+        return 0
+    }
+
+    private static func doubleAttribute(_ keys: [String], in span: TraceSpan) -> Double {
+        for key in keys {
+            if let value = span.attributes[key].flatMap(Double.init) { return value }
+        }
+        return 0
     }
 
     private static func countSpans(namedLike needles: [String], failureKind: AgentFailureKind, in spans: [TraceSpan]) -> Int {
