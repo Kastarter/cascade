@@ -326,17 +326,42 @@ public struct AnthropicMessagesClient: Sendable {
     ) -> [String: Any] {
         var body: [String: Any] = [
             "model": model,
-            "max_tokens": maxTokens,
             "messages": messages,
         ]
+        // The effort-based `output_config` API self-manages the output budget, and the
+        // server REJECTS a top-level `max_tokens` sent alongside it — HTTP 400
+        // "max_tokens: Extra inputs are not permitted". That 400 silently zeroed out
+        // EVERY computer-use turn (model "ran" but emitted 0 actions → validatorIncomplete).
+        // Send max_tokens ONLY when output_config is absent.
+        if outputConfig == nil { body["max_tokens"] = maxTokens }
         if let system { body["system"] = system }
         if let temperature { body["temperature"] = temperature }
-        if let tools { body["tools"] = tools }
+        // Anthropic caps STRICT tools at 20 per request. The enabled set (base +
+        // harness + recall + fill + skill) grew past that and 400'd every turn with
+        // "Too many strict tools (22)". Relax `strict` on the overflow so all tools
+        // stay available — strict only adds server-side input-schema validation.
+        if let tools { body["tools"] = Self.cappingStrictTools(tools) }
         if let toolChoice { body["tool_choice"] = toolChoice }
         if let thinking { body["thinking"] = thinking }
         if let outputConfig { body["output_config"] = outputConfig }
         if let stream { body["stream"] = stream }
         return body
+    }
+
+    /// Anthropic rejects requests with more than 20 tools marked `strict`. Keep the
+    /// first `max` strict tools strict and relax the rest (they still function —
+    /// `strict` only enforces input-schema validation server-side). Without this the
+    /// whole turn 400s ("Too many strict tools"), silently zeroing every agent action.
+    static func cappingStrictTools(_ tools: [[String: Any]], max: Int = 20) -> [[String: Any]] {
+        var strictCount = 0
+        return tools.map { tool in
+            guard (tool["strict"] as? Bool) == true else { return tool }
+            strictCount += 1
+            if strictCount <= max { return tool }
+            var relaxed = tool
+            relaxed.removeValue(forKey: "strict")
+            return relaxed
+        }
     }
 
     public static func bodyData(

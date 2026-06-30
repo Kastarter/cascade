@@ -863,14 +863,17 @@ public final class ComputerUseAgent {
         // leaves room for thinking ahead of the tool calls.
         // .sortedKeys keeps the rendered body byte-stable across turns — prompt
         // caching is a prefix match, and unordered keys would silently invalidate it.
+        // `thinking: {type: "adaptive"}` and `output_config: {effort}` are REJECTED by the
+        // Messages API (HTTP 400 "max_tokens: Extra inputs are not permitted" / extra
+        // fields). That 400 silently failed EVERY computer-use turn (model "ran" but
+        // emitted 0 actions → validatorIncomplete). Use Anthropic's documented computer-use
+        // request shape: max_tokens + tools + beta header, no non-standard extras.
         guard let bodyData = try? AnthropicMessagesClient.bodyData(
             model: model,
             maxTokens: 2048,
             system: system,
             messages: Self.withMovingCacheBreakpoints(messages),
             tools: tools,
-            thinking: ["type": "adaptive"],
-            outputConfig: ["effort": effort],
             stream: true
         ) else {
             return CUStep(actions: [], text: "", done: true, failed: true)
@@ -2085,11 +2088,16 @@ public final class ComputerUseAgent {
         }
         guard let http = response as? HTTPURLResponse else { return .fatal }
         guard (200..<300).contains(http.statusCode) else {
+            // DIAGNOSTIC: capture the API error body (consumes the stream — only safe
+            // here because every branch below returns without reading `bytes`).
+            var errData = Data()
+            do { for try await b in bytes { errData.append(b) } } catch {}
+            let errBody = String(data: errData, encoding: .utf8) ?? "<no body>"
             guard canRetry, http.statusCode == 429 || http.statusCode >= 500 else {
-                Self.logger.error("step failed — HTTP \(http.statusCode)")
+                Self.logger.error("step failed — HTTP \(http.statusCode): \(errBody, privacy: .public)")
                 return .fatal
             }
-            Self.logger.notice("step got HTTP \(http.statusCode) — retrying once")
+            Self.logger.notice("step got HTTP \(http.statusCode) — retrying once: \(errBody, privacy: .public)")
             return .retry(after: http.value(forHTTPHeaderField: "retry-after").flatMap(Double.init))
         }
 
