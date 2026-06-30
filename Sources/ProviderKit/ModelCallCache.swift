@@ -1,4 +1,5 @@
 import CoreFoundation
+import CascadeMemory
 import CryptoKit
 import Foundation
 
@@ -167,65 +168,116 @@ public actor ModelCallCache {
     }
 
     private var entries: [String: Entry] = [:]
+    private var failureExpiries: [String: Date] = [:]
     private var inFlight: [String: Task<Data, Error>] = [:]
     private let ttl: TimeInterval
+    private let failureTTL: TimeInterval
+    private let persistentStore: CascadeStore?
 
-    public init(ttl: TimeInterval = 30) {
+    public init(ttl: TimeInterval = 30, failureTTL: TimeInterval = 30, store: CascadeStore? = nil) {
         self.ttl = ttl
+        self.failureTTL = failureTTL
+        self.persistentStore = store
     }
 
     public func lookup<Payload: Decodable & Sendable>(
         _ request: ModelCallRequest,
         as type: Payload.Type = Payload.self,
-        now: Date = Date()
-    ) throws -> Payload? {
-        guard let entry = entries[request.canonicalRequestHash] else { return nil }
-        guard now < entry.expiresAt else {
-            entries.removeValue(forKey: request.canonicalRequestHash)
+        now: Date = Date(),
+        policy: ModelCallCachePolicy = .readWrite
+    ) async throws -> Payload? {
+        guard policy.allowsLookup else { return nil }
+        let hash = request.canonicalRequestHash
+        if let failureExpiry = failureExpiries[hash] {
+            guard now >= failureExpiry else { return nil }
+            failureExpiries.removeValue(forKey: hash)
+        }
+        if let entry = entries[hash] {
+            guard now < entry.expiresAt else {
+                entries.removeValue(forKey: hash)
+                return nil
+            }
+            if let persistentStore {
+                try? await persistentStore.touchModelCallCache(keySHA256: hash, now: now)
+            }
+            return try JSONDecoder().decode(Payload.self, from: entry.payload)
+        }
+        guard let persistentStore,
+              let stored = try await persistentStore.lookupModelCallCache(keySHA256: hash, now: now),
+              let data = stored.record.validatedPayloadJSON.data(using: .utf8) else {
             return nil
         }
-        return try JSONDecoder().decode(Payload.self, from: entry.payload)
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        entries[hash] = Entry(payload: data, expiresAt: stored.record.expiresAt)
+        try await persistentStore.touchModelCallCache(keySHA256: hash, now: now)
+        return payload
     }
 
     public func store<Payload: Encodable & Sendable>(
         _ payload: Payload,
         for request: ModelCallRequest,
-        now: Date = Date()
-    ) throws {
+        now: Date = Date(),
+        policy: ModelCallCachePolicy = .readWrite
+    ) async throws {
+        guard policy.allowsStore else { return }
         let data = try JSONEncoder().encode(payload)
-        entries[request.canonicalRequestHash] = Entry(
+        let hash = request.canonicalRequestHash
+        let expiresAt = now.addingTimeInterval(ttl)
+        entries[hash] = Entry(
             payload: data,
-            expiresAt: now.addingTimeInterval(ttl)
+            expiresAt: expiresAt
         )
+        try await persist(payloadData: data, request: request, createdAt: now, expiresAt: expiresAt)
+    }
+
+    public func isFailureSuppressed(_ request: ModelCallRequest, now: Date = Date()) -> Bool {
+        let hash = request.canonicalRequestHash
+        guard let expiresAt = failureExpiries[hash] else { return false }
+        guard now < expiresAt else {
+            failureExpiries.removeValue(forKey: hash)
+            return false
+        }
+        return true
+    }
+
+    public func storeFailure(for request: ModelCallRequest, now: Date = Date()) {
+        failureExpiries[request.canonicalRequestHash] = now.addingTimeInterval(failureTTL)
     }
 
     public func value<Payload: Codable & Sendable>(
         for request: ModelCallRequest,
         as type: Payload.Type = Payload.self,
         now: Date = Date(),
+        policy: ModelCallCachePolicy = .readWrite,
         load: @Sendable @escaping () async throws -> Payload
     ) async throws -> Payload {
-        if let cached: Payload = try lookup(request, as: Payload.self, now: now) {
+        if let cached: Payload = try await lookup(request, as: Payload.self, now: now, policy: policy) {
             return cached
         }
 
         let hash = request.canonicalRequestHash
         let task: Task<Data, Error>
-        if let existing = inFlight[hash] {
+        if policy.allowsLookup, let existing = inFlight[hash] {
             task = existing
         } else {
             let newTask = Task<Data, Error> {
                 let payload = try await load()
                 return try JSONEncoder().encode(payload)
             }
-            inFlight[hash] = newTask
+            if policy.allowsLookup {
+                inFlight[hash] = newTask
+            }
             task = newTask
         }
 
         do {
             let data = try await task.value
             let completedAt = Date()
-            entries[hash] = Entry(payload: data, expiresAt: completedAt.addingTimeInterval(ttl))
+            let expiresAt = completedAt.addingTimeInterval(ttl)
+            if policy.allowsStore {
+                entries[hash] = Entry(payload: data, expiresAt: expiresAt)
+                try await persist(payloadData: data, request: request, createdAt: completedAt, expiresAt: expiresAt)
+            }
             inFlight[hash] = nil
             return try JSONDecoder().decode(Payload.self, from: data)
         } catch {
@@ -236,7 +288,29 @@ public actor ModelCallCache {
 
     public func removeAll() {
         entries.removeAll()
+        failureExpiries.removeAll()
         inFlight.removeAll()
+    }
+
+    private func persist(payloadData: Data, request: ModelCallRequest, createdAt: Date, expiresAt: Date) async throws {
+        guard let persistentStore,
+              let payloadJSON = String(data: payloadData, encoding: .utf8) else { return }
+        try await persistentStore.upsertModelCallCache(ModelCallCacheRecord(
+            keySHA256: request.canonicalRequestHash,
+            model: request.model,
+            callsite: request.callsite,
+            promptVersion: request.promptVersion,
+            schemaVersion: request.schemaVersion,
+            requestJSONSHA256: Self.sha256Hex(request.canonicalBody),
+            validatedPayloadJSON: payloadJSON,
+            createdAt: createdAt,
+            expiresAt: expiresAt
+        ))
+    }
+
+    private static func sha256Hex(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -273,7 +347,10 @@ public struct CachedMessageCompleter: Sendable {
             options: options
         )
         let request = try options.cacheRequest(model: model, maxTokens: maxTokens, body: body)
-        let payload = try await cache.value(for: request, as: CachedCompletion.self) {
+        if await cache.isFailureSuppressed(request) {
+            throw CachedMessageCompleterError.invalidResponse
+        }
+        let payload = try await cache.value(for: request, as: CachedCompletion.self, policy: options.cachePolicy) {
             let text = try await client.complete(
                 system: system,
                 user: user,
@@ -281,9 +358,34 @@ public struct CachedMessageCompleter: Sendable {
                 maxTokens: maxTokens,
                 options: options
             )
-            try validate(text)
-            return CachedCompletion(text: text)
+            do {
+                try validate(text)
+                return CachedCompletion(text: text)
+            } catch {
+                let repaired = try await client.complete(
+                    system: system,
+                    user: Self.repairPrompt(user: user),
+                    model: model,
+                    maxTokens: maxTokens,
+                    options: options
+                )
+                do {
+                    try validate(repaired)
+                    return CachedCompletion(text: repaired)
+                } catch {
+                    await cache.storeFailure(for: request)
+                    throw error
+                }
+            }
         }
         return payload.text
+    }
+
+    private static func repairPrompt(user: String) -> String {
+        """
+        \(user)
+
+        Your previous response did not match the required JSON schema. Return only valid JSON matching the requested schema, with no prose or code fences.
+        """
     }
 }

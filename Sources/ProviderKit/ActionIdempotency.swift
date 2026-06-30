@@ -81,6 +81,13 @@ public struct ActionIdempotencyKey: Hashable, Sendable, CustomStringConvertible 
         self.canonicalPayload = canonicalPayload
     }
 
+    public init(rawDigest digest: String, retryClass: ActionRetryClass) {
+        self.rawValue = "action:\(digest)"
+        self.digest = digest
+        self.retryClass = retryClass
+        self.canonicalPayload = #"{"canonicalRequestHash":true}"#
+    }
+
     private static func normalizedPrivateTextFields(_ fields: Set<String>) -> Set<String> {
         Set(fields.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })
     }
@@ -307,10 +314,10 @@ public enum RetryErrorClassifier {
         guard let httpStatusCode else { return .transient }
 
         switch httpStatusCode {
-        case 408, 409, 425, 429:
+        case 408, 429, 500, 503, 504, 529:
             return .transient
-        case 500...599:
-            return .transient
+        case 400, 401, 402, 403, 404, 413:
+            return .nonTransient
         default:
             return .nonTransient
         }

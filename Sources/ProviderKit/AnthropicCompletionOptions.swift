@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 
 public enum AnthropicRequestVersions {
@@ -5,25 +6,68 @@ public enum AnthropicRequestVersions {
     public static let computerUseBeta = "computer-use-2025-11-24"
 }
 
+public enum ModelCallCachePolicy: String, Codable, Equatable, Sendable {
+    case readWrite
+    case readOnly
+    case writeOnly
+    case bypass
+
+    public var allowsLookup: Bool {
+        switch self {
+        case .readWrite, .readOnly: true
+        case .writeOnly, .bypass: false
+        }
+    }
+
+    public var allowsStore: Bool {
+        switch self {
+        case .readWrite, .writeOnly: true
+        case .readOnly, .bypass: false
+        }
+    }
+}
+
 public struct AnthropicCompletionOptions: Equatable, Sendable {
     public let temperature: Double?
     public let promptVersion: String
     public let schemaVersion: String
     public let callsite: String
+    public let cachePolicy: ModelCallCachePolicy
+    public let idempotencyClass: ActionRetryClass
+    public let retryPolicy: RetryBackoffPolicy?
+    public let attemptRecorder: (any ModelRequestAttemptRecording)?
 
     public init(
         temperature: Double? = nil,
         promptVersion: String = "unversioned-prompt",
         schemaVersion: String = "unversioned-schema",
-        callsite: String = "unversioned-callsite"
+        callsite: String = "unversioned-callsite",
+        cachePolicy: ModelCallCachePolicy = .readWrite,
+        idempotencyClass: ActionRetryClass = .pureModelCall,
+        retryPolicy: RetryBackoffPolicy? = nil,
+        attemptRecorder: (any ModelRequestAttemptRecording)? = nil
     ) {
         self.temperature = temperature
         self.promptVersion = promptVersion
         self.schemaVersion = schemaVersion
         self.callsite = callsite
+        self.cachePolicy = cachePolicy
+        self.idempotencyClass = idempotencyClass
+        self.retryPolicy = retryPolicy
+        self.attemptRecorder = attemptRecorder
     }
 
     public static let standard = AnthropicCompletionOptions()
+
+    public static func == (lhs: AnthropicCompletionOptions, rhs: AnthropicCompletionOptions) -> Bool {
+        lhs.temperature == rhs.temperature
+            && lhs.promptVersion == rhs.promptVersion
+            && lhs.schemaVersion == rhs.schemaVersion
+            && lhs.callsite == rhs.callsite
+            && lhs.cachePolicy == rhs.cachePolicy
+            && lhs.idempotencyClass == rhs.idempotencyClass
+            && lhs.retryPolicy == rhs.retryPolicy
+    }
 
     public static func deterministic(
         promptVersion: String,
@@ -34,7 +78,35 @@ public struct AnthropicCompletionOptions: Equatable, Sendable {
             temperature: 0,
             promptVersion: promptVersion,
             schemaVersion: schemaVersion,
-            callsite: callsite
+            callsite: callsite,
+            cachePolicy: .readWrite,
+            idempotencyClass: .pureModelCall
+        )
+    }
+
+    public func withRetryPolicy(_ retryPolicy: RetryBackoffPolicy?) -> AnthropicCompletionOptions {
+        AnthropicCompletionOptions(
+            temperature: temperature,
+            promptVersion: promptVersion,
+            schemaVersion: schemaVersion,
+            callsite: callsite,
+            cachePolicy: cachePolicy,
+            idempotencyClass: idempotencyClass,
+            retryPolicy: retryPolicy,
+            attemptRecorder: attemptRecorder
+        )
+    }
+
+    public func withAttemptRecorder(_ attemptRecorder: (any ModelRequestAttemptRecording)?) -> AnthropicCompletionOptions {
+        AnthropicCompletionOptions(
+            temperature: temperature,
+            promptVersion: promptVersion,
+            schemaVersion: schemaVersion,
+            callsite: callsite,
+            cachePolicy: cachePolicy,
+            idempotencyClass: idempotencyClass,
+            retryPolicy: retryPolicy,
+            attemptRecorder: attemptRecorder
         )
     }
 

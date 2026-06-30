@@ -38,6 +38,9 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     private let maxHops: Int
     private let includeStructuredContent: Bool
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "record-answerer")
+    static let toolLoopPromptVersion = "record-search-answerer.tool-loop.prompt.v1"
+    static let breadthPromptVersion = "record-search-answerer.breadth-synthesis.prompt.v1"
+    static let schemaVersion = "record-search-answerer.answer.schema.v1"
 
     public init(
         store: CascadeStore,
@@ -124,6 +127,11 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     // MARK: - Request plumbing
 
     private func send(key: String, messages: [[String: Any]], toolsAllowed: Bool) async throws -> [String: Any] {
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.toolLoopPromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "RecordSearchAnswerer.send"
+        )
         // System is split into a STABLE, cacheable prefix and a VOLATILE time
         // block placed after the cache breakpoint. The tool loop rebuilds this
         // request on every hop; if the wall-clock time lived in the cached prefix
@@ -147,6 +155,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             maxTokens: 700,
             system: system,
             messages: messages,
+            temperature: options.temperature ?? 0,
             tools: tools
         )
         let response = try await messagesClient.send(
@@ -154,6 +163,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             maxTokens: 700,
             system: system,
             messages: messages,
+            temperature: options.temperature ?? 0,
             tools: tools,
             timeout: 30
         )
@@ -190,19 +200,25 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         Synthesize the answer using only the evidence above. Cite only ids present in the evidence.
         End with: SOURCES: #id, #id (at most 4). If evidence is insufficient, say so.
         """
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.breadthPromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "RecordSearchAnswerer.answerBroadQuestion"
+        )
         let messages = [["role": "user", "content": user]]
         _ = try? await messagesClient.countTokens(
             model: model,
             maxTokens: 700,
             system: Self.breadthSynthesisSystemPrompt(),
-            messages: messages
+            messages: messages,
+            temperature: options.temperature ?? 0
         )
         let response = try await messagesClient.send(
             model: model,
             maxTokens: 700,
             system: Self.breadthSynthesisSystemPrompt(),
             messages: messages,
-            temperature: 0,
+            temperature: options.temperature ?? 0,
             timeout: 30
         )
         let parsed = Self.parseCitations(from: response.text)

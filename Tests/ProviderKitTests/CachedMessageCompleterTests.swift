@@ -109,7 +109,7 @@ func promptSchemaAndModelChangesMissCachedMessageCompleter() async throws {
 }
 
 @Test
-func validationFailuresAreNotCachedAsPlannerResponses() async throws {
+func validationFailuresRetryOnceAndCacheOnlyValidatedRepair() async throws {
     let client = CountingMessageClient(replies: ["not json", validStepJSON])
     let completer = CachedMessageCompleter(
         client: CountingMessageCompleter(client: client),
@@ -117,11 +117,16 @@ func validationFailuresAreNotCachedAsPlannerResponses() async throws {
     )
     let options = AnthropicCompletionOptions.deterministic(promptVersion: "p1", schemaVersion: "s1", callsite: "planner")
 
-    do {
-        _ = try await completer.complete(system: "system", user: "user", model: AnthropicModel.sonnet, maxTokens: 256, options: options, validating: validatePlannerStep)
-        Issue.record("Expected the invalid response to throw.")
-    } catch CachedMessageCompleterError.invalidResponse {
-    }
+    let repaired = try await completer.complete(
+        system: "system",
+        user: "user",
+        model: AnthropicModel.sonnet,
+        maxTokens: 256,
+        options: options,
+        validating: validatePlannerStep
+    )
+    #expect(repaired == validStepJSON)
+    #expect(await client.count == 2)
 
     let recovered = try await completer.complete(
         system: "system",
