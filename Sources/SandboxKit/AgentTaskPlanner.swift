@@ -105,6 +105,97 @@ public struct AgentTaskFinding: Sendable, Equatable {
     }
 }
 
+public enum SearchRoutingIntent: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case onScreen
+    case recordedMemory
+    case localFiles
+    case web
+    case ambiguous
+    case multi
+    case noSearch
+
+    static func normalized(_ raw: String?) -> SearchRoutingIntent? {
+        let value = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch value {
+        case "onscreen", "on_screen", "screen", "visible", "current_screen":
+            return .onScreen
+        case "recordedmemory", "recorded_memory", "memory", "recall", "record":
+            return .recordedMemory
+        case "localfiles", "local_files", "files", "file", "folder", "spotlight":
+            return .localFiles
+        case "web", "internet", "browser", "online":
+            return .web
+        case "ambiguous", "unknown", "unclear":
+            return .ambiguous
+        case "multi", "multiple", "multi_source", "multi-source":
+            return .multi
+        case "none", "no_search", "nosearch", "no_retrieval":
+            return .noSearch
+        default:
+            return nil
+        }
+    }
+}
+
+public enum SearchResource: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case onScreen
+    case recordedMemory
+    case localFiles
+    case web
+
+    static func normalized(_ raw: String?) -> SearchResource? {
+        let value = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch value {
+        case "onscreen", "on_screen", "screen", "visible", "current_screen":
+            return .onScreen
+        case "recordedmemory", "recorded_memory", "memory", "recall", "record":
+            return .recordedMemory
+        case "localfiles", "local_files", "files", "file", "folder", "spotlight":
+            return .localFiles
+        case "web", "internet", "browser", "online":
+            return .web
+        default:
+            return nil
+        }
+    }
+}
+
+public struct SearchRouteHint: Sendable, Equatable, Codable {
+    public let routingIntent: SearchRoutingIntent
+    public let candidateSources: [SearchResource]
+    public let cleanQuery: String
+
+    public init(
+        routingIntent: SearchRoutingIntent,
+        candidateSources: [SearchResource],
+        cleanQuery: String
+    ) {
+        self.routingIntent = routingIntent
+        self.candidateSources = Self.dedup(candidateSources)
+        self.cleanQuery = cleanQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var allowsWeb: Bool { candidateSources.contains(.web) || routingIntent == .web || routingIntent == .multi }
+    public var usesCheapLocalSources: Bool {
+        candidateSources.contains(.recordedMemory) || candidateSources.contains(.localFiles)
+    }
+
+    private static func dedup(_ sources: [SearchResource]) -> [SearchResource] {
+        var seen = Set<SearchResource>()
+        var output: [SearchResource] = []
+        for source in sources where seen.insert(source).inserted {
+            output.append(source)
+        }
+        return output
+    }
+}
+
 public struct AgentRecoveryMemo: Sendable, Equatable {
     public let failedSubtask: AgentSubtask
     public let failureKind: AgentFailureKind
@@ -161,7 +252,9 @@ public struct AgentTaskPlanner: Sendable {
     private let model: String
     static let promptVersion = "agent-task-planner.prompt.v2"
     static let replanPromptVersion = "agent-task-replanner.prompt.v1"
+    static let searchRoutePromptVersion = "agent-search-router.prompt.v1"
     static let schemaVersion = "agent-task-planner.schema.v2"
+    static let searchRouteSchemaVersion = "agent-search-router.schema.v1"
 
     public init(
         client: any MessageCompleting = AnthropicClient(),
@@ -257,9 +350,49 @@ public struct AgentTaskPlanner: Sendable {
         return .replaceCurrent(Self.recoveryFallbackSubtask(from: memo, recovery: recovery))
     }
 
+    public func routeSearch(
+        for task: String,
+        in environment: Environment,
+        conversationContext: String = ""
+    ) async -> SearchRouteHint {
+        let request = Self.searchRouteRequestBody(
+            task: task,
+            environment: environment,
+            conversationContext: conversationContext
+        )
+        let user = (try? Self.jsonString(request)) ?? "Job: \(task)"
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.searchRoutePromptVersion,
+            schemaVersion: Self.searchRouteSchemaVersion,
+            callsite: "AgentTaskPlanner.searchRoute"
+        )
+        let raw = try? await complete(
+            system: Self.searchRouteSystemPrompt,
+            user: user,
+            maxTokens: 300,
+            options: options,
+            validating: {
+                guard Self.parseSearchRoute($0) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
+        )
+        if let raw, let parsed = Self.parseSearchRoute(raw) {
+            return parsed
+        }
+        return Self.heuristicSearchRoute(for: task, in: environment, conversationContext: conversationContext)
+    }
+
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "planner")
 
     static let maxSubtasks = 5
+
+    static let searchRouteSystemPrompt = """
+    You route a user request across Cascade's search resources. Return only JSON:
+    {"routingIntent":"onScreen|recordedMemory|localFiles|web|ambiguous|multi|noSearch","candidateSources":["onScreen","recordedMemory","localFiles","web"],"cleanQuery":"..."}
+
+    Choose the cheapest useful source first. Use recordedMemory for things the user saw or did earlier. Use localFiles for files or folders on this Mac. Use web for current/public/world facts. Use onScreen when the answer is visible now. Use multi when more than one source is likely needed.
+    """
 
     private func complete(
         system: String,
@@ -401,6 +534,157 @@ public struct AgentTaskPlanner: Sendable {
         return subtasks.isEmpty ? nil : subtasks
     }
 
+    static func parseSearchRoute(_ raw: String) -> SearchRouteHint? {
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end,
+              let data = String(raw[start...end]).data(using: .utf8),
+              let dto = try? JSONDecoder().decode(SearchRouteDTO.self, from: data),
+              let intent = SearchRoutingIntent.normalized(dto.routingIntent) else {
+            return nil
+        }
+        let cleanQuery = (dto.cleanQuery ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuery.isEmpty else { return nil }
+        let rawSources = dto.candidateSources ?? []
+        let parsedSources = rawSources.compactMap(SearchResource.normalized)
+        guard rawSources.isEmpty || !parsedSources.isEmpty else { return nil }
+        let sources = parsedSources.isEmpty ? defaultSources(for: intent) : parsedSources
+        guard !sources.isEmpty || intent == .noSearch else { return nil }
+        return SearchRouteHint(
+            routingIntent: intent,
+            candidateSources: sources,
+            cleanQuery: cleanQuery
+        )
+    }
+
+    static func searchRouteRequestBody(
+        task: String,
+        environment: Environment,
+        conversationContext: String
+    ) -> [String: Any] {
+        let memo = conversationContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "normalizedGoal": cleanSearchQuery(task).lowercased(),
+            "originalGoal": task.trimmingCharacters(in: .whitespacesAndNewlines),
+            "conversationMemo": memo,
+            "frontmostContext": routeContextFingerprintInput(memo),
+            "environment": environment == .webSandbox ? "webSandbox" : "onScreen",
+            "availableResources": availableSearchResources(for: environment).map(\.rawValue),
+            "output": [
+                "routingIntent": "one of onScreen, recordedMemory, localFiles, web, ambiguous, multi, noSearch",
+                "candidateSources": "ordered cheapest-first subset of availableResources",
+                "cleanQuery": "short search query with voice filler removed",
+            ],
+        ]
+    }
+
+    private static func availableSearchResources(for environment: Environment) -> [SearchResource] {
+        switch environment {
+        case .webSandbox:
+            [.web, .recordedMemory, .localFiles]
+        case .onScreen:
+            [.onScreen, .recordedMemory, .localFiles, .web]
+        }
+    }
+
+    private static func routeContextFingerprintInput(_ memo: String) -> String {
+        let lines = memo
+            .split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let contextLines = lines.filter { line in
+            let lower = line.lowercased()
+            return lower.contains("frontmost") || lower.contains("window") || lower.contains("app:")
+        }
+        return contextLines.prefix(6).joined(separator: "\n")
+    }
+
+    private static func jsonString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+
+    static func heuristicSearchRoute(
+        for task: String,
+        in environment: Environment,
+        conversationContext: String = ""
+    ) -> SearchRouteHint {
+        let query = cleanSearchQuery(task)
+        let haystack = " \(task.lowercased()) \(conversationContext.lowercased()) "
+        let recordedMarkers = [
+            " earlier", "this morning", "yesterday", "last week", "last time", "i had open",
+            "i was reading", "i saw", "we saw", "remember", "history", "recorded", "timeline",
+        ]
+        let localMarkers = [
+            " file", "folder", "desktop", "downloads", "documents", "finder", "on my mac",
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".md",
+        ]
+        let webMarkers = [
+            "latest", "current", "today", "news", "weather", "stock", "price", "online",
+            "internet", "website", "web", "google", "who is", "what is", "when is",
+        ]
+        let screenMarkers = [
+            "on screen", "this screen", "this page", "visible", "what does this say",
+            "summarize this", "read this",
+        ]
+
+        var sources: [SearchResource] = []
+        if screenMarkers.contains(where: haystack.contains) { sources.append(.onScreen) }
+        if recordedMarkers.contains(where: haystack.contains) { sources.append(.recordedMemory) }
+        if localMarkers.contains(where: haystack.contains) { sources.append(.localFiles) }
+        if webMarkers.contains(where: haystack.contains) || environment == .webSandbox { sources.append(.web) }
+
+        if sources.isEmpty {
+            sources = environment == .webSandbox ? [.web] : [.onScreen, .recordedMemory, .localFiles]
+        }
+
+        let intent: SearchRoutingIntent
+        if sources.count > 1 {
+            intent = sources.contains(.web) && (sources.contains(.recordedMemory) || sources.contains(.localFiles)) ? .multi : .ambiguous
+        } else {
+            switch sources.first {
+            case .onScreen: intent = .onScreen
+            case .recordedMemory: intent = .recordedMemory
+            case .localFiles: intent = .localFiles
+            case .web: intent = .web
+            case nil: intent = .noSearch
+            }
+        }
+
+        return SearchRouteHint(routingIntent: intent, candidateSources: sources, cleanQuery: query)
+    }
+
+    private static func defaultSources(for intent: SearchRoutingIntent) -> [SearchResource] {
+        switch intent {
+        case .onScreen: [.onScreen]
+        case .recordedMemory: [.recordedMemory]
+        case .localFiles: [.localFiles]
+        case .web: [.web]
+        case .ambiguous: [.onScreen, .recordedMemory, .localFiles]
+        case .multi: [.recordedMemory, .localFiles, .web]
+        case .noSearch: []
+        }
+    }
+
+    static func cleanSearchQuery(_ task: String) -> String {
+        var query = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefixes = [
+            "please ", "can you ", "could you ", "would you ", "find ", "search for ",
+            "search ", "look up ", "lookup ", "tell me ", "show me ", "where is ",
+            "what is ", "what's ",
+        ]
+        var lowered = query.lowercased()
+        var changed = true
+        while changed {
+            changed = false
+            for prefix in prefixes where lowered.hasPrefix(prefix) {
+                query = String(query.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                lowered = query.lowercased()
+                changed = true
+                break
+            }
+        }
+        return query.isEmpty ? task.trimmingCharacters(in: .whitespacesAndNewlines) : query
+    }
+
     /// Deterministic fallback start page when no better URL is known.
     static func searchURL(for task: String) -> String {
         "https://www.google.com/search?q=" +
@@ -475,6 +759,12 @@ public struct AgentTaskPlanner: Sendable {
             let expectedEffects: [ExpectedEffectDTO]?
             let risk: String?
         }
+    }
+
+    private struct SearchRouteDTO: Decodable {
+        let routingIntent: String?
+        let candidateSources: [String]?
+        let cleanQuery: String?
     }
 
     private struct ExpectedEffectDTO: Decodable {

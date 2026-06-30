@@ -67,20 +67,128 @@ func agentTaskPlannerModelChangesMissCache() async {
 }
 
 @Test
-func agentTaskPlannerParseFailuresAreNotCachedAsSubtasks() async {
+func agentTaskPlannerCachesValidatedRepairResponses() async {
     let client = CountingTaskPlannerClient(replies: ["not json", validTaskPlanJSON])
     let planner = AgentTaskPlanner(
         client: CountingTaskPlannerCompleter(client: client),
         cache: ModelCallCache(ttl: 60)
     )
 
-    let fallback = await planner.plan(for: "book lunch", in: .webSandbox)
-    #expect(fallback.first?.task == "book lunch")
-    #expect(fallback.first?.startURL.hasPrefix("https://www.google.com/search?q=") == true)
+    let repaired = await planner.plan(for: "book lunch", in: .webSandbox)
+    #expect(repaired.first?.task == "Book lunch")
+    #expect(repaired.first?.startURL == "https://opentable.com")
 
-    let recovered = await planner.plan(for: "book lunch", in: .webSandbox)
-    #expect(recovered.first?.task == "Book lunch")
+    let cached = await planner.plan(for: "book lunch", in: .webSandbox)
+    #expect(cached.first?.task == "Book lunch")
     #expect(await client.count == 2)
 }
 
+@Test
+func searchRouteWithoutCacheCallsClientTwice() async {
+    let client = CountingTaskPlannerClient(replies: [validSearchRouteJSON])
+    let planner = AgentTaskPlanner(client: CountingTaskPlannerCompleter(client: client), cache: nil)
+
+    _ = await planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    _ = await planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+
+    #expect(await client.count == 2)
+}
+
+@Test
+func searchRouteEnabledCacheDedupesIdenticalInFlightRequests() async {
+    let client = CountingTaskPlannerClient(replies: [validSearchRouteJSON], delayNanos: 50_000_000)
+    let planner = AgentTaskPlanner(
+        client: CountingTaskPlannerCompleter(client: client),
+        cache: ModelCallCache(ttl: 60)
+    )
+
+    async let first = planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    async let second = planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    async let third = planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+
+    let results = await [first, second, third]
+
+    #expect(results.map(\.routingIntent) == [.web, .web, .web])
+    #expect(await client.count == 1)
+}
+
+@Test
+func searchRouteModelAndContextChangesMissCache() async {
+    let client = CountingTaskPlannerClient(replies: [validSearchRouteJSON])
+    let cache = ModelCallCache(ttl: 60)
+    let completer = CountingTaskPlannerCompleter(client: client)
+    let sonnetPlanner = AgentTaskPlanner(client: completer, model: AnthropicModel.sonnet, cache: cache)
+    let haikuPlanner = AgentTaskPlanner(client: completer, model: AnthropicModel.haiku, cache: cache)
+
+    _ = await sonnetPlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    _ = await sonnetPlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    _ = await sonnetPlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Notes\nWindow: Draft"
+    )
+    _ = await haikuPlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+
+    #expect(await client.count == 3)
+}
+
+@Test
+func searchRouteParseFailuresAreNotCached() async {
+    let client = CountingTaskPlannerClient(replies: ["not json", "still bad", validSearchRouteJSON])
+    let planner = AgentTaskPlanner(
+        client: CountingTaskPlannerCompleter(client: client),
+        cache: ModelCallCache(ttl: 60, failureTTL: 0)
+    )
+
+    let fallback = await planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari"
+    )
+    #expect(fallback.cleanQuery == "the latest exchange rate")
+    #expect(await client.count == 2)
+
+    let recovered = await planner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari"
+    )
+    #expect(recovered.routingIntent == .web)
+    #expect(recovered.cleanQuery == "latest exchange rate")
+    #expect(await client.count == 3)
+}
+
 private let validTaskPlanJSON = #"{"subtasks":[{"task":"Book lunch","startURL":"https://opentable.com","web":true,"note":""}]}"#
+private let validSearchRouteJSON = #"{"routingIntent":"web","candidateSources":["web"],"cleanQuery":"latest exchange rate"}"#

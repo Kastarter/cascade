@@ -54,6 +54,20 @@ func experimentalModelCallCacheDefaultsOffAndLeavesPureCallsUncached() async thr
     _ = await taskPlanner.plan(for: "book lunch", in: .webSandbox)
     _ = await taskPlanner.plan(for: "book lunch", in: .webSandbox)
     #expect(await taskClient.count == 2)
+
+    let routeClient = ModelCacheCountingClient(reply: validModelCacheSearchRouteJSON)
+    let routePlanner = AgentTaskPlanner(client: ModelCacheCountingCompleter(client: routeClient), cache: cache)
+    _ = await routePlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    _ = await routePlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    #expect(await routeClient.count == 2)
 }
 
 @MainActor @Test
@@ -80,6 +94,20 @@ func experimentalModelCallCacheEnabledDedupesPlannerCuratorAndTaskPlannerCalls()
     _ = await taskPlanner.plan(for: "book lunch", in: .webSandbox)
     _ = await taskPlanner.plan(for: "book lunch", in: .webSandbox)
     #expect(await taskClient.count == 1)
+
+    let routeClient = ModelCacheCountingClient(reply: validModelCacheSearchRouteJSON)
+    let routePlanner = AgentTaskPlanner(client: ModelCacheCountingCompleter(client: routeClient), cache: cache)
+    _ = await routePlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    _ = await routePlanner.routeSearch(
+        for: "look up the latest exchange rate",
+        in: .onScreen,
+        conversationContext: "Frontmost app: Safari\nWindow: Exchange rates"
+    )
+    #expect(await routeClient.count == 1)
 }
 
 @Test
@@ -105,6 +133,7 @@ func sourcesDoNotDiscardCacheRequestResults() throws {
 private let validModelCacheStepJSON = #"{"rationale":"open it","confidence":0.8,"action":{"kind":"click","x":12,"y":34}}"#
 private let validModelCacheCuratorJSON = #"{"agents":[{"index":0,"name":"File invoices","why":"Avoids repeated filing","goal":"File new invoices into the tracker","value":0.82}]}"#
 private let validModelCacheTaskPlanJSON = #"{"subtasks":[{"task":"Book lunch","startURL":"https://opentable.com","web":true,"note":""}]}"#
+private let validModelCacheSearchRouteJSON = #"{"routingIntent":"web","candidateSources":["web"],"cleanQuery":"latest exchange rate"}"#
 
 private func modelCacheWaste() -> DetectedWaste {
     DetectedWaste(

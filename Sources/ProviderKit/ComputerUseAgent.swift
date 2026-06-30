@@ -241,6 +241,9 @@ public final class ComputerUseAgent {
     /// web sandbox), so their behaviour is unchanged.
     private let recallEnabled: Bool
     private let includeStructuredRecallContent: Bool
+    /// Default-off SEQ-31 prompt shape: when enabled, source-selection guidance is
+    /// one resource catalog instead of separate file and recall prose blocks.
+    private let resourceCatalogEnabled: Bool
     /// Grounding split (Phase 1): when set, the on-screen agent is offered
     /// `fill_target`, where the model NAMES a target and the RUNTIME locates it via
     /// this grounder (local UI-TARS or Claude) and acts on it — the model never has
@@ -454,19 +457,30 @@ public final class ComputerUseAgent {
     static func renderedSystemPrompt(
         structural: Bool,
         harnessTier: HarnessTier,
-        recallEnabled: Bool
+        recallEnabled: Bool,
+        resourceCatalogEnabled: Bool = false
     ) -> String {
         var system = structural ? structuralSystemPrompt : systemPrompt
-        switch harnessTier {
-        case .off:
-            break
-        case .readOnly:
-            system += "\n\n<harness_contract>\n" + Self.harnessReadOnlyNote + "\n</harness_contract>"
-        case .full:
-            system += "\n\n<harness_contract>\n" + Self.harnessReadOnlyNote + "\n\n" + Self.harnessPowerNote + "\n</harness_contract>"
-        }
-        if recallEnabled {
-            system += "\n\n<tool_contract>\n" + Self.recallNote + "\n</tool_contract>"
+        if resourceCatalogEnabled {
+            system += "\n\n<resource_catalog>\n" + Self.resourceCatalogNote(
+                harnessTier: harnessTier,
+                recallEnabled: recallEnabled
+            ) + "\n</resource_catalog>"
+            if harnessTier == .full {
+                system += "\n\n<harness_contract>\n" + Self.harnessPowerNote + "\n</harness_contract>"
+            }
+        } else {
+            switch harnessTier {
+            case .off:
+                break
+            case .readOnly:
+                system += "\n\n<harness_contract>\n" + Self.harnessReadOnlyNote + "\n</harness_contract>"
+            case .full:
+                system += "\n\n<harness_contract>\n" + Self.harnessReadOnlyNote + "\n\n" + Self.harnessPowerNote + "\n</harness_contract>"
+            }
+            if recallEnabled {
+                system += "\n\n<tool_contract>\n" + Self.recallNote + "\n</tool_contract>"
+            }
         }
         return system
     }
@@ -556,6 +570,21 @@ public final class ComputerUseAgent {
     user's own past, not the live screen; for what is on screen now, just look.
     """
 
+    nonisolated public static func resourceCatalogNote(harnessTier: HarnessTier, recallEnabled: Bool) -> String {
+        var cards = [
+            "- On screen now: use the live screenshot/AX context. Best for \"what does this say?\", \"summarize this page\", or anything visibly present. Cost: free, zero latency."
+        ]
+        if recallEnabled {
+            cards.append("- Recorded memory: search_record, get_timeframe, inspect_moment, list_sessions. Best for \"the email I had open earlier\", \"what did I work on this morning?\", or \"that dashboard number\". Cost: cheap, local, instant.")
+        }
+        if harnessTier != .off {
+            cards.append("- Local files: search_files, list_folder, read_file. Best for \"find X on my Mac\", \"what is in that folder?\", or \"open/read the contract\". Cost: cheap, local, instant.")
+        }
+        cards.append("- Web: use the browser/web sandbox when the answer is current, public, or not on this Mac. Best for \"latest/current facts\", world knowledge, prices, news, and external sites. Cost: expensive, slower, network.")
+        cards.append("Pick the cheapest source that can answer the ask. For ambiguous searches, try recorded memory or local files before web; only finish after actually searching a matching source.")
+        return cards.joined(separator: "\n")
+    }
+
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
     /// a tab bar. Not used by the single-view web sandbox.
     public static let foregroundBrowserNote = """
@@ -576,6 +605,7 @@ public final class ComputerUseAgent {
         extraTools: [[String: Any]] = [],
         recallEnabled: Bool = false,
         includeStructuredRecallContent: Bool = false,
+        resourceCatalogEnabled: Bool = false,
         grounder: VisualGrounder? = nil,
         groundingMode: GroundingMode = .coordinate,
         groundingCropProvider: (@Sendable (CGRect, Int, Int) async -> GroundingCrop?)? = nil,
@@ -596,6 +626,7 @@ public final class ComputerUseAgent {
         // there is nothing to route the calls to.
         self.recallEnabled = recallEnabled && harnessProvider != nil
         self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
+        self.resourceCatalogEnabled = resourceCatalogEnabled
         self.grounder = grounder
         self.groundingCropProvider = groundingCropProvider
         self.groundingCache = groundingCache
@@ -702,6 +733,25 @@ public final class ComputerUseAgent {
         return await step()
     }
 
+    /// Continue after a runtime-owned guard blocked a premature terminal answer.
+    /// There is no pending tool_result to answer in this case, so inject a fresh user
+    /// turn with the current screenshot and the guard's note while preserving history.
+    public func continueAfterNudge(screenshot: Data, note: String) async -> CUStep {
+        guard let jpeg = resize(screenshot, resW, resH) else {
+            return CUStep(actions: [], text: "I couldn't read the screen.", done: true)
+        }
+        lastFrameJPEG = jpeg
+        pendingToolIDs = []
+        toolResultOverrides = [:]
+        var content: [[String: Any]] = []
+        content.append(contentsOf: runtimeContextBlocks(note: nil))
+        content.append(["type": "text", "text": note])
+        content.append(imageBlock(jpeg))
+        messages.append(["role": "user", "content": content])
+        pruneScreenshots()
+        return await step()
+    }
+
     private func step(retryOnTruncation: Bool = true, inlineHops: Int = 0) async -> CUStep {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return CUStep(actions: [], text: "Connect your Claude key first.", done: true)
@@ -804,7 +854,8 @@ public final class ComputerUseAgent {
         let system = Self.renderedSystemPrompt(
             structural: isStructural,
             harnessTier: harnessTier,
-            recallEnabled: recallEnabled
+            recallEnabled: recallEnabled,
+            resourceCatalogEnabled: resourceCatalogEnabled
         )
         // Adaptive thinking is Anthropic's benchmarked setup for computer use on
         // Sonnet 4.6: the model plans before acting, and fewer wrong clicks means
