@@ -78,7 +78,7 @@ public enum AnchorDriftScorer {
         public init(
             maximumStableScoreDrop: Double = 0.15,
             sourceChangeScoreDrop: Double = 0.06,
-            ambiguousTopMargin: Double = 0.035,
+            ambiguousTopMargin: Double = 0.05,
             retryNextCandidateMargin: Double = 0.05,
             minimumRetryScore: Double = 0.60,
             demoteFailureCount: Int = 3,
@@ -172,10 +172,11 @@ public enum AnchorDriftScorer {
             return Result(outcome: .ambiguous, selected: best, alternate: second, reasons: reasons)
         }
 
-        let identityChanged = reasons.contains(.sourceChanged) || reasons.contains(.hashChanged)
+        let sourceChanged = reasons.contains(.sourceChanged)
+        let identityChanged = sourceChanged || reasons.contains(.hashChanged)
         let sourceSensitiveDrop = scoreDrop > configuration.sourceChangeScoreDrop
         let failedWithoutRetry = best.failureCount > 0
-        if reasons.contains(.scoreDrop) || (isRecent && identityChanged && sourceSensitiveDrop) || failedWithoutRetry {
+        if reasons.contains(.scoreDrop) || sourceChanged || (isRecent && identityChanged && sourceSensitiveDrop) || failedWithoutRetry {
             return Result(outcome: .drifted, selected: best, alternate: second, reasons: reasons)
         }
 

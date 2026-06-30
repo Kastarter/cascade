@@ -44,10 +44,16 @@ public enum AXTargetDescriptorBuilder {
         "AXSlider", "AXDisclosureTriangle",
     ]
 
-    public static func descriptor(for element: AXUIElement, fallbackLabel: String? = nil) -> AXTargetDescriptorV2 {
+    public static func descriptor(
+        for element: AXUIElement,
+        fallbackLabel: String? = nil,
+        windowTitle: String? = nil,
+        createdFrom: String? = nil
+    ) -> AXTargetDescriptorV2 {
         AXClient.setMessagingTimeout(element)
         let role = string(element, kAXRoleAttribute as String)
         let label = fallbackLabel ?? labelText(of: element) ?? ""
+        let safeWindowTitle = sanitizedContextText(windowTitle)
         let value = string(element, kAXValueAttribute as String)
         let frame = frame(of: element)
         let ancestorPath = ancestors(of: element)
@@ -55,15 +61,25 @@ public enum AXTargetDescriptorBuilder {
         let bucket = frame.map(frameBucketString)
         let exactFrame = frame.map(frameString)
         let subtree = subtreeShape(of: element, maxDepth: 2, maxNodes: 24)
-        let structuralPath = (ancestorPath + [role, String(sibling.index ?? -1)].compactMap { $0 }).joined(separator: "|")
+        let semanticPhrase = AXTargetDescriptorV2.semanticPhrase(
+            label: label,
+            role: role,
+            container: ancestorPath.last,
+            ancestorPath: ancestorPath,
+            neighborLabels: sibling.neighborLabels,
+            windowTitle: safeWindowTitle
+        )
+        let structuralPath = (ancestorPath + [role, String(sibling.roleIndex ?? sibling.index ?? -1)].compactMap { $0 }).joined(separator: "|")
 
         return AXTargetDescriptorV2(
             label: label,
             role: role,
             identifier: string(element, kAXIdentifierAttribute as String),
             container: ancestorPath.last,
+            windowTitle: safeWindowTitle,
             ancestorPath: ancestorPath,
             siblingIndex: sibling.index,
+            siblingRoleIndex: sibling.roleIndex,
             neighborLabels: sibling.neighborLabels,
             frameBucket: bucket,
             frame: exactFrame,
@@ -74,19 +90,33 @@ public enum AXTargetDescriptorBuilder {
             pathHash: structuralPath.isEmpty ? nil : AuditIdentity.hash(structuralPath),
             subtree: subtree.summary,
             subtreeHash: subtree.hash,
-            semanticHash: semanticHash(role: role, label: label)
+            semanticTextHash: AXTargetDescriptorV2.semanticTextHash(for: semanticPhrase),
+            semanticHash: semanticHash(role: role, label: label),
+            createdFrom: createdFrom
         )
     }
 
-    public static func encodedDescriptor(for element: AXUIElement, fallbackLabel: String? = nil) -> String? {
-        let descriptor = descriptor(for: element, fallbackLabel: fallbackLabel)
+    public static func encodedDescriptor(
+        for element: AXUIElement,
+        fallbackLabel: String? = nil,
+        windowTitle: String? = nil,
+        createdFrom: String? = nil
+    ) -> String? {
+        let descriptor = descriptor(
+            for: element,
+            fallbackLabel: fallbackLabel,
+            windowTitle: windowTitle,
+            createdFrom: createdFrom
+        )
         guard descriptor.hasSignal else { return nil }
         return descriptor.encodedJSON()
     }
 
     public static func labeledActionableAncestor(
         from element: AXUIElement,
-        maxHops: Int = 4
+        maxHops: Int = 4,
+        windowTitle: String? = nil,
+        createdFrom: String? = nil
     ) -> (element: AXUIElement, label: String, descriptor: String?)? {
         var current = element
         for _ in 0..<maxHops {
@@ -97,7 +127,12 @@ public enum AXTargetDescriptorBuilder {
                 return (
                     current,
                     String(label.prefix(80)),
-                    encodedDescriptor(for: current, fallbackLabel: String(label.prefix(80)))
+                    encodedDescriptor(
+                        for: current,
+                        fallbackLabel: String(label.prefix(80)),
+                        windowTitle: windowTitle,
+                        createdFrom: createdFrom
+                    )
                 )
             }
             guard let parent = parent(of: current) else { break }
@@ -153,17 +188,26 @@ public enum AXTargetDescriptorBuilder {
         return out
     }
 
-    private static func siblingInfo(for element: AXUIElement) -> (index: Int?, neighborLabels: [String]) {
+    private static func sanitizedContextText(_ text: String?) -> String? {
+        guard let text, !PrivacyRules.isSensitiveText(text) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(80))
+    }
+
+    private static func siblingInfo(for element: AXUIElement) -> (index: Int?, roleIndex: Int?, neighborLabels: [String]) {
         guard let parent = parent(of: element),
               case .success(let children) = AXClient.children(parent),
               let index = children.firstIndex(where: { CFEqual($0, element) }) else {
-            return (nil, [])
+            return (nil, nil, [])
         }
+        let role = string(element, kAXRoleAttribute as String)
+        let sameRoleBefore = children[..<index].filter { string($0, kAXRoleAttribute as String) == role }.count
+        let roleIndex = role == nil ? nil : sameRoleBefore
         let labels = [index - 1, index + 1].compactMap { candidate -> String? in
             guard children.indices.contains(candidate) else { return nil }
             return labelText(of: children[candidate]).map { String($0.prefix(60)) }
         }
-        return (index, labels)
+        return (index, roleIndex, labels)
     }
 
     private static func frameBucketString(_ frame: CGRect) -> String {
@@ -373,16 +417,16 @@ public final class InputRecorder: @unchecked Sendable {
         let now = Date()
         let location = Where(app: context.app, bundle: context.bundle, window: context.window)
 
-        switch type {
-        case .leftMouseDown:
-            let clickState = event.getIntegerValueField(.mouseEventClickState)
-            let point = event.location
-            enqueue(.click(x: Double(point.x), y: Double(point.y), double: clickState >= 2, at: now, in: location))
-            resolveClickLabel(at: point, when: now)
-        case .rightMouseDown:
-            let point = event.location
-            enqueue(.rightClick(x: Double(point.x), y: Double(point.y), at: now, in: location))
-            resolveClickLabel(at: point, when: now)
+	        switch type {
+	        case .leftMouseDown:
+	            let clickState = event.getIntegerValueField(.mouseEventClickState)
+	            let point = event.location
+	            enqueue(.click(x: Double(point.x), y: Double(point.y), double: clickState >= 2, at: now, in: location))
+	            resolveClickLabel(at: point, when: now, windowTitle: location.window)
+	        case .rightMouseDown:
+	            let point = event.location
+	            enqueue(.rightClick(x: Double(point.x), y: Double(point.y), at: now, in: location))
+	            resolveClickLabel(at: point, when: now, windowTitle: location.window)
         case .scrollWheel:
             let dy = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
             let dx = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
@@ -430,9 +474,9 @@ public final class InputRecorder: @unchecked Sendable {
     /// must stay fast). Runs only for events that already passed the app/window
     /// privacy gate; the label TEXT gets its own check — an element title can
     /// smuggle a sensitive phrase out of an otherwise unflagged window.
-    private func resolveClickLabel(at point: CGPoint, when: Date) {
+    private func resolveClickLabel(at point: CGPoint, when: Date, windowTitle: String?) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, let hit = Self.axClickTarget(atCG: point) else { return }
+            guard let self, let hit = Self.axClickTarget(atCG: point, windowTitle: windowTitle) else { return }
             let label = InputEventSanitizer.sanitize(text: hit.label, kind: .click)
             let descriptor = InputEventSanitizer.sanitize(descriptor: hit.descriptor)
             guard label != nil || descriptor != nil else { return }
@@ -470,13 +514,17 @@ public final class InputRecorder: @unchecked Sendable {
     /// ranks on so a moved/renamed control is still re-found (XCUIAutomation-style:
     /// identifier first, then role to disambiguate equal labels). `descriptor` is
     /// `nil` when the matched ancestor exposes neither a usable role nor identifier.
-    private static func axClickTarget(atCG point: CGPoint) -> (label: String, descriptor: String?)? {
+    private static func axClickTarget(atCG point: CGPoint, windowTitle: String?) -> (label: String, descriptor: String?)? {
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.3)
         var ref: AXUIElement?
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
               let element = ref else { return nil }
-        return AXTargetDescriptorBuilder.labeledActionableAncestor(from: element).map {
+        return AXTargetDescriptorBuilder.labeledActionableAncestor(
+            from: element,
+            windowTitle: windowTitle,
+            createdFrom: "input_recorder"
+        ).map {
             ($0.label, $0.descriptor)
         }
     }

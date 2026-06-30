@@ -144,15 +144,95 @@ public enum AXElementResolver {
         }
     }
 
+    public enum CandidateSource: String, Codable, Sendable, Equatable {
+        case accessibility
+        case synthetic
+        case unknown
+    }
+
+    public struct ScoreBreakdown: Sendable, Equatable {
+        public let identifier: Double
+        public let label: Double
+        public let role: Double
+        public let structuralPath: Double
+        public let neighborLabels: Double
+        public let frameProximity: Double
+        public let subtreeHash: Double
+        public let semanticText: Double
+        public let totalScore: Double
+        public let availableWeight: Double
+        public let confidence: Double
+
+        public init(
+            identifier: Double = 0,
+            label: Double = 0,
+            role: Double = 0,
+            structuralPath: Double = 0,
+            neighborLabels: Double = 0,
+            frameProximity: Double = 0,
+            subtreeHash: Double = 0,
+            semanticText: Double = 0,
+            totalScore: Double = 0,
+            availableWeight: Double = 0,
+            confidence: Double = 0
+        ) {
+            self.identifier = identifier
+            self.label = label
+            self.role = role
+            self.structuralPath = structuralPath
+            self.neighborLabels = neighborLabels
+            self.frameProximity = frameProximity
+            self.subtreeHash = subtreeHash
+            self.semanticText = semanticText
+            self.totalScore = totalScore
+            self.availableWeight = availableWeight
+            self.confidence = confidence
+        }
+
+        public static let empty = ScoreBreakdown()
+    }
+
     public struct Candidate: Sendable, Equatable {
         public let id: String
-        public let descriptor: AXTargetDescriptorV2
         public let center: CGPoint?
+        public let frame: CGRect?
+        public let descriptor: AXTargetDescriptorV2
+        public let source: CandidateSource
+        public let componentScores: ScoreBreakdown
+        public let totalScore: Double
+        public let confidence: Double
 
-        public init(id: String, descriptor: AXTargetDescriptorV2, center: CGPoint? = nil) {
+        public init(
+            id: String,
+            descriptor: AXTargetDescriptorV2,
+            center: CGPoint? = nil,
+            frame: CGRect? = nil,
+            source: CandidateSource = .unknown,
+            componentScores: ScoreBreakdown = .empty,
+            totalScore: Double = 0,
+            confidence: Double = 0
+        ) {
             self.id = id
-            self.descriptor = descriptor
             self.center = center
+            self.frame = frame
+            self.descriptor = descriptor
+            self.source = source
+            self.componentScores = componentScores
+            self.totalScore = totalScore
+            self.confidence = confidence
+        }
+
+        func ranked(with components: ScoreBreakdown) -> Candidate {
+            Candidate(
+                id: id,
+                descriptor: descriptor,
+                center: center,
+                frame: frame,
+                source: source,
+                componentScores: components,
+                totalScore: components.totalScore,
+                confidence: components.confidence
+            )
         }
     }
 
@@ -163,12 +243,14 @@ public enum AXElementResolver {
         public let score: Double
         public let confidence: Double
         public let distance: Double?
+        public let components: ScoreBreakdown
 
-        public init(candidate: Candidate, score: Double, confidence: Double, distance: Double? = nil) {
+        public init(candidate: Candidate, score: Double, confidence: Double, distance: Double? = nil, components: ScoreBreakdown = .empty) {
             self.candidate = candidate
             self.score = score
             self.confidence = confidence
             self.distance = distance
+            self.components = components
         }
     }
 
@@ -182,7 +264,9 @@ public enum AXElementResolver {
 
     private static let maxNodes = 1_400
     private static let maxDepth = 16
-    public static let defaultMinimumConfidence = 0.72
+    public static let automaticHealMinimumConfidence = 0.78
+    public static let rerankMinimumConfidence = 0.60
+    public static let defaultMinimumConfidence = automaticHealMinimumConfidence
 
     /// Finds the best element matching `label` in the frontmost app's windows.
     /// Thin wrapper over `find(descriptor:)` for callers that only have a label —
@@ -229,32 +313,27 @@ public enum AXElementResolver {
     /// can't run away on a huge tree.
     public static func interactables(limit: Int = 40) -> [Match] {
         guard AXIsProcessTrusted(),
-              let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.3)
-
-        var out: [Match] = []
+              NSWorkspace.shared.frontmostApplication != nil else { return [] }
         var seen = Set<String>()
-        var visited = 0
-        for window in windows(of: app) {
-            walk(window, depth: 0, visited: &visited) { element, role in
-                guard out.count < limit, actionableRoles.contains(role),
-                      let text = labelText(of: element) else { return }
-                let key = normalize(text)
-                guard !key.isEmpty, key.count <= 60 else { return }
-                let dedupe = role + "|" + key
-                guard !seen.contains(dedupe) else { return }
-                guard let frame = frame(of: element), frame.width > 1, frame.height > 1 else { return }
-                seen.insert(dedupe)
-                let descriptor = AXTargetDescriptorBuilder.descriptor(for: element, fallbackLabel: String(text.prefix(60)))
-                out.append(Match(
-                    center: CGPoint(x: frame.midX, y: frame.midY),
-                    role: role,
-                    title: String(text.prefix(60)),
-                    score: 0,
-                    descriptor: descriptor
-                ))
-            }
+        var out: [Match] = []
+        for candidate in liveCandidates().prefix(limit * 3) {
+            let descriptor = candidate.descriptor
+            let role = descriptor.role ?? ""
+            guard out.count < limit,
+                  actionableRoles.contains(role),
+                  let center = candidate.center else { continue }
+            let key = normalize(descriptor.label)
+            guard !key.isEmpty, key.count <= 60 else { continue }
+            let dedupe = role + "|" + key
+            guard !seen.contains(dedupe) else { continue }
+            seen.insert(dedupe)
+            out.append(Match(
+                center: center,
+                role: role,
+                title: String(descriptor.label.prefix(60)),
+                score: candidate.confidence,
+                descriptor: descriptor
+            ))
         }
         return out
     }
@@ -307,8 +386,14 @@ public enum AXElementResolver {
             if descriptor?.focused == true {
                 hints.append("focused")
             }
-            if let sibling = descriptor?.siblingIndex {
-                hints.append("sibling \(sibling)")
+            if let sibling = descriptor?.siblingRoleIndex ?? descriptor?.siblingIndex {
+                hints.append("roleSibling \(sibling)")
+            }
+            if let frameBucket = bounded(descriptor?.frameBucket ?? descriptor?.frame, limit: 32) {
+                hints.append("frame \(frameBucket)")
+            }
+            if let source = descriptor?.createdFrom {
+                hints.append("source \(source)")
             }
             return "“\(title)” (\(hints.joined(separator: "; ")))"
         }
@@ -388,16 +473,19 @@ public enum AXElementResolver {
 
     // MARK: - Matching
 
+    public typealias SemanticSimilarity = @Sendable (_ recordedPhrase: String, _ candidatePhrase: String) -> Double?
+
     /// Similo-style weighted ranking over recorded descriptor signals. Missing recorded
     /// signals are ignored so legacy/thin descriptors do not get unfairly penalized;
     /// missing candidate signals score zero when the recording had that signal.
     public static func rank(
         recorded: AXTargetDescriptorV2,
         candidates: [Candidate],
-        near recordedPoint: CGPoint? = nil
+        near recordedPoint: CGPoint? = nil,
+        semanticSimilarity: SemanticSimilarity? = nil
     ) -> [RankedCandidate] {
         candidates
-            .map { rank(recorded: recorded, candidate: $0, near: recordedPoint) }
+            .map { rank(recorded: recorded, candidate: $0, near: recordedPoint, semanticSimilarity: semanticSimilarity) }
             .filter { $0.confidence > 0 }
             .sorted { lhs, rhs in
                 if abs(lhs.confidence - rhs.confidence) > 0.000_001 {
@@ -418,13 +506,37 @@ public enum AXElementResolver {
 
     public static func rank(
         recorded: AXTargetDescriptorV2,
+        near recordedPoint: CGPoint? = nil,
+        limit: Int = 5
+    ) -> [RankedCandidate] {
+        guard recorded.hasSignal,
+              AXIsProcessTrusted(),
+              NSWorkspace.shared.frontmostApplication != nil else { return [] }
+        return Array(rank(recorded: recorded, candidates: liveCandidates(), near: recordedPoint).prefix(max(0, limit)))
+    }
+
+    public static func rank(
+        recorded: AXTargetDescriptorV2,
         candidate: Candidate,
-        near recordedPoint: CGPoint? = nil
+        near recordedPoint: CGPoint? = nil,
+        semanticSimilarity: SemanticSimilarity? = nil
     ) -> RankedCandidate {
-        let scored = weightedScore(recorded: recorded, candidate: candidate.descriptor)
-        let confidence = scored.availableWeight > 0 ? min(max(scored.score / scored.availableWeight, 0), 1) : 0
+        let scored = weightedScore(
+            recorded: recorded,
+            candidate: candidate.descriptor,
+            recordedPoint: recordedPoint,
+            candidateCenter: candidate.center,
+            semanticSimilarity: semanticSimilarity
+        )
         let distance = distance(from: recordedPoint, to: candidate.center)
-        return RankedCandidate(candidate: candidate, score: scored.score, confidence: confidence, distance: distance)
+        let rankedCandidate = candidate.ranked(with: scored)
+        return RankedCandidate(
+            candidate: rankedCandidate,
+            score: scored.totalScore,
+            confidence: scored.confidence,
+            distance: distance,
+            components: scored
+        )
     }
 
     /// Pure thresholded wrapper for tests and future synthetic candidate harvesters. The
@@ -434,10 +546,11 @@ public enum AXElementResolver {
         candidates: [Candidate],
         near recordedPoint: CGPoint? = nil,
         minimumConfidence: Double = defaultMinimumConfidence,
-        scoreCap: Double? = nil
+        scoreCap: Double? = nil,
+        semanticSimilarity: SemanticSimilarity? = nil
     ) -> RankedCandidate? {
         let threshold = scoreCap ?? minimumConfidence
-        return rank(recorded: recorded, candidates: candidates, near: recordedPoint)
+        return rank(recorded: recorded, candidates: candidates, near: recordedPoint, semanticSimilarity: semanticSimilarity)
             .first { $0.confidence >= threshold }
     }
 
@@ -450,14 +563,9 @@ public enum AXElementResolver {
         guard recorded.hasSignal,
               AXIsProcessTrusted(),
               NSWorkspace.shared.frontmostApplication != nil else { return nil }
-        let candidates = liveCandidates()
-        guard let ranked = find(
-            recorded: recorded,
-            candidates: candidates,
-            near: recordedPoint,
-            minimumConfidence: minimumConfidence,
-            scoreCap: scoreCap
-        ),
+        let threshold = scoreCap ?? minimumConfidence
+        guard let ranked = rank(recorded: recorded, near: recordedPoint, limit: 5)
+            .first(where: { $0.confidence >= threshold }),
             let center = ranked.candidate.center else { return nil }
         let descriptor = ranked.candidate.descriptor
         return Match(
@@ -504,36 +612,93 @@ public enum AXElementResolver {
         return labelScore + roleBonus + containerBonus
     }
 
+    private enum ComponentWeight {
+        static let identifier = 0.30
+        static let label = 0.20
+        static let role = 0.10
+        static let structuralPath = 0.15
+        static let neighborLabels = 0.10
+        static let frameProximity = 0.05
+        static let subtreeHash = 0.05
+        static let semanticText = 0.05
+    }
+
     private static func weightedScore(
         recorded: AXTargetDescriptorV2,
-        candidate: AXTargetDescriptorV2
-    ) -> (score: Double, availableWeight: Double) {
+        candidate: AXTargetDescriptorV2,
+        recordedPoint: CGPoint?,
+        candidateCenter: CGPoint?,
+        semanticSimilarity: SemanticSimilarity?
+    ) -> ScoreBreakdown {
         var score = 0.0
         var available = 0.0
+        var identifier = 0.0
+        var label = 0.0
+        var role = 0.0
+        var structuralPath = 0.0
+        var neighborLabels = 0.0
+        var frameProximity = 0.0
+        var subtreeHash = 0.0
+        var semanticText = 0.0
 
-        func add(_ weight: Double, active: Bool, similarity: () -> Double) {
-            guard active else { return }
+        func add(_ weight: Double, active: Bool, assign: (Double) -> Void, similarity: () -> Double) {
+            guard active else {
+                assign(0)
+                return
+            }
             available += weight
-            score += weight * min(max(similarity(), 0), 1)
+            let value = min(max(similarity(), 0), 1)
+            assign(value)
+            score += weight * value
         }
 
-        add(0.40, active: recorded.identifier != nil) {
+        add(ComponentWeight.identifier, active: recorded.identifier != nil, assign: { identifier = $0 }) {
             exactSimilarity(recorded.identifier, candidate.identifier)
         }
-        add(0.15, active: recorded.role != nil) {
-            exactSimilarity(recorded.role, candidate.role)
-        }
-        add(0.20, active: !recorded.label.isEmpty) {
+        add(ComponentWeight.label, active: !recorded.label.isEmpty, assign: { label = $0 }) {
             matchScore(needle: normalize(recorded.label), candidate: normalize(candidate.label)) / 3.0
         }
-        add(0.15, active: hasStructuralSignal(recorded)) {
-            structuralSimilarity(recorded, candidate)
+        add(ComponentWeight.role, active: recorded.role != nil, assign: { role = $0 }) {
+            exactSimilarity(recorded.role, candidate.role)
         }
-        add(0.10, active: recorded.frameBucket != nil || recorded.frame != nil) {
-            frameSimilarity(recorded, candidate)
+        add(ComponentWeight.structuralPath, active: hasStructuralPathSignal(recorded), assign: { structuralPath = $0 }) {
+            structuralPathSimilarity(recorded, candidate)
+        }
+        add(ComponentWeight.neighborLabels, active: !recorded.neighborLabels.isEmpty, assign: { neighborLabels = $0 }) {
+            labelSetSimilarity(recorded.neighborLabels, candidate.neighborLabels)
+        }
+        add(
+            ComponentWeight.frameProximity,
+            active: recorded.frameBucket != nil || recorded.frame != nil || recordedPoint != nil,
+            assign: { frameProximity = $0 }
+        ) {
+            frameSimilarity(recorded, candidate, recordedPoint: recordedPoint, candidateCenter: candidateCenter)
+        }
+        add(ComponentWeight.subtreeHash, active: recorded.subtreeHash != nil || recorded.visualPatchHash != nil, assign: { subtreeHash = $0 }) {
+            max(
+                exactSimilarity(recorded.subtreeHash, candidate.subtreeHash),
+                exactSimilarity(recorded.visualPatchHash, candidate.visualPatchHash)
+            )
+        }
+        add(ComponentWeight.semanticText, active: hasSemanticSignal(recorded), assign: { semanticText = $0 }) {
+            semanticTextSimilarity(recorded, candidate, semanticSimilarity: semanticSimilarity)
         }
 
-        return (score, available)
+        let confidence = available > 0 ? min(max(score / available, 0), 1) : 0
+
+        return ScoreBreakdown(
+            identifier: identifier,
+            label: label,
+            role: role,
+            structuralPath: structuralPath,
+            neighborLabels: neighborLabels,
+            frameProximity: frameProximity,
+            subtreeHash: subtreeHash,
+            semanticText: semanticText,
+            totalScore: score,
+            availableWeight: available,
+            confidence: confidence
+        )
     }
 
     private static func recordedStructuralPath(_ descriptor: AXTargetDescriptorV2) -> [String] {
@@ -541,13 +706,16 @@ public enum AXElementResolver {
         return descriptor.container.map { [$0] } ?? []
     }
 
-    private static func hasStructuralSignal(_ descriptor: AXTargetDescriptorV2) -> Bool {
+    private static func hasStructuralPathSignal(_ descriptor: AXTargetDescriptorV2) -> Bool {
         !recordedStructuralPath(descriptor).isEmpty
             || descriptor.pathHash != nil
-            || descriptor.subtreeHash != nil
-            || descriptor.semanticHash != nil
-            || !descriptor.neighborLabels.isEmpty
             || descriptor.siblingIndex != nil
+            || descriptor.siblingRoleIndex != nil
+    }
+
+    private static func hasSemanticSignal(_ descriptor: AXTargetDescriptorV2) -> Bool {
+        descriptor.semanticTextHash != nil
+            || descriptor.semanticHash != nil
     }
 
     private static func exactSimilarity(_ recorded: String?, _ candidate: String?) -> Double {
@@ -585,26 +753,51 @@ public enum AXElementResolver {
         return 0
     }
 
-    private static func structuralSimilarity(_ recorded: AXTargetDescriptorV2, _ candidate: AXTargetDescriptorV2) -> Double {
+    private static func structuralPathSimilarity(_ recorded: AXTargetDescriptorV2, _ candidate: AXTargetDescriptorV2) -> Double {
         var best = pathSimilarity(recordedStructuralPath(recorded), recordedStructuralPath(candidate))
         best = max(best, exactSimilarity(recorded.pathHash, candidate.pathHash))
-        best = max(best, exactSimilarity(recorded.subtreeHash, candidate.subtreeHash) * 0.50)
-        best = max(best, exactSimilarity(recorded.semanticHash, candidate.semanticHash) * 0.30)
-        best = max(best, labelSetSimilarity(recorded.neighborLabels, candidate.neighborLabels) * 0.35)
-        best = max(best, siblingSimilarity(recorded.siblingIndex, candidate.siblingIndex) * 0.15)
+        best = max(best, siblingSimilarity(recorded.siblingRoleIndex, candidate.siblingRoleIndex) * 0.25)
+        best = max(best, siblingSimilarity(recorded.siblingIndex, candidate.siblingIndex) * 0.10)
         return best
     }
 
-    private static func frameSimilarity(_ recorded: AXTargetDescriptorV2, _ candidate: AXTargetDescriptorV2) -> Double {
+    private static func frameSimilarity(
+        _ recorded: AXTargetDescriptorV2,
+        _ candidate: AXTargetDescriptorV2,
+        recordedPoint: CGPoint?,
+        candidateCenter: CGPoint?
+    ) -> Double {
+        var best = 0.0
+        if let recordedPoint, let candidateCenter {
+            let distance = hypot(candidateCenter.x - recordedPoint.x, candidateCenter.y - recordedPoint.y)
+            best = max(best, max(0, 1 - distance / 900.0))
+        }
         if exactSimilarity(recorded.frameBucket, candidate.frameBucket) == 1 { return 1 }
         if exactSimilarity(recorded.frame, candidate.frame) == 1 { return 1 }
         guard let recordedBucket = bucketTuple(recorded.frameBucket),
-              let candidateBucket = bucketTuple(candidate.frameBucket) else { return 0 }
+              let candidateBucket = bucketTuple(candidate.frameBucket) else { return best }
         let distance = abs(recordedBucket.0 - candidateBucket.0)
             + abs(recordedBucket.1 - candidateBucket.1)
             + abs(recordedBucket.2 - candidateBucket.2)
             + abs(recordedBucket.3 - candidateBucket.3)
-        return max(0, 1 - Double(distance) / 40.0)
+        return max(best, max(0, 1 - Double(distance) / 40.0))
+    }
+
+    private static func semanticTextSimilarity(
+        _ recorded: AXTargetDescriptorV2,
+        _ candidate: AXTargetDescriptorV2,
+        semanticSimilarity: SemanticSimilarity?
+    ) -> Double {
+        if exactSimilarity(recorded.semanticTextHash, candidate.semanticTextHash) == 1 { return 1 }
+        if exactSimilarity(recorded.semanticHash, candidate.semanticHash) == 1 { return 1 }
+        let recordedPhrase = recorded.semanticPhrase
+        let candidatePhrase = candidate.semanticPhrase
+        if let injected = semanticSimilarity?(recordedPhrase, candidatePhrase) {
+            return min(max(injected, 0), 1)
+        }
+        guard let recordedVector = LocalSemanticVector.vector(for: recordedPhrase),
+              let candidateVector = LocalSemanticVector.vector(for: candidatePhrase) else { return 0 }
+        return min(max(Double(LocalSemanticVector.cosine(recordedVector, candidateVector)), 0), 1)
     }
 
     private static func bucketTuple(_ value: String?) -> (Int, Int, Int, Int)? {
@@ -647,7 +840,7 @@ public enum AXElementResolver {
         return windows
     }
 
-    private static func liveCandidates(limit: Int = maxNodes) -> [Candidate] {
+    public static func liveCandidates(limit: Int = 1_400) -> [Candidate] {
         guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
         let app = AXUIElementCreateApplication(pid)
         AXClient.setMessagingTimeout(app)
@@ -664,14 +857,16 @@ public enum AXElementResolver {
                 let id = descriptor.identifier
                     ?? descriptor.pathHash
                     ?? "\(role)|\(descriptor.label)|\(candidates.count)"
-                candidates.append(Candidate(
-                    id: id,
-                    descriptor: descriptor,
-                    center: CGPoint(x: frame.midX, y: frame.midY)
-                ))
-            }
-            guard visited < limit else { break }
-        }
+	                candidates.append(Candidate(
+	                    id: id,
+	                    descriptor: descriptor,
+	                    center: CGPoint(x: frame.midX, y: frame.midY),
+	                    frame: frame,
+	                    source: .accessibility
+	                ))
+	            }
+	            guard visited < limit else { break }
+	        }
         return candidates
     }
 

@@ -239,6 +239,7 @@ public final class GuidanceOverlayController {
         orderFront()
         state.highlightScreen = screenFrame(containing: CGPoint(x: globalRect.midX, y: globalRect.midY))
         withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+            state.highlightRects = [globalRect]
             state.highlightRect = globalRect
             state.highlightVisible = true
         }
@@ -250,10 +251,37 @@ public final class GuidanceOverlayController {
         }
     }
 
+    public func highlight(globalRects: [CGRect], seconds: TimeInterval = 8) {
+        let rects = globalRects.filter { $0.width > 1 && $0.height > 1 }
+        guard !rects.isEmpty else {
+            clearHighlight()
+            return
+        }
+        startFollowing()
+        orderFront()
+        let first = rects[0]
+        state.highlightScreen = screenFrame(containing: CGPoint(x: first.midX, y: first.midY))
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+            state.highlightRects = rects
+            state.highlightRect = first
+            state.highlightVisible = true
+        }
+        highlightTask?.cancel()
+        highlightTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard let self, !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                self.state.highlightVisible = false
+                self.state.highlightRects = []
+            }
+        }
+    }
+
     public func clearHighlight() {
         highlightTask?.cancel()
         highlightTask = nil
         state.highlightVisible = false
+        state.highlightRects = []
     }
 
     /// Recolors the whole guidance overlay (cursor, trail, ripple, marquee).
@@ -428,9 +456,10 @@ final class GuidanceState: ObservableObject {
     /// Bumped on every press so the overlay can fire a one-shot tap ripple.
     @Published var pressTrigger = 0
     /// Dashed marquee that frames a region for "where do I find/do X" answers.
-    @Published var highlightRect: CGRect = .zero    // global AppKit (bottom-left)
-    @Published var highlightScreen: CGRect = .zero
-    @Published var highlightVisible = false
+	    @Published var highlightRect: CGRect = .zero    // global AppKit (bottom-left)
+	    @Published var highlightScreen: CGRect = .zero
+	    @Published var highlightRects: [CGRect] = []
+	    @Published var highlightVisible = false
     /// Colorway for every piece of guidance chrome.
     @Published var theme: CursorTheme = .green
 }
@@ -477,21 +506,24 @@ struct GuidanceOverlayView: View {
     }
 
     /// Highlight rect mapped into this window's local (top-left) space.
-    private var highlightLocalRect: CGRect? {
-        guard state.highlightVisible, state.highlightScreen == screenFrame, state.highlightRect.width > 1 else { return nil }
-        let r = state.highlightRect
-        let yFromBottom = r.minY - screenFrame.minY
-        return CGRect(
-            x: r.minX - screenFrame.minX,
-            y: screenFrame.height - (yFromBottom + r.height),
-            width: r.width, height: r.height
-        )
+    private var highlightLocalRects: [CGRect] {
+        guard state.highlightVisible else { return [] }
+        let rects = state.highlightRects.isEmpty ? [state.highlightRect] : state.highlightRects
+        return rects.compactMap { r in
+            guard r.width > 1, screenFrame.contains(CGPoint(x: r.midX, y: r.midY)) else { return nil }
+	        let yFromBottom = r.minY - screenFrame.minY
+            return CGRect(
+                x: r.minX - screenFrame.minX,
+                y: screenFrame.height - (yFromBottom + r.height),
+                width: r.width, height: r.height
+            )
+        }
     }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             Color.clear
-            if let box = highlightLocalRect {
+            ForEach(Array(highlightLocalRects.enumerated()), id: \.offset) { _, box in
                 MarchingAntsBox(rect: box, color: state.theme.core)
             }
             // The theme's motion trail behind the companion during a flight — pink's

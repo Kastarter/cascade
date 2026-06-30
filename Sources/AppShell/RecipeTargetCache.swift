@@ -1,4 +1,5 @@
 import CascadeMemory
+import ComputerUseKit
 import CoreGraphics
 import Foundation
 
@@ -37,6 +38,10 @@ public struct RecipeTargetCacheEntry: Equatable, Sendable {
     public let successCount: Int
     public let failureCount: Int
     public let confidence: Double
+    public let verifiedScore: Double
+    public let source: AnchorDriftScorer.AnchorSource
+    public let anchorHash: String?
+    public let lastVerifiedAt: Date
     public let lastUsedAt: Date
 }
 
@@ -53,6 +58,10 @@ public actor RecipeTargetCache {
             successCount: entry.successCount,
             failureCount: entry.failureCount,
             confidence: entry.confidence,
+            verifiedScore: entry.verifiedScore,
+            source: entry.source,
+            anchorHash: entry.anchorHash,
+            lastVerifiedAt: entry.lastVerifiedAt,
             lastUsedAt: now
         )
         entries[context] = touched
@@ -64,18 +73,26 @@ public actor RecipeTargetCache {
         _ context: RecipeTargetCacheContext,
         point: CGPoint,
         tier: RecipeTargetCacheTier,
+        verifiedScore: Double? = nil,
+        source: AnchorDriftScorer.AnchorSource? = nil,
+        anchorHash: String? = nil,
         now: Date = Date()
     ) -> RecipeTargetCacheEntry {
         let previous = entries[context]
         let successCount = (previous?.successCount ?? 0) + 1
-        let failureCount = previous?.failureCount ?? 0
-        let confidence = min(0.98, max(previous?.confidence ?? 0.55, 0.55) + 0.12)
+        let failureCount = max(0, (previous?.failureCount ?? 0) - 1)
+        let base = max(previous?.confidence ?? 0.55, verifiedScore ?? 0.55, 0.55)
+        let confidence = min(0.98, base + 0.12)
         let entry = RecipeTargetCacheEntry(
             point: point,
             tier: tier,
             successCount: successCount,
             failureCount: failureCount,
             confidence: confidence,
+            verifiedScore: verifiedScore ?? confidence,
+            source: source ?? Self.anchorSource(for: tier),
+            anchorHash: anchorHash ?? previous?.anchorHash,
+            lastVerifiedAt: now,
             lastUsedAt: now
         )
         entries[context] = entry
@@ -92,6 +109,10 @@ public actor RecipeTargetCache {
             successCount: previous.successCount,
             failureCount: previous.failureCount + 1,
             confidence: confidence,
+            verifiedScore: previous.verifiedScore,
+            source: previous.source,
+            anchorHash: previous.anchorHash,
+            lastVerifiedAt: previous.lastVerifiedAt,
             lastUsedAt: now
         )
         if confidence < 0.20 {
@@ -104,6 +125,14 @@ public actor RecipeTargetCache {
 
     public func removeAll() {
         entries.removeAll()
+    }
+
+    private static func anchorSource(for tier: RecipeTargetCacheTier) -> AnchorDriftScorer.AnchorSource {
+        switch tier {
+        case .ax: .accessibility
+        case .ocr, .vision: .vision
+        case .recorded: .recordedPoint
+        }
     }
 }
 

@@ -711,11 +711,14 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public let role: String?
     public let identifier: String?
     public let container: String?
+    public let windowTitle: String?
     public let ancestorPath: [String]
     public let siblingIndex: Int?
+    public let siblingRoleIndex: Int?
     public let neighborLabels: [String]
     public let frameBucket: String?
     public let frame: String?
+    public let visualPatchHash: String?
     public let valueHash: String?
     public let enabled: Bool?
     public let selected: Bool?
@@ -723,7 +726,9 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public let pathHash: String?
     public let subtree: String?
     public let subtreeHash: String?
+    public let semanticTextHash: String?
     public let semanticHash: String?
+    public let createdFrom: String?
 
     public init(
         schemaVersion: Int = 2,
@@ -731,11 +736,14 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         role: String? = nil,
         identifier: String? = nil,
         container: String? = nil,
+        windowTitle: String? = nil,
         ancestorPath: [String] = [],
         siblingIndex: Int? = nil,
+        siblingRoleIndex: Int? = nil,
         neighborLabels: [String] = [],
         frameBucket: String? = nil,
         frame: String? = nil,
+        visualPatchHash: String? = nil,
         valueHash: String? = nil,
         enabled: Bool? = nil,
         selected: Bool? = nil,
@@ -743,18 +751,23 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         pathHash: String? = nil,
         subtree: String? = nil,
         subtreeHash: String? = nil,
-        semanticHash: String? = nil
+        semanticTextHash: String? = nil,
+        semanticHash: String? = nil,
+        createdFrom: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.label = label.trimmingCharacters(in: .whitespacesAndNewlines)
         self.role = Self.cleaned(role)
         self.identifier = Self.cleaned(identifier)
         self.container = Self.cleaned(container)
+        self.windowTitle = Self.cleaned(windowTitle)
         self.ancestorPath = ancestorPath.compactMap(Self.cleaned)
         self.siblingIndex = siblingIndex
+        self.siblingRoleIndex = siblingRoleIndex ?? siblingIndex
         self.neighborLabels = neighborLabels.compactMap(Self.cleaned)
         self.frameBucket = Self.cleaned(frameBucket)
         self.frame = Self.cleaned(frame)
+        self.visualPatchHash = Self.cleaned(visualPatchHash)
         self.valueHash = Self.cleaned(valueHash)
         self.enabled = enabled
         self.selected = selected
@@ -762,7 +775,9 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         self.pathHash = Self.cleaned(pathHash)
         self.subtree = Self.cleaned(subtree)
         self.subtreeHash = Self.cleaned(subtreeHash)
-        self.semanticHash = Self.cleaned(semanticHash)
+        self.semanticTextHash = Self.cleaned(semanticTextHash) ?? Self.cleaned(semanticHash)
+        self.semanticHash = Self.cleaned(semanticHash) ?? Self.cleaned(semanticTextHash)
+        self.createdFrom = Self.cleaned(createdFrom)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -771,11 +786,14 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         case role
         case identifier
         case container
+        case windowTitle
         case ancestorPath
         case siblingIndex
+        case siblingRoleIndex
         case neighborLabels
         case frameBucket
         case frame
+        case visualPatchHash
         case valueHash
         case enabled
         case selected
@@ -783,22 +801,30 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         case pathHash
         case subtree
         case subtreeHash
+        case semanticTextHash
         case semanticHash
+        case createdFrom
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let legacySiblingIndex = try container.decodeIfPresent(Int.self, forKey: .siblingIndex)
+        let semanticTextHash = try container.decodeIfPresent(String.self, forKey: .semanticTextHash)
+            ?? container.decodeIfPresent(String.self, forKey: .semanticHash)
         self.init(
             schemaVersion: try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 2,
             label: try container.decodeIfPresent(String.self, forKey: .label) ?? "",
             role: try container.decodeIfPresent(String.self, forKey: .role),
             identifier: try container.decodeIfPresent(String.self, forKey: .identifier),
             container: try container.decodeIfPresent(String.self, forKey: .container),
+            windowTitle: try container.decodeIfPresent(String.self, forKey: .windowTitle),
             ancestorPath: try container.decodeIfPresent([String].self, forKey: .ancestorPath) ?? [],
-            siblingIndex: try container.decodeIfPresent(Int.self, forKey: .siblingIndex),
+            siblingIndex: legacySiblingIndex,
+            siblingRoleIndex: try container.decodeIfPresent(Int.self, forKey: .siblingRoleIndex) ?? legacySiblingIndex,
             neighborLabels: try container.decodeIfPresent([String].self, forKey: .neighborLabels) ?? [],
             frameBucket: try container.decodeIfPresent(String.self, forKey: .frameBucket),
             frame: try container.decodeIfPresent(String.self, forKey: .frame),
+            visualPatchHash: try container.decodeIfPresent(String.self, forKey: .visualPatchHash),
             valueHash: try container.decodeIfPresent(String.self, forKey: .valueHash),
             enabled: try container.decodeIfPresent(Bool.self, forKey: .enabled),
             selected: try container.decodeIfPresent(Bool.self, forKey: .selected),
@@ -806,7 +832,9 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             pathHash: try container.decodeIfPresent(String.self, forKey: .pathHash),
             subtree: try container.decodeIfPresent(String.self, forKey: .subtree),
             subtreeHash: try container.decodeIfPresent(String.self, forKey: .subtreeHash),
-            semanticHash: try container.decodeIfPresent(String.self, forKey: .semanticHash)
+            semanticTextHash: semanticTextHash,
+            semanticHash: try container.decodeIfPresent(String.self, forKey: .semanticHash),
+            createdFrom: try container.decodeIfPresent(String.self, forKey: .createdFrom)
         )
     }
 
@@ -822,11 +850,14 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         role: String? = nil,
         identifier: String? = nil,
         container: String? = nil,
+        windowTitle: String? = nil,
         ancestorPath: [String] = [],
         siblingIndex: Int? = nil,
+        siblingRoleIndex: Int? = nil,
         neighborLabels: [String] = [],
         frameBucket: String? = nil,
         frame: String? = nil,
+        visualPatchHash: String? = nil,
         valueHash: String? = nil,
         enabled: Bool? = nil,
         selected: Bool? = nil,
@@ -834,18 +865,23 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         pathHash: String? = nil,
         subtree: String? = nil,
         subtreeHash: String? = nil,
-        semanticHash: String? = nil
+        semanticTextHash: String? = nil,
+        semanticHash: String? = nil,
+        createdFrom: String? = nil
     ) -> String? {
         let descriptor = AXTargetDescriptorV2(
             label: label,
             role: role,
             identifier: identifier,
             container: container,
+            windowTitle: windowTitle,
             ancestorPath: ancestorPath,
             siblingIndex: siblingIndex,
+            siblingRoleIndex: siblingRoleIndex,
             neighborLabels: neighborLabels,
             frameBucket: frameBucket,
             frame: frame,
+            visualPatchHash: visualPatchHash,
             valueHash: valueHash,
             enabled: enabled,
             selected: selected,
@@ -853,7 +889,9 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             pathHash: pathHash,
             subtree: subtree,
             subtreeHash: subtreeHash,
-            semanticHash: semanticHash
+            semanticTextHash: semanticTextHash,
+            semanticHash: semanticHash,
+            createdFrom: createdFrom
         )
         guard descriptor.hasSignal else { return nil }
         return descriptor.encodedJSON()
@@ -868,11 +906,14 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
                     role: descriptor.role,
                     identifier: descriptor.identifier,
                     container: descriptor.container,
+                    windowTitle: descriptor.windowTitle,
                     ancestorPath: descriptor.ancestorPath,
                     siblingIndex: descriptor.siblingIndex,
+                    siblingRoleIndex: descriptor.siblingRoleIndex,
                     neighborLabels: descriptor.neighborLabels,
                     frameBucket: descriptor.frameBucket,
                     frame: descriptor.frame,
+                    visualPatchHash: descriptor.visualPatchHash,
                     valueHash: descriptor.valueHash,
                     enabled: descriptor.enabled,
                     selected: descriptor.selected,
@@ -880,7 +921,9 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
                     pathHash: descriptor.pathHash,
                     subtree: descriptor.subtree,
                     subtreeHash: descriptor.subtreeHash,
-                    semanticHash: descriptor.semanticHash
+                    semanticTextHash: descriptor.semanticTextHash,
+                    semanticHash: descriptor.semanticHash,
+                    createdFrom: descriptor.createdFrom
                 )
             }
             return descriptor
@@ -916,11 +959,14 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             || role != nil
             || identifier != nil
             || container != nil
+            || windowTitle != nil
             || !ancestorPath.isEmpty
             || siblingIndex != nil
+            || siblingRoleIndex != nil
             || !neighborLabels.isEmpty
             || frameBucket != nil
             || frame != nil
+            || visualPatchHash != nil
             || valueHash != nil
             || enabled != nil
             || selected != nil
@@ -928,7 +974,38 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             || pathHash != nil
             || subtree != nil
             || subtreeHash != nil
+            || semanticTextHash != nil
             || semanticHash != nil
+            || createdFrom != nil
+    }
+
+    public var semanticPhrase: String {
+        Self.semanticPhrase(
+            label: label,
+            role: role,
+            container: container,
+            ancestorPath: ancestorPath,
+            neighborLabels: neighborLabels,
+            windowTitle: windowTitle
+        )
+    }
+
+    public static func semanticPhrase(
+        label: String,
+        role: String?,
+        container: String?,
+        ancestorPath: [String],
+        neighborLabels: [String],
+        windowTitle: String?
+    ) -> String {
+        ([label, role, windowTitle, container] + ancestorPath + neighborLabels)
+            .compactMap(cleaned)
+            .joined(separator: " ")
+    }
+
+    public static func semanticTextHash(for phrase: String) -> String? {
+        let normalized = SemanticEmbeddingText.normalized(phrase)
+        return normalized.isEmpty ? nil : AuditIdentity.hash(normalized)
     }
 
     private static func cleaned(_ text: String?) -> String? {
