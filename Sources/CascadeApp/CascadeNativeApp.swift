@@ -1,5 +1,6 @@
 import AppKit
 import AppShell
+import Foundation
 import SwiftUI
 
 @MainActor
@@ -50,7 +51,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
 struct CascadeNativeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = AppModelBox.make()
@@ -84,6 +84,44 @@ struct CascadeNativeApp: App {
                 .keyboardShortcut("f", modifiers: [.control, .command])
             }
         }
+    }
+}
+
+/// Process entry point. `Cascade --probe "<goal>"` runs ONE headless agent
+/// verification turn (real key, real screenshot, real tools — no actuation), prints
+/// a ground-truth verdict, and exits. Any other invocation launches the GUI app.
+/// This is the harness that makes "tested" mean "actually runs", not "compiles".
+@main
+enum CascadeEntryPoint {
+    static func main() {
+        let args = CommandLine.arguments
+        if let idx = args.firstIndex(of: "--probe") {
+            // Goal = the args after --probe up to the next --flag (so --probe-out etc.
+            // don't leak into the task text).
+            let goalTokens = args[(idx + 1)...].prefix { !$0.hasPrefix("--") }
+            let goal = goalTokens.isEmpty ? "open Notes and type hello" : goalTokens.joined(separator: " ")
+            Task { @MainActor in
+                let out: String
+                do {
+                    let model = try CascadeAppModel()
+                    out = await model.probeAgentTurn(goal: goal)
+                } catch {
+                    out = "PROBE | verdict=ERROR | reason=model_init_failed: \(error.localizedDescription)"
+                }
+                print(out)
+                // Launched via `open` (to inherit Screen Recording), stdout is detached —
+                // also write the verdict to a fixed file so the caller can read it back.
+                // An optional `--probe-out <path>` overrides the destination.
+                let outPath: String = {
+                    if let i = args.firstIndex(of: "--probe-out"), args.count > i + 1 { return args[i + 1] }
+                    return "/tmp/cascade-probe-result.txt"
+                }()
+                try? out.write(toFile: outPath, atomically: true, encoding: .utf8)
+                exit(0)
+            }
+            CFRunLoopRun()   // pump the main run loop until the probe Task calls exit(0)
+        }
+        CascadeNativeApp.main()
     }
 }
 

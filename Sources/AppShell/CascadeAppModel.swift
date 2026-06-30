@@ -2681,6 +2681,46 @@ public final class CascadeAppModel: ObservableObject {
         return agent
     }
 
+    /// Headless verification probe (driven by the app's `--probe` CLI flag). Runs ONE
+    /// real assist agent turn against a live screenshot through the real API + tool set,
+    /// and reports whether the agent emitted a valid action — WITHOUT executing it
+    /// (no stream-sink is wired here, so `begin()` returns actions instead of posting
+    /// them; the cursor never moves). This exercises the exact request/loop path that
+    /// `swift build` and mock unit tests can't: HTTP status, tool/strict count, whether
+    /// the model returned `tool_use` or text-only. The verdict is ground truth, not
+    /// Cascade's own self-assessment.
+    public func probeAgentTurn(goal: String) async -> String {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            return "PROBE | verdict=ERROR | reason=no_screen"
+        }
+        let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
+        let res = AgentResolution.best(forWidth: dw, height: dh)
+        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
+            return "PROBE | verdict=ERROR | reason=no_screenshot (Screen Recording permission not granted?)"
+        }
+        let agent = makeAssistAgent(model: AnthropicModel.opus, goal: goal, gen: 0)
+        let step = await agent.begin(
+            goal: goal, screenshot: shot, displayWidthPoints: dw, displayHeightPoints: dh
+        )
+        let emitted = step.actions.count + step.streamedActions
+        let verdict: String
+        if step.failed {
+            verdict = "FAIL (request/transport error — see the [computeruse] log line for the HTTP status + body)"
+        } else if emitted == 0 {
+            verdict = "FAIL (0 actions — model returned text only, no tool_use)"
+        } else {
+            verdict = "PASS (agent emitted \(emitted) action(s) for a live screen)"
+        }
+        let firstActions = step.actions.prefix(4).map { String(describing: $0) }.joined(separator: " | ")
+        return """
+        PROBE | goal=\(goal)
+          verdict=\(verdict)
+          failed=\(step.failed)  actions=\(step.actions.count)  streamed=\(step.streamedActions)  done=\(step.done)
+          firstActions=\(firstActions)
+          modelText=\(step.text.prefix(180))
+        """
+    }
+
     private static func assistGroundingCropProvider() -> @Sendable (CGRect, Int, Int) async -> GroundingCrop? {
         { rect, displayWidth, displayHeight in
             let normalized = normalizedTopLeftRect(
