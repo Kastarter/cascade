@@ -59,7 +59,18 @@ public extension CascadeStore {
     /// a missing embedding asset just means keyword search carries that moment.
     func indexEmbedding(contextID: Int64, text: String) throws {
         let safeText = CascadeStore.sanitizeStoredText(text) ?? ""
-        if let vector = LocalSemanticVector.vector(for: safeText) {
+        let rawStructuredText: String?
+        do {
+            rawStructuredText = try ocrStructure(contextID: contextID)?.searchableText
+        } catch {
+            rawStructuredText = nil
+        }
+        let structuredText = rawStructuredText.flatMap { CascadeStore.sanitizeStoredText($0) } ?? ""
+        let combinedText = [safeText, structuredText]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        if let vector = LocalSemanticVector.vector(for: combinedText.isEmpty ? safeText : combinedText) {
             try withStatement("INSERT OR REPLACE INTO context_embedding (context_id, vector) VALUES (?, ?);") { statement in
                 sqlite3_bind_int64(statement, 1, contextID)
                 let blob = LocalSemanticVector.blob(from: vector)
@@ -70,16 +81,18 @@ public extension CascadeStore {
             }
         }
 
-        let visualLines = (try? ocrLines(contextID: contextID))
+        var visualLines = (try? ocrLines(contextID: contextID))
             .map { rows in
                 rows
-                    .filter { $0.source.hasPrefix("vision") }
                     .sorted { lhs, rhs in
                         lhs.lineIndex == rhs.lineIndex ? lhs.source < rhs.source : lhs.lineIndex < rhs.lineIndex
                     }
                     .compactMap { CascadeStore.sanitizeStoredText($0.text) }
             } ?? []
-        let chunks = SemanticTextChunker.chunks(text: safeText, visualLines: visualLines)
+        visualLines.append(contentsOf: structuredText.components(separatedBy: .newlines).compactMap {
+            CascadeStore.sanitizeStoredText($0)
+        })
+        let chunks = SemanticTextChunker.chunks(text: combinedText.isEmpty ? safeText : combinedText, visualLines: visualLines)
         try withStatement("DELETE FROM context_chunk_embedding WHERE context_id = ?;") { statement in
             sqlite3_bind_int64(statement, 1, contextID)
             try stepDone(statement)

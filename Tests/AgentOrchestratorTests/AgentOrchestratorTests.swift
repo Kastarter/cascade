@@ -123,8 +123,27 @@ private struct ThrowingAnswerer: ContextQuestionAnswering {
 /// Keeps `ask` tests deterministic on machines that have a real key in the
 /// keychain — the agentic record path must never hit the network in tests.
 private struct ThrowingRecordAnswerer: RecordAnswering {
-    func answer(question: String, conversation: [(user: String, assistant: String)]) async throws -> RecordAnswer {
+    func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        focus: RecordAnswerFocus?
+    ) async throws -> RecordAnswer {
         throw CocoaError(.featureUnsupported)
+    }
+}
+
+private final class CapturingRecordAnswerer: RecordAnswering, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _focus: RecordAnswerFocus?
+    var focus: RecordAnswerFocus? { lock.withLock { _focus } }
+
+    func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        focus: RecordAnswerFocus?
+    ) async throws -> RecordAnswer {
+        lock.withLock { _focus = focus }
+        return RecordAnswer(text: "focused", citedMomentIDs: focus.map { [$0.momentID] } ?? [])
     }
 }
 
@@ -191,4 +210,57 @@ func askRecallsQuestionRelevantMomentsFromEarlierInTheDay() async throws {
     let answer = try await orchestrator.ask("when is the final project due?")
 
     #expect(answer.contains("Jul 30"))
+}
+
+@Test
+func askRecordPassesFocusToInjectedRecordAnswerer() async throws {
+    let store = try makeStore()
+    let selected = try await store.insert(RecordedContext(source: .screen, appName: "Numbers", ocrText: "TOTAL DUE $443,355"))
+    let answerer = CapturingRecordAnswerer()
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        localAnswerer: ThrowingAnswerer(),
+        claudeAnswerer: ThrowingAnswerer(),
+        recordAnswerer: answerer
+    )
+
+    let answer = try await orchestrator.askRecord("what is on this screen?", focus: RecordAnswerFocus(moment: selected))
+
+    #expect(answer.text == "focused")
+    #expect(answerer.focus?.momentID == selected.id)
+    #expect(answer.citedMomentIDs == [selected.id])
+}
+
+private struct FocusedEchoAnswerer: ContextQuestionAnswering {
+    func answer(question: String, grounding: ChatGrounding) async throws -> String {
+        grounding.focused.compactMap(\.ocrText).joined(separator: " | ")
+    }
+}
+
+@Test
+func focusedFallbackGroundingAndCitationsPreferSelectedOldMoment() async throws {
+    let store = try makeStore()
+    let selected = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSinceNow: -6 * 3600),
+        source: .screen,
+        appName: "Numbers",
+        ocrText: "Selected old invoice TOTAL DUE $443,355"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: Date(),
+        source: .screen,
+        appName: "Safari",
+        ocrText: "new unrelated live context"
+    ))
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        localAnswerer: FocusedEchoAnswerer(),
+        claudeAnswerer: ThrowingAnswerer(),
+        recordAnswerer: ThrowingRecordAnswerer()
+    )
+
+    let answer = try await orchestrator.askRecord("what is on this screen?", focus: RecordAnswerFocus(moment: selected))
+
+    #expect(answer.text.contains("TOTAL DUE $443,355"))
+    #expect(answer.citedMomentIDs.first == selected.id)
 }

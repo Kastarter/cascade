@@ -1032,20 +1032,49 @@ private struct ActivityTimeline: View {
     /// Called when the user clicks or drags the bar to a different moment.
     let onScrub: (Int) -> Void
 
-    private struct Run: Identifiable { let id = UUID(); let app: String; let bundle: String?; let count: Int }
+    private struct Run: Identifiable {
+        let id = UUID()
+        let app: String
+        let bundle: String?
+        let start: Date
+        let end: Date
+    }
     private struct LegendItem: Identifiable { let id: String; let app: String; let bundle: String? }
+    private static let domainSpan: TimeInterval = 24 * 60 * 60
+
+    private var domainEnd: Date {
+        contexts.first?.capturedAt ?? Date()
+    }
+
+    private var domainStart: Date {
+        domainEnd.addingTimeInterval(-Self.domainSpan)
+    }
+
+    private var displayContexts: [RecordedContext] {
+        contexts
+            .filter { $0.capturedAt >= domainStart && $0.capturedAt <= domainEnd }
+            .sorted { $0.capturedAt < $1.capturedAt }
+    }
 
     private var runs: [Run] {
         var result: [Run] = []
-        for context in contexts.reversed() {
+        let ordered = displayContexts
+        for (offset, context) in ordered.enumerated() {
             // Group by the web app inside the browser when there is one, so the lanes
             // read "Gmail" / "Google Docs" instead of one long "Google Chrome".
             let app = CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle)
             let bundle = app == context.appName ? context.bundleIdentifier : nil
-            if let last = result.last, last.app == app {
-                result[result.count - 1] = Run(app: last.app, bundle: last.bundle, count: last.count + 1)
+            var start = max(context.capturedAt, domainStart)
+            var end = min(offset + 1 < ordered.count ? ordered[offset + 1].capturedAt : domainEnd, domainEnd)
+            if end <= start {
+                end = min(domainEnd, start.addingTimeInterval(60))
+                if end <= start { start = max(domainStart, end.addingTimeInterval(-60)) }
+            }
+            guard end > start else { continue }
+            if let last = result.last, last.app == app, last.bundle == bundle {
+                result[result.count - 1] = Run(app: last.app, bundle: last.bundle, start: last.start, end: end)
             } else {
-                result.append(Run(app: app, bundle: bundle, count: 1))
+                result.append(Run(app: app, bundle: bundle, start: start, end: end))
             }
         }
         return result
@@ -1054,7 +1083,7 @@ private struct ActivityTimeline: View {
     private var legend: [LegendItem] {
         var seen = Set<String>()
         var items: [LegendItem] = []
-        for context in contexts {
+        for context in displayContexts {
             let app = CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle)
             guard !seen.contains(app) else { continue }
             seen.insert(app)
@@ -1103,22 +1132,24 @@ private struct ActivityTimeline: View {
             // always fits its frame. (An HStack of min-6pt segments overflowed the
             // track in narrow windows once many short runs were squeezed together —
             // the bar bled past the playhead and the rounded border.)
-            let total = CGFloat(max(contexts.count, 1))
             let segments = runs.map {
-                (color: AppVisuals.color(for: $0.app, bundleIdentifier: $0.bundle), count: CGFloat($0.count))
+                (
+                    color: AppVisuals.color(for: $0.app, bundleIdentifier: $0.bundle),
+                    start: $0.start.timeIntervalSince(domainStart),
+                    duration: $0.end.timeIntervalSince($0.start)
+                )
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Canvas { context, size in
-                        var x: CGFloat = 0
                         for segment in segments {
-                            let w = size.width * segment.count / total
+                            let x = size.width * CGFloat(max(0, min(Self.domainSpan, segment.start)) / Self.domainSpan)
+                            let w = size.width * CGFloat(max(0, segment.duration) / Self.domainSpan)
                             // Hairline gaps separate runs, but only when a run is
                             // wide enough to survive one.
                             let gap: CGFloat = w > 5 ? 1.5 : 0
                             let rect = CGRect(x: x + gap / 2, y: 0, width: max(w - gap, 0.5), height: size.height)
                             context.fill(Path(rect), with: .color(segment.color))
-                            x += w
                         }
                     }
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1153,20 +1184,22 @@ private struct ActivityTimeline: View {
     /// moment spans from its capture until the next one — so at the live edge the
     /// handle is flush with the end of the bar instead of half a slot short of it.
     private func playheadX(_ width: CGFloat) -> CGFloat {
-        let count = max(contexts.count, 1)
-        let ordinal = count - min(max(currentIndex, 0), count - 1)  // count = newest (right edge)
-        let fraction = Double(ordinal) / Double(count)
-        return min(CGFloat(fraction) * width, width - 2)
+        guard !contexts.isEmpty else { return width }
+        let current = contexts[min(max(currentIndex, 0), contexts.count - 1)].capturedAt
+        let clamped = min(max(current.timeIntervalSince(domainStart), 0), Self.domainSpan)
+        let fraction = clamped / Self.domainSpan
+        return min(max(CGFloat(fraction) * width, 2), width - 2)
     }
 
     /// Maps a tap/drag X into the matching moment index and reports it (only when it
     /// actually changes, so dragging within one moment doesn't thrash state).
     private func scrub(toX x: CGFloat, width: CGFloat) {
         guard !contexts.isEmpty, width > 0 else { return }
-        let count = contexts.count
         let fraction = min(max(Double(x / width), 0), 1)
-        let ordinal = min(Int(fraction * Double(count)), count - 1)  // 0 = oldest
-        let newIndex = count - 1 - ordinal
+        let target = domainStart.addingTimeInterval(Self.domainSpan * fraction)
+        let newIndex = contexts.indices.min(by: {
+            abs(contexts[$0].capturedAt.timeIntervalSince(target)) < abs(contexts[$1].capturedAt.timeIntervalSince(target))
+        }) ?? currentIndex
         if newIndex != currentIndex { onScrub(newIndex) }
     }
 
@@ -1179,18 +1212,15 @@ private struct ActivityTimeline: View {
         }
     }
 
-    /// Four evenly spaced hour ticks across the captured span (min 3h window),
+    /// Five evenly spaced six-hour ticks across the fixed 24-hour domain,
     /// oldest → newest, matching the track's left → right direction.
     private var axisLabels: [String] {
-        let end = contexts.first?.capturedAt ?? Date()
-        let start = contexts.last?.capturedAt ?? end.addingTimeInterval(-3 * 3600)
-        let span = max(end.timeIntervalSince(start), 3 * 3600)
         let formatter = DateFormatter()
         formatter.dateFormat = "ha"
         formatter.amSymbol = "am"
         formatter.pmSymbol = "pm"
-        return (0..<4).map { i in
-            formatter.string(from: start.addingTimeInterval(span * Double(i) / 3)).lowercased()
+        return (0...4).map { i in
+            formatter.string(from: domainStart.addingTimeInterval(Double(i) * 6 * 3600)).lowercased()
         }
     }
 }
@@ -1256,7 +1286,7 @@ private struct AskPanel: View {
 
             VStack(alignment: .leading, spacing: CascadeMetrics.s2 + 2) {
                 if model.conversation.isEmpty && !model.thinking {
-                    FlowChips(items: suggestedQuestions) { q in model.ask(q) }
+                    FlowChips(items: suggestedQuestions) { q in model.ask(q, selectedMoment: selected) }
                 }
                 // Capsule composer with the send button living inside the field.
                 HStack(spacing: CascadeMetrics.s2) {
@@ -1357,7 +1387,7 @@ private struct AskPanel: View {
         guard canSend else { return }
         let q = draft
         draft = ""
-        model.ask(q)
+        model.ask(q, selectedMoment: selected)
     }
 }
 
@@ -2564,7 +2594,7 @@ private struct PrivacyPolicyCard: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Private mode").font(.cascadeSans(15, .semibold))
-                        Text(model.capturePrivacyPolicy.privateModeEnabled ? "Capture is paused." : "Capture follows the local policy.")
+                        Text(model.capturePrivacyPolicy.privateModeEnabled ? "Sensitive content is excluded or redacted." : "Capture follows the local policy.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()

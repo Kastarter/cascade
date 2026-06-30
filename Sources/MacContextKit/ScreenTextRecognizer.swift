@@ -73,6 +73,20 @@ public enum ScreenTextRecognizer {
         }
     }
 
+    public struct DetailedResult: Sendable, Equatable {
+        public let lineBoxes: [TextBox]
+        public let tokenBoxes: [TextBox]
+
+        public init(lineBoxes: [TextBox], tokenBoxes: [TextBox]) {
+            self.lineBoxes = lineBoxes
+            self.tokenBoxes = tokenBoxes
+        }
+
+        public var allBoxes: [TextBox] {
+            lineBoxes + tokenBoxes
+        }
+    }
+
     /// On-device OCR returning each line WITH its bounding box — the perception half
     /// of the B4 grounder: re-find a recorded click target by its text on a live
     /// frame, with NO model round-trip and NO Accessibility (so it works on the
@@ -96,6 +110,41 @@ public enum ScreenTextRecognizer {
                 confidence: candidate.confidence
             )
         }
+    }
+
+    /// Detailed screen OCR for persisted record capture. It keeps each Vision line
+    /// observation for stable reading order and derives token boxes from
+    /// `VNRecognizedText.boundingBox(for:)` so structure reconstruction can split
+    /// fields and tables even when Vision returned whole-line observations.
+    public static func recognizeDetailedBoxes(
+        inImageData data: Data,
+        level: VNRequestTextRecognitionLevel = .accurate,
+        regionOfInterest: CGRect? = nil,
+        maxDecodeDimension: Int? = nil
+    ) -> DetailedResult {
+        guard let cgImage = decode(imageData: data, maxDecodeDimension: maxDecodeDimension) else {
+            return DetailedResult(lineBoxes: [], tokenBoxes: [])
+        }
+        let clippedROI = clippedRegionOfInterest(regionOfInterest)
+        let request = makeTextRequest(level: level, regionOfInterest: clippedROI)
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        guard (try? handler.perform([request])) != nil, let observations = request.results else {
+            return DetailedResult(lineBoxes: [], tokenBoxes: [])
+        }
+
+        var lines: [TextBox] = []
+        var tokens: [TextBox] = []
+        for obs in observations {
+            guard let candidate = obs.topCandidates(1).first else { continue }
+            let line = TextBox(
+                text: candidate.string,
+                boundingBox: fullFrameBoundingBox(obs.boundingBox, regionOfInterest: clippedROI),
+                confidence: candidate.confidence
+            )
+            lines.append(line)
+            tokens.append(contentsOf: tokenBoxes(in: candidate, regionOfInterest: clippedROI, fallbackLine: line))
+        }
+        return DetailedResult(lineBoxes: lines, tokenBoxes: tokens)
     }
 
     /// The text line that best matches a recorded `anchor`, or nil when nothing
@@ -178,16 +227,17 @@ public enum ScreenTextRecognizer {
     /// OCR, set consistently across both the line and box paths.
     private static func makeTextRequest(
         level: VNRequestTextRecognitionLevel,
-        regionOfInterest: CGRect? = nil
+        regionOfInterest: CGRect? = nil,
+        usesLanguageCorrection: Bool = false
     ) -> VNRecognizeTextRequest {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = level
         if let region = clippedRegionOfInterest(regionOfInterest) {
             request.regionOfInterest = region
         }
-        // Language correction is an extra NLP pass that mostly helps the slower
-        // `.accurate` model; on the cheap `.fast` insurance pass it's wasted cost.
-        request.usesLanguageCorrection = (level == .accurate)
+        // Language correction can alter visible IDs, amounts, and codes. Keep it
+        // opt-in for exact screen capture.
+        request.usesLanguageCorrection = usesLanguageCorrection
         request.minimumTextHeight = minimumTextHeight
         // Vision defaults recognitionLanguages to ["en-US"] only, so non-Latin
         // on-screen text (e.g. Arabic) comes back garbled or empty. Offer a
@@ -195,6 +245,25 @@ public enum ScreenTextRecognizer {
         // unsupported code can't fail the request.
         request.recognitionLanguages = supportedRecognitionLanguages(for: request)
         return request
+    }
+
+    private static func tokenBoxes(
+        in candidate: VNRecognizedText,
+        regionOfInterest: CGRect?,
+        fallbackLine: TextBox
+    ) -> [TextBox] {
+        let text = candidate.string
+        guard let regex = try? NSRegularExpression(pattern: #"\S+"#) else { return [] }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: nsRange).compactMap { match in
+            guard let range = Range(match.range, in: text),
+                  let observation = try? candidate.boundingBox(for: range) else { return nil }
+            let token = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !token.isEmpty else { return nil }
+            let rect = fullFrameBoundingBox(observation.boundingBox, regionOfInterest: regionOfInterest)
+            guard rect.width > 0, rect.height > 0 else { return nil }
+            return TextBox(text: token, boundingBox: rect, confidence: fallbackLine.confidence)
+        }
     }
 
     /// The app's primary locales, intersected with the languages Vision actually

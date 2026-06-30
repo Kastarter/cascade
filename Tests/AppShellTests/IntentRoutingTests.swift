@@ -21,4 +21,17 @@ struct IntentRoutingTests {
         // highlight / mark always route to the acting agent (it owns the tool).
         #expect(CascadeAppModel.isActionRequest("highlight the total"))
     }
+
+    @Test func howToQuestionsAreInstructionalAnswersNotPointRequests() {
+        #expect(CascadeAppModel.isInstructionalQuestion("how can I export a PDF"))
+        #expect(CascadeAppModel.isInstructionalQuestion("how do I create a chart"))
+        #expect(!CascadeAppModel.refersToScreen("how can I export a PDF"))
+        #expect(!CascadeAppModel.refersToScreen("how do I create a chart"))
+    }
+
+    @Test func screenLocationQuestionsStillPointAtTheScreen() {
+        #expect(CascadeAppModel.refersToScreen("where is the export button"))
+        #expect(CascadeAppModel.refersToScreen("show me the settings menu"))
+        #expect(CascadeAppModel.refersToScreen("locate the toolbar icon"))
+    }
 }

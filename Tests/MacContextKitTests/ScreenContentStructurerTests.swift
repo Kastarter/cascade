@@ -61,6 +61,33 @@ func reconstructsASimpleTable() {
 }
 
 @Test
+func detailedVisionLinesUseTokenBoxesForMultiWordFieldsAndTables() {
+    let lines = [
+        box("Due Date 2026-07-15", 0, 0, w: 230),
+        box("Item Qty Amount", 0, 30, w: 300),
+        box("Consulting services 2 $400.00", 0, 54, w: 300),
+        box("Platform fee 1 $43.00", 0, 78, w: 300),
+    ]
+    let tokens = [
+        box("Due", 0, 0, w: 30), box("Date", 34, 0, w: 34), box("2026-07-15", 140, 0, w: 90),
+        box("Item", 0, 30, w: 34), box("Qty", 150, 30, w: 28), box("Amount", 230, 30, w: 58),
+        box("Consulting", 0, 54, w: 72), box("services", 76, 54, w: 58), box("2", 150, 54, w: 12), box("$400.00", 230, 54, w: 70),
+        box("Platform", 0, 78, w: 64), box("fee", 68, 78, w: 24), box("1", 150, 78, w: 12), box("$43.00", 230, 78, w: 62),
+    ]
+
+    let structured = ScreenContentStructurer.structure(
+        ScreenTextRecognizer.DetailedResult(lineBoxes: lines, tokenBoxes: tokens)
+    )
+
+    #expect(structured.fields.contains { $0.key == "Due Date" && $0.value == "2026-07-15" })
+    #expect(structured.tables.first?.rows == [
+        ["Item", "Qty", "Amount"],
+        ["Consulting services", "2", "$400.00"],
+        ["Platform fee", "1", "$43.00"],
+    ])
+}
+
+@Test
 func rejectsTwoRowTableFalsePositive() {
     let boxes = [
         box("Name", 0, 0), box("Q1", 100, 0),
@@ -109,6 +136,14 @@ func extractsAXControlFieldsWithoutOCRBoxes() {
 
     #expect(structured.lines.isEmpty)
     #expect(structured.fields.contains { $0.key == "Approved" && $0.value == "1" && $0.kind == .formControl })
+}
+
+@Test
+func axTextParticipatesInReadingOrderAndSearchableText() {
+    let structured = ScreenContentStructurer.structure([], axText: "Exact AX title\nFooter TOTAL DUE $443,355")
+
+    #expect(structured.readingOrderText.contains("Exact AX title"))
+    #expect(structured.searchableText.contains("Footer TOTAL DUE $443,355"))
 }
 
 @Test

@@ -175,6 +175,24 @@ func taskPlanWrapsOriginalTaskAndSubtasks() async {
 }
 
 @Test
+func onScreenPlannerMergesLaunchOnlySubtaskIntoRealWork() async {
+    let canned = """
+    {"subtasks":[
+      {"task":"Open Keynote","app":"Keynote","expectedEffects":[{"kind":"frontmost_app","value":"Keynote"}],"risk":"low"},
+      {"task":"Design and create a title slide with the requested content","app":"","expectedEffects":[],"risk":"medium"}
+    ]}
+    """
+    let planner = AgentTaskPlanner(client: FakeCompleter(canned: canned))
+
+    let plan = await planner.taskPlan(for: "Open Keynote and design a title slide", in: .onScreen)
+
+    #expect(plan.subtasks.count == 1)
+    #expect(plan.subtasks[0].task == "Design and create a title slide with the requested content")
+    #expect(plan.subtasks[0].app == "Keynote")
+    #expect(plan.subtasks[0].expectedEffects.isEmpty)
+}
+
+@Test
 func replannerFallsBackToBoundedRecoverySubtask() async {
     let planner = AgentTaskPlanner(client: FailingCompleter())
     let memo = AgentRecoveryMemo(

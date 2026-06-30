@@ -23,7 +23,9 @@ public struct CaptureRetentionPolicy: Codable, Equatable, Sendable {
 
 /// Local, JSON-serializable capture policy. The default preserves the historical
 /// `PrivacyRules` keyword behavior while giving managed deployments explicit app,
-/// bundle, window-title, private-mode, and per-data-class retention knobs.
+/// bundle, window-title, user-visible private-mode, and per-data-class retention knobs.
+/// Private mode is not a stop gate; the app/window/text rules still decide what is
+/// dropped or redacted while capture continues.
 public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
     public static let defaultVersion = "capture-policy-v1"
 
@@ -137,7 +139,6 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         windowTitle: String?,
         text: String? = nil
     ) -> CapturePrivacyDecision {
-        if privateModeEnabled { return .deny("private_mode") }
         if !allowedBundleIdentifiers.isEmpty {
             guard let bundleIdentifier,
                   allowedBundleIdentifiers.contains(where: { matches($0, bundleIdentifier) }) else {

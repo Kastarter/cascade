@@ -101,6 +101,22 @@ func sidecarPayloadEncodesVersionedFullStructure() throws {
 }
 
 @Test
+func sidecarPayloadRetainsManyTableRowsInSearchableText() throws {
+    var boxes: [ExportBox] = [exportBox("Item", 0, 0), exportBox("Qty", 120, 0), exportBox("Amount", 220, 0)]
+    for row in 1...20 {
+        boxes.append(exportBox("Line \(row)", 0, CGFloat(row * 24), w: 70))
+        boxes.append(exportBox("\(row)", 120, CGFloat(row * 24), w: 30))
+        boxes.append(exportBox("$\(row * 10).00", 220, CGFloat(row * 24), w: 70))
+    }
+    let structured = ScreenContentStructurer.structure(boxes)
+
+    let payload = try #require(StructuredContentExporter.sidecarPayload(from: structured))
+
+    #expect(payload.searchableText.contains("Line 20"))
+    #expect(payload.searchableText.contains("$200.00"))
+}
+
+@Test
 func exportsCSVWithFormulaNeutralizedCells() {
     let table = ScreenContentStructurer.Table(rows: [
         ["A", "B", "C", "D", "E"],

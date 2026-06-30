@@ -192,7 +192,7 @@ public final class ContextRecorder: ObservableObject {
 
         public init(
             indexWorkGraph: Bool = true,
-            structuredContent: Bool = false,
+            structuredContent: Bool = true,
             capturePolicy: CapturePrivacyPolicy = .default
         ) {
             self.indexWorkGraph = indexWorkGraph
@@ -224,10 +224,6 @@ public final class ContextRecorder: ObservableObject {
         options.capturePolicy = policy
         input.updatePolicy(policy)
         rewind?.updatePolicy(policy)
-        if policy.privateModeEnabled, status.running {
-            pause()
-            status.message = "Recording paused by private mode."
-        }
     }
 
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
@@ -269,10 +265,6 @@ public final class ContextRecorder: ObservableObject {
         refreshPermissions()
         guard status.permissions.canRecordContext else {
             status.message = "Open Settings to grant Screen Recording before recording."
-            return
-        }
-        guard !options.capturePolicy.privateModeEnabled else {
-            status.message = "Recording paused by private mode."
             return
         }
         guard rewind == nil else { return }
@@ -495,6 +487,7 @@ public final class ContextRecorder: ObservableObject {
         var axTextForLines = ""
         var axControls: [ScreenContentStructurer.AXControl] = []
         var privacyMetadata: FrameRedactor.Metadata?
+        var detailedOCR = ScreenTextRecognizer.DetailedResult(lineBoxes: [], tokenBoxes: [])
         if canCaptureScreen,
            let sample = await ScreenCaptureUtility.captureCursorScreenContext(includeImage: true, includeOCR: false) {
             source = .screen
@@ -506,8 +499,9 @@ public final class ContextRecorder: ObservableObject {
             }
             if let png = sample.imagePNG {
                 capturedImageData = png
-                ocrBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: png)
-                let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
+                detailedOCR = ScreenTextRecognizer.recognizeDetailedBoxes(inImageData: png)
+                ocrBoxes = detailedOCR.lineBoxes
+                let structured = ScreenContentStructurer.structure(detailedOCR, topLeftOrigin: false)
                 if !structured.readingOrderText.isEmpty { ocrText = structured.readingOrderText }
             }
         }
@@ -535,17 +529,18 @@ public final class ContextRecorder: ObservableObject {
         if let imageData = capturedImageData {
             guard let redacted = FrameRedactor.redact(
                 imageData: imageData,
-                boxes: ocrBoxes,
+                detailedOCR: detailedOCR,
                 policy: options.capturePolicy
             ) else {
                 status.message = "Could not redact captured frame."
                 return nil
             }
             capturedImageData = redacted.imageData
-            ocrBoxes = redacted.boxes
+            detailedOCR = redacted.ocr
+            ocrBoxes = redacted.ocr.lineBoxes
             privacyMetadata = redacted.metadata
             imagePath = FrameStore.save(jpeg: redacted.imageData)
-            let redactedOCR = ScreenContentStructurer.structure(redacted.boxes, topLeftOrigin: false).readingOrderText
+            let redactedOCR = ScreenContentStructurer.structure(redacted.ocr, topLeftOrigin: false).readingOrderText
             let redactedAX = FrameRedactor.redactedText(axTextForLines, policy: options.capturePolicy)
             axTextForLines = redactedAX
             axControls = axControls.map {
@@ -585,11 +580,12 @@ public final class ContextRecorder: ObservableObject {
             }
         }
         let structuredForStorage = ScreenContentStructurer.structure(
-            ocrBoxes,
+            detailedOCR,
             topLeftOrigin: false,
+            axText: axTextForLines,
             axControls: axControls
         )
-        let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, !ocrBoxes.isEmpty {
+        let structuredMetadata: StructuredContentExporter.Metadata? = if options.structuredContent, !structuredForStorage.searchableText.isEmpty {
             StructuredContentExporter.metadata(from: structuredForStorage)
         } else {
             nil

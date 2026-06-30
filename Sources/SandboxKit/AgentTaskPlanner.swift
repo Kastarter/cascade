@@ -305,7 +305,10 @@ public struct AgentTaskPlanner: Sendable {
             }
         )
         if let raw, let parsed = Self.parse(raw) {
-            return AgentTaskPlan(originalTask: task, subtasks: parsed)
+            return AgentTaskPlan(
+                originalTask: task,
+                subtasks: Self.normalizePlan(parsed, originalTask: task, environment: environment)
+            )
         }
         // Degrading to one subtask is safe but should never be invisible — a key,
         // network, or schema problem would otherwise just look like "worse plans".
@@ -345,7 +348,7 @@ public struct AgentTaskPlanner: Sendable {
             }
         )
         if let raw, let subtask = Self.parse(raw)?.first {
-            return .replaceCurrent(subtask)
+            return .replaceCurrent(Self.normalizePlan([subtask], originalTask: originalTask, environment: environment).first ?? subtask)
         }
         return .replaceCurrent(Self.recoveryFallbackSubtask(from: memo, recovery: recovery))
     }
@@ -465,6 +468,9 @@ public struct AgentTaskPlanner: Sendable {
     (e.g. "Notes", "Mail", "Calendar"). If it happens on a specific website, put the \
     full https:// page in "url" instead. Leave both "" when the part continues where \
     the previous part ends.
+    - "app" and "url" are setup hints, not work. Do NOT emit standalone Open/Switch/\
+    Navigate subtasks unless the whole job is only to open or navigate. Attach the \
+    app/url to the first real work subtask.
 
     - Include "expectedEffects" only for observable checks: frontmost_app, \
     window_title_contains, visible_text, url_contains, artifact_exists, no_unexpected_modal.
@@ -532,6 +538,63 @@ public struct AgentTaskPlanner: Sendable {
             )
         }
         return subtasks.isEmpty ? nil : subtasks
+    }
+
+    static func normalizePlan(
+        _ subtasks: [AgentSubtask],
+        originalTask: String,
+        environment: Environment
+    ) -> [AgentSubtask] {
+        guard environment == .onScreen, subtasks.count > 1 else { return subtasks }
+        var result: [AgentSubtask] = []
+        var index = 0
+        while index < subtasks.count {
+            let current = subtasks[index]
+            if isLaunchOnlySubtask(current), index + 1 < subtasks.count {
+                let next = subtasks[index + 1]
+                let merged = AgentSubtask(
+                    task: next.task,
+                    startURL: next.startURL.isEmpty ? current.startURL : next.startURL,
+                    app: next.app.isEmpty ? current.app : next.app,
+                    web: next.web,
+                    note: [current.note, next.note].filter { !$0.isEmpty }.joined(separator: " "),
+                    expectedEffects: next.expectedEffects.isEmpty ? nonSetupEffects(from: current.expectedEffects) : next.expectedEffects,
+                    risk: maxRisk(current.risk, next.risk)
+                )
+                result.append(merged)
+                index += 2
+                continue
+            }
+            result.append(current)
+            index += 1
+        }
+        return result.isEmpty ? subtasks : result
+    }
+
+    private static func isLaunchOnlySubtask(_ subtask: AgentSubtask) -> Bool {
+        let t = subtask.task.lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9\s:/\.-]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ["open ", "launch ", "switch to ", "bring up ", "go to ", "navigate to "].contains(where: { t.hasPrefix($0) }) else {
+            return false
+        }
+        if [" and ", " then ", " after "].contains(where: { t.contains($0) }) { return false }
+        let words = Set(t.split(separator: " ").map(String.init))
+        let workMarkers: Set<String> = [
+            "create", "design", "write", "make", "build",
+            "send", "reply", "edit", "fill", "export", "download", "upload", "delete",
+            "move", "copy", "paste", "search", "find"
+        ]
+        return words.isDisjoint(with: workMarkers)
+    }
+
+    private static func nonSetupEffects(from effects: [ExpectedEffect]) -> [ExpectedEffect] {
+        effects.filter {
+            if case .frontmostApp = $0 { return false }
+            if case .urlContains = $0 { return false }
+            return true
+        }
     }
 
     static func parseSearchRoute(_ raw: String) -> SearchRouteHint? {

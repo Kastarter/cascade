@@ -674,7 +674,7 @@ actor RewindEngine {
     init(
         store: CascadeStore,
         indexWorkGraph: Bool = true,
-        structuredContent: Bool = false,
+        structuredContent: Bool = true,
         maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
@@ -784,16 +784,17 @@ actor RewindEngine {
             : frame.ocrPixelsRequested
         let recognitionLevel: VNRequestTextRecognitionLevel = budget.ocrPolicy == .fastOnly ? .fast : (axRich ? .fast : .accurate)
         let maxDecodeDimension = recognitionLevel == .fast && axRich ? 1280 : nil
-        let ocrBoxes = ScreenTextRecognizer.recognizeBoxes(
+        var detailedOCR = ScreenTextRecognizer.recognizeDetailedBoxes(
             inImageData: frame.jpeg,
             level: recognitionLevel,
             regionOfInterest: ocrRegion,
             maxDecodeDimension: maxDecodeDimension
         )
+        let ocrBoxes = detailedOCR.lineBoxes
         var redactedOCRBoxes = ocrBoxes
-        let structured = ScreenContentStructurer.structure(ocrBoxes, topLeftOrigin: false)
+        let structured = ScreenContentStructurer.structure(detailedOCR, topLeftOrigin: false)
         var ocrText = structured.readingOrderText
-        var nativeOCRLines: [ScreenTextRecognizer.TextBox] = []
+        var nativeOCR = ScreenTextRecognizer.DetailedResult(lineBoxes: [], tokenBoxes: [])
 
         // Canvas/web window with little AX text → OCR is the only channel, so
         // do one native-resolution pass (rate-limited) for the focused window
@@ -807,11 +808,11 @@ actor RewindEngine {
 	               normalizedRect: windowRect, maxDimension: 2400
 	           ) {
             lastNativeOCRAt = Date()
-            let nativeBoxes = ScreenTextRecognizer.recognizeBoxes(inImageData: nativeCrop, level: .accurate)
+            let nativeBoxes = ScreenTextRecognizer.recognizeDetailedBoxes(inImageData: nativeCrop, level: .accurate)
             let nativeText = ScreenContentStructurer.structure(nativeBoxes, topLeftOrigin: false).readingOrderText
             if nativeText.count > ocrText.count {
                 ocrText = nativeText
-                nativeOCRLines = nativeBoxes
+                nativeOCR = nativeBoxes
             }
         }
 
@@ -825,9 +826,10 @@ actor RewindEngine {
         ) != nil {
             return
         }
-        guard let redacted = FrameRedactor.redact(imageData: frame.jpeg, boxes: ocrBoxes, policy: policy) else { return }
-        redactedOCRBoxes = redacted.boxes
-        ocrText = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false).readingOrderText
+        guard let redacted = FrameRedactor.redact(imageData: frame.jpeg, detailedOCR: detailedOCR, policy: policy) else { return }
+        detailedOCR = redacted.ocr
+        redactedOCRBoxes = redacted.ocr.lineBoxes
+        ocrText = ScreenContentStructurer.structure(redacted.ocr, topLeftOrigin: false).readingOrderText
         let redactedAXText = FrameRedactor.redactedText(axText, policy: policy)
         let redactedAXControls = axControls.map {
             ScreenContentStructurer.AXControl(
@@ -839,16 +841,26 @@ actor RewindEngine {
                 confidence: $0.confidence
             )
         }
-        nativeOCRLines = nativeOCRLines.map {
-            ScreenTextRecognizer.TextBox(
-                text: FrameRedactor.redactedText($0.text, policy: policy),
-                boundingBox: $0.boundingBox,
-                confidence: $0.confidence
-            )
-        }
+        nativeOCR = ScreenTextRecognizer.DetailedResult(
+            lineBoxes: nativeOCR.lineBoxes.map {
+                ScreenTextRecognizer.TextBox(
+                    text: FrameRedactor.redactedText($0.text, policy: policy),
+                    boundingBox: $0.boundingBox,
+                    confidence: $0.confidence
+                )
+            },
+            tokenBoxes: nativeOCR.tokenBoxes.map {
+                ScreenTextRecognizer.TextBox(
+                    text: FrameRedactor.redactedText($0.text, policy: policy),
+                    boundingBox: $0.boundingBox,
+                    confidence: $0.confidence
+                )
+            }
+        )
         let structuredRedacted = ScreenContentStructurer.structure(
-            redactedOCRBoxes,
+            detailedOCR,
             topLeftOrigin: false,
+            axText: redactedAXText,
             axControls: redactedAXControls
         )
         let structuredMetadata: StructuredContentExporter.Metadata? = if structuredContent {
@@ -904,9 +916,9 @@ actor RewindEngine {
             structuredPayload: structuredContent ? StructuredContentExporter.sidecarPayload(from: structuredRedacted) : nil,
             visionBoxes: redactedOCRBoxes,
             axText: redactedAXText,
-            nativeVisionBoxes: nativeOCRLines,
+            nativeVisionBoxes: nativeOCR.lineBoxes,
             signature: signature,
-            semanticText: mergedText.isEmpty ? nil : mergedText,
+            semanticText: structuredRedacted.searchableText.isEmpty ? (mergedText.isEmpty ? nil : mergedText) : structuredRedacted.searchableText,
             auditDetail: ContextRecorder.captureAuditDetail(
                 appName: context.appName,
                 axChars: axText.count,
@@ -973,7 +985,7 @@ final class RewindRecorder {
         threshold: Int = PerceptualHash.defaultSkipThreshold,
         fps: Int32 = 1,
         indexWorkGraph: Bool = true,
-        structuredContent: Bool = false,
+        structuredContent: Bool = true,
         maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void

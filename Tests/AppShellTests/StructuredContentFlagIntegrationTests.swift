@@ -18,16 +18,35 @@ private let appShellStructuredMetadataJSON = #"""
 """#
 
 @MainActor @Test
-func structuredContentFlagDefaultsOffAndLeavesStructuredMetadataAbsent() throws {
-    let defaults = UserDefaults(suiteName: "CascadeStructuredFlagOff-\(UUID().uuidString)")!
+func structuredContentDefaultsOnAndExposesStructuredRecall() throws {
+    let defaults = UserDefaults(suiteName: "CascadeStructuredDefaultOn-\(UUID().uuidString)")!
+    let store = try makeStructuredFlagStore()
+    let model = try CascadeAppModel(store: store, defaults: defaults, startsSubsystems: false)
+
+    #expect(CascadeAppModel.experimentalStructuredContentEnabled(defaults: defaults))
+    #expect(model.recorder.configuration.structuredContent)
+
+    let metadata = RecorderMetadataJSON.capture(processIdentifier: 123, cursorScreen: true, structured: nil)
+    #expect(!metadata.contains("structured"))
+
+    let agent = ComputerUseAgent(
+        harnessProvider: { _, _ in "unused" },
+        recallEnabled: true,
+        includeStructuredRecallContent: CascadeAppModel.experimentalStructuredContentEnabled(defaults: defaults)
+    )
+    let names = agent.configuredRecallToolDefinitions().compactMap { $0["name"] as? String }
+    #expect(names.contains("inspect_structure"))
+}
+
+@MainActor @Test
+func structuredContentEscapeHatchCanDisableStructuredRecall() throws {
+    let defaults = UserDefaults(suiteName: "CascadeStructuredOff-\(UUID().uuidString)")!
+    defaults.set(false, forKey: CascadeAppModel.experimentalStructuredContentKey)
     let store = try makeStructuredFlagStore()
     let model = try CascadeAppModel(store: store, defaults: defaults, startsSubsystems: false)
 
     #expect(!CascadeAppModel.experimentalStructuredContentEnabled(defaults: defaults))
-    #expect(model.recorder.configuration.structuredContent == false)
-
-    let metadata = RecorderMetadataJSON.capture(processIdentifier: 123, cursorScreen: true, structured: nil)
-    #expect(!metadata.contains("structured"))
+    #expect(!model.recorder.configuration.structuredContent)
 
     let agent = ComputerUseAgent(
         harnessProvider: { _, _ in "unused" },

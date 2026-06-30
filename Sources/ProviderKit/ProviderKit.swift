@@ -18,6 +18,9 @@ public struct ProviderMessage: Equatable, Sendable {
 /// did that page say?") via `samples` and `relevant`, and "what just happened?"
 /// via `recent`.
 public struct ChatGrounding: Sendable {
+    /// Selected Reel moment and its nearby context. When present this is the primary
+    /// evidence for "this/current/on screen" wording from the scrubbed playhead.
+    public let focused: [RecordedContext]
     /// The whole window, lightweight rows (no OCR) — drives the session digest.
     public let timeline: [RecordedContext]
     /// Representative on-screen text excerpts sampled across the window.
@@ -28,11 +31,13 @@ public struct ChatGrounding: Sendable {
     public let recent: [RecordedContext]
 
     public init(
+        focused: [RecordedContext] = [],
         timeline: [RecordedContext] = [],
         samples: [RecordedContext] = [],
         relevant: [RecordedContext] = [],
         recent: [RecordedContext] = []
     ) {
+        self.focused = focused
         self.timeline = timeline
         self.samples = samples
         self.relevant = relevant
@@ -44,7 +49,7 @@ public struct ChatGrounding: Sendable {
     public var allMoments: [RecordedContext] {
         var seen = Set<Int64>()
         var result: [RecordedContext] = []
-        for context in recent + relevant + samples + timeline {
+        for context in focused + recent + relevant + samples + timeline {
             if context.id != 0 {
                 guard seen.insert(context.id).inserted else { continue }
             }
@@ -62,6 +67,10 @@ public struct LocalGroundedAnswerer: ContextQuestionAnswering {
     public init() {}
 
     public func answer(question: String, grounding: ChatGrounding) async throws -> String {
+        if RecordSearchAnswerer.isInstructionalQuestion(question) {
+            return "Step-by-step help for that requires a connected model. Connect Claude in Settings and ask again."
+        }
+
         let sorted = grounding.allMoments.sorted { $0.capturedAt > $1.capturedAt }
         guard let newest = sorted.first else {
             return "I do not have enough recorded context yet."

@@ -357,6 +357,8 @@ public final class CascadeAppModel: ObservableObject {
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
     static let valueMonthlyActionBudgetKey = "cascade.value.monthlyActionBudget"
     static let valueMonthlyCostCentsBudgetKey = "cascade.value.monthlyCostCentsBudget"
+    static let reelTimelineWindow: TimeInterval = 24 * 60 * 60
+    static let reelTimelineLimit = 8_000
     static let proactiveModeKey = "cascade.proactive.mode"
     static let suggestionTimingPreferenceKey = "cascade.personalization.suggestionTiming"
     static let backgroundAgentPreferenceKey = "cascade.personalization.backgroundAgent"
@@ -370,7 +372,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
-        defaults.bool(forKey: Self.experimentalStructuredContentKey)
+        defaults.object(forKey: Self.experimentalStructuredContentKey) as? Bool ?? true
     }
 
     static func experimentalWorkGraphIndexEnabled(defaults: UserDefaults) -> Bool {
@@ -662,9 +664,15 @@ public final class CascadeAppModel: ObservableObject {
 
     public func refreshAll() async {
         do {
-            refreshPermissionState()
-            await refreshComputerUseHealth()
-            contexts = try await store.recentContexts(limit: 80)
+            if startsSubsystems {
+                refreshPermissionState()
+                await refreshComputerUseHealth()
+            }
+            let timeline = try await store.contextTimeline(
+                since: Date(timeIntervalSinceNow: -Self.reelTimelineWindow),
+                limit: Self.reelTimelineLimit
+            )
+            contexts = timeline.isEmpty ? try await store.recentContexts(limit: 80) : timeline
             let integrity = try await store.verifyAuditChain()
             auditIntegrityStatus = Self.auditIntegrityStatus(from: integrity)
             if trustedAuditHistoryForSensitiveAction() {
@@ -908,11 +916,12 @@ public final class CascadeAppModel: ObservableObject {
     /// The Reel chat. Replies briefly. Questions that refer to the current screen
     /// ("where is the send button", "show me X") point the companion cursor at the
     /// element AND reply; everything else is a brief grounded answer about the record.
-    public func ask(_ question: String) {
+    public func ask(_ question: String, selectedMoment: RecordedContext? = nil) {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let focus = selectedMoment.map(RecordAnswerFocus.init(moment:))
 
-        if Self.refersToScreen(trimmed) {
+        if focus == nil, !Self.isInstructionalQuestion(trimmed), Self.refersToScreen(trimmed) {
             showOnScreen(trimmed)
             return
         }
@@ -926,7 +935,7 @@ public final class CascadeAppModel: ObservableObject {
             var citations: [CitedMoment] = []
             var answered = true
             do {
-                let recordAnswer = try await orchestrator.askRecord(trimmed, conversation: Array(history))
+                let recordAnswer = try await orchestrator.askRecord(trimmed, conversation: Array(history), focus: focus)
                 // Show the FULL answer in the text thread. brief() is the ~280-char
                 // SPOKEN cap (voice replies stay short) — applying it here chopped
                 // multi-item summaries mid-word ("2. **Keyn…") even though the chat
@@ -1022,13 +1031,17 @@ public final class CascadeAppModel: ObservableObject {
     /// Whether a chat question is about the *current screen* (point the cursor) vs.
     /// the *recorded past* (answer as text). Retrospective phrasing wins so that
     /// "what did I do today" is never mistaken for a screen command.
-    private static func refersToScreen(_ text: String) -> Bool {
+    nonisolated static func isInstructionalQuestion(_ text: String) -> Bool {
+        RecordSearchAnswerer.isInstructionalQuestion(text)
+    }
+
+    nonisolated static func refersToScreen(_ text: String) -> Bool {
         let t = text.lowercased()
         let retrospective = ["what did", "what was", "what have", "did i ", "summar", "recap",
                              "today", "yesterday", "earlier", "this week", "last week", "history", "happened"]
         if retrospective.contains(where: { t.contains($0) }) { return false }
         let screenReferring = ["where", "show me", "show the", "find ", "which ", "point", "take me to",
-                              "locate", "highlight", "how do i", "how can i", "open ", "click", "button",
+                              "locate", "highlight", "open ", "click", "button",
                               "menu", "icon", " tab", "field", "on screen", "on my screen", "this screen"]
         return screenReferring.contains { t.contains($0) }
     }
@@ -1745,6 +1758,17 @@ public final class CascadeAppModel: ObservableObject {
         case .goal(let cleaned):
             q = cleaned
         }
+        if Self.isInstructionalQuestion(q) {
+            teachMessage = "Thinking…"
+            Task {
+                let answer = Self.brief((try? await orchestrator.ask(q)) ?? "I couldn't answer that from the local record.")
+                assistMemory.remember(user: q, assistant: answer)
+                teachMessage = answer
+                voice.speak(answer)
+                voice.done()
+            }
+            return
+        }
         guard hasAnthropicKey else {
             teachMessage = "Connect your Claude key in Settings first."
             showSettings = true
@@ -2160,7 +2184,74 @@ public final class CascadeAppModel: ObservableObject {
                 }
 
                 switch attempt {
-                case .finished(let text, _):
+                case .finished(let text, let acted):
+                    if !acted, !Self.allowsActionlessAssistCompletion(goal: goal, subtask: sub, planCount: plan.count) {
+                        let reason = "finished without executing any screen action"
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "assist.subgoal.fail",
+                            detail: Self.assistSubgoalAuditDetail(
+                                index: index,
+                                total: plan.count,
+                                subtask: sub,
+                                status: "failed",
+                                failureKind: .validatorIncomplete,
+                                reason: reason
+                            )
+                        ))
+                        let recovery = Self.recoveryAction(for: .validatorIncomplete, attempt: 1)
+                        await recordAssistRecoveryMemory(
+                            goal: goal,
+                            subtask: sub,
+                            failureKind: .validatorIncomplete,
+                            reason: reason,
+                            recovery: recovery
+                        )
+                        if !replannedCurrent, Self.shouldReplanAssistSubgoal(failureKind: .validatorIncomplete) {
+                            let memo = AgentRecoveryMemo(
+                                failedSubtask: sub,
+                                failureKind: .validatorIncomplete,
+                                attemptedRecovery: recovery,
+                                targetHash: Self.auditHash(sub.task),
+                                stateSummary: reason,
+                                evidenceSummary: "claimed=\(String(text.prefix(180)))",
+                                completedFindings: findings.map { AgentTaskFinding(task: $0.task, result: $0.result) }
+                            )
+                            let h = TextHelperModel.resolve()
+                            let decision = await AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache).replan(
+                                originalTask: goal,
+                                memo: memo,
+                                environment: .onScreen,
+                                conversationContext: assistMemory.contextMemo()
+                            )
+                            switch decision {
+                            case .replaceCurrent(let replacement):
+                                plan[index] = replacement
+                                sub = replacement
+                                replannedCurrent = true
+                                shot = nil
+                                _ = try? await store.appendAudit(AuditEvent(
+                                    actor: "agent",
+                                    action: "assist.subgoal.replan",
+                                    detail: Self.assistSubgoalAuditDetail(
+                                        index: index,
+                                        total: plan.count,
+                                        subtask: replacement,
+                                        status: "replace",
+                                        failureKind: .validatorIncomplete,
+                                        reason: reason
+                                    )
+                                ))
+                                continue subgoal
+                            case .pause(let pauseReason):
+                                stalledOn = sub.task
+                                findings.append((task: sub.task, result: pauseReason))
+                                break parts
+                            }
+                        }
+                        stalledOn = sub.task
+                        break parts
+                    }
                     let forceValidator = plan.count > 1 || sub.risk == .high || Self.onScreenBackendIsScout()
                     let verification = await verifyAssistSubgoal(
                         subtask: sub,
@@ -5981,10 +6072,33 @@ public final class CascadeAppModel: ObservableObject {
         // means GO DO IT — navigate / open / surface it. So "find" is NOT a point
         // trigger; only the locational "where…" is (which still catches "where can I
         // find X"). Previously "find " sat here and sent every "find …" to point-only.
-        let teachy = ["where", "how do i", "how can i", "show me", "what is", "what's",
+        let teachy = ["where", "show me", "what is", "what's",
                       "which ", "who ", "is there", "are there", "can i ", "does "]
         if teachy.contains(where: { t.contains($0) }) { return false }
         return true
+    }
+
+    nonisolated static func allowsActionlessAssistCompletion(goal: String, subtask: AgentSubtask, planCount: Int) -> Bool {
+        guard planCount == 1 else { return false }
+        return isLaunchOnlyTask(goal) && isLaunchOnlyTask(subtask.task)
+    }
+
+    private nonisolated static func isLaunchOnlyTask(_ text: String) -> Bool {
+        let t = text.lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9\s:/\.-]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ["open ", "launch ", "switch to ", "bring up ", "go to ", "navigate to "].contains(where: { t.hasPrefix($0) }) else {
+            return false
+        }
+        if [" and ", " then ", " after "].contains(where: { t.contains($0) }) { return false }
+        let words = Set(t.split(separator: " ").map(String.init))
+        let workMarkers: Set<String> = [
+            "create", "design", "write", "make", "build",
+            "send", "reply", "edit", "fill", "export", "download", "upload", "delete",
+            "move", "copy", "paste", "search", "find"
+        ]
+        return words.isDisjoint(with: workMarkers)
     }
 
     /// Questions about the recorded past ("what did I do today?") — answered from
@@ -6046,6 +6160,7 @@ public final class CascadeAppModel: ObservableObject {
     /// be the agent's, not the user's hand).
     public func beginTeaching() {
         guard !teachingMode else { return }
+        clearStoppedRunBlockersBeforeTeaching()
         guard !assistTaskRunning, !agentRunning else {
             flashTeachStatus("Finish the running task before teaching.")
             return
@@ -6055,6 +6170,14 @@ public final class CascadeAppModel: ObservableObject {
         teachingMode = true
         teachStatus = "Teaching — do the task, narrate if you like, then press ⌥⌃T to finish."
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.started", detail: "")) }
+    }
+
+    private func clearStoppedRunBlockersBeforeTeaching() {
+        guard driver.runState.isStopRequested, assistTaskRunning || agentRunning else { return }
+        assistGeneration += 1
+        assistTaskRunning = false
+        assistTaskGoal = nil
+        agentRunning = false
     }
 
     /// End the demonstration and turn the bracketed range into a curated agent (shown
@@ -7197,6 +7320,14 @@ public final class CascadeAppModel: ObservableObject {
             backgroundCapable: runsInBackground(apps: waste.apps),
             privacyRiskBucket: (waste.quality?.privacyPenalty ?? 0) >= 0.25 ? "medium" : "low"
         )
+        if model.evidenceCount(waste.signature) >= 2 {
+            return ranker.personalizationThreshold(
+                waste.signature,
+                baseRepeats: minRepeatsToAutomate,
+                baseObservedSeconds: minSecondsToReview,
+                using: model
+            )
+        }
         return ranker.personalizationThreshold(
             waste.signature,
             baseRepeats: minRepeatsToAutomate,
@@ -9064,7 +9195,7 @@ public final class CascadeAppModel: ObservableObject {
         var policy = capturePrivacyPolicy
         policy.privateModeEnabled = enabled
         capturePrivacyPolicy = policy
-        statusLine = enabled ? "Recording paused by private mode." : recorder.status.message
+        statusLine = enabled ? "Private mode on. Sensitive content will be excluded or redacted while capture continues." : recorder.status.message
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "privacy.private_mode", detail: "enabled=\(enabled)")) }
     }
 
@@ -9235,8 +9366,10 @@ public final class CascadeAppModel: ObservableObject {
     private func ingestLiveMoment(_ context: RecordedContext) {
         guard !contexts.contains(where: { $0.id == context.id }) else { return }
         contexts.insert(context, at: 0)
-        if contexts.count > 200 {
-            contexts.removeLast(contexts.count - 200)
+        let cutoff = Date(timeIntervalSinceNow: -Self.reelTimelineWindow)
+        contexts.removeAll { $0.capturedAt < cutoff }
+        if contexts.count > Self.reelTimelineLimit {
+            contexts.removeLast(contexts.count - Self.reelTimelineLimit)
         }
     }
 

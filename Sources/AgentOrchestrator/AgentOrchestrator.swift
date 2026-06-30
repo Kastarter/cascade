@@ -259,18 +259,22 @@ public actor CascadeOrchestrator {
     /// per-moment inspection) and returns the answer WITH the moments it used.
     /// Falls back to single-shot grounding, then to the local heuristic, so a
     /// missing key or a flaky network never breaks asking.
-    public func askRecord(_ question: String, conversation: [(user: String, assistant: String)] = []) async throws -> RecordAnswer {
-        if keyStore.hasKey(),
-           let answer = try? await recordAnswerer.answer(question: question, conversation: conversation) {
+    public func askRecord(
+        _ question: String,
+        conversation: [(user: String, assistant: String)] = [],
+        focus: RecordAnswerFocus? = nil
+    ) async throws -> RecordAnswer {
+        if let answer = try? await recordAnswerer.answer(question: question, conversation: conversation, focus: focus) {
             return answer
         }
-        let grounding = try await chatGrounding(for: question)
+        let grounding = try await chatGrounding(for: question, focus: focus)
+        let focusedCitationIDs = Self.focusedCitationIDs(from: grounding)
         if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: question, grounding: grounding) {
-            return RecordAnswer(text: answer, citedMomentIDs: [])
+            return RecordAnswer(text: answer, citedMomentIDs: focusedCitationIDs)
         }
         return RecordAnswer(
             text: try await localAnswerer.answer(question: question, grounding: grounding),
-            citedMomentIDs: []
+            citedMomentIDs: focusedCitationIDs
         )
     }
 
@@ -290,18 +294,48 @@ public actor CascadeOrchestrator {
     /// samples plus question-matched moments from the entire record (specifics
     /// seen at any time), and the freshest fully-decoded moments (what just
     /// happened). Privacy-filtered before anything reaches a provider.
-    private func chatGrounding(for question: String) async throws -> ChatGrounding {
+    private func chatGrounding(for question: String, focus: RecordAnswerFocus? = nil) async throws -> ChatGrounding {
         let since = Date(timeIntervalSinceNow: -24 * 60 * 60)
         let recent = try await store.recentContexts(limit: 24)
         let timeline = (try? await store.contextTimeline(since: since)) ?? []
         let samples = (try? await store.contentSamples(since: since)) ?? []
         let relevant = (try? await store.relevantContexts(to: question)) ?? []
+        let focused = await focusedGrounding(for: focus)
         return ChatGrounding(
+            focused: focused,
             timeline: timeline.filter { !PrivacyRules.isSensitive($0) },
             samples: samples.filter { !PrivacyRules.isSensitive($0) },
             relevant: relevant.filter { !PrivacyRules.isSensitive($0) },
             recent: recent.filter { !PrivacyRules.isSensitive($0) }
         )
+    }
+
+    private func focusedGrounding(for focus: RecordAnswerFocus?) async -> [RecordedContext] {
+        guard let focus else { return [] }
+        var rows: [RecordedContext] = []
+        let selected = ((try? await store.context(id: focus.momentID)) ?? focus.fallbackContext)
+        if !PrivacyRules.isSensitive(selected) {
+            rows.append(selected)
+        }
+        let nearby = ((try? await store.contexts(
+            between: focus.capturedAt.addingTimeInterval(-90),
+            and: focus.capturedAt.addingTimeInterval(90),
+            limit: 12
+        )) ?? [])
+            .filter { $0.id != selected.id && !PrivacyRules.isSensitive($0) }
+        rows.append(contentsOf: nearby)
+        return rows
+    }
+
+    private static func focusedCitationIDs(from grounding: ChatGrounding) -> [Int64] {
+        var seen = Set<Int64>()
+        var ids: [Int64] = []
+        for context in grounding.focused where context.id > 0 {
+            guard seen.insert(context.id).inserted else { continue }
+            ids.append(context.id)
+            if ids.count == 4 { break }
+        }
+        return ids
     }
 
     /// Proposes exactly one reviewed next step toward `goal`, grounded in recent

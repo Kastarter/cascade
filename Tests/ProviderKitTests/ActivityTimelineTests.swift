@@ -100,16 +100,23 @@ func localAnswererCoversTheWholeWindowNotJustTheLatestMoments() async throws {
 private final class CapturingCompleter: MessageCompleting, @unchecked Sendable {
     private let lock = NSLock()
     private var _lastUser: String?
+    private var _lastSystem: String?
     var lastUser: String? {
         lock.withLock { _lastUser }
     }
+    var lastSystem: String? {
+        lock.withLock { _lastSystem }
+    }
 
-    private func record(_ user: String) {
-        lock.withLock { _lastUser = user }
+    private func record(system: String?, user: String) {
+        lock.withLock {
+            _lastSystem = system
+            _lastUser = user
+        }
     }
 
     func complete(system: String?, user: String, model: String, maxTokens: Int) async throws -> String {
-        record(user)
+        record(system: system, user: user)
         return "ok"
     }
 }
@@ -135,4 +142,24 @@ func claudeAnswererPromptCarriesEveryGroundingLayer() async throws {
     #expect(prompt.contains("Final Project due Jul 30 at 11:59 PM"))
     #expect(prompt.contains("quarterly dashboard numbers"))
     #expect(prompt.contains("Moments matching the question"))
+}
+
+@Test
+func claudeAnswererPromptAllowsInstructionalAnswersWithoutFutureActionBan() async throws {
+    let completer = CapturingCompleter()
+    let answerer = ClaudeGroundedAnswerer(client: completer)
+
+    _ = try await answerer.answer(
+        question: "how can I export a PDF?",
+        grounding: ChatGrounding(focused: [moment("Preview", at: 0, title: "Invoice", ocr: "File Export as PDF")])
+    )
+
+    let system = try #require(completer.lastSystem)
+    let user = try #require(completer.lastUser)
+    #expect(system.contains("instructional/how-to questions"))
+    #expect(system.contains("give concrete actionable steps"))
+    #expect(!system.contains("never plan or suggest future actions"))
+    #expect(system.contains("Do not claim actions were performed"))
+    #expect(user.contains("Selected Reel moment and nearby context"))
+    #expect(user.contains("File Export as PDF"))
 }

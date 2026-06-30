@@ -316,7 +316,11 @@ public final class InputRecorder: @unchecked Sendable {
     public func updatePolicy(_ policy: CapturePrivacyPolicy) {
         contextLock.lock()
         self.policy = policy
-        currentContext.isSensitive = policy.privateModeEnabled
+        currentContext.isSensitive = !policy.decision(
+            appName: currentContext.app,
+            bundleIdentifier: currentContext.bundle,
+            windowTitle: currentContext.window
+        ).allowed
         contextLock.unlock()
     }
 

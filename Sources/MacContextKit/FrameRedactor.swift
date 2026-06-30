@@ -39,6 +39,15 @@ public enum FrameRedactor {
         }
     }
 
+    public struct DetailedResult: Sendable {
+        public let imageData: Data
+        public let ocr: ScreenTextRecognizer.DetailedResult
+        public let redactionRects: [CGRect]
+        public let metadata: Metadata
+
+        public var boxes: [ScreenTextRecognizer.TextBox] { ocr.lineBoxes }
+    }
+
     public static func wholeFrameDropReason(
         appName: String,
         bundleIdentifier: String?,
@@ -97,6 +106,70 @@ public enum FrameRedactor {
         return Result(imageData: encoded, boxes: redactedBoxes, redactionRects: rects, metadata: metadata)
     }
 
+    public static func redact(
+        imageData: Data,
+        detailedOCR: ScreenTextRecognizer.DetailedResult,
+        policy: CapturePrivacyPolicy = .default,
+        compression: CGFloat = 0.6
+    ) -> DetailedResult? {
+        guard let image = decode(imageData) else { return nil }
+        var entityTypes = Set<String>()
+        var rects: [CGRect] = []
+        var sensitiveLineRects: [CGRect] = []
+
+        let redactedLines = detailedOCR.lineBoxes.map { box -> ScreenTextRecognizer.TextBox in
+            let pii = PIIDetector.redact(box.text, includeNames: false, highConfidenceOnly: false)
+            let keywordSensitive = policy.isSensitiveText(box.text)
+            var redactedText = pii.redacted
+            if keywordSensitive {
+                redactedText = policy.redactingSensitiveKeywords(in: redactedText)
+                entityTypes.insert("SENSITIVE_TEXT")
+            }
+            for finding in pii.findings {
+                entityTypes.insert(finding.type.rawValue)
+            }
+            if keywordSensitive || !pii.findings.isEmpty {
+                sensitiveLineRects.append(box.boundingBox)
+                rects.append(pixelRect(for: box.boundingBox, imageWidth: image.width, imageHeight: image.height))
+            }
+            return ScreenTextRecognizer.TextBox(text: redactedText, boundingBox: box.boundingBox, confidence: box.confidence)
+        }
+
+        let redactedTokens = detailedOCR.tokenBoxes.compactMap { box -> ScreenTextRecognizer.TextBox? in
+            if sensitiveLineRects.contains(where: { overlaps(box.boundingBox, $0) }) {
+                return nil
+            }
+            let pii = PIIDetector.redact(box.text, includeNames: false, highConfidenceOnly: false)
+            let keywordSensitive = policy.isSensitiveText(box.text)
+            var redactedText = pii.redacted
+            if keywordSensitive {
+                redactedText = policy.redactingSensitiveKeywords(in: redactedText)
+                entityTypes.insert("SENSITIVE_TEXT")
+            }
+            for finding in pii.findings {
+                entityTypes.insert(finding.type.rawValue)
+            }
+            if keywordSensitive || !pii.findings.isEmpty {
+                rects.append(pixelRect(for: box.boundingBox, imageWidth: image.width, imageHeight: image.height))
+            }
+            return ScreenTextRecognizer.TextBox(text: redactedText, boundingBox: box.boundingBox, confidence: box.confidence)
+        }
+
+        guard let redactedImage = draw(image: image, covering: rects),
+              let encoded = encodeJPEG(redactedImage, compression: compression) else { return nil }
+        let metadata = Metadata(
+            redactionCount: rects.count,
+            entityTypes: entityTypes.sorted(),
+            redactedFrameHash: sha256Hex(encoded)
+        )
+        return DetailedResult(
+            imageData: encoded,
+            ocr: ScreenTextRecognizer.DetailedResult(lineBoxes: redactedLines, tokenBoxes: redactedTokens),
+            redactionRects: rects,
+            metadata: metadata
+        )
+    }
+
     public static func redactedText(_ text: String, policy: CapturePrivacyPolicy = .default) -> String {
         let pii = PIIDetector.redact(text, includeNames: false, highConfidenceOnly: false).redacted
         return policy.redactingSensitiveKeywords(in: pii)
@@ -139,6 +212,12 @@ public enum FrameRedactor {
             height: normalized.height * h
         ).insetBy(dx: -padding, dy: -padding)
         return rect.integral
+    }
+
+    private static func overlaps(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull, lhs.width > 0, lhs.height > 0 else { return false }
+        return (intersection.width * intersection.height) / (lhs.width * lhs.height) >= 0.35
     }
 
     private static func encodeJPEG(_ image: CGImage, compression: CGFloat) -> Data? {

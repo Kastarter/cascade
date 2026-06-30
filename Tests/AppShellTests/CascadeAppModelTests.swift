@@ -15,6 +15,27 @@ private struct FakeCompleter: MessageCompleting {
     }
 }
 
+private struct ThrowingRecordAnswerer: RecordAnswering {
+    func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        focus: RecordAnswerFocus?
+    ) async throws -> RecordAnswer {
+        throw CocoaError(.featureUnsupported)
+    }
+}
+
+private struct FocusedGroundingAnswerer: ContextQuestionAnswering {
+    func answer(question: String, grounding: ChatGrounding) async throws -> String {
+        let selected = grounding.focused.first
+        return [
+            selected?.appName,
+            selected?.windowTitle,
+            selected?.ocrText,
+        ].compactMap { $0 }.joined(separator: " | ")
+    }
+}
+
 private let base = Date(timeIntervalSince1970: 1_700_000_000)
 
 /// Builds the model in HEADLESS mode — injected temp store + orchestrator, no taps,
@@ -112,6 +133,56 @@ func modelBuildsHeadlessWithoutStartingHardware() throws {
     #expect(model.agents.isEmpty)
     #expect(model.pendingCuratedAgents.isEmpty)
     #expect(!model.agentRunning)
+}
+
+@MainActor @Test
+func askWithSelectedMomentUsesRewindContextInsteadOfLiveScreen() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeSelectedAsk-\(UUID().uuidString).sqlite").path
+    let store = try CascadeStore(path: path)
+    let selected = try await store.insert(RecordedContext(
+        capturedAt: base,
+        source: .screen,
+        appName: "Numbers",
+        windowTitle: "Invoice tracker",
+        ocrText: "TOTAL DUE $443,355"
+    ))
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        localAnswerer: FocusedGroundingAnswerer(),
+        claudeAnswerer: FocusedGroundingAnswerer(),
+        recordAnswerer: ThrowingRecordAnswerer()
+    )
+    let defaults = UserDefaults(suiteName: "CascadeSelectedAsk-\(UUID().uuidString)")!
+    let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
+
+    model.ask("where is the total on this screen?", selectedMoment: selected)
+    try await waitUntil { model.conversation.count == 1 }
+
+    let turn = try #require(model.conversation.last)
+    #expect(turn.answer.contains("Numbers"))
+    #expect(turn.answer.contains("Invoice tracker"))
+    #expect(turn.answer.contains("TOTAL DUE $443,355"))
+    #expect(turn.citations.map(\.id).contains(selected.id))
+}
+
+@Test
+func actionlessAssistCompletionOnlyAllowsSingleLaunchTasks() {
+    #expect(CascadeAppModel.allowsActionlessAssistCompletion(
+        goal: "Open Keynote",
+        subtask: AgentSubtask(task: "Open Keynote", app: "Keynote"),
+        planCount: 1
+    ))
+    #expect(!CascadeAppModel.allowsActionlessAssistCompletion(
+        goal: "Open Keynote and design a title slide",
+        subtask: AgentSubtask(task: "Open Keynote", app: "Keynote"),
+        planCount: 2
+    ))
+    #expect(!CascadeAppModel.allowsActionlessAssistCompletion(
+        goal: "Design a title slide in Keynote",
+        subtask: AgentSubtask(task: "Design a title slide", app: "Keynote"),
+        planCount: 1
+    ))
 }
 
 @MainActor @Test
@@ -830,6 +901,31 @@ func voicePartialUtteranceUpdatesStatusWithoutTeaching() throws {
     model.teach(question: "ok")
 
     #expect(model.teachMessage == "ok")
+}
+
+@MainActor @Test
+func beginTeachingClearsStoppedAgentRunBlocker() throws {
+    let (model, _) = try makeModel()
+    let agent = CascadeAgent(
+        name: "Preview checklist",
+        source: .detected,
+        signature: "preview-checklist",
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .activateApp, appName: "Preview"),
+        ]),
+        apps: ["Preview"],
+        goal: "Open Preview"
+    )
+
+    model.deployAgent(agent)
+    #expect(model.agentRunning)
+    model.driver.runState.requestStop()
+    model.beginTeaching()
+
+    #expect(model.teachingMode)
+    #expect(model.teachStatus?.contains("Teaching") == true)
+    #expect(model.teachStatus != "Finish the running task before teaching.")
+    #expect(!model.agentRunning)
 }
 
 @MainActor @Test

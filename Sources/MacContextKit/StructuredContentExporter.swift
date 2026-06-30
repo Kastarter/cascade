@@ -14,9 +14,9 @@ public enum StructuredContentExporter {
             self.maxLines = max(0, maxLines)
         }
 
-        public static let markdown = Budget(maxBytes: 12_000, maxLines: 160)
-        public static let table = Budget(maxBytes: 8_000, maxLines: 120)
-        public static let summary = Budget(maxBytes: 1_000, maxLines: 8)
+        public static let markdown = Budget(maxBytes: 20_000, maxLines: 240)
+        public static let table = Budget(maxBytes: 16_000, maxLines: 240)
+        public static let summary = Budget(maxBytes: 2_000, maxLines: 16)
     }
 
     public struct MetadataKeyValue: Codable, Sendable, Equatable {
@@ -180,12 +180,12 @@ public enum StructuredContentExporter {
     public static func metadata(
         from structured: ScreenContentStructurer.Structured,
         summaryBudget: Budget = .summary,
-        readingOrderBudget: Budget = Budget(maxBytes: 4_000, maxLines: 80),
+        readingOrderBudget: Budget = Budget(maxBytes: 8_000, maxLines: 160),
         tableBudget: Budget = .table,
-        maxKeyValues: Int = 40,
-        maxBlocks: Int = 12,
-        maxLists: Int = 8,
-        maxTables: Int = 4
+        maxKeyValues: Int = 80,
+        maxBlocks: Int = 24,
+        maxLists: Int = 16,
+        maxTables: Int = 8
     ) -> Metadata {
         Metadata(
             summary: summary(from: structured, budget: summaryBudget),
@@ -226,7 +226,7 @@ public enum StructuredContentExporter {
             json: json,
             searchableText: bounded(
                 structured.searchableText.components(separatedBy: .newlines),
-                budget: Budget(maxBytes: 24_000, maxLines: 400)
+                budget: Budget(maxBytes: 64_000, maxLines: 1_000)
             )
         )
     }

@@ -114,6 +114,24 @@ func recognizeBoxesReturnsTextWithNormalizedBoundingBox() async {
     }
 }
 
+@Test
+func recognizeDetailedBoxesReturnsLineAndTokenGeometry() async {
+    let png = renderPNG(text: "TOTAL DUE 443355", width: 900, height: 220)
+    let detailed = await Task.detached {
+        ScreenTextRecognizer.recognizeDetailedBoxes(inImageData: png, level: .accurate)
+    }.value
+
+    guard !detailed.lineBoxes.isEmpty else { return }
+    #expect(detailed.lineBoxes.first?.text.uppercased().contains("TOTAL") == true)
+    if !detailed.tokenBoxes.isEmpty {
+        #expect(detailed.tokenBoxes.contains { $0.text.uppercased().contains("TOTAL") })
+        #expect(detailed.tokenBoxes.allSatisfy {
+            $0.boundingBox.minX >= 0 && $0.boundingBox.maxX <= 1 &&
+            $0.boundingBox.minY >= 0 && $0.boundingBox.maxY <= 1
+        })
+    }
+}
+
 // MARK: - OCR Set-of-Marks (planner perception on canvas / sparse-AX surfaces)
 
 @Test

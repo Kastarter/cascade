@@ -14,11 +14,80 @@ public struct RecordAnswer: Sendable, Equatable {
     }
 }
 
+/// The Reel playhead focus for an ask: the selected moment is primary evidence,
+/// and nearby/tool evidence is only supporting context.
+public struct RecordAnswerFocus: Sendable, Equatable {
+    public let momentID: Int64
+    public let capturedAt: Date
+    public let source: ContextSource
+    public let appName: String
+    public let bundleIdentifier: String?
+    public let windowTitle: String?
+    public let ocrText: String?
+    public let imagePath: String?
+
+    public init(
+        momentID: Int64,
+        capturedAt: Date,
+        source: ContextSource = .screen,
+        appName: String,
+        bundleIdentifier: String? = nil,
+        windowTitle: String? = nil,
+        ocrText: String? = nil,
+        imagePath: String? = nil
+    ) {
+        self.momentID = momentID
+        self.capturedAt = capturedAt
+        self.source = source
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.windowTitle = windowTitle
+        self.ocrText = ocrText
+        self.imagePath = imagePath
+    }
+
+    public init(moment: RecordedContext) {
+        self.init(
+            momentID: moment.id,
+            capturedAt: moment.capturedAt,
+            source: moment.source,
+            appName: moment.appName,
+            bundleIdentifier: moment.bundleIdentifier,
+            windowTitle: moment.windowTitle,
+            ocrText: moment.ocrText,
+            imagePath: moment.imagePath
+        )
+    }
+
+    public var fallbackContext: RecordedContext {
+        RecordedContext(
+            id: momentID,
+            capturedAt: capturedAt,
+            source: source,
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle,
+            ocrText: ocrText,
+            imagePath: imagePath
+        )
+    }
+}
+
 /// Q&A that can hunt through the record and report which moments it used.
 /// Abstracted so the orchestrator's fallback chain is unit-testable without
 /// the network.
 public protocol RecordAnswering: Sendable {
-    func answer(question: String, conversation: [(user: String, assistant: String)]) async throws -> RecordAnswer
+    func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        focus: RecordAnswerFocus?
+    ) async throws -> RecordAnswer
+}
+
+public extension RecordAnswering {
+    func answer(question: String, conversation: [(user: String, assistant: String)]) async throws -> RecordAnswer {
+        try await answer(question: question, conversation: conversation, focus: nil)
+    }
 }
 
 /// Agentic Q&A over the local record: instead of one scoop of grounding, the
@@ -40,6 +109,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "record-answerer")
     static let toolLoopPromptVersion = "record-search-answerer.tool-loop.prompt.v1"
     static let breadthPromptVersion = "record-search-answerer.breadth-synthesis.prompt.v1"
+    static let instructionalPromptVersion = "record-search-answerer.instructional.prompt.v1"
     static let schemaVersion = "record-search-answerer.answer.schema.v1"
 
     public init(
@@ -69,12 +139,21 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     /// Answers `question`, optionally with prior conversation turns for
     /// follow-ups ("and after that?"). Throws only on missing key / transport
     /// failure — the caller falls back to the single-shot answerer.
-    public func answer(question: String, conversation: [(user: String, assistant: String)] = []) async throws -> RecordAnswer {
+    public func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)] = [],
+        focus: RecordAnswerFocus? = nil
+    ) async throws -> RecordAnswer {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             throw AnthropicError.missingKey
         }
 
-        if Self.isBroadQuestion(question),
+        if Self.isInstructionalQuestion(question) {
+            return try await answerInstructionalQuestion(question: question, conversation: conversation, focus: focus)
+        }
+
+        if focus == nil,
+           Self.isBroadQuestion(question),
            let broad = try? await answerBroadQuestion(question: question, conversation: conversation) {
             return broad
         }
@@ -84,7 +163,11 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             messages.append(["role": "user", "content": turn.user])
             messages.append(["role": "assistant", "content": turn.assistant])
         }
-        messages.append(["role": "user", "content": question])
+        if let focus {
+            messages.append(["role": "user", "content": await focusedUserContent(question: question, focus: focus)])
+        } else {
+            messages.append(["role": "user", "content": question])
+        }
 
         for hop in 0..<maxHops {
             let isLastHop = hop == maxHops - 1
@@ -226,6 +309,54 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         return RecordAnswer(text: parsed.text, citedMomentIDs: Array(validIDs.prefix(4)))
     }
 
+    private func answerInstructionalQuestion(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        focus: RecordAnswerFocus?
+    ) async throws -> RecordAnswer {
+        let prior = conversation.suffix(6).map { "User: \($0.user)\nAssistant: \($0.assistant)" }.joined(separator: "\n")
+        var user = """
+        Question: \(question)
+
+        Recent conversation:
+        \(prior.isEmpty ? "(none)" : prior)
+        """
+        if let focus {
+            user += """
+
+            Optional selected Reel context:
+            \(focusText(focus))
+            """
+        }
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.instructionalPromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "RecordSearchAnswerer.answerInstructionalQuestion"
+        )
+        let response = try await messagesClient.send(
+            model: model,
+            maxTokens: 700,
+            system: Self.instructionalSystemPrompt(),
+            messages: [["role": "user", "content": user]],
+            temperature: options.temperature ?? 0,
+            timeout: 30
+        )
+        return RecordAnswer(text: response.text.trimmingCharacters(in: .whitespacesAndNewlines), citedMomentIDs: [])
+    }
+
+    public static func isInstructionalQuestion(_ question: String) -> Bool {
+        let q = " " + question.lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9\s]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines) + " "
+        let markers = [
+            " how do i ", " how can i ", " how should i ", " steps to ", " step by step ",
+            " walk me through ", " instructions to ", " what are the steps ", " how to "
+        ]
+        if markers.contains(where: { q.contains($0) }) { return true }
+        return q.hasPrefix(" how to ") || q.hasPrefix(" steps to ")
+    }
+
     public static func isBroadQuestion(_ question: String) -> Bool {
         let q = question.lowercased()
         let broadTerms = [
@@ -276,6 +407,64 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         """
     }
 
+    private static func instructionalSystemPrompt() -> String {
+        """
+        You answer instructional/how-to questions. Preserve the user's actual task and \
+        give concrete step-by-step instructions. You may use selected recorded context \
+        only to infer the app or screen the user is looking at; do not claim you performed \
+        any action and do not invent past facts from the record.
+
+        Keep the answer concise but useful. Use numbered steps when the task has multiple \
+        actions.
+        """
+    }
+
+    private func focusedUserContent(question: String, focus: RecordAnswerFocus) async -> [[String: Any]] {
+        var text = """
+        Question: \(question)
+
+        Selected Reel moment is PRIMARY evidence for "this", "current", and "on screen" wording.
+        \(focusText(focus))
+        """
+        if focus.momentID > 0 {
+            let inspection = await perform(tool: "inspect_moment", input: ["id": focus.momentID])
+            text += "\n\ninspect_moment for selected Reel moment, including nearby moments:\n\(inspection)"
+        }
+        text += "\n\nUse tools only if you need related context beyond the selected Reel moment. Cite the selected moment if it supports the answer."
+
+        var blocks: [[String: Any]] = [["type": "text", "text": text]]
+        if let image = Self.imageBlock(from: focus.imagePath) {
+            blocks.append(image)
+        }
+        return blocks
+    }
+
+    private func focusText(_ focus: RecordAnswerFocus) -> String {
+        let title = focus.windowTitle.map { " — \($0)" } ?? ""
+        let ocr = focus.ocrText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        [#\(focus.momentID)] \(ISO8601DateFormatter().string(from: focus.capturedAt)) \(focus.appName)\(title)
+        On-screen text:
+        \(ocr?.isEmpty == false ? String(ocr!.prefix(2_000)) : "(none captured in this row)")
+        """
+    }
+
+    private static func imageBlock(from path: String?) -> [String: Any]? {
+        guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let url = URL(fileURLWithPath: path)
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+        let ext = url.pathExtension.lowercased()
+        let mediaType = ext == "png" ? "image/png" : "image/jpeg"
+        return [
+            "type": "image",
+            "source": [
+                "type": "base64",
+                "media_type": mediaType,
+                "data": data.base64EncodedString()
+            ]
+        ]
+    }
+
     /// The stable, cacheable system prefix — byte-identical across hops and
     /// answers, so the prompt cache actually hits. Carries NO wall-clock time
     /// (that lives in `timeContext()`, after the cache breakpoint). Public for tests.
@@ -284,6 +473,9 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         You answer questions about what the user did and saw on their Mac, grounded ONLY \
         in their local screen record, which you search with the tools. Timestamps in \
         results are local HH:mm; the current time is given separately below.
+
+        If the user selected a Reel moment, that selected evidence is primary for "this", \
+        "current", and "on screen" wording. Use tools only for related context around it.
 
         Hunt before answering: search with the user's words, then with synonyms; pull a \
         timeframe when the question is about a stretch of time; inspect promising hits. \

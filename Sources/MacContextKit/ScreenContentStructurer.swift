@@ -353,9 +353,35 @@ public enum ScreenContentStructurer {
     public static func structure(
         _ boxes: [ScreenTextRecognizer.TextBox],
         topLeftOrigin: Bool = true,
+        axText: String = "",
         axControls: [AXControl] = []
     ) -> Structured {
-        let lines = groupIntoLines(boxes, topLeftOrigin: topLeftOrigin)
+        var lines = groupIntoLines(boxes, topLeftOrigin: topLeftOrigin)
+        lines += axTextLines(axText, startingAt: lines.count)
+        let lists = detectLists(lines)
+        let tables = detectTables(lines)
+        let fields = extractFields(lines: lines, tables: tables, axControls: axControls)
+        let blocks = detectBlocks(lines: lines, lists: lists, tables: tables, fields: fields)
+        let codeBlocks = detectCodeBlocks(lines)
+        return Structured(
+            version: currentVersion,
+            lines: lines,
+            blocks: blocks,
+            fields: fields,
+            lists: lists,
+            tables: tables,
+            codeBlocks: codeBlocks
+        )
+    }
+
+    public static func structure(
+        _ detailed: ScreenTextRecognizer.DetailedResult,
+        topLeftOrigin: Bool = true,
+        axText: String = "",
+        axControls: [AXControl] = []
+    ) -> Structured {
+        var lines = detailedLines(detailed, topLeftOrigin: topLeftOrigin)
+        lines += axTextLines(axText, startingAt: lines.count)
         let lists = detectLists(lines)
         let tables = detectTables(lines)
         let fields = extractFields(lines: lines, tables: tables, axControls: axControls)
@@ -422,6 +448,56 @@ public enum ScreenContentStructurer {
                 confidence: raw.confidence
             )
         }
+    }
+
+    private static func detailedLines(_ detailed: ScreenTextRecognizer.DetailedResult, topLeftOrigin: Bool) -> [Line] {
+        guard !detailed.lineBoxes.isEmpty else {
+            return groupIntoLines(detailed.tokenBoxes, topLeftOrigin: topLeftOrigin)
+        }
+        let lineScaffolds = groupIntoLines(detailed.lineBoxes, topLeftOrigin: topLeftOrigin)
+        return lineScaffolds.enumerated().map { index, line in
+            let tokens = detailed.tokenBoxes
+                .filter { tokenBelongs($0.boundingBox, to: line.rect) }
+                .sorted { $0.boundingBox.minX < $1.boundingBox.minX }
+            let boxes = tokens.isEmpty ? line.boxes : tokens
+            let rect = unionRect(([line.rect] + boxes.map(\.boundingBox)))
+            return Line(
+                id: stableID(prefix: "line", index: index),
+                orderIndex: index,
+                text: line.text,
+                boxes: boxes,
+                rect: rect,
+                normalizedRect: rect,
+                source: .ocr,
+                confidence: line.confidence
+            )
+        }
+    }
+
+    private static func tokenBelongs(_ token: CGRect, to line: CGRect) -> Bool {
+        let verticalOverlap = max(0, min(token.maxY, line.maxY) - max(token.minY, line.minY))
+        let minHeight = max(min(token.height, line.height), 1e-6)
+        return verticalOverlap / minHeight >= 0.45 || abs(token.midY - line.midY) <= max(line.height, token.height)
+    }
+
+    private static func axTextLines(_ text: String, startingAt start: Int) -> [Line] {
+        text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .enumerated()
+            .map { offset, text in
+                let index = start + offset
+                return Line(
+                    id: stableID(prefix: "ax-line", index: index),
+                    orderIndex: index,
+                    text: text,
+                    boxes: [],
+                    rect: .zero,
+                    normalizedRect: .zero,
+                    source: .ax,
+                    confidence: 0.9
+                )
+            }
     }
 
     private static func orderByWhitespace(
@@ -806,12 +882,19 @@ public enum ScreenContentStructurer {
     }
 
     private static func sameBaselinePair(_ line: Line) -> (key: String, value: String)? {
-        let boxes = line.boxes
+        let boxes = line.boxes.sorted { $0.boundingBox.minX < $1.boundingBox.minX }
         guard boxes.count >= 2 else { return nil }
-        let first = boxes.dropLast().map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        let last = boxes.last?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard isLabelLike(first), looksLikeValue(last) else { return nil }
-        return (first, last)
+        let gaps = zip(boxes.indices, boxes.indices.dropFirst()).map { leftIndex, rightIndex in
+            (
+                index: rightIndex,
+                gap: boxes[rightIndex].boundingBox.minX - boxes[leftIndex].boundingBox.maxX
+            )
+        }
+        guard let split = gaps.max(by: { $0.gap < $1.gap })?.index, split > 0 else { return nil }
+        let key = boxes[..<split].map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = boxes[split...].map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isLabelLike(key), looksLikeValue(value) else { return nil }
+        return (key, value)
     }
 
     private static func aboveBelowPairs(_ lines: [Line]) -> [(Line, Line)] {
@@ -922,9 +1005,15 @@ public enum ScreenContentStructurer {
 
     // MARK: - Table reconstruction
 
+    private struct RowSegment {
+        let text: String
+        let rect: CGRect
+        let lineID: String
+    }
+
     static func detectTables(_ lines: [Line]) -> [Table] {
         var tables: [Table] = []
-        let candidates = lines.enumerated().filter { $0.element.boxes.count >= 2 }
+        let candidates = lines.enumerated().filter { rowSegments($0.element).count >= 2 }
         guard candidates.count >= 3 else { return [] }
 
         var run: [Line] = []
@@ -949,42 +1038,47 @@ public enum ScreenContentStructurer {
     }
 
     private static func makeTable(_ rows: [Line], index: Int) -> Table? {
-        let allBoxes = rows.flatMap(\.boxes)
-        guard allBoxes.count >= rows.count * 2 else { return nil }
+        let tableRows = trimLeadingStandaloneFieldRows(rows)
+        guard tableRows.count >= 3 else { return nil }
+        let segmentedRows = tableRows.map { rowSegments($0) }
+        let allSegments = segmentedRows.flatMap { $0 }
+        guard allSegments.count >= tableRows.count * 2 else { return nil }
 
-        let medianHeight = median(allBoxes.map { $0.boundingBox.height })
-        let medianChar = median(allBoxes.map {
-            max($0.boundingBox.width / CGFloat(max(1, $0.text.count)), 0.0001)
+        let medianHeight = median(allSegments.map { $0.rect.height })
+        let medianChar = median(allSegments.map {
+            max($0.rect.width / CGFloat(max(1, $0.text.count)), 0.0001)
         })
         let columnTolerance = max(medianHeight * 1.4, medianChar * 4)
 
-        let leftAnchors = clusterValues(allBoxes.map { $0.boundingBox.minX }, tolerance: columnTolerance)
+        let leftAnchors = clusterValues(allSegments.map { $0.rect.minX }, tolerance: columnTolerance)
         guard leftAnchors.count >= 2 else { return nil }
 
         var columnHits = [Int](repeating: 0, count: leftAnchors.count)
-        for row in rows {
+        for row in segmentedRows {
             var seen = Set<Int>()
-            for box in row.boxes {
-                seen.insert(nearestIndex(of: box.boundingBox.minX, in: leftAnchors))
+            for segment in row {
+                seen.insert(nearestIndex(of: segment.rect.minX, in: leftAnchors))
             }
             for col in seen { columnHits[col] += 1 }
         }
-        let stableColumns = leftAnchors.indices.filter { columnHits[$0] >= 3 || columnHits[$0] * 2 >= rows.count }
+        let stableColumns = leftAnchors.indices.filter { columnHits[$0] >= 3 || columnHits[$0] * 2 >= tableRows.count }
         guard stableColumns.count >= 2 else { return nil }
         let columns = stableColumns.map { leftAnchors[$0] }.sorted()
 
         var grid = [[String]]()
         var cells: [TableCell] = []
-        for (rowIndex, row) in rows.enumerated() {
+        for (rowIndex, row) in segmentedRows.enumerated() {
             var rowCells = [String](repeating: "", count: columns.count)
             var rects = [CGRect](repeating: .zero, count: columns.count)
             var hasRect = [Bool](repeating: false, count: columns.count)
-            for box in row.boxes {
-                let col = nearestIndex(of: box.boundingBox.minX, in: columns)
-                let text = box.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            var evidence = [Set<String>](repeating: [], count: columns.count)
+            for segment in row {
+                let col = nearestIndex(of: segment.rect.minX, in: columns)
+                let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 rowCells[col] = rowCells[col].isEmpty ? text : rowCells[col] + " " + text
-                rects[col] = hasRect[col] ? rects[col].union(box.boundingBox) : box.boundingBox
+                rects[col] = hasRect[col] ? rects[col].union(segment.rect) : segment.rect
                 hasRect[col] = true
+                evidence[col].insert(segment.lineID)
             }
             grid.append(rowCells)
             for columnIndex in columns.indices {
@@ -993,7 +1087,7 @@ public enum ScreenContentStructurer {
                     column: columnIndex,
                     text: rowCells[columnIndex],
                     rect: hasRect[columnIndex] ? rects[columnIndex] : .zero,
-                    evidenceLineIDs: [row.id]
+                    evidenceLineIDs: Array(evidence[columnIndex]).sorted()
                 ))
             }
         }
@@ -1003,17 +1097,65 @@ public enum ScreenContentStructurer {
         guard !looksLikeProseGrid(nonEmptyRows) else { return nil }
 
         let headerIndex = inferHeaderRow(grid)
-        let rect = unionRect(rows.map(\.rect))
+        let rect = unionRect(tableRows.map(\.rect))
         return Table(
             rows: grid,
             id: stableID(prefix: "table", index: index),
-            orderIndex: rows.first?.orderIndex ?? index,
+            orderIndex: tableRows.first?.orderIndex ?? index,
             cells: cells,
             rect: rect,
             headerRowIndex: headerIndex,
             confidence: headerIndex == 0 ? 0.82 : 0.74,
-            evidenceLineIDs: rows.map(\.id)
+            evidenceLineIDs: tableRows.map(\.id)
         )
+    }
+
+    private static func rowSegments(_ line: Line) -> [RowSegment] {
+        let boxes = line.boxes.sorted { $0.boundingBox.minX < $1.boundingBox.minX }
+        guard !boxes.isEmpty else { return [] }
+        guard boxes.count >= 2 else {
+            let text = boxes[0].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return [] }
+            return [RowSegment(text: text, rect: boxes[0].boundingBox, lineID: line.id)]
+        }
+        let medianHeight = median(boxes.map { $0.boundingBox.height })
+        let medianChar = median(boxes.map { max($0.boundingBox.width / CGFloat(max(1, $0.text.count)), 0.0001) })
+        let threshold = max(medianHeight * 0.9, medianChar * 1.5)
+
+        var segments: [[ScreenTextRecognizer.TextBox]] = []
+        var current: [ScreenTextRecognizer.TextBox] = []
+        for box in boxes {
+            if let previous = current.last {
+                let gap = box.boundingBox.minX - previous.boundingBox.maxX
+                if gap > threshold {
+                    segments.append(current)
+                    current = []
+                }
+            }
+            current.append(box)
+        }
+        if !current.isEmpty { segments.append(current) }
+        return segments.compactMap { group in
+            let text = group.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return RowSegment(text: text, rect: unionRect(group.map(\.boundingBox)), lineID: line.id)
+        }
+    }
+
+    private static func isStandaloneFieldRow(_ line: Line) -> Bool {
+        guard let pair = sameBaselinePair(line) else { return false }
+        if kind(forKey: pair.key, value: pair.value) != .text { return true }
+        let key = pair.key.lowercased()
+        return ["status", "date", "total", "amount", "balance", "subtotal", "tax", "invoice", "order", "due"]
+            .contains { key.contains($0) }
+    }
+
+    private static func trimLeadingStandaloneFieldRows(_ rows: [Line]) -> [Line] {
+        var rows = rows
+        while rows.count > 3, let first = rows.first, isStandaloneFieldRow(first) {
+            rows.removeFirst()
+        }
+        return rows
     }
 
     private static func inferHeaderRow(_ rows: [[String]]) -> Int? {

@@ -29,7 +29,7 @@ func frameRedactorCoversSensitiveBoxesAndRedactsOCRText() throws {
 }
 
 @Test
-func frameRedactorDropsWholeFrameWhenPolicySaysPrivate() {
+func frameRedactorDoesNotDropOrdinaryPrivateModeFrames() {
     let policy = CapturePrivacyPolicy(privateModeEnabled: true)
     let reason = FrameRedactor.wholeFrameDropReason(
         appName: "Safari",
@@ -38,7 +38,20 @@ func frameRedactorDropsWholeFrameWhenPolicySaysPrivate() {
         rawText: "ordinary text",
         policy: policy
     )
-    #expect(reason == "private_mode")
+    #expect(reason == nil)
+}
+
+@Test
+func frameRedactorDropsWholeFrameForActualSensitiveTextInPrivateMode() {
+    let policy = CapturePrivacyPolicy(privateModeEnabled: true)
+    let reason = FrameRedactor.wholeFrameDropReason(
+        appName: "Safari",
+        bundleIdentifier: "com.apple.Safari",
+        windowTitle: "Inbox",
+        rawText: "password reset",
+        policy: policy
+    )
+    #expect(reason?.hasPrefix("sensitive_keyword") == true)
 }
 
 @Test
@@ -52,6 +65,31 @@ func frameRedactorReportsSensitiveKeywordEntity() throws {
 
     #expect(result.metadata.entityTypes.contains("SENSITIVE_TEXT"))
     #expect(result.boxes.first?.text.contains("<SENSITIVE_TEXT>") == true)
+}
+
+@Test
+func detailedFrameRedactorDropsTokensFromSensitiveLine() throws {
+    let image = renderRedactionFixture(text: "Card 4242 4242 4242 4242", width: 760, height: 240)
+    let line = ScreenTextRecognizer.TextBox(
+        text: "Card 4242 4242 4242 4242",
+        boundingBox: CGRect(x: 0.05, y: 0.35, width: 0.85, height: 0.3)
+    )
+    let tokens = [
+        ScreenTextRecognizer.TextBox(text: "Card", boundingBox: CGRect(x: 0.05, y: 0.35, width: 0.14, height: 0.3)),
+        ScreenTextRecognizer.TextBox(text: "4242", boundingBox: CGRect(x: 0.22, y: 0.35, width: 0.12, height: 0.3)),
+        ScreenTextRecognizer.TextBox(text: "4242", boundingBox: CGRect(x: 0.36, y: 0.35, width: 0.12, height: 0.3)),
+        ScreenTextRecognizer.TextBox(text: "4242", boundingBox: CGRect(x: 0.50, y: 0.35, width: 0.12, height: 0.3)),
+        ScreenTextRecognizer.TextBox(text: "4242", boundingBox: CGRect(x: 0.64, y: 0.35, width: 0.12, height: 0.3)),
+    ]
+
+    let result = try #require(FrameRedactor.redact(
+        imageData: image,
+        detailedOCR: ScreenTextRecognizer.DetailedResult(lineBoxes: [line], tokenBoxes: tokens)
+    ))
+
+    #expect(result.metadata.redactionCount == 1)
+    #expect(result.ocr.tokenBoxes.isEmpty)
+    #expect(result.ocr.lineBoxes.first?.text.contains("4242 4242 4242 4242") == false)
 }
 
 private func renderRedactionFixture(text: String, width: Int, height: Int) -> Data {

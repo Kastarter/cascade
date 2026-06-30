@@ -25,7 +25,7 @@ func capturePolicyImportExportRoundTrips() throws {
 }
 
 @Test
-func capturePolicyDeniesBundleWindowAndPrivateMode() {
+func capturePolicyDeniesBundleWindowButPrivateModeAllowsOrdinaryContexts() {
     let bundlePolicy = CapturePrivacyPolicy(deniedBundleIdentifiers: ["com.example.Secret"])
     #expect(!bundlePolicy.decision(appName: "Secret", bundleIdentifier: "com.example.Secret", windowTitle: nil).allowed)
 
@@ -33,7 +33,8 @@ func capturePolicyDeniesBundleWindowAndPrivateMode() {
     #expect(!windowPolicy.decision(appName: "Numbers", bundleIdentifier: nil, windowTitle: "Q4 Payroll").allowed)
 
     let privatePolicy = CapturePrivacyPolicy(privateModeEnabled: true)
-    #expect(privatePolicy.decision(appName: "Notes", bundleIdentifier: nil, windowTitle: nil).reason == "private_mode")
+    #expect(privatePolicy.decision(appName: "Notes", bundleIdentifier: nil, windowTitle: nil).allowed)
+    #expect(privatePolicy.decision(appName: "Notes", bundleIdentifier: nil, windowTitle: "Password reset").reason?.hasPrefix("sensitive_keyword") == true)
 }
 
 @Test

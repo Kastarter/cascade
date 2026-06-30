@@ -52,6 +52,21 @@ func citationsAreCappedAtFour() {
 }
 
 @Test
+func instructionalIntentIsSeparatedFromRetrospectiveRecordSearch() {
+    #expect(RecordSearchAnswerer.isInstructionalQuestion("how can I export a PDF"))
+    #expect(RecordSearchAnswerer.isInstructionalQuestion("steps to create a pivot table"))
+    #expect(!RecordSearchAnswerer.isInstructionalQuestion("what did I work on today"))
+    #expect(RecordSearchAnswerer.isBroadQuestion("what did I work on today"))
+}
+
+@Test
+func stablePromptNamesSelectedReelEvidenceAsPrimary() {
+    let prompt = RecordSearchAnswerer.stableSystemPrompt()
+    #expect(prompt.contains("selected evidence is primary"))
+    #expect(prompt.contains("Use tools only for related context"))
+}
+
+@Test
 func recordSearchAnswererConfiguresHeuristicRecallRerankerWithoutNetwork() throws {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("CascadeRecordAnswererTests-\(UUID().uuidString).sqlite")

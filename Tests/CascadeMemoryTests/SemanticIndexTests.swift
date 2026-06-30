@@ -70,6 +70,24 @@ func indexEmbeddingUsesRedactedTextForChunkDigests() async throws {
 }
 
 @Test
+func indexEmbeddingIncludesStructuredSearchableTextInChunkDigests() async throws {
+    let (store, path) = try makeSemanticStoreWithPath()
+    let context = try await store.insert(RecordedContext(source: .screen, appName: "Numbers", ocrText: "safe context"))
+    try await store.insertOCRStructure(
+        contextID: context.id,
+        version: 2,
+        json: "{}",
+        searchableText: "Footer TOTAL DUE $443,355\nInvoice table Acme 403050"
+    )
+    try await store.indexEmbedding(contextID: context.id, text: context.ocrText ?? "")
+
+    let digest = rawInt64(path, "SELECT text_digest FROM context_chunk_embedding WHERE context_id = \(context.id) AND chunk_index = 0;")
+    if let digest {
+        #expect(digest == testDigest("Footer TOTAL DUE $443,355\nInvoice table Acme 403050"))
+    }
+}
+
+@Test
 func unindexedRecentContextsFindsTextRowsNeedingSemanticCatchUp() async throws {
     let store = try makeSemanticStore()
     let text = try await store.insert(RecordedContext(source: .screen, appName: "Notes", ocrText: "needs semantic catch up"))
