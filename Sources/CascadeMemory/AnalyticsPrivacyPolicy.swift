@@ -33,8 +33,16 @@ public struct FleetMetric: Codable, Equatable, Sendable {
 
 public struct FleetExportManifest: Codable, Equatable, Sendable {
     public let schemaVersion: Int
+    public let generatedAt: Date
     public let privacyMode: FleetPrivacyMode
+    public let appBuild: String?
+    public let tenantIDHash: String?
+    public let periodStart: String?
+    public let periodEnd: String?
     public let clippingBounds: FleetClippingBounds
+    public let epsilon: Double?
+    public let delta: Double?
+    public let mechanism: LocalDPMechanism?
     public let omittedFields: [String]
     public let minCohort: Int
     public let sourceAuditHead: AuditHead?
@@ -42,16 +50,32 @@ public struct FleetExportManifest: Codable, Equatable, Sendable {
 
     public init(
         schemaVersion: Int,
+        generatedAt: Date = Date(),
         privacyMode: FleetPrivacyMode,
+        appBuild: String? = nil,
+        tenantIDHash: String? = nil,
+        periodStart: String? = nil,
+        periodEnd: String? = nil,
         clippingBounds: FleetClippingBounds,
+        epsilon: Double? = nil,
+        delta: Double? = nil,
+        mechanism: LocalDPMechanism? = nil,
         omittedFields: [String],
         minCohort: Int,
         sourceAuditHead: AuditHead?,
         policyVersion: String
     ) {
         self.schemaVersion = schemaVersion
+        self.generatedAt = generatedAt
         self.privacyMode = privacyMode
+        self.appBuild = appBuild
+        self.tenantIDHash = tenantIDHash
+        self.periodStart = periodStart
+        self.periodEnd = periodEnd
         self.clippingBounds = clippingBounds
+        self.epsilon = epsilon
+        self.delta = delta
+        self.mechanism = mechanism
         self.omittedFields = omittedFields
         self.minCohort = minCohort
         self.sourceAuditHead = sourceAuditHead
@@ -66,6 +90,54 @@ public struct FleetAnalyticsExport: Codable, Equatable, Sendable {
     public init(manifest: FleetExportManifest, metrics: [FleetMetric]) {
         self.manifest = manifest
         self.metrics = metrics
+    }
+}
+
+public struct FleetAuditProvenance: Codable, Equatable, Sendable {
+    public let generatedAt: Date
+    public let appBuild: String
+    public let policyVersion: String
+    public let periodStart: String
+    public let periodEnd: String
+    public let auditHead: AuditHead?
+
+    public init(
+        generatedAt: Date = Date(),
+        appBuild: String,
+        policyVersion: String,
+        periodStart: String,
+        periodEnd: String,
+        auditHead: AuditHead?
+    ) {
+        self.generatedAt = generatedAt
+        self.appBuild = appBuild
+        self.policyVersion = policyVersion
+        self.periodStart = periodStart
+        self.periodEnd = periodEnd
+        self.auditHead = auditHead
+    }
+}
+
+public struct FleetCohortReleaseDecision: Codable, Equatable, Sendable {
+    public let observedDevices: Int
+    public let minCohort: Int
+    public let releasedMetrics: [FleetMetric]
+    public let suppressedMetrics: [FleetMetric]
+
+    public init(
+        observedDevices: Int,
+        minCohort: Int,
+        releasedMetrics: [FleetMetric],
+        suppressedMetrics: [FleetMetric]
+    ) {
+        self.observedDevices = max(0, observedDevices)
+        self.minCohort = max(1, minCohort)
+        self.releasedMetrics = releasedMetrics
+        self.suppressedMetrics = suppressedMetrics
+    }
+
+    public var isSuppressed: Bool {
+        !suppressedMetrics.isEmpty && releasedMetrics.isEmpty
     }
 }
 
@@ -88,12 +160,17 @@ public struct AnalyticsPrivacyPolicy: Sendable {
         "agent.value.reclaimed_seconds.count",
         "agent.value.tool_action.count",
         "agent.reclaimed_seconds.count",
+        "failure.kind.count",
         "input_event.count",
         "model.call.count",
+        "model.token_bucket.count",
+        "permission.state.count",
         "recorded_context.count",
         "suggestion.accepted.count",
         "suggestion.dismissed.count",
         "tool.call.count",
+        "tool.class.count",
+        "trace.duration_bucket.count",
         "trace.duration_ms.count"
     ]
 
@@ -122,7 +199,15 @@ public struct AnalyticsPrivacyPolicy: Sendable {
 
     public func export(
         candidates: [String: FleetMetricInput],
-        sourceAuditHead: AuditHead? = nil
+        sourceAuditHead: AuditHead? = nil,
+        appBuild: String? = nil,
+        tenantIDHash: String? = nil,
+        periodStart: String? = nil,
+        periodEnd: String? = nil,
+        epsilon: Double? = nil,
+        delta: Double? = nil,
+        mechanism: LocalDPMechanism? = nil,
+        generatedAt: Date = Date()
     ) -> FleetAnalyticsExport {
         var metrics: [FleetMetric] = []
         var omitted = Set<String>()
@@ -144,8 +229,16 @@ public struct AnalyticsPrivacyPolicy: Sendable {
 
         let manifest = FleetExportManifest(
             schemaVersion: schemaVersion,
+            generatedAt: generatedAt,
             privacyMode: privacyMode,
+            appBuild: appBuild,
+            tenantIDHash: tenantIDHash,
+            periodStart: periodStart,
+            periodEnd: periodEnd,
             clippingBounds: clippingBounds,
+            epsilon: epsilon,
+            delta: delta,
+            mechanism: mechanism,
             omittedFields: omitted.sorted(),
             minCohort: minCohort,
             sourceAuditHead: sourceAuditHead,
@@ -160,10 +253,49 @@ public struct AnalyticsPrivacyPolicy: Sendable {
     public func serialize(
         candidates: [String: FleetMetricInput],
         sourceAuditHead: AuditHead? = nil,
+        appBuild: String? = nil,
+        tenantIDHash: String? = nil,
+        periodStart: String? = nil,
+        periodEnd: String? = nil,
+        epsilon: Double? = nil,
+        delta: Double? = nil,
+        mechanism: LocalDPMechanism? = nil,
         encoder: JSONEncoder = JSONEncoder()
     ) throws -> Data {
         encoder.outputFormatting.formUnion([.sortedKeys])
-        return try encoder.encode(export(candidates: candidates, sourceAuditHead: sourceAuditHead))
+        return try encoder.encode(export(
+            candidates: candidates,
+            sourceAuditHead: sourceAuditHead,
+            appBuild: appBuild,
+            tenantIDHash: tenantIDHash,
+            periodStart: periodStart,
+            periodEnd: periodEnd,
+            epsilon: epsilon,
+            delta: delta,
+            mechanism: mechanism
+        ))
+    }
+
+    public func releaseDecision(
+        for export: FleetAnalyticsExport,
+        observedDevices: Int
+    ) -> FleetCohortReleaseDecision {
+        let observed = max(0, observedDevices)
+        guard observed >= minCohort else {
+            return FleetCohortReleaseDecision(
+                observedDevices: observed,
+                minCohort: minCohort,
+                releasedMetrics: [],
+                suppressedMetrics: export.metrics
+            )
+        }
+
+        return FleetCohortReleaseDecision(
+            observedDevices: observed,
+            minCohort: minCohort,
+            releasedMetrics: export.metrics,
+            suppressedMetrics: []
+        )
     }
 
     public static func omissionCategory(for field: String) -> String {

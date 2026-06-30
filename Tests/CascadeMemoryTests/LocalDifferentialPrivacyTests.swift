@@ -151,6 +151,70 @@ func categoryDisclosureHashesOrOmitsRawCategories() throws {
 }
 
 @Test
+func optimizedLocalHashingReportsHideRawCategoryAndEstimateCandidates() throws {
+    let rawWorkflow = "Copy payroll totals into Finance.xlsx"
+    var truthfulRNG = SequenceRNG([0])
+    let report = try LocalDifferentialPrivacy.optimizedLocalHashingReport(
+        name: "workflow.popularity",
+        category: rawWorkflow,
+        bucketCount: 32,
+        epsilon: 1.5,
+        hashSalt: "tenant-secret",
+        cohortIDHash: "cohort-a",
+        rng: &truthfulRNG
+    )
+    let data = try JSONEncoder().encode(report)
+    let json = String(decoding: data, as: UTF8.self)
+
+    #expect(report.mechanism == .optimizedLocalHashing)
+    #expect(report.reportedBucket >= 0)
+    #expect(report.reportedBucket < 32)
+    #expect(!json.contains(rawWorkflow))
+
+    let reports = Array(repeating: report, count: 80)
+    let estimates = LocalDifferentialPrivacy.estimateHeavyHitters(
+        name: "workflow.popularity",
+        reports: reports,
+        candidateCategories: [rawWorkflow],
+        hashSalt: "tenant-secret",
+        minReports: 50,
+        limit: 1
+    )
+
+    #expect(estimates.first?.categoryHash == LocalDifferentialPrivacy.hashedCategory(rawWorkflow, salt: "tenant-secret"))
+    #expect(estimates.first?.minReportsSatisfied == true)
+    #expect((estimates.first?.estimatedCount ?? 0) > 0)
+}
+
+@Test
+func persistedPrivacyBudgetLedgerIsTenantKeyedAndAudited() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("FleetPrivacyBudget-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+    let parameters = try LocalDPPrivacyParameters(epsilon: 0.4, delta: 0.0001, mechanism: .laplaceBoundedCount)
+
+    let spend = try await store.reserveFleetPrivacyBudget(
+        tenantIDHash: "tenant-a",
+        metricFamily: "runs",
+        period: "2026-06",
+        parameters: parameters,
+        epsilonCap: 0.5,
+        deltaCap: 0.001
+    )
+    let rows = try await store.fleetPrivacyBudgetSpends(tenantIDHash: "tenant-a", period: "2026-06")
+    let audits = try await store.recentAudit(limit: 3)
+
+    #expect(spend.tenantIDHash == AuditIdentity.hash("tenant-a"))
+    #expect(rows.count == 1)
+    #expect(rows.first?.tenantIDHash == AuditIdentity.hash("tenant-a"))
+    #expect(rows.first?.metricFamily == "runs")
+    #expect(rows.first?.epsilon == 0.4)
+    #expect(audits.first?.action == "fleet.export.dp_budget_spent")
+    #expect(audits.first?.detail.contains("tenant-a") == false)
+}
+
+@Test
 func dpSerializationComposesWithFleetManifestWithoutSensitiveFields() throws {
     let policy = AnalyticsPrivacyPolicy(clippingBounds: FleetClippingBounds(minimum: 0, maximum: 5))
     var rng = SequenceRNG([1 << 62])

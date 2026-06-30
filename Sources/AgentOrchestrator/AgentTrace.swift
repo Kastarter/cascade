@@ -53,6 +53,43 @@ public struct TraceSpan: Sendable, Equatable, Codable {
     }
 }
 
+public struct FleetMetricEvent: Sendable, Equatable, Codable {
+    public let period: String
+    public let tenantMetricKey: String
+    public let bucket: String
+    public let count: Int
+    public let sum: Int
+    public let epsilon: Double?
+    public let delta: Double?
+    public let mechanism: LocalDPMechanism?
+    public let minCohort: Int
+    public let auditHeadHash: String?
+
+    public init(
+        period: String,
+        tenantMetricKey: String,
+        bucket: String = "all",
+        count: Int,
+        sum: Int = 0,
+        epsilon: Double? = nil,
+        delta: Double? = nil,
+        mechanism: LocalDPMechanism? = nil,
+        minCohort: Int,
+        auditHeadHash: String? = nil
+    ) {
+        self.period = period
+        self.tenantMetricKey = tenantMetricKey
+        self.bucket = bucket
+        self.count = count
+        self.sum = sum
+        self.epsilon = epsilon
+        self.delta = delta
+        self.mechanism = mechanism
+        self.minCohort = minCohort
+        self.auditHeadHash = auditHeadHash
+    }
+}
+
 /// A complete agent-run trace: the spans plus roll-up metrics and enterprise
 /// export formats. Pure value type — assembled from captured spans, exportable to
 /// OTel JSON (observability), SIEM JSONL (Splunk/Datadog), or CSV (audit/procurement).
@@ -134,6 +171,82 @@ public struct AgentTrace: Sendable, Equatable, Codable {
             confidence: confidence,
             actualSuccess: confidence == nil ? nil : status == .success,
             calibrationOutcome: calibrationOutcome
+        )
+    }
+
+    public func fleetMetrics(
+        period: String,
+        policy: AnalyticsPrivacyPolicy = AnalyticsPrivacyPolicy(),
+        sourceAuditHead: AuditHead? = nil,
+        epsilon: Double? = nil,
+        delta: Double? = nil,
+        mechanism: LocalDPMechanism? = nil
+    ) -> [FleetMetricEvent] {
+        var events: [FleetMetricEvent] = []
+        func append(_ key: String, bucket: String = "all", count: Int, sum: Int = 0) {
+            guard policy.allowedCounters.contains(key) else { return }
+            let clippedCount = policy.clippingBounds.clipped(count).value
+            let clippedSum = policy.clippingBounds.clipped(sum).value
+            events.append(FleetMetricEvent(
+                period: period,
+                tenantMetricKey: key,
+                bucket: bucket,
+                count: clippedCount,
+                sum: clippedSum,
+                epsilon: epsilon,
+                delta: delta,
+                mechanism: mechanism,
+                minCohort: policy.minCohort,
+                auditHeadHash: sourceAuditHead?.hash
+            ))
+        }
+
+        append("agent.run.completed.count", count: succeeded ? 1 : 0)
+        append("agent.run.failed.count", count: succeeded ? 0 : 1)
+        append("model.call.count", count: modelCallCount)
+        append("tool.call.count", count: toolCallCount)
+        append("trace.duration_ms.count", count: durationMs)
+        append("trace.duration_bucket.count", bucket: Self.durationBucket(durationMs), count: 1, sum: durationMs)
+
+        let totalTokens = inputTokens + outputTokens + cacheReadTokens
+        append("model.token_bucket.count", bucket: Self.tokenBucket(totalTokens), count: totalTokens > 0 ? 1 : 0, sum: totalTokens)
+
+        for (bucket, count) in Dictionary(grouping: spans.filter { $0.kind == .tool }, by: Self.toolClass).mapValues(\.count) {
+            append("tool.class.count", bucket: bucket, count: count)
+        }
+        for (bucket, count) in Dictionary(grouping: failureKinds.map(\.rawValue), by: { $0 }).mapValues(\.count) {
+            append("failure.kind.count", bucket: bucket, count: count)
+        }
+        for (bucket, count) in Dictionary(grouping: spans.compactMap(Self.permissionState), by: { $0 }).mapValues(\.count) {
+            append("permission.state.count", bucket: bucket, count: count)
+        }
+
+        return events.sorted {
+            if $0.tenantMetricKey != $1.tenantMetricKey {
+                return $0.tenantMetricKey < $1.tenantMetricKey
+            }
+            return $0.bucket < $1.bucket
+        }
+    }
+
+    public func fleetAnalyticsExport(
+        period: String,
+        policy: AnalyticsPrivacyPolicy = AnalyticsPrivacyPolicy(),
+        sourceAuditHead: AuditHead? = nil,
+        appBuild: String? = nil,
+        tenantIDHash: String? = nil
+    ) -> FleetAnalyticsExport {
+        let candidates = fleetMetrics(period: period, policy: policy, sourceAuditHead: sourceAuditHead)
+            .reduce(into: [String: FleetMetricInput]()) { result, event in
+                result[event.tenantMetricKey] = .counter((result[event.tenantMetricKey]?.counterValue ?? 0) + event.count)
+            }
+        return policy.export(
+            candidates: candidates,
+            sourceAuditHead: sourceAuditHead,
+            appBuild: appBuild,
+            tenantIDHash: tenantIDHash,
+            periodStart: period,
+            periodEnd: period
         )
     }
 
@@ -268,6 +381,56 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: options),
               let string = String(data: data, encoding: .utf8) else { return "{}" }
         return string
+    }
+
+    private static func durationBucket(_ durationMs: Int) -> String {
+        switch max(0, durationMs) {
+        case 0..<1_000: "lt_1s"
+        case 1_000..<10_000: "1s_10s"
+        case 10_000..<60_000: "10s_60s"
+        case 60_000..<300_000: "1m_5m"
+        default: "gte_5m"
+        }
+    }
+
+    private static func tokenBucket(_ tokens: Int) -> String {
+        switch max(0, tokens) {
+        case 0: "zero"
+        case 1..<1_000: "1_999"
+        case 1_000..<10_000: "1k_10k"
+        case 10_000..<100_000: "10k_100k"
+        default: "gte_100k"
+        }
+    }
+
+    private static func toolClass(_ span: TraceSpan) -> String {
+        let explicit = (span.attributes["tool.class"] ?? span.attributes["tool.type"] ?? "").lowercased()
+        let candidate = explicit.isEmpty ? span.name.lowercased() : explicit
+        if candidate.contains("browser") || candidate.contains("web") || candidate.contains("dom") {
+            return "browser"
+        }
+        if candidate.contains("file") || candidate.contains("read") || candidate.contains("write") {
+            return "file"
+        }
+        if candidate.contains("click") || candidate.contains("key") || candidate.contains("type") || candidate.contains("scroll") {
+            return "input"
+        }
+        if candidate.contains("shell") || candidate.contains("command") || candidate.contains("process") {
+            return "system"
+        }
+        return "other"
+    }
+
+    private static func permissionState(_ span: TraceSpan) -> String? {
+        let raw = span.attributes["permission.state"] ?? span.attributes["permissionState"]
+        guard let value = raw?.lowercased(), !value.isEmpty else { return nil }
+        if value.contains("granted") || value == "ok" || value == "allowed" {
+            return "granted"
+        }
+        if value.contains("denied") || value.contains("missing") || value.contains("blocked") {
+            return "blocked"
+        }
+        return "unknown"
     }
 
     private func traceCSV() -> String {
@@ -1544,5 +1707,12 @@ public enum AgentTraceBuilder {
 
     private static func spanID(prefix: String, event: AuditEvent, order: Int) -> String {
         "\(prefix)-\(event.id > 0 ? String(event.id) : String(order))"
+    }
+}
+
+private extension FleetMetricInput {
+    var counterValue: Int? {
+        guard case .counter(let value) = self else { return nil }
+        return value
     }
 }

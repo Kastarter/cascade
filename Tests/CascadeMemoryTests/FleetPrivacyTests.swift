@@ -75,6 +75,7 @@ func fleetSerializationDoesNotLeakForbiddenValues() throws {
 
 @Test
 func fleetManifestCarriesRequiredPolicyFields() {
+    let generatedAt = Date(timeIntervalSince1970: 1_800_000_000)
     let policy = AnalyticsPrivacyPolicy(
         schemaVersion: 7,
         privacyMode: .aggregateCountersOnly,
@@ -84,14 +85,33 @@ func fleetManifestCarriesRequiredPolicyFields() {
         allowedCounters: ["tool.call.count"]
     )
 
-    let export = policy.export(candidates: ["tool.call.count": .counter(6)])
+    let export = policy.export(
+        candidates: ["tool.call.count": .counter(6)],
+        sourceAuditHead: AuditHead(count: 2, hash: "audit-head"),
+        appBuild: "build-42",
+        tenantIDHash: "tenant-hash",
+        periodStart: "2026-06-01",
+        periodEnd: "2026-06-30",
+        epsilon: 0.7,
+        delta: 0,
+        mechanism: .laplaceBoundedCount,
+        generatedAt: generatedAt
+    )
 
     #expect(export.manifest.schemaVersion == 7)
+    #expect(export.manifest.generatedAt == generatedAt)
     #expect(export.manifest.privacyMode == .aggregateCountersOnly)
+    #expect(export.manifest.appBuild == "build-42")
+    #expect(export.manifest.tenantIDHash == "tenant-hash")
+    #expect(export.manifest.periodStart == "2026-06-01")
+    #expect(export.manifest.periodEnd == "2026-06-30")
     #expect(export.manifest.clippingBounds == FleetClippingBounds(minimum: 2, maximum: 9))
+    #expect(export.manifest.epsilon == 0.7)
+    #expect(export.manifest.delta == 0)
+    #expect(export.manifest.mechanism == .laplaceBoundedCount)
     #expect(export.manifest.omittedFields.isEmpty)
     #expect(export.manifest.minCohort == 1)
-    #expect(export.manifest.sourceAuditHead == nil)
+    #expect(export.manifest.sourceAuditHead == AuditHead(count: 2, hash: "audit-head"))
     #expect(export.manifest.policyVersion == "policy-fixture")
     #expect(export.metrics == [FleetMetric(name: "tool.call.count", value: 6, wasClipped: false)])
 }
@@ -115,4 +135,27 @@ func fleetPolicyAllowsOnlyAggregateValueCounters() throws {
     #expect(json.contains("agent.value.tool_action.count"))
     #expect(!json.contains("Jane Secret"))
     #expect(!json.contains("secret"))
+}
+
+@Test
+func fleetReleaseDecisionSuppressesSmallCohorts() {
+    let policy = AnalyticsPrivacyPolicy(
+        clippingBounds: FleetClippingBounds(minimum: 0, maximum: 100),
+        minCohort: 50
+    )
+    let export = policy.export(candidates: [
+        "agent.run.completed.count": .counter(12),
+        "tool.call.count": .counter(88)
+    ])
+
+    let suppressed = policy.releaseDecision(for: export, observedDevices: 12)
+    #expect(suppressed.isSuppressed)
+    #expect(suppressed.releasedMetrics.isEmpty)
+    #expect(suppressed.suppressedMetrics == export.metrics)
+    #expect(suppressed.minCohort == 50)
+
+    let released = policy.releaseDecision(for: export, observedDevices: 50)
+    #expect(!released.isSuppressed)
+    #expect(released.releasedMetrics == export.metrics)
+    #expect(released.suppressedMetrics.isEmpty)
 }
