@@ -227,3 +227,92 @@ func valueSummaryCountsOnlyCompletedRunsAndAppliesBudgets() {
     #expect(summary.costPerCompletedRunUSD == 0.02)
     #expect(summary.budgetExhausted)
 }
+
+@Test
+func fleetMetricsEmitAggregateBucketsWithoutTraceDetail() throws {
+    let trace = AgentTrace(
+        traceID: "trace-secret-123",
+        goal: "Rank Jane payroll files",
+        surface: "assist",
+        spans: [
+            TraceSpan(
+                id: "root",
+                parentID: nil,
+                kind: .run,
+                name: "Open https://internal.example/payroll",
+                startMs: 0,
+                durationMs: 80_000,
+                attributes: ["prompt": "rank Jane payroll files"]
+            ),
+            TraceSpan(
+                id: "model",
+                parentID: "root",
+                kind: .model,
+                name: "secret planning prompt",
+                startMs: 5,
+                durationMs: 300,
+                usage: ModelUsage(inputTokens: 2_000, outputTokens: 500, cacheReadTokens: 8_000)
+            ),
+            TraceSpan(
+                id: "tool",
+                parentID: "root",
+                kind: .tool,
+                name: "browser_click_internal_url",
+                startMs: 400,
+                durationMs: 30,
+                attributes: [
+                    "tool.type": "browser",
+                    "permission.state": "denied",
+                    "gen_ai.tool.call.arguments": "{\"url\":\"https://internal.example/payroll\"}"
+                ]
+            ),
+            TraceSpan(
+                id: "failure",
+                parentID: "root",
+                kind: .eval,
+                name: "verify payroll result",
+                startMs: 500,
+                durationMs: 10,
+                status: .error,
+                failureKind: .permissionMissing
+            )
+        ]
+    )
+    let policy = AnalyticsPrivacyPolicy(
+        clippingBounds: FleetClippingBounds(minimum: 0, maximum: 10_000),
+        minCohort: 50
+    )
+
+    let events = trace.fleetMetrics(
+        period: "2026-06-29",
+        policy: policy,
+        sourceAuditHead: AuditHead(count: 9, hash: "audit-head"),
+        epsilon: 0.5,
+        delta: 0,
+        mechanism: .laplaceBoundedCount
+    )
+    let data = try JSONEncoder().encode(events)
+    let json = String(decoding: data, as: UTF8.self)
+
+    #expect(events.contains { $0.tenantMetricKey == "model.token_bucket.count" && $0.bucket == "10k_100k" })
+    #expect(events.contains { $0.tenantMetricKey == "trace.duration_bucket.count" && $0.bucket == "1m_5m" })
+    #expect(events.contains { $0.tenantMetricKey == "tool.class.count" && $0.bucket == "browser" })
+    #expect(events.contains { $0.tenantMetricKey == "permission.state.count" && $0.bucket == "blocked" })
+    #expect(events.allSatisfy { $0.minCohort == 50 && $0.auditHeadHash == "audit-head" })
+    #expect(!json.contains("trace-secret-123"))
+    #expect(!json.contains("Jane"))
+    #expect(!json.contains("payroll"))
+    #expect(!json.contains("internal.example"))
+    #expect(!json.contains("secret planning prompt"))
+
+    let export = trace.fleetAnalyticsExport(
+        period: "2026-06-29",
+        policy: policy,
+        sourceAuditHead: AuditHead(count: 9, hash: "audit-head"),
+        appBuild: "build-privacy",
+        tenantIDHash: "tenant-hash"
+    )
+    #expect(export.manifest.sourceAuditHead == AuditHead(count: 9, hash: "audit-head"))
+    #expect(export.manifest.appBuild == "build-privacy")
+    #expect(export.manifest.tenantIDHash == "tenant-hash")
+}

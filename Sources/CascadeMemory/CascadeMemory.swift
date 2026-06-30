@@ -2911,6 +2911,101 @@ public actor CascadeStore {
         return AuditHead(count: chainedAuditCount(), hash: hash)
     }
 
+    public func fleetAuditProvenance(
+        appBuild: String,
+        policyVersion: String = AnalyticsPrivacyPolicy.defaultPolicyVersion,
+        periodStart: String,
+        periodEnd: String,
+        generatedAt: Date = Date()
+    ) throws -> FleetAuditProvenance {
+        FleetAuditProvenance(
+            generatedAt: generatedAt,
+            appBuild: AuditIdentity.safeToken(appBuild),
+            policyVersion: AuditIdentity.safeToken(policyVersion),
+            periodStart: periodStart,
+            periodEnd: periodEnd,
+            auditHead: try auditHead()
+        )
+    }
+
+    @discardableResult
+    public func reserveFleetPrivacyBudget(
+        tenantIDHash: String,
+        metricFamily: String,
+        period: String,
+        parameters: LocalDPPrivacyParameters,
+        epsilonCap: Double,
+        deltaCap: Double = 1,
+        at date: Date = Date()
+    ) throws -> FleetDPBudgetSpend {
+        let tenantHash = AuditIdentity.hash(tenantIDHash)
+        let totals = try fleetPrivacyBudgetTotals(tenantIDHash: tenantHash, period: period)
+        guard totals.epsilon + parameters.epsilon <= epsilonCap,
+              totals.delta + parameters.delta <= deltaCap else {
+            throw LocalDifferentialPrivacyError.monthlyBudgetExceeded
+        }
+
+        let reservedAt = DateCodec.string(from: date)
+        try withStatement("""
+        INSERT INTO fleet_privacy_budget_spend
+            (reserved_at, tenant_id_hash, period, metric_family, epsilon, delta, mechanism)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+        """) { statement in
+            bind(reservedAt, at: 1, in: statement)
+            bind(tenantHash, at: 2, in: statement)
+            bind(period, at: 3, in: statement)
+            bind(AuditIdentity.safeToken(metricFamily), at: 4, in: statement)
+            bind(parameters.epsilon, at: 5, in: statement)
+            bind(parameters.delta, at: 6, in: statement)
+            bind(parameters.mechanism.rawValue, at: 7, in: statement)
+            try stepDone(statement)
+        }
+
+        let spend = FleetDPBudgetSpend(
+            tenantIDHash: tenantHash,
+            period: period,
+            metricFamily: AuditIdentity.safeToken(metricFamily),
+            epsilon: parameters.epsilon,
+            delta: parameters.delta,
+            mechanism: parameters.mechanism,
+            reservedAt: date
+        )
+        _ = try? appendAudit(AuditEvent(
+            actor: "system",
+            action: "fleet.export.dp_budget_spent",
+            detail: [
+                "tenantHash=\(tenantHash)",
+                "period=\(AuditIdentity.safeToken(period))",
+                "metricFamily=\(AuditIdentity.safeToken(metricFamily))",
+                String(format: "epsilon=%.6f", parameters.epsilon),
+                String(format: "delta=%.6f", parameters.delta),
+                "mechanism=\(parameters.mechanism.rawValue)"
+            ].joined(separator: " ")
+        ))
+        return spend
+    }
+
+    public func fleetPrivacyBudgetSpends(
+        tenantIDHash: String,
+        period: String
+    ) throws -> [FleetDPBudgetSpend] {
+        let tenantHash = AuditIdentity.hash(tenantIDHash)
+        return try withStatement("""
+        SELECT reserved_at, tenant_id_hash, period, metric_family, epsilon, delta, mechanism
+        FROM fleet_privacy_budget_spend
+        WHERE tenant_id_hash = ? AND period = ?
+        ORDER BY id ASC;
+        """) { statement in
+            bind(tenantHash, at: 1, in: statement)
+            bind(period, at: 2, in: statement)
+            var rows: [FleetDPBudgetSpend] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeFleetBudgetSpend(statement))
+            }
+            return rows
+        }
+    }
+
     /// Recompute the audit hash chain and report the first row that no longer
     /// reconciles. Scans ALL rows (not just chained ones) so a forged un-chained
     /// row inserted after the chain begins is caught; legacy pre-chain rows are
@@ -3040,6 +3135,37 @@ public actor CascadeStore {
         }
     }
 
+    private func fleetPrivacyBudgetTotals(
+        tenantIDHash: String,
+        period: String
+    ) throws -> (epsilon: Double, delta: Double) {
+        try withStatement("""
+        SELECT COALESCE(SUM(epsilon), 0), COALESCE(SUM(delta), 0)
+        FROM fleet_privacy_budget_spend
+        WHERE tenant_id_hash = ? AND period = ?;
+        """) { statement in
+            bind(tenantIDHash, at: 1, in: statement)
+            bind(period, at: 2, in: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return (0, 0) }
+            return (
+                sqlite3_column_double(statement, 0),
+                sqlite3_column_double(statement, 1)
+            )
+        }
+    }
+
+    private func decodeFleetBudgetSpend(_ statement: OpaquePointer) -> FleetDPBudgetSpend {
+        FleetDPBudgetSpend(
+            tenantIDHash: text(statement, 1) ?? "local",
+            period: text(statement, 2) ?? "",
+            metricFamily: text(statement, 3) ?? "",
+            epsilon: sqlite3_column_double(statement, 4),
+            delta: sqlite3_column_double(statement, 5),
+            mechanism: text(statement, 6).flatMap(LocalDPMechanism.init(rawValue:)) ?? .laplaceBoundedCount,
+            reservedAt: text(statement, 0).flatMap(DateCodec.date(from:))
+        )
+    }
+
     /// Opt-in chronological audit window for trace assembly. Kept separate from
     /// `recentAudit` so the UI's latest-first activity feed remains byte-for-byte
     /// unchanged unless callers explicitly enable trace assembly.
@@ -3137,6 +3263,19 @@ public actor CascadeStore {
         );
         CREATE INDEX IF NOT EXISTS idx_audit_event_created_at
             ON audit_event(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS fleet_privacy_budget_spend (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reserved_at TEXT NOT NULL,
+            tenant_id_hash TEXT NOT NULL,
+            period TEXT NOT NULL,
+            metric_family TEXT NOT NULL,
+            epsilon REAL NOT NULL,
+            delta REAL NOT NULL DEFAULT 0,
+            mechanism TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_fleet_privacy_budget_scope
+            ON fleet_privacy_budget_spend(tenant_id_hash, period, metric_family);
 
         CREATE TABLE IF NOT EXISTS preference_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
