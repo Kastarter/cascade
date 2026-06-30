@@ -852,20 +852,25 @@ public struct MixtureGrounder: VisualGrounder {
             return []
         }
         return AXElementResolver.interactables(limit: 48).compactMap { match in
-            guard let point = displayLocalPoint(
-                cgGlobalCenter: match.center,
-                displayCGBounds: bounds,
-                displayHeightPoints: displayHeightPoints
-            ) else { return nil }
             let role = indexRole(fromAXRole: match.role)
-            let size = role == .textField ? CGSize(width: 180, height: 28) : CGSize(width: 96, height: 28)
+            let candidateBounds: ScreenElementIndex.Bounds
+            if let frame = match.frame {
+                guard let rect = displayLocalRect(
+                    cgGlobalFrame: frame,
+                    displayCGBounds: bounds,
+                    displayHeightPoints: displayHeightPoints
+                ) else { return nil }
+                candidateBounds = indexBounds(from: rect)
+            } else {
+                guard let point = displayLocalPoint(
+                    cgGlobalCenter: match.center,
+                    displayCGBounds: bounds,
+                    displayHeightPoints: displayHeightPoints
+                ) else { return nil }
+                candidateBounds = estimatedAXBounds(center: point, role: role)
+            }
             return ScreenElementIndex.Candidate(
-                bounds: ScreenElementIndex.Bounds(
-                    x: Double(point.x - size.width / 2),
-                    y: Double(point.y - size.height / 2),
-                    width: Double(size.width),
-                    height: Double(size.height)
-                ),
+                bounds: candidateBounds,
                 label: match.title,
                 role: role,
                 source: .accessibility,
@@ -1211,21 +1216,31 @@ public struct MixtureGrounder: VisualGrounder {
         }
         guard let match = AXElementResolver.find(label: target),
               match.score >= minAXScore else { return nil }
-        // Map the matched element center (CG-global, top-left) into the display-local
-        // AppKit point the executor consumes. Use the display the screenshot came
-        // from — the cursor's — selected by matching the declared dimensions.
+        // Map the matched element frame (CG-global, top-left) into the display-local
+        // AppKit bounds the executor consumes. Legacy frame-less matches fall back to
+        // a center estimate. Use the display the screenshot came from — the cursor's —
+        // selected by matching the declared dimensions.
         guard let bounds = Self.captureDisplayBounds(widthPoints: displayWidthPoints, heightPoints: displayHeightPoints) else {
             return nil
         }
-        guard let point = Self.displayLocalPoint(
-            cgGlobalCenter: match.center, displayCGBounds: bounds, displayHeightPoints: displayHeightPoints
-        ) else { return nil }
-        let candidateBounds = ScreenElementIndex.Bounds(
-            x: Double(point.x - 48),
-            y: Double(point.y - 14),
-            width: 96,
-            height: 28
-        )
+        let role = Self.indexRole(fromAXRole: match.role)
+        let candidateBounds: ScreenElementIndex.Bounds
+        if let frame = match.frame {
+            guard let rect = Self.displayLocalRect(
+                cgGlobalFrame: frame,
+                displayCGBounds: bounds,
+                displayHeightPoints: displayHeightPoints
+            ) else { return nil }
+            candidateBounds = Self.indexBounds(from: rect)
+        } else {
+            guard let point = Self.displayLocalPoint(
+                cgGlobalCenter: match.center,
+                displayCGBounds: bounds,
+                displayHeightPoints: displayHeightPoints
+            ) else { return nil }
+            candidateBounds = Self.estimatedAXBounds(center: point, role: role)
+        }
+        let point = CGPoint(x: candidateBounds.cgRect.midX, y: candidateBounds.cgRect.midY)
         guard Self.trustPolicy.acceptsAXCandidate(
             role: match.role,
             score: match.score,
@@ -1241,6 +1256,7 @@ public struct MixtureGrounder: VisualGrounder {
             id: candidateID,
             candidate: GroundingCandidate(
                 point: point,
+                region: candidateBounds.cgRect,
                 confidence: min(1, max(0, match.score / 3)),
                 source: .accessibility,
                 coordinateSpace: .displayLocalAppKitPoints,
@@ -1284,6 +1300,44 @@ public struct MixtureGrounder: VisualGrounder {
             backingScaleFactor: 1
         )
         return mapper.screenLocalAppKit(fromCGGlobal: c)
+    }
+
+    nonisolated static func displayLocalRect(
+        cgGlobalFrame frame: CGRect, displayCGBounds bounds: CGRect, displayHeightPoints: Int
+    ) -> CGRect? {
+        guard bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0,
+              displayHeightPoints > 0
+        else { return nil }
+        let mapper = DisplayCoordinateMapper(
+            displayID: CGMainDisplayID(),
+            appKitFrame: CGRect(x: 0, y: 0, width: bounds.width, height: CGFloat(displayHeightPoints)),
+            cgBounds: bounds,
+            backingScaleFactor: 1
+        )
+        return mapper.screenLocalAppKit(fromCGGlobal: frame)
+    }
+
+    private nonisolated static func estimatedAXBounds(
+        center point: CGPoint,
+        role: ScreenElementIndex.Role
+    ) -> ScreenElementIndex.Bounds {
+        let size = role == .textField ? CGSize(width: 180, height: 28) : CGSize(width: 96, height: 28)
+        return ScreenElementIndex.Bounds(
+            x: Double(point.x - size.width / 2),
+            y: Double(point.y - size.height / 2),
+            width: Double(size.width),
+            height: Double(size.height)
+        )
+    }
+
+    private nonisolated static func indexBounds(from rect: CGRect) -> ScreenElementIndex.Bounds {
+        ScreenElementIndex.Bounds(
+            x: Double(rect.minX),
+            y: Double(rect.minY),
+            width: Double(rect.width),
+            height: Double(rect.height)
+        )
     }
 
     /// CG-global bounds of the display the screenshot came from. The capture path is

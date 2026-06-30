@@ -140,6 +140,60 @@ struct VisualGrounderTests {
         #expect(far.maxY == 1000)
     }
 
+    @Test func structuredRegionPreferenceUsesCandidateRegionFirst() {
+        let region = CGRect(x: 10, y: 20, width: 300, height: 80)
+        let displayBounds = CGRect(x: 1, y: 2, width: 30, height: 40)
+        let result = GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: CGPoint(x: 160, y: 60),
+                    region: region,
+                    confidence: 0.9,
+                    source: .uiTars,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    displayBounds: displayBounds
+                )
+            ],
+            selectedIndex: 0
+        )
+
+        #expect(UITARSGrounder.preferredStructuredRegion(from: result) == region)
+    }
+
+    @Test func structuredRegionPreferenceFallsBackToDisplayBounds() {
+        let displayBounds = CGRect(x: 40, y: 50, width: 120, height: 36)
+        let result = GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: CGPoint(x: 100, y: 68),
+                    confidence: 0.9,
+                    source: .uiTars,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    displayBounds: displayBounds
+                )
+            ],
+            selectedIndex: 0
+        )
+
+        #expect(UITARSGrounder.preferredStructuredRegion(from: result) == displayBounds)
+    }
+
+    @Test func pointOnlyGroundingResultHasNoStructuredRegion() {
+        let result = GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: CGPoint(x: 100, y: 68),
+                    confidence: 0.9,
+                    source: .uiTars,
+                    coordinateSpace: .displayLocalAppKitPoints
+                )
+            ],
+            selectedIndex: 0
+        )
+
+        #expect(UITARSGrounder.preferredStructuredRegion(from: result) == nil)
+    }
+
     // MARK: extractContent — OpenAI chat-completions reply
 
     @Test func extractsStringContent() {

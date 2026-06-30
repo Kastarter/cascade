@@ -68,4 +68,40 @@ struct DisplayCoordinateMapperTests {
         #expect(mapper.screenLocalAppKit(fromCGGlobal: CGPoint(x: 2000, y: 450)) == nil)
         #expect(mapper.cgGlobal(fromScreenLocal: CGPoint(x: 1500, y: 450)) == nil)
     }
+
+    @Test func cgGlobalAXFrameMapsToDisplayLocalAppKitRect() {
+        let mapper = DisplayCoordinateMapper(
+            displayID: 6,
+            appKitFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            cgBounds: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            backingScaleFactor: 2
+        )
+
+        let rect = mapper.screenLocalAppKit(fromCGGlobal: CGRect(x: 100, y: 120, width: 240, height: 60))
+        #expect(rect == CGRect(x: 100, y: 720, width: 240, height: 60))
+    }
+
+    @Test func cgGlobalAXFrameClipsToDisplay() {
+        let mapper = DisplayCoordinateMapper(
+            displayID: 7,
+            appKitFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            cgBounds: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            backingScaleFactor: 1
+        )
+
+        let rect = mapper.screenLocalAppKit(fromCGGlobal: CGRect(x: -20, y: 850, width: 80, height: 80))
+        #expect(rect == CGRect(x: 0, y: 0, width: 60, height: 50))
+    }
+
+    @Test func offDisplayAndDegenerateAXFramesAreRejected() {
+        let mapper = DisplayCoordinateMapper(
+            displayID: 8,
+            appKitFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            cgBounds: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            backingScaleFactor: 1
+        )
+
+        #expect(mapper.screenLocalAppKit(fromCGGlobal: CGRect(x: 1600, y: 100, width: 40, height: 40)) == nil)
+        #expect(mapper.screenLocalAppKit(fromCGGlobal: CGRect(x: 100, y: 100, width: 0, height: 40)) == nil)
+    }
 }

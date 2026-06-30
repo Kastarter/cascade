@@ -66,6 +66,25 @@ struct MixtureGrounderTests {
         ) == nil)
     }
 
+    @Test func axFrameMapsToFittedDisplayLocalRect() {
+        let bounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let rect = MixtureGrounder.displayLocalRect(
+            cgGlobalFrame: CGRect(x: 100, y: 120, width: 240, height: 60),
+            displayCGBounds: bounds,
+            displayHeightPoints: 900
+        )
+        #expect(rect == CGRect(x: 100, y: 720, width: 240, height: 60))
+    }
+
+    @Test func axFrameOffDisplayIsRejected() {
+        let bounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        #expect(MixtureGrounder.displayLocalRect(
+            cgGlobalFrame: CGRect(x: 1600, y: 100, width: 40, height: 40),
+            displayCGBounds: bounds,
+            displayHeightPoints: 900
+        ) == nil)
+    }
+
     @Test func canvasConceptsBypassAX() {
         // Canvas placeholders/surfaces must go to the visual grounder, never an AX
         // substring match (the Keynote inspector-checkbox hijack).

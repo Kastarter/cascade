@@ -685,8 +685,7 @@ public struct UITARSGrounder: VisualGrounder {
                     rawModel: rawContents.joined(separator: "\n---\n"),
                     latency: start.duration(to: ContinuousClock.now).timeInterval,
                     dispersion: cluster.dispersion,
-                    reason: accepted ? reason : "\(reason) rejected",
-                    displayBounds: Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints)
+                    reason: accepted ? reason : "\(reason) rejected"
                 )
             ],
             selectedIndex: 0,
@@ -837,19 +836,24 @@ public struct UITARSGrounder: VisualGrounder {
         return (wb, hb)
     }
 
-    /// Region grounding for the highlight: locate the target's click point, then
-    /// frame a box around it. UI-TARS grounds to a point; a box around it is plenty
-    /// for "show me where X is" (the marquee frames the area). Returns nil on any
-    /// miss (unreachable OR not found) so the caller falls back to Claude.
+    /// Region grounding for the highlight uses structured candidate bounds only.
+    /// Point-only UI-TARS hits return nil so the caller can fall back to a true region
+    /// locator instead of drawing a synthetic fixed-size box.
     public func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? {
-        guard let point = await ground(
+        let result = await groundResult(
             screenshot: screenshot, target: target,
             displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
-        ) else { return nil }
-        let rect = Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints)
+        )
+        guard let rect = Self.preferredStructuredRegion(from: result) else { return nil }
         return ElementRegion(rect: rect, speech: "Here — it's in this area.")
+    }
+
+    static func preferredStructuredRegion(from result: GroundingResult) -> CGRect? {
+        guard !result.isAbstainedOrRejected,
+              let candidate = result.selectedCandidate else { return nil }
+        return candidate.region ?? candidate.displayBounds
     }
 
     /// A display-local AppKit rect framing a located point — ~12%×8% of the

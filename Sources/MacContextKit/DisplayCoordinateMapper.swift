@@ -55,6 +55,33 @@ public struct DisplayCoordinateMapper: Equatable, Sendable {
         )
     }
 
+    public func screenLocalAppKit(fromCGGlobal rect: CGRect, tolerance: CGFloat = 1) -> CGRect? {
+        guard rect.isFinite,
+              rect.width > 0,
+              rect.height > 0,
+              cgBounds.isFinite,
+              cgBounds.width > 0,
+              cgBounds.height > 0,
+              appKitFrame.height > 0,
+              rect.intersects(cgBounds.insetBy(dx: -tolerance, dy: -tolerance)) else {
+            return nil
+        }
+        let clipped = rect.intersection(cgBounds)
+        guard clipped.isFinite,
+              !clipped.isNull,
+              !clipped.isEmpty,
+              clipped.width > 0,
+              clipped.height > 0 else {
+            return nil
+        }
+        return CGRect(
+            x: clipped.minX - cgBounds.minX,
+            y: appKitFrame.height - (clipped.maxY - cgBounds.minY),
+            width: clipped.width,
+            height: clipped.height
+        )
+    }
+
     public func capturedImagePixel(fromCGGlobal point: CGPoint, imageSize: CGSize, tolerance: CGFloat = 1) -> CGPoint? {
         guard imageSize.width > 0, imageSize.height > 0,
               cgBounds.width > 0, cgBounds.height > 0,
@@ -102,5 +129,14 @@ public struct DisplayCoordinateMapper: Equatable, Sendable {
         CGRect(origin: .zero, size: appKitFrame.size)
             .insetBy(dx: -tolerance, dy: -tolerance)
             .contains(point)
+    }
+}
+
+private extension CGRect {
+    var isFinite: Bool {
+        origin.x.isFinite
+            && origin.y.isFinite
+            && size.width.isFinite
+            && size.height.isFinite
     }
 }

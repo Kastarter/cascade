@@ -396,20 +396,22 @@ public enum ScreenElementIndex {
         ) else {
             return []
         }
+        let mapper = DisplayCoordinateMapper(
+            displayID: CGMainDisplayID(),
+            appKitFrame: CGRect(x: 0, y: 0, width: displayBounds.width, height: CGFloat(displayHeightPoints)),
+            cgBounds: displayBounds,
+            backingScaleFactor: 1
+        )
         return AXElementResolver.interactables(limit: limit).compactMap { match in
-            guard let point = displayLocalPoint(
-                cgGlobalCenter: match.center,
-                displayCGBounds: displayBounds,
-                displayHeightPoints: displayHeightPoints
-            ) else { return nil }
             let role = policy.role(fromAXRole: match.role)
-            let size = role == .textField ? CGSize(width: 180, height: 28) : CGSize(width: 96, height: 28)
-            let bounds = Bounds(
-                x: Double(point.x - size.width / 2),
-                y: Double(point.y - size.height / 2),
-                width: Double(size.width),
-                height: Double(size.height)
-            )
+            let bounds: Bounds
+            if let frame = match.frame {
+                guard let rect = mapper.screenLocalAppKit(fromCGGlobal: frame) else { return nil }
+                bounds = Bounds(rect)
+            } else {
+                guard let point = mapper.screenLocalAppKit(fromCGGlobal: match.center) else { return nil }
+                bounds = estimatedAXBounds(center: point, role: role)
+            }
             guard policy.acceptsAXCandidate(
                 role: match.role,
                 score: max(match.score, policy.minAXScore),
@@ -886,6 +888,16 @@ private extension ScreenElementIndex {
             backingScaleFactor: 1
         )
         return mapper.screenLocalAppKit(fromCGGlobal: point)
+    }
+
+    static func estimatedAXBounds(center point: CGPoint, role: ScreenElementIndex.Role) -> ScreenElementIndex.Bounds {
+        let size = role == .textField ? CGSize(width: 180, height: 28) : CGSize(width: 96, height: 28)
+        return ScreenElementIndex.Bounds(
+            x: Double(point.x - size.width / 2),
+            y: Double(point.y - size.height / 2),
+            width: Double(size.width),
+            height: Double(size.height)
+        )
     }
 
     static func drawMarks(

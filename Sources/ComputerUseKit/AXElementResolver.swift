@@ -103,6 +103,8 @@ public enum AXElementResolver {
     public struct Match: Sendable {
         /// Element center in CGEvent global coordinates (top-left origin).
         public let center: CGPoint
+        /// Element frame in CG global coordinates (top-left origin), when available.
+        public let frame: CGRect?
         public let role: String
         public let title: String
         public let score: Double
@@ -110,12 +112,14 @@ public enum AXElementResolver {
 
         public init(
             center: CGPoint,
+            frame: CGRect? = nil,
             role: String,
             title: String,
             score: Double,
             descriptor: AXTargetDescriptorV2? = nil
         ) {
             self.center = center
+            self.frame = frame
             self.role = role
             self.title = title
             self.score = score
@@ -329,6 +333,7 @@ public enum AXElementResolver {
             seen.insert(dedupe)
             out.append(Match(
                 center: center,
+                frame: candidate.frame,
                 role: role,
                 title: String(descriptor.label.prefix(60)),
                 score: candidate.confidence,
@@ -570,6 +575,7 @@ public enum AXElementResolver {
         let descriptor = ranked.candidate.descriptor
         return Match(
             center: center,
+            frame: ranked.candidate.frame,
             role: descriptor.role ?? "",
             title: descriptor.label,
             score: ranked.confidence,
