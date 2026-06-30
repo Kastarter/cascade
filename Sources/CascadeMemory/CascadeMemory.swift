@@ -1465,7 +1465,7 @@ public actor CascadeStore {
     /// `decodeContext(_:)` expects. `prefix` qualifies each column with a table
     /// alias so the FTS join (where `ocr_text`/`window_title`/`app_name` exist in
     /// both tables) is unambiguous.
-    private static func contextColumns(prefix: String = "") -> String {
+    internal static func contextColumns(prefix: String = "") -> String {
         let p = prefix.isEmpty ? "" : "\(prefix)."
         return "\(p)id, \(p)captured_at, \(p)source, \(p)app_name, \(p)bundle_identifier, \(p)window_title, \(p)ocr_text, \(p)image_path, \(p)metadata_json, \(p)frame_hash, \(p)source_trust, \(p)raw_trust_label, \(p)injection_score, \(p)injection_reasons, \(p)user_confirmed, \(p)safe_to_show, \(p)safe_to_summarize, \(p)safe_for_control"
     }
@@ -1907,6 +1907,9 @@ public actor CascadeStore {
         try? execute("DELETE FROM context_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM context_chunk_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM context_visual_embedding WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM context_visual_cluster WHERE context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM visual_cluster WHERE representative_context_id NOT IN (SELECT id FROM recorded_context);")
+        try? execute("DELETE FROM visual_cluster WHERE id NOT IN (SELECT cluster_id FROM context_visual_cluster);")
         try? execute("DELETE FROM ocr_line WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM ocr_structure WHERE context_id NOT IN (SELECT id FROM recorded_context);")
         try? execute("DELETE FROM frame_signature WHERE context_id NOT IN (SELECT id FROM recorded_context);")
@@ -3400,7 +3403,9 @@ public actor CascadeStore {
             model TEXT NOT NULL,
             revision TEXT NOT NULL,
             dimension INTEGER NOT NULL,
+            metric TEXT NOT NULL DEFAULT 'cosine',
             vector BLOB NOT NULL,
+            norm REAL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (context_id, provider, model, revision)
         );
@@ -3409,6 +3414,40 @@ public actor CascadeStore {
         CREATE TRIGGER IF NOT EXISTS recorded_context_visual_embedding_ad
         AFTER DELETE ON recorded_context BEGIN
             DELETE FROM context_visual_embedding WHERE context_id = old.id;
+        END;
+
+        CREATE TABLE IF NOT EXISTS visual_cluster (
+            id INTEGER PRIMARY KEY,
+            representative_context_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            app_name TEXT,
+            first_at TEXT NOT NULL,
+            last_at TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            label TEXT,
+            FOREIGN KEY(representative_context_id) REFERENCES recorded_context(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_visual_cluster_representative
+            ON visual_cluster(representative_context_id);
+        CREATE INDEX IF NOT EXISTS idx_visual_cluster_provider_model_time
+            ON visual_cluster(provider, model, last_at DESC);
+
+        CREATE TABLE IF NOT EXISTS context_visual_cluster (
+            context_id INTEGER PRIMARY KEY,
+            cluster_id INTEGER NOT NULL,
+            distance REAL NOT NULL,
+            FOREIGN KEY(context_id) REFERENCES recorded_context(id) ON DELETE CASCADE,
+            FOREIGN KEY(cluster_id) REFERENCES visual_cluster(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_visual_cluster_cluster
+            ON context_visual_cluster(cluster_id);
+        CREATE TRIGGER IF NOT EXISTS recorded_context_visual_cluster_ad
+        AFTER DELETE ON recorded_context BEGIN
+            DELETE FROM context_visual_cluster WHERE context_id = old.id;
+            DELETE FROM visual_cluster
+            WHERE representative_context_id = old.id
+               OR id NOT IN (SELECT cluster_id FROM context_visual_cluster);
         END;
 
         CREATE TABLE IF NOT EXISTS memory_event (
@@ -3434,6 +3473,13 @@ public actor CascadeStore {
         END;
         """, db: db)
 
+        try? execute("ALTER TABLE context_visual_embedding ADD COLUMN metric TEXT NOT NULL DEFAULT 'cosine';", db: db)
+        try? execute("ALTER TABLE context_visual_embedding ADD COLUMN norm REAL;", db: db)
+        try execute("""
+        CREATE INDEX IF NOT EXISTS idx_context_visual_embedding_descriptor
+            ON context_visual_embedding(provider, model, revision, dimension, metric);
+        """, db: db)
+
         try execute("""
         DELETE FROM day_partition;
         INSERT INTO day_partition
@@ -3452,7 +3498,7 @@ public actor CascadeStore {
         GROUP BY captured_day;
         """, db: db)
 
-	        try execute("""
+        try execute("""
         CREATE TABLE IF NOT EXISTS agent_trace (
             trace_id TEXT PRIMARY KEY,
             started_at TEXT NOT NULL,
@@ -4330,7 +4376,7 @@ public actor CascadeStore {
     }
 
     /// Decodes a `recorded_context` row in the `contextColumns(...)` order.
-    private func decodeContext(_ statement: OpaquePointer) -> RecordedContext {
+    internal func decodeContext(_ statement: OpaquePointer) -> RecordedContext {
         RecordedContext(
             id: sqlite3_column_int64(statement, 0),
             capturedAt: DateCodec.date(from: text(statement, 1)) ?? Date(),
