@@ -290,3 +290,70 @@ func summaryMentionsRunningLong() {
     #expect(summary.contains("Email the price to Sam"))
     #expect(summary.contains("$420 on Delta"))
 }
+
+@Test
+func searchRouteParserAcceptsOnlyKnownSourcesAndCleanQuery() throws {
+    let raw = """
+    Here is the route:
+    ```json
+    {"routingIntent":"multi","candidateSources":["recordedMemory","localFiles","dropMe","web","localFiles"],"cleanQuery":"Q2 audit dashboard total"}
+    ```
+    """
+
+    let route = try #require(AgentTaskPlanner.parseSearchRoute(raw))
+
+    #expect(route.routingIntent == .multi)
+    #expect(route.candidateSources == [.recordedMemory, .localFiles, .web])
+    #expect(route.cleanQuery == "Q2 audit dashboard total")
+}
+
+@Test
+func searchRouteParserRejectsUnknownIntentAndEmptyQuery() {
+    #expect(AgentTaskPlanner.parseSearchRoute(#"{"routingIntent":"futureDb","candidateSources":["web"],"cleanQuery":"Q"}"#) == nil)
+    #expect(AgentTaskPlanner.parseSearchRoute(#"{"routingIntent":"web","candidateSources":["web"],"cleanQuery":"  "}"#) == nil)
+    #expect(AgentTaskPlanner.parseSearchRoute(#"{"routingIntent":"web","candidateSources":["madeUp"],"cleanQuery":"Q"}"#) == nil)
+}
+
+@Test
+func searchRouteFallbackClassifiesRecordedLocalAndWebSources() {
+    let recorded = AgentTaskPlanner.heuristicSearchRoute(
+        for: "Find the invoice total I had open earlier",
+        in: .onScreen
+    )
+    #expect(recorded.routingIntent == .recordedMemory)
+    #expect(recorded.candidateSources.contains(.recordedMemory))
+
+    let local = AgentTaskPlanner.heuristicSearchRoute(
+        for: "Find the signed engagement letter PDF on my Mac",
+        in: .onScreen
+    )
+    #expect(local.routingIntent == .localFiles)
+    #expect(local.candidateSources.contains(.localFiles))
+
+    let web = AgentTaskPlanner.heuristicSearchRoute(
+        for: "Look up the latest Bank of Canada interest rate",
+        in: .onScreen
+    )
+    #expect(web.routingIntent == .web)
+    #expect(web.candidateSources == [.web])
+}
+
+@Test
+func oldTaskPlanParsingIgnoresRouteOnlyFields() throws {
+    let canned = """
+    {"subtasks":[{
+      "task":"Find the invoice",
+      "app":"Finder",
+      "routingIntent":"web",
+      "candidateSources":["web"],
+      "cleanQuery":"ignored"
+    }]}
+    """
+
+    let plan = try #require(AgentTaskPlanner.parse(canned))
+
+    #expect(plan.count == 1)
+    #expect(plan[0].task == "Find the invoice")
+    #expect(plan[0].app == "Finder")
+    #expect(plan[0].startURL.isEmpty)
+}

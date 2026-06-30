@@ -56,6 +56,7 @@ public final class ScoutAgent {
     private let harnessTier: HarnessTier
     private let recallEnabled: Bool
     private let includeStructuredRecallContent: Bool
+    private let resourceCatalogEnabled: Bool
     /// One-line-per-skill catalogue for use_skill (so Scout knows what it CAN pull).
     private let skillIndex: String?
     /// System prompt for the episode — base prompt + tool catalogue + any pushed
@@ -78,7 +79,8 @@ public final class ScoutAgent {
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
         harnessTier: HarnessTier = .off,
         recallEnabled: Bool = false,
-        includeStructuredRecallContent: Bool = false
+        includeStructuredRecallContent: Bool = false,
+        resourceCatalogEnabled: Bool = false
     ) {
         self.vision = vision
         self.grounder = grounder
@@ -90,6 +92,7 @@ public final class ScoutAgent {
         self.harnessTier = harnessProvider == nil ? .off : harnessTier
         self.recallEnabled = recallEnabled && harnessProvider != nil
         self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
+        self.resourceCatalogEnabled = resourceCatalogEnabled
         rebuildSystem()
     }
 
@@ -188,13 +191,16 @@ public final class ScoutAgent {
             lines.append("- use_skill: fetch a playbook's full instructions — {\"action\":\"use_skill\",\"name\":\"<exact skill name>\"}.")
             if let skillIndex, !skillIndex.isEmpty { lines.append("  Available skills:\n\(skillIndex)") }
         }
-        if t.contains("search_files") {
+        if resourceCatalogEnabled, t.contains("search_files") || t.contains("search_record") {
+            lines.append("RESOURCE CATALOG — pick the cheapest matching source before acting or finishing:")
+            lines.append(ComputerUseAgent.resourceCatalogNote(harnessTier: harnessTier, recallEnabled: recallEnabled))
+        } else if t.contains("search_files") {
             lines.append("- search_files {\"action\":\"search_files\",\"query\":\"…\",\"folder\":\"~/Desktop\"} · read_file {\"action\":\"read_file\",\"path\":\"…\"} · list_folder {\"action\":\"list_folder\",\"path\":\"…\"} — find/read files instead of clicking through Finder (folder optional).")
         }
         if t.contains("run_command") {
             lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} runs one allowlisted executable with literal argv (no shell syntax) · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
         }
-        if t.contains("search_record") {
+        if !resourceCatalogEnabled, t.contains("search_record") {
             lines.append("- search_record {\"action\":\"search_record\",\"query\":\"…\"} · inspect_moment {\"action\":\"inspect_moment\",\"id\":<n>} — recall what the user already saw on screen EARLIER (use when the goal refers to something not on screen now).")
         }
         return lines.joined(separator: "\n")

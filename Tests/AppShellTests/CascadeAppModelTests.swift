@@ -872,3 +872,117 @@ func isSameGoalDetectsReFiresButNotDifferentCommands() {
     // Short utterances never match (need ≥3 words).
     #expect(!CascadeAppModel.isSameGoal("open it", "open it"))
 }
+
+@Test
+func searchShapedGoalDetectorCoversCommonLookupForms() {
+    #expect(CascadeAppModel.isSearchShapedGoal("Find the invoice from yesterday"))
+    #expect(CascadeAppModel.isSearchShapedGoal("look up the latest exchange rate"))
+    #expect(CascadeAppModel.isSearchShapedGoal("ابحث عن ملف العقد"))
+    #expect(!CascadeAppModel.isSearchShapedGoal("Open Notes and write hello"))
+}
+
+@Test
+func searchUngatedAuditDetailKeepsGoalAndQueryHashOnly() {
+    let rawToken = "ApertureDeltaSearchSeed"
+    let route = SearchRouteHint(
+        routingIntent: .web,
+        candidateSources: [.web],
+        cleanQuery: rawToken
+    )
+
+    let detail = CascadeAppModel.assistSearchUngatedAuditDetail(
+        goal: rawToken,
+        routeHint: route,
+        status: "blocked"
+    )
+
+    #expect(detail.contains("status=blocked"))
+    #expect(detail.contains("intent=web"))
+    #expect(detail.contains("sources=web"))
+    #expect(detail.contains("goalHash=\(AuditIdentity.hash(rawToken))"))
+    #expect(detail.contains("cleanQueryHash=\(AuditIdentity.hash(rawToken))"))
+    #expect(!detail.contains(rawToken))
+}
+
+@Test
+func searchToolClassifiersCoverReadOnlyAndRecallTools() {
+    #expect(AgentHarness.isReadOnlyTool("search_files"))
+    #expect(AgentHarness.isReadOnlyTool("list_folder"))
+    #expect(AgentHarness.isReadOnlyTool("read_file"))
+    #expect(!AgentHarness.isReadOnlyTool("run_command"))
+
+    #expect(RecordRecall.isRecallTool("search_record"))
+    #expect(RecordRecall.isRecallTool("inspect_moment"))
+    #expect(!RecordRecall.isRecallTool("search_files"))
+}
+
+@Test
+func searchEvidenceVerdictParserUsesStrictLeadingToken() {
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("SUFFICIENT") == .sufficient)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("SUFFICIENT: local files answer it") == .sufficient)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("INSUFFICIENT - no matching record") == .insufficient)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("ABSTAIN") == .abstain)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("SUFFICIENTLY likely") == .abstain)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("maybe") == .abstain)
+}
+
+@Test
+func firstConcreteLocalPathSkipsStatusAndCountLines() {
+    let output = """
+    status=ok
+    No files matched the first pattern.
+    /Users/mohanadbahammam/Documents/report.pdf
+    /Users/mohanadbahammam/Documents/old.pdf 3 more.
+    """
+
+    #expect(CascadeAppModel.firstConcreteLocalPath(from: output) == "/Users/mohanadbahammam/Documents/report.pdf")
+    #expect(CascadeAppModel.firstConcreteLocalPath(from: "status=ok\nNo files matched") == nil)
+}
+
+@Test
+func searchEscalationAndBackgroundPreferenceArePureRouteDecisions() {
+    let web = SearchRouteHint(routingIntent: .web, candidateSources: [.web], cleanQuery: "rate")
+    let localThenWeb = SearchRouteHint(routingIntent: .multi, candidateSources: [.recordedMemory, .web], cleanQuery: "rate")
+    let localOnly = SearchRouteHint(routingIntent: .localFiles, candidateSources: [.localFiles], cleanQuery: "invoice")
+
+    #expect(CascadeAppModel.shouldPreferBackgroundWeb(routeHint: web))
+    #expect(!CascadeAppModel.shouldPreferBackgroundWeb(routeHint: localThenWeb))
+    #expect(CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localThenWeb, verdict: .insufficient))
+    #expect(CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localThenWeb, verdict: .abstain))
+    #expect(!CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localThenWeb, verdict: .sufficient))
+    #expect(!CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localOnly, verdict: .insufficient))
+}
+
+@Test
+func assistBackgroundWebResultClassificationIsPure() {
+    let task = "look up the filing deadline"
+
+    switch CascadeAppModel.classifyAssistBackgroundWebUpdate(task: task, update: completedUpdate("Due April 30")) {
+    case .finding(let finding):
+        #expect(finding == AgentTaskFinding(task: task, result: "Due April 30"))
+    default:
+        #expect(Bool(false))
+    }
+
+    let login = BackgroundWebAgent.Update(
+        status: "Sign in required",
+        snapshotPNG: nil,
+        url: "https://example.com",
+        done: true,
+        result: "Please sign in",
+        needsLogin: true
+    )
+    switch CascadeAppModel.classifyAssistBackgroundWebUpdate(task: task, update: login) {
+    case .pause(let reason):
+        #expect(reason == "Please sign in")
+    default:
+        #expect(Bool(false))
+    }
+
+    switch CascadeAppModel.classifyAssistBackgroundWebUpdate(task: task, update: failedUpdate("Could not load")) {
+    case .pause(let reason):
+        #expect(reason == "Could not load")
+    default:
+        #expect(Bool(false))
+    }
+}

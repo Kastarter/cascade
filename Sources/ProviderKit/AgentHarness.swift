@@ -193,6 +193,10 @@ public enum AgentHarness {
         readOnlyTools.contains(name) || powerTools.contains(name)
     }
 
+    public static func isReadOnlyTool(_ name: String) -> Bool {
+        readOnlyTools.contains(name)
+    }
+
     /// App names an AppleScript source (or an osascript-bearing shell command)
     /// drives via `tell application "X"` / `tell app "X"` / `tell application id
     /// "com.vendor.X"`. Bundle-id targets yield their last dot component

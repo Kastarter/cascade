@@ -351,6 +351,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalWorkGraphIndexKey = "cascade.experimentalWorkGraphIndex"
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
+    static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
@@ -1102,52 +1103,8 @@ public final class CascadeAppModel: ObservableObject {
             return false
         }
         let id = UUID()
-        let runtime = BackgroundWebAgent(modelCallCache: modelCallCache)
+        let runtime = configuredBackgroundWebAgent(id: id, attachCursor: true)
         sandboxRuntimes[id] = runtime
-        // The agent's pointer drives the box's native cursor overlay.
-        runtime.onCursor = { [weak self] point in self?.sandboxBox.moveCursor(id, toPagePoint: point) }
-        // Tag every audited row with this run's id so concurrent background agents (up to
-        // the cap) can be told apart in the one shared audit log — without it parallel
-        // runs' rows interleave with no way to attribute them.
-        runtime.auditTag = String(id.uuidString.prefix(8))
-        // Record every web action/turn so the background run is auditable, not a black box.
-        runtime.onAudit = { [weak self] action, detail in
-            guard let self else { return }
-            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: action, detail: String(detail.prefix(240)))) }
-        }
-        // Give the background Scout the SAME in-process harness the on-screen agent
-        // has — file/shell tools + record recall — so a background run can reach the
-        // user's local files and recorded screen history, not just the web. Pure
-        // execution here; the agent applies its own STOP gate + safe audit. Power
-        // tools stay behind the user's Power-harness opt-in; recall is read-only.
-        runtime.harnessTier = effectivePowerHarnessEnabled ? .full : .readOnly
-        runtime.recallEnabled = capturePrivacyPolicy.recordRecallAvailable
-        runtime.includeStructuredRecallContent = experimentalStructuredContent
-        runtime.harnessProvider = { [weak self] name, input in
-            guard let self else { return "Cascade is shutting down — stop." }
-            guard self.trustedAuditHistoryForSensitiveAction() else { return self.untrustedAuditHistoryMessage }
-            if RecordRecall.isRecallTool(name, includeStructuredContent: self.experimentalStructuredContent) {
-                guard self.capturePrivacyPolicy.recordRecallAvailable else {
-                    _ = try? await self.store.appendAudit(AuditEvent(
-                        actor: "policy",
-                        action: "policy.enforced",
-                        detail: Self.policyDecisionAuditDetail(capability: "record_recall", decision: "blocked", reason: "record_recall_unavailable")
-                    ))
-                    return "Managed policy has disabled record recall for agents."
-                }
-                return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
-            }
-            guard let call = HarnessCall(name: name, input: input) else { return "Unknown harness tool “\(name)”." }
-            if let reason = self.deniedURLReason(inHarnessInput: input) {
-                _ = try? await self.store.appendAudit(AuditEvent(
-                    actor: "policy",
-                    action: "policy.enforced",
-                    detail: Self.policyDecisionAuditDetail(capability: "harness_url", decision: "blocked", reason: reason)
-                ))
-                return "Managed policy blocked this site."
-            }
-            return await AgentHarness.perform(call, powerEnabled: self.effectivePowerHarnessEnabled)
-        }
         backgroundAgents.insert(BackgroundAgentRun(id: id, task: trimmed, agentID: agentID), at: 0)
         teachMessage = "Running in the background: \(trimmed)"
         assistMemory.remember(user: trimmed, assistant: "Started a background agent on it.")
@@ -1172,6 +1129,55 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         return true
+    }
+
+    private func configuredBackgroundWebAgent(id: UUID, attachCursor: Bool) -> BackgroundWebAgent {
+        let runtime = BackgroundWebAgent(modelCallCache: modelCallCache)
+        if attachCursor {
+            runtime.onCursor = { [weak self] point in self?.sandboxBox.moveCursor(id, toPagePoint: point) }
+        }
+        runtime.auditTag = String(id.uuidString.prefix(8))
+        runtime.onAudit = { [weak self] action, detail in
+            guard let self else { return }
+            Task {
+                _ = try? await self.store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: action,
+                    detail: String(detail.prefix(240))
+                ))
+            }
+        }
+        runtime.harnessTier = effectivePowerHarnessEnabled ? .full : .readOnly
+        runtime.recallEnabled = capturePrivacyPolicy.recordRecallAvailable
+        runtime.includeStructuredRecallContent = experimentalStructuredContent
+        runtime.harnessProvider = { [weak self] name, input in
+            guard let self else { return "Cascade is shutting down — stop." }
+            guard self.trustedAuditHistoryForSensitiveAction() else { return self.untrustedAuditHistoryMessage }
+            if RecordRecall.isRecallTool(name, includeStructuredContent: self.experimentalStructuredContent) {
+                guard self.capturePrivacyPolicy.recordRecallAvailable else {
+                    _ = try? await self.store.appendAudit(AuditEvent(
+                        actor: "policy",
+                        action: "policy.enforced",
+                        detail: Self.policyDecisionAuditDetail(capability: "record_recall", decision: "blocked", reason: "record_recall_unavailable")
+                    ))
+                    return "Managed policy has disabled record recall for agents."
+                }
+                return await RecordRecall(store: self.store).perform(RecordRecall.Call(name: name, input: input))
+            }
+            guard let call = HarnessCall(name: name, input: input) else {
+                return "Unknown harness tool “\(name)”."
+            }
+            if let reason = self.deniedURLReason(inHarnessInput: input) {
+                _ = try? await self.store.appendAudit(AuditEvent(
+                    actor: "policy",
+                    action: "policy.enforced",
+                    detail: Self.policyDecisionAuditDetail(capability: "harness_url", decision: "blocked", reason: reason)
+                ))
+                return "Managed policy blocked this site."
+            }
+            return await AgentHarness.perform(call, powerEnabled: self.effectivePowerHarnessEnabled)
+        }
+        return runtime
     }
 
     public func stopSandboxAgent(_ id: UUID) {
@@ -1992,6 +1998,15 @@ public final class CascadeAppModel: ObservableObject {
         // commands skip the round-trip entirely — a one-part plan runs exactly like
         // the old single loop. The conversation memo lets the planner split
         // follow-ups ("now reply to the first one") against what just happened.
+        let planningSnapshot = AppWindowObserver.snapshot()
+        let planningContext = [
+            assistMemory.contextMemo(),
+            "Frontmost app: \(planningSnapshot.appName)\nWindow: \(planningSnapshot.windowTitle ?? "")",
+            await planningPriorNote(for: goal, frontmostApp: planningSnapshot.appName),
+        ].compactMap { $0 }.compactMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }.joined(separator: "\n\n")
         let taskPlan: AgentTaskPlan
         if Self.isSinglePartCommand(goal) {
             taskPlan = AgentTaskPlan(originalTask: goal, subtasks: [AgentSubtask(task: goal)])
@@ -1999,18 +2014,24 @@ public final class CascadeAppModel: ObservableObject {
             // Downgraded helper task: Groq llama-3.3-70b when a key is set, else
             // Anthropic haiku. Planning is text-only, so no Claude needed.
             let h = TextHelperModel.resolve()
-            let planningContext = [
-                assistMemory.contextMemo(),
-                await planningPriorNote(for: goal, frontmostApp: AppWindowObserver.snapshot().appName),
-            ].compactMap { $0 }.compactMap { value -> String? in
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
-            }.joined(separator: "\n\n")
             taskPlan = await AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache).taskPlan(
                 for: goal, in: .onScreen, conversationContext: planningContext
             )
         }
         var plan = taskPlan.subtasks
+        let searchRoutingEnabled = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey)
+        var routeHints: [String: SearchRouteHint] = [:]
+        if searchRoutingEnabled {
+            let h = TextHelperModel.resolve()
+            let router = AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache)
+            for subtask in plan where Self.isSearchShapedGoal(subtask.task) {
+                routeHints[subtask.task] = await router.routeSearch(
+                    for: subtask.task,
+                    in: .onScreen,
+                    conversationContext: planningContext
+                )
+            }
+        }
         _ = try? await store.appendAudit(AuditEvent(
             actor: "agent",
             action: "assist.plan",
@@ -2021,6 +2042,7 @@ public final class CascadeAppModel: ObservableObject {
         var stalledOn: String?
         var interrupted = false
         var shot: Data? = firstScreenshotPNG
+        var appliedSearchRoutingKeys = Set<String>()
 
         // All frames in this run are captured at the model resolution as JPEG and
         // pass through to base64 untouched.
@@ -2053,6 +2075,56 @@ public final class CascadeAppModel: ObservableObject {
                     detail: Self.assistSubgoalAuditDetail(index: index, total: plan.count, subtask: sub, status: "start")
                 ))
 
+                let subRouteHint = routeHints[sub.task]
+                if searchRoutingEnabled,
+                   let routeHint = subRouteHint,
+                   appliedSearchRoutingKeys.insert(Self.auditHash(sub.task)).inserted {
+                    var localVerdict: SearchEvidenceVerdict?
+                    if routeHint.usesCheapLocalSources {
+                        let evidence = await collectCheapLocalEvidence(routeHint: routeHint)
+                        let verdict = await judgeSearchEvidence(evidence)
+                        localVerdict = verdict
+                        if verdict == .sufficient {
+                            findings.append((task: sub.task, result: evidence.findingText))
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent",
+                                action: "assist.search.local",
+                                detail: Self.assistSearchUngatedAuditDetail(goal: sub.task, routeHint: routeHint, status: "local_sufficient")
+                            ))
+                            index += 1
+                            break subgoal
+                        }
+                        if evidence.hasEvidence {
+                            sub = AgentSubtask(
+                                task: "\(sub.task)\n\nLocal evidence already checked; use it as context and search another source only if needed:\n\(evidence.findingText)",
+                                startURL: sub.startURL,
+                                app: sub.app,
+                                web: sub.web,
+                                note: sub.note,
+                                expectedEffects: sub.expectedEffects,
+                                risk: sub.risk
+                            )
+                            plan[index] = sub
+                        }
+                    }
+                    let shouldUseWeb = Self.shouldPreferBackgroundWeb(routeHint: routeHint)
+                        || localVerdict.map { Self.shouldEscalateSearchToWeb(routeHint: routeHint, verdict: $0) } == true
+                    if shouldUseWeb {
+                        switch await runAssistBackgroundWebSearch(subtask: sub, routeHint: routeHint) {
+                        case .finding(let finding):
+                            findings.append((task: finding.task, result: finding.result))
+                            index += 1
+                            break subgoal
+                        case .pause(let reason):
+                            findings.append((task: sub.task, result: reason))
+                            stalledOn = sub.task
+                            break parts
+                        case .unavailable:
+                            break
+                        }
+                    }
+                }
+
                 // Jump straight to the part's app or site — instant, no vision round-trip.
                 if !sub.app.isEmpty {
                     await executeCU(.openApp(sub.app), on: screen)
@@ -2073,7 +2145,8 @@ public final class CascadeAppModel: ObservableObject {
 
                 var attempt = await runAssistEpisode(
                     goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: false),
-                    prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot, gen: gen
+                    prefix: prefix, screen: screen, firstScreenshotPNG: episodeShot, gen: gen,
+                    routeHint: subRouteHint
                 )
                 // The model replied without doing anything — usually narration or a
                 // question. One firmer retry on a fresh frame; its answer stands.
@@ -2081,7 +2154,8 @@ public final class CascadeAppModel: ObservableObject {
                    let retryShot = await freshShot() {
                     attempt = await runAssistEpisode(
                         goal: AgentTaskPlanner.goal(for: sub, index: index, total: plan.count, job: goal, findings: findings, firmer: true),
-                        prefix: prefix, screen: screen, firstScreenshotPNG: retryShot, gen: gen
+                        prefix: prefix, screen: screen, firstScreenshotPNG: retryShot, gen: gen,
+                        routeHint: subRouteHint
                     )
                 }
 
@@ -2359,6 +2433,58 @@ public final class CascadeAppModel: ObservableObject {
         case failed
     }
 
+    struct SearchEvidenceBundle: Sendable, Equatable {
+        let query: String
+        let routeHint: SearchRouteHint
+        var recordResult: String?
+        var fileSearchResult: String?
+        var fileReadResult: String?
+
+        var hasEvidence: Bool {
+            [recordResult, fileSearchResult, fileReadResult].contains { text in
+                guard let text else { return false }
+                return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+
+        var combinedText: String {
+            [
+                recordResult.map { "Recorded memory:\n\($0)" },
+                fileSearchResult.map { "Local file search:\n\($0)" },
+                fileReadResult.map { "Local file read:\n\($0)" },
+            ].compactMap { $0 }.joined(separator: "\n\n")
+        }
+
+        var findingText: String {
+            let text = combinedText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return "No local evidence found." }
+            return String(text.prefix(1800))
+        }
+    }
+
+    enum SearchEvidenceVerdict: String, Sendable, Equatable {
+        case sufficient
+        case insufficient
+        case abstain
+
+        static func parse(_ raw: String) -> SearchEvidenceVerdict {
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            let token = normalized.split { !$0.isLetter }.first.map(String.init) ?? normalized
+            switch token {
+            case "SUFFICIENT": return .sufficient
+            case "INSUFFICIENT": return .insufficient
+            case "ABSTAIN": return .abstain
+            default: return .abstain
+            }
+        }
+    }
+
+    enum AssistBackgroundWebResult: Sendable, Equatable {
+        case finding(AgentTaskFinding)
+        case pause(String)
+        case unavailable
+    }
+
     /// Steps one Computer Use episode through a single part: observe → act →
     /// re-observe until the model finishes, the user stops it, or the step budget
     /// runs out. Returns the model's closing line plus whether it acted at all.
@@ -2391,17 +2517,30 @@ public final class CascadeAppModel: ObservableObject {
     /// Harness + recall provider shared by both on-screen paths: recall tools route
     /// to performRecall (read-only memory); everything else to performHarness
     /// (file/shell, gated + audited).
-    private func assistHarnessProvider(goal: String, gen: Int) -> @MainActor (String, [String: Any]) async -> String {
+    private func assistHarnessProvider(
+        goal: String,
+        gen: Int,
+        onSearchToolCall: (@MainActor (String) -> Void)? = nil
+    ) -> @MainActor (String, [String: Any]) async -> String {
         { [weak self] name, input in
             guard let self else { return "Cascade is shutting down — stop." }
             if RecordRecall.isRecallTool(name, includeStructuredContent: self.experimentalStructuredContent) {
+                onSearchToolCall?(name)
                 return await self.performRecall(name: name, input: input, gen: gen)
+            }
+            if AgentHarness.isReadOnlyTool(name) {
+                onSearchToolCall?(name)
             }
             return await self.performHarness(name: name, input: input, goal: goal, gen: gen)
         }
     }
 
-    private func makeAssistAgent(model: String, goal: String, gen: Int) -> ComputerUseAgent {
+    private func makeAssistAgent(
+        model: String,
+        goal: String,
+        gen: Int,
+        onSearchToolCall: (@MainActor (String) -> Void)? = nil
+    ) -> ComputerUseAgent {
         // Structural grounding split: when a grounder is configured (hosted UI-TARS
         // via OpenRouter, or Claude), Opus drives the screen by NAMING targets and
         // the runtime grounds each — the model never emits pixel coordinates. The
@@ -2418,12 +2557,13 @@ public final class CascadeAppModel: ObservableObject {
             // Direct-Mac tools beside the computer tool: find/read is always on;
             // run/script/write only with the user's Power harness opt-in.
             harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
-            harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
+            harnessProvider: assistHarnessProvider(goal: goal, gen: gen, onSearchToolCall: onSearchToolCall),
             // Let the agent recall what the user already saw on screen — the whole
             // point of a context recorder. The same in-process tools the Ask panel
             // hunts the record with, so a retrospective goal resolves before acting.
             recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
             includeStructuredRecallContent: experimentalStructuredContent,
+            resourceCatalogEnabled: defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey),
             // Grounding split: the grounder locates named targets. In structural
             // mode it backs click_target/fill_target/scroll (the model never emits
             // coordinates); in coordinate mode it backs the optional fill_target aid.
@@ -2768,7 +2908,12 @@ public final class CascadeAppModel: ObservableObject {
     /// Opus path (no SSE streaming, no skills/harness) — additive, opt-in, so the
     /// Opus loop is untouched. RUNTIME-UNVERIFIED (needs Scout + UI-TARS serving).
     private func runScoutEpisode(
-        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
+        goal: String,
+        prefix: String,
+        screen: NSScreen,
+        firstScreenshotPNG: Data,
+        gen: Int,
+        routeHint: SearchRouteHint? = nil
     ) async -> AssistEpisodeOutcome {
         // Scout grounds EVERY click, so it can't run without a working grounder.
         // Fail clearly rather than fall back to a dead localhost endpoint (the old
@@ -2787,6 +2932,9 @@ public final class CascadeAppModel: ObservableObject {
         // multimodal model on OpenRouter (e.g. qwen/qwen3.6-plus). The grounder is
         // configured separately (`cascade.visualGrounder.*`).
         let planner = ScoutPlannerBackend.resolve(defaults: defaultsStore)
+        let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        var searchToolCalls = 0
+        var searchFinishBlocked = false
         let agent = ScoutAgent(
             vision: planner.vision,
             grounder: grounder,
@@ -2796,10 +2944,13 @@ public final class CascadeAppModel: ObservableObject {
             environmentNote: ComputerUseAgent.foregroundBrowserNote + "\n\n" + AgentDateContext.line(),
             skillProvider: assistSkillProvider(goal: goal),
             skillIndex: appSkills.indexText,
-            harnessProvider: assistHarnessProvider(goal: goal, gen: gen),
+            harnessProvider: assistHarnessProvider(goal: goal, gen: gen, onSearchToolCall: { _ in
+                searchToolCalls += 1
+            }),
             harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
             recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
-            includeStructuredRecallContent: experimentalStructuredContent
+            includeStructuredRecallContent: experimentalStructuredContent,
+            resourceCatalogEnabled: defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey)
         )
         let dw = Int(screen.frame.width), dh = Int(screen.frame.height)
         let res = AgentResolution.best(forWidth: dw, height: dh)
@@ -2843,6 +2994,7 @@ public final class CascadeAppModel: ObservableObject {
             skill: scoutSkillPush(goal: goal)
         )
         modelTime += modelStart.duration(to: .now); count += 1
+        var currentShot = firstScreenshotPNG
         for _ in 0..<maxSteps {
             if assistGeneration != gen { return await scoutEnd(.stopped, "superseded") }
             if driver.runState.isStopRequested {
@@ -2865,6 +3017,31 @@ public final class CascadeAppModel: ObservableObject {
             }
             if step.done {
                 let claimed = step.text.isEmpty ? "Done." : step.text
+                if searchShapedGoal, searchToolCalls == 0 {
+                    if searchFinishBlocked {
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "assist.search.ungated",
+                            detail: Self.assistSearchUngatedAuditDetail(goal: goal, routeHint: routeHint, status: "stalled")
+                        ))
+                        return await scoutEnd(.stalled("I tried to finish without searching any source, so I paused instead of guessing."), "search-ungated-stall")
+                    }
+                    searchFinishBlocked = true
+                    let searchNudge = Self.searchSufficiencyNudge(routeHint: routeHint)
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "assist.search.ungated",
+                        detail: Self.assistSearchUngatedAuditDetail(goal: goal, routeHint: routeHint, status: "blocked")
+                    ))
+                    modelStart = ContinuousClock.now
+                    step = await agent.proceed(
+                        screenshot: currentShot,
+                        note: [scoutGroundingNote(), searchNudge].compactMap { $0 }.joined(separator: "\n"),
+                        skill: scoutSkillPush(goal: goal)
+                    )
+                    modelTime += modelStart.duration(to: .now); count += 1
+                    continue
+                }
                 if acted, let missing = await validateAssistCompletion(goal: goal, claimed: claimed, screen: screen) {
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.validate", detail: Self.assistValidationAuditDetail(missing)))
                     return await scoutEnd(.stalled("I'm not sure that finished — \(missing)"), "validate-incomplete")
@@ -3035,6 +3212,7 @@ public final class CascadeAppModel: ObservableObject {
             let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count, turn: count)
             let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
+            currentShot = observedShot
             step = await agent.proceed(
                 screenshot: observedShot,
                 note: turnNote.isEmpty ? nil : turnNote,
@@ -3046,14 +3224,26 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func runAssistEpisode(
-        goal: String, prefix: String, screen: NSScreen, firstScreenshotPNG: Data, gen: Int
+        goal: String,
+        prefix: String,
+        screen: NSScreen,
+        firstScreenshotPNG: Data,
+        gen: Int,
+        routeHint: SearchRouteHint? = nil
     ) async -> AssistEpisodeOutcome {
         // Tier 2 downgrade: when selected, the cheap on-screen brain (Scout plans,
         // UI-TARS grounds) replaces the Opus computer-use loop. This guard is the
         // ONLY change to the Opus path — default is Claude, so behaviour is
         // unchanged unless the user opts in. See [[cascade-cu-downgrade-research]].
         if Self.onScreenBackendIsScout() {
-            return await runScoutEpisode(goal: goal, prefix: prefix, screen: screen, firstScreenshotPNG: firstScreenshotPNG, gen: gen)
+            return await runScoutEpisode(
+                goal: goal,
+                prefix: prefix,
+                screen: screen,
+                firstScreenshotPNG: firstScreenshotPNG,
+                gen: gen,
+                routeHint: routeHint
+            )
         }
         // Pull-based skills: the agent gets a one-line index and fetches a
         // skill's full instructions itself via the use_skill tool. Content
@@ -3066,7 +3256,12 @@ public final class CascadeAppModel: ObservableObject {
         // wall-clock (Sonnet-first ballooned the same Keynote task from ~10 turns
         // to 15 and over-thought; reverted). Effort stays medium — CU default.
         let cuModel = AnthropicModel.opus
-        let agent = makeAssistAgent(model: cuModel, goal: goal, gen: gen)
+        let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        var searchToolCalls = 0
+        var searchFinishBlocked = false
+        let agent = makeAssistAgent(model: cuModel, goal: goal, gen: gen, onSearchToolCall: { _ in
+            searchToolCalls += 1
+        })
         // Structural mode: the model names targets and the grounder locates them —
         // it emits NO coordinates, so the flail nudge below must push target NAMES
         // (to re-describe via click_target), never click coordinates it can't use.
@@ -3155,6 +3350,7 @@ public final class CascadeAppModel: ObservableObject {
         )
         // begin() IS the first model turn; in-stream action time isn't model time.
         modelTime += episodeStart.duration(to: .now) - streamActionTime
+        var currentShot = firstScreenshotPNG
         var acted = false
         var count = 0
         // Stall guard: a turn with no actions and no done is the model talking
@@ -3209,6 +3405,32 @@ public final class CascadeAppModel: ObservableObject {
             }
             if step.done {
                 let claimed = step.text.isEmpty ? "Done." : step.text
+                if searchShapedGoal, searchToolCalls == 0 {
+                    if searchFinishBlocked {
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "assist.search.ungated",
+                            detail: Self.assistSearchUngatedAuditDetail(goal: goal, routeHint: routeHint, status: "stalled")
+                        ))
+                        auditTiming(outcome: "search-ungated-stall")
+                        return .stalled("I tried to finish without searching any source, so I paused instead of guessing.")
+                    }
+                    searchFinishBlocked = true
+                    nudge = Self.searchSufficiencyNudge(routeHint: routeHint)
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "assist.search.ungated",
+                        detail: Self.assistSearchUngatedAuditDetail(goal: goal, routeHint: routeHint, status: "blocked")
+                    ))
+                    let modelStart = ContinuousClock.now
+                    step = await agent.continueAfterNudge(
+                        screenshot: currentShot,
+                        note: episodeNote(nudge) ?? Self.searchSufficiencyNudge(routeHint: routeHint)
+                    )
+                    modelTime += modelStart.duration(to: .now) - streamActionTime
+                    count += 1
+                    continue
+                }
                 // Validator stage: a run that DID work and claims done is checked
                 // against fresh on-screen evidence (gated off by default → nil, no
                 // overhead). A clear mismatch is reported honestly instead of a
@@ -3309,6 +3531,7 @@ public final class CascadeAppModel: ObservableObject {
                 // Native-resolution crop so the model can actually read small text.
                 if actedThisTurn { try? await Task.sleep(for: .milliseconds(260)) }
                 if let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: zoomRegion) {
+                    currentShot = crop
                     streamActed = false
                     streamActionTime = .zero
                     streamExpectedChange = false
@@ -3500,6 +3723,7 @@ public final class CascadeAppModel: ObservableObject {
             streamExpectedChange = false
             pendingNarration = nil
             let modelStart = ContinuousClock.now
+            currentShot = observedShot
             step = await agent.proceed(screenshot: observedShot, note: episodeNote(nudge))
             modelTime += modelStart.duration(to: .now) - streamActionTime
             count += 1
@@ -3681,6 +3905,66 @@ public final class CascadeAppModel: ObservableObject {
     private func episodeNote(_ nudge: String?) -> String? {
         guard let nudge else { return groundingNote() }
         return [groundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    nonisolated static func isSearchShapedGoal(_ goal: String) -> Bool {
+        let normalized = " " + goal.lowercased()
+            .folding(options: [.diacriticInsensitive, .widthInsensitive], locale: .current)
+            .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "ابتثجحخدذرزسشصضطظعغفقكلمنهويءأإآةىؤئ")).inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ") + " "
+        let markers = [
+            " find ", " search ", " look up ", " lookup ", " where is ", " where are ",
+            " what is ", " what's ", " who is ", " when is ", " how much ", " how many ",
+            " latest ", " current ", " price ", " locate ", " show me ", " ابحث ",
+            " دور ", " وين ", " اين ", " أين ", " ما هو ", " كم ",
+        ]
+        return markers.contains { normalized.contains($0.lowercased()) }
+    }
+
+    nonisolated static func searchSufficiencyNudge(routeHint: SearchRouteHint?) -> String {
+        var lines = [
+            "You tried to finish a search-shaped task without searching any source. Pick the cheapest matching resource and actually search before finishing.",
+            "Resource catalog:",
+            ComputerUseAgent.resourceCatalogNote(harnessTier: .readOnly, recallEnabled: true),
+        ]
+        if let routeHint {
+            lines.append("Route hint: intent=\(routeHint.routingIntent.rawValue), sources=\(routeHint.candidateSources.map(\.rawValue).joined(separator: ",")), cleanQuery=\(routeHint.cleanQuery)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    nonisolated static func assistSearchUngatedAuditDetail(
+        goal: String,
+        routeHint: SearchRouteHint?,
+        status: String
+    ) -> String {
+        var parts = [
+            "status=\(safeAuditToken(status))",
+            textAuditDetail("goal", goal),
+        ]
+        if let routeHint {
+            parts.append("intent=\(safeAuditToken(routeHint.routingIntent.rawValue))")
+            parts.append("sources=\(routeHint.candidateSources.map { safeAuditToken($0.rawValue) }.joined(separator: ","))")
+            parts.append(textAuditDetail("cleanQuery", routeHint.cleanQuery))
+        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func classifyAssistBackgroundWebUpdate(
+        task: String,
+        update: BackgroundWebAgent.Update
+    ) -> AssistBackgroundWebResult {
+        if update.completed, let result = update.result, !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .finding(AgentTaskFinding(task: task, result: result))
+        }
+        if update.needsLogin {
+            return .pause(update.result ?? update.status)
+        }
+        if update.done {
+            return .pause((update.result?.isEmpty == false ? update.result : nil) ?? update.status)
+        }
+        return .unavailable
     }
 
     private func initialAssistNote(goal: String) async -> String? {
@@ -3880,6 +4164,114 @@ public final class CascadeAppModel: ObservableObject {
             user: user, model: h.model, maxTokens: 120
         ) else { return nil }  // verifier unavailable → never block a completion
         return Self.parseAssistVerdict(reply)
+    }
+
+    private func collectCheapLocalEvidence(routeHint: SearchRouteHint) async -> SearchEvidenceBundle {
+        var bundle = SearchEvidenceBundle(
+            query: routeHint.cleanQuery,
+            routeHint: routeHint,
+            recordResult: nil,
+            fileSearchResult: nil,
+            fileReadResult: nil
+        )
+        if routeHint.candidateSources.contains(.recordedMemory), capturePrivacyPolicy.recordRecallAvailable {
+            bundle.recordResult = await RecordRecall(store: store).perform(.search(query: routeHint.cleanQuery))
+        }
+        if routeHint.candidateSources.contains(.localFiles) {
+            let search = await AgentHarness.perform(
+                .searchFiles(query: routeHint.cleanQuery, folder: nil),
+                powerEnabled: false
+            )
+            bundle.fileSearchResult = search
+            if let path = Self.firstConcreteLocalPath(from: search) {
+                bundle.fileReadResult = await AgentHarness.perform(.readFile(path: path), powerEnabled: false)
+            }
+        }
+        return bundle
+    }
+
+    private func judgeSearchEvidence(_ bundle: SearchEvidenceBundle) async -> SearchEvidenceVerdict {
+        guard bundle.hasEvidence, hasAnthropicKey else { return .abstain }
+        let user = """
+        Query:
+        \(bundle.query)
+
+        Candidate evidence:
+        \(bundle.combinedText.prefix(3600))
+
+        Does the evidence directly answer the query enough to avoid a web search?
+        Reply with exactly one token: SUFFICIENT, INSUFFICIENT, or ABSTAIN.
+        """
+        let h = TextHelperModel.resolve()
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: "assist-search-evidence.prompt.v1",
+            schemaVersion: "assist-search-evidence.schema.v1",
+            callsite: "CascadeAppModel.searchEvidenceJudge"
+        )
+        guard let reply = try? await h.client.complete(
+            system: "Judge whether local search evidence is enough. Do not answer the user's query; only classify evidence sufficiency.",
+            user: user,
+            model: h.model,
+            maxTokens: 20,
+            options: options
+        ) else { return .abstain }
+        return SearchEvidenceVerdict.parse(reply)
+    }
+
+    nonisolated static func shouldEscalateSearchToWeb(routeHint: SearchRouteHint, verdict: SearchEvidenceVerdict) -> Bool {
+        routeHint.allowsWeb && verdict != .sufficient
+    }
+
+    nonisolated static func shouldPreferBackgroundWeb(routeHint: SearchRouteHint) -> Bool {
+        routeHint.candidateSources.first == .web || routeHint.routingIntent == .web
+    }
+
+    private func runAssistBackgroundWebSearch(
+        subtask: AgentSubtask,
+        routeHint: SearchRouteHint
+    ) async -> AssistBackgroundWebResult {
+        guard Self.shouldPreferBackgroundWeb(routeHint: routeHint) || routeHint.allowsWeb else { return .unavailable }
+        guard capturePrivacyPolicy.backgroundWebRunsAvailable else { return .unavailable }
+        if let reason = capturePrivacyPolicy.deniedURLReason(in: subtask.task) {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "policy",
+                action: "policy.enforced",
+                detail: Self.policyDecisionAuditDetail(capability: "background_web_run", decision: "blocked", reason: reason)
+            ))
+            return .unavailable
+        }
+        guard hasAnthropicKey, trustedAuditHistoryForSensitiveAction(),
+              sandboxRuntimes.count < Self.maxConcurrentSandboxAgents else {
+            return .unavailable
+        }
+        let id = UUID()
+        let runtime = configuredBackgroundWebAgent(id: id, attachCursor: false)
+        sandboxRuntimes[id] = runtime
+        defer { sandboxRuntimes[id] = nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.search.web",
+            detail: Self.assistSearchUngatedAuditDetail(goal: subtask.task, routeHint: routeHint, status: "background_start")
+        ))
+        var terminal: BackgroundWebAgent.Update?
+        await runtime.run(task: subtask.task) { update in
+            if update.done { terminal = update }
+        }
+        guard let terminal else { return .unavailable }
+        return Self.classifyAssistBackgroundWebUpdate(task: subtask.task, update: terminal)
+    }
+
+    nonisolated static func firstConcreteLocalPath(from searchResult: String) -> String? {
+        for rawLine in searchResult.split(separator: "\n") {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("status="), !line.hasPrefix("No files matched") else { continue }
+            if line.hasPrefix("/") || line.hasPrefix("~") {
+                let path = line.replacingOccurrences(of: "…", with: "")
+                guard path.range(of: #"\s+\d+ more\.?$"#, options: .regularExpression) == nil else { continue }
+                return path
+            }
+        }
+        return nil
     }
 
     private func runNoEffectVerifier(
