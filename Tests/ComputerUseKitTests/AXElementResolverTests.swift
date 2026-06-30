@@ -171,20 +171,23 @@ struct AXElementResolverTests {
                 role: "AXGroup",
                 title: "Stale",
                 score: 0,
-                descriptor: AXTargetDescriptorV2(
-                    label: "Approve",
-                    role: "AXButton",
-                    identifier: "expense.approve",
-                    container: "AXRow: Q2 Expense",
-                    siblingIndex: 3,
-                    enabled: false,
-                    selected: true,
-                    focused: true
-                )
-            )
-        ])
-        #expect(summary == "“Approve” (button; id expense.approve; in AXRow: Q2 Expense; disabled; selected; focused; sibling 3)")
-    }
+	                descriptor: AXTargetDescriptorV2(
+	                    label: "Approve",
+	                    role: "AXButton",
+	                    identifier: "expense.approve",
+	                    container: "AXRow: Q2 Expense",
+	                    siblingIndex: 8,
+	                    siblingRoleIndex: 3,
+	                    frameBucket: "1,2,3,4",
+	                    enabled: false,
+	                    selected: true,
+	                    focused: true,
+                        createdFrom: "fixture"
+	                )
+	            )
+	        ])
+	        #expect(summary == "“Approve” (button; id expense.approve; in AXRow: Q2 Expense; disabled; selected; focused; roleSibling 3; frame 1,2,3,4; source fixture)")
+	    }
 
     @Test func interactableSummaryIsNilWhenEmpty() {
         // Canvas/Electron apps expose no AX controls — caller must degrade to a

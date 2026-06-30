@@ -44,6 +44,19 @@ struct AnchorDriftScorerTests {
         #expect(result.reasons.contains(.closeTopCandidates))
     }
 
+    @Test func documentedAmbiguityMarginFlagsCloseTopCandidates() {
+        let result = AnchorDriftScorer.evaluate(
+            previous: previous(score: 0.94),
+            rankedCandidates: [
+                candidate("continue-billing", score: 0.91),
+                candidate("continue-help", score: 0.865),
+            ],
+            now: now)
+
+        #expect(result.outcome == .ambiguous)
+        #expect(result.reasons.contains(.closeTopCandidates))
+    }
+
     @Test func repeatedFailedAnchorsDemote() {
         let result = AnchorDriftScorer.evaluate(
             previous: previous(score: 0.94),
@@ -92,6 +105,17 @@ struct AnchorDriftScorerTests {
         #expect(result.outcome == .drifted)
         #expect(result.reasons.contains(.sourceChanged))
         #expect(result.reasons.contains(.hashChanged))
+    }
+
+    @Test func sourceChangeWithoutScoreDropStillFlagsDrift() {
+        let result = AnchorDriftScorer.evaluate(
+            previous: previous(score: 0.94, source: .accessibility, hash: "save-v1"),
+            rankedCandidates: [candidate("save", score: 0.94, source: .vision, hash: "save-v1")],
+            now: now)
+
+        #expect(result.outcome == .drifted)
+        #expect(result.reasons.contains(.sourceChanged))
+        #expect(!result.reasons.contains(.scoreDrop))
     }
 
     @Test func staleVerificationAllowsMoreScoreSlack() {

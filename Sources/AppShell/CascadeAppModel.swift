@@ -4587,7 +4587,11 @@ public final class CascadeAppModel: ObservableObject {
         tier: RecipeTargetCacheTier? = nil,
         reason: String? = nil,
         confidence: Double? = nil,
-        deltaReason: String? = nil
+        deltaReason: String? = nil,
+        source: AnchorDriftScorer.AnchorSource? = nil,
+        score: Double? = nil,
+        candidateCount: Int? = nil,
+        anchorHash: String? = nil
     ) -> String {
         var parts = [
             "step=\(step.order)",
@@ -4598,6 +4602,48 @@ public final class CascadeAppModel: ObservableObject {
         if let reason { parts.append("reason=\(safeAuditToken(reason))") }
         if let confidence { parts.append("confidence=\(String(format: "%.2f", confidence))") }
         if let deltaReason { parts.append("delta=\(safeAuditToken(deltaReason))") }
+        if let source { parts.append("source=\(safeAuditToken(source.rawValue))") }
+        if let score { parts.append("score=\(String(format: "%.2f", score))") }
+        if let candidateCount { parts.append("candidates=\(candidateCount)") }
+        if let anchorHash { parts.append("anchorHash=\(safeAuditToken(anchorHash))") }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func recipeTargetAuditDetail(
+        step: RecipeStep,
+        tier: String,
+        confidence: Double? = nil,
+        source: AnchorDriftScorer.AnchorSource? = nil,
+        score: Double? = nil,
+        candidateCount: Int? = nil,
+        drift: AnchorDriftScorer.Outcome? = nil
+    ) -> String {
+        var detail = recipeAuditDetail(step, tier: tier)
+        if let confidence { detail += " confidence=\(String(format: "%.2f", confidence))" }
+        if let source { detail += " source=\(safeAuditToken(source.rawValue))" }
+        if let score { detail += " score=\(String(format: "%.2f", score))" }
+        if let candidateCount { detail += " candidates=\(candidateCount)" }
+        if let drift { detail += " drift=\(safeAuditToken(String(describing: drift)))" }
+        return detail
+    }
+
+    nonisolated static func recipeDriftAuditDetail(
+        step: RecipeStep,
+        outcome: AnchorDriftScorer.Outcome,
+        reasons: Set<AnchorDriftScorer.Reason>,
+        previousScore: Double?,
+        selectedScore: Double?,
+        candidateCount: Int
+    ) -> String {
+        var parts = [
+            "step=\(step.order)",
+            "kind=\(safeAuditToken(step.kind.rawValue))",
+            "outcome=\(safeAuditToken(String(describing: outcome)))",
+            "reasons=\(safeAuditToken(reasons.map { String(describing: $0) }.sorted().joined(separator: ",")))",
+            "candidates=\(candidateCount)",
+        ]
+        if let previousScore { parts.append("previous=\(String(format: "%.2f", previousScore))") }
+        if let selectedScore { parts.append("selected=\(String(format: "%.2f", selectedScore))") }
         return parts.joined(separator: " ")
     }
 
@@ -6995,14 +7041,23 @@ public final class CascadeAppModel: ObservableObject {
 		                    } else {
 		                        targetCacheContext = nil
 		                    }
-		                    if let targetCacheContext,
-		                       let cached = await recipeTargetCache.lookup(targetCacheContext) {
-		                        try await driver.act(.computerUse(.move(x: cached.point.x, y: cached.point.y)))
+                            var previousVerifiedEntry: RecipeTargetCacheEntry?
+			                    if let targetCacheContext,
+			                       let cached = await recipeTargetCache.lookup(targetCacheContext) {
+                                previousVerifiedEntry = cached
+			                        try await driver.act(.computerUse(.move(x: cached.point.x, y: cached.point.y)))
 		                        try? await Task.sleep(for: .milliseconds(320))
 		                        try await clickAction(step, at: cached.point)
 		                        let cacheVerification = await Self.verifyUIChange(after: cacheInitialState)
 		                        if cacheVerification.changed {
-		                            _ = await recipeTargetCache.promote(targetCacheContext, point: cached.point, tier: cached.tier)
+		                            _ = await recipeTargetCache.promote(
+                                            targetCacheContext,
+                                            point: cached.point,
+                                            tier: cached.tier,
+                                            verifiedScore: cached.verifiedScore,
+                                            source: cached.source,
+                                            anchorHash: cached.anchorHash
+                                        )
 		                            unverifiedStreak = 0
 		                            _ = try? await store.appendAudit(AuditEvent(
 		                                actor: "agent",
@@ -7049,20 +7104,152 @@ public final class CascadeAppModel: ObservableObject {
                     // text the AX tree can't. Tier 3 (vision): Claude vision via the OCR
                     // anchor. Tier 4 (recorded): the recorded pixel. The tier lands in
                     // the step's audit row so a drifting recipe is diagnosable.
-                    let target: CGPoint
-                    let tier: String
-                    if !axUnreliable, let axTarget = await Self.resolveByAX(step: step, recorded: recorded) {
-                        target = axTarget
-                        tier = "ax"
-                    } else if let ocrTarget = await regroundedByOCR(anchor: step.ocrAnchor ?? step.text) {
-                        target = ocrTarget
-                        tier = "ocr"
-                    } else {
-                        // Falls back to `recorded` itself when there's no anchor/key.
-                        target = await regroundedTarget(anchor: step.ocrAnchor, recorded: recorded)
-                        tier = target == recorded ? "recorded" : "vision"
-                    }
-                    _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.target", detail: Self.recipeAuditDetail(step, tier: tier)))
+	                    let axResolution = axUnreliable ? nil : await Self.resolveByAX(step: step, recorded: recorded)
+                            if let axResolution,
+                               axResolution.isRerankable,
+                               let second = axResolution.topCandidates.dropFirst().first,
+                               axResolution.confidence - second.confidence <= AnchorDriftScorer.Configuration.default.ambiguousTopMargin {
+                                let choices = Self.recipeCandidateChoices(axResolution.topCandidates)
+                                _ = try? await store.appendAudit(AuditEvent(
+                                    actor: "agent",
+                                    action: "recipe.drift",
+                                    detail: Self.recipeDriftAuditDetail(
+                                        step: step,
+                                        outcome: .ambiguous,
+                                        reasons: [.closeTopCandidates],
+                                        previousScore: previousVerifiedEntry?.verifiedScore,
+                                        selectedScore: axResolution.confidence,
+                                        candidateCount: axResolution.topCandidates.count
+                                    )
+                                ))
+                                await escalateRecipeToAssist(
+                                    agent,
+                                    reason: "multiple current targets match this recorded click",
+                                    failureKind: .targetNotFound,
+                                    recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
+                                    ambiguityChoices: choices,
+                                    ambiguityFrames: axResolution.topCandidates.compactMap { $0.candidate.frame }
+                                )
+                                stoppedEarly = true
+                                break
+                            }
+                            var driftOutcome: AnchorDriftScorer.Outcome?
+                            if let axResolution,
+                               let previousVerifiedEntry,
+                               axResolution.isRerankable {
+                                let drift = AnchorDriftScorer.evaluate(
+                                    previous: AnchorDriftScorer.VerifiedAnchor(
+                                        score: previousVerifiedEntry.verifiedScore,
+                                        source: previousVerifiedEntry.source,
+                                        hash: previousVerifiedEntry.anchorHash,
+                                        verifiedAt: previousVerifiedEntry.lastVerifiedAt
+                                    ),
+                                    rankedCandidates: Self.driftCandidates(
+                                        from: axResolution.topCandidates,
+                                        failureCount: previousVerifiedEntry.failureCount
+                                    )
+                                )
+                                driftOutcome = drift.outcome
+                                if drift.outcome != .stable {
+                                    _ = try? await store.appendAudit(AuditEvent(
+                                        actor: "agent",
+                                        action: "recipe.drift",
+                                        detail: Self.recipeDriftAuditDetail(
+                                            step: step,
+                                            outcome: drift.outcome,
+                                            reasons: drift.reasons,
+                                            previousScore: previousVerifiedEntry.verifiedScore,
+                                            selectedScore: drift.selected?.score,
+                                            candidateCount: axResolution.topCandidates.count
+                                        )
+                                    ))
+                                }
+                            }
+	                    let target: CGPoint
+	                    let tier: String
+                            let targetSource: AnchorDriftScorer.AnchorSource?
+                            let targetScore: Double?
+                            let targetCandidateCount: Int?
+                            let targetAnchorHash: String?
+	                    if let axResolution, axResolution.isAutomatic {
+	                        target = axResolution.point
+	                        tier = "ax"
+                                targetSource = axResolution.source
+                                targetScore = axResolution.confidence
+                                targetCandidateCount = axResolution.topCandidates.count
+                                targetAnchorHash = Self.anchorHash(for: axResolution.selectedCandidate)
+	                    } else {
+                                let ocrTarget = await regroundedByOCR(anchor: step.ocrAnchor ?? step.text)
+                                if let axResolution,
+                                   axResolution.isRerankable,
+                                   let ocrTarget,
+                                   hypot(ocrTarget.x - axResolution.point.x, ocrTarget.y - axResolution.point.y) <= 120 {
+                                    target = axResolution.point
+                                    tier = "ax_rerank"
+                                    targetSource = axResolution.source
+                                    targetScore = axResolution.confidence
+                                    targetCandidateCount = axResolution.topCandidates.count
+                                    targetAnchorHash = Self.anchorHash(for: axResolution.selectedCandidate)
+                                } else if let ocrTarget {
+                                    target = ocrTarget
+                                    tier = "ocr"
+                                    targetSource = .vision
+                                    targetScore = nil
+                                    targetCandidateCount = axResolution?.topCandidates.count
+                                    targetAnchorHash = nil
+                                } else {
+                                    let visualTarget = await regroundedTarget(anchor: step.ocrAnchor, recorded: recorded)
+                                    if let axResolution,
+                                       axResolution.isRerankable,
+                                       visualTarget != recorded,
+                                       hypot(visualTarget.x - axResolution.point.x, visualTarget.y - axResolution.point.y) <= 160 {
+                                        target = axResolution.point
+                                        tier = "ax_rerank"
+                                        targetSource = axResolution.source
+                                        targetScore = axResolution.confidence
+                                        targetCandidateCount = axResolution.topCandidates.count
+                                        targetAnchorHash = Self.anchorHash(for: axResolution.selectedCandidate)
+                                    } else if visualTarget != recorded || axResolution == nil {
+                                        target = visualTarget
+                                        tier = visualTarget == recorded ? "recorded" : "vision"
+                                        targetSource = visualTarget == recorded ? .recordedPoint : .vision
+                                        targetScore = nil
+                                        targetCandidateCount = axResolution?.topCandidates.count
+                                        targetAnchorHash = nil
+                                    } else if let axResolution {
+                                        await escalateRecipeToAssist(
+                                            agent,
+                                            reason: "the recorded target is low-confidence in the current UI",
+                                            failureKind: .targetNotFound,
+                                            recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
+                                            ambiguityChoices: Self.recipeCandidateChoices(axResolution.topCandidates),
+                                            ambiguityFrames: axResolution.topCandidates.compactMap { $0.candidate.frame }
+                                        )
+                                        stoppedEarly = true
+                                        break
+                                    } else {
+                                        target = recorded
+                                        tier = "recorded"
+                                        targetSource = .recordedPoint
+                                        targetScore = nil
+                                        targetCandidateCount = nil
+                                        targetAnchorHash = nil
+                                    }
+                                }
+                            }
+	                    _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "recipe.target",
+                            detail: Self.recipeTargetAuditDetail(
+                                step: step,
+                                tier: tier,
+                                confidence: targetScore,
+                                source: targetSource,
+                                score: targetScore,
+                                candidateCount: targetCandidateCount,
+                                drift: driftOutcome
+                            )
+                        ))
                     try await driver.act(.computerUse(.move(x: target.x, y: target.y)))
                     try? await Task.sleep(for: .milliseconds(320))
 
@@ -7088,9 +7275,16 @@ public final class CascadeAppModel: ObservableObject {
 		                        let verification = await Self.verifyUIChange(after: before)
 		                        if verification.changed {
 		                            unverifiedStreak = 0
-		                            if let targetCacheContext,
-		                               let cacheTier = RecipeTargetCacheTier(rawValue: tier) {
-		                                let promoted = await recipeTargetCache.promote(targetCacheContext, point: target, tier: cacheTier)
+			                            if let targetCacheContext,
+                                           let cacheTier = (tier == "ax_rerank" ? RecipeTargetCacheTier.ax : RecipeTargetCacheTier(rawValue: tier)) {
+			                                let promoted = await recipeTargetCache.promote(
+                                                targetCacheContext,
+                                                point: target,
+                                                tier: cacheTier,
+                                                verifiedScore: targetScore,
+                                                source: targetSource,
+                                                anchorHash: targetAnchorHash
+                                            )
 		                                _ = try? await store.appendAudit(AuditEvent(
 		                                    actor: "agent",
 		                                    action: "recipe.target_cache.promote",
@@ -7114,7 +7308,14 @@ public final class CascadeAppModel: ObservableObject {
 		                            if retryVerification.changed {
 		                                unverifiedStreak = 0
 		                                if let targetCacheContext {
-		                                    let promoted = await recipeTargetCache.promote(targetCacheContext, point: recorded, tier: .recorded)
+			                                    let promoted = await recipeTargetCache.promote(
+                                                    targetCacheContext,
+                                                    point: recorded,
+                                                    tier: .recorded,
+                                                    verifiedScore: nil,
+                                                    source: .recordedPoint,
+                                                    anchorHash: nil
+                                                )
 		                                    _ = try? await store.appendAudit(AuditEvent(
 		                                        actor: "agent",
 		                                        action: "recipe.target_cache.promote",
@@ -7213,7 +7414,9 @@ public final class CascadeAppModel: ObservableObject {
         _ agent: CascadeAgent,
         reason: String,
         failureKind: AgentOrchestrator.AgentFailureKind? = nil,
-        recoveryAction: RecoveryAction? = nil
+        recoveryAction: RecoveryAction? = nil,
+        ambiguityChoices: String? = nil,
+        ambiguityFrames: [CGRect] = []
     ) async {
         // Honor a pending STOP: runAssistTask resets runState on entry, which would
         // otherwise swallow an abort the user pressed just as drift triggered.
@@ -7234,6 +7437,9 @@ public final class CascadeAppModel: ObservableObject {
         ))
         let mouse = NSEvent.mouseLocation
         guard hasAnthropicKey, let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
+            if !ambiguityFrames.isEmpty {
+                guidanceOverlay.highlight(globalRects: Array(ambiguityFrames.prefix(2)))
+            }
             agentMessage = "Paused “\(agent.name)” — \(reason), and I can't take over without a Claude key. Take over, or re-record."
             dock.show(title: "Paused", detail: agentMessage)
             return
@@ -7248,7 +7454,11 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
         guard assistGeneration == gen else { return } // a barge-in superseded us
-        await runAssistTask(goal: Self.deployGoal(for: agent), screen: screen, firstScreenshotPNG: shot, gen: gen)
+        var goal = Self.deployGoal(for: agent)
+        if let ambiguityChoices, !ambiguityChoices.isEmpty {
+            goal += "\nPossible current targets: \(ambiguityChoices)"
+        }
+        await runAssistTask(goal: goal, screen: screen, firstScreenshotPNG: shot, gen: gen)
         agentMessage = teachMessage
     }
 
@@ -7301,22 +7511,84 @@ public final class CascadeAppModel: ObservableObject {
         return "expected “\(step.appName)” in front but “\(front?.localizedName ?? "no app")” is — the screen isn’t where the recording started"
     }
 
-    private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> CGPoint? {
+    private struct RecipeAXResolution: Sendable, Equatable {
+        let point: CGPoint
+        let confidence: Double
+        let source: AnchorDriftScorer.AnchorSource
+        let selectedCandidate: AXElementResolver.RankedCandidate
+        let topCandidates: [AXElementResolver.RankedCandidate]
+
+        var isAutomatic: Bool { confidence >= AXElementResolver.automaticHealMinimumConfidence }
+        var isRerankable: Bool { confidence >= AXElementResolver.rerankMinimumConfidence }
+    }
+
+    private static func resolveByAX(step: RecipeStep, recorded: CGPoint) async -> RecipeAXResolution? {
         let label = (step.text ?? step.ocrAnchor) ?? ""
         let (role, identifier, container) = AXTargetDescriptor.decode(step.targetDescriptor)
         // Need a label or a stable identifier to re-find the element by identity.
         guard !label.trimmingCharacters(in: .whitespaces).isEmpty || (identifier?.isEmpty == false) else { return nil }
         let descriptor = AXTargetDescriptorV2.decode(step.targetDescriptor, fallbackLabel: label)
             ?? AXTargetDescriptorV2(
-                label: label,
-                role: role,
-                identifier: identifier,
-                container: container,
-                ancestorPath: container.map { [$0] } ?? []
-            )
+	                label: label,
+	                role: role,
+	                identifier: identifier,
+	                container: container,
+	                ancestorPath: container.map { [$0] } ?? []
+	            )
         return await Task.detached(priority: .userInitiated) {
-            AXElementResolver.find(recorded: descriptor, near: recorded)?.center
+            let ranked = AXElementResolver.rank(recorded: descriptor, near: recorded, limit: 5)
+            guard let selected = ranked.first,
+                  let point = selected.candidate.center else { return nil }
+            return RecipeAXResolution(
+                point: point,
+                confidence: selected.confidence,
+                source: Self.anchorSource(for: selected.candidate.source),
+                selectedCandidate: selected,
+                topCandidates: ranked
+            )
         }.value
+    }
+
+    nonisolated private static func anchorSource(for source: AXElementResolver.CandidateSource) -> AnchorDriftScorer.AnchorSource {
+        switch source {
+        case .accessibility: .accessibility
+        case .synthetic: .semantic
+        case .unknown: .unknown
+        }
+    }
+
+    nonisolated private static func anchorHash(for candidate: AXElementResolver.RankedCandidate?) -> String? {
+        guard let descriptor = candidate?.candidate.descriptor else { return nil }
+        return descriptor.identifier
+            ?? descriptor.pathHash
+            ?? descriptor.subtreeHash
+            ?? descriptor.semanticTextHash
+            ?? descriptor.semanticHash
+    }
+
+    nonisolated static func recipeCandidateChoices(_ candidates: [AXElementResolver.RankedCandidate], limit: Int = 2) -> String {
+        candidates.prefix(limit).enumerated().map { index, ranked in
+            let descriptor = ranked.candidate.descriptor
+            let label = descriptor.label.isEmpty ? "unlabeled" : String(descriptor.label.prefix(36))
+            let role = (descriptor.role ?? "AXElement").replacingOccurrences(of: "AX", with: "")
+            let container = descriptor.container ?? descriptor.ancestorPath.last ?? "screen"
+            return "\(index + 1). \(label) \(role.lowercased()) near \(String(container.prefix(28))) score \(String(format: "%.2f", ranked.confidence))"
+        }.joined(separator: "; ")
+    }
+
+    nonisolated private static func driftCandidates(
+        from ranked: [AXElementResolver.RankedCandidate],
+        failureCount: Int = 0
+    ) -> [AnchorDriftScorer.Candidate] {
+        ranked.map { candidate in
+            AnchorDriftScorer.Candidate(
+                id: candidate.candidate.id,
+                score: candidate.confidence,
+                source: anchorSource(for: candidate.candidate.source),
+                hash: anchorHash(for: candidate),
+                failureCount: failureCount
+            )
+        }
     }
 
     private struct UIVerificationResult: Sendable, Equatable {
