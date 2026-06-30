@@ -16,6 +16,29 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 
 ## Continuation log (latest first)
 
+### 2026-06-29 — session 6: ran SEQ-27→31 — PARTIAL-IMPLEMENTATION PASS COMPLETE ✅
+- **Re-launched** the script as run `wf_8ed48fb7-cf2` (task `weeapmb1n`). Skipped SEQ-01–26, then
+  **committed + pushed the final five** (build-green each):
+  - `b508d2f` seq-27 multimodal-visual-retrieval (visual storage, similar contexts, descriptor migrations)
+  - `1bd5248` seq-28 privacy-preserving-fleet-analytics (trace metrics, audit provenance, local DP, budget ledger, cohort thresholds, manifest)
+  - `d2f8ca3` seq-29 self-healing-ui-robustness (recipe drift audit, replay survival fixtures)
+  - `95970e3` seq-30 llm-call-determinism-caching (retry/idempotency, DTO cache, grounding cache)
+  - `788f742` seq-31 resource-routing-search (resource catalog, cheap-first escalation)
+  **All 31 SEQs are now landed** (SEQ-01–31 committed + pushed). HEAD `788f742`, in sync with origin (0/0).
+- **Build verified green by an actual recompile, not just the cached gate.** The IDE briefly reported
+  stale SourceKit errors in `CascadeAppModel.swift`/`AgentTaskPlanner.swift` (mid-run Implement state
+  referencing not-yet-added symbols). Forced a real rebuild of those files → `swift build` **green**
+  (warnings only). The commit gate held; HEAD genuinely compiles.
+  - Note: `swift build` with no source changes is a ~0.15s no-op (cached) — to truly verify, force a
+    recompile (touch the file) or `swift build` after a real edit. Don't trust a sub-second "Build complete".
+- **SEQ-05 footnote resolved:** it was *not* empty after all — session 3 found real partial targets and
+  committed it (`9905f44`). Every SEQ-01–31 has a real `feat(seq-NN …)` commit.
+
+**▶ Next pass (not done yet):** refresh the audit to regenerate `IMPLEMENTATION_STATUS.md` and measure
+partial→implemented movement, run the full `swift test` suite on the branch, then tackle the deferred
+**greenfield** items (the 123 ❌ not_implemented + per-SEQ `deferred[]` subprojects — on-device LLM
+weights, video codec, external OCR sidecar, encryption-at-rest). See "Remaining work" below.
+
 ### 2026-06-29 — session 5: ran SEQ-21→26, stopped by user (continue later)
 - **Re-launched** the script as run `wf_ec1592c5-934` (task `w7g1vmd34`). Skipped SEQ-01–20, then
   **committed + pushed SEQ-21, 22, 23, 24, 25, 26** (build-green each):
@@ -92,8 +115,8 @@ through **Plan → Implement → Audit → Fix**, committing each build-green re
 The workflow is **still running**. Committed so far on `feat/production-grade`:
 
 ```
-SEQ-01 … 26   ← committed + pushed (build-green); HEAD = a436c42 (seq-26)
-SEQ-27 … 31   ← pending (user-paused on a clean SEQ boundary — resumes on fresh re-launch)
+SEQ-01 … 31   ← ALL committed + pushed (build-green); HEAD = 788f742 (seq-31). Partial-impl pass COMPLETE ✅
+              ← next: refresh audit + full swift test, then the deferred greenfield pass
 ```
 
 - HEAD advances as each SEQ lands (latest `feat(seq-NN …)` / docs commit); the commit gate guarantees
