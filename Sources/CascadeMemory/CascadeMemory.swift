@@ -3284,6 +3284,167 @@ public actor CascadeStore {
         }
     }
 
+    public func lookupModelCallCache(
+        keySHA256: String,
+        now: Date = Date()
+    ) throws -> ModelCallCacheStoredEntry? {
+        let sql = """
+        SELECT key_sha256, model, callsite, prompt_version, schema_version,
+               request_json_sha256, response_json, validated_payload_json, usage_json,
+               request_id, created_at, expires_at, hit_count, last_hit_at
+        FROM model_call_cache
+        WHERE key_sha256 = ?
+        LIMIT 1;
+        """
+        return try withStatement(sql) { statement in
+            bind(keySHA256, at: 1, in: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            let expiresAt = DateCodec.date(from: text(statement, 11)) ?? .distantPast
+            guard now < expiresAt else {
+                try pruneExpiredModelCallCache(now: now)
+                return nil
+            }
+            let record = ModelCallCacheRecord(
+                keySHA256: text(statement, 0) ?? keySHA256,
+                model: text(statement, 1) ?? "",
+                callsite: text(statement, 2) ?? "",
+                promptVersion: text(statement, 3) ?? "",
+                schemaVersion: text(statement, 4) ?? "",
+                requestJSONSHA256: text(statement, 5) ?? "",
+                responseJSON: text(statement, 6),
+                validatedPayloadJSON: text(statement, 7) ?? "{}",
+                usageJSON: text(statement, 8),
+                requestID: text(statement, 9),
+                createdAt: DateCodec.date(from: text(statement, 10)) ?? Date(timeIntervalSince1970: 0),
+                expiresAt: expiresAt
+            )
+            return ModelCallCacheStoredEntry(
+                record: record,
+                hitCount: Int(sqlite3_column_int64(statement, 12)),
+                lastHitAt: DateCodec.date(from: text(statement, 13))
+            )
+        }
+    }
+
+    public func upsertModelCallCache(_ record: ModelCallCacheRecord) throws {
+        let sql = """
+        INSERT INTO model_call_cache
+            (key_sha256, model, callsite, prompt_version, schema_version,
+             request_json_sha256, response_json, validated_payload_json, usage_json,
+             request_id, created_at, expires_at, hit_count, last_hit_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+        ON CONFLICT(key_sha256) DO UPDATE SET
+            model = excluded.model,
+            callsite = excluded.callsite,
+            prompt_version = excluded.prompt_version,
+            schema_version = excluded.schema_version,
+            request_json_sha256 = excluded.request_json_sha256,
+            response_json = excluded.response_json,
+            validated_payload_json = excluded.validated_payload_json,
+            usage_json = excluded.usage_json,
+            request_id = excluded.request_id,
+            expires_at = excluded.expires_at;
+        """
+        try withStatement(sql) { statement in
+            bind(record.keySHA256, at: 1, in: statement)
+            bind(record.model, at: 2, in: statement)
+            bind(record.callsite, at: 3, in: statement)
+            bind(record.promptVersion, at: 4, in: statement)
+            bind(record.schemaVersion, at: 5, in: statement)
+            bind(record.requestJSONSHA256, at: 6, in: statement)
+            bind(record.responseJSON, at: 7, in: statement)
+            bind(record.validatedPayloadJSON, at: 8, in: statement)
+            bind(record.usageJSON, at: 9, in: statement)
+            bind(record.requestID, at: 10, in: statement)
+            bind(DateCodec.string(from: record.createdAt), at: 11, in: statement)
+            bind(DateCodec.string(from: record.expiresAt), at: 12, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    public func touchModelCallCache(
+        keySHA256: String,
+        requestID: String? = nil,
+        now: Date = Date()
+    ) throws {
+        let sql = """
+        UPDATE model_call_cache
+        SET hit_count = hit_count + 1,
+            last_hit_at = ?,
+            request_id = COALESCE(?, request_id)
+        WHERE key_sha256 = ?;
+        """
+        try withStatement(sql) { statement in
+            bind(DateCodec.string(from: now), at: 1, in: statement)
+            bind(requestID, at: 2, in: statement)
+            bind(keySHA256, at: 3, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    public func pruneExpiredModelCallCache(now: Date = Date()) throws {
+        try withStatement("DELETE FROM model_call_cache WHERE expires_at <= ?;") { statement in
+            bind(DateCodec.string(from: now), at: 1, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    public func nextModelRequestAttemptNumber(for keySHA256: String) throws -> Int {
+        let sql = "SELECT COALESCE(MAX(attempt), 0) + 1 FROM model_request_attempt WHERE key_sha256 = ?;"
+        return try withStatement(sql) { statement in
+            bind(keySHA256, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : 1
+        }
+    }
+
+    public func recordModelRequestAttempt(_ record: ModelRequestAttemptRecord) throws {
+        let sql = """
+        INSERT INTO model_request_attempt
+            (key_sha256, attempt, started_at, finished_at, status, request_id, error_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key_sha256, attempt) DO UPDATE SET
+            finished_at = excluded.finished_at,
+            status = excluded.status,
+            request_id = excluded.request_id,
+            error_type = excluded.error_type;
+        """
+        try withStatement(sql) { statement in
+            bind(record.keySHA256, at: 1, in: statement)
+            bind(Int64(record.attempt), at: 2, in: statement)
+            bind(DateCodec.string(from: record.startedAt), at: 3, in: statement)
+            bind(record.finishedAt.map(DateCodec.string(from:)), at: 4, in: statement)
+            bind(record.status.rawValue, at: 5, in: statement)
+            bind(record.requestID, at: 6, in: statement)
+            bind(record.errorType, at: 7, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    public func modelRequestAttempts(keySHA256: String) throws -> [ModelRequestAttemptRecord] {
+        let sql = """
+        SELECT key_sha256, attempt, started_at, finished_at, status, request_id, error_type
+        FROM model_request_attempt
+        WHERE key_sha256 = ?
+        ORDER BY attempt ASC;
+        """
+        return try withStatement(sql) { statement in
+            bind(keySHA256, at: 1, in: statement)
+            var rows: [ModelRequestAttemptRecord] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(ModelRequestAttemptRecord(
+                    keySHA256: text(statement, 0) ?? keySHA256,
+                    attempt: Int(sqlite3_column_int64(statement, 1)),
+                    startedAt: DateCodec.date(from: text(statement, 2)) ?? Date(timeIntervalSince1970: 0),
+                    finishedAt: DateCodec.date(from: text(statement, 3)),
+                    status: ModelRequestAttemptStatus(rawValue: text(statement, 4) ?? "") ?? .failed,
+                    requestID: text(statement, 5),
+                    errorType: text(statement, 6)
+                ))
+            }
+            return rows
+        }
+    }
+
     private static func migrate(_ db: OpaquePointer?) throws {
         try execute("""
         PRAGMA journal_mode=WAL;
@@ -3396,6 +3557,40 @@ public actor CascadeStore {
             ON routine_profile(app_name, weekday, hour_bucket);
         CREATE INDEX IF NOT EXISTS idx_routine_profile_signature
             ON routine_profile(workflow_signature, weekday, hour_bucket);
+
+        CREATE TABLE IF NOT EXISTS model_call_cache (
+            key_sha256 TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            callsite TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            request_json_sha256 TEXT NOT NULL,
+            response_json TEXT,
+            validated_payload_json TEXT NOT NULL,
+            usage_json TEXT,
+            request_id TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            last_hit_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_call_cache_expiry
+            ON model_call_cache(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_model_call_cache_identity
+            ON model_call_cache(model, callsite, prompt_version, schema_version);
+
+        CREATE TABLE IF NOT EXISTS model_request_attempt (
+            key_sha256 TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            request_id TEXT,
+            error_type TEXT,
+            PRIMARY KEY (key_sha256, attempt)
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_request_attempt_key
+            ON model_request_attempt(key_sha256, attempt);
         """, db: db)
 
         // Best-effort migrations for databases created before these columns existed.

@@ -360,8 +360,8 @@ public final class CascadeAppModel: ObservableObject {
     static let suggestionTimingPreferenceKey = "cascade.personalization.suggestionTiming"
     static let backgroundAgentPreferenceKey = "cascade.personalization.backgroundAgent"
 
-    static func experimentalModelCallCache(defaults: UserDefaults) -> ModelCallCache? {
-        defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache() : nil
+    static func experimentalModelCallCache(defaults: UserDefaults, store: CascadeStore? = nil) -> ModelCallCache? {
+        defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache(store: store) : nil
     }
 
     static func experimentalGroundingCache(defaults: UserDefaults) -> GroundingCache? {
@@ -527,7 +527,6 @@ public final class CascadeAppModel: ObservableObject {
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
-        self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults)
         self.groundingCache = Self.experimentalGroundingCache(defaults: defaults)
         self.experimentalStructuredContent = Self.experimentalStructuredContentEnabled(defaults: defaults)
         self.experimentalWorkGraphIndex = Self.experimentalWorkGraphIndexEnabled(defaults: defaults)
@@ -543,6 +542,7 @@ public final class CascadeAppModel: ObservableObject {
         // store and never hit this path.
         let store = try injectedStore ?? CascadeStore(auditAnchor: KeychainAuditAnchor())
         self.store = store
+        self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults, store: store)
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)
             .flatMap(CursorTheme.init(rawValue:)) ?? .green
         powerHarnessEnabled = defaults.bool(forKey: Self.powerHarnessKey)

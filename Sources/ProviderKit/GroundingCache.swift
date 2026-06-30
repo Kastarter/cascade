@@ -15,6 +15,11 @@ public struct GroundingCacheKey: Hashable, Sendable {
     public let displayHeightPoints: Int
     public let screenHash: UInt64
     public let gridHashes: [UInt64]
+    public let model: String
+    public let promptVersion: String
+    public let pixelWidth: Int?
+    public let pixelHeight: Int?
+    public let screenshotSHA256: String?
     public let mode: GroundingCacheMode
 
     public init?(
@@ -26,6 +31,11 @@ public struct GroundingCacheKey: Hashable, Sendable {
         displayHeightPoints: Int,
         screenHash: UInt64,
         gridHashes: [UInt64],
+        model: String = "unversioned-model",
+        promptVersion: String = "unversioned-prompt",
+        pixelWidth: Int? = nil,
+        pixelHeight: Int? = nil,
+        screenshotSHA256: String? = nil,
         mode: GroundingCacheMode
     ) {
         let target = targetText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -47,6 +57,11 @@ public struct GroundingCacheKey: Hashable, Sendable {
         self.displayHeightPoints = displayHeightPoints
         self.screenHash = screenHash
         self.gridHashes = gridHashes
+        self.model = model
+        self.promptVersion = promptVersion
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.screenshotSHA256 = screenshotSHA256?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         self.mode = mode
     }
 
@@ -66,20 +81,22 @@ public enum GroundingCacheLookup: Equatable, Sendable {
 
 public actor GroundingCache {
     private enum Entry: Sendable {
-        case hit(GroundingResult)
+        case hit(GroundingResult, expiresAt: Date)
         case miss(expiresAt: Date)
     }
 
     private var entries: [GroundingCacheKey: Entry] = [:]
+    private let positiveHitTTL: TimeInterval
     private let negativeMissTTL: TimeInterval
 
-    public init(negativeMissTTL: TimeInterval = 3) {
+    public init(positiveHitTTL: TimeInterval = 30, negativeMissTTL: TimeInterval = 3) {
+        self.positiveHitTTL = positiveHitTTL
         self.negativeMissTTL = negativeMissTTL
     }
 
-    public func store(_ result: GroundingResult, for key: GroundingCacheKey?) {
+    public func store(_ result: GroundingResult, for key: GroundingCacheKey?, now: Date = Date()) {
         guard let key else { return }
-        entries[key] = .hit(result)
+        entries[key] = .hit(result, expiresAt: now.addingTimeInterval(positiveHitTTL))
     }
 
     public func storeMiss(for key: GroundingCacheKey?, now: Date = Date()) {
@@ -91,7 +108,11 @@ public actor GroundingCache {
         guard let key, let entry = entries[key] else { return nil }
 
         switch entry {
-        case .hit(let result):
+        case .hit(let result, let expiresAt):
+            guard now < expiresAt else {
+                entries.removeValue(forKey: key)
+                return nil
+            }
             return .hit(result)
         case .miss(let expiresAt):
             guard now < expiresAt else {

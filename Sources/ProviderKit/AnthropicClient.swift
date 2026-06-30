@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 
 /// Current Claude model ids. Default to the most capable model; callers can pin
@@ -73,6 +74,8 @@ public struct AnthropicMessagesResponse {
     public let stopReason: String?
     public let usage: AnthropicUsage
     public let raw: [String: Any]
+    public let requestID: String?
+    public let retryCount: Int
 
     public var text: String {
         content.compactMap { block in
@@ -115,7 +118,11 @@ public struct AnthropicMessagesClient: Sendable {
         thinking: [String: Any]? = nil,
         outputConfig: [String: Any]? = nil,
         betaHeader: String? = nil,
-        timeout: TimeInterval = 30
+        timeout: TimeInterval = 30,
+        retryPolicy: RetryBackoffPolicy? = nil,
+        idempotencyClass: ActionRetryClass = .pureModelCall,
+        idempotencyKey: String? = nil,
+        attemptRecorder: (any ModelRequestAttemptRecording)? = nil
     ) async throws -> AnthropicMessagesResponse {
         guard let key = keyStore.readKey(), !key.isEmpty else { throw AnthropicError.missingKey }
         let bodyData = try Self.bodyData(
@@ -130,26 +137,133 @@ public struct AnthropicMessagesClient: Sendable {
             outputConfig: outputConfig,
             stream: false
         )
-        var request = Self.request(
-            url: endpoint,
-            key: key,
-            bodyData: bodyData,
-            betaHeader: betaHeader,
-            timeout: timeout
-        )
-        request.httpMethod = "POST"
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw AnthropicError.transport(error.localizedDescription)
+        var retryCount = 0
+
+        while true {
+            var request = Self.request(
+                url: endpoint,
+                key: key,
+                bodyData: bodyData,
+                betaHeader: betaHeader,
+                timeout: timeout
+            )
+            request.httpMethod = "POST"
+            let startedAt = Date()
+            let attemptNumber = try await Self.nextAttemptNumber(
+                key: idempotencyKey,
+                recorder: attemptRecorder
+            )
+            try await Self.recordAttempt(
+                key: idempotencyKey,
+                recorder: attemptRecorder,
+                attempt: attemptNumber,
+                startedAt: startedAt,
+                finishedAt: nil,
+                status: .started,
+                requestID: nil,
+                errorType: nil
+            )
+
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request)
+            } catch {
+                let wrapped = AnthropicError.transport(error.localizedDescription)
+                try await Self.recordAttempt(
+                    key: idempotencyKey,
+                    recorder: attemptRecorder,
+                    attempt: attemptNumber,
+                    startedAt: startedAt,
+                    finishedAt: Date(),
+                    status: .failed,
+                    requestID: nil,
+                    errorType: Self.errorType(wrapped)
+                )
+                if let delay = Self.retryDelay(
+                    error: wrapped,
+                    retryPolicy: retryPolicy,
+                    retryCount: retryCount,
+                    idempotencyClass: idempotencyClass,
+                    idempotencyKey: idempotencyKey,
+                    retryAfter: nil
+                ) {
+                    retryCount += 1
+                    try await Self.sleep(delay)
+                    continue
+                }
+                throw wrapped
+            }
+
+            guard let http = response as? HTTPURLResponse else {
+                let error = AnthropicError.transport("No HTTP response.")
+                try await Self.recordAttempt(
+                    key: idempotencyKey,
+                    recorder: attemptRecorder,
+                    attempt: attemptNumber,
+                    startedAt: startedAt,
+                    finishedAt: Date(),
+                    status: .failed,
+                    requestID: nil,
+                    errorType: Self.errorType(error)
+                )
+                throw error
+            }
+
+            let requestID = Self.requestID(from: http)
+            guard (200..<300).contains(http.statusCode) else {
+                let error = AnthropicError.http(http.statusCode, AnthropicClient.errorMessage(from: data, status: http.statusCode))
+                try await Self.recordAttempt(
+                    key: idempotencyKey,
+                    recorder: attemptRecorder,
+                    attempt: attemptNumber,
+                    startedAt: startedAt,
+                    finishedAt: Date(),
+                    status: .failed,
+                    requestID: requestID,
+                    errorType: Self.errorType(error)
+                )
+                if let delay = Self.retryDelay(
+                    error: error,
+                    retryPolicy: retryPolicy,
+                    retryCount: retryCount,
+                    idempotencyClass: idempotencyClass,
+                    idempotencyKey: idempotencyKey,
+                    retryAfter: Self.retryAfter(from: http)
+                ) {
+                    retryCount += 1
+                    try await Self.sleep(delay)
+                    continue
+                }
+                throw error
+            }
+
+            guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let error = AnthropicError.emptyResponse
+                try await Self.recordAttempt(
+                    key: idempotencyKey,
+                    recorder: attemptRecorder,
+                    attempt: attemptNumber,
+                    startedAt: startedAt,
+                    finishedAt: Date(),
+                    status: .failed,
+                    requestID: requestID,
+                    errorType: Self.errorType(error)
+                )
+                throw error
+            }
+            try await Self.recordAttempt(
+                key: idempotencyKey,
+                recorder: attemptRecorder,
+                attempt: attemptNumber,
+                startedAt: startedAt,
+                finishedAt: Date(),
+                status: .succeeded,
+                requestID: requestID,
+                errorType: nil
+            )
+            return Self.response(from: raw, requestID: requestID, retryCount: retryCount)
         }
-        try Self.validate(response: response, data: data)
-        guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw AnthropicError.emptyResponse
-        }
-        return Self.response(from: raw)
     }
 
     public func countTokens(
@@ -268,13 +382,19 @@ public struct AnthropicMessagesClient: Sendable {
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
-    public static func response(from raw: [String: Any]) -> AnthropicMessagesResponse {
+    public static func response(
+        from raw: [String: Any],
+        requestID: String? = nil,
+        retryCount: Int = 0
+    ) -> AnthropicMessagesResponse {
         AnthropicMessagesResponse(
             id: raw["id"] as? String,
             content: raw["content"] as? [[String: Any]] ?? [],
             stopReason: raw["stop_reason"] as? String,
             usage: AnthropicUsage.parse(raw["usage"] as? [String: Any] ?? [:]),
-            raw: raw
+            raw: raw,
+            requestID: requestID,
+            retryCount: retryCount
         )
     }
 
@@ -304,6 +424,103 @@ public struct AnthropicMessagesClient: Sendable {
         }
     }
 
+    private static func requestID(from response: HTTPURLResponse) -> String? {
+        response.value(forHTTPHeaderField: "request-id")
+            ?? response.value(forHTTPHeaderField: "x-request-id")
+            ?? response.value(forHTTPHeaderField: "anthropic-request-id")
+    }
+
+    private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
+        guard let raw = response.value(forHTTPHeaderField: "retry-after") else { return nil }
+        if let seconds = TimeInterval(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return max(0, seconds)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss zzz"
+        guard let date = formatter.date(from: raw) else { return nil }
+        return max(0, date.timeIntervalSinceNow)
+    }
+
+    private static func retryDelay(
+        error: Error,
+        retryPolicy: RetryBackoffPolicy?,
+        retryCount: Int,
+        idempotencyClass: ActionRetryClass,
+        idempotencyKey: String?,
+        retryAfter: TimeInterval?
+    ) -> TimeInterval? {
+        guard let retryPolicy else { return nil }
+        let classification = RetryErrorClassifier.classify(error)
+        let key = idempotencyKey.map {
+            ActionIdempotencyKey(rawDigest: $0, retryClass: idempotencyClass)
+        }
+        guard let delay = retryPolicy.delay(
+            afterRetryCount: retryCount,
+            retryClass: idempotencyClass,
+            classification: classification,
+            key: key
+        ) else {
+            return nil
+        }
+        if let retryAfter {
+            return max(delay, retryAfter)
+        }
+        return delay
+    }
+
+    private static func sleep(_ delay: TimeInterval) async throws {
+        guard delay > 0 else { return }
+        let maxSeconds = Double(UInt64.max) / 1_000_000_000
+        try await Task.sleep(nanoseconds: UInt64((min(delay, maxSeconds) * 1_000_000_000).rounded()))
+    }
+
+    private static func nextAttemptNumber(
+        key: String?,
+        recorder: (any ModelRequestAttemptRecording)?
+    ) async throws -> Int {
+        guard let key, let recorder else { return 1 }
+        return try await recorder.nextModelRequestAttemptNumber(for: key)
+    }
+
+    private static func recordAttempt(
+        key: String?,
+        recorder: (any ModelRequestAttemptRecording)?,
+        attempt: Int,
+        startedAt: Date,
+        finishedAt: Date?,
+        status: ModelRequestAttemptStatus,
+        requestID: String?,
+        errorType: String?
+    ) async throws {
+        guard let key, let recorder else { return }
+        try await recorder.recordModelRequestAttempt(ModelRequestAttemptRecord(
+            keySHA256: key,
+            attempt: attempt,
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            status: status,
+            requestID: requestID,
+            errorType: errorType
+        ))
+    }
+
+    private static func errorType(_ error: Error) -> String {
+        if let anthropic = error as? AnthropicError {
+            switch anthropic {
+            case .missingKey: return "missing_key"
+            case .transport: return "transport"
+            case .http(let status, _): return "http_\(status)"
+            case .emptyResponse: return "empty_response"
+            }
+        }
+        if let urlError = error as? URLError {
+            return "url_\(urlError.code.rawValue)"
+        }
+        return String(describing: type(of: error))
+    }
+
     private static func int(_ value: Any?) -> Int {
         if let value = value as? Int { return value }
         if let value = value as? NSNumber { return value.intValue }
@@ -322,11 +539,27 @@ public struct MessageCompletionResult: Sendable, Equatable {
     public let text: String
     public let usage: ModelUsage?
     public let responseID: String?
+    public let requestID: String?
+    public let retryCount: Int
+    public let cacheHit: Bool
+    public let cacheKeyPrefix: String?
 
-    public init(text: String, usage: ModelUsage? = nil, responseID: String? = nil) {
+    public init(
+        text: String,
+        usage: ModelUsage? = nil,
+        responseID: String? = nil,
+        requestID: String? = nil,
+        retryCount: Int = 0,
+        cacheHit: Bool = false,
+        cacheKeyPrefix: String? = nil
+    ) {
         self.text = text
         self.usage = usage
         self.responseID = responseID
+        self.requestID = requestID
+        self.retryCount = retryCount
+        self.cacheHit = cacheHit
+        self.cacheKeyPrefix = cacheKeyPrefix
     }
 }
 
@@ -393,23 +626,42 @@ public struct RetryingMessageCompleter: MessageCompleting {
         maxTokens: Int,
         options: AnthropicCompletionOptions
     ) async throws -> MessageCompletionResult {
+        let optionsWithRetry = options.withRetryPolicy(options.retryPolicy ?? retryPolicy)
+        if client is AnthropicClient {
+            return try await client.completeWithMetadata(
+                system: system,
+                user: user,
+                model: model,
+                maxTokens: maxTokens,
+                options: optionsWithRetry
+            )
+        }
         let key = try Self.idempotencyKey(
             system: system,
             user: user,
             model: model,
             maxTokens: maxTokens,
-            options: options
+            options: optionsWithRetry
         )
         var retryCount = 0
 
         while true {
             do {
-                return try await client.completeWithMetadata(
+                let result = try await client.completeWithMetadata(
                     system: system,
                     user: user,
                     model: model,
                     maxTokens: maxTokens,
-                    options: options
+                    options: optionsWithRetry
+                )
+                return MessageCompletionResult(
+                    text: result.text,
+                    usage: result.usage,
+                    responseID: result.responseID,
+                    requestID: result.requestID,
+                    retryCount: retryCount + result.retryCount,
+                    cacheHit: result.cacheHit,
+                    cacheKeyPrefix: result.cacheKeyPrefix
                 )
             } catch {
                 let classification = RetryErrorClassifier.classify(error)
@@ -445,7 +697,7 @@ public struct RetryingMessageCompleter: MessageCompleting {
         )
         let payload = try JSONSerialization.jsonObject(with: body, options: [])
         return try ActionIdempotencyKey(
-            retryClass: .pureModelCall,
+            retryClass: options.idempotencyClass,
             operation: options.callsite,
             model: model,
             prompt: options.promptVersion,
@@ -506,19 +758,37 @@ public struct AnthropicClient: MessageCompleting {
         maxTokens: Int = 1024,
         options: AnthropicCompletionOptions
     ) async throws -> MessageCompletionResult {
+        let messages = [AnthropicMessageRequestBody.Message(role: "user", content: user).dictionary]
+        let bodyData = try AnthropicMessagesClient.bodyData(
+            model: model,
+            maxTokens: maxTokens,
+            system: system,
+            messages: messages,
+            temperature: options.temperature,
+            stream: false
+        )
+        let request = try options.cacheRequest(model: model, maxTokens: maxTokens, body: bodyData)
         let response = try await messagesClient.send(
             model: model,
             maxTokens: maxTokens,
             system: system,
-            messages: [AnthropicMessageRequestBody.Message(role: "user", content: user).dictionary],
-            temperature: options.temperature
+            messages: messages,
+            temperature: options.temperature,
+            retryPolicy: options.retryPolicy,
+            idempotencyClass: options.idempotencyClass,
+            idempotencyKey: request.canonicalRequestHash,
+            attemptRecorder: options.attemptRecorder
         )
         let text = response.text
         guard !text.isEmpty else { throw AnthropicError.emptyResponse }
         return MessageCompletionResult(
             text: text,
             usage: response.normalizedUsage(model: model),
-            responseID: response.id
+            responseID: response.id,
+            requestID: response.requestID,
+            retryCount: response.retryCount,
+            cacheHit: false,
+            cacheKeyPrefix: String(request.canonicalRequestHash.prefix(12))
         )
     }
 
