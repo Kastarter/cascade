@@ -87,9 +87,15 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         let haystack = [appName, bundleIdentifier ?? "", windowTitle ?? "", text ?? ""]
             .joined(separator: " ")
             .lowercased()
-        if haystack.contains("<sensitive_text>") { return .deny("redacted_sensitive_text") }
-        if let keyword = sensitiveKeywords.first(where: { haystack.contains($0.lowercased()) }) {
-            return .deny("sensitive_keyword:\(keyword)")
+        // In private mode, KEEP the frame (recording continues) and let FrameRedactor +
+        // PII/keyword redaction blur only the sensitive boxes — don't drop the whole
+        // frame just because a keyword appears somewhere on screen. Normal mode still
+        // drops sensitive frames outright.
+        if !privateModeEnabled {
+            if haystack.contains("<sensitive_text>") { return .deny("redacted_sensitive_text") }
+            if let keyword = sensitiveKeywords.first(where: { haystack.contains($0.lowercased()) }) {
+                return .deny("sensitive_keyword:\(keyword)")
+            }
         }
         return .allow
     }
