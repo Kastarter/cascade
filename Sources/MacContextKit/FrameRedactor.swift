@@ -63,10 +63,12 @@ public enum FrameRedactor {
     ) -> Result? {
         guard let image = decode(imageData) else { return nil }
         var entityTypes = Set<String>()
-        var redactedBoxes: [ScreenTextRecognizer.TextBox] = []
         var rects: [CGRect] = []
 
-        for box in boxes {
+        // Pass 1: per-box sensitivity (keyword label or PII finding) + text redaction.
+        var sensitive = [Bool](repeating: false, count: boxes.count)
+        var redactedTexts = [String](repeating: "", count: boxes.count)
+        for (i, box) in boxes.enumerated() {
             let pii = PIIDetector.redact(box.text, includeNames: false, highConfidenceOnly: false)
             let keywordSensitive = policy.isSensitiveText(box.text)
             var redactedText = pii.redacted
@@ -74,14 +76,35 @@ public enum FrameRedactor {
                 redactedText = policy.redactingSensitiveKeywords(in: redactedText)
                 entityTypes.insert("SENSITIVE_TEXT")
             }
-            for finding in pii.findings {
-                entityTypes.insert(finding.type.rawValue)
+            for finding in pii.findings { entityTypes.insert(finding.type.rawValue) }
+            sensitive[i] = keywordSensitive || !pii.findings.isEmpty
+            redactedTexts[i] = redactedText
+        }
+
+        // Pass 2: a sensitive LABEL leaks its value into the neighbouring OCR box
+        // ("Password:" and "102010203*2" are separate boxes). Redact every box that
+        // shares a line (vertical overlap) with a sensitive box so the value is covered.
+        let seedSensitive = sensitive
+        for i in boxes.indices where seedSensitive[i] {
+            let a = boxes[i].boundingBox
+            for j in boxes.indices where !sensitive[j] {
+                let b = boxes[j].boundingBox
+                let yOverlap = min(a.maxY, b.maxY) - max(a.minY, b.minY)
+                if yOverlap > 0.4 * min(a.height, b.height) {
+                    sensitive[j] = true
+                    redactedTexts[j] = "<SENSITIVE_TEXT>"
+                    entityTypes.insert("SENSITIVE_TEXT")
+                }
             }
-            if keywordSensitive || !pii.findings.isEmpty {
+        }
+
+        var redactedBoxes: [ScreenTextRecognizer.TextBox] = []
+        for (i, box) in boxes.enumerated() {
+            if sensitive[i] {
                 rects.append(pixelRect(for: box.boundingBox, imageWidth: image.width, imageHeight: image.height))
             }
             redactedBoxes.append(ScreenTextRecognizer.TextBox(
-                text: redactedText,
+                text: redactedTexts[i],
                 boundingBox: box.boundingBox,
                 confidence: box.confidence
             ))

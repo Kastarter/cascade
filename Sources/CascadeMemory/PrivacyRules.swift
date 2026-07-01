@@ -9,7 +9,12 @@ import Foundation
 public enum PrivacyRules {
     public static let defaultSensitiveKeywords = [
         "bank", "health", "medical", "legal", "dating", "incognito", "private browsing",
-        "password", "1password", "keychain", "wallet"
+        "password", "1password", "keychain", "wallet",
+        // Credential labels — matched so the VALUE on the same line gets redacted too
+        // (see FrameRedactor line-level redaction).
+        "api key", "api-key", "apikey", "secret key", "private key", "access token",
+        "passphrase", "seed phrase", "credential", "routing number", "account number",
+        "social security", "ssn", "cvv", "pin code"
     ]
 
     /// Keywords that mark a moment as off-limits. Matched case-insensitively
