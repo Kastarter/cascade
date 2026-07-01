@@ -137,6 +137,13 @@ public struct WasteDetector: Sendable {
         self.maxRunLength = maxRunLength
     }
 
+    // TODO(seq-08 validation): category/parameter-aware mining. Today this needs
+    // near-identical token sequences, so the SAME ACTIONS with DIFFERENT DATA don't
+    // cluster — e.g. copying ETH/SOL/BTC/LTC prices from Google into Notion (×4)
+    // produced NO candidate. Want: parameterize the varying value (coin/price), match
+    // on action-structure ("search term → copy result → paste into Notion"), and
+    // cluster instances that share a CATEGORY (Crypto) into ONE deployable agent
+    // candidate instead of four unrelated variants. See PR #51 + SEQ_VALIDATION_WALK_HANDOFF.
     public func detect(
         contexts: [RecordedContext],
         inputEvents: [InputEvent],
