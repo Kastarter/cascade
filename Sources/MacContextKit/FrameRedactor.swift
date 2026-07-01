@@ -68,7 +68,9 @@ public enum FrameRedactor {
 
         for box in boxes {
             let pii = PIIDetector.redact(box.text, includeNames: false, highConfidenceOnly: false)
-            let keywordSensitive = policy.isSensitiveText(box.text)
+            // Private mode redacts ALL text so the frame is still recorded (rewind works)
+            // but no on-screen text is stored in the clear.
+            let keywordSensitive = policy.privateModeEnabled || policy.isSensitiveText(box.text)
             var redactedText = pii.redacted
             if keywordSensitive {
                 redactedText = policy.redactingSensitiveKeywords(in: redactedText)

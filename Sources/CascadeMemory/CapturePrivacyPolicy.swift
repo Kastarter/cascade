@@ -64,7 +64,11 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         windowTitle: String?,
         text: String? = nil
     ) -> CapturePrivacyDecision {
-        if privateModeEnabled { return .deny("private_mode") }
+        // Private mode must NOT drop the whole capture — that stopped ALL recording
+        // (the Reel froze the instant it was toggled). Recording continues; instead,
+        // FrameRedactor redacts EVERY on-screen text box in private mode (screenshots
+        // stay, text is kept private), and genuinely sensitive frames are still dropped
+        // by the keyword checks below.
         if !allowedBundleIdentifiers.isEmpty {
             guard let bundleIdentifier,
                   allowedBundleIdentifiers.contains(where: { matches($0, bundleIdentifier) }) else {
