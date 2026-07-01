@@ -40,8 +40,237 @@ final class RealtimeSocket: @unchecked Sendable {
     }
 }
 
+protocol RealtimeVoiceEventSending: AnyObject, Sendable {
+    func sendEvent(_ object: [String: Any])
+    func appendAudio(base64: String)
+}
+
+extension RealtimeSocket: RealtimeVoiceEventSending {}
+
 private final class ConverterInputState: @unchecked Sendable {
     var hasFedBuffer = false
+}
+
+final class RealtimeVoiceResponseState: @unchecked Sendable {
+    private static let outputSampleRate = 24_000
+
+    private(set) var responseInFlight = false
+    private var assistantAudioItemID: String?
+    private var assistantAudioPlayedSamples = 0
+    private var assistantAudioActive = false
+
+    var hasActiveResponse: Bool {
+        responseInFlight || assistantAudioActive || assistantAudioItemID != nil
+    }
+
+    func speechResponseEvents(for trimmedText: String) -> [[String: Any]] {
+        var events: [[String: Any]] = []
+        if responseInFlight {
+            events.append(["type": "response.cancel"])
+            clearAssistantAudio()
+        }
+        responseInFlight = true
+        events.append([
+            "type": "response.create",
+            "response": [
+                "instructions": "You are a text-to-speech voice. Read the following text aloud exactly as written, naturally, and add NOTHING else: \(trimmedText)",
+            ],
+        ])
+        return events
+    }
+
+    func noteOutputAudioDelta(event: [String: Any], pcmByteCount: Int) {
+        if let itemID = event["item_id"] as? String, !itemID.isEmpty {
+            if assistantAudioItemID != itemID {
+                assistantAudioItemID = itemID
+                assistantAudioPlayedSamples = 0
+            }
+        }
+        assistantAudioActive = true
+        responseInFlight = true
+        assistantAudioPlayedSamples += pcmByteCount / MemoryLayout<Int16>.size
+    }
+
+    func bargeInEvents() -> [[String: Any]] {
+        var events: [[String: Any]] = []
+        if let itemID = assistantAudioItemID {
+            events.append([
+                "type": "conversation.item.truncate",
+                "item_id": itemID,
+                "content_index": 0,
+                "audio_end_ms": audioEndMs,
+            ])
+        }
+        events.append(["type": "response.cancel"])
+        clear()
+        return events
+    }
+
+    func clear() {
+        responseInFlight = false
+        clearAssistantAudio()
+    }
+
+    private var audioEndMs: Int {
+        max(0, assistantAudioPlayedSamples * 1_000 / Self.outputSampleRate)
+    }
+
+    private func clearAssistantAudio() {
+        assistantAudioItemID = nil
+        assistantAudioPlayedSamples = 0
+        assistantAudioActive = false
+    }
+}
+
+final class RealtimeVoiceEndpointSession: @unchecked Sendable {
+    enum ReleaseResult: Equatable {
+        case cleared
+        case committed
+        case tailWait(remainingMs: Int)
+    }
+
+    private let localEndpointingEnabled: Bool
+    private let sender: any RealtimeVoiceEventSending
+    private let policy: VoiceTurnEndpointPolicy
+    private var gate: LocalVoiceActivityGate
+    private var pendingSamples: [Int16] = []
+    /// Whether gated audio reached the server this turn. Non-speech turns clear.
+    private var hasUploadedAudio = false
+    private var keyUpAtMs: Int?
+    private var partialTranscript = ""
+    private let lock = NSLock()
+
+    init(
+        localEndpointingEnabled: Bool,
+        sender: any RealtimeVoiceEventSending,
+        gateConfiguration: LocalVoiceActivityGate.Configuration = LocalVoiceActivityGate.Configuration(),
+        endpointPolicy: VoiceTurnEndpointPolicy = VoiceTurnEndpointPolicy()
+    ) {
+        self.localEndpointingEnabled = localEndpointingEnabled
+        self.sender = sender
+        self.policy = endpointPolicy
+        self.gate = LocalVoiceActivityGate(configuration: gateConfiguration)
+    }
+
+    func captureBufferFrameCount(inputSampleRate: Double) -> AVAudioFrameCount {
+        let frames = inputSampleRate * Double(gate.configuration.frameDurationMs) / 1_000.0
+        return AVAudioFrameCount(max(1, Int(frames.rounded())))
+    }
+
+    func updatePartialTranscript(_ partial: String) {
+        lock.lock()
+        partialTranscript = partial
+        lock.unlock()
+    }
+
+    func ingestConvertedPCM16(_ data: Data) {
+        guard localEndpointingEnabled else {
+            sender.appendAudio(base64: data.base64EncodedString())
+            return
+        }
+
+        let samples = data.withUnsafeBytes { raw in
+            Array(raw.bindMemory(to: Int16.self))
+        }
+        guard !samples.isEmpty else { return }
+
+        let uploadFrames = gatedUploadFrames(from: samples)
+        guard !uploadFrames.isEmpty else { return }
+        sender.appendAudio(base64: Self.pcm16Data(frames: uploadFrames).base64EncodedString())
+    }
+
+    func release() -> ReleaseResult {
+        guard localEndpointingEnabled else {
+            commit()
+            return .committed
+        }
+
+        switch endpointDecisionOnRelease() {
+        case .commitNow:
+            lock.lock()
+            let hadAudio = hasUploadedAudio
+            lock.unlock()
+            if hadAudio {
+                commit()
+                return .committed
+            }
+            clear()
+            return .cleared
+        case .tailWait(let remainingMs):
+            return .tailWait(remainingMs: remainingMs)
+        case .clear, .appendOnly:
+            clear()
+            return .cleared
+        }
+    }
+
+    func commit() {
+        sender.sendEvent(["type": "input_audio_buffer.commit"])
+    }
+
+    func clear() {
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
+    }
+
+    /// Re-chunks converted audio into exact gate frames and returns only the
+    /// prefix/speech/hangover frames the local gate authorizes for upload.
+    private func gatedUploadFrames(from samples: [Int16]) -> [[Int16]] {
+        var uploadFrames: [[Int16]] = []
+        lock.lock()
+        pendingSamples.append(contentsOf: samples)
+        let samplesPerFrame = gate.configuration.samplesPerFrame
+        while pendingSamples.count >= samplesPerFrame {
+            let frame = Array(pendingSamples.prefix(samplesPerFrame))
+            pendingSamples.removeFirst(samplesPerFrame)
+            let result = gate.ingestPCM16Frame(frame)
+            if !result.uploadFrames.isEmpty {
+                uploadFrames.append(contentsOf: result.uploadFrames)
+                hasUploadedAudio = true
+            }
+        }
+        lock.unlock()
+        return uploadFrames
+    }
+
+    private func endpointDecisionOnRelease() -> VoiceTurnEndpointPolicy.Decision {
+        lock.lock()
+        if keyUpAtMs == nil {
+            keyUpAtMs = gate.snapshot.totalMs
+        }
+        let snapshot = gate.snapshot
+        let keyUpAtMs = keyUpAtMs
+        let hasUnfinishedLexicalFragment = VoiceTurnEndpointPolicy.hasUnfinishedLexicalFragment(partialTranscript)
+        lock.unlock()
+
+        let lastSpeechAtMs: Int?
+        let speechStartedAtMs: Int?
+        if snapshot.uploadedSpeechMs > 0 {
+            let lastSpeech = max(0, snapshot.totalMs - snapshot.trailingSilenceMs)
+            lastSpeechAtMs = lastSpeech
+            speechStartedAtMs = max(0, lastSpeech - snapshot.uploadedSpeechMs)
+        } else {
+            lastSpeechAtMs = nil
+            speechStartedAtMs = nil
+        }
+
+        return policy.decide(VoiceTurnEndpointPolicy.Timing(
+            nowMs: snapshot.totalMs,
+            keyDownAtMs: 0,
+            keyUpAtMs: keyUpAtMs,
+            speechStartedAtMs: speechStartedAtMs,
+            lastSpeechAtMs: lastSpeechAtMs,
+            uploadedSpeechMs: snapshot.uploadedSpeechMs,
+            hasUnfinishedLexicalFragment: hasUnfinishedLexicalFragment
+        ))
+    }
+
+    private static func pcm16Data(frames: [[Int16]]) -> Data {
+        var data = Data(capacity: frames.reduce(0) { $0 + $1.count * MemoryLayout<Int16>.size })
+        for frame in frames {
+            data.append(frame.withUnsafeBufferPointer { Data(buffer: $0) })
+        }
+        return data
+    }
 }
 
 /// Replaces the Apple Speech / AVSpeechSynthesizer voice with OpenAI **GPT-Realtime-2**:
@@ -60,8 +289,13 @@ public final class RealtimeVoice: ObservableObject {
 
     /// Spoken phrase handed off to Claude when the user releases the talk key.
     public var onUtterance: ((String) -> Void)?
+    /// Live transcript prefix for UI and safe warmups only. Completed transcripts
+    /// remain the only path to execution.
+    public var onPartialUtterance: ((String) -> Void)?
     /// The user barged in while the agent was responding.
     public var onInterrupt: (() -> Void)?
+
+    public nonisolated static let experimentalLocalVoiceEndpointingKey = "cascade.experimentalLocalVoiceEndpointing"
 
     private let keyStore = OpenAIKeyStore()
     private var urlSession: URLSession?
@@ -72,14 +306,49 @@ public final class RealtimeVoice: ObservableObject {
     private var permissionMessage: String?
 
     // Audio
-    private let captureEngine = AVAudioEngine()
-    private let playbackEngine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private let playbackFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
+    private let audioEnabled: Bool
+    private var captureEngine: AVAudioEngine?
+    private var playbackEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var playbackFormat: AVAudioFormat?
+    private let localVoiceEndpointingEnabled: Bool
+    private var endpointSession: RealtimeVoiceEndpointSession?
+    private var endpointCommitTask: Task<Void, Never>?
+    private let responseState = RealtimeVoiceResponseState()
+    /// True between key-down and key-up. The connect → capture handshake is
+    /// async (the OpenAI socket isn't prewarmed), so on a cold start the user
+    /// can release the key before `startCapture()` runs. This flag lets that
+    /// in-flight task bail instead of starting a capture the release can no
+    /// longer end — which would wedge `state` at `.listening` and make every
+    /// subsequent press a silent no-op.
+    private var wantsToTalk = false
 
     private static let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
-    public init() {
+    public nonisolated static func experimentalLocalVoiceEndpointingEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: experimentalLocalVoiceEndpointingKey)
+    }
+
+    public init(
+        audioEnabled: Bool = true,
+        defaults: UserDefaults = .standard,
+        localEndpointingEnabled: Bool? = nil
+    ) {
+        self.audioEnabled = audioEnabled
+        self.localVoiceEndpointingEnabled = localEndpointingEnabled
+            ?? Self.experimentalLocalVoiceEndpointingEnabled(defaults: defaults)
+        guard audioEnabled else { return }
+        let captureEngine = AVAudioEngine()
+        let playbackEngine = AVAudioEngine()
+        let playerNode = AVAudioPlayerNode()
+        guard let playbackFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false) else {
+            permissionMessage = "No audio output is available."
+            return
+        }
+        self.captureEngine = captureEngine
+        self.playbackEngine = playbackEngine
+        self.playerNode = playerNode
+        self.playbackFormat = playbackFormat
         playbackEngine.attach(playerNode)
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
     }
@@ -95,10 +364,14 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Push-to-talk
 
     public func beginTalking() {
+        cancelPendingEndpointCommit(clearBufferedAudio: true)
+        wantsToTalk = true
         // Barge-in: cut the agent off and listen.
-        if state == .working || playerNode.isPlaying {
+        if state == .working || (playerNode?.isPlaying ?? false) || responseState.hasActiveResponse {
+            for event in responseState.bargeInEvents() {
+                socket?.sendEvent(event)
+            }
             stopPlayback()
-            socket?.sendEvent(["type": "response.cancel"])
             onInterrupt?()
         }
         guard state != .listening else { return }
@@ -106,21 +379,46 @@ public final class RealtimeVoice: ObservableObject {
         Task { @MainActor in
             guard await ensureMic() else { return }
             guard await ensureConnected() else { return }
+            // Cold WebSocket: the user may have already released the key while we
+            // were connecting. Starting a capture they can no longer end would
+            // wedge state at .listening and make the NEXT press a no-op. Bail and
+            // settle back to idle instead. (Main-actor serialized, so this guard
+            // and startCapture can't be split by a release.)
+            guard wantsToTalk else { state = .idle; return }
             startCapture()
         }
     }
 
     public func endTalking() {
+        wantsToTalk = false
         guard state == .listening else { return }
-        stopCapture()
-        socket?.sendEvent(["type": "input_audio_buffer.commit"])
-        state = .working
+        guard let endpointSession else {
+            stopCapture()
+            socket?.sendEvent(["type": "input_audio_buffer.commit"])
+            state = .working
+            return
+        }
+
+        switch endpointSession.release() {
+        case .cleared:
+            stopCapture()
+            self.endpointSession = nil
+            state = .idle
+        case .committed:
+            stopCapture()
+            self.endpointSession = nil
+            state = .working
+        case .tailWait(let remainingMs):
+            state = .working
+            scheduleEndpointTailWait(endpointSession, initialDelayMs: remainingMs)
+        }
         // The transcript arrives via conversation.item.input_audio_transcription.completed.
     }
 
     public func done() { if state == .working { state = .idle } }
 
     public func speak(_ text: String) {
+        guard audioEnabled else { return }
         guard state != .listening else { return }
         // NOTE: speak() must not touch `state` — mid-run narration would flip
         // .working → .idle and collapse the notch while the agent still works;
@@ -129,12 +427,9 @@ public final class RealtimeVoice: ObservableObject {
         guard !trimmed.isEmpty else { return }
         Task { @MainActor in
             guard await ensureConnected() else { return }
-            socket?.sendEvent([
-                "type": "response.create",
-                "response": [
-                    "instructions": "You are a text-to-speech voice. Read the following text aloud exactly as written, naturally, and add NOTHING else: \(trimmed)",
-                ],
-            ])
+            for event in responseState.speechResponseEvents(for: trimmed) {
+                socket?.sendEvent(event)
+            }
         }
     }
 
@@ -166,6 +461,10 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     private func handleClose() {
+        cancelPendingEndpointCommit(clearBufferedAudio: false)
+        stopCapture()
+        endpointSession = nil
+        responseState.clear()
         connected = false
         socket = nil
         let waiters = connectWaiters
@@ -225,12 +524,28 @@ public final class RealtimeVoice: ObservableObject {
             }
 
         case "conversation.item.input_audio_transcription.delta":
-            if let delta = json["delta"] as? String, state == .listening { transcript += delta }
+            if let delta = json["delta"] as? String, state == .listening {
+                transcript += delta
+                let partial = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                endpointSession?.updatePartialTranscript(partial)
+                if !partial.isEmpty {
+                    onPartialUtterance?(partial)
+                }
+            }
 
         case "response.output_audio.delta":
-            if let b64 = json["delta"] as? String, let pcm = Data(base64Encoded: b64) { playPCM16(pcm) }
+            if let b64 = json["delta"] as? String, let pcm = Data(base64Encoded: b64) {
+                responseState.noteOutputAudioDelta(event: json, pcmByteCount: pcm.count)
+                playPCM16(pcm)
+            } else {
+                responseState.noteOutputAudioDelta(event: json, pcmByteCount: 0)
+            }
+
+        case "response.output_audio.done", "response.done", "response.cancelled":
+            responseState.clear()
 
         case "error":
+            responseState.clear()
             if let error = json["error"] as? [String: Any], let message = error["message"] as? String {
                 permissionMessage = message
             }
@@ -243,10 +558,21 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Capture
 
     private func startCapture() {
+        guard audioEnabled, let captureEngine, let socket else {
+            permissionMessage = "No microphone input is available."
+            state = .idle
+            return
+        }
+        cancelPendingEndpointCommit(clearBufferedAudio: false)
         transcript = ""
-        socket?.sendEvent(["type": "input_audio_buffer.clear"])
+        let endpointSession = RealtimeVoiceEndpointSession(
+            localEndpointingEnabled: localVoiceEndpointingEnabled,
+            sender: socket
+        )
+        self.endpointSession = endpointSession
+        socket.sendEvent(["type": "input_audio_buffer.clear"])
         do {
-            try Self.installCaptureTap(engine: captureEngine, sender: socket!) { [weak self] level in
+            try Self.installCaptureTap(engine: captureEngine, endpointSession: endpointSession) { [weak self] level in
                 Task { @MainActor in
                     guard let self, self.state == .listening else { return }
                     // Light smoothing so the bars breathe instead of flickering.
@@ -255,22 +581,65 @@ public final class RealtimeVoice: ObservableObject {
             }
             state = .listening
         } catch {
+            self.endpointSession = nil
             permissionMessage = "No microphone input is available."
             state = .idle
         }
     }
 
     private func stopCapture() {
+        guard let captureEngine else { return }
         captureEngine.inputNode.removeTap(onBus: 0)
         captureEngine.stop()
         inputLevel = 0
+    }
+
+    private func cancelPendingEndpointCommit(clearBufferedAudio: Bool) {
+        endpointCommitTask?.cancel()
+        endpointCommitTask = nil
+        if clearBufferedAudio, endpointSession != nil, state != .listening {
+            endpointSession?.clear()
+            endpointSession = nil
+            stopCapture()
+            state = .idle
+        }
+    }
+
+    private func scheduleEndpointTailWait(
+        _ endpointSession: RealtimeVoiceEndpointSession,
+        initialDelayMs: Int
+    ) {
+        endpointCommitTask = Task { @MainActor [weak self, endpointSession] in
+            var delayMs = initialDelayMs
+            while true {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, delayMs)) * 1_000_000)
+                guard !Task.isCancelled, let self, self.endpointSession === endpointSession else { return }
+                switch endpointSession.release() {
+                case .tailWait(let remainingMs):
+                    delayMs = remainingMs
+                    continue
+                case .committed:
+                    self.stopCapture()
+                    self.endpointSession = nil
+                    self.endpointCommitTask = nil
+                    self.state = .working
+                    return
+                case .cleared:
+                    self.stopCapture()
+                    self.endpointSession = nil
+                    self.endpointCommitTask = nil
+                    self.state = .idle
+                    return
+                }
+            }
+        }
     }
 
     /// Installs the mic tap from a `nonisolated` context (the audio render thread must
     /// not touch main-actor state) and streams converted PCM16/24k frames to the socket.
     nonisolated private static func installCaptureTap(
         engine: AVAudioEngine,
-        sender: RealtimeSocket,
+        endpointSession: RealtimeVoiceEndpointSession,
         onLevel: @escaping @Sendable (Float) -> Void
     ) throws {
         let input = engine.inputNode
@@ -283,7 +652,11 @@ public final class RealtimeVoice: ObservableObject {
             throw NSError(domain: "Cascade.Voice", code: 2)
         }
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, _ in
+        input.installTap(
+            onBus: 0,
+            bufferSize: endpointSession.captureBufferFrameCount(inputSampleRate: inFormat.sampleRate),
+            format: inFormat
+        ) { buffer, _ in
             // Cheap RMS on the raw float buffer (sampled, not every frame) so the
             // notch waveform tracks the user's actual speech.
             if let floats = buffer.floatChannelData?[0] {
@@ -320,7 +693,7 @@ public final class RealtimeVoice: ObservableObject {
             converter.convert(to: out, error: &error, withInputFrom: inputBlock)
             guard error == nil, out.frameLength > 0, let channel = out.int16ChannelData else { return }
             let data = Data(bytes: channel[0], count: Int(out.frameLength) * MemoryLayout<Int16>.size)
-            sender.appendAudio(base64: data.base64EncodedString())
+            endpointSession.ingestConvertedPCM16(data)
         }
         engine.prepare()
         try engine.start()
@@ -329,6 +702,7 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Playback
 
     private func playPCM16(_ data: Data) {
+        guard let playbackFormat, let playbackEngine, let playerNode else { return }
         let frames = data.count / MemoryLayout<Int16>.size
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: AVAudioFrameCount(frames)) else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
@@ -343,12 +717,14 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     private func stopPlayback() {
+        guard let playerNode else { return }
         if playerNode.isPlaying { playerNode.stop() }
     }
 
     // MARK: - Mic auth
 
     private func ensureMic() async -> Bool {
+        guard audioEnabled else { return false }
         if micAuthorized { return true }
         let granted = await Self.requestMic()
         micAuthorized = granted

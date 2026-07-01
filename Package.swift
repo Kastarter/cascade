@@ -23,7 +23,7 @@ let package = Package(
             resources: [.copy("Skills")]
         ),
         .target(name: "ProviderKit", dependencies: ["CascadeMemory"]),
-        .target(name: "SandboxKit", dependencies: ["ProviderKit", "CascadeMemory"]),
+        .target(name: "SandboxKit", dependencies: ["ProviderKit", "CascadeMemory", "AgentOrchestrator"]),
         .target(name: "WasteDetection", dependencies: ["CascadeMemory"]),
         .target(
             name: "AgentOrchestrator",
@@ -56,13 +56,17 @@ let package = Package(
             name: "AgentOrchestratorTests",
             dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
-        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit"]),
-        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit"]),
+        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory"]),
+        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory"]),
         .testTarget(name: "ProviderKitTests", dependencies: ["ProviderKit", "CascadeMemory"]),
-        .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit"]),
+        .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit", "AgentOrchestrator"]),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ProviderKit", "WasteDetection", "SandboxKit"]
+            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection", "SandboxKit", "MacContextKit"]
+        ),
+        .testTarget(
+            name: "ReliabilityEvalTests",
+            dependencies: ["AgentOrchestrator", "CascadeMemory"]
         )
     ]
 )

@@ -45,10 +45,23 @@ public struct CuratedAgent: Identifiable, Sendable, Equatable {
 /// raw detector list, so curation is never worse than showing everything.
 public struct WorkflowCurator: Sendable {
     private let client: any MessageCompleting
+    private let cachedClient: CachedMessageCompleter?
     private let model: String
+    static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
+    static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v1"
+    static let schemaVersion = "workflow-curator.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet) {
-        self.client = client
+    public init(
+        client: any MessageCompleting = AnthropicClient(),
+        model: String = AnthropicModel.sonnet,
+        cache: ModelCallCache? = nil,
+        retryPolicy: RetryBackoffPolicy? = nil
+    ) {
+        let effectiveClient: any MessageCompleting = retryPolicy.map {
+            RetryingMessageCompleter(client: client, retryPolicy: $0)
+        } ?? client
+        self.client = effectiveClient
+        self.cachedClient = cache.map { CachedMessageCompleter(client: effectiveClient, cache: $0) }
         self.model = model
     }
 
@@ -63,11 +76,22 @@ public struct WorkflowCurator: Sendable {
     /// one ("reply to emails"). Optional — with none, behaviour is exactly as before.
     public func curate(_ candidates: [DetectedWaste], onScreen: [String: String] = [:]) async -> [CuratedAgent] {
         guard !candidates.isEmpty else { return [] }
-        let raw = try? await client.complete(
+        let user = Self.userPrompt(candidates, onScreen: onScreen)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.curatePromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "WorkflowCurator.curate"
+        )
+        let raw = try? await complete(
             system: Self.systemPrompt,
-            user: Self.userPrompt(candidates, onScreen: onScreen),
-            model: model,
-            maxTokens: 900
+            user: user,
+            maxTokens: 900,
+            options: options,
+            validating: {
+                guard Self.parse($0, candidates: candidates) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
         )
         if let raw, let picked = Self.parse(raw, candidates: candidates) {
             return picked
@@ -86,11 +110,22 @@ public struct WorkflowCurator: Sendable {
     /// (`fallback`) — never worse than the automatic path, never nothing.
     public func curateOne(_ waste: DetectedWaste, statedIntent: String? = nil, onScreen: String? = nil) async -> CuratedAgent {
         let intent = statedIntent?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = try? await client.complete(
+        let user = Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil, onScreen: onScreen)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.curateOnePromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "WorkflowCurator.curateOne"
+        )
+        let raw = try? await complete(
             system: Self.curateOneSystemPrompt,
-            user: Self.userPromptOne(waste, statedIntent: (intent?.isEmpty == false) ? intent : nil, onScreen: onScreen),
-            model: model,
-            maxTokens: 400
+            user: user,
+            maxTokens: 400,
+            options: options,
+            validating: {
+                guard Self.parse($0, candidates: [waste])?.first != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
         )
         if let raw, let picked = Self.parse(raw, candidates: [waste])?.first {
             return picked
@@ -100,6 +135,26 @@ public struct WorkflowCurator: Sendable {
     }
 
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "curator")
+
+    private func complete(
+        system: String,
+        user: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions,
+        validating validate: @Sendable @escaping (String) throws -> Void
+    ) async throws -> String {
+        if let cachedClient {
+            return try await cachedClient.complete(
+                system: system,
+                user: user,
+                model: model,
+                maxTokens: maxTokens,
+                options: options,
+                validating: validate
+            )
+        }
+        return try await client.complete(system: system, user: user, model: model, maxTokens: maxTokens, options: options)
+    }
 
     static let curateOneSystemPrompt = """
     The user just DEMONSTRATED a task by hand for you to turn into an agent — they \
@@ -193,11 +248,10 @@ public struct WorkflowCurator: Sendable {
     than "reply to emails") — but NEVER invent details the snippet does not show, and \
     never copy private/sensitive values verbatim into the goal.
 
-    When a candidate notes that "N value(s) change each run", those are parameters — the \
-    user typed a DIFFERENT value each time (an order number, a date, a name). Write the \
-    goal so the agent supplies the CURRENT/appropriate value at run time (e.g. "…using \
-    today's date", "…for the requested order"), and NEVER bake the one recorded value \
-    into the goal as if it were fixed.
+    When a candidate lists parameters, those fields change each run (an order number, \
+    a date, a name). Write the goal so the agent supplies the CURRENT/appropriate value \
+    at run time (e.g. "…using today's date", "…for the requested order"), and NEVER \
+    bake the one recorded value into the goal as if it were fixed.
 
     A candidate marked "moves data between apps" copies from one app and pastes into \
     another — the highest-value kind of task to automate (tedious, error-prone, clearly \
@@ -221,8 +275,8 @@ public struct WorkflowCurator: Sendable {
             var line = "[\(index)] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps)"
             line += " · seen \(waste.occurrences)× (~\(waste.estimatedSecondsPerRun)s each)"
             if !steps.isEmpty { line += " · steps: \(steps)" }
-            let parameterCount = waste.recipe.steps.filter { $0.isParameter }.count
-            if parameterCount > 0 { line += " · \(parameterCount) value(s) change each run" }
+            let parameters = parameterPromptSummaries(for: waste.recipe.steps)
+            if !parameters.isEmpty { line += " · " + parameters.joined(separator: "; ") }
             // The canonical high-value automatable routine: data moved between apps.
             if WasteDetector.hasCrossAppCopyPaste(waste.recipe.steps) { line += " · moves data between apps" }
             lines.append(line)
@@ -231,6 +285,33 @@ public struct WorkflowCurator: Sendable {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    private static func parameterPromptSummaries(for steps: [RecipeStep]) -> [String] {
+        let parameterSteps = steps.filter(\.isParameter)
+        guard !parameterSteps.isEmpty else { return [] }
+        return parameterSteps.prefix(4).map { step in
+            let field = parameterDisplayName(step.parameterKey) ?? parameterDisplayName(step.ocrAnchor) ?? "field"
+            let kind = step.parameterKind?.rawValue ?? "freeText"
+            var summary = "parameter \(field) (\(kind)) changes each run"
+            if !step.sourceStepIDs.isEmpty {
+                summary += " from earlier selected/copied value"
+            }
+            return summary
+        }
+    }
+
+    private static func parameterDisplayName(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        let spaced = raw
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spaced.isEmpty, !PrivacyRules.isSensitiveText(spaced) else { return nil }
+        return spaced
+            .split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
     }
 
     /// Parses the reply, tolerating prose or code fences. Returns nil ONLY when the

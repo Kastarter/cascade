@@ -30,6 +30,49 @@ func emptyDataRecognizesNothing() async {
     #expect(result.isEmpty)
 }
 
+@Test
+func regionOfInterestIsClippedAndBoxesStayInFullFrameSpace() {
+    let clipped = ScreenTextRecognizer.clippedRegionOfInterest(CGRect(x: -0.2, y: 0.25, width: 0.7, height: 0.9))
+
+    #expect(abs((clipped?.minX ?? 0) - 0) <= 0.0001)
+    #expect(abs((clipped?.minY ?? 0) - 0.25) <= 0.0001)
+    #expect(abs((clipped?.width ?? 0) - 0.5) <= 0.0001)
+    #expect(abs((clipped?.height ?? 0) - 0.75) <= 0.0001)
+    let fullFrame = ScreenTextRecognizer.fullFrameBoundingBox(
+        CGRect(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+        regionOfInterest: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+    )
+    #expect(fullFrame == CGRect(x: 0.5, y: 0.5, width: 0.1, height: 0.1))
+}
+
+@Test
+func thumbnailDecodeHonorsMaxDimension() {
+    let png = renderPNG(text: "CASCADE THUMBNAIL", width: 1200, height: 400)
+    let size = ScreenTextRecognizer.decodedImageSize(imageData: png, maxDecodeDimension: 300)
+
+    #expect(size != nil)
+    if let size {
+        #expect(max(size.width, size.height) <= 300)
+    }
+}
+
+@Test
+func regionOfInterestOCRExcludesTextOutsideRegion() async {
+    let png = renderTwoColumnPNG(left: "LEFTTOKEN", right: "RIGHTTOKEN", width: 1000, height: 260)
+    let fullFrame = await ScreenTextRecognizer.recognize(inPNG: png, level: .accurate).uppercased()
+    guard fullFrame.contains("LEFTTOKEN"), fullFrame.contains("RIGHTTOKEN") else {
+        return
+    }
+    let result = await ScreenTextRecognizer.recognize(
+        inPNG: png,
+        level: .accurate,
+        regionOfInterest: CGRect(x: 0, y: 0, width: 0.46, height: 1)
+    ).uppercased()
+
+    #expect(result.contains("LEFTTOKEN"))
+    #expect(!result.contains("RIGHTTOKEN"))
+}
+
 // MARK: - B4 on-device OCR grounding
 
 private func box(_ text: String, _ rect: CGRect = CGRect(x: 0, y: 0, width: 0.1, height: 0.1)) -> ScreenTextRecognizer.TextBox {
@@ -148,6 +191,39 @@ private func renderPNG(text: String, width: Int, height: Int) -> Data {
     let line = CTLineCreateWithAttributedString(attributed)
     context.textPosition = CGPoint(x: 24, y: CGFloat(height) / 2 - 28)
     CTLineDraw(line, context)
+
+    let image = context.makeImage()!
+    let data = NSMutableData()
+    let destination = CGImageDestinationCreateWithData(
+        data as CFMutableData,
+        UTType.png.identifier as CFString,
+        1,
+        nil
+    )!
+    CGImageDestinationAddImage(destination, image, nil)
+    CGImageDestinationFinalize(destination)
+    return data as Data
+}
+
+private func renderTwoColumnPNG(left: String, right: String, width: Int, height: Int) -> Data {
+    let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )!
+    context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    context.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 1))
+    let font = NSFont.boldSystemFont(ofSize: 64)
+    let baseline = CGFloat(height) / 2 - 24
+    context.textPosition = CGPoint(x: 24, y: baseline)
+    CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: left, attributes: [.font: font])), context)
+    context.textPosition = CGPoint(x: CGFloat(width) * 0.58, y: baseline)
+    CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: right, attributes: [.font: font])), context)
 
     let image = context.makeImage()!
     let data = NSMutableData()

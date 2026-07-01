@@ -18,6 +18,8 @@ struct AssistMemoryTests {
         #expect(history.count == 2)
         #expect(history[0].user == "highlight my WhatsApp messages")
         #expect(history[1].assistant == "Replied.")
+        #expect(memory.turns[0].provenance == .trustedUserInstruction)
+        #expect(memory.turns[0].safeForControl == false)
     }
 
     @Test func compactsBeyondActiveLimitIntoArchive() {

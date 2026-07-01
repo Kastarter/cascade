@@ -1,3 +1,4 @@
+import ApplicationServices
 import CascadeMemory
 import Foundation
 import Testing
@@ -30,6 +31,24 @@ struct AXElementResolverTests {
 
     @Test func normalizeCollapsesWhitespaceAndCase() {
         #expect(AXElementResolver.normalize("  Send\n  Message ") == "send message")
+    }
+
+    @Test func decodeAXPointAcceptsOnlyAXPointValues() {
+        var point = CGPoint(x: 12.5, y: -4.25)
+        let value = AXValueCreate(.cgPoint, &point)
+
+        #expect(AXElementResolver.decodeAXPoint(value) == point)
+        #expect(AXElementResolver.decodeAXPoint("not an AXValue" as CFString) == nil)
+        #expect(AXElementResolver.decodeAXPoint(NSNumber(value: 7)) == nil)
+    }
+
+    @Test func decodeAXSizeAcceptsOnlyAXSizeValues() {
+        var size = CGSize(width: 640.5, height: 480.25)
+        let value = AXValueCreate(.cgSize, &size)
+
+        #expect(AXElementResolver.decodeAXSize(value) == size)
+        #expect(AXElementResolver.decodeAXSize("not an AXValue" as CFString) == nil)
+        #expect(AXElementResolver.decodeAXSize(NSNumber(value: 7)) == nil)
     }
 
     // MARK: - B1 ranked locator: rank(recorded:candidate:)
@@ -145,6 +164,31 @@ struct AXElementResolverTests {
         #expect(summary == "“Save” (button), “Bold” (checkbox)")
     }
 
+    @Test func interactableSummaryReusesDescriptorHintsWhenPresent() {
+        let summary = AXElementResolver.interactableSummary([
+            AXElementResolver.Match(
+                center: .zero,
+                role: "AXGroup",
+                title: "Stale",
+                score: 0,
+	                descriptor: AXTargetDescriptorV2(
+	                    label: "Approve",
+	                    role: "AXButton",
+	                    identifier: "expense.approve",
+	                    container: "AXRow: Q2 Expense",
+	                    siblingIndex: 8,
+	                    siblingRoleIndex: 3,
+	                    frameBucket: "1,2,3,4",
+	                    enabled: false,
+	                    selected: true,
+	                    focused: true,
+                        createdFrom: "fixture"
+	                )
+	            )
+	        ])
+	        #expect(summary == "“Approve” (button; id expense.approve; in AXRow: Q2 Expense; disabled; selected; focused; roleSibling 3; frame 1,2,3,4; source fixture)")
+	    }
+
     @Test func interactableSummaryIsNilWhenEmpty() {
         // Canvas/Electron apps expose no AX controls — caller must degrade to a
         // plain nudge, so an empty harvest yields nil, not "".
@@ -155,5 +199,55 @@ struct AXElementResolverTests {
         let many = (0..<10).map { match("Item \($0)", "AXButton") }
         let summary = AXElementResolver.interactableSummary(many, limit: 3)
         #expect(summary?.components(separatedBy: ", ").count == 3)
+    }
+
+    @Test func runtimeProfileSparseThresholds() {
+        let sparse = AXRuntimeProfile(
+            bundleIdentifier: "com.example.Canvas",
+            appName: "Canvas",
+            sampledNodeCount: 8,
+            actionableRoleCount: 1,
+            labeledActionableCount: 0,
+            identifierCount: 0,
+            frameFailureCount: 0,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0
+        )
+        let rich = AXRuntimeProfile(
+            bundleIdentifier: "com.example.Native",
+            appName: "Native",
+            sampledNodeCount: 80,
+            actionableRoleCount: 20,
+            labeledActionableCount: 15,
+            identifierCount: 6,
+            frameFailureCount: 1,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0.05
+        )
+
+        #expect(sparse.isSparse)
+        #expect(sparse.shouldRetryManualAccessibility)
+        #expect(!rich.isSparse)
+        #expect(!rich.shouldRetryManualAccessibility)
+    }
+
+    @Test func runtimeProfileAuditDetailIsSanitized() {
+        let profile = AXRuntimeProfile(
+            bundleIdentifier: "com.secret.App",
+            appName: "Secret App",
+            sampledNodeCount: 20,
+            actionableRoleCount: 2,
+            labeledActionableCount: 1,
+            identifierCount: 0,
+            frameFailureCount: 9,
+            timeoutOrErrorCount: 0,
+            canvasSizedElementRatio: 0.50,
+            manualAccessibilityAttempted: true
+        )
+
+        #expect(profile.safeAuditDetail.contains("sparse=true"))
+        #expect(profile.safeAuditDetail.contains("manualAccessibility=true"))
+        #expect(!profile.safeAuditDetail.contains("Secret App"))
+        #expect(!profile.safeAuditDetail.contains("com.secret.App"))
     }
 }

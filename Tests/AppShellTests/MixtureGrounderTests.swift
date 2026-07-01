@@ -87,6 +87,12 @@ struct MixtureGrounderTests {
         #expect(!MixtureGrounder.clickableRoles.contains("AXImage"))
     }
 
+    @Test func targetAliasesNormalizeLearnedGroundingNames() {
+        let aliases = ["Title placeholder": ["title box", "heading field"]]
+        #expect(MixtureGrounder.applyTargetAliases("the title box", aliases: aliases) == "Title placeholder")
+        #expect(MixtureGrounder.applyTargetAliases("Save button", aliases: aliases) == "Save button")
+    }
+
     @Test func ocrTextBoxMapsToDisplayRectWithoutYFlip() {
         // OCR text grounding (the fix for "point at document text"): a Vision box
         // (normalized 0…1, LOWER-LEFT origin) → display-local AppKit rect (also

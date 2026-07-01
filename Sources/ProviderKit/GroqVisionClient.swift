@@ -7,13 +7,33 @@ import Foundation
 /// screen; UI-TARS grounds WHERE. Reuses GroqKeyStore / GroqError /
 /// GroqClient.parseContent. See [[cascade-cu-downgrade-research]].
 public struct GroqVisionClient: Sendable {
-    private let keyStore: GroqKeyStore
+    private let readKey: @Sendable () -> String?
     private let session: URLSession
-    private let endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
+    private let endpoint: URL
+    private let extraHeaders: [String: String]
 
+    /// Default: Groq (`api.groq.com`) with the Groq key — the original behavior.
     public init(keyStore: GroqKeyStore = GroqKeyStore(), session: URLSession = .shared) {
-        self.keyStore = keyStore
+        self.readKey = { keyStore.readKey() }
         self.session = session
+        self.endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
+        self.extraHeaders = [:]
+    }
+
+    /// Any OpenAI-compatible MULTIMODAL endpoint (e.g. a Qwen3-VL model on
+    /// OpenRouter). `readKey` is read at call time, never cached — mirrors the Groq
+    /// path. `extraHeaders` carries provider niceties (OpenRouter's HTTP-Referer /
+    /// X-Title). The served model MUST accept images, or every Scout turn fails.
+    public init(
+        endpoint: URL,
+        readKey: @escaping @Sendable () -> String?,
+        session: URLSession = .shared,
+        extraHeaders: [String: String] = [:]
+    ) {
+        self.endpoint = endpoint
+        self.readKey = readKey
+        self.session = session
+        self.extraHeaders = extraHeaders
     }
 
     /// One multimodal turn: `user` text + one JPEG screenshot. `prior` carries the
@@ -28,7 +48,7 @@ public struct GroqVisionClient: Sendable {
         maxTokens: Int = 1024,
         prior: [(user: String, assistant: String)] = []
     ) async throws -> String {
-        guard let key = keyStore.readKey(), !key.isEmpty else { throw GroqError.missingKey }
+        guard let key = readKey(), !key.isEmpty else { throw GroqError.missingKey }
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -39,6 +59,8 @@ public struct GroqVisionClient: Sendable {
         // usual source of the "network connection lost" / TLS errors that used
         // to kill the whole Scout run on the very first turn.
         request.setValue("close", forHTTPHeaderField: "connection")
+        // Provider-specific headers (e.g. OpenRouter's HTTP-Referer / X-Title).
+        for (field, value) in extraHeaders { request.setValue(value, forHTTPHeaderField: field) }
         guard let body = try? JSONSerialization.data(
             withJSONObject: Self.requestBody(model: model, system: system, user: user, imageJPEG: imageJPEG, maxTokens: maxTokens, prior: prior)
         ) else { throw GroqError.transport("Couldn't encode the request.") }

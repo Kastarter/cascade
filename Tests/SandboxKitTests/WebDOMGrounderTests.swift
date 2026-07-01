@@ -36,4 +36,42 @@ struct WebDOMGrounderTests {
         #expect(WebSandbox.parseGroundResult("nope", viewportHeight: 560) == nil)
         #expect(WebSandbox.parseGroundResult("1,2,3", viewportHeight: 560) == nil)
     }
+
+    @Test func groundResultRejectsNonFiniteAndOversizedCoordinates() {
+        #expect(WebSandbox.parseGroundResult("nan,10", viewportHeight: 560) == nil)
+        #expect(WebSandbox.parseGroundResult("inf,10", viewportHeight: 560) == nil)
+        #expect(WebSandbox.parseGroundResult("10,inf", viewportHeight: 560) == nil)
+        #expect(WebSandbox.parseGroundResult("1000000000,10", viewportHeight: 560) == nil)
+        #expect(WebSandbox.parseGroundResult("10,1000000000", viewportHeight: 560) == nil)
+    }
+
+    @Test func webClickFormattingRejectsInvalidCoordinatesBeforeJavaScript() {
+        let invalid: [CGFloat] = [.nan, .infinity, -.infinity, 1_000_000_000]
+        for value in invalid {
+            #expect(WebSandbox.clickJavaScript(xTopLeft: value, yTopLeft: 10) == nil)
+            #expect(WebSandbox.clickJavaScript(xTopLeft: 10, yTopLeft: value) == nil)
+        }
+
+        let script = WebSandbox.clickJavaScript(xTopLeft: 10.8, yTopLeft: 20.2)
+        #expect(script?.contains("})(10, 20);") == true)
+        #expect(script?.localizedCaseInsensitiveContains("nan") == false)
+        #expect(script?.localizedCaseInsensitiveContains("inf") == false)
+    }
+
+    @Test func webScrollFormattingRejectsInvalidDeltaBeforeJavaScript() {
+        let invalid: [CGFloat] = [.nan, .infinity, -.infinity, 1_000_000_000]
+        for value in invalid {
+            #expect(WebSandbox.scrollJavaScript(dy: value) == nil)
+        }
+
+        #expect(WebSandbox.scrollJavaScript(dy: -240) == "window.scrollBy(0, -240);")
+    }
+
+    @Test func sandboxCoordinateOnlyStoresFiniteBoundedPagePoints() {
+        #expect(SandboxCoordinate.pagePoint(x: 12.9, y: 34.1)?.x == 12)
+        #expect(SandboxCoordinate.pagePoint(x: 12.9, y: 34.1)?.y == 34)
+        #expect(SandboxCoordinate.pagePoint(x: .nan, y: 34) == nil)
+        #expect(SandboxCoordinate.pagePoint(x: 12, y: .infinity) == nil)
+        #expect(SandboxCoordinate.pagePoint(x: 1_000_000_000, y: 34) == nil)
+    }
 }

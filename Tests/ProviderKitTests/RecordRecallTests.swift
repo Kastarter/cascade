@@ -1,4 +1,5 @@
 import CascadeMemory
+import CryptoKit
 import Foundation
 import ProviderKit
 import Testing
@@ -8,6 +9,19 @@ private func makeStore() throws -> CascadeStore {
         .appendingPathComponent("CascadeRecallTests-\(UUID().uuidString).sqlite")
         .path
     return try CascadeStore(path: path)
+}
+
+private func sha256Prefix(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+}
+
+private struct ReverseRecordReranker: RecordReranker {
+    func rerank(query: String, candidates: [RecordChunkCandidate], limit: Int) -> [RecordRerankResult] {
+        candidates
+            .sorted { $0.contextID > $1.contextID }
+            .prefix(limit)
+            .map { RecordRerankResult(candidate: $0, score: Double($0.contextID)) }
+    }
 }
 
 // MARK: - search_record
@@ -26,6 +40,9 @@ func recallSearchReturnsCitableIdLines() async throws {
     #expect(out.contains("Safari"))
     #expect(out.contains("revenue projections"))
     #expect(!out.contains("lunch plans"))         // the other moment didn't match
+    let envelope = try observationEnvelope(from: out)
+    #expect(envelope.trust == .untrustedRecord)
+    #expect(envelope.acquiredByTool == "search_record")
 }
 
 @Test
@@ -35,7 +52,7 @@ func recallSearchEmptyQueryAsksForOne() async throws {
     // whitespace-only query becomes empty and trips the guard.
     let call = RecordRecall.Call(name: "search_record", input: ["query": "   "])
     let out = await RecordRecall(store: store).perform(call)
-    #expect(out == "search_record needs a query.")
+    #expect(out == #"{"kind":"validation_error","message":"search_record needs a query.","status":"error","tool":"search_record"}"#)
 }
 
 @Test
@@ -58,6 +75,60 @@ func recallSearchFiltersSensitiveMoments() async throws {
     let out = await RecordRecall(store: store).perform(.search(query: "unicorn"))
     #expect(out.contains("No recorded moments match"))
     #expect(!out.contains("unicorn vault"))
+}
+
+@Test
+func recallDefaultsToNoRerankerForAgentCallers() throws {
+    let store = try makeStore()
+    #expect(!RecordRecall(store: store).hasReranker)
+}
+
+@Test
+func recallSearchRerankerPreservesRecordedContextCitationIDs() async throws {
+    let store = try makeStore()
+    let first = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Notes",
+        ocrText: "alpha handoff note"))
+    let second = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Notes",
+        ocrText: "alpha handoff decision"))
+
+    let out = await RecordRecall(store: store, reranker: ReverseRecordReranker()).perform(.search(query: "alpha handoff"))
+    let lines = out.components(separatedBy: "\n")
+
+    #expect(lines.first?.contains("[#\(second.id)]") == true)
+    #expect(out.contains("[#\(first.id)]"))
+    #expect(out.contains("[#\(second.id)]"))
+}
+
+@Test
+func heuristicRecordRerankerScoresPhraseTitleAndCoverage() {
+    let base = Date(timeIntervalSince1970: 1_800_000_000)
+    let weak = RecordChunkCandidate(
+        contextID: 1,
+        text: "alpha notes",
+        title: "Inbox",
+        appName: "Mail",
+        capturedAt: base,
+        baseRank: 0,
+        baseScore: 0.02
+    )
+    let strong = RecordChunkCandidate(
+        contextID: 2,
+        text: "budget details for the project",
+        title: "Project Alpha Budget",
+        appName: "Numbers",
+        capturedAt: base.addingTimeInterval(-60),
+        baseRank: 1,
+        baseScore: 0.01
+    )
+
+    let ranked = HeuristicRecordReranker().rerank(query: "project alpha budget", candidates: [weak, strong], limit: 2)
+
+    #expect(ranked.first?.candidate.contextID == strong.contextID)
+    #expect(ranked[0].score > ranked[1].score)
 }
 
 // MARK: - get_timeframe
@@ -112,7 +183,8 @@ func recallListSessionsGroupsMomentsIntoSessions() async throws {
     #expect(out.contains("[#\(mail.id)]"))
     #expect(out.contains("Mail — Inbox"))
     #expect(out.contains("moments"))
-    #expect(out.components(separatedBy: "\n").count == 2)
+    let envelope = try observationEnvelope(from: out)
+    #expect(envelope.payload.components(separatedBy: "\n").count == 2)
 }
 
 @Test
@@ -173,7 +245,7 @@ func recallInspectIncludesNeighbors() async throws {
 func recallInspectNeedsNumericId() async throws {
     let store = try makeStore()
     let out = await RecordRecall(store: store).perform(.inspect(id: nil))
-    #expect(out == "inspect_moment needs a numeric id.")
+    #expect(out == #"{"kind":"validation_error","message":"inspect_moment needs a numeric id.","status":"error","tool":"inspect_moment"}"#)
 }
 
 @Test
@@ -198,10 +270,27 @@ func recallCallParsesEachToolFromRawInput() {
 }
 
 @Test
-func recallCallAuditDetailIsVerbatim() {
-    #expect(RecordRecall.Call.search(query: "the email").auditDetail == "search_record: the email")
-    #expect(RecordRecall.Call.timeframe(startISO: "T1", endISO: "T2").auditDetail == "get_timeframe: T1 → T2")
-    #expect(RecordRecall.Call.inspect(id: 12).auditDetail == "inspect_moment: #12")
+func recallCallAuditDetailUsesSafeDescriptors() {
+    let phrase = "Aperture-Delta Jane Example confidential runway.pdf"
+    let detail = RecordRecall.Call.search(query: phrase).auditDetail
+    #expect(detail.contains("tool=search_record"))
+    #expect(detail.contains("queryLength=\(phrase.count)"))
+    #expect(detail.contains("queryHash=\(sha256Prefix(phrase))"))
+    #expect(!detail.contains(phrase))
+    #expect(detail == RecordRecall.Call.search(query: phrase).auditDetail)
+
+    let timeframe = RecordRecall.Call.timeframe(
+        startISO: "2026-06-26T12:34:56-04:00",
+        endISO: "private appointment with Jane"
+    ).auditDetail
+    #expect(timeframe.contains("tool=get_timeframe"))
+    #expect(timeframe.contains("start=2026-06-26T16:34:56.000Z"))
+    #expect(timeframe.contains("end=invalid"))
+    #expect(!timeframe.contains("private appointment with Jane"))
+
+    #expect(RecordRecall.Call.inspect(id: 12).auditDetail == "tool=inspect_moment id=12")
+    #expect(RecordRecall.Call.sessions(startISO: nil, endISO: "not a timestamp").auditDetail
+        == "tool=list_sessions start=missing end=invalid")
 }
 
 @Test
@@ -210,6 +299,7 @@ func recallToolNamesAreStableAndDistinctFromOtherTools() {
     #expect(RecordRecall.isRecallTool("get_timeframe"))
     #expect(RecordRecall.isRecallTool("inspect_moment"))
     #expect(RecordRecall.isRecallTool("list_sessions"))
+    #expect(!RecordRecall.isRecallTool("inspect_structure"))
     #expect(!RecordRecall.isRecallTool("computer"))
     #expect(!RecordRecall.isRecallTool("use_skill"))
     // Recall names must not collide with the Mac harness tools, or the in-process
@@ -222,5 +312,11 @@ func recallToolNamesAreStableAndDistinctFromOtherTools() {
 @Test
 func recallToolDefinitionsExposeEveryTool() {
     let names = RecordRecall.toolDefinitions().compactMap { $0["name"] as? String }
-    #expect(Set(names) == RecordRecall.toolNames)
+    #expect(Set(names) == RecordRecall.toolNames())
+}
+
+private func observationEnvelope(from rendered: String) throws -> ObservationEnvelope {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try decoder.decode(ObservationEnvelope.self, from: Data(rendered.utf8))
 }

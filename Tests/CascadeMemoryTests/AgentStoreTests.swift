@@ -93,17 +93,19 @@ func agentRecipeAndAppsRoundTrip() async throws {
         source: .detected,
         signature: "mail>numbers",
         recipe: recipe,
-        apps: ["Mail", "Numbers"],
-        estimatedSeconds: 90,
-        evidenceCount: 4
-    ))
+	        apps: ["Mail", "Numbers"],
+	        estimatedSeconds: 90,
+	        evidenceCount: 4,
+	        evidenceIDs: [11, 12, 13, 14]
+	    ))
 
     #expect(saved.id > 0)
     let reread = try await store.agent(id: saved.id)
     #expect(reread?.recipe == recipe)
-    #expect(reread?.apps == ["Mail", "Numbers"])
-    #expect(reread?.estimatedSeconds == 90)
-}
+	    #expect(reread?.apps == ["Mail", "Numbers"])
+	    #expect(reread?.estimatedSeconds == 90)
+	    #expect(reread?.evidenceIDs == [11, 12, 13, 14])
+	}
 
 @Test
 func upsertDedupesBySignature() async throws {
@@ -113,17 +115,19 @@ func upsertDedupesBySignature() async throws {
     let second = try await store.upsertAgent(CascadeAgent(
         name: "Updated",
         source: .detected,
-        signature: "sig-x",
-        recipe: AgentRecipe(steps: [RecipeStep(order: 0, kind: .click, x: 5, y: 5, appName: "Safari")]),
-        evidenceCount: 9
-    ))
+	        signature: "sig-x",
+	        recipe: AgentRecipe(steps: [RecipeStep(order: 0, kind: .click, x: 5, y: 5, appName: "Safari")]),
+	        evidenceCount: 9,
+	        evidenceIDs: [41, 42]
+	    ))
 
     #expect(first.id == second.id) // same row, not a duplicate
     let all = try await store.agents()
-    #expect(all.count == 1)
-    #expect(all.first?.name == "Updated")
-    #expect(all.first?.evidenceCount == 9)
-}
+	    #expect(all.count == 1)
+	    #expect(all.first?.name == "Updated")
+	    #expect(all.first?.evidenceCount == 9)
+	    #expect(all.first?.evidenceIDs == [41, 42])
+	}
 
 @Test
 func markRunEnableAndDelete() async throws {
@@ -202,6 +206,51 @@ func humanStepsReadLikeTheWorkflow() {
 }
 
 @Test
+func recipeActionKeysIgnoreCoordinatesAndTypedText() {
+    let first = RecipeStep(
+        order: 1,
+        kind: .click,
+        x: 10,
+        y: 20,
+        appName: "Mail",
+        bundleIdentifier: "com.apple.mail",
+        windowTitleHint: "Inbox",
+        ocrAnchor: "Send",
+        targetDescriptor: AXTargetDescriptor.encode(role: "AXButton", identifier: "send")
+    )
+    let moved = RecipeStep(
+        order: 1,
+        kind: .click,
+        x: 90,
+        y: 120,
+        appName: "Mail",
+        bundleIdentifier: "com.apple.mail",
+        windowTitleHint: "Inbox",
+        ocrAnchor: "Send",
+        targetDescriptor: AXTargetDescriptor.encode(role: "AXButton", identifier: "send")
+    )
+    let differentLabel = RecipeStep(
+        order: 1,
+        kind: .click,
+        x: 10,
+        y: 20,
+        appName: "Mail",
+        bundleIdentifier: "com.apple.mail",
+        windowTitleHint: "Inbox",
+        ocrAnchor: "Archive",
+        targetDescriptor: AXTargetDescriptor.encode(role: "AXButton", identifier: "archive")
+    )
+    let typedSecret = RecipeStep(order: 2, kind: .type, text: "secret offer 123-45-6789", appName: "Mail")
+    let typedOther = RecipeStep(order: 2, kind: .type, text: "different private text", appName: "Mail")
+
+    #expect(first.idempotentActionKey == moved.idempotentActionKey)
+    #expect(first.idempotentActionKey != differentLabel.idempotentActionKey)
+    #expect(typedSecret.idempotentActionKey == typedOther.idempotentActionKey)
+    #expect(!typedSecret.idempotentActionKey.contains("secret"))
+    #expect(!typedSecret.idempotentActionKey.contains("123"))
+}
+
+@Test
 func curatedGoalRoundTripsAndSurvivesRedetect() async throws {
     let store = try makeAgentStore()
     let goal = "Copy the latest invoice totals out of Mail into the Numbers tracker."
@@ -220,4 +269,56 @@ func curatedGoalRoundTripsAndSurvivesRedetect() async throws {
     let refreshed = try await store.agent(id: agent.id)
     #expect(refreshed?.goal == goal)
     #expect(refreshed?.name == "Copy invoice totals into Numbers v2") // name still refreshes
+}
+
+@Test
+func agentDemoSketchesRoundTripAndSurviveRedetect() async throws {
+    let store = try makeAgentStore()
+    let demo = AgentDemoSketch(
+        id: "mail-send",
+        appName: "Mail",
+        windowTitle: "Inbox",
+        normalizedGoalTokens: ["send", "reply"],
+        promptText: "TRAJECTORY SKETCH\napp: Mail\nfirst_actions:\n1. click \"Send\"",
+        actionCount: 1,
+        anchorCount: 1,
+        checkCount: 0
+    )
+    let agent = try await store.upsertAgent(CascadeAgent(
+        name: "Send reply",
+        source: .detected,
+        signature: "mail-send",
+        recipe: AgentRecipe(steps: []),
+        demoSketches: [demo]
+    ))
+
+    #expect(try await store.agent(id: agent.id)?.demoSketches == [demo])
+
+    _ = try await store.upsertAgent(CascadeAgent(
+        name: "Send reply v2",
+        source: .detected,
+        signature: "mail-send",
+        recipe: AgentRecipe(steps: [])
+    ))
+
+    let refreshed = try #require(await store.agent(id: agent.id))
+    #expect(refreshed.demoSketches == [demo])
+}
+
+@Test
+func cascadeAgentDecodesLegacyPayloadWithoutDemoSketches() throws {
+    let json = """
+    {
+      "id": 1,
+      "name": "Legacy",
+      "source": "detected",
+      "signature": "legacy",
+      "recipe": { "steps": [] }
+    }
+    """
+    let agent = try JSONDecoder().decode(CascadeAgent.self, from: Data(json.utf8))
+
+    #expect(agent.demoSketches.isEmpty)
+    #expect(agent.apps.isEmpty)
+    #expect(agent.enabled)
 }

@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 
 // Ported from milind-soni/tiptour-macos `TipTour/Skills/MarkdownAppSkill.swift`
@@ -67,17 +68,23 @@ public struct AppSkillRuntimeHints: Decodable, Sendable {
     /// agent clicks (no cursor restore) and be inside the app's window before
     /// bare key presses, or hotkeys land nowhere.
     public let keysFollowPointer: Bool
+    public let targetAliases: [String: [String]]
+    public let preferredGroundingSource: String?
 
     public init(
         appMatchers: AppMatchers? = nil,
         inputPolicies: [InputPolicy] = [],
         axUnreliable: Bool = false,
-        keysFollowPointer: Bool = false
+        keysFollowPointer: Bool = false,
+        targetAliases: [String: [String]] = [:],
+        preferredGroundingSource: String? = nil
     ) {
         self.appMatchers = appMatchers
         self.inputPolicies = inputPolicies
         self.axUnreliable = axUnreliable
         self.keysFollowPointer = keysFollowPointer
+        self.targetAliases = targetAliases
+        self.preferredGroundingSource = preferredGroundingSource
     }
 
     public init(from decoder: Decoder) throws {
@@ -86,11 +93,21 @@ public struct AppSkillRuntimeHints: Decodable, Sendable {
         inputPolicies = try container.decodeIfPresent([InputPolicy].self, forKey: .inputPolicies) ?? []
         axUnreliable = try container.decodeIfPresent(Bool.self, forKey: .axUnreliable) ?? false
         keysFollowPointer = try container.decodeIfPresent(Bool.self, forKey: .keysFollowPointer) ?? false
+        targetAliases = try container.decodeIfPresent([String: [String]].self, forKey: .targetAliases) ?? [:]
+        preferredGroundingSource = try container.decodeIfPresent(String.self, forKey: .preferredGroundingSource)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case appMatchers, inputPolicies, axUnreliable, keysFollowPointer
+        case appMatchers, inputPolicies, axUnreliable, keysFollowPointer, targetAliases, preferredGroundingSource
     }
+}
+
+public enum AppSkillStatus: String, Sendable, Equatable {
+    case active
+    case draft
+    case shadow
+    case archived
+    case quarantined
 }
 
 /// One per-app cheat sheet: markdown instructions for the agent's prompt plus
@@ -114,15 +131,39 @@ public struct AppSkill: Sendable {
     /// qualifiers get read as policy ("repeated parts → script it"), so the
     /// gate has to be structural, not another sentence in the prompt.
     public let explicitAskOnly: Bool
+    public let version: Int
+    public let parentSkills: [String]
+    public let sourceCaseIDs: [String]
+    public let lastVerifiedAt: Date?
+    public let successCount: Int
+    public let failureCount: Int
+    public let riskClass: String?
+    public let status: AppSkillStatus
 
     public var axUnreliable: Bool { hints.axUnreliable }
     public var keysFollowPointer: Bool { hints.keysFollowPointer }
+    public var isActive: Bool { status == .active }
 
     public var promptBlock: String {
         "App skill: \(name) — follow these instructions while working in this app:\n\(instructions)"
     }
 
+    public var planningGraphAppNames: [String] {
+        hints.appMatchers?.names ?? []
+    }
+
+    @discardableResult
+    public func indexPlanningMetadata(in store: CascadeStore) async throws -> WorkGraphEntity {
+        try await store.indexPlanningSkill(
+            name: name,
+            appNames: planningGraphAppNames,
+            useWhen: useWhen,
+            dangerous: explicitAskOnly
+        )
+    }
+
     public func matches(appName: String?, bundleIdentifier: String?) -> Bool {
+        guard isActive else { return false }
         guard let matchers = hints.appMatchers else { return false }
         let normalizedBundle = (bundleIdentifier ?? "").lowercased()
         if !normalizedBundle.isEmpty,
@@ -137,10 +178,30 @@ public struct AppSkill: Sendable {
         }
     }
 
+    /// Lightweight live-surfacing score: app match is necessary, then `useWhen`
+    /// overlap with the latest action labels can lift a generic per-app skill into a
+    /// just-in-time suggestion. Pure so AppShell can rank without loading markdown.
+    public func relevance(
+        appName: String?,
+        bundleIdentifier: String?,
+        actionLabels: [String]
+    ) -> Double {
+        guard matches(appName: appName, bundleIdentifier: bundleIdentifier) else { return 0 }
+        let normalizedUseWhen = Self.normalized(useWhen)
+        let useWords = Set(normalizedUseWhen.split(separator: " ").filter { $0.count >= 4 })
+        guard !useWords.isEmpty else { return 0.62 }
+        let actionWords = Set(actionLabels.flatMap {
+            Self.normalized($0).split(separator: " ").filter { $0.count >= 4 }
+        })
+        let overlap = !useWords.isDisjoint(with: actionWords)
+        return overlap ? 0.78 : 0.62
+    }
+
     /// True when an input policy says this text must be delivered as physical
     /// key events (Blender-style modal numeric input that ignores AX insertion
     /// and clipboard paste).
     public func shouldTypePhysicalKeys(_ text: String) -> Bool {
+        guard isActive else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         return hints.inputPolicies.contains { policy in
@@ -194,13 +255,13 @@ public struct AppSkillRegistry: Sendable {
     }
 
     public func skill(appName: String?, bundleIdentifier: String?) -> AppSkill? {
-        skills.first { $0.matches(appName: appName, bundleIdentifier: bundleIdentifier) }
+        skills.first { $0.isActive && $0.matches(appName: appName, bundleIdentifier: bundleIdentifier) }
     }
 
     /// Lookup for the agent's use_skill tool — exact name, case-insensitive.
     public func skill(named name: String) -> AppSkill? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return skills.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
+        return skills.first { $0.isActive && $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
     }
 
     /// The app a goal names, resolved against what is ACTUALLY INSTALLED on
@@ -264,8 +325,9 @@ public struct AppSkillRegistry: Sendable {
     /// pulled via the use_skill tool, never pushed — this is all the prompt
     /// carries no matter how large the library grows.
     public var indexText: String? {
-        guard !skills.isEmpty else { return nil }
-        let lines = skills.map { "- \($0.name): \($0.useWhen)" }
+        let active = skills.filter(\.isActive)
+        guard !active.isEmpty else { return nil }
+        let lines = active.map { "- \($0.name): \($0.useWhen)" }
         return """
         Skills available through your use_skill tool — proven playbooks for specific \
         apps and tasks. When one matches what you're about to do, call use_skill with \
@@ -323,21 +385,30 @@ public struct AppSkillRegistry: Sendable {
         }
         let metadata = frontMatter(in: markdown)
         let fallbackName = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
-        let description = metadata["description"] ?? ""
-        let name = metadata["name"] ?? fallbackName
-        let useWhen = metadata["useWhen"] ?? (description.isEmpty ? name : description)
-        return AppSkill(
-            name: name,
-            description: description,
-            useWhen: useWhen,
-            source: source,
-            path: path,
-            markdown: markdown,
-            hints: hints,
-            instructions: strippedInstructions(from: markdown),
-            explicitAskOnly: metadata["explicitAskOnly"]?.lowercased() == "true"
-        )
-    }
+	        let description = metadata["description"] ?? ""
+	        let name = metadata["name"] ?? fallbackName
+	        let useWhen = metadata["useWhen"] ?? (description.isEmpty ? name : description)
+	        let status = metadata["status"].flatMap { AppSkillStatus(rawValue: $0.lowercased()) } ?? .active
+	        return AppSkill(
+	            name: name,
+	            description: description,
+	            useWhen: useWhen,
+	            source: source,
+	            path: path,
+	            markdown: markdown,
+	            hints: hints,
+	            instructions: strippedInstructions(from: markdown),
+	            explicitAskOnly: metadata["explicitAskOnly"]?.lowercased() == "true",
+	            version: max(1, Int(metadata["version"] ?? "") ?? 1),
+	            parentSkills: metadataList(metadata["parentSkills"]),
+	            sourceCaseIDs: metadataList(metadata["sourceCaseIDs"]),
+	            lastVerifiedAt: metadataDate(metadata["lastVerifiedAt"]),
+	            successCount: max(0, Int(metadata["successCount"] ?? "") ?? 0),
+	            failureCount: max(0, Int(metadata["failureCount"] ?? "") ?? 0),
+	            riskClass: normalizedMetadata(metadata["riskClass"]),
+	            status: status
+	        )
+	    }
 
     static func fencedRuntimeHints(in markdown: String) -> String? {
         for fence in ["cascade-runtime-hints", "tiptour-runtime-hints"] {
@@ -363,7 +434,30 @@ public struct AppSkillRegistry: Sendable {
             guard parts.count == 2 else { continue }
             metadata[parts[0]] = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
         }
-        return metadata
+	        return metadata
+	    }
+
+    private static func metadataList(_ value: String?) -> [String] {
+        guard let value else { return [] }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let body = trimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        return body
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'"))) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func metadataDate(_ value: String?) -> Date? {
+        guard let value = normalizedMetadata(value) else { return nil }
+        return ISO8601DateFormatter().date(from: value)
+    }
+
+    private static func normalizedMetadata(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
     }
 
     /// Markdown minus the frontmatter block and the entire hints fence.

@@ -16,10 +16,12 @@ public struct ElementGuidance: Sendable {
     public let point: CGPoint?
     /// One short sentence to speak to the user.
     public let speech: String
+    public let result: GroundingResult
 
-    public init(point: CGPoint?, speech: String) {
+    public init(point: CGPoint?, speech: String, result: GroundingResult? = nil) {
         self.point = point
         self.speech = speech
+        self.result = result ?? .legacy(point: point, source: .claude)
     }
 }
 
@@ -37,11 +39,17 @@ public struct ElementRegion: Sendable {
 
 public struct ElementLocator: Sendable {
     private let keyStore: AnthropicKeyStore
+    private let messagesClient: AnthropicMessagesClient
     private let model: String
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    static let guidePromptVersion = "element-locator.guide.prompt.v1"
+    static let regionPromptVersion = "element-locator.region.prompt.v1"
+    static let guideSchemaVersion = "element-locator.guide.schema.v1"
+    static let regionSchemaVersion = "element-locator.region.schema.v1"
 
     public init(keyStore: AnthropicKeyStore = AnthropicKeyStore(), model: String = AnthropicModel.sonnet) {
         self.keyStore = keyStore
+        self.messagesClient = AnthropicMessagesClient(keyStore: keyStore)
         self.model = model
     }
 
@@ -59,7 +67,8 @@ public struct ElementLocator: Sendable {
         question: String,
         displayWidthPoints: Int,
         displayHeightPoints: Int,
-        conversation: [(user: String, assistant: String)] = []
+        conversation: [(user: String, assistant: String)] = [],
+        markedCandidates: [MarkedGroundingCandidate] = []
     ) async -> ElementGuidance {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return ElementGuidance(point: nil, speech: "Connect your Claude key first.")
@@ -67,6 +76,34 @@ public struct ElementLocator: Sendable {
         let res = bestResolution(forWidth: displayWidthPoints, height: displayHeightPoints)
         guard let jpeg = resize(image: screenshot, toWidth: res.w, toHeight: res.h) else {
             return ElementGuidance(point: nil, speech: "I couldn't read the screen image.")
+        }
+        if !markedCandidates.isEmpty {
+            guard let result = await callMarkedGuide(
+                jpeg: jpeg,
+                question: question,
+                candidates: markedCandidates,
+                declaredW: res.w,
+                declaredH: res.h,
+                key: key,
+                conversation: conversation
+            ) else {
+                return ElementGuidance(point: nil, speech: "I couldn't reach Claude just now.")
+            }
+            let speech = result.say.isEmpty ? "Here — this is what you're looking for." : result.say
+            guard let mark = result.mark,
+                  let candidate = markedCandidates.first(where: { $0.markNumber == mark }) else {
+                return ElementGuidance(
+                    point: nil,
+                    speech: result.say.isEmpty ? "I couldn't find that on the current screen." : result.say,
+                    result: GroundingResult(
+                        verifierVerdict: .abstain,
+                        verifierFailureKind: .noCandidates,
+                        alternativeCount: markedCandidates.count
+                    )
+                )
+            }
+            let grounding = groundingResult(from: candidate, reason: "selected Set-of-Mark \(mark)")
+            return ElementGuidance(point: candidate.center, speech: speech, result: grounding)
         }
         guard let result = await callComputerUse(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key, conversation: conversation) else {
             return ElementGuidance(point: nil, speech: "I couldn't reach Claude just now.")
@@ -95,7 +132,8 @@ public struct ElementLocator: Sendable {
         question: String,
         displayWidthPoints: Int,
         displayHeightPoints: Int,
-        conversation: [(user: String, assistant: String)] = []
+        conversation: [(user: String, assistant: String)] = [],
+        markedCandidates: [MarkedGroundingCandidate] = []
     ) async -> ElementRegion {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             return ElementRegion(rect: nil, speech: "Connect your Claude key first.")
@@ -103,6 +141,26 @@ public struct ElementLocator: Sendable {
         let res = bestResolution(forWidth: displayWidthPoints, height: displayHeightPoints)
         guard let jpeg = resize(image: screenshot, toWidth: res.w, toHeight: res.h) else {
             return ElementRegion(rect: nil, speech: "I couldn't read the screen image.")
+        }
+        if !markedCandidates.isEmpty,
+           let result = await callMarkedGuide(
+               jpeg: jpeg,
+               question: question,
+               candidates: markedCandidates,
+               declaredW: res.w,
+               declaredH: res.h,
+               key: key,
+               conversation: conversation
+           ) {
+            let speech = result.say.isEmpty ? "Here — it's in this area." : result.say
+            guard let mark = result.mark,
+                  let candidate = markedCandidates.first(where: { $0.markNumber == mark }) else {
+                return ElementRegion(
+                    rect: nil,
+                    speech: result.say.isEmpty ? "I couldn't find that on the current screen." : result.say
+                )
+            }
+            return ElementRegion(rect: candidate.displayBounds, speech: speech)
         }
         guard let result = await callRegion(jpeg: jpeg, question: question, declaredW: res.w, declaredH: res.h, key: key, conversation: conversation) else {
             return ElementRegion(rect: nil, speech: "I couldn't reach Claude just now.")
@@ -123,6 +181,37 @@ public struct ElementLocator: Sendable {
         let yBottom = CGFloat(displayHeightPoints) - (yTop + h)
         let rect = CGRect(x: x, y: yBottom, width: w, height: h)
         return ElementRegion(rect: rect, speech: speech)
+    }
+
+    private func groundingResult(
+        from candidate: MarkedGroundingCandidate,
+        reason: String
+    ) -> GroundingResult {
+        GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: candidate.center,
+                    region: candidate.displayBounds,
+                    confidence: candidate.confidence,
+                    source: candidate.source,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    rawModel: candidate.label,
+                    reason: reason,
+                    candidateID: candidate.id,
+                    markNumber: candidate.markNumber,
+                    displayBounds: candidate.displayBounds,
+                    imageBounds: candidate.imageBounds,
+                    role: candidate.role,
+                    label: candidate.label,
+                    nearbyOCRText: candidate.label,
+                    ocrDistancePoints: 0,
+                    agreeingSources: [candidate.source]
+                )
+            ],
+            selectedIndex: 0,
+            selectedCandidateID: candidate.id,
+            alternativeCount: 0
+        )
     }
 
     /// The model sometimes answers with corners ([x1, y1, x2, y2]) instead of the
@@ -156,12 +245,12 @@ public struct ElementLocator: Sendable {
     }
 
     private func callRegion(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String, conversation: [(user: String, assistant: String)] = []) async -> (box: [CGFloat]?, say: String)? {
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        _ = key
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.regionPromptVersion,
+            schemaVersion: Self.regionSchemaVersion,
+            callsite: "ElementLocator.locateRegion"
+        )
 
         let prompt = """
         The user asked: "\(question)". Their screen is in the attached screenshot \
@@ -179,30 +268,109 @@ public struct ElementLocator: Sendable {
         element itself. If it is not visible on screen, use {"box": null, "say": "..."}.
         """
 
-        let body: [String: Any] = [
-            // Region detection is a simple bounding-box vision task — Haiku is ~2× faster
-            // and plenty accurate for framing, so the find loop isn't bottlenecked on it.
-            "model": AnthropicModel.haiku,
-            "max_tokens": 400,
-            // Instruction BEFORE the image — measurably better localization.
-            "messages": Self.historyMessages(conversation) + [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": prompt],
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
-                ],
-            ]],
-        ]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        request.httpBody = bodyData
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String else {
-            return nil
-        }
+        let messages = Self.historyMessages(conversation) + [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ],
+        ]]
+        _ = try? await messagesClient.countTokens(
+            model: AnthropicModel.haiku,
+            maxTokens: 400,
+            messages: messages,
+            temperature: options.temperature ?? 0
+        )
+        guard let response = try? await messagesClient.send(
+            model: AnthropicModel.haiku,
+            maxTokens: 400,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            timeout: 20
+        ) else { return nil }
+        let text = response.text
         return parseRegion(text)
+    }
+
+    private func callMarkedGuide(
+        jpeg: Data,
+        question: String,
+        candidates: [MarkedGroundingCandidate],
+        declaredW: Int,
+        declaredH: Int,
+        key: String,
+        conversation: [(user: String, assistant: String)] = []
+    ) async -> (mark: Int?, say: String)? {
+        _ = key
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.guidePromptVersion,
+            schemaVersion: Self.guideSchemaVersion,
+            callsite: "ElementLocator.guide.marked"
+        )
+        let list = candidates.prefix(80).map {
+            "\($0.markNumber): \($0.label) [\($0.role), \($0.source.rawValue)]"
+        }.joined(separator: "\n")
+        let prompt = """
+        The user asked: "\(question)". Their screen is in the attached screenshot \
+        (\(declaredW) by \(declaredH) pixels). Candidate UI elements are labeled with \
+        visible numbered marks on the image. Choose the one mark that best matches the \
+        target. Reply with ONLY compact JSON:
+        {"mark": <number or null>, "say": "<one short sentence>"}
+        If no candidate matches, use {"mark": null, "say": "..."}.
+
+        Candidates:
+        \(list)
+        """
+        let messages = Self.historyMessages(conversation) + [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ],
+        ]]
+        _ = try? await messagesClient.countTokens(
+            model: model,
+            maxTokens: 256,
+            messages: messages,
+            temperature: options.temperature ?? 0
+        )
+        guard let response = try? await messagesClient.send(
+            model: model,
+            maxTokens: 256,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            timeout: 20
+        ) else { return nil }
+        let text = response.text
+        return Self.parseMarkedSelection(text)
+    }
+
+    public static func parseMarkedSelection(_ text: String) -> (mark: Int?, say: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let start = trimmed.firstIndex(of: "{"),
+           let end = trimmed.lastIndex(of: "}"),
+           let data = String(trimmed[start...end]).data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let say = (json["say"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value = json["mark"] as? NSNumber {
+                return (value.intValue, say)
+            }
+            if let value = json["id"] as? NSNumber {
+                return (value.intValue, say)
+            }
+            if let value = json["mark"] as? String,
+               let parsed = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return (parsed, say)
+            }
+            return (nil, say)
+        }
+        if let match = try? NSRegularExpression(pattern: #"(?i)\b(?:mark|id|#)?\s*(\d{1,4})\b"#),
+           let found = match.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+           let range = Range(found.range(at: 1), in: trimmed),
+           let mark = Int(trimmed[range]) {
+            return (mark, "")
+        }
+        return (nil, trimmed)
     }
 
     private func parseRegion(_ text: String) -> (box: [CGFloat]?, say: String) {
@@ -223,13 +391,12 @@ public struct ElementLocator: Sendable {
     }
 
     private func callComputerUse(jpeg: Data, question: String, declaredW: Int, declaredH: Int, key: String, conversation: [(user: String, assistant: String)] = []) async -> (point: CGPoint?, text: String)? {
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue("computer-use-2025-11-24", forHTTPHeaderField: "anthropic-beta")
+        _ = key
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.guidePromptVersion,
+            schemaVersion: Self.guideSchemaVersion,
+            callsite: "ElementLocator.guide"
+        )
 
         let prompt = """
         The user said: "\(question)". Their current screen is in the attached screenshot.
@@ -240,35 +407,40 @@ public struct ElementLocator: Sendable {
         left_click the closest relevant element.
         """
 
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 1024,
-            "tools": [[
+        let tools: [[String: Any]] = [[
                 "type": "computer_20251124",
                 "name": "computer",
                 "display_width_px": declaredW,
                 "display_height_px": declaredH,
-            ]],
-            "tool_choice": ["type": "tool", "name": "computer"],
-            // Instruction BEFORE the image — measurably better click accuracy.
-            "messages": Self.historyMessages(conversation) + [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": prompt],
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
-                ],
-            ]],
-        ]
-
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        request.httpBody = bodyData
-
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode) else {
-            return nil
-        }
-        return parse(data)
+        ]]
+        let messages = Self.historyMessages(conversation) + [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ],
+        ]]
+        let toolChoice = ["type": "tool", "name": "computer"]
+        _ = try? await messagesClient.countTokens(
+            model: model,
+            maxTokens: 1024,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            tools: tools,
+            toolChoice: toolChoice,
+            betaHeader: AnthropicRequestVersions.computerUseBeta
+        )
+        guard let response = try? await messagesClient.send(
+            model: model,
+            maxTokens: 1024,
+            messages: messages,
+            temperature: options.temperature ?? 0,
+            tools: tools,
+            toolChoice: toolChoice,
+            betaHeader: AnthropicRequestVersions.computerUseBeta,
+            timeout: 20
+        ) else { return nil }
+        return parse(content: response.content)
     }
 
     /// Claude's response: a `text` block (the spoken instruction) and/or a
@@ -276,6 +448,10 @@ public struct ElementLocator: Sendable {
     private func parse(_ data: Data) -> (point: CGPoint?, text: String)? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]] else { return nil }
+        return parse(content: content)
+    }
+
+    private func parse(content: [[String: Any]]) -> (point: CGPoint?, text: String)? {
         var coordinate: CGPoint?
         var texts: [String] = []
         for block in content {

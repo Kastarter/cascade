@@ -138,4 +138,89 @@ struct NoEffectDetectionTests {
         let offscreen = [AXElementResolver.Match(center: CGPoint(x: 5000, y: 5000), role: "AXButton", title: "Ghost", score: 0)]
         #expect(CascadeAppModel.groundingControls(offscreen, display: display, resW: 1280, resH: 800) == nil)
     }
+
+    @Test func noEffectAuditDetailHashesControlsButModelNotesKeepLabels() {
+        let phrase = "Aperture-Delta payroll seed"
+        let display = CGRect(x: 0, y: 0, width: 1280, height: 800)
+        let controls = [
+            AXElementResolver.Match(center: CGPoint(x: 640, y: 400), role: "AXButton", title: phrase, score: 0),
+        ]
+        let labels = AXElementResolver.interactableSummary(controls)!
+        let coords = CascadeAppModel.groundingControls(controls, display: display, resW: 1280, resH: 800)!
+
+        #expect(labels.contains(phrase))
+        #expect(coords.contains(phrase))
+
+        let labelDetail = CascadeAppModel.assistNoEffectAuditDetail(
+            turn: 7,
+            status: "pushed-labels",
+            noEffectStreak: 1,
+            controlCount: controls.count,
+            labels: labels
+        )
+        #expect(labelDetail.contains("turn=7"))
+        #expect(labelDetail.contains("controlCount=1"))
+        #expect(labelDetail.contains("recoveryAction=recapture"))
+        #expect(labelDetail.contains("labelsHash=\(CascadeAppModel.auditHash(labels))"))
+        #expect(!labelDetail.contains(phrase))
+        #expect(!labelDetail.contains(labels))
+
+        let coordDetail = CascadeAppModel.assistNoEffectAuditDetail(
+            turn: 8,
+            status: "pushed-coords",
+            noEffectStreak: 2,
+            controlCount: controls.count,
+            coords: coords
+        )
+        #expect(coordDetail.contains("coordsHash=\(CascadeAppModel.auditHash(coords))"))
+        #expect(!coordDetail.contains(phrase))
+        #expect(!coordDetail.contains(coords))
+    }
+
+    @Test func groundMissAuditDetailHashesMissedTargetAndControlLabels() {
+        let phrase = "Aperture-Delta payroll seed"
+        let controls = [
+            AXElementResolver.Match(center: .zero, role: "AXTextField", title: phrase, score: 0),
+        ]
+        let labels = AXElementResolver.interactableSummary(controls)!
+
+        let detail = CascadeAppModel.groundMissAuditDetail(
+            turn: 4,
+            missedTarget: phrase,
+            controlCount: controls.count,
+            labels: labels
+        )
+
+        #expect(labels.contains(phrase))
+        #expect(detail.contains("turn=4"))
+        #expect(detail.contains("controlCount=1"))
+        #expect(detail.contains("missedTargetHash=\(CascadeAppModel.auditHash(phrase))"))
+        #expect(detail.contains("labelsHash=\(CascadeAppModel.auditHash(labels))"))
+        #expect(!detail.contains(phrase))
+        #expect(!detail.contains(labels))
+    }
+
+    @Test func ocrMarksAuditDetailHashesMarksButModelNoteKeepsText() {
+        let phrase = "Aperture-Delta payroll seed"
+        let boxes = [
+            ScreenTextRecognizer.TextBox(text: phrase, boundingBox: CGRect(x: 0.1, y: 0.7, width: 0.4, height: 0.1)),
+            ScreenTextRecognizer.TextBox(text: "Continue", boundingBox: CGRect(x: 0.1, y: 0.5, width: 0.2, height: 0.1)),
+        ]
+        let marks = ScreenTextRecognizer.setOfMarks(boxes)!
+
+        let detail = CascadeAppModel.ocrMarksAuditDetail(
+            turn: 5,
+            axControlCount: 2,
+            ocrLineCount: boxes.count,
+            marks: marks
+        )
+
+        #expect(marks.contains(phrase))
+        #expect(detail.contains("turn=5"))
+        #expect(detail.contains("controlCount=2"))
+        #expect(detail.contains("ocrLineCount=2"))
+        #expect(detail.contains("ocrMarksHash=\(CascadeAppModel.auditHash(marks))"))
+        #expect(!detail.contains(phrase))
+        #expect(!detail.contains(marks))
+    }
 }

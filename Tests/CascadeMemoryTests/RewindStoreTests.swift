@@ -41,10 +41,10 @@ func searchEmptyOrPunctuationOnlyQueryReturnsNothing() async throws {
 @Test
 func searchWithPunctuationDoesNotThrow() async throws {
     let store = try makeStore()
-    _ = try await store.insert(RecordedContext(source: .screen, appName: "Mail", ocrText: "ping user@example.com today"))
+    _ = try await store.insert(RecordedContext(source: .screen, appName: "Mail", ocrText: "ping alpha.example today"))
 
-    // Tokenizes to user/example/com — all present — without an FTS syntax error.
-    let hits = try await store.searchContexts(query: "user@example.com")
+    // Tokenizes to alpha/example — all present — without an FTS syntax error.
+    let hits = try await store.searchContexts(query: "alpha.example")
     #expect(hits.count == 1)
 }
 
@@ -86,6 +86,62 @@ func pruneDropsOldMomentsAndSyncsSearchIndex() async throws {
     // The FTS `_ad` trigger removed the pruned row from the index too.
     #expect(try await store.searchContexts(query: "ancient").isEmpty)
     #expect(try await store.searchContexts(query: "recent").count == 1)
+}
+
+@Test
+func ocrStructureSidecarRoundTripsAndPrunesWithContext() async throws {
+    let store = try makeStore()
+    let old = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSinceNow: -100 * 24 * 3600),
+        source: .screen,
+        appName: "Numbers",
+        ocrText: "flat text"
+    ))
+    let fresh = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Numbers",
+        ocrText: "new flat text"
+    ))
+
+    try await store.insertOCRStructure(
+        contextID: old.id,
+        version: 2,
+        json: #"{"version":2,"fields":[{"key":"TOTAL DUE","value":"$443,355"}]}"#,
+        searchableText: "TOTAL DUE $443,355"
+    )
+    try await store.insertOCRStructure(
+        contextID: fresh.id,
+        version: 2,
+        json: #"{"version":2,"fields":[{"key":"Status","value":"Ready"}]}"#,
+        searchableText: "Status Ready"
+    )
+
+    #expect(try await store.ocrStructure(contextID: old.id)?.version == 2)
+
+    _ = try await store.prune(maxAge: 7 * 24 * 3600)
+
+    #expect(try await store.ocrStructure(contextID: old.id) == nil)
+    #expect(try await store.ocrStructure(contextID: fresh.id)?.searchableText == "Status Ready")
+}
+
+@Test
+func hybridSearchUsesStructuredSidecarLane() async throws {
+    let store = try makeStore()
+    let moment = try await store.insert(RecordedContext(
+        source: .screen,
+        appName: "Preview",
+        ocrText: "plain invoice frame"
+    ))
+    try await store.insertOCRStructure(
+        contextID: moment.id,
+        version: 2,
+        json: #"{"version":2,"fields":[{"key":"Amount Due","value":"$443,355"}],"tables":[]}"#,
+        searchableText: "Amount Due $443,355"
+    )
+
+    let hits = try await store.hybridContexts(matching: "amount due", limit: 5)
+
+    #expect(hits.map(\.id).contains(moment.id))
 }
 
 @Test
@@ -141,6 +197,32 @@ func contentSamplesPickTheRichestMomentPerAppPerHour() async throws {
     #expect(chromeEarly?.capturedAt == base.addingTimeInterval(60))
     // The excerpt is trimmed to the requested length.
     #expect(chromeEarly?.ocrText == "the long assignment ")
+}
+
+@Test
+func previewReadsUseOCRExcerptWhileInspectionKeepsFullText() async throws {
+    let store = try makeStore()
+    let longText = String(repeating: "visible preview sentence ", count: 40)
+        + "full inspection tail"
+    let inserted = try await store.insert(RecordedContext(
+        capturedAt: Date(timeIntervalSince1970: 1_900_000_100),
+        source: .screen,
+        appName: "PreviewApp",
+        ocrText: longText
+    ))
+
+    let samples = try await store.contentSamples(
+        since: Date(timeIntervalSince1970: 1_900_000_000),
+        excerptLength: 32
+    )
+    let searchHits = try await store.searchContexts(query: "preview", excerptLength: 32)
+    let relevant = try await store.relevantContexts(to: "where was the visible preview sentence?", excerptLength: 32)
+    let inspected = try #require(try await store.context(id: inserted.id))
+
+    #expect(samples.first?.ocrText == String(longText.prefix(32)))
+    #expect(searchHits.first?.ocrText == String(longText.prefix(32)))
+    #expect(relevant.first?.ocrText == String(longText.prefix(32)))
+    #expect(inspected.ocrText == longText)
 }
 
 @Test

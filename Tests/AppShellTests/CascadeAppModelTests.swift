@@ -41,13 +41,13 @@ private func makeModel(curatorReply: String = #"{"agents":[]}"#) throws -> (mode
 private func webWorkflowEvents() -> [InputEvent] {
     var events: [InputEvent] = []
     var i = 0
-    func at() -> Date { base.addingTimeInterval(Double(i) * 3) }
-    for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "a", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .type, text: "reply", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 30, y: 30, text: "Send", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+    for run in 0..<3 {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: "Compose", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 8), kind: .key, key: "a", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 16), kind: .type, text: "reply", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 24), kind: .click, x: 30, y: 30, text: "Send", appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 32), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
     }
     return events
 }
@@ -61,6 +61,43 @@ private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throw
         try await Task.sleep(for: .milliseconds(10))
         tries += 1
     }
+}
+
+private func waitForAudit(
+    _ store: CascadeStore,
+    action: String,
+    maxTries: Int = 500
+) async throws -> AuditEvent {
+    var tries = 0
+    while tries < maxTries {
+        if let row = try await store.recentAudit(limit: 80).first(where: { $0.action == action }) {
+            return row
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+    throw CocoaError(.fileReadNoSuchFile)
+}
+
+private func waitForAudit(
+    _ store: CascadeStore,
+    action: String,
+    detailContains needle: String,
+    maxTries: Int = 500
+) async throws -> AuditEvent {
+    var tries = 0
+    while tries < maxTries {
+        if let row = try await store.recentAudit(limit: 80).first(where: { $0.action == action && $0.detail.contains(needle) }) {
+            return row
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        tries += 1
+    }
+    throw CocoaError(.fileReadNoSuchFile)
+}
+
+private func expectAuditDetail(_ detail: String, excludesRawIdentityContaining token: String) {
+    #expect(!detail.lowercased().contains(token.lowercased()))
 }
 
 private let curatorKeepsOne = """
@@ -88,10 +125,17 @@ func refreshAllCuratesDetectedWorkflows() async throws {
     // (≥3×, real time) kept it → curator judged + named it → it's what the
     // manager's review queue shows.
     #expect(model.detectedWaste.count == 1)
-    #expect(model.curatedWaste.count == 1)
-    #expect(model.curatedWaste.first?.name == "Reply to refund emails with the policy link")
-    #expect(model.pendingCuratedAgents.count == 1) // nothing approved or declined yet
-}
+	    #expect(model.curatedWaste.count == 1)
+	    #expect(model.curatedWaste.first?.name == "Reply to refund emails with the policy link")
+	    #expect(model.pendingCuratedAgents.count == 1) // nothing approved or declined yet
+	    #expect(model.learningOpportunities.contains { $0.kind == .repeatedWorkflow })
+
+	    let opportunity = try #require(model.learningOpportunities.first { $0.kind == .repeatedWorkflow })
+	    model.focusLearningOpportunity(opportunity)
+	    #expect(model.selectedTab == .manager)
+	    model.dismissLearningOpportunity(opportunity)
+	    #expect(!model.learningOpportunities.contains { $0.id == opportunity.id })
+	}
 
 @MainActor @Test
 func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
@@ -101,12 +145,12 @@ func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
     // escalate to the cursor-class runtime on drift).
     var events: [InputEvent] = []
     var i = 0
-    func at() -> Date { base.addingTimeInterval(Double(i) * 4) } // clear the 30s floor
-    for _ in 0..<3 {
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    for run in 0..<3 {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 8), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 16), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 24), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
     }
     let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
     try await store.insertInputEvents(events)
@@ -227,11 +271,293 @@ func stoppedFailedAndStepLimitRunsNeverCount() async throws {
     #expect(try await store.agent(id: agent.id)?.runCount == 0)
 }
 
-private func waste(apps: [String], occurrences: Int, perRun: Int = 20) -> DetectedWaste {
+@MainActor @Test
+func managedPolicyBlocksRecordingBackgroundRunsAndSchedules() async throws {
+    let (model, store) = try makeModel()
+    model.capturePrivacyPolicy = CapturePrivacyPolicy(
+        recordingAvailable: false,
+        backgroundWebRunsAvailable: false,
+        scheduledRunsAvailable: false
+    )
+
+    model.startRecording()
+    let recordingRow = try await waitForAudit(store, action: "policy.enforced", detailContains: "capability=recording")
+    #expect(recordingRow.detail.contains("capability=recording"))
+
+    #expect(!model.createSandboxAgent(task: "open https://example.com and summarize it"))
+    let backgroundRow = try await waitForAudit(store, action: "policy.enforced", detailContains: "capability=background_web_run")
+    #expect(backgroundRow.detail.contains("capability=background_web_run"))
+
+    let agent = try await deployedAgent(in: store)
+    model.setAgentSchedule(agent, schedule: "daily@09:05")
+    let scheduleRow = try await waitForAudit(store, action: "policy.enforced", detailContains: "capability=agent_schedule")
+    #expect(scheduleRow.detail.contains("capability=agent_schedule"))
+}
+
+@MainActor @Test
+func managedPolicyBlocksDeniedBackgroundSites() async throws {
+    let (model, store) = try makeModel()
+    model.capturePrivacyPolicy = CapturePrivacyPolicy(deniedURLHosts: ["example.com"])
+
+    #expect(!model.createSandboxAgent(task: "visit https://secure.example.com/report"))
+    let row = try await waitForAudit(store, action: "policy.enforced")
+    #expect(row.detail.contains("capability=background_web_run"))
+    #expect(row.detail.contains("reasonChars="))
+}
+
+@MainActor @Test
+func appShellAuditDetailsKeepStableIdentityReferencesNotRawText() async throws {
+    let (model, store) = try makeModel()
+    let rawToken = "ApertureDeltaAuditSeed"
+    let task = "\(rawToken)-task"
+    let scheduleName = "\(rawToken)-schedule-agent"
+    let intent = "\(rawToken)-teach-intent"
+    let pointedLabel = "\(rawToken)-pointed-label"
+    let approvedName = "\(rawToken)-approved-agent"
+    let steerMessage = "\(rawToken)-sandbox-steer"
+    let recipeLabel = "\(rawToken)-recipe-label"
+    let assistGoal = "\(rawToken)-assist-goal"
+    let skillName = "\(rawToken)-skill-name"
+    let validationMessage = "\(rawToken)-validation-missing"
+    let stalledText = "\(rawToken)-stalled-reason"
+    let groundLog = "hit \"\(rawToken)-ground-target\" @ (120,240)"
+    let watchedApp = "\(rawToken)-watched-app"
+    let pointQuestion = "\(rawToken)-where-is-the-private-button"
+    let plannerFailure = "\(rawToken)-planner-failed-with-private-text"
+
+    let scheduledAgent = try await store.upsertAgent(CascadeAgent(
+        name: scheduleName,
+        source: .detected,
+        signature: "\(rawToken)-schedule-signature",
+        recipe: AgentRecipe(steps: []),
+        apps: ["Numbers"],
+        estimatedSecondsPerRun: 30
+    ))
+
+    await model.recordSandboxCompletion(deployedAgentID: scheduledAgent.id, update: completedUpdate("done"), task: task)
+    model.setAgentSchedule(scheduledAgent, schedule: "daily@09:05")
+    model.beginTeaching()
+    model.teach(question: intent)
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "teach.clickPointed",
+        detail: CascadeAppModel.teachPointedAuditDetail(utterance: "click that", label: pointedLabel)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "employee",
+        action: "sandbox.steer",
+        detail: CascadeAppModel.sandboxSteerAuditDetail(runID: UUID(), message: steerMessage)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.task",
+        detail: CascadeAppModel.textAuditDetail("goal", assistGoal)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "recipe.step",
+        detail: CascadeAppModel.recipeAuditDetail(RecipeStep(
+            order: 1,
+            kind: .click,
+            x: 10,
+            y: 20,
+            appName: "\(rawToken)-app",
+            ocrAnchor: recipeLabel
+        ))
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "agent.skill",
+        detail: CascadeAppModel.textAuditDetail("skill", skillName)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "agent.skill.denied",
+        detail: CascadeAppModel.textAuditDetail("skill", skillName)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "computer.type.keys",
+        detail: "chars=7 \(CascadeAppModel.textAuditDetail("skill", skillName))"
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "reel.point",
+        detail: CascadeAppModel.textAuditDetail("question", pointQuestion)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "system",
+        action: "voice.fragment.ignored",
+        detail: CascadeAppModel.textAuditDetail("utterance", intent)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "system",
+        action: "voice.duplicate.ignored",
+        detail: CascadeAppModel.textAuditDetail("utterance", assistGoal)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.validate",
+        detail: CascadeAppModel.assistValidationAuditDetail(validationMessage)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.stalled",
+        detail: CascadeAppModel.assistStalledAuditDetail(engine: "scout", text: stalledText)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "agent.ground",
+        detail: CascadeAppModel.groundAuditDetail(groundLog)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "harness.denied.watched-app",
+        detail: CascadeAppModel.harnessDeniedWatchedAppAuditDetail(toolName: "run_applescript", watchedApp: watchedApp)
+    ))
+    _ = try await store.appendAudit(AuditEvent(
+        actor: "agent",
+        action: "assist.timing",
+        detail: "\(CascadeAppModel.assistPlannerFailedTimingReason(plannerFailure)) · scout · 1 turns"
+    ))
+
+    let approved = taughtCurated(signature: "\(rawToken)-approval-signature", name: approvedName)
+    model.approveCurated(approved)
+
+    let sandboxTask = try await waitForAudit(store, action: "sandbox.task")
+    #expect(sandboxTask.detail.contains("taskHash=\(AuditIdentity.hash(task))"))
+    expectAuditDetail(sandboxTask.detail, excludesRawIdentityContaining: rawToken)
+
+    let completed = try await waitForAudit(store, action: "agent.run.completed")
+    #expect(completed.detail.contains("agentID=\(scheduledAgent.id)"))
+    #expect(completed.detail.contains("labelHash=\(AuditIdentity.hash(task))"))
+    expectAuditDetail(completed.detail, excludesRawIdentityContaining: rawToken)
+
+    let schedule = try await waitForAudit(store, action: "agent.schedule.set")
+    #expect(schedule.detail.contains("agentID=\(scheduledAgent.id)"))
+    #expect(schedule.detail.contains("nameHash=\(AuditIdentity.hash(scheduleName))"))
+    expectAuditDetail(schedule.detail, excludesRawIdentityContaining: rawToken)
+
+    let teachIntent = try await waitForAudit(store, action: "teach.intent")
+    #expect(teachIntent.detail.contains("intentHash=\(AuditIdentity.hash(intent))"))
+    expectAuditDetail(teachIntent.detail, excludesRawIdentityContaining: rawToken)
+
+    let pointed = try await waitForAudit(store, action: "teach.clickPointed")
+    #expect(pointed.detail.contains("pointedLabelHash=\(AuditIdentity.hash(pointedLabel))"))
+    expectAuditDetail(pointed.detail, excludesRawIdentityContaining: rawToken)
+
+    let steer = try await waitForAudit(store, action: "sandbox.steer")
+    #expect(steer.detail.contains("messageHash=\(AuditIdentity.hash(steerMessage))"))
+    expectAuditDetail(steer.detail, excludesRawIdentityContaining: rawToken)
+
+    let assist = try await waitForAudit(store, action: "assist.task")
+    #expect(assist.detail.contains("goalHash=\(AuditIdentity.hash(assistGoal))"))
+    expectAuditDetail(assist.detail, excludesRawIdentityContaining: rawToken)
+
+    let recipe = try await waitForAudit(store, action: "recipe.step")
+    #expect(recipe.detail.contains("anchorHash=\(AuditIdentity.hash(recipeLabel))"))
+    expectAuditDetail(recipe.detail, excludesRawIdentityContaining: rawToken)
+
+    let approvedRow = try await waitForAudit(store, action: "agent.approved")
+    #expect(approvedRow.detail.contains("nameHash=\(AuditIdentity.hash(approvedName))"))
+    expectAuditDetail(approvedRow.detail, excludesRawIdentityContaining: rawToken)
+
+    let skill = try await waitForAudit(store, action: "agent.skill")
+    #expect(skill.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
+    expectAuditDetail(skill.detail, excludesRawIdentityContaining: rawToken)
+
+    let deniedSkill = try await waitForAudit(store, action: "agent.skill.denied")
+    #expect(deniedSkill.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
+    expectAuditDetail(deniedSkill.detail, excludesRawIdentityContaining: rawToken)
+
+    let typedKeys = try await waitForAudit(store, action: "computer.type.keys")
+    #expect(typedKeys.detail.contains("chars=7"))
+    #expect(typedKeys.detail.contains("skillHash=\(AuditIdentity.hash(skillName))"))
+    expectAuditDetail(typedKeys.detail, excludesRawIdentityContaining: rawToken)
+
+    let point = try await waitForAudit(store, action: "reel.point")
+    #expect(point.detail.contains("questionHash=\(AuditIdentity.hash(pointQuestion))"))
+    #expect(point.detail.contains("questionChars=\(pointQuestion.count)"))
+    expectAuditDetail(point.detail, excludesRawIdentityContaining: rawToken)
+
+    let fragment = try await waitForAudit(store, action: "voice.fragment.ignored")
+    #expect(fragment.detail.contains("utteranceHash=\(AuditIdentity.hash(intent))"))
+    #expect(fragment.detail.contains("utteranceChars=\(intent.count)"))
+    expectAuditDetail(fragment.detail, excludesRawIdentityContaining: rawToken)
+
+    let duplicate = try await waitForAudit(store, action: "voice.duplicate.ignored")
+    #expect(duplicate.detail.contains("utteranceHash=\(AuditIdentity.hash(assistGoal))"))
+    #expect(duplicate.detail.contains("utteranceChars=\(assistGoal.count)"))
+    expectAuditDetail(duplicate.detail, excludesRawIdentityContaining: rawToken)
+
+    let validation = try await waitForAudit(store, action: "assist.validate")
+    #expect(validation.detail.contains("status=incomplete"))
+    #expect(validation.detail.contains("missingHash=\(AuditIdentity.hash(validationMessage))"))
+    #expect(validation.detail.contains("missingChars=\(validationMessage.count)"))
+    expectAuditDetail(validation.detail, excludesRawIdentityContaining: rawToken)
+
+    let stalled = try await waitForAudit(store, action: "assist.stalled")
+    #expect(stalled.detail.contains("status=stalled"))
+    #expect(stalled.detail.contains("engine=scout"))
+    #expect(stalled.detail.contains("textHash=\(AuditIdentity.hash(stalledText))"))
+    #expect(stalled.detail.contains("textChars=\(stalledText.count)"))
+    expectAuditDetail(stalled.detail, excludesRawIdentityContaining: rawToken)
+
+    let ground = try await waitForAudit(store, action: "agent.ground")
+    #expect(ground.detail.contains("groundHash=\(AuditIdentity.hash(groundLog))"))
+    #expect(ground.detail.contains("groundChars=\(groundLog.count)"))
+    expectAuditDetail(ground.detail, excludesRawIdentityContaining: rawToken)
+
+    let watched = try await waitForAudit(store, action: "harness.denied.watched-app")
+    #expect(watched.detail.contains("tool=run_applescript"))
+    #expect(watched.detail.contains("appHash=\(AuditIdentity.hash(watchedApp))"))
+    #expect(watched.detail.contains("appChars=\(watchedApp.count)"))
+    expectAuditDetail(watched.detail, excludesRawIdentityContaining: rawToken)
+
+    let timing = try await waitForAudit(store, action: "assist.timing")
+    #expect(timing.detail.contains("status=planner-failed"))
+    #expect(timing.detail.contains("textHash=\(AuditIdentity.hash(plannerFailure))"))
+    #expect(timing.detail.contains("textChars=\(plannerFailure.count)"))
+    expectAuditDetail(timing.detail, excludesRawIdentityContaining: rawToken)
+}
+
+@MainActor @Test
+func watchedAppHarnessDenialPersistsHashedAppIdentity() async throws {
+    let (model, store) = try makeModel()
+    let watchedApp = "P9SentinelWatchedApp"
+
+    let denial = await model.watchedAppHarnessDenialMessageIfNeeded(
+        toolName: "run_applescript",
+        input: ["script": #"tell application "\#(watchedApp)" to activate"#],
+        goal: "Update the visible document",
+        watchedAppActionCounts: [watchedApp: 3]
+    )
+
+    #expect(denial != nil)
+    let watched = try await waitForAudit(store, action: "harness.denied.watched-app")
+    #expect(watched.detail.contains("tool=run_applescript"))
+    #expect(watched.detail.contains("appHash=\(AuditIdentity.hash(watchedApp))"))
+    #expect(watched.detail.contains("appChars=\(watchedApp.count)"))
+    #expect(!watched.detail.contains(watchedApp))
+}
+
+@Test
+func flightDelayMillisecondsRejectsNonFiniteAndClampsLargeValues() {
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(.nan) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(.infinity) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(-.infinity) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(-1) == 0)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(0.245) == 245)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(2.5) == 2_500)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(60) == 5_000)
+    #expect(CascadeAppModel.safeFlightDelayMilliseconds(.greatestFiniteMagnitude) == 5_000)
+}
+
+private func waste(apps: [String], occurrences: Int, perRun: Int = 20, sig: String = "sig") -> DetectedWaste {
     DetectedWaste(
         title: "t", apps: apps, occurrences: occurrences,
         estimatedSecondsPerRun: perRun, estimatedTotalSeconds: perRun * occurrences,
-        recipe: AgentRecipe(steps: []), evidence: [], confidence: 0.7, signature: "sig"
+        recipe: AgentRecipe(steps: []), evidence: [], confidence: 0.7, signature: sig
     )
 }
 
@@ -297,6 +623,16 @@ func repetitionBarNeedsThreeRepeats() {
 }
 
 @Test
+func repetitionBarUsesAcceptedAndDeclinedPreferenceThresholds() {
+    var model = PreferenceModel()
+    for _ in 0..<12 { model.record("accepted", accepted: true) }
+    for _ in 0..<12 { model.record("declined", accepted: false) }
+
+    #expect(CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 2, sig: "accepted"), using: model))
+    #expect(!CascadeAppModel.meetsRepetitionBar(waste(apps: ["Safari"], occurrences: 3, sig: "declined"), using: model))
+}
+
+@Test
 func realTimeBarKeepsTrivialHabitsOut() {
     // "Really save time": ~60s clears the floor, 6s doesn't — independent of how
     // many times it repeated.
@@ -357,6 +693,65 @@ func completionMessageIsHonestAboutTheOutcome() {
     #expect(CascadeAppModel.sandboxCompletionMessage(for: failedUpdate("Couldn't open the sandbox browser.")) == "Couldn't open the sandbox browser.")
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stoppedUpdate()) == "Stopped.")
     #expect(CascadeAppModel.sandboxCompletionMessage(for: stepLimitUpdate("Ran out of steps — ask again.")) == "Ran out of steps — ask again.")
+}
+
+@Test
+func sandboxFailureMemoryContextRequiresExternalSignalAndKnownFailure() {
+    let rawSelfReport = BackgroundWebAgent.Update(
+        status: "INCOMPLETE: I could not finish",
+        snapshotPNG: nil,
+        url: "https://example.test/private",
+        done: true,
+        result: nil
+    )
+    #expect(CascadeAppModel.sandboxFailureMemoryContext(for: rawSelfReport, failureKind: .verifierRejected) == nil)
+    #expect(CascadeAppModel.sandboxFailureMemoryContext(for: rawSelfReport, failureKind: .unknown) == nil)
+
+    let verifierSignal = BackgroundWebAgent.Update(
+        status: "Couldn't finish — verify check found the form still blank for jane@example.com",
+        snapshotPNG: nil,
+        url: "https://example.test/form",
+        done: true,
+        result: nil
+    )
+    let context = CascadeAppModel.sandboxFailureMemoryContext(for: verifierSignal, failureKind: .verifierRejected)
+    #expect(context != nil)
+    #expect(context?.stateSummary.contains("<EMAIL>") == true)
+    #expect(context?.stateSummary.contains("jane@example.com") == false)
+    #expect(context?.recoveryEvidenceHash.isEmpty == false)
+}
+
+@Test
+func failureMemoryScoreBoostsSameFailureKindAndCategory() {
+    let memory = AgentFailureMemory(
+        appName: "Safari",
+        normalizedGoalTokens: ["submit", "invoice"],
+        failureKind: .noEffect,
+        repairHint: "Use a different button."
+    )
+    let queryTokens: Set<String> = ["submit", "invoice"]
+
+    let base = CascadeAppModel.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: "Safari")
+    let exact = CascadeAppModel.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: "Safari", expectedFailureKind: .noEffect)
+    let category = CascadeAppModel.failureMemoryScore(memory, queryTokens: queryTokens, frontmostApp: "Safari", expectedFailureKind: .staleFrameBatch)
+
+    #expect(exact > category)
+    #expect(category > base)
+}
+
+@Test
+func groundingBucketReliabilityRequiresEnoughAccurateSamples() {
+    let goodReport = VerifierCalibration.report(samples: Array(repeating: VerifierCalibrationSample(
+        confidence: 0.9,
+        outcome: .acceptedCorrect
+    ), count: 8), bucketCount: 5)
+    let sparseReport = VerifierCalibration.report(samples: [
+        VerifierCalibrationSample(confidence: 0.9, outcome: .acceptedCorrect)
+    ], bucketCount: 5)
+
+    #expect(CascadeAppModel.groundingBucketIsReliable(confidence: 0.91, report: goodReport))
+    #expect(!CascadeAppModel.groundingBucketIsReliable(confidence: 0.91, report: sparseReport))
+    #expect(!CascadeAppModel.groundingBucketIsReliable(confidence: 0.91, report: nil))
 }
 
 // MARK: - Teach-once (demonstrate a task → agent, over the shared spine)
@@ -420,6 +815,24 @@ func teachingGatesNarrationIntoIntentNotAnAssistRun() throws {
 }
 
 @MainActor @Test
+func voicePartialUtteranceUpdatesStatusWithoutTeaching() throws {
+    let (model, _) = try makeModel()
+    let initialTeachMessage = model.teachMessage
+
+    model.voice.onPartialUtterance?("  ok  ")
+
+    #expect(model.voicePartialUtterance == "ok")
+    #expect(model.teachStatus?.contains("ok") == true)
+    #expect(model.teachMessage == initialTeachMessage)
+    #expect(!model.showSettings)
+    #expect(!model.agentRunning)
+
+    model.teach(question: "ok")
+
+    #expect(model.teachMessage == "ok")
+}
+
+@MainActor @Test
 func createTaughtAgentLandsInYourAgents() async throws {
     let (model, _) = try makeModel()
     model.teachPreview = taughtCurated()
@@ -458,4 +871,118 @@ func isSameGoalDetectsReFiresButNotDifferentCommands() {
     #expect(!CascadeAppModel.isSameGoal(g, "now add a chart to the slide"))
     // Short utterances never match (need ≥3 words).
     #expect(!CascadeAppModel.isSameGoal("open it", "open it"))
+}
+
+@Test
+func searchShapedGoalDetectorCoversCommonLookupForms() {
+    #expect(CascadeAppModel.isSearchShapedGoal("Find the invoice from yesterday"))
+    #expect(CascadeAppModel.isSearchShapedGoal("look up the latest exchange rate"))
+    #expect(CascadeAppModel.isSearchShapedGoal("ابحث عن ملف العقد"))
+    #expect(!CascadeAppModel.isSearchShapedGoal("Open Notes and write hello"))
+}
+
+@Test
+func searchUngatedAuditDetailKeepsGoalAndQueryHashOnly() {
+    let rawToken = "ApertureDeltaSearchSeed"
+    let route = SearchRouteHint(
+        routingIntent: .web,
+        candidateSources: [.web],
+        cleanQuery: rawToken
+    )
+
+    let detail = CascadeAppModel.assistSearchUngatedAuditDetail(
+        goal: rawToken,
+        routeHint: route,
+        status: "blocked"
+    )
+
+    #expect(detail.contains("status=blocked"))
+    #expect(detail.contains("intent=web"))
+    #expect(detail.contains("sources=web"))
+    #expect(detail.contains("goalHash=\(AuditIdentity.hash(rawToken))"))
+    #expect(detail.contains("cleanQueryHash=\(AuditIdentity.hash(rawToken))"))
+    #expect(!detail.contains(rawToken))
+}
+
+@Test
+func searchToolClassifiersCoverReadOnlyAndRecallTools() {
+    #expect(AgentHarness.isReadOnlyTool("search_files"))
+    #expect(AgentHarness.isReadOnlyTool("list_folder"))
+    #expect(AgentHarness.isReadOnlyTool("read_file"))
+    #expect(!AgentHarness.isReadOnlyTool("run_command"))
+
+    #expect(RecordRecall.isRecallTool("search_record"))
+    #expect(RecordRecall.isRecallTool("inspect_moment"))
+    #expect(!RecordRecall.isRecallTool("search_files"))
+}
+
+@Test
+func searchEvidenceVerdictParserUsesStrictLeadingToken() {
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("SUFFICIENT") == .sufficient)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("SUFFICIENT: local files answer it") == .sufficient)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("INSUFFICIENT - no matching record") == .insufficient)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("ABSTAIN") == .abstain)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("SUFFICIENTLY likely") == .abstain)
+    #expect(CascadeAppModel.SearchEvidenceVerdict.parse("maybe") == .abstain)
+}
+
+@Test
+func firstConcreteLocalPathSkipsStatusAndCountLines() {
+    let output = """
+    status=ok
+    No files matched the first pattern.
+    /Users/mohanadbahammam/Documents/report.pdf
+    /Users/mohanadbahammam/Documents/old.pdf 3 more.
+    """
+
+    #expect(CascadeAppModel.firstConcreteLocalPath(from: output) == "/Users/mohanadbahammam/Documents/report.pdf")
+    #expect(CascadeAppModel.firstConcreteLocalPath(from: "status=ok\nNo files matched") == nil)
+}
+
+@Test
+func searchEscalationAndBackgroundPreferenceArePureRouteDecisions() {
+    let web = SearchRouteHint(routingIntent: .web, candidateSources: [.web], cleanQuery: "rate")
+    let localThenWeb = SearchRouteHint(routingIntent: .multi, candidateSources: [.recordedMemory, .web], cleanQuery: "rate")
+    let localOnly = SearchRouteHint(routingIntent: .localFiles, candidateSources: [.localFiles], cleanQuery: "invoice")
+
+    #expect(CascadeAppModel.shouldPreferBackgroundWeb(routeHint: web))
+    #expect(!CascadeAppModel.shouldPreferBackgroundWeb(routeHint: localThenWeb))
+    #expect(CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localThenWeb, verdict: .insufficient))
+    #expect(CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localThenWeb, verdict: .abstain))
+    #expect(!CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localThenWeb, verdict: .sufficient))
+    #expect(!CascadeAppModel.shouldEscalateSearchToWeb(routeHint: localOnly, verdict: .insufficient))
+}
+
+@Test
+func assistBackgroundWebResultClassificationIsPure() {
+    let task = "look up the filing deadline"
+
+    switch CascadeAppModel.classifyAssistBackgroundWebUpdate(task: task, update: completedUpdate("Due April 30")) {
+    case .finding(let finding):
+        #expect(finding == AgentTaskFinding(task: task, result: "Due April 30"))
+    default:
+        #expect(Bool(false))
+    }
+
+    let login = BackgroundWebAgent.Update(
+        status: "Sign in required",
+        snapshotPNG: nil,
+        url: "https://example.com",
+        done: true,
+        result: "Please sign in",
+        needsLogin: true
+    )
+    switch CascadeAppModel.classifyAssistBackgroundWebUpdate(task: task, update: login) {
+    case .pause(let reason):
+        #expect(reason == "Please sign in")
+    default:
+        #expect(Bool(false))
+    }
+
+    switch CascadeAppModel.classifyAssistBackgroundWebUpdate(task: task, update: failedUpdate("Could not load")) {
+    case .pause(let reason):
+        #expect(reason == "Could not load")
+    default:
+        #expect(Bool(false))
+    }
 }

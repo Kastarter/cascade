@@ -102,12 +102,65 @@ public actor LocalMacDriver: AgentDriver {
     public func act(_ action: AgentAction) async throws {
         switch action {
         case .computerUse(let computerUseAction):
-            try await actuator.perform(computerUseAction)
-            _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "computer.act", detail: "\(computerUseAction)"))
+            let result = await actuator.execute(computerUseAction)
+            _ = try await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "computer.act",
+                detail: result.auditDetail
+            ))
+            if result.status != .ok {
+                if result.failureKind == .secureInput {
+                    throw ComputerUseError.secureInput(result.failureKind?.rawValue ?? result.status.rawValue)
+                }
+                throw ComputerUseError.unsupported(result.failureKind?.rawValue ?? result.status.rawValue)
+            }
         case .writeLocalArtifact(let title, let body):
             let url = try Self.writeArtifact(title: title, body: body)
-            _ = try await store.appendAudit(AuditEvent(actor: "agent", action: "artifact.write", detail: "\(title) → \(url.path)"))
+            _ = try await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "artifact.write",
+                detail: Self.artifactAuditDetail(title: title, body: body, url: url)
+            ))
         }
+    }
+
+    private nonisolated static func computerActionAuditDetail(_ action: ComputerUseAction) -> String {
+        switch action {
+        case .move(let x, let y):
+            return "kind=move x=\(coordinate(x)) y=\(coordinate(y))"
+        case .click(let x, let y):
+            return "kind=click x=\(coordinate(x)) y=\(coordinate(y))"
+        case .doubleClick(let x, let y):
+            return "kind=doubleClick x=\(coordinate(x)) y=\(coordinate(y))"
+        case .tripleClick(let x, let y):
+            return "kind=tripleClick x=\(coordinate(x)) y=\(coordinate(y))"
+        case .rightClick(let x, let y):
+            return "kind=rightClick x=\(coordinate(x)) y=\(coordinate(y))"
+        case .drag(let fromX, let fromY, let toX, let toY):
+            return "kind=drag fromX=\(coordinate(fromX)) fromY=\(coordinate(fromY)) toX=\(coordinate(toX)) toY=\(coordinate(toY))"
+        case .key(let key, let modifiers):
+            let modifierTokens = modifiers.map(AuditIdentity.safeToken).joined(separator: "+")
+            return "kind=key key=\(AuditIdentity.safeToken(key)) modifiers=\(modifierTokens)"
+        case .typeText(let text):
+            return "kind=typeText \(AuditIdentity.descriptor("text", text))"
+        case .scroll(let deltaX, let deltaY):
+            return "kind=scroll deltaX=\(coordinate(deltaX)) deltaY=\(coordinate(deltaY))"
+        case .openURL(let url):
+            return "kind=openURL \(AuditIdentity.descriptor("url", url))"
+        }
+    }
+
+    private nonisolated static func artifactAuditDetail(title: String, body: String, url: URL) -> String {
+        [
+            AuditIdentity.descriptor("title", title),
+            AuditIdentity.descriptor("path", url.path),
+            "bodyChars=\(body.count)",
+            "ext=\(AuditIdentity.safeToken(url.pathExtension.isEmpty ? "none" : url.pathExtension))",
+        ].joined(separator: " ")
+    }
+
+    private nonisolated static func coordinate(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.1f", value) : "invalid"
     }
 
     /// Writes an agent-produced artifact as Markdown under
@@ -181,16 +234,17 @@ public actor CascadeOrchestrator {
         localAnswerer: ContextQuestionAnswering = LocalGroundedAnswerer(),
         claudeAnswerer: ContextQuestionAnswering = ClaudeGroundedAnswerer(),
         recordAnswerer: RecordAnswering? = nil,
-        planner: SingleStepPlanner = ClaudeSingleStepPlanner(),
+        planner: SingleStepPlanner? = nil,
         curator: WorkflowCurator? = nil,
+        modelCallCache: ModelCallCache? = nil,
         keyStore: AnthropicKeyStore = AnthropicKeyStore()
     ) {
         self.store = store
         self.localAnswerer = localAnswerer
         self.claudeAnswerer = claudeAnswerer
         self.recordAnswerer = recordAnswerer ?? RecordSearchAnswerer(store: store, keyStore: keyStore)
-        self.planner = planner
-        self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore))
+        self.planner = planner ?? ClaudeSingleStepPlanner(cache: modelCallCache)
+        self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore), cache: modelCallCache)
         self.keyStore = keyStore
     }
 
@@ -261,11 +315,18 @@ public actor CascadeOrchestrator {
     /// the Rewind. Each is a candidate to turn into an agent built from real actions.
     public func detectedWaste(
         maxResults: Int = 5,
-        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        useEpisodeMining: Bool = true
     ) async throws -> [DetectedWaste] {
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)
-        return wasteDetector.detect(contexts: contexts, inputEvents: events, maxResults: maxResults, webAppIdentity: webAppIdentity)
+        return wasteDetector.detect(
+            contexts: contexts,
+            inputEvents: events,
+            maxResults: maxResults,
+            webAppIdentity: webAppIdentity,
+            useEpisodeMining: useEpisodeMining
+        )
     }
 
     /// Turns an arbitrary recorded time range into ONE named, grounded
@@ -360,6 +421,9 @@ public actor CascadeOrchestrator {
     @discardableResult
     public func createAgent(from curated: CuratedAgent) async throws -> CascadeAgent {
         let waste = curated.source
+        let demoSketch = TrajectorySketchBuilder(maxActions: 6, maxAnchors: 4, maxChecks: 3, maxCorrections: 2)
+            .build(goal: curated.goal, recipe: waste.recipe)
+        let persistedSketches = [AgentDemoSketch(demoSketch)].filter { !$0.promptText.isEmpty }
         return try await store.upsertAgent(CascadeAgent(
             name: curated.name,
             source: .detected,
@@ -369,11 +433,28 @@ public actor CascadeOrchestrator {
             estimatedSeconds: waste.estimatedTotalSeconds,
             estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
             evidenceCount: waste.occurrences,
-            goal: curated.goal
+            evidenceIDs: curated.evidence,
+            goal: curated.goal,
+            demoSketches: Array(persistedSketches.prefix(3))
         ))
     }
 
     public func agents() async throws -> [CascadeAgent] {
         try await store.agents()
+    }
+}
+
+private extension AgentDemoSketch {
+    init(_ sketch: TrajectorySketch) {
+        self.init(
+            id: sketch.id,
+            appName: sketch.appName,
+            windowTitle: sketch.windowTitle,
+            normalizedGoalTokens: sketch.normalizedGoalTokens,
+            promptText: sketch.promptText,
+            actionCount: sketch.firstActions.count,
+            anchorCount: sketch.safeAnchors.count,
+            checkCount: sketch.expectedChecks.count
+        )
     }
 }

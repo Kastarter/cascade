@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 
+import CascadeMemory
 @testable import ProviderKit
 
 /// Pins the structural gates added after the Keynote title-page incident
@@ -105,5 +106,50 @@ struct ActionGateTests {
         #expect(!ComputerUseAgent.goalMentionsDestruction("title page for the market entry readout"))
         #expect(!ComputerUseAgent.goalMentionsDestruction("make a donut in Blender"))
         #expect(!ComputerUseAgent.goalMentionsDestruction("summarize today's meetings into Notes"))
+    }
+
+    @Test func actionCriticTriggersOnPowerHarnessAndAmbiguousGrounding() {
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(harnessToolName: "run_command"))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(harnessToolName: "run_applescript"))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(alternativeCount: 2))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(lowConfidenceGrounding: true))
+        #expect(ComputerUseAgent.shouldTriggerActionCritic(noEffectCount: 2))
+        #expect(!ComputerUseAgent.shouldTriggerActionCritic(harnessToolName: "read_file"))
+    }
+
+    @Test func promptActionCriticParsesVerdictsAndFailureKind() {
+        let critique = PromptActionCritic.parse("""
+        {"verdict":"ask_user","reason":"Needs confirmation","saferInstruction":"Ask first","failureKind":"unsafe_action"}
+        """)
+
+        #expect(critique?.verdict == .askUser)
+        #expect(critique?.reason == "Needs confirmation")
+        #expect(critique?.saferInstruction == "Ask first")
+        #expect(critique?.failureKind == CascadeMemory.AgentFailureKind.unsafeAction)
+        #expect(PromptActionCritic.parse(#"{"verdict":"approve","reason":"ok"}"#)?.verdict == .approve)
+    }
+
+    @Test func preActionVerifierClassifiesRiskyHarnessURLAndGroundingSignals() {
+        let shell = PreActionVerifier.verify(harnessToolName: "run_command")
+        #expect(shell.risk == .high)
+        #expect(shell.failureKind == .unsafeAction)
+        #expect(shell.triggerReasons.contains("shell"))
+        #expect(shell.triggerReasons.contains("power_harness_tool"))
+
+        let write = PreActionVerifier.verify(harnessToolName: "write_file")
+        #expect(write.risk == .high)
+        #expect(write.failureKind == .unsafeAction)
+        #expect(write.triggerReasons.contains("file_write"))
+
+        let externalURL = PreActionVerifier.verify(action: .openURL("https://example.com/dashboard"))
+        #expect(externalURL.risk == .high)
+        #expect(externalURL.failureKind == .unsafeAction)
+        #expect(externalURL.triggerReasons.contains("external_url"))
+
+        let grounding = PreActionVerifier.verify(lowConfidenceGrounding: true, alternativeCount: 2)
+        #expect(grounding.risk == .high)
+        #expect(grounding.failureKind == .groundingMiss)
+        #expect(grounding.triggerReasons.contains("low_confidence_grounding"))
+        #expect(grounding.triggerReasons.contains("ambiguous_grounding"))
     }
 }

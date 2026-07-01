@@ -1,6 +1,31 @@
 import CoreGraphics
 import Foundation
 
+public struct FrameSignature: Sendable, Equatable, Codable {
+    public let dHash: UInt64
+    public let combinedGridHash: UInt64
+    public let gridDHash: [UInt64]
+    public let blockHash: UInt64
+    public let changedCellsMask: UInt16
+    public var textDigest: UInt64?
+
+    public init(
+        dHash: UInt64,
+        combinedGridHash: UInt64,
+        gridDHash: [UInt64],
+        blockHash: UInt64,
+        changedCellsMask: UInt16,
+        textDigest: UInt64? = nil
+    ) {
+        self.dHash = dHash
+        self.combinedGridHash = combinedGridHash
+        self.gridDHash = gridDHash
+        self.blockHash = blockHash
+        self.changedCellsMask = changedCellsMask
+        self.textDigest = textDigest
+    }
+}
+
 /// A cheap perceptual fingerprint of a frame, used to drop near-identical frames
 /// so an idle screen doesn't become a new "moment" every second. This is what
 /// bounds storage in the continuous recorder — only frames whose hash differs
@@ -38,6 +63,23 @@ public enum PerceptualHash {
                 }
                 bit += 1
             }
+        }
+        return hash
+    }
+
+    /// A second deterministic screen-content signature: downscale to an 8x8
+    /// luminance grid and compare each block to the global mean. This complements
+    /// dHash: dHash is edge/order-sensitive, while this catches broad block-level
+    /// brightness/layout changes without DCT complexity.
+    public static func blockMeanHash(_ image: CGImage) -> UInt64 {
+        let side = 8
+        guard let pixels = grayscaleSamples(from: image, width: side, height: side), !pixels.isEmpty else {
+            return 0
+        }
+        let mean = Double(pixels.reduce(0) { $0 + Int($1) }) / Double(pixels.count)
+        var hash: UInt64 = 0
+        for (index, pixel) in pixels.enumerated() where Double(pixel) >= mean {
+            hash |= (1 << UInt64(index))
         }
         return hash
     }
@@ -135,9 +177,82 @@ public enum PerceptualHash {
         return zip(candidate, previous).allSatisfy { hamming($0, $1) <= threshold }
     }
 
+    public static func changedCellsMask(
+        current: [UInt64],
+        previous: [UInt64]?,
+        threshold: Int = regionSkipThreshold
+    ) -> UInt16 {
+        guard let previous, current.count == previous.count, !current.isEmpty else {
+            let count = min(current.count, 16)
+            return count == 16 ? UInt16.max : UInt16((1 << count) - 1)
+        }
+        var mask: UInt16 = 0
+        for index in current.indices where index < 16 && hamming(current[index], previous[index]) > threshold {
+            mask |= (1 << UInt16(index))
+        }
+        return mask
+    }
+
+    /// Returns row-major grid cells whose regional hashes changed beyond
+    /// `threshold`, mapped into image coordinates for later cropped OCR.
+    public static func diffRegions(
+        current: [UInt64],
+        previous: [UInt64],
+        threshold: Int = regionSkipThreshold,
+        imageSize: CGSize
+    ) -> [CGRect] {
+        let grid = gridDimension
+        guard current.count == previous.count, current.count == grid * grid else { return [] }
+
+        let cellWidth = imageSize.width / CGFloat(grid)
+        let cellHeight = imageSize.height / CGFloat(grid)
+
+        var regions: [CGRect] = []
+        regions.reserveCapacity(current.count)
+        for index in current.indices where hamming(current[index], previous[index]) > threshold {
+            let row = index / grid
+            let col = index % grid
+            let minX = CGFloat(col) * cellWidth
+            let minY = CGFloat(row) * cellHeight
+            let maxX = col == grid - 1 ? imageSize.width : CGFloat(col + 1) * cellWidth
+            let maxY = row == grid - 1 ? imageSize.height : CGFloat(row + 1) * cellHeight
+            regions.append(CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY))
+        }
+        return regions
+    }
+
+    public static func normalizedChangedRegion(
+        changedCellsMask: UInt16,
+        padding: CGFloat = 0.04
+    ) -> CGRect? {
+        let grid = gridDimension
+        var union: CGRect?
+        let cellWidth = CGFloat(1) / CGFloat(grid)
+        let cellHeight = CGFloat(1) / CGFloat(grid)
+        for index in 0..<(grid * grid) where (changedCellsMask & (1 << UInt16(index))) != 0 {
+            let row = index / grid
+            let col = index % grid
+            let rect = CGRect(
+                x: CGFloat(col) * cellWidth,
+                y: CGFloat(row) * cellHeight,
+                width: cellWidth,
+                height: cellHeight
+            )
+            union = union.map { $0.union(rect) } ?? rect
+        }
+        guard let union else { return nil }
+        return union
+            .insetBy(dx: -padding, dy: -padding)
+            .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
     /// Renders `image` into a `width x height` 8-bit grayscale buffer using a CPU
     /// context with low-quality interpolation (fast, and identical across runs).
     private static func grayscaleSamples(from image: CGImage) -> [UInt8]? {
+        grayscaleSamples(from: image, width: width, height: height)
+    }
+
+    private static func grayscaleSamples(from image: CGImage, width: Int, height: Int) -> [UInt8]? {
         let count = width * height
         var buffer = [UInt8](repeating: 0, count: count)
         let colorSpace = CGColorSpaceCreateDeviceGray()

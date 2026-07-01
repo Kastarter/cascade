@@ -55,6 +55,8 @@ public final class ScoutAgent {
     private let harnessProvider: (@MainActor (String, [String: Any]) async -> String)?
     private let harnessTier: HarnessTier
     private let recallEnabled: Bool
+    private let includeStructuredRecallContent: Bool
+    private let resourceCatalogEnabled: Bool
     /// One-line-per-skill catalogue for use_skill (so Scout knows what it CAN pull).
     private let skillIndex: String?
     /// System prompt for the episode — base prompt + tool catalogue + any pushed
@@ -76,7 +78,9 @@ public final class ScoutAgent {
         skillIndex: String? = nil,
         harnessProvider: (@MainActor (String, [String: Any]) async -> String)? = nil,
         harnessTier: HarnessTier = .off,
-        recallEnabled: Bool = false
+        recallEnabled: Bool = false,
+        includeStructuredRecallContent: Bool = false,
+        resourceCatalogEnabled: Bool = false
     ) {
         self.vision = vision
         self.grounder = grounder
@@ -87,6 +91,8 @@ public final class ScoutAgent {
         self.harnessProvider = harnessProvider
         self.harnessTier = harnessProvider == nil ? .off : harnessTier
         self.recallEnabled = recallEnabled && harnessProvider != nil
+        self.includeStructuredRecallContent = includeStructuredRecallContent && self.recallEnabled
+        self.resourceCatalogEnabled = resourceCatalogEnabled
         rebuildSystem()
     }
 
@@ -101,7 +107,11 @@ public final class ScoutAgent {
             // Resolve ALL recall tools (so a list_sessions/get_timeframe emitted from
             // the shared history still routes), even though toolsPrompt only
             // advertises the two a weak planner can use without an ISO time window.
-            if recallEnabled { s.formUnion(RecordRecall.toolNames) }
+            if recallEnabled {
+                s.formUnion(RecordRecall.toolNames(
+                    includeStructuredContent: includeStructuredRecallContent
+                ))
+            }
         }
         return s
     }
@@ -181,13 +191,16 @@ public final class ScoutAgent {
             lines.append("- use_skill: fetch a playbook's full instructions — {\"action\":\"use_skill\",\"name\":\"<exact skill name>\"}.")
             if let skillIndex, !skillIndex.isEmpty { lines.append("  Available skills:\n\(skillIndex)") }
         }
-        if t.contains("search_files") {
+        if resourceCatalogEnabled, t.contains("search_files") || t.contains("search_record") {
+            lines.append("RESOURCE CATALOG — pick the cheapest matching source before acting or finishing:")
+            lines.append(ComputerUseAgent.resourceCatalogNote(harnessTier: harnessTier, recallEnabled: recallEnabled))
+        } else if t.contains("search_files") {
             lines.append("- search_files {\"action\":\"search_files\",\"query\":\"…\",\"folder\":\"~/Desktop\"} · read_file {\"action\":\"read_file\",\"path\":\"…\"} · list_folder {\"action\":\"list_folder\",\"path\":\"…\"} — find/read files instead of clicking through Finder (folder optional).")
         }
         if t.contains("run_command") {
-            lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
+            lines.append("- run_command {\"action\":\"run_command\",\"command\":\"…\"} runs one allowlisted executable with literal argv (no shell syntax) · run_applescript {\"action\":\"run_applescript\",\"script\":\"…\"} · write_file {\"action\":\"write_file\",\"path\":\"…\",\"content\":\"…\"} — ONLY for data/file work the user asked for, never to do on-screen work the user is watching.")
         }
-        if t.contains("search_record") {
+        if !resourceCatalogEnabled, t.contains("search_record") {
             lines.append("- search_record {\"action\":\"search_record\",\"query\":\"…\"} · inspect_moment {\"action\":\"inspect_moment\",\"id\":<n>} — recall what the user already saw on screen EARLIER (use when the goal refers to something not on screen now).")
         }
         return lines.joined(separator: "\n")
@@ -201,10 +214,24 @@ public final class ScoutAgent {
     /// (450,438)` or `miss "New Document"`. Lets the audit show WHERE each grounded
     /// click landed (or that it found nothing), the visibility we were missing.
     public private(set) var lastGroundLog: String?
+    public private(set) var lastGroundTarget: String?
+    public private(set) var lastGroundCandidateID: String?
+    public private(set) var lastGroundSource: GroundingSource?
+    public private(set) var lastGroundConfidence: Double?
+    public private(set) var lastGroundDispersion: Double?
+    public private(set) var lastGroundRisk: GroundingActionRisk?
+    public private(set) var lastRiskyVisualClick: RiskyVisualGroundingClick?
 
     private func step(screenshot: Data, note: String? = nil, carried: String? = nil, hop: Int = 0, parseRetry: Bool = false) async -> CUStep {
         lastGroundMiss = nil
         lastGroundLog = nil
+        lastGroundTarget = nil
+        lastGroundCandidateID = nil
+        lastGroundSource = nil
+        lastGroundConfidence = nil
+        lastGroundDispersion = nil
+        lastGroundRisk = nil
+        lastRiskyVisualClick = nil
         var user = "Goal: \(goal)\n\nDecide the next action(s) and reply with the JSON object only."
         if let carried, !carried.isEmpty { user += "\n\nResults of your tool calls:\n" + carried }
         if let note, !note.isEmpty { user += "\n\n" + note }
@@ -281,12 +308,22 @@ public final class ScoutAgent {
         // miss/log the runner reads is deterministic. (Capture isolated locals; the
         // task closures can't touch actor state.)
         let g = grounder, dw = displayW, dh = displayH
-        var groundResults: [(idx: Int, target: String, point: CGPoint?)] = []
-        await withTaskGroup(of: (Int, String, CGPoint?).self) { group in
+        var groundResults: [(idx: Int, target: String, result: GroundingResult)] = []
+        await withTaskGroup(of: (Int, String, GroundingResult).self) { group in
             for (i, a) in batch.enumerated() {
                 guard let target = Self.groundTarget(of: a) else { continue }
+                let route = ComputerUseAgent.riskRoute(
+                    target: target,
+                    click: a.kind == .doubleClick ? "double" : a.click
+                )
                 group.addTask {
-                    (i, target, await g.ground(screenshot: screenshot, target: target, displayWidthPoints: dw, displayHeightPoints: dh))
+                    (i, target, await g.groundResult(
+                        screenshot: screenshot,
+                        target: target,
+                        displayWidthPoints: dw,
+                        displayHeightPoints: dh,
+                        options: ComputerUseAgent.groundingOptions(for: route)
+                    ))
                 }
             }
             for await r in group { groundResults.append(r) }
@@ -294,12 +331,48 @@ public final class ScoutAgent {
         var grounded: [Int: CGPoint] = [:]
         var logs: [String] = []
         for r in groundResults.sorted(by: { $0.idx < $1.idx }) {
-            if let p = r.point {
-                grounded[r.idx] = p
-                logs.append("hit \"\(r.target)\" @ (\(Int(p.x)),\(Int(p.y)))")
+            let action = batch[r.idx]
+            let route = ComputerUseAgent.riskRoute(
+                target: r.target,
+                click: action.kind == .doubleClick ? "double" : action.click
+            )
+            if ComputerUseAgent.allowsGroundedAction(r.result, route: route),
+               let candidate = r.result.selectedCandidate,
+               let p = candidate.point,
+               let safePoint = Self.safeGroundedPoint(p, displayWidth: dw, displayHeight: dh) {
+                grounded[r.idx] = safePoint
+                lastGroundTarget = r.target
+                lastGroundCandidateID = candidate.candidateID ?? r.result.selectedCandidateID
+                lastGroundSource = candidate.source
+                lastGroundConfidence = candidate.confidence
+                lastGroundDispersion = candidate.dispersion
+                lastGroundRisk = route.risk
+                if (action.kind == .click || action.kind == .doubleClick),
+                   ComputerUseAgent.isRiskyVisualClick(candidate, route: route) {
+                    lastRiskyVisualClick = RiskyVisualGroundingClick(
+                        target: r.target,
+                        source: candidate.source,
+                        confidence: candidate.confidence,
+                        dispersion: candidate.dispersion,
+                        risk: route.risk,
+                        reason: candidate.reason
+                    )
+                }
+                let reason = candidate.reason.map { " reason=\(Self.safeLogToken($0))" } ?? ""
+                let id = (candidate.candidateID ?? r.result.selectedCandidateID).map { " id=\(Self.safeLogToken($0))" } ?? ""
+                let dispersion = candidate.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
+                let verdict = r.result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
+                let failure = r.result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
+                logs.append("hit \"\(r.target)\" source=\(candidate.source.rawValue)\(id) confidence=\(String(format: "%.2f", candidate.confidence))\(dispersion) risk=\(route.risk.rawValue) @(\(Int(safePoint.x)),\(Int(safePoint.y))) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)\(reason)")
             } else {
                 if lastGroundMiss == nil { lastGroundMiss = r.target }
-                logs.append("miss \"\(r.target)\"")
+                let candidate = r.result.selectedCandidate
+                let source = candidate.map { " source=\($0.source.rawValue)" } ?? ""
+                let confidence = candidate.map { " confidence=\(String(format: "%.2f", $0.confidence))" } ?? ""
+                let dispersion = candidate?.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
+                let verdict = r.result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
+                let failure = r.result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
+                logs.append("miss \"\(r.target)\"\(source)\(confidence)\(dispersion) risk=\(route.risk.rawValue) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)")
             }
         }
         lastGroundLog = logs.isEmpty ? nil : logs.joined(separator: "; ")
@@ -320,6 +393,14 @@ public final class ScoutAgent {
             return CUStep(actions: [], text: spoken.isEmpty && sawDone ? "Done." : spoken, done: sawDone)
         }
         return CUStep(actions: cuActions, text: spoken, done: false)
+    }
+
+    private nonisolated static func safeLogToken(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .prefix(48)
+            .description
     }
 
     /// Resolves one in-process tool call to a text result. use_skill goes through
@@ -419,6 +500,22 @@ public final class ScoutAgent {
             guard let point = groundedPoint else { return [] }
             return ComputerUseAgent.fillActions(at: point, text: text, double: a.click != "single", submit: "return")
         }
+    }
+
+    nonisolated private static func safeGroundedPoint(
+        _ point: CGPoint,
+        displayWidth: Int,
+        displayHeight: Int
+    ) -> CGPoint? {
+        guard point.x.isFinite, point.y.isFinite,
+              point.x >= 0, point.y >= 0 else { return nil }
+        if displayWidth > 0 {
+            guard point.x <= CGFloat(displayWidth) else { return nil }
+        }
+        if displayHeight > 0 {
+            guard point.y <= CGFloat(displayHeight) else { return nil }
+        }
+        return point
     }
 
     nonisolated private static func historyLine(_ a: ScoutAction) -> String {

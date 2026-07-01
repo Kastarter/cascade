@@ -1,4 +1,7 @@
 import Foundation
+import CryptoKit
+import AgentOrchestrator
+import ComputerUseKit
 import ProviderKit
 
 /// Runs a job entirely inside a `WebSandbox` — the isolated, background browser —
@@ -48,6 +51,7 @@ public final class BackgroundWebAgent {
     /// remains the fallback when there's no Groq key.
     private let groqKeyStore: GroqKeyStore
     private let groqVision: GroqVisionClient
+    private let scoutPlannerModel: String
     private let usesScout: Bool
     private let planner: AgentTaskPlanner
     /// Cheap second opinion that checks a claimed completion against the actual page.
@@ -57,6 +61,11 @@ public final class BackgroundWebAgent {
     /// A mid-run correction the user typed into the watch box. Injected into the next
     /// turn as a prominent note, then cleared — the agent's "cursor for agents".
     private var pendingSteer: String?
+    /// Bumped when WebKit cannot evaluate the typed state snapshot. The fallback is
+    /// intentionally changing so no-effect detection fails open instead of treating
+    /// an unreadable page as unchanged.
+    private var pageSignatureFallbackGeneration = 0
+    private var scoutContextCache: (signature: String, context: String?)?
 
     // The current plan. Survives a login pause so `resume()` re-enters at
     // `nextIndex` with the earlier parts' findings intact.
@@ -65,6 +74,7 @@ public final class BackgroundWebAgent {
     private var nextIndex = 0
     private var findings: [(task: String, result: String)] = []
     private var skipped: [AgentSubtask] = []
+    private var replannedSubtaskKeys: Set<String> = []
     /// Set once the first steer supersedes the auto-planned remainder — so later steers
     /// ADD to the queue instead of dropping the ones already queued.
     private var droppedOriginalPlanForSteer = false
@@ -101,6 +111,7 @@ public final class BackgroundWebAgent {
     /// Whether record-recall tools are offered (needs the owner to inject a store via
     /// `harnessProvider`).
     public var recallEnabled = false
+    public var includeStructuredRecallContent = false
 
     /// Emits an audit row through `onAudit`, prefixing the run tag so the row stays
     /// attributable to this run even when several agents log into the same stream.
@@ -108,26 +119,52 @@ public final class BackgroundWebAgent {
         onAudit?(action, Self.taggedDetail(tag: auditTag, detail))
     }
 
+    private func auditObservationResultIfNeeded(tool: String, result: String) {
+        guard let info = InjectionGuard.envelopeAuditInfo(from: result) else { return }
+        guard info.injectionScore > 0 else { return }
+        audit("trust.untrusted_seen", Self.observationAuditDescriptor(tool: tool, info: info))
+        audit("injection.suspected", Self.observationAuditDescriptor(tool: tool, info: info))
+    }
+
     /// Prefixes `detail` with the run tag (pure, so the format is unit-tested).
     nonisolated static func taggedDetail(tag: String, _ detail: String) -> String {
         tag.isEmpty ? detail : "[\(tag)] \(detail)"
     }
 
+    /// Safe descriptor for sandbox harness audit. Recall calls use their own
+    /// descriptor so search queries are never persisted as generic raw input.
+    nonisolated static func harnessAuditDescriptor(
+        name: String,
+        input: [String: Any],
+        includeStructuredContent: Bool = false
+    ) -> String {
+        if RecordRecall.isRecallTool(name, includeStructuredContent: includeStructuredContent) {
+            return RecordRecall.Call(name: name, input: input).auditDetail
+        }
+        return HarnessCall.auditDescriptor(name: name, input: input)
+    }
+
     public init(
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         groqKeyStore: GroqKeyStore = GroqKeyStore(),
-        model: String = AnthropicModel.sonnet
+        model: String = AnthropicModel.sonnet,
+        modelCallCache: ModelCallCache? = nil
     ) {
         self.keyStore = keyStore
         self.groqKeyStore = groqKeyStore
-        self.groqVision = GroqVisionClient(keyStore: groqKeyStore)
+        // Same configurable planner backend as the on-screen Scout (cascade.scoutPlanner.*):
+        // Llama-4 Scout via Groq by default, or a multimodal OpenRouter model (e.g.
+        // qwen/qwen3.6-plus). Keeps the on-screen + background brains identical.
+        let scoutPlanner = ScoutPlannerBackend.resolve(groqKeyStore: groqKeyStore)
+        self.groqVision = scoutPlanner.vision
+        self.scoutPlannerModel = scoutPlanner.model
         self.model = model
         self.usesScout = Self.backgroundUsesScout(groqKeyStore: groqKeyStore)
         // The planner (≤5 subtasks + start URLs) and the completion verifier are
         // structurally simple TEXT tasks — downgraded to Groq llama-3.3-70b when a
         // Groq key is set (else Anthropic haiku). The agent loop stays on `model`.
         let h = TextHelperModel.resolve(anthropicKeyStore: keyStore)
-        self.planner = AgentTaskPlanner(client: h.client, model: h.model)
+        self.planner = AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache)
         self.verifier = h.client
         self.verifierModel = h.model
     }
@@ -159,7 +196,9 @@ public final class BackgroundWebAgent {
         nextIndex = 0
         findings = []
         skipped = []
+        replannedSubtaskKeys = []
         droppedOriginalPlanForSteer = false
+        scoutContextCache = nil
         onUpdate(Update(status: "Planning…", snapshotPNG: nil, url: "", done: false, result: nil))
         plan = await planner.plan(for: task, in: .webSandbox)
         await execute(onUpdate: onUpdate)
@@ -196,6 +235,9 @@ public final class BackgroundWebAgent {
                 onUpdate(Update(status: summary, snapshotPNG: await sandbox.snapshotPNG(), url: sandbox.currentURL, done: true, result: summary))
                 return
             case .failed(let reason):
+                if await replanCurrentSubtaskIfPossible(sub: sub, failureReason: reason) {
+                    continue episodes
+                }
                 onUpdate(Update(status: reason, snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
                 return
             case .stopped:
@@ -220,6 +262,61 @@ public final class BackgroundWebAgent {
         case failed(String)
     }
 
+    private func replanCurrentSubtaskIfPossible(sub: AgentSubtask, failureReason: String) async -> Bool {
+        guard let failureKind = Self.replannableFailureKind(from: failureReason) else { return false }
+        let key = "\(nextIndex):\(Self.auditHash(sub.task)):\(failureKind.rawValue)"
+        guard replannedSubtaskKeys.insert(key).inserted else { return false }
+        let recovery = Self.recoveryAction(for: failureKind, attempt: 1)
+        guard recovery.canRecover else { return false }
+        let page = await sandbox.readPageText()
+        let memo = AgentRecoveryMemo(
+            failedSubtask: sub,
+            failureKind: failureKind,
+            attemptedRecovery: recovery,
+            targetHash: Self.auditHash(sub.task),
+            stateSummary: String(failureReason.prefix(220)),
+            evidenceSummary: String(page.prefix(400)),
+            completedFindings: findings.map { AgentTaskFinding(task: $0.task, result: $0.result) }
+        )
+        switch await planner.replan(
+            originalTask: originalTask,
+            memo: memo,
+            environment: .webSandbox
+        ) {
+        case .replaceCurrent(let replacement):
+            plan[nextIndex] = replacement
+            audit("sandbox.subgoal.replan", Self.sandboxReplanAuditDescriptor(
+                failureKind: failureKind,
+                recoveryAction: recovery,
+                status: "replace",
+                reason: failureReason
+            ))
+            return true
+        case .pause(let reason):
+            audit("sandbox.subgoal.replan", Self.sandboxReplanAuditDescriptor(
+                failureKind: failureKind,
+                recoveryAction: recovery,
+                status: "pause",
+                reason: reason
+            ))
+            return false
+        }
+    }
+
+    nonisolated static func replannableFailureKind(from reason: String) -> AgentOrchestrator.AgentFailureKind? {
+        let lower = reason.lowercased()
+        if lower.contains("no effect") || lower.contains("stopped changing") || lower.contains("unchanged") {
+            return .noEffect
+        }
+        if lower.contains("couldn't find") || lower.contains("target") || lower.contains("ground") {
+            return .groundingMiss
+        }
+        if lower.contains("couldn't finish") || lower.contains("incomplete") || lower.contains("verify") {
+            return .validatorIncomplete
+        }
+        return nil
+    }
+
     /// Runs one part as its own Computer Use episode. If the model stops without
     /// taking a single action — narrating or asking instead of working — it gets
     /// one firmer retry; the second answer stands either way.
@@ -236,10 +333,10 @@ public final class BackgroundWebAgent {
         // mismatch downgrades to a failure; doubt leans verified so real wins still pass.
         if case .finished(let finding) = attempt.outcome, !stopped {
             if let reason = await verifyCompletion(task: sub.task, claimed: finding) {
-                audit("sandbox.verify", "INCOMPLETE: \(reason.prefix(80))")
+                audit("sandbox.verify", Self.sandboxVerifyAuditDescriptor(status: "incomplete", detail: reason))
                 return .failed("Couldn't finish — \(reason)")
             }
-            audit("sandbox.verify", "verified: \(finding.prefix(70))")
+            audit("sandbox.verify", Self.sandboxVerifyAuditDescriptor(status: "verified", detail: finding))
         }
         return attempt.outcome
     }
@@ -331,19 +428,21 @@ public final class BackgroundWebAgent {
         // no-effect. Incremented in the sink/harness/leftover sites, read + reset
         // once per loop iteration.
         var turnStateChanges = 0
+        let webPolicy = WebHarnessPolicyContext(originalTask: originalTask, subtask: sub.task)
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
-            harnessProvider: { [weak self, sandbox] name, input in
+            harnessProvider: { [weak self, sandbox, webPolicy] name, input in
                 // Using any tool IS acting (reading/clicking/filling) — not the model
                 // narrating instead of working, so it must clear the firmer-retry guard.
                 acted = true
                 if name == "click_text" || name == "fill_field" { turnStateChanges += 1 }
-                let result = await WebHarness.run(name, input, sandbox: sandbox)
+                let result = await WebHarness.run(name, input, sandbox: sandbox, policyContext: webPolicy)
                 // DOM tools (click_text / fill_field) act by element — surface where they
                 // landed so the watch-box cursor follows them too.
                 if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
-                self?.audit("sandbox.tool", "\(name) \(Self.argSummary(input)) → \(result.prefix(70))")
+                self?.audit("sandbox.tool", Self.sandboxToolAuditDescriptor(name: name, input: input, result: result))
+                self?.auditObservationResultIfNeeded(tool: name, result: result)
                 return result
             },
             extraTools: WebHarness.toolDefinitions()
@@ -372,6 +471,7 @@ public final class BackgroundWebAgent {
         // stall guard, so a stuck run ends early instead of spinning to the 80-step
         // cap. lastSignature is the page BEFORE this episode's first actions.
         var lastSignature = await pageSignature()
+        _ = await sandbox.consumeMutations()
         var noEffectTurns = 0
         var idleTurns = 0
         var step = await agent.begin(
@@ -397,22 +497,26 @@ public final class BackgroundWebAgent {
                     // the false-completion the audit log caught: a mid-task run reported
                     // "done — I couldn't reach Claude" and was marked completed. Report it
                     // honestly and count nothing.
-                    audit("sandbox.done", "unreachable — couldn't reach Claude (acted=\(acted))")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(
+                        status: "transport_failure",
+                        acted: acted,
+                        recoveryAction: Self.recoveryAction(for: .transportFailure, attempt: 1)
+                    ))
                     return (.failed("I couldn't reach Claude just now — ask again and I'll continue."), acted)
                 case .needsLogin(let site):
-                    audit("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "needs_login", acted: acted, detail: site, detailName: "target"))
                     return (.needsLogin(site), acted)
                 case .incomplete(let reason):
                     // The agent said done but flagged it couldn't actually finish — report
                     // it honestly and do NOT let it count as a completion.
-                    audit("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "incomplete", acted: acted, detail: reason))
                     return (.failed("Couldn't finish — \(reason)"), acted)
                 case .finished(let raw):
-                    audit("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "finished", acted: acted, detail: raw))
                     return (.finished(raw), acted)
                 }
             }
-            if !step.text.isEmpty { audit("sandbox.turn", String(step.text.prefix(90))) }
+            if !step.text.isEmpty { audit("sandbox.turn", Self.sandboxTurnAuditDescriptor(step.text)) }
             // Streamed actions already ran via the sink; this handles any non-streamed
             // leftovers (zoom/screenshot are no-ops here, harness/skill resolve inline).
             for action in step.actions {
@@ -434,7 +538,7 @@ public final class BackgroundWebAgent {
             } else if !step.done {
                 idleTurns += 1
                 if idleTurns >= 3 {
-                    audit("sandbox.stalled", String(step.text.prefix(80)))
+                    audit("sandbox.stalled", Self.sandboxStalledAuditDescriptor(step.text))
                     return (.failed("I kept looking without making progress, so I stopped."), acted)
                 }
                 if idleTurns == 2 {
@@ -451,13 +555,20 @@ public final class BackgroundWebAgent {
             // click that "succeeded" but changed nothing.
             if turnActed {
                 let signature = await pageSignature()
-                if signature == lastSignature {
+                let mutations = await sandbox.consumeMutations()
+                if signature == lastSignature && mutations.isEmpty {
                     noEffectTurns += 1
-                    if noEffectTurns >= 3 {
-                        audit("sandbox.noeffect", "3rd no-effect — stopping")
+                    if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
+                        audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                            status: "stopping",
+                            streak: noEffectTurns
+                        ))
                         return (.failed("My actions stopped changing the page, so I stopped."), acted)
                     }
-                    audit("sandbox.noeffect", "page unchanged after acting")
+                    audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                        status: "unchanged",
+                        streak: noEffectTurns
+                    ))
                     let extra = "Your last action did NOT change the page — it had no effect. Do NOT repeat it; try a different element or route (list_interactives shows what's actually clickable)."
                     nudge = nudge.map { $0 + " " + extra } ?? extra
                 } else {
@@ -534,6 +645,7 @@ public final class BackgroundWebAgent {
         // DOM-first grounder (UI-TARS snapshot fallback only if an OpenRouter key is
         // set). Scout pulls web skills the same way the Claude path does.
         let grounder = WebDOMGrounder(sandbox: sandbox, fallback: Self.snapshotFallbackGrounder())
+        let webPolicy = WebHarnessPolicyContext(originalTask: originalTask, subtask: sub.task)
         // The on-screen harness (file/shell + recall), wrapped with this run's STOP
         // gate + tagged audit so a background file/shell/recall call is supervised
         // exactly like a click. The owner's closure is pure execution.
@@ -541,7 +653,11 @@ public final class BackgroundWebAgent {
         if let injectedHarness = harnessProvider {
             wrappedHarness = { [weak self] name, input in
                 guard let self, !self.stopped else { return "The user stopped this task. Do not continue — end now." }
-                self.audit("sandbox.harness", "\(name) \(Self.argSummary(input))")
+                self.audit("sandbox.harness", Self.harnessAuditDescriptor(
+                    name: name,
+                    input: input,
+                    includeStructuredContent: self.includeStructuredRecallContent
+                ))
                 return await injectedHarness(name, input)
             }
         } else {
@@ -550,16 +666,19 @@ public final class BackgroundWebAgent {
         let agent = ScoutAgent(
             vision: groqVision,
             grounder: grounder,
+            model: scoutPlannerModel,
             environmentNote: Self.scoutSandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
             skillIndex: WebSkills.index(),
             harnessProvider: wrappedHarness,
             harnessTier: harnessTier,
-            recallEnabled: recallEnabled
+            recallEnabled: recallEnabled,
+            includeStructuredRecallContent: includeStructuredRecallContent
         )
 
         var acted = false
         var lastSignature = await pageSignature()
+        _ = await sandbox.consumeMutations()
         var noEffectTurns = 0
         var idleTurns = 0
         var step = await agent.begin(
@@ -567,33 +686,38 @@ public final class BackgroundWebAgent {
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height),
-            note: await scoutWebContext()
+            note: await scoutWebContext(policyContext: webPolicy, forceRefresh: true)
         )
 
         let maxSteps = 80
         var count = 0
         while count < maxSteps, !stopped {
             if step.failed {
-                audit("sandbox.done", "scout planner error (acted=\(acted)): \(step.text.prefix(70))")
+                audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "planner_error", acted: acted, detail: step.text))
                 return (.failed("I couldn't reach the Scout model just now — ask again and I'll continue."), acted)
             }
             if step.done {
                 switch Self.classifyDone(rawText: step.text, failed: false) {
                 case .transportFailure:
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(
+                        status: "transport_failure",
+                        acted: acted,
+                        recoveryAction: Self.recoveryAction(for: .transportFailure, attempt: 1)
+                    ))
                     return (.failed("I couldn't reach the model just now — ask again."), acted)
                 case .needsLogin(let site):
-                    audit("sandbox.done", "needs-login: \(site) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "needs_login", acted: acted, detail: site, detailName: "target"))
                     return (.needsLogin(site), acted)
                 case .incomplete(let reason):
-                    audit("sandbox.done", "incomplete: \(reason.prefix(80)) · acted=\(acted)")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "incomplete", acted: acted, detail: reason))
                     return (.failed("Couldn't finish — \(reason)"), acted)
                 case .finished(let raw):
-                    audit("sandbox.done", "finished (acted=\(acted)): \(raw.prefix(90))")
+                    audit("sandbox.done", Self.sandboxDoneAuditDescriptor(status: "finished", acted: acted, detail: raw))
                     return (.finished(raw), acted)
                 }
             }
             if !step.text.isEmpty {
-                audit("sandbox.turn", String(step.text.prefix(90)))
+                audit("sandbox.turn", Self.sandboxTurnAuditDescriptor(step.text))
                 onUpdate(Update(status: prefix + step.text, snapshotPNG: nil, url: sandbox.currentURL, done: false, result: nil))
             }
             // Scout's actions are already batch-safe + pre-grounded; execute them.
@@ -609,9 +733,9 @@ public final class BackgroundWebAgent {
             // Grounding visibility — where each named target resolved (or missed) —
             // plus a re-describe nudge on a miss, so Scout renames from the pushed
             // list instead of silently going idle on an un-findable target.
-            if let g = agent.lastGroundLog { audit("sandbox.ground", String(g.prefix(100))) }
+            if let g = agent.lastGroundLog { audit("sandbox.ground", Self.sandboxGroundAuditDescriptor(g)) }
             if let missed = agent.lastGroundMiss {
-                audit("sandbox.ground.miss", String(missed.prefix(80)))
+                audit("sandbox.ground.miss", Self.sandboxGroundMissAuditDescriptor(missed))
                 nudge = "Couldn't find “\(missed)” on the page — name a target EXACTLY as it appears in the clickable/fillable list below, or use type with NO target if you've already clicked into the field."
             }
 
@@ -621,7 +745,7 @@ public final class BackgroundWebAgent {
             } else if !step.done {
                 idleTurns += 1
                 if idleTurns >= 3 {
-                    audit("sandbox.stalled", String(step.text.prefix(80)))
+                    audit("sandbox.stalled", Self.sandboxStalledAuditDescriptor(step.text))
                     return (.failed("I kept looking without making progress, so I stopped."), acted)
                 }
                 if idleTurns == 2 {
@@ -633,15 +757,24 @@ public final class BackgroundWebAgent {
             try? await Task.sleep(for: .milliseconds(300))
             shot = await sandbox.snapshotPNG() ?? shot
 
+            var pageChangedThisTurn = false
             if turnActed {
                 let signature = await pageSignature()
-                if signature == lastSignature {
+                let mutations = await sandbox.consumeMutations()
+                pageChangedThisTurn = signature != lastSignature || !mutations.isEmpty
+                if signature == lastSignature && mutations.isEmpty {
                     noEffectTurns += 1
-                    if noEffectTurns >= 3 {
-                        audit("sandbox.noeffect", "3rd no-effect — stopping")
+                    if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
+                        audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                            status: "stopping",
+                            streak: noEffectTurns
+                        ))
                         return (.failed("My actions stopped changing the page, so I stopped."), acted)
                     }
-                    audit("sandbox.noeffect", "page unchanged after acting")
+                    audit("sandbox.noeffect", Self.sandboxNoEffectAuditDescriptor(
+                        status: "unchanged",
+                        streak: noEffectTurns
+                    ))
                     let extra = "Your last action did NOT change the page — it had no effect. Do NOT repeat it; name a DIFFERENT element from the clickable list, or take another route."
                     nudge = nudge.map { $0 + " " + extra } ?? extra
                 } else {
@@ -671,7 +804,7 @@ public final class BackgroundWebAgent {
             // Proactive context (the web Set-of-Marks push): the page text + the
             // clickable/fillable elements, every turn, so the weak planner names
             // targets that exist and the DOM grounder hits them.
-            let note = [steerNote, nudge, await scoutWebContext()].compactMap { $0 }.joined(separator: "\n\n")
+            let note = [steerNote, nudge, await scoutWebContext(policyContext: webPolicy, forceRefresh: pageChangedThisTurn)].compactMap { $0 }.joined(separator: "\n\n")
             step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
             count += 1
         }
@@ -680,15 +813,23 @@ public final class BackgroundWebAgent {
 
     /// The page's text + clickable/fillable elements, pushed to Scout each turn
     /// (the web analog of the on-screen AX-label push) so it names real targets.
-    private func scoutWebContext() async -> String? {
-        let page = await sandbox.readPageText()
-        let interactives = await sandbox.listInteractives()
+    private func scoutWebContext(policyContext: WebHarnessPolicyContext, forceRefresh: Bool = false) async -> String? {
+        let signature = await pageSignature()
+        if !forceRefresh, let cached = scoutContextCache, cached.signature == signature {
+            return cached.context
+        }
+        let page = await WebHarness.run("read_page", [:], sandbox: sandbox, policyContext: policyContext)
+        let interactives = await WebHarness.run("list_interactives", [:], sandbox: sandbox, policyContext: policyContext)
         var parts: [String] = []
-        if !page.hasPrefix("Couldn't read") { parts.append("PAGE NOW:\n" + String(page.prefix(1600))) }
+        auditObservationResultIfNeeded(tool: "read_page", result: page)
+        auditObservationResultIfNeeded(tool: "list_interactives", result: interactives)
+        if !page.hasPrefix("Couldn't read") { parts.append("PAGE NOW:\n" + String(page.prefix(1800))) }
         if !interactives.hasPrefix("No interactive"), !interactives.hasPrefix("Couldn't") {
             parts.append("CLICKABLE / FILLABLE NOW (name one of these to click or fill):\n" + String(interactives.prefix(1200)))
         }
-        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+        let context = parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+        scoutContextCache = (signature, context)
+        return context
     }
 
     /// Optional visual fallback for the web grounder: hosted UI-TARS over OpenRouter,
@@ -731,13 +872,40 @@ public final class BackgroundWebAgent {
     later parts of the job rely on that line.
     """
 
-    /// Cheap "did the page change" signature for no-effect detection — URL + a
-    /// prefix of the readable text. A dead DOM action leaves it unchanged;
-    /// navigation/content changes move it. Web-native (no pixel churn from
-    /// cursors/ads), the structural analog of the on-screen frame diff.
+    /// Cheap "did the page change" signature for no-effect detection. Uses the
+    /// typed web-state snapshot so form/focus/checked-state changes count even when
+    /// visible page text is unchanged, while retaining only a stable hash.
     private func pageSignature() async -> String {
-        let text = await sandbox.readPageText()
-        return sandbox.currentURL + "\u{1}" + String(text.prefix(4000))
+        if let signature = await sandbox.stateSignature() {
+            return Self.pageStateSignatureHash(signature)
+        }
+        pageSignatureFallbackGeneration &+= 1
+        return Self.fallbackPageStateSignatureHash(
+            url: sandbox.currentURL,
+            title: sandbox.title,
+            nonce: pageSignatureFallbackGeneration
+        )
+    }
+
+    nonisolated static func pageStateSignatureHash(_ signature: WebStateSignature) -> String {
+        signature.stableHash
+    }
+
+    nonisolated static func pageStateSignatureHash(snapshot: [String: Any]) -> String {
+        pageStateSignatureHash(WebStateSignature(snapshot: snapshot))
+    }
+
+    nonisolated static func fallbackPageStateSignatureHash(url: String, title: String, nonce: Int) -> String {
+        pageStateSignatureHash(WebStateSignature(
+            url: url,
+            title: title,
+            interactivesHash: "fallback:unavailable",
+            formValuesHash: "fallback:unavailable",
+            checkedSelectedHash: "fallback:unavailable",
+            contentEditableTextHash: "fallback:unavailable",
+            ariaTextHash: "fallback:unavailable",
+            mutationSequence: nonce
+        ))
     }
 
     /// Whether a built-in action changes page state (so it counts toward acting),
@@ -797,26 +965,48 @@ public final class BackgroundWebAgent {
     /// Maps a Computer Use action onto the web sandbox. The agent works in bottom-left
     /// AppKit coordinates; the page wants top-left, so y is flipped.
     private func apply(_ action: CUAction) async {
-        func topLeftY(_ y: Double) -> CGFloat { WebSandbox.height - CGFloat(y) }
+        let actuator = WebSandboxComputerUseActuator(sandbox: sandbox)
         switch action {
         case .click(let x, let y), .doubleClick(let x, let y), .rightClick(let x, let y), .tripleClick(let x, let y):
-            audit("sandbox.act", "click (\(Int(x)),\(Int(topLeftY(y))))")
-            await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: topLeftY(y))
+            guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("click"))
+                return
+            }
+            let result = await actuator.execute(.click(x: Double(point.x), y: Double(point.y)))
+            audit("sandbox.act", result.auditDetail)
         case .drag(_, _, let toX, let toY):
             // No real drag in the JS bridge — landing on the destination is the
             // closest meaningful approximation.
-            await sandbox.click(xTopLeft: CGFloat(toX), yTopLeft: topLeftY(toY))
+            guard let point = Self.sandboxTopLeftPoint(x: toX, y: toY) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("drag"))
+                return
+            }
+            let result = await actuator.execute(.drag(
+                fromX: Double(point.x), fromY: Double(point.y),
+                toX: Double(point.x), toY: Double(point.y)
+            ))
+            audit("sandbox.act", result.auditDetail)
         case .move(let x, let y):
-            await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: topLeftY(y))
+            guard let point = Self.sandboxTopLeftPoint(x: x, y: y) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("move"))
+                return
+            }
+            let result = await actuator.execute(.move(x: Double(point.x), y: Double(point.y)))
+            audit("sandbox.act", result.auditDetail)
         case .type(let text):
-            audit("sandbox.act", "type \"\(text.prefix(40))\"")
-            await sandbox.typeText(text)
+            let result = await actuator.execute(.typeText(text))
+            audit("sandbox.act", result.auditDetail)
         case .key(let combo):
-            audit("sandbox.act", "key \(combo)")
-            await sandbox.pressKey(combo)
+            let parsed = Self.parseKeyCombo(combo)
+            let result = await actuator.execute(.key(parsed.key, modifiers: parsed.modifiers))
+            audit("sandbox.act", result.auditDetail)
         case .scroll(_, _, let direction, let amount):
-            let magnitude = CGFloat(max(1, amount)) * 120
-            await sandbox.scroll(dy: direction.lowercased() == "up" ? -magnitude : magnitude)
+            guard let delta = Self.sandboxScrollDelta(direction: direction, amount: amount) else {
+                audit("sandbox.act", Self.invalidCoordinateDetail("scroll"))
+                return
+            }
+            let result = await actuator.execute(.scroll(deltaX: 0, deltaY: Double(delta)))
+            audit("sandbox.act", result.auditDetail)
         case .wait:
             try? await Task.sleep(for: .milliseconds(600))
         case .screenshot, .zoom:
@@ -826,21 +1016,216 @@ public final class BackgroundWebAgent {
         case .openApp:
             break  // no apps inside the web sandbox
         case .openURL(let urlString):
-            audit("sandbox.act", "open \(urlString.prefix(60))")
-            await sandbox.navigate(to: urlString)
-            try? await Task.sleep(for: .milliseconds(800))  // let the page start rendering
+            let result = await actuator.execute(.openURL(urlString))
+            audit("sandbox.act", result.auditDetail)
         }
     }
 
-    /// A short readable summary of a tool's input for the audit trail.
-    private static func argSummary(_ input: [String: Any]) -> String {
-        for key in ["text", "field", "url", "query"] {
-            if let v = input[key] as? String, !v.isEmpty {
-                let value = (input["value"] as? String).map { " = \"\($0.prefix(30))\"" } ?? ""
-                return "\"\(v.prefix(40))\"\(value)"
-            }
+    nonisolated static func parseKeyCombo(_ combo: String) -> (key: String, modifiers: [String]) {
+        let parts = combo
+            .split(separator: "+")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let key = parts.last else { return (combo, []) }
+        return (key, Array(parts.dropLast()))
+    }
+
+    nonisolated static func sandboxTopLeftPoint(x: Double, y: Double) -> (x: Int, y: Int)? {
+        guard x.isFinite, y.isFinite else { return nil }
+        let topLeftY = CGFloat(SandboxCoordinate.pageMaxY) - CGFloat(y)
+        return SandboxCoordinate.pagePoint(x: CGFloat(x), y: topLeftY)
+    }
+
+    nonisolated static func sandboxScrollDelta(direction: String, amount: Int) -> Int? {
+        guard amount < Int.max / 120 else { return nil }
+        let magnitude = CGFloat(max(1, amount)) * 120
+        let signed = direction.lowercased() == "up" ? -magnitude : magnitude
+        return SandboxCoordinate.scrollDelta(signed)
+    }
+
+    nonisolated static func invalidCoordinateDetail(_ action: String) -> String {
+        "invalid-coordinate action=\(action)"
+    }
+
+    nonisolated static func sandboxActionAuditDescriptor(_ action: CUAction) -> String {
+        switch action {
+        case .type(let text):
+            return "action=type textChars=\(text.count) textHash=\(auditHash(text)) status=ok"
+        case .openURL(let url):
+            return "action=open_url urlChars=\(url.count) urlHash=\(auditHash(url)) status=ok"
+        case .key(let combo):
+            return "action=key comboChars=\(combo.count) comboHash=\(auditHash(combo)) status=ok"
+        case .click, .doubleClick, .rightClick, .tripleClick:
+            return sandboxActionAuditDescriptor(actionKind: "click")
+        case .drag:
+            return sandboxActionAuditDescriptor(actionKind: "drag")
+        case .move:
+            return sandboxActionAuditDescriptor(actionKind: "move")
+        case .scroll:
+            return sandboxActionAuditDescriptor(actionKind: "scroll")
+        case .wait:
+            return sandboxActionAuditDescriptor(actionKind: "wait")
+        case .screenshot:
+            return sandboxActionAuditDescriptor(actionKind: "screenshot")
+        case .zoom:
+            return sandboxActionAuditDescriptor(actionKind: "zoom")
+        case .highlight:
+            return sandboxActionAuditDescriptor(actionKind: "highlight")
+        case .openApp:
+            return sandboxActionAuditDescriptor(actionKind: "open_app")
         }
-        return ""
+    }
+
+    nonisolated static func sandboxActionAuditDescriptor(actionKind: String, status: String = "ok") -> String {
+        "action=\(safeAuditToken(actionKind)) status=\(safeAuditToken(status))"
+    }
+
+    nonisolated static func sandboxToolAuditDescriptor(name: String, input: [String: Any], result: String) -> String {
+        var parts = [
+            "tool=\(safeAuditToken(name))",
+            "status=\(safeToolStatus(result))",
+        ]
+        if let target = firstString(input, keys: ["text", "field", "target"]) {
+            parts.append("targetChars=\(target.count)")
+            parts.append("targetHash=\(auditHash(target))")
+        }
+        if let value = input["value"] as? String {
+            parts.append("valueChars=\(value.count)")
+            parts.append("valueHash=\(auditHash(value))")
+        }
+        if let url = input["url"] as? String {
+            parts.append("urlChars=\(url.count)")
+            parts.append("urlHash=\(auditHash(url))")
+        }
+        let canonical = canonicalAuditInput(input)
+        if !canonical.isEmpty {
+            parts.append("inputHash=\(auditHash(canonical))")
+        }
+        parts.append("resultChars=\(result.count)")
+        parts.append("resultHash=\(auditHash(result))")
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func observationAuditDescriptor(tool: String, info: InjectionGuard.EnvelopeAuditInfo) -> String {
+        var parts = [
+            "tool=\(safeAuditToken(tool))",
+            "trust=\(safeAuditToken(info.trust.rawValue))",
+            "sourceHash=\(auditHash(info.source))",
+            "payloadHash=\(safeAuditToken(info.payloadHash))",
+            "score=\(info.injectionScore)",
+        ]
+        if !info.injectionReasons.isEmpty {
+            parts.append("reasons=\(info.injectionReasons.map(safeAuditToken).joined(separator: ","))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func sandboxTurnAuditDescriptor(_ text: String) -> String {
+        "status=message textChars=\(text.count) textHash=\(auditHash(text))"
+    }
+
+    nonisolated static func sandboxStalledAuditDescriptor(_ text: String) -> String {
+        "status=stalled textChars=\(text.count) textHash=\(auditHash(text))"
+    }
+
+    nonisolated static func sandboxGroundAuditDescriptor(_ detail: String) -> String {
+        "status=hit targetChars=\(detail.count) targetHash=\(auditHash(detail))"
+    }
+
+    nonisolated static func sandboxGroundMissAuditDescriptor(_ target: String) -> String {
+        "status=miss targetChars=\(target.count) targetHash=\(auditHash(target))"
+    }
+
+    nonisolated static func sandboxVerifyAuditDescriptor(status: String, detail: String) -> String {
+        let postEffect = status == "verified" ? "verified" : "mismatch"
+        return "status=\(safeAuditToken(status)) postEffect=\(postEffect) expectedEffect=page_state resultChars=\(detail.count) resultHash=\(auditHash(detail))"
+    }
+
+    nonisolated static func sandboxNoEffectAuditDescriptor(status: String, streak: Int) -> String {
+        let action = recoveryAction(for: .noEffect, attempt: streak)
+        return "status=\(safeAuditToken(status)) postEffect=mismatch expectedEffect=page_state noEffectStreak=\(streak) recoveryAction=\(safeAuditToken(action.rawValue))"
+    }
+
+    nonisolated static func sandboxReplanAuditDescriptor(
+        failureKind: AgentOrchestrator.AgentFailureKind,
+        recoveryAction: RecoveryAction,
+        status: String,
+        reason: String
+    ) -> String {
+        [
+            "status=\(safeAuditToken(status))",
+            "failureKind=\(safeAuditToken(failureKind.rawValue))",
+            "recoveryAction=\(safeAuditToken(recoveryAction.rawValue))",
+            "reasonChars=\(reason.count)",
+            "reasonHash=\(auditHash(reason))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func sandboxDoneAuditDescriptor(
+        status: String,
+        acted: Bool,
+        detail: String? = nil,
+        detailName: String = "result",
+        recoveryAction: RecoveryAction? = nil
+    ) -> String {
+        var parts = ["status=\(safeAuditToken(status))", "acted=\(acted)"]
+        if let recoveryAction {
+            parts.append("recoveryAction=\(safeAuditToken(recoveryAction.rawValue))")
+        }
+        if let detail {
+            let prefix = safeAuditToken(detailName)
+            parts.append("\(prefix)Chars=\(detail.count)")
+            parts.append("\(prefix)Hash=\(auditHash(detail))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func recoveryAction(
+        for failureKind: AgentOrchestrator.AgentFailureKind,
+        attempt: Int
+    ) -> RecoveryAction {
+        let plan = AgentRecoveryPolicy.plan(for: failureKind)
+        let rungs = plan.retryRungs
+        let index = max(0, attempt - 1)
+        guard rungs.indices.contains(index) else { return plan.terminal }
+        return rungs[index]
+    }
+
+    nonisolated static func recoveryAttemptLimit(for failureKind: AgentOrchestrator.AgentFailureKind) -> Int {
+        AgentRecoveryPolicy.plan(for: failureKind).retryRungs.count + 1
+    }
+
+    nonisolated private static func firstString(_ input: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = input[key] as? String, !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    nonisolated private static func canonicalAuditInput(_ input: [String: Any]) -> String {
+        input.keys.sorted()
+            .map { key in "\(key)=\(String(describing: input[key] ?? ""))" }
+            .joined(separator: "\u{1f}")
+    }
+
+    nonisolated private static func safeToolStatus(_ result: String) -> String {
+        let lower = result.lowercased()
+        if lower.contains("unknown") || lower.contains(" needs ") || lower.hasPrefix("needs ")
+            || lower.contains("couldn't") || lower.contains("not found") {
+            return "error"
+        }
+        return "ok"
+    }
+
+    nonisolated private static func safeAuditToken(_ value: String) -> String {
+        let token = value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-"
+        }
+        return token.isEmpty ? "unknown" : token
+    }
+
+    nonisolated private static func auditHash(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 
     /// What a finished model turn means, BEFORE page-verification. Kept pure (no I/O)

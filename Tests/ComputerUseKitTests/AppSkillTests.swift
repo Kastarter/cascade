@@ -90,6 +90,20 @@ struct AppSkillTests {
         #expect(skill?.hints.inputPolicies.first?.maxLength == 12)
     }
 
+    @Test func parsesGroundingRuntimeHints() {
+        let markdown = blenderFixture.replacingOccurrences(
+            of: "\"keysFollowPointer\": true",
+            with: """
+            "keysFollowPointer": true,
+              "targetAliases": {"Title placeholder": ["title box", "heading field"]},
+              "preferredGroundingSource": "ocr"
+            """
+        )
+        let skill = parsed(markdown)
+        #expect(skill?.hints.targetAliases["Title placeholder"] == ["title box", "heading field"])
+        #expect(skill?.hints.preferredGroundingSource == "ocr")
+    }
+
     @Test func acceptsTipTourFenceWithUnknownKeys() {
         let skill = parsed(tiptourFixture)
         #expect(skill != nil)
@@ -174,6 +188,17 @@ struct AppSkillTests {
         #expect(skill.matches(appName: "blender", bundleIdentifier: nil))
         #expect(!skill.matches(appName: "Finder", bundleIdentifier: nil))
         #expect(!skill.matches(appName: nil, bundleIdentifier: nil))
+    }
+
+    @Test func relevanceCombinesAppMatchAndActionShape() throws {
+        let skill = try #require(parsed(blenderFixture.replacingOccurrences(
+            of: "description: Drives Blender's modal keyboard workflows.",
+            with: "description: Drives Blender modal keyboard workflows for numeric input."
+        )))
+
+        #expect(skill.relevance(appName: "Blender", bundleIdentifier: nil, actionLabels: ["press numeric input"]) > 0.7)
+        #expect(skill.relevance(appName: "Blender", bundleIdentifier: nil, actionLabels: ["click toolbar"]) >= 0.6)
+        #expect(skill.relevance(appName: "Safari", bundleIdentifier: nil, actionLabels: ["press numeric input"]) == 0)
     }
 
     @Test func numericModalTextUsesPhysicalKeys() throws {
@@ -294,6 +319,58 @@ struct AppSkillTests {
         #expect(flagged?.explicitAskOnly == true)
         // Absent flag defaults to an always-available skill.
         #expect(parsed(blenderFixture)?.explicitAskOnly == false)
+    }
+
+    @Test func lifecycleMetadataParsesAndArchivedSkillsDoNotSurface() throws {
+        let archived = """
+        ---
+        name: archived-mail
+        description: Old mail workflow.
+        useWhen: Send archived mail updates
+        version: 3
+        parentSkills: ["mail-v2"]
+        sourceCaseIDs: ["101", "102"]
+        lastVerifiedAt: 2026-06-29T12:00:00Z
+        successCount: 4
+        failureCount: 1
+        riskClass: medium
+        status: archived
+        ---
+
+        # Archived Mail
+
+        ```cascade-runtime-hints
+        {"appMatchers":{"names":["Mail"]}}
+        ```
+        """
+        let active = """
+        ---
+        name: active-mail
+        description: Current mail workflow.
+        status: active
+        ---
+
+        # Active Mail
+
+        ```cascade-runtime-hints
+        {"appMatchers":{"names":["Mail"]}}
+        ```
+        """
+        let archivedSkill = try #require(parsed(archived, path: "/tmp/skills/archived-mail/SKILL.md"))
+        let activeSkill = try #require(parsed(active, path: "/tmp/skills/active-mail/SKILL.md"))
+        let registry = AppSkillRegistry(skills: [archivedSkill, activeSkill])
+
+        #expect(archivedSkill.version == 3)
+        #expect(archivedSkill.parentSkills == ["mail-v2"])
+        #expect(archivedSkill.sourceCaseIDs == ["101", "102"])
+        #expect(archivedSkill.successCount == 4)
+        #expect(archivedSkill.failureCount == 1)
+        #expect(archivedSkill.riskClass == "medium")
+        #expect(archivedSkill.status == .archived)
+        #expect(!archivedSkill.isActive)
+        #expect(registry.skill(named: "archived-mail") == nil)
+        #expect(registry.skill(appName: "Mail", bundleIdentifier: nil)?.name == "active-mail")
+        #expect(registry.indexText?.contains("archived-mail") == false)
     }
 
     @Test func goalAsksForScriptOnlyOnExplicitWording() {

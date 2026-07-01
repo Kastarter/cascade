@@ -40,11 +40,12 @@ private func makeStore() throws -> CascadeStore {
 private func copyPasteEvents() -> [InputEvent] {
     var events: [InputEvent] = []
     var i = 0
-    for _ in 0..<2 {
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
+    for run in 0..<3 {
+        let start = TimeInterval(run * 300)
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 8), kind: .key, key: "c", modifiers: ["command"], appName: "Mail")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 16), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 24), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
     }
     return events
 }
@@ -229,7 +230,39 @@ func curatorPromptFlagsParametersThatChangeEachRun() async {
     let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
     _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture)).curate([parameterized])
     let prompt = await capture.lastUser
-    #expect(prompt.contains("1 value(s) change each run"))
+    #expect(prompt.contains("parameter field (freeText) changes each run"))
+    #expect(!prompt.contains("report-q1"))
+}
+
+@Test
+func curatorPromptUsesPrivacySafeFieldAwareParameterMetadata() async {
+    let capture = PromptCapture()
+    let parameterized = DetectedWaste(
+        title: "Update invoice", apps: ["Books"], occurrences: 3,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 60,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .click, x: 1, y: 1, appName: "Books", ocrAnchor: "Invoice number"),
+            RecipeStep(
+                order: 1,
+                kind: .type,
+                text: "INV-001",
+                appName: "Books",
+                isParameter: true,
+                parameterKey: "invoice_number",
+                parameterKind: .number,
+                valueExamples: ["number:AAA-000"],
+                valueHashes: ["abc123"],
+                sourceStepIDs: [0]
+            ),
+        ]),
+        evidence: [1], confidence: 0.7, signature: "param-sig"
+    )
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
+    _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture)).curate([parameterized])
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("parameter Invoice Number (number) changes each run"))
+    #expect(prompt.contains("earlier selected/copied value"))
+    #expect(!prompt.contains("INV-001"))
 }
 
 @Test

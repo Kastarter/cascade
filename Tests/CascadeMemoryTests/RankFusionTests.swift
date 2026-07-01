@@ -35,7 +35,7 @@ func rrfHonorsLimitAndEmptyInputs() {
     #expect(RankFusion.reciprocalRankFusion([[1, 2, 3, 4, 5]], limit: 2) == [1, 2])
     #expect(RankFusion.reciprocalRankFusion([[1, 2, 3]], limit: 0) == [])
     #expect(RankFusion.reciprocalRankFusion([[], []], limit: 10) == [])
-    #expect(RankFusion.reciprocalRankFusion([], limit: 10) == [])
+    #expect(RankFusion.reciprocalRankFusion([[Int64]](), limit: 10) == [])
 }
 
 @Test
@@ -44,4 +44,23 @@ func rrfDedupesAcrossLanesIntoOneEntry() {
     let fused = RankFusion.reciprocalRankFusion([[1, 2], [2, 1]], limit: 10)
     #expect(fused.count == 2)
     #expect(Set(fused) == [1, 2])
+}
+
+@Test
+func rrfCandidateProvenancePreservesOrderingAndLaneRanks() {
+    let fused = RankFusion.reciprocalRankFusion([
+        .init(.lexical, ids: [1, 2, 3]),
+        .init(.vector, ids: [3, 4, 1]),
+    ], limit: 10)
+
+    #expect(fused.map(\.id) == RankFusion.reciprocalRankFusion([[1, 2, 3], [3, 4, 1]], limit: 10))
+    let top = fused[0]
+    #expect(top.id == 3)
+    #expect(top.lexicalRank == 2)
+    #expect(top.vectorRank == 0)
+    #expect(top.memoryRank == nil)
+    let expected = (1.0 / 63.0) + (1.0 / 61.0)
+    #expect(abs(top.finalScore - expected) < 0.000_000_001)
+    #expect(top.contributions.contains { $0.lane == .lexical && $0.rank == 2 })
+    #expect(top.contributions.contains { $0.lane == .vector && $0.rank == 0 })
 }

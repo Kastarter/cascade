@@ -1,6 +1,329 @@
 import AppKit
 import Foundation
 
+/// Provenance for a grounded target candidate. Kept small and Codable so later
+/// routing/verifier code can compare AX/DOM/OCR/cache/model hits without parsing
+/// ad hoc strings.
+public enum GroundingSource: String, Codable, Equatable, Sendable {
+    case accessibility
+    case dom
+    case ocr
+    case uiTars
+    case claude
+    case cache
+    case visualModel
+    case compatibility
+    case unknown
+}
+
+/// Coordinate convention used by a grounding candidate's point/region.
+public enum GroundingCoordinateSpace: String, Codable, Equatable, Sendable {
+    /// Display-local AppKit points, bottom-left origin; this is the executor's click space.
+    case displayLocalAppKitPoints
+    /// Pixel coordinates in the screenshot/model image, top-left origin.
+    case screenshotPixelsTopLeft
+    /// 0...1000 model-normalized coordinates, top-left origin.
+    case normalizedThousandths
+    /// Web viewport CSS pixels, top-left origin.
+    case viewportCSSPixelsTopLeft
+    case unknown
+}
+
+/// A candidate shown to a model with a visible Set-of-Mark label. ProviderKit keeps
+/// this shape independent of ComputerUseKit so prompt/parse code can use it without
+/// depending on AX/OCR inventory construction.
+public struct MarkedGroundingCandidate: Codable, Equatable, Sendable {
+    public let id: String
+    public let markNumber: Int
+    public let label: String
+    public let role: String
+    public let source: GroundingSource
+    public let confidence: Double
+    public let isSafeToClick: Bool
+    public let displayBounds: CGRect
+    public let imageBounds: CGRect?
+
+    public init(
+        id: String,
+        markNumber: Int,
+        label: String,
+        role: String,
+        source: GroundingSource,
+        confidence: Double,
+        isSafeToClick: Bool,
+        displayBounds: CGRect,
+        imageBounds: CGRect? = nil
+    ) {
+        self.id = id
+        self.markNumber = markNumber
+        self.label = label
+        self.role = role
+        self.source = source
+        self.confidence = confidence
+        self.isSafeToClick = isSafeToClick
+        self.displayBounds = displayBounds
+        self.imageBounds = imageBounds
+    }
+
+    public var center: CGPoint {
+        CGPoint(x: displayBounds.midX, y: displayBounds.midY)
+    }
+}
+
+/// One possible grounding answer for a named UI target.
+public struct GroundingCandidate: Codable, Equatable, Sendable {
+    public let point: CGPoint?
+    public let region: CGRect?
+    public let confidence: Double
+    public let source: GroundingSource
+    public let coordinateSpace: GroundingCoordinateSpace
+    public let rawModel: String?
+    public let latency: TimeInterval?
+    public let dispersion: Double?
+    public let reason: String?
+    public let candidateID: String?
+    public let markNumber: Int?
+    public let displayBounds: CGRect?
+    public let imageBounds: CGRect?
+    public let role: String?
+    public let label: String?
+    public let nearbyOCRText: String?
+    public let ocrDistancePoints: Double?
+    public let agreeingSources: [GroundingSource]
+
+    enum CodingKeys: String, CodingKey {
+        case point
+        case region
+        case confidence
+        case source
+        case coordinateSpace
+        case rawModel
+        case latency
+        case dispersion
+        case reason
+        case candidateID
+        case markNumber
+        case displayBounds
+        case imageBounds
+        case role
+        case label
+        case nearbyOCRText
+        case ocrDistancePoints
+        case agreeingSources
+    }
+
+    public init(
+        point: CGPoint?,
+        region: CGRect? = nil,
+        confidence: Double,
+        source: GroundingSource,
+        coordinateSpace: GroundingCoordinateSpace,
+        rawModel: String? = nil,
+        latency: TimeInterval? = nil,
+        dispersion: Double? = nil,
+        reason: String? = nil,
+        candidateID: String? = nil,
+        markNumber: Int? = nil,
+        displayBounds: CGRect? = nil,
+        imageBounds: CGRect? = nil,
+        role: String? = nil,
+        label: String? = nil,
+        nearbyOCRText: String? = nil,
+        ocrDistancePoints: Double? = nil,
+        agreeingSources: [GroundingSource] = []
+    ) {
+        self.point = point
+        self.region = region
+        self.confidence = confidence
+        self.source = source
+        self.coordinateSpace = coordinateSpace
+        self.rawModel = rawModel
+        self.latency = latency
+        self.dispersion = dispersion
+        self.reason = reason
+        self.candidateID = candidateID
+        self.markNumber = markNumber
+        self.displayBounds = displayBounds
+        self.imageBounds = imageBounds
+        self.role = role
+        self.label = label
+        self.nearbyOCRText = nearbyOCRText
+        self.ocrDistancePoints = ocrDistancePoints
+        self.agreeingSources = agreeingSources
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.point = try container.decodeIfPresent(CGPoint.self, forKey: .point)
+        self.region = try container.decodeIfPresent(CGRect.self, forKey: .region)
+        self.confidence = try container.decode(Double.self, forKey: .confidence)
+        self.source = try container.decode(GroundingSource.self, forKey: .source)
+        self.coordinateSpace = try container.decode(GroundingCoordinateSpace.self, forKey: .coordinateSpace)
+        self.rawModel = try container.decodeIfPresent(String.self, forKey: .rawModel)
+        self.latency = try container.decodeIfPresent(TimeInterval.self, forKey: .latency)
+        self.dispersion = try container.decodeIfPresent(Double.self, forKey: .dispersion)
+        self.reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        self.candidateID = try container.decodeIfPresent(String.self, forKey: .candidateID)
+        self.markNumber = try container.decodeIfPresent(Int.self, forKey: .markNumber)
+        self.displayBounds = try container.decodeIfPresent(CGRect.self, forKey: .displayBounds)
+        self.imageBounds = try container.decodeIfPresent(CGRect.self, forKey: .imageBounds)
+        self.role = try container.decodeIfPresent(String.self, forKey: .role)
+        self.label = try container.decodeIfPresent(String.self, forKey: .label)
+        self.nearbyOCRText = try container.decodeIfPresent(String.self, forKey: .nearbyOCRText)
+        self.ocrDistancePoints = try container.decodeIfPresent(Double.self, forKey: .ocrDistancePoints)
+        self.agreeingSources = try container.decodeIfPresent([GroundingSource].self, forKey: .agreeingSources) ?? []
+    }
+}
+
+/// Structured grounding output. The legacy point API reads `legacyPoint`, while
+/// newer routing/verifier code can inspect every candidate and why it was chosen.
+public struct GroundingResult: Codable, Equatable, Sendable {
+    public let candidates: [GroundingCandidate]
+    public let selectedIndex: Int?
+    public let selectedCandidateID: String?
+    public let verifierVerdict: GroundingVerifierVerdict?
+    public let verifierFailureKind: GroundingVerifierFailureKind?
+    public let alternativeCount: Int
+
+    public init(
+        candidates: [GroundingCandidate] = [],
+        selectedIndex: Int? = nil,
+        selectedCandidateID: String? = nil,
+        verifierVerdict: GroundingVerifierVerdict? = nil,
+        verifierFailureKind: GroundingVerifierFailureKind? = nil,
+        alternativeCount: Int? = nil
+    ) {
+        self.candidates = candidates
+        self.selectedIndex = selectedIndex
+        self.selectedCandidateID = selectedCandidateID
+            ?? selectedIndex.flatMap { candidates.indices.contains($0) ? candidates[$0].candidateID : nil }
+        self.verifierVerdict = verifierVerdict
+        self.verifierFailureKind = verifierFailureKind
+        self.alternativeCount = alternativeCount ?? max(0, candidates.count - (selectedIndex == nil ? 0 : 1))
+    }
+
+    public var selectedCandidate: GroundingCandidate? {
+        guard let selectedIndex, candidates.indices.contains(selectedIndex) else { return nil }
+        return candidates[selectedIndex]
+    }
+
+    public var selectedPoint: CGPoint? {
+        guard !isAbstainedOrRejected else { return nil }
+        return selectedCandidate?.point
+    }
+
+    public var legacyPoint: CGPoint? {
+        selectedPoint
+    }
+
+    public var isAbstainedOrRejected: Bool {
+        verifierVerdict == .abstain || verifierVerdict == .reject
+    }
+
+    public func isActionable(minConfidence: Double = 0.30) -> Bool {
+        guard let candidate = selectedCandidate, candidate.point != nil else { return false }
+        guard !isAbstainedOrRejected else { return false }
+        return candidate.confidence >= minConfidence
+    }
+
+    public var abstainReason: String? {
+        if let verifierFailureKind, verifierVerdict == .abstain || verifierVerdict == .reject {
+            return verifierFailureKind.rawValue
+        }
+        return selectedCandidate?.reason
+    }
+
+    public static func legacy(
+        point: CGPoint?,
+        source: GroundingSource = .compatibility,
+        coordinateSpace: GroundingCoordinateSpace = .displayLocalAppKitPoints,
+        latency: TimeInterval? = nil
+    ) -> GroundingResult {
+        return GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: point,
+                    confidence: point == nil ? 0 : 1,
+                    source: source,
+                    coordinateSpace: coordinateSpace,
+                    latency: latency
+                )
+            ],
+            selectedIndex: 0
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case candidates
+        case selectedIndex
+        case selectedCandidateID
+        case verifierVerdict
+        case verifierFailureKind
+        case alternativeCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let candidates = try container.decodeIfPresent([GroundingCandidate].self, forKey: .candidates) ?? []
+        let selectedIndex = try container.decodeIfPresent(Int.self, forKey: .selectedIndex)
+        self.init(
+            candidates: candidates,
+            selectedIndex: selectedIndex,
+            selectedCandidateID: try container.decodeIfPresent(String.self, forKey: .selectedCandidateID),
+            verifierVerdict: try container.decodeIfPresent(GroundingVerifierVerdict.self, forKey: .verifierVerdict),
+            verifierFailureKind: try container.decodeIfPresent(GroundingVerifierFailureKind.self, forKey: .verifierFailureKind),
+            alternativeCount: try container.decodeIfPresent(Int.self, forKey: .alternativeCount)
+        )
+    }
+}
+
+public struct GroundingRequestOptions: Equatable, Sendable {
+    public let sampleCount: Int
+    public let maxDispersion: Double
+    public let minimumConfidence: Double
+    public let risk: GroundingActionRisk
+    public let priorityRegions: [CGRect]
+    public let useRegionBudgeting: Bool
+    public let hostedMode: Bool
+
+    public init(
+        sampleCount: Int = 1,
+        maxDispersion: Double = 28,
+        minimumConfidence: Double = 0.30,
+        risk: GroundingActionRisk = .normal,
+        priorityRegions: [CGRect] = [],
+        useRegionBudgeting: Bool = false,
+        hostedMode: Bool = true
+    ) {
+        self.sampleCount = max(1, min(sampleCount, 5))
+        self.maxDispersion = max(1, maxDispersion)
+        self.minimumConfidence = max(0, min(1, minimumConfidence))
+        self.risk = risk
+        self.priorityRegions = priorityRegions
+        self.useRegionBudgeting = useRegionBudgeting
+        self.hostedMode = hostedMode
+    }
+
+    public static let `default` = GroundingRequestOptions()
+
+    public static func highRisk(priorityRegions: [CGRect] = []) -> GroundingRequestOptions {
+        GroundingRequestOptions(
+            sampleCount: 3,
+            maxDispersion: 24,
+            minimumConfidence: 0.72,
+            risk: .high,
+            priorityRegions: priorityRegions
+        )
+    }
+}
+
+public enum GroundingActionRisk: String, Codable, Equatable, Sendable {
+    case normal
+    case visual
+    case high
+    case destructive
+}
+
 // MARK: - Grounding split (Phase 1 of the model-downgrade roadmap)
 //
 // The field consensus — and Cascade's own audited finding — is that *grounding*
@@ -34,6 +357,23 @@ public protocol VisualGrounder: Sendable {
         displayHeightPoints: Int
     ) async -> CGPoint?
 
+    /// Structured grounding output for verifier/routing code. Existing point-only
+    /// grounders inherit the compatibility wrapper in the protocol extension.
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult
+
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult
+
     /// Locates a target as a REGION to frame (the "where is X" marching-ants
     /// highlight) — display-local AppKit rect + a short spoken line. Returns nil
     /// when this grounder can't produce one (unreachable, or not implemented), so
@@ -44,15 +384,69 @@ public protocol VisualGrounder: Sendable {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> ElementRegion?
+
+    /// Optional Set-of-Mark path. Conformers that can ask the model to choose a mark
+    /// return a selected candidate directly; others inherit the empty fallback.
+    func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult
 }
 
 public extension VisualGrounder {
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+    }
+
+    func groundResult(
+        screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
+    ) async -> GroundingResult {
+        let start = ContinuousClock.now
+        let point = await ground(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+        let elapsed = start.duration(to: ContinuousClock.now)
+        return GroundingResult.legacy(point: point, latency: elapsed.timeInterval)
+    }
+
     /// Default: no region grounding (the caller falls back to ElementLocator). The
     /// Claude grounder uses this default on purpose — the fallback IS its engine,
     /// at full quality (tight box + spoken line + conversation context).
     func groundRegion(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> ElementRegion? { nil }
+
+    func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult { GroundingResult() }
+}
+
+private extension Duration {
+    var timeInterval: TimeInterval {
+        let components = self.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
+    }
 }
 
 // MARK: - Claude-backed grounder (the proven engine, as a fallback)
@@ -79,6 +473,22 @@ public struct ClaudeVisualGrounder: VisualGrounder {
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         ).point
+    }
+
+    public func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult {
+        await locator.guide(
+            screenshot: screenshot,
+            question: "click \(target)",
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            markedCandidates: candidates
+        ).result
     }
 }
 
@@ -115,7 +525,7 @@ public enum GUIGrounderModel {
 public struct UITARSGrounder: VisualGrounder {
     /// How the served model encodes the coordinates it returns. A swapped grounder
     /// read in the wrong space misses every click, so this is explicit + unit-pinned.
-    public enum CoordSpace: String, Sendable {
+    public enum CoordSpace: String, Codable, Equatable, CaseIterable, Sendable {
         /// UI-TARS / Qwen2.5-VL: absolute pixels in the SMART-RESIZED image space
         /// (the proven default — coords come back in `smartResize(sent)` space).
         case smartResize
@@ -131,6 +541,7 @@ public struct UITARSGrounder: VisualGrounder {
     private let apiKey: String?
     private let coordSpace: CoordSpace
     private let session: URLSession
+    private let enableRegionBudgeting: Bool
 
     /// - Parameters:
     ///   - baseURL: OpenAI-compatible chat-completions endpoint. Defaults to the
@@ -142,12 +553,14 @@ public struct UITARSGrounder: VisualGrounder {
         model: String = "ui-tars-1.5-7b",
         apiKey: String? = nil,
         coordSpace: CoordSpace = .smartResize,
+        enableRegionBudgeting: Bool = false,
         session: URLSession = .shared
     ) {
         self.endpoint = baseURL
         self.model = model
         self.apiKey = apiKey
         self.coordSpace = coordSpace
+        self.enableRegionBudgeting = enableRegionBudgeting
         self.session = session
     }
 
@@ -157,29 +570,205 @@ public struct UITARSGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) async -> CGPoint? {
-        // Resize to the same Anthropic-recommended resolution the rest of the agent
-        // declares, so coords come back in a known image space (frames captured at
-        // this size pass through untouched). UI-TARS-1.5-7B emits ABSOLUTE pixel
-        // coords in the input image's space.
-        let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
-        guard let jpeg = Self.resizeJPEG(screenshot, toWidth: res.w, toHeight: res.h) else { return nil }
-        guard let content = await callModel(jpeg: jpeg, target: target, declaredW: res.w, declaredH: res.h) else {
-            return nil
-        }
-        guard let imagePoint = Self.parseBox(content) else { return nil }
-        // Map the model's coordinate into the sent image's pixel space per its coord
-        // convention, THEN scale to the display. UI-TARS (Qwen2.5-VL) emits in the
-        // SMART-RESIZED space (live-verified: a 1280×800 send yields coords in
-        // 1288×812; mapping through it lands to the pixel — bytedance/UI-TARS
-        // README_coordinates.md). A swapped Qwen3-VL grounder (UI-Venus-1.5 / Holo1.5)
-        // may emit in the sent space or 0–1000 instead — `coordSpace` selects which.
-        let space = Self.resolveImageSpace(
-            parsed: imagePoint, sentW: res.w, sentH: res.h, space: coordSpace
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ).selectedPoint
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        await groundResult(
+            screenshot: screenshot,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            options: .default
         )
-        return Self.toDisplayPoint(
+    }
+
+    public func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult {
+        let start = ContinuousClock.now
+        let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
+        guard let jpeg = prepareJPEG(
+            screenshot,
+            toWidth: res.w,
+            height: res.h,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            options: options
+        ) else { return GroundingResult() }
+
+        let sampleCount = options.sampleCount
+        var rawContents: [String] = []
+        var parsedPoints: [CGPoint] = []
+        for sample in 0..<sampleCount {
+            guard let content = await callModel(
+                jpeg: jpeg,
+                target: target,
+                declaredW: res.w,
+                declaredH: res.h,
+                temperature: sampleCount == 1 ? 0 : 0.1,
+                seed: sample
+            ) else {
+                continue
+            }
+            rawContents.append(content)
+            if let imagePoint = Self.parseBox(content) {
+                parsedPoints.append(imagePoint)
+            }
+        }
+
+        guard !rawContents.isEmpty else {
+            return GroundingResult()
+        }
+        guard !parsedPoints.isEmpty else {
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: nil,
+                        confidence: 0,
+                        source: .uiTars,
+                        coordinateSpace: .screenshotPixelsTopLeft,
+                        rawModel: rawContents.joined(separator: "\n---\n"),
+                        latency: start.duration(to: ContinuousClock.now).timeInterval,
+                        reason: "ui-tars parse miss samples=\(sampleCount)"
+                    )
+                ],
+                selectedIndex: 0,
+                verifierVerdict: .abstain,
+                verifierFailureKind: .missingPoint
+            )
+        }
+        let cluster = Self.cluster(points: parsedPoints)
+        let imagePoint = cluster.center
+        let space = Self.resolveImageSpace(
+            parsed: imagePoint,
+            sentW: res.w,
+            sentH: res.h,
+            space: coordSpace
+        )
+        let point = Self.toDisplayPoint(
             imagePoint: space.point,
-            imageW: space.imageW, imageH: space.imageH,
-            displayW: displayWidthPoints, displayH: displayHeightPoints
+            imageW: space.imageW,
+            imageH: space.imageH,
+            displayW: displayWidthPoints,
+            displayH: displayHeightPoints
+        )
+        let parseRate = Double(parsedPoints.count) / Double(sampleCount)
+        let dispersionOK = cluster.dispersion <= options.maxDispersion
+        let sampleAgreement = Double(cluster.points.count) / Double(max(1, parsedPoints.count))
+        let confidence = max(0, min(1, 0.62 + 0.18 * parseRate + 0.18 * sampleAgreement - min(0.30, cluster.dispersion / 180)))
+        let accepted = confidence >= options.minimumConfidence && (sampleCount == 1 || dispersionOK)
+        let reason = sampleCount == 1
+            ? "ui-tars coordinate"
+            : "ui-tars samples=\(sampleCount) accepted=\(cluster.points.count) dispersion=\(String(format: "%.1f", cluster.dispersion))"
+        return GroundingResult(
+            candidates: [
+                GroundingCandidate(
+                    point: point,
+                    confidence: confidence,
+                    source: .uiTars,
+                    coordinateSpace: .displayLocalAppKitPoints,
+                    rawModel: rawContents.joined(separator: "\n---\n"),
+                    latency: start.duration(to: ContinuousClock.now).timeInterval,
+                    dispersion: cluster.dispersion,
+                    reason: accepted ? reason : "\(reason) rejected",
+                    displayBounds: Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints)
+                )
+            ],
+            selectedIndex: 0,
+            verifierVerdict: accepted ? nil : .abstain,
+            verifierFailureKind: accepted ? nil : .lowEvidence
+        )
+    }
+
+    public func groundMarkedCandidate(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        candidates: [MarkedGroundingCandidate]
+    ) async -> GroundingResult {
+        guard !candidates.isEmpty else { return GroundingResult() }
+        let start = ContinuousClock.now
+        let res = AgentResolution.best(forWidth: displayWidthPoints, height: displayHeightPoints)
+        guard let jpeg = Self.resizeJPEG(screenshot, toWidth: res.w, toHeight: res.h) else { return GroundingResult() }
+        guard let content = await callModel(
+            jpeg: jpeg,
+            target: target,
+            declaredW: res.w,
+            declaredH: res.h,
+            prompt: Self.markPrompt(target: target, candidates: candidates)
+        ) else {
+            return GroundingResult()
+        }
+        let marks = Self.parseMarkIDs(content)
+        let selectedMarks = marks
+            .reduce(into: [Int]()) { acc, mark in
+                if !acc.contains(mark) { acc.append(mark) }
+            }
+            .prefix(3)
+        let selectedCandidates = selectedMarks.compactMap { mark in
+            candidates.first(where: { $0.markNumber == mark })
+        }
+        guard let selected = selectedCandidates.first else {
+            return GroundingResult(
+                candidates: [
+                    GroundingCandidate(
+                        point: nil,
+                        confidence: 0,
+                        source: .uiTars,
+                        coordinateSpace: .displayLocalAppKitPoints,
+                        rawModel: content,
+                        latency: start.duration(to: ContinuousClock.now).timeInterval,
+                        reason: "ui-tars mark parse miss"
+                    )
+                ],
+                selectedIndex: nil,
+                verifierVerdict: .abstain,
+                verifierFailureKind: .noCandidates,
+                alternativeCount: candidates.count
+            )
+        }
+        let groundingCandidates = selectedCandidates.map { candidate in
+            GroundingCandidate(
+                point: candidate.center,
+                region: candidate.displayBounds,
+                confidence: max(0.78, candidate.confidence),
+                source: candidate.source,
+                coordinateSpace: .displayLocalAppKitPoints,
+                rawModel: content,
+                latency: start.duration(to: ContinuousClock.now).timeInterval,
+                reason: "ranked Set-of-Mark \(candidate.markNumber)",
+                candidateID: candidate.id,
+                markNumber: candidate.markNumber,
+                displayBounds: candidate.displayBounds,
+                imageBounds: candidate.imageBounds,
+                role: candidate.role,
+                label: candidate.label,
+                nearbyOCRText: candidate.label,
+                ocrDistancePoints: 0,
+                agreeingSources: [candidate.source]
+            )
+        }
+        return GroundingResult(
+            candidates: groundingCandidates,
+            selectedIndex: 0,
+            selectedCandidateID: selected.id,
+            alternativeCount: max(0, candidates.count - groundingCandidates.count)
         )
     }
 
@@ -212,18 +801,36 @@ public struct UITARSGrounder: VisualGrounder {
         width: Int, height: Int,
         factor: Int = 28, minPixels: Int = 100 * 28 * 28, maxPixels: Int = 16384 * 28 * 28
     ) -> (w: Int, h: Int) {
-        let w = Double(max(1, width)), h = Double(max(1, height)), f = Double(factor)
-        func roundTo(_ v: Double) -> Int { Int((v / f).rounded()) * factor }
-        func floorTo(_ v: Double) -> Int { Int((v / f).rounded(.down)) * factor }
-        func ceilTo(_ v: Double) -> Int { Int((v / f).rounded(.up)) * factor }
-        var wb = max(factor, roundTo(w))
-        var hb = max(factor, roundTo(h))
-        if wb * hb > maxPixels {
-            let beta = (w * h / Double(maxPixels)).squareRoot()
-            wb = max(factor, floorTo(w / beta))
-            hb = max(factor, floorTo(h / beta))
-        } else if wb * hb < minPixels {
-            let beta = (Double(minPixels) / (w * h)).squareRoot()
+        let safeFactor = max(1, factor)
+        let safeMinPixels = max(1, minPixels)
+        let safeMaxPixels = max(1, maxPixels)
+        let w = Double(max(1, width)), h = Double(max(1, height)), f = Double(safeFactor)
+        func multiple(_ units: Double) -> Int {
+            guard units.isFinite else { return safeFactor }
+            let maxUnits = Int.max / safeFactor
+            if units <= 1 { return safeFactor }
+            if units >= Double(maxUnits) { return maxUnits * safeFactor }
+            return Int(units) * safeFactor
+        }
+        func roundTo(_ v: Double) -> Int { multiple((v / f).rounded()) }
+        func floorTo(_ v: Double) -> Int { multiple((v / f).rounded(.down)) }
+        func ceilTo(_ v: Double) -> Int { multiple((v / f).rounded(.up)) }
+        func productExceeds(_ lhs: Int, _ rhs: Int, _ limit: Int) -> Bool {
+            guard lhs > 0, rhs > 0 else { return false }
+            return lhs > limit / rhs
+        }
+        func productBelow(_ lhs: Int, _ rhs: Int, _ limit: Int) -> Bool {
+            guard lhs > 0, rhs > 0 else { return true }
+            return lhs <= (limit - 1) / rhs
+        }
+        var wb = max(safeFactor, roundTo(w))
+        var hb = max(safeFactor, roundTo(h))
+        if productExceeds(wb, hb, safeMaxPixels) {
+            let beta = (w * h / Double(safeMaxPixels)).squareRoot()
+            wb = max(safeFactor, floorTo(w / beta))
+            hb = max(safeFactor, floorTo(h / beta))
+        } else if productBelow(wb, hb, safeMinPixels) {
+            let beta = (Double(safeMinPixels) / (w * h)).squareRoot()
             wb = ceilTo(w * beta)
             hb = ceilTo(h * beta)
         }
@@ -247,7 +854,7 @@ public struct UITARSGrounder: VisualGrounder {
 
     /// A display-local AppKit rect framing a located point — ~12%×8% of the
     /// display, clamped on screen. Pure + pinned (a bad rect frames empty space).
-    static func boxAround(point: CGPoint, displayW: Int, displayH: Int) -> CGRect {
+    public static func boxAround(point: CGPoint, displayW: Int, displayH: Int) -> CGRect {
         let w = CGFloat(displayW) * 0.12
         let h = CGFloat(displayH) * 0.08
         let x = max(0, min(point.x - w / 2, CGFloat(displayW) - w))
@@ -268,7 +875,89 @@ public struct UITARSGrounder: VisualGrounder {
         """
     }
 
-    private func callModel(jpeg: Data, target: String, declaredW: Int, declaredH: Int) async -> String? {
+    static func markPrompt(target: String, candidates: [MarkedGroundingCandidate]) -> String {
+        let list = candidates.prefix(80).map {
+            "\($0.markNumber): \($0.label) [\($0.role), \($0.source.rawValue)]"
+        }.joined(separator: "\n")
+        return """
+        You are a GUI grounding model. The screenshot has visible numbered labels drawn \
+        on candidate UI elements. Locate the element described by:
+        "\(target)"
+        Choose up to three candidate marks ranked best-first from the list. Respond with \
+        ONLY compact JSON like {"marks": [7, 4, 9]}. If none matches, respond {"marks": []}.
+
+        Candidates:
+        \(list)
+        """
+    }
+
+    static func parseMarkID(_ text: String) -> Int? {
+        parseMarkIDs(text).first
+    }
+
+    static func parseMarkIDs(_ text: String) -> [Int] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let start = trimmed.firstIndex(of: "{"),
+           let end = trimmed.lastIndex(of: "}"),
+           let data = String(trimmed[start...end]).data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for key in ["marks", "ranked", "candidates"] {
+                if let values = json[key] as? [Any] {
+                    return values.compactMap(Self.parseMarkValue)
+                }
+            }
+            if let mark = json["mark"].flatMap(Self.parseMarkValue) { return [mark] }
+            if let mark = json["id"].flatMap(Self.parseMarkValue) { return [mark] }
+            return []
+        }
+        let pattern = #"(?i)\b(?:mark|id|#)?\s*(\d{1,4})\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = trimmed as NSString
+        return regex.matches(in: trimmed, range: NSRange(location: 0, length: ns.length))
+            .compactMap { match in
+                guard match.numberOfRanges > 1 else { return nil }
+                return Int(ns.substring(with: match.range(at: 1)))
+            }
+    }
+
+    private static func parseMarkValue(_ value: Any) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
+    }
+
+    private func prepareJPEG(
+        _ screenshot: Data,
+        toWidth width: Int,
+        height: Int,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) -> Data? {
+        if enableRegionBudgeting || options.useRegionBudgeting {
+            let budgeted = RegionBudgetedImage.composeJPEG(
+                screenshot: screenshot,
+                outputWidth: width,
+                outputHeight: height,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                priorityRegions: options.priorityRegions,
+                hostedMode: options.hostedMode
+            )
+            if let budgeted { return budgeted }
+        }
+        return Self.resizeJPEG(screenshot, toWidth: width, toHeight: height)
+    }
+
+    private func callModel(
+        jpeg: Data,
+        target: String,
+        declaredW: Int,
+        declaredH: Int,
+        prompt: String? = nil,
+        temperature: Double = 0,
+        seed: Int? = nil
+    ) async -> String? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         // Short per-attempt cap: grounding normally returns in ~1s, so a connection
@@ -286,18 +975,19 @@ public struct UITARSGrounder: VisualGrounder {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "authorization")
         }
         let dataURL = "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": 128,
-            "temperature": 0,
+            "temperature": temperature,
             "messages": [[
                 "role": "user",
                 "content": [
-                    ["type": "text", "text": Self.prompt(target: target)],
+                    ["type": "text", "text": prompt ?? Self.prompt(target: target)],
                     ["type": "image_url", "image_url": ["url": dataURL]],
                 ],
             ]],
         ]
+        if let seed { body["seed"] = seed }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         request.httpBody = bodyData
         // Hosted UI-TARS over OpenRouter hits transient TLS/connection failures
@@ -367,6 +1057,47 @@ public struct UITARSGrounder: VisualGrounder {
             return CGPoint(x: x, y: y)
         }
         return nil
+    }
+
+    struct SampleCluster: Equatable {
+        let points: [CGPoint]
+        let center: CGPoint
+        let dispersion: Double
+    }
+
+    static func cluster(points: [CGPoint], radius: Double = 32) -> SampleCluster {
+        guard let first = points.first else {
+            return SampleCluster(points: [], center: .zero, dispersion: .greatestFiniteMagnitude)
+        }
+        var best: [CGPoint] = []
+        for point in points {
+            let cluster = points.filter { hypot($0.x - point.x, $0.y - point.y) <= radius }
+            if cluster.count > best.count {
+                best = cluster
+            } else if cluster.count == best.count, !cluster.isEmpty {
+                let lhs = dispersion(of: cluster)
+                let rhs = dispersion(of: best)
+                if lhs < rhs { best = cluster }
+            }
+        }
+        if best.isEmpty { best = [first] }
+        let center = average(best)
+        return SampleCluster(points: best, center: center, dispersion: dispersion(of: best, center: center))
+    }
+
+    static func average(_ points: [CGPoint]) -> CGPoint {
+        guard !points.isEmpty else { return .zero }
+        let sum = points.reduce(CGPoint.zero) { partial, point in
+            CGPoint(x: partial.x + point.x, y: partial.y + point.y)
+        }
+        return CGPoint(x: sum.x / CGFloat(points.count), y: sum.y / CGFloat(points.count))
+    }
+
+    static func dispersion(of points: [CGPoint], center: CGPoint? = nil) -> Double {
+        guard !points.isEmpty else { return .greatestFiniteMagnitude }
+        let c = center ?? average(points)
+        let distances = points.map { hypot($0.x - c.x, $0.y - c.y) }
+        return distances.reduce(0, +) / Double(distances.count)
     }
 
     /// Runs `pattern` and returns capture groups 1...n as optional CGFloats

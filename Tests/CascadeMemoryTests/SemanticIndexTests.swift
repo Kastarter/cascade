@@ -1,5 +1,6 @@
 import CascadeMemory
 import Foundation
+import SQLite3
 import Testing
 
 private func makeSemanticStore() throws -> CascadeStore {
@@ -7,6 +8,13 @@ private func makeSemanticStore() throws -> CascadeStore {
         .appendingPathComponent("CascadeSemanticTests-\(UUID().uuidString).sqlite")
         .path
     return try CascadeStore(path: path)
+}
+
+private func makeSemanticStoreWithPath() throws -> (CascadeStore, String) {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeSemanticTests-\(UUID().uuidString).sqlite")
+        .path
+    return (try CascadeStore(path: path), path)
 }
 
 @Test
@@ -46,4 +54,49 @@ func pruneDropsEmbeddingsWithTheirMoments() async throws {
 
     let results = try await store.semanticContexts(matching: "quarterly planning", limit: 4)
     #expect(!results.contains { $0.id == old.id })
+}
+
+@Test
+func indexEmbeddingUsesRedactedTextForChunkDigests() async throws {
+    let (store, path) = try makeSemanticStoreWithPath()
+    let context = try await store.insert(RecordedContext(source: .screen, appName: "Mail", ocrText: "safe context"))
+    try await store.indexEmbedding(contextID: context.id, text: "Email jane@example.com about planning")
+
+    let storedDigest = rawInt64(path, "SELECT text_digest FROM context_chunk_embedding WHERE context_id = \(context.id) LIMIT 1;")
+    if let storedDigest {
+        #expect(storedDigest != testDigest("Email jane@example.com about planning"))
+        #expect(storedDigest == testDigest("Email <EMAIL> about planning"))
+    }
+}
+
+@Test
+func unindexedRecentContextsFindsTextRowsNeedingSemanticCatchUp() async throws {
+    let store = try makeSemanticStore()
+    let text = try await store.insert(RecordedContext(source: .screen, appName: "Notes", ocrText: "needs semantic catch up"))
+    _ = try await store.insert(RecordedContext(source: .screen, appName: "Blank", ocrText: nil))
+
+    let pending = try await store.unindexedRecentContexts(limit: 10)
+
+    #expect(pending.map(\.id).contains(text.id))
+    #expect(!pending.contains { $0.appName == "Blank" })
+}
+
+private func rawInt64(_ path: String, _ sql: String) -> Int64? {
+    var db: OpaquePointer?
+    guard sqlite3_open(path, &db) == SQLITE_OK else { return nil }
+    defer { sqlite3_close(db) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return sqlite3_column_int64(statement, 0)
+}
+
+private func testDigest(_ text: String) -> Int64 {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for byte in text.lowercased().utf8 {
+        hash ^= UInt64(byte)
+        hash &*= 0x100000001b3
+    }
+    return Int64(bitPattern: hash)
 }

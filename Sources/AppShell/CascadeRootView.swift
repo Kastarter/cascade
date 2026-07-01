@@ -3,6 +3,7 @@ import AppKit
 import CascadeDesignSystem
 import CascadeMemory
 import MacContextKit
+import ProviderKit
 import WasteDetection
 import SwiftUI
 
@@ -365,6 +366,23 @@ private struct OnboardingScreen: View {
                             .disabled(claudeKey.isEmpty)
                         }
                     }
+                    step(number: 4, title: "Personalize", done: true,
+                         detail: "Optional local defaults for when Cascade surfaces suggestions and whether browser agents should be favored.") {
+                        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                            Picker("Suggestion timing", selection: $model.suggestionTimingPreference) {
+                                Text("Early").tag(CascadeAppModel.SuggestionTimingPreference.early)
+                                Text("Balanced").tag(CascadeAppModel.SuggestionTimingPreference.balanced)
+                                Text("Strong evidence").tag(CascadeAppModel.SuggestionTimingPreference.strongEvidence)
+                            }
+                            .pickerStyle(.segmented)
+                            Picker("Background agents", selection: $model.backgroundAgentPreference) {
+                                Text("Prefer").tag(CascadeAppModel.BackgroundAgentPreference.prefer)
+                                Text("Ask first").tag(CascadeAppModel.BackgroundAgentPreference.askFirst)
+                                Text("Avoid").tag(CascadeAppModel.BackgroundAgentPreference.avoid)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    }
                     footer
                 }
                 .padding(CascadeMetrics.s6)
@@ -621,7 +639,10 @@ private struct ReelScreen: View {
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.horizontal, CascadeMetrics.s4)
             .padding(.top, CascadeMetrics.s2)
-            SceneCard(context: selected)
+            SceneCard(
+                context: selected,
+                clickMarkers: selected.map { model.reelClickMarkersByContextID[$0.id] ?? [] } ?? []
+            )
             TransportBar(
                 isPlaying: $isPlaying,
                 speed: $speed,
@@ -647,6 +668,8 @@ private struct ReelScreen: View {
                 }
             )
         }
+        .onAppear { model.refreshClickMarkers(near: selected) }
+        .onChange(of: selected?.id) { _, _ in model.refreshClickMarkers(near: selected) }
     }
 
     private var headline: String {
@@ -678,10 +701,25 @@ private struct ReelScreen: View {
 
 private struct SceneCard: View {
     let context: RecordedContext?
+    let clickMarkers: [ReelClickMarker]
+
+    private struct DisplayMetadata: Decodable {
+        let id: UInt32?
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct SceneMetadata: Decodable {
+        let w: Int?
+        let h: Int?
+        let display: DisplayMetadata?
+    }
 
     @ViewBuilder var body: some View {
         if let context, let path = context.imagePath, let image = NSImage(contentsOfFile: path) {
-            screenshotCard(image)
+            screenshotCard(image, context: context)
         } else {
             panelCard
         }
@@ -690,7 +728,7 @@ private struct SceneCard: View {
     /// Full-width card, flush with the transport bar below, and the capture fills
     /// it edge-to-edge like fullscreen video — cropping a sliver of the frame when
     /// the aspect ratios differ rather than ever showing a letterbox.
-    private func screenshotCard(_ image: NSImage) -> some View {
+    private func screenshotCard(_ image: NSImage, context: RecordedContext) -> some View {
         ZStack(alignment: .topTrailing) {
             // Color.clear sized by the card + overlay/clipped keeps scaledToFill's
             // natural-size overflow from inflating the layout.
@@ -701,6 +739,7 @@ private struct SceneCard: View {
                         .scaledToFill()
                 }
                 .clipped()
+            clickOverlay(context: context, image: image)
             capturedBadge
                 .padding(CascadeMetrics.s4)
         }
@@ -712,6 +751,76 @@ private struct SceneCard: View {
                 .stroke(Color.cascadeBorderHi.opacity(0.55), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.4), radius: 22, y: 10)
+    }
+
+    private func clickOverlay(context: RecordedContext, image: NSImage) -> some View {
+        GeometryReader { geo in
+            ForEach(clickMarkers) { marker in
+                if let point = markerPoint(marker, context: context, image: image, container: geo.size) {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.cascadeRecText, lineWidth: 2)
+                            .frame(width: 22, height: 22)
+                        Circle()
+                            .fill(Color.cascadeRecDot)
+                            .frame(width: 6, height: 6)
+                    }
+                    .shadow(color: .black.opacity(0.65), radius: 4)
+                    .position(point)
+                    .help(marker.label ?? marker.targetDescriptor ?? "Click")
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func markerPoint(
+        _ marker: ReelClickMarker,
+        context: RecordedContext,
+        image: NSImage,
+        container: CGSize
+    ) -> CGPoint? {
+        guard container.width > 0, container.height > 0,
+              let metadata = metadata(for: context),
+              let display = metadata.display,
+              display.width > 0,
+              display.height > 0 else { return nil }
+
+        let normalizedX = (marker.x - display.x) / display.width
+        let normalizedY = 1 - ((marker.y - display.y) / display.height)
+        guard (0...1).contains(normalizedX), (0...1).contains(normalizedY) else { return nil }
+
+        let imageWidth = CGFloat(metadata.w ?? Int(image.size.width))
+        let imageHeight = CGFloat(metadata.h ?? Int(image.size.height))
+        guard imageWidth > 0, imageHeight > 0 else { return nil }
+
+        let imageAspect = imageWidth / imageHeight
+        let containerAspect = container.width / container.height
+        let drawWidth: CGFloat
+        let drawHeight: CGFloat
+        let offsetX: CGFloat
+        let offsetY: CGFloat
+        if containerAspect > imageAspect {
+            drawWidth = container.width
+            drawHeight = container.width / imageAspect
+            offsetX = 0
+            offsetY = (container.height - drawHeight) / 2
+        } else {
+            drawHeight = container.height
+            drawWidth = container.height * imageAspect
+            offsetX = (container.width - drawWidth) / 2
+            offsetY = 0
+        }
+        return CGPoint(
+            x: offsetX + CGFloat(normalizedX) * drawWidth,
+            y: offsetY + CGFloat(normalizedY) * drawHeight
+        )
+    }
+
+    private func metadata(for context: RecordedContext) -> SceneMetadata? {
+        guard let json = context.metadataJSON,
+              let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(SceneMetadata.self, from: data)
     }
 
     /// Fallback card (OCR text or idle) — full-width cinematic panel.
@@ -1326,7 +1435,19 @@ private struct CascadesScreen: View {
     @ObservedObject var model: CascadeAppModel
 
     private var agentActivity: [AuditEvent] {
-        model.audit.filter { $0.action.hasPrefix("step.") || $0.action.hasPrefix("agent.") || $0.action == "computer.act" }
+        model.audit.filter(Self.isAgentActivity)
+    }
+
+    private static func isAgentActivity(_ event: AuditEvent) -> Bool {
+        let action = event.action
+        if action.hasPrefix("step.") || action.hasPrefix("agent.") || action.hasPrefix("assist.")
+            || action.hasPrefix("sandbox.") || action.hasPrefix("harness.") {
+            return true
+        }
+        return action == "computer.act"
+            || action == "computer.zoom"
+            || action == "grounding.verifier"
+            || action == "scout.ocr.marks"
     }
 
     /// Newly approved agent to flash + scroll to, so an approve never feels
@@ -1436,6 +1557,7 @@ private struct CascadesScreen: View {
             VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                 SectionLabel(title: "LEARNED SKILLS — REVIEW", trailing: "\(model.pendingLearnedSkills.count) drafted")
                 ForEach(model.pendingLearnedSkills) { skill in
+                    let consolidationHint = model.learnedSkillConsolidationHint(for: skill)
                     CascadePanel {
                         VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                             HStack(spacing: CascadeMetrics.s2) {
@@ -1444,8 +1566,16 @@ private struct CascadesScreen: View {
                                 Text("New skill for \(skill.appName)").font(.cascadeSans(15, .semibold))
                                 Spacer()
                             }
-                            Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
-                                .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+	                            Text("Distilled from “\(skill.sourceTask)”. Approve and the agent pulls this playbook every time it works in \(skill.appName).")
+	                                .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+	                            if !skill.sourceCaseIDs.isEmpty {
+	                                Text("Source cases \(skill.sourceCaseIDs.map(String.init).joined(separator: ", ")) · evidence \(skill.evidenceIDs.count)")
+	                                    .font(.cascadeMono(10))
+	                                    .foregroundStyle(Color.cascadeText3)
+	                            }
+	                            if let consolidationHint {
+	                                learnedSkillConsolidationRow(consolidationHint)
+	                            }
                             Text(skill.markdown)
                                 .font(.cascadeMono(10)).foregroundStyle(Color.cascadeText2)
                                 .lineLimit(10)
@@ -1463,6 +1593,74 @@ private struct CascadesScreen: View {
                     }
                 }
             }
+        }
+    }
+
+    private func learnedSkillConsolidationRow(_ hint: CascadeAppModel.LearnedSkillConsolidationHint) -> some View {
+        HStack(alignment: .top, spacing: CascadeMetrics.s2) {
+            Image(systemName: learnedSkillConsolidationIcon(hint.kind))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(learnedSkillConsolidationColor(hint.kind))
+                .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: CascadeMetrics.s2) {
+                    Text(hint.title)
+                        .font(.cascadeSans(12, .semibold))
+                        .foregroundStyle(Color.cascadeText)
+                    if let score = hint.score {
+                        Text("\(Int((score * 100).rounded()))% overlap")
+                            .font(.cascadeSans(11))
+                            .foregroundStyle(Color.cascadeText3)
+                    }
+                }
+	                Text(hint.detail)
+	                    .font(.cascadeSans(12))
+	                    .foregroundStyle(Color.cascadeText3)
+	                    .fixedSize(horizontal: false, vertical: true)
+	                HStack(spacing: CascadeMetrics.s2) {
+	                    Text("risk \(hint.predictedRisk.rawValue)")
+	                    Text("\(hint.successCount) success")
+	                    if hint.failureCount > 0 { Text("\(hint.failureCount) failure") }
+	                    if !hint.sourceCaseIDs.isEmpty { Text("cases \(hint.sourceCaseIDs.map(String.init).joined(separator: ","))") }
+	                }
+	                .font(.cascadeMono(10))
+	                .foregroundStyle(Color.cascadeText3)
+	                if !hint.requiredEvidence.isEmpty {
+	                    Text("Needs \(hint.requiredEvidence.joined(separator: ", "))")
+	                        .font(.cascadeSans(11))
+	                        .foregroundStyle(Color.cascadeText3)
+	                }
+	                if !hint.mergeReason.isEmpty {
+	                    Text(hint.mergeReason)
+	                        .font(.cascadeSans(11))
+	                        .foregroundStyle(Color.cascadeText3)
+	                }
+	            }
+	        }
+        .padding(CascadeMetrics.s2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(learnedSkillConsolidationColor(hint.kind).opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(learnedSkillConsolidationColor(hint.kind).opacity(0.28), lineWidth: 1)
+        )
+    }
+
+    private func learnedSkillConsolidationIcon(_ kind: CascadeAppModel.LearnedSkillConsolidationHint.Kind) -> String {
+        switch kind {
+        case .newSkill: "sparkles"
+        case .reviseExisting: "pencil.and.outline"
+        case .archiveCandidate: "archivebox"
+        case .quarantine: "exclamationmark.triangle"
+        }
+    }
+
+    private func learnedSkillConsolidationColor(_ kind: CascadeAppModel.LearnedSkillConsolidationHint.Kind) -> Color {
+        switch kind {
+        case .newSkill: Color.cascadeAgent
+        case .reviseExisting: Color.cascadeAccent
+        case .archiveCandidate: Color.cascadeText3
+        case .quarantine: Color.cascadeRecText
         }
     }
 
@@ -1574,6 +1772,75 @@ private struct WasteCard: View {
             }
             .padding(.top, 2)
         }
+    }
+}
+
+private struct ProactiveNextActionCard: View {
+    let offer: ProactiveOffer
+    let onAccept: () -> Void
+    let onSnooze: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        CascadePanel {
+            HStack(alignment: .top, spacing: CascadeMetrics.s3) {
+                Image(systemName: "sparkle.magnifyingglass")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(Color.cascadeAgent)
+                    .frame(width: 34, height: 34)
+                    .background(Color.cascadeAgent.opacity(0.12), in: Circle())
+                VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(offer.title).font(.cascadeSans(15, .semibold))
+                        CascadeTag(levelText, tone: .cascadeAgent)
+                        Spacer()
+                    }
+                    Text(offer.detail)
+                        .font(.cascadeSans(13))
+                        .foregroundStyle(Color.cascadeText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(evidenceText)
+                        .font(.cascadeSans(12))
+                        .foregroundStyle(Color.cascadeText3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: CascadeMetrics.s2) {
+                        Spacer()
+                        if offer.level == .action, let actionTitle = offer.actionTitle {
+                            Button(action: onAccept) {
+                                Label(actionTitle, systemImage: "bolt.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Color.cascadeAgent)
+                        }
+                        Button(action: onSnooze) {
+                            Label("Later", systemImage: "clock")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.cascadeText3)
+                        Button(action: onDismiss) {
+                            Label("Not this", systemImage: "xmark")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.cascadeText3)
+                    }
+                }
+            }
+        }
+    }
+
+    private var levelText: String {
+        switch offer.level {
+        case .auditOnly: "AUDIT"
+        case .ambient: "AMBIENT"
+        case .passive: "PROACTIVE"
+        case .action: "ACTION"
+        }
+    }
+
+    private var evidenceText: String {
+        let confidence = "\(Int((offer.confidence * 100).rounded()))%"
+        let evidence = offer.evidence.prefix(3).joined(separator: " · ")
+        return evidence.isEmpty ? "\(confidence) confidence." : "\(confidence) confidence · \(evidence)"
     }
 }
 
@@ -1713,6 +1980,15 @@ private struct ManagerScreen: View {
         model.agents.map(\.runCount).reduce(0, +)
     }
 
+    private var costPerRunText: String {
+        String(format: "$%.2f", model.valueSummary.costPerCompletedRunUSD)
+    }
+
+    private var sloText: String {
+        let rate = Int(((model.sloSnapshot?.successRate ?? 1.0) * 100).rounded())
+        return "\(rate)%"
+    }
+
     /// Sample counts per app, biggest first — where the recorded time actually went.
     private var appUsage: [(app: String, bundle: String?, count: Int)] {
         var counts: [String: (bundle: String?, count: Int)] = [:]
@@ -1737,10 +2013,13 @@ private struct ManagerScreen: View {
                     MetricCard(value: "~\(minutesOnTheTable)m", label: "On the table")
                     MetricCard(value: "\(appsObserved)", label: "Apps observed")
                     MetricCard(value: "\(model.agents.count)", label: "Agents approved")
+                    MetricCard(value: costPerRunText, label: "Cost / run")
+                    MetricCard(value: sloText, label: "SLO pass rate")
                     MetricCard(value: "0", label: "Raw screenshots")
                 }
-                reviewQueueSection
-                whereTimeGoesSection
+	                learningOpportunitiesSection
+	                reviewQueueSection
+	                whereTimeGoesSection
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, CascadeMetrics.s6)
@@ -1748,14 +2027,57 @@ private struct ManagerScreen: View {
             .frame(maxWidth: 960, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
+	    }
+
+    private var learningOpportunitiesSection: some View {
+        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            if !model.learningOpportunities.isEmpty {
+                SectionLabel(title: "LEARNING CURRICULUM", trailing: "\(model.learningOpportunities.count) suggested")
+                ForEach(model.learningOpportunities) { opportunity in
+                    CascadePanel {
+                        HStack(alignment: .top, spacing: CascadeMetrics.s3) {
+                            Image(systemName: learningOpportunityIcon(opportunity.kind))
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Color.cascadeAgent)
+                                .frame(width: 20, height: 20)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(opportunity.title)
+                                    .font(.cascadeSans(13, .semibold))
+                                    .foregroundStyle(Color.cascadeText)
+                                Text(opportunity.detail)
+                                    .font(.cascadeSans(12))
+                                    .foregroundStyle(Color.cascadeText3)
+                            }
+                            Spacer(minLength: CascadeMetrics.s2)
+                            Button(opportunity.actionTitle) { model.focusLearningOpportunity(opportunity) }
+                                .buttonStyle(CascadeQuietButtonStyle())
+                            Button("Dismiss") { model.dismissLearningOpportunity(opportunity) }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Color.cascadeText3)
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// The manager's review queue: the genuinely repeated, time-saving workflows
-    /// Cascade caught, each judged and named by the curator. Approve to land a ready
-    /// agent in the employee's Cascades; dismiss to never see it again.
-    private var reviewQueueSection: some View {
-        VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(model.pendingCuratedAgents.count) pending")
+    private func learningOpportunityIcon(_ kind: CascadeAppModel.LearningOpportunity.Kind) -> String {
+        switch kind {
+        case .repeatedWorkflow: "repeat"
+        case .overlappingDrafts: "square.stack.3d.up"
+        case .recurringFailure: "wrench.and.screwdriver"
+        case .parameterizedRecipe: "tag"
+        }
+    }
+
+		    /// The manager's review queue: the genuinely repeated, time-saving workflows
+	    /// Cascade caught, each judged and named by the curator. Approve to land a ready
+	    /// agent in the employee's Cascades; dismiss to never see it again.
+	    private var reviewQueueSection: some View {
+	        let hasProactiveOffer = model.proactiveOffer != nil
+	        let pendingCount = model.pendingCuratedAgents.count + (hasProactiveOffer ? 1 : 0)
+	        return VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+            SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(pendingCount) pending")
             if let note = model.managerReviewNote {
                 HStack(spacing: CascadeMetrics.s2) {
                     Image(systemName: "checkmark.seal.fill")
@@ -1768,7 +2090,15 @@ private struct ManagerScreen: View {
                 .background(Color.cascadeAgent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .transition(.opacity)
             }
-            if model.pendingCuratedAgents.isEmpty {
+	            if let offer = model.proactiveOffer {
+	                ProactiveNextActionCard(
+	                    offer: offer,
+	                    onAccept: { model.acceptProactiveOffer() },
+	                    onSnooze: { model.snoozeProactiveOffer() },
+	                    onDismiss: { model.dismissProactiveNextActionOffer() }
+	                )
+	            }
+            if model.pendingCuratedAgents.isEmpty && !hasProactiveOffer {
                 CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
             } else {
                 ForEach(model.pendingCuratedAgents) { curated in
@@ -1926,12 +2256,31 @@ private struct AgentActivityRow: View {
     let event: AuditEvent
 
     var body: some View {
+        let item = AgentActivityItem(event: event)
         HStack(spacing: CascadeMetrics.s3) {
-            Circle().fill(Color.cascadeAgent).frame(width: 7, height: 7)
-            Text(event.action.replacingOccurrences(of: ".", with: " ").uppercased())
-                .font(.cascadeMono(10, .semibold)).foregroundStyle(Color.cascadeText3)
-                .frame(width: 130, alignment: .leading)
-            Text(event.detail).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText).lineLimit(1)
+            Image(systemName: item.icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(item.tint)
+                .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: CascadeMetrics.s2) {
+                    Text(item.title.uppercased())
+                        .font(.cascadeMono(10, .semibold))
+                        .foregroundStyle(Color.cascadeText3)
+                    if let status = item.status {
+                        Text(status.uppercased())
+                            .font(.cascadeMono(9, .semibold))
+                            .foregroundStyle(item.tint)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(item.tint.opacity(0.12), in: Capsule())
+                    }
+                }
+                Text(item.detail)
+                    .font(.cascadeSans(13))
+                    .foregroundStyle(Color.cascadeText)
+                    .lineLimit(1)
+            }
             Spacer()
             Text(event.createdAt, style: .time).font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
         }
@@ -1939,6 +2288,148 @@ private struct AgentActivityRow: View {
         .padding(.vertical, CascadeMetrics.s3)
         .background(Color.cascadePanel, in: RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: CascadeMetrics.radiusCard, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+    }
+}
+
+private struct AgentActivityItem {
+    let title: String
+    let detail: String
+    let icon: String
+    let tint: Color
+    let status: String?
+
+    init(event: AuditEvent) {
+        let action = event.action
+        let status = Self.value("status", in: event.detail) ?? Self.value("outcome", in: event.detail) ?? Self.value("verdict", in: event.detail)
+        self.status = status
+        switch action {
+        case "assist.timing", "sandbox.turn":
+            title = "Model turn"
+            detail = Self.modelDetail(action: action, detail: event.detail)
+            icon = "brain.head.profile"
+            tint = Color.cascadeAgent
+        case "assist.capture":
+            title = "Budget"
+            detail = Self.counts(event.detail, keys: ["imageTurns", "prunedImages", "inputTokens", "outputTokens"])
+            icon = "camera.metering.matrix"
+            tint = Color.cascadeAccent
+        case "agent.ground", "grounding.verifier":
+            title = "Grounding"
+            detail = Self.groundingDetail(event.detail)
+            icon = "scope"
+            tint = Color.cascadeAccent
+        case "agent.ground.miss":
+            title = "Grounding miss"
+            detail = Self.counts(event.detail, keys: ["turn", "controlCount", "missedTargetHash", "labelsHash"])
+            icon = "scope.badge.questionmark"
+            tint = Color.cascadeRecText
+        case "scout.ocr.marks":
+            title = "OCR marks"
+            detail = Self.counts(event.detail, keys: ["turn", "controlCount", "ocrLineCount", "ocrMarksHash"])
+            icon = "text.viewfinder"
+            tint = Color.cascadeAccentWarm
+        case "assist.verify.action", "assist.verify.unavailable", "assist.validate", "sandbox.verify":
+            title = "Verifier"
+            detail = Self.verifierDetail(event.detail)
+            icon = "checkmark.seal"
+            tint = status == "failed" || status == "incomplete" ? Color.cascadeRecText : Color.cascadeAccent
+        case "assist.noeffect", "assist.stalled", "sandbox.noeffect", "sandbox.stalled":
+            title = action.contains("noeffect") ? "No effect" : "Stall guard"
+            detail = Self.counts(event.detail, keys: ["turn", "noEffectStreak", "controlCount", "textHash"])
+            icon = "exclamationmark.triangle"
+            tint = Color.cascadeRecText
+        case "agent.action.refused", "sandbox.stopped":
+            title = action == "sandbox.stopped" ? "Stopped" : "Refusal"
+            detail = Self.safeSummary(for: action, detail: event.detail)
+            icon = "hand.raised"
+            tint = Color.cascadeRecText
+        case "agent.trajectory_sketch":
+            title = "Replay sketch"
+            detail = Self.counts(event.detail, keys: ["score", "sketchHash", "actionCount", "checkCount"])
+            icon = "point.topleft.down.curvedto.point.bottomright.up"
+            tint = Color.cascadeAgent
+        case "agent.failure_memory.used", "agent.failure_memory.saved":
+            title = action.hasSuffix(".used") ? "Failure memory" : "Saved reflection"
+            detail = Self.counts(event.detail, keys: ["count", "ids", "failureKinds", "memoryHash", "targetHash"])
+            icon = "arrow.counterclockwise.circle"
+            tint = Color.cascadeAccentWarm
+        case "agent.run.completed", "sandbox.done", "sandbox.task":
+            title = "Completion"
+            detail = Self.safeSummary(for: action, detail: event.detail)
+            icon = "checkmark.circle"
+            tint = Color.cascadeAccent
+        case "computer.act", "computer.zoom", "sandbox.act":
+            title = action == "computer.zoom" ? "Zoom" : "Tool action"
+            detail = Self.actionDetail(event.detail)
+            icon = "cursorarrow.click"
+            tint = Color.cascadeAgent
+        default:
+            if action.hasPrefix("harness.") || action == "sandbox.harness" {
+                title = "Harness"
+                detail = Self.safeSummary(for: action, detail: event.detail)
+                icon = "terminal"
+                tint = Color.cascadeAccent
+            } else if action.hasPrefix("step.") || action == "recipe.step" {
+                title = "Step"
+                detail = Self.safeSummary(for: action, detail: event.detail)
+                icon = "list.bullet.rectangle"
+                tint = Color.cascadeAgent
+            } else {
+                title = action.replacingOccurrences(of: ".", with: " ")
+                detail = Self.safeSummary(for: action, detail: event.detail)
+                icon = "circle.grid.cross"
+                tint = Color.cascadeText3
+            }
+        }
+    }
+
+    private static func modelDetail(action: String, detail: String) -> String {
+        if action == "assist.timing" {
+            return counts(detail, keys: ["total", "model", "actions", "turns", "effort"])
+        }
+        return safeSummary(for: action, detail: detail)
+    }
+
+    private static func groundingDetail(_ detail: String) -> String {
+        let fields = ["source", "confidence", "failure", "candidates", "groundHash", "targetHash"]
+        return counts(detail, keys: fields)
+    }
+
+    private static func verifierDetail(_ detail: String) -> String {
+        counts(detail, keys: ["status", "actionKind", "failureKind", "verdict", "outcome", "confidence", "targetHash"])
+    }
+
+    private static func actionDetail(_ detail: String) -> String {
+        counts(detail, keys: ["status", "actionKind", "kind", "coordinateValid", "failureKind", "surface", "region"])
+    }
+
+    private static func safeSummary(for action: String, detail: String) -> String {
+        let keyed = counts(detail, keys: ["status", "outcome", "failureKind", "agentID", "tool", "actionKind", "textHash", "taskHash", "labelHash"])
+        if keyed != "event recorded" { return keyed }
+        return action.replacingOccurrences(of: ".", with: " ") + " recorded"
+    }
+
+    private static func counts(_ detail: String, keys: [String]) -> String {
+        let parts = keys.compactMap { key -> String? in
+            guard let value = value(key, in: detail) else { return nil }
+            return "\(key)=\(safeToken(value))"
+        }
+        return parts.isEmpty ? "event recorded" : parts.joined(separator: " · ")
+    }
+
+    private static func value(_ key: String, in detail: String) -> String? {
+        let prefix = "\(key)="
+        return detail
+            .split(separator: " ")
+            .first { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+    }
+
+    private static func safeToken(_ value: String) -> String {
+        let safe = value.filter { character in
+            character.isLetter || character.isNumber || character == "." || character == "_" || character == "-" || character == ","
+        }
+        return safe.isEmpty ? "redacted" : String(safe.prefix(36))
     }
 }
 
@@ -1981,6 +2472,18 @@ private struct SettingsScreen: View {
                 }
                 section("PERMISSIONS", trailing: "local capture & control") {
                     permissionsCard
+                }
+                section("CAPTURE POLICY", trailing: "privacy controls") {
+                    PrivacyPolicyCard(model: model)
+                }
+                section("PRIVACY OUTBOX", trailing: "employee data rights") {
+                    PrivacyOutboxCard(model: model)
+                }
+                section("PERSONALIZATION", trailing: "local priors") {
+                    PersonalizationCard(model: model)
+                }
+                section("AUDIT EXPORT", trailing: "SIEM and release gates") {
+                    AuditExportCard(model: model)
                 }
                 section("AGENT HARNESS", trailing: "direct-Mac tools, fully audited") {
                     HarnessCard(model: model)
@@ -2052,6 +2555,234 @@ private struct SettingsScreen: View {
     }
 }
 
+private struct PrivacyPolicyCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Private mode").font(.cascadeSans(15, .semibold))
+                        Text(model.capturePrivacyPolicy.privateModeEnabled ? "Capture is paused." : "Capture follows the local policy.")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { model.capturePrivacyPolicy.privateModeEnabled },
+                        set: { model.setCapturePrivateMode($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Managed controls").font(.cascadeSans(15, .semibold))
+                    Text(managedControls)
+                        .font(.cascadeSans(12))
+                        .foregroundStyle(Color.cascadeText2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Managed JSON").font(.cascadeSans(15, .semibold))
+                        Text("\(model.capturePrivacyPolicy.deniedBundleIdentifiers.count) bundle rules · \(model.capturePrivacyPolicy.deniedWindowTitleKeywords.count) title rules · \(model.capturePrivacyPolicy.deniedURLHosts.count) site rules")
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Button("Import") { model.importCapturePolicyFromPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                    Button("Export") { model.exportCapturePolicyToPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+            }
+        }
+    }
+
+    private var managedControls: String {
+        let policy = model.capturePrivacyPolicy
+        let controls = [
+            ("Recording", policy.recordingAvailable),
+            ("Background", policy.backgroundWebRunsAvailable),
+            ("Schedules", policy.scheduledRunsAvailable),
+            ("Power harness", policy.powerHarnessAvailable),
+            ("Record recall", policy.recordRecallAvailable),
+            ("Audit export", policy.agentAuditExportAvailable),
+            ("Diagnostic export", policy.diagnosticBundleExportAvailable),
+            ("Irreversible guard", policy.forceIrreversibleActionGuard),
+        ]
+        return controls.map { "\($0.0): \($0.1 ? "on" : "blocked")" }.joined(separator: " · ")
+    }
+}
+
+private struct PrivacyOutboxCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Captured summary").font(.cascadeSans(15, .semibold))
+                        Text(summaryLine)
+                            .font(.cascadeSans(12))
+                            .foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Button("Export manifest") { model.exportPrivacyManifestToPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                    Button("Delete all") { model.deletePrivacyData() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+                if let summary = model.privacySummary, !summary.buckets.isEmpty {
+                    Divider().overlay(Color.cascadeBorder)
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(summary.buckets.prefix(3).enumerated()), id: \.offset) { _, bucket in
+                            HStack {
+                                Text(bucket.appName)
+                                    .font(.cascadeSans(12, .medium))
+                                    .foregroundStyle(Color.cascadeText)
+                                Spacer()
+                                Text("\(bucket.count) moments")
+                                    .font(.cascadeMono(11))
+                                    .foregroundStyle(Color.cascadeText3)
+                            }
+                        }
+                    }
+                }
+                HStack(spacing: CascadeMetrics.s2) {
+                    CascadeTag(model.capturePrivacyPolicy.privateModeEnabled ? "Private mode on" : "Private mode off", tone: model.capturePrivacyPolicy.privateModeEnabled ? .cascadeWarn : .cascadeGood)
+                    Text("Exports omit OCR, image paths, metadata JSON, and input text.")
+                        .font(.cascadeSans(11))
+                        .foregroundStyle(Color.cascadeText3)
+                }
+            }
+        }
+    }
+
+    private var summaryLine: String {
+        guard let summary = model.privacySummary else { return "No captured summary loaded yet." }
+        let megabytes = Double(summary.estimatedFrameBytes) / 1_000_000.0
+        let start = summary.firstCapturedAt?.formatted(date: .abbreviated, time: .shortened) ?? "none"
+        let end = summary.lastCapturedAt?.formatted(date: .abbreviated, time: .shortened) ?? "none"
+        return "\(summary.totalContexts) moments · \(String(format: "%.1f", megabytes)) MB frames · \(start) to \(end)"
+    }
+}
+
+private struct AuditExportCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Agent audit export").font(.cascadeSans(15, .semibold))
+                        Text(auditLine)
+                            .font(.cascadeSans(12))
+                            .foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Button("Copy SLO") { model.copySLOSnapshotToPasteboard() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+                Divider().overlay(Color.cascadeBorder)
+                TraceExportSheet(model: model)
+                Divider().overlay(Color.cascadeBorder)
+                HStack(spacing: CascadeMetrics.s3) {
+                    MetricPill(title: "Runs", value: "\(model.sloSnapshot?.totalRuns ?? 0)")
+                    MetricPill(title: "SLO", value: model.sloSnapshot?.passesReleaseGate == false ? "Fail" : "Pass")
+                    MetricPill(title: "Cost/run", value: String(format: "$%.2f", model.valueSummary.costPerCompletedRunUSD))
+                }
+            }
+        }
+    }
+
+    private var auditLine: String {
+        switch model.auditIntegrityStatus {
+        case .trusted:
+            return "Trusted audit chain. Export uses safe trace attributes and a manifest."
+        case .untrusted:
+            return "Audit chain is untrusted. Enforcement blocks export when enabled."
+        case .verificationFailed(let reason):
+            return "Audit verification failed: \(reason)"
+        case .unchecked:
+            return "Audit chain has not been checked yet."
+        }
+    }
+}
+
+private struct PersonalizationCard: View {
+    @ObservedObject var model: CascadeAppModel
+
+    var body: some View {
+        CascadePanel {
+            VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Local preference model").font(.cascadeSans(15, .semibold))
+                        Text(summaryLine)
+                            .font(.cascadeSans(12))
+                            .foregroundStyle(Color.cascadeText2)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { model.personalizationEnabled },
+                        set: { model.personalizationEnabled = $0 }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                VStack(alignment: .leading, spacing: CascadeMetrics.s2) {
+                    Picker("Suggestion timing", selection: $model.suggestionTimingPreference) {
+                        Text("Early").tag(CascadeAppModel.SuggestionTimingPreference.early)
+                        Text("Balanced").tag(CascadeAppModel.SuggestionTimingPreference.balanced)
+                        Text("Strong evidence").tag(CascadeAppModel.SuggestionTimingPreference.strongEvidence)
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("Background agents", selection: $model.backgroundAgentPreference) {
+                        Text("Prefer").tag(CascadeAppModel.BackgroundAgentPreference.prefer)
+                        Text("Ask first").tag(CascadeAppModel.BackgroundAgentPreference.askFirst)
+                        Text("Avoid").tag(CascadeAppModel.BackgroundAgentPreference.avoid)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Divider().overlay(Color.cascadeBorder)
+                HStack(spacing: CascadeMetrics.s3) {
+                    MetricPill(title: "Events", value: "\(model.personalizationSnapshot.eventCount)")
+                    MetricPill(title: "Routines", value: "\(model.personalizationSnapshot.routineProfileCount)")
+                    MetricPill(title: "Disabled", value: "\(model.personalizationSnapshot.disabledSignatureCount + model.personalizationSnapshot.disabledAppCount)")
+                    Spacer()
+                    Button("Clear all") { model.clearAllPersonalization() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                }
+            }
+        }
+    }
+
+    private var summaryLine: String {
+        let last = model.personalizationSnapshot.lastEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "none"
+        return "Events and routine counters are stored locally. Last update: \(last)."
+    }
+}
+
+private struct MetricPill: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(value).font(.cascadeSans(15, .semibold))
+            Text(title).font(.cascadeMono(9, .semibold)).foregroundStyle(Color.cascadeText4)
+        }
+        .padding(.horizontal, CascadeMetrics.s3)
+        .padding(.vertical, CascadeMetrics.s2)
+        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 /// The assist agent's direct-Mac tools: the always-on read-only tier, and the
 /// opt-in Power harness that lets it run commands, scripts, and file writes.
 private struct HarnessCard: View {
@@ -2073,7 +2804,7 @@ private struct HarnessCard: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Power harness").font(.cascadeSans(15, .semibold))
-                        Text("run_command · run_applescript · write_file — the agent can run shell commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Every call lands verbatim in the audit log, destructive commands (sudo, rm -rf /, …) are refused, and Esc stops it mid-run.")
+                        Text("run_command · run_applescript · write_file — the agent can run allowlisted argv-safe commands and drive scriptable apps (bulk-edit a spreadsheet in one script instead of hundreds of clicks). Commands and scripts are shown live for supervision; audit rows store safe descriptors, hashes, and byte counts. Shell syntax, destructive commands, and protected paths are refused, and Esc stops it mid-run.")
                             .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()
@@ -2407,18 +3138,68 @@ private struct GroqKeyCard: View {
 private struct OpenRouterKeyCard: View {
     @ObservedObject var model: CascadeAppModel
     @State private var key = ""
+    @State private var endpoint = ""
 
     var body: some View {
+        let runtime = model.visualGrounderRuntime
         CascadePanel {
             VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("OpenRouter key · UI-TARS grounding").font(.cascadeSans(16, .semibold))
+                        Text("Visual grounder runtime").font(.cascadeSans(16, .semibold))
                         Text(model.openRouterKeyMessage).font(.cascadeSans(13)).foregroundStyle(Color.cascadeText2)
                     }
                     Spacer()
                     CascadeTag(model.hasOpenRouterKey ? "Connected" : "Grounder off", tone: model.hasOpenRouterKey ? .cascadeGood : .cascadeWarn)
                 }
+                HStack(spacing: CascadeMetrics.s2) {
+                    runtimePill("Backend", runtime.preset.endpointClass.rawValue)
+                    runtimePill("Model", runtime.preset.modelSize)
+                    runtimePill("Coord", runtime.coordSpace.rawValue)
+                    runtimePill("Probe", runtime.probeStatus)
+                }
+                Picker("Preset", selection: Binding(
+                    get: { model.visualGrounderRuntime.preset.id },
+                    set: { model.selectVisualGrounderPreset($0); endpoint = model.visualGrounderRuntime.endpoint }
+                )) {
+                    ForEach(GrounderRegistry.presets) { preset in
+                        Text(preset.displayName).tag(preset.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                HStack(spacing: CascadeMetrics.s2) {
+                    TextField(runtime.endpoint, text: $endpoint)
+                        .textFieldStyle(.plain)
+                        .font(.cascadeMono(12))
+                        .padding(.horizontal, CascadeMetrics.s3)
+                        .padding(.vertical, CascadeMetrics.s2 + 1)
+                        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
+                    Picker("Coord", selection: Binding(
+                        get: { model.visualGrounderRuntime.coordSpace.rawValue },
+                        set: { model.updateVisualGrounderCoordSpace($0) }
+                    )) {
+                        ForEach(UITARSGrounder.CoordSpace.allCases, id: \.rawValue) { space in
+                            Text(space.rawValue).tag(space.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+                HStack {
+                    Button("Save runtime") {
+                        model.updateVisualGrounderEndpoint(endpoint.isEmpty ? runtime.endpoint : endpoint)
+                    }.buttonStyle(CascadeQuietButtonStyle())
+                    Button("Run coord probe") { model.runVisualGrounderCoordinateProbe() }
+                        .buttonStyle(CascadeQuietButtonStyle())
+                    Spacer()
+                    runtimePill("License", runtime.preset.license.rawValue)
+                    runtimePill("Eval", runtime.lastMiniEvalScore.map { String(format: "%.0f%%", $0 * 100) } ?? "none")
+                }
+                Text(runtime.preset.note)
+                    .font(.cascadeSans(12))
+                    .foregroundStyle(Color.cascadeText3)
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider().overlay(Color.cascadeBorder)
                 SecureField("sk-or-…", text: $key)
                     .textFieldStyle(.plain)
                     .font(.cascadeMono(12))
@@ -2430,10 +3211,28 @@ private struct OpenRouterKeyCard: View {
                     Button("Save key") { model.saveOpenRouterKey(key); key = "" }.buttonStyle(CascadeAccentButtonStyle())
                     Button("Clear") { model.clearOpenRouterKey(); key = "" }.buttonStyle(CascadeQuietButtonStyle())
                 }
-                Text("Stored in macOS Keychain. Hosts UI-TARS-1.5-7B for the on-screen agent: Opus 4.8 names the target, hosted UI-TARS locates it (no local 7B model). When connected, the on-screen agent grounds every click through it; without it, Opus places its own coordinates.")
+                Text("OpenRouter keys stay in macOS Keychain. Local and BYO presets require their own endpoint; no model weights are bundled.")
                     .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
             }
+            .onAppear { endpoint = model.visualGrounderRuntime.endpoint }
         }
+    }
+
+    private func runtimePill(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.cascadeMono(8, .semibold))
+                .foregroundStyle(Color.cascadeText4)
+            Text(value)
+                .font(.cascadeMono(10))
+                .foregroundStyle(Color.cascadeText2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, CascadeMetrics.s2)
+        .padding(.vertical, 5)
+        .background(Color.cascadePanel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
     }
 }
 

@@ -1,0 +1,437 @@
+import CascadeMemory
+import Foundation
+
+public enum ActionEpisodeBoundaryReason: String, Codable, Equatable, Hashable, Sendable {
+    case idleGap
+    case surfaceSwitch
+    case windowSwitch
+    case completionControl
+    case noisySurface
+    case sensitiveSurface
+}
+
+public struct ActionEpisode: Equatable, Sendable {
+    public let eventIDs: [Int64]
+    public let startAt: Date
+    public let endAt: Date
+    public let surfaceFlow: [String]
+    public let windowTitles: [String]
+    public let boundaryReasons: [ActionEpisodeBoundaryReason]
+}
+
+public struct LiveRepetitionCandidate: Equatable, Sendable {
+    public enum Stage: String, Sendable, Equatable {
+        case quiet
+        case actionable
+    }
+
+    public let stage: Stage
+    public let signature: String
+    public let occurrences: Int
+    public let startAt: Date
+    public let endAt: Date
+    public let eventIDs: [Int64]
+    public let evidenceLabels: [String]
+
+    public init(
+        stage: Stage,
+        signature: String,
+        occurrences: Int,
+        startAt: Date,
+        endAt: Date,
+        eventIDs: [Int64],
+        evidenceLabels: [String]
+    ) {
+        self.stage = stage
+        self.signature = signature
+        self.occurrences = occurrences
+        self.startAt = startAt
+        self.endAt = endAt
+        self.eventIDs = eventIDs
+        self.evidenceLabels = evidenceLabels
+    }
+}
+
+public struct LiveRepetitionDetector: Sendable {
+    public let window: TimeInterval
+    public let quietThreshold: Int
+    public let actionableThreshold: Int
+    public let segmenter: ActionEpisodeSegmenter
+
+    public init(
+        window: TimeInterval = 15 * 60,
+        quietThreshold: Int = 2,
+        actionableThreshold: Int = 3,
+        segmenter: ActionEpisodeSegmenter = ActionEpisodeSegmenter(maxIdleGap: 180)
+    ) {
+        self.window = max(5 * 60, window)
+        self.quietThreshold = max(2, quietThreshold)
+        self.actionableThreshold = max(self.quietThreshold + 1, actionableThreshold)
+        self.segmenter = segmenter
+    }
+
+    public func detect(
+        events: [InputEvent],
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        now: Date? = nil
+    ) -> LiveRepetitionCandidate? {
+        let ordered = WasteDetector.collapsedActionEvents(events)
+            .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+            .filter { !WasteDetector.isNoisySurface(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier) }
+            .sorted {
+                if $0.capturedAt == $1.capturedAt { return $0.id < $1.id }
+                return $0.capturedAt < $1.capturedAt
+            }
+        guard let newest = now ?? ordered.last?.capturedAt else { return nil }
+        let recent = ordered.filter { newest.timeIntervalSince($0.capturedAt) <= window }
+        guard recent.count >= 4 else { return nil }
+        let eventsByID = Dictionary(recent.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let episodes = segmenter
+            .segment(recent, surface: webAppIdentity)
+            .map { episode in episode.eventIDs.compactMap { eventsByID[$0] } }
+            .filter { WasteDetector.isAutomatableActionInstance($0) }
+        guard episodes.count >= quietThreshold else { return nil }
+
+        var grouped: [String: [[InputEvent]]] = [:]
+        for episode in episodes {
+            let signature = Self.signature(for: episode, webAppIdentity: webAppIdentity)
+            guard !signature.isEmpty else { continue }
+            grouped[signature, default: []].append(episode)
+        }
+        guard let best = grouped.max(by: { lhs, rhs in
+            if lhs.value.count != rhs.value.count { return lhs.value.count < rhs.value.count }
+            let lEnd = lhs.value.last?.last?.capturedAt ?? .distantPast
+            let rEnd = rhs.value.last?.last?.capturedAt ?? .distantPast
+            if lEnd != rEnd { return lEnd < rEnd }
+            return lhs.key > rhs.key
+        }), best.value.count >= quietThreshold else { return nil }
+
+        let newestInstance = best.value.max { lhs, rhs in
+            (lhs.last?.capturedAt ?? .distantPast) < (rhs.last?.capturedAt ?? .distantPast)
+        } ?? best.value[best.value.count - 1]
+        guard let start = newestInstance.first?.capturedAt,
+              let end = newestInstance.last?.capturedAt else { return nil }
+        return LiveRepetitionCandidate(
+            stage: best.value.count >= actionableThreshold ? .actionable : .quiet,
+            signature: best.key,
+            occurrences: best.value.count,
+            startAt: start,
+            endAt: end,
+            eventIDs: newestInstance.map(\.id),
+            evidenceLabels: newestInstance.map(NextActionPredictor.humanLabel).prefix(3).map { $0 }
+        )
+    }
+
+    private static func signature(
+        for episode: [InputEvent],
+        webAppIdentity: (@Sendable (InputEvent) -> String?)?
+    ) -> String {
+        episode.map { event in
+            let surface = webAppIdentity?(event) ?? event.appName
+            return WasteDetector.actionToken(event, surface: surface)
+        }.joined(separator: "|")
+    }
+}
+
+/// Splits low-level input into task-shaped episodes before routine mining.
+/// Pure and deterministic: callers provide recorded events and an optional
+/// surface resolver, and the segmenter returns ordered episode metadata only.
+public struct ActionEpisodeSegmenter: Sendable {
+    public let maxIdleGap: TimeInterval
+    public let dataflowContinuityGap: TimeInterval
+
+    public init(maxIdleGap: TimeInterval = 180, dataflowContinuityGap: TimeInterval = 90) {
+        self.maxIdleGap = maxIdleGap
+        self.dataflowContinuityGap = dataflowContinuityGap
+    }
+
+    public func segment(
+        _ inputEvents: [InputEvent],
+        surface surfaceResolver: (@Sendable (InputEvent) -> String?)? = nil
+    ) -> [ActionEpisode] {
+        let events = inputEvents.sorted {
+            if $0.capturedAt == $1.capturedAt { return $0.id < $1.id }
+            return $0.capturedAt < $1.capturedAt
+        }
+        let surface: (InputEvent) -> String = { event in
+            let resolved = surfaceResolver?(event)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return resolved?.isEmpty == false ? resolved! : event.appName
+        }
+
+        var episodes: [ActionEpisode] = []
+        var active: EpisodeBuilder?
+        var pendingStartReasons: [ActionEpisodeBoundaryReason] = []
+
+        func finishActive(with reasons: [ActionEpisodeBoundaryReason]) {
+            guard var builder = active else { return }
+            builder.close(with: reasons)
+            episodes.append(builder.build())
+            active = nil
+        }
+
+        for event in events {
+            let currentSurface = surface(event)
+            if Self.isSensitive(event, surface: currentSurface) {
+                finishActive(with: [.sensitiveSurface])
+                Self.appendUnique(.sensitiveSurface, to: &pendingStartReasons)
+                continue
+            }
+            if Self.isNoisy(event, surface: currentSurface) {
+                finishActive(with: [.noisySurface])
+                Self.appendUnique(.noisySurface, to: &pendingStartReasons)
+                continue
+            }
+
+            if var builder = active {
+                let reasons = boundaryReasons(from: builder, to: event, surface: currentSurface)
+                if !reasons.isEmpty {
+                    builder.close(with: reasons)
+                    episodes.append(builder.build())
+                    active = EpisodeBuilder(event: event, surface: currentSurface, startReasons: pendingStartReasons)
+                    pendingStartReasons.removeAll()
+                } else {
+                    builder.append(event, surface: currentSurface)
+                    active = builder
+                }
+            } else {
+                active = EpisodeBuilder(event: event, surface: currentSurface, startReasons: pendingStartReasons)
+                pendingStartReasons.removeAll()
+            }
+
+        }
+
+        if var builder = active {
+            if Self.isCompletionControl(builder.lastEvent) {
+                builder.close(with: [.completionControl])
+            }
+            episodes.append(builder.build())
+        }
+        return episodes
+    }
+
+    private func boundaryReasons(from builder: EpisodeBuilder, to event: InputEvent, surface: String) -> [ActionEpisodeBoundaryReason] {
+        let gap = event.capturedAt.timeIntervalSince(builder.lastEvent.capturedAt)
+        if gap > maxIdleGap { return [.idleGap] }
+
+        let continuous = continuesDataflow(from: builder, to: event, gap: gap)
+        if Self.isCompletionControl(builder.lastEvent), !continuous {
+            return [.completionControl]
+        }
+
+        let surfaceChanged = builder.lastSurface != surface
+        let windowChanged = Self.isWindowSwitch(from: builder.lastEvent.windowTitle, to: event.windowTitle)
+        guard surfaceChanged || windowChanged else { return [] }
+
+        if continuous {
+            return []
+        }
+
+        var reasons: [ActionEpisodeBoundaryReason] = []
+        if surfaceChanged { reasons.append(.surfaceSwitch) }
+        if windowChanged { reasons.append(.windowSwitch) }
+        return reasons
+    }
+
+    private func continuesDataflow(from builder: EpisodeBuilder, to event: InputEvent, gap: TimeInterval) -> Bool {
+        guard gap <= dataflowContinuityGap else { return false }
+        if builder.hasOpenCopyFlow { return true }
+        if builder.hasRecentContinuityToken(in: Self.continuityTokens(for: event)) { return true }
+        return false
+    }
+
+    private static func isWindowSwitch(from previous: String?, to current: String?) -> Bool {
+        let lhs = normalizedWindowTitle(previous)
+        let rhs = normalizedWindowTitle(current)
+        return !lhs.isEmpty && !rhs.isEmpty && lhs != rhs
+    }
+
+    private static func normalizedWindowTitle(_ title: String?) -> String {
+        guard let title else { return "" }
+        return title
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func isSensitive(_ event: InputEvent, surface: String) -> Bool {
+        PrivacyRules.isSensitive(appName: event.appName, bundleIdentifier: event.bundleIdentifier, windowTitle: event.windowTitle)
+            || PrivacyRules.isSensitiveText(surface)
+    }
+
+    private static func isNoisy(_ event: InputEvent, surface: String) -> Bool {
+        if WasteDetector.isNoisyApp(appName: event.appName, bundleIdentifier: event.bundleIdentifier) {
+            return true
+        }
+        let noisySurfaces: Set<String> = ["zoom", "zoom.us", "microsoft teams", "webex", "google meet"]
+        return noisySurfaces.contains(surface.lowercased())
+    }
+
+    private static func isCompletionControl(_ event: InputEvent) -> Bool {
+        if event.kind == .key {
+            let key = event.key?.lowercased()
+            let modifiers = Set(event.modifiers.map { $0.lowercased() })
+            return (key == "s" && modifiers.contains("command"))
+                || (key == "return" && (modifiers.contains("command") || modifiers.contains("control")))
+        }
+
+        guard event.kind == .click || event.kind == .doubleClick || event.kind == .rightClick else { return false }
+        let label = WasteDetector.normalizedLabel(event.text)
+        guard !label.isEmpty else { return false }
+        let exact: Set<String> = [
+            "archive", "complete", "done", "finish", "ok", "publish", "save",
+            "save changes", "send", "send message", "submit"
+        ]
+        if exact.contains(label) { return true }
+        return label.hasPrefix("save ") || label.hasPrefix("send ") || label.hasPrefix("submit ")
+    }
+
+    private static func isCopyShortcut(_ event: InputEvent) -> Bool {
+        isShortcut(event, key: "c") || isShortcut(event, key: "x")
+    }
+
+    private static func isPasteShortcut(_ event: InputEvent) -> Bool {
+        isShortcut(event, key: "v")
+    }
+
+    private static func isShortcut(_ event: InputEvent, key: String) -> Bool {
+        guard event.kind == .key, event.key?.lowercased() == key else { return false }
+        let modifiers = event.modifiers.map { $0.lowercased() }
+        return modifiers.contains("command") || modifiers.contains("control")
+    }
+
+    private static func continuityTokens(for event: InputEvent) -> [String] {
+        var tokens: [String] = []
+        if let descriptor = normalizedDescriptorToken(event.targetDescriptor) {
+            tokens.append("target:\(descriptor)")
+        }
+        if let label = descriptorLabel(event.targetDescriptor) {
+            tokens.append("label:\(label)")
+        }
+        switch event.kind {
+        case .click, .doubleClick, .rightClick:
+            let label = WasteDetector.normalizedLabel(event.text)
+            if !label.isEmpty {
+                tokens.append("label:\(label)")
+                tokens.append("value:\(label)")
+            }
+        case .type:
+            if let value = normalizedValue(event.text) {
+                tokens.append("value:\(value)")
+            }
+        case .key, .scroll:
+            break
+        }
+        return Array(Set(tokens)).sorted()
+    }
+
+    private static func normalizedDescriptorToken(_ descriptor: String?) -> String? {
+        guard let descriptor = descriptor?.trimmingCharacters(in: .whitespacesAndNewlines), !descriptor.isEmpty else {
+            return nil
+        }
+        if let decoded = AXTargetDescriptorV2.decode(descriptor) {
+            let parts = [decoded.role, decoded.identifier, decoded.container, decoded.label]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let joined = parts.joined(separator: " ")
+            return normalizedValue(joined)
+        }
+        return normalizedValue(descriptor)
+    }
+
+    private static func descriptorLabel(_ descriptor: String?) -> String? {
+        guard let label = AXTargetDescriptorV2.decode(descriptor)?.label else { return nil }
+        let normalized = WasteDetector.normalizedLabel(label)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func normalizedValue(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let normalized = text
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = normalized
+            .replacingOccurrences(of: #"^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$"#, with: "", options: .regularExpression)
+        return stripped.isEmpty ? nil : String(stripped.prefix(80))
+    }
+
+    fileprivate static func appendUnique(_ reason: ActionEpisodeBoundaryReason, to reasons: inout [ActionEpisodeBoundaryReason]) {
+        if !reasons.contains(reason) { reasons.append(reason) }
+    }
+
+    private struct EpisodeBuilder {
+        var events: [InputEvent]
+        var surfaceFlow: [String]
+        var windowTitles: [String]
+        var boundaryReasons: [ActionEpisodeBoundaryReason]
+        var lastSurface: String
+        var hasOpenCopyFlow: Bool
+        private var recentContinuityTokens: [String]
+
+        var lastEvent: InputEvent { events[events.count - 1] }
+
+        init(event: InputEvent, surface: String, startReasons: [ActionEpisodeBoundaryReason]) {
+            self.events = []
+            self.surfaceFlow = []
+            self.windowTitles = []
+            self.boundaryReasons = startReasons
+            self.lastSurface = surface
+            self.hasOpenCopyFlow = false
+            self.recentContinuityTokens = []
+            append(event, surface: surface)
+        }
+
+        mutating func append(_ event: InputEvent, surface: String) {
+            events.append(event)
+            lastSurface = surface
+            Self.appendDistinct(surface, to: &surfaceFlow)
+            if let title = cleanedWindowTitle(event.windowTitle) {
+                Self.appendDistinct(title, to: &windowTitles)
+            }
+            if ActionEpisodeSegmenter.isCopyShortcut(event) {
+                hasOpenCopyFlow = true
+            } else if ActionEpisodeSegmenter.isPasteShortcut(event) {
+                hasOpenCopyFlow = false
+            }
+            for token in ActionEpisodeSegmenter.continuityTokens(for: event) {
+                recentContinuityTokens.append(token)
+                if recentContinuityTokens.count > 12 {
+                    recentContinuityTokens.removeFirst(recentContinuityTokens.count - 12)
+                }
+            }
+        }
+
+        mutating func close(with reasons: [ActionEpisodeBoundaryReason]) {
+            for reason in reasons {
+                ActionEpisodeSegmenter.appendUnique(reason, to: &boundaryReasons)
+            }
+        }
+
+        func hasRecentContinuityToken(in tokens: [String]) -> Bool {
+            !Set(tokens).isDisjoint(with: recentContinuityTokens)
+        }
+
+        func build() -> ActionEpisode {
+            ActionEpisode(
+                eventIDs: events.map(\.id),
+                startAt: events.first?.capturedAt ?? Date(timeIntervalSince1970: 0),
+                endAt: events.last?.capturedAt ?? Date(timeIntervalSince1970: 0),
+                surfaceFlow: surfaceFlow,
+                windowTitles: windowTitles,
+                boundaryReasons: boundaryReasons
+            )
+        }
+
+        private static func appendDistinct(_ value: String, to values: inout [String]) {
+            if values.last != value {
+                values.append(value)
+            }
+        }
+
+        private func cleanedWindowTitle(_ title: String?) -> String? {
+            guard let title else { return nil }
+            let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return cleaned.isEmpty ? nil : cleaned
+        }
+    }
+}

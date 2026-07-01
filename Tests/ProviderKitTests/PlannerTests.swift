@@ -46,3 +46,12 @@ func plannerRejectsNonWebURL() async throws {
     let step = try await planner.proposeNextStep(goal: "x", contexts: [])
     #expect(step.action == .unsupported("open_url"))
 }
+
+@Test
+func plannedActionShortLabelSanitizesInvalidCoordinates() {
+    #expect(PlannedAction.click(x: .nan, y: .infinity).shortLabel == "click ?, ?")
+    #expect(PlannedAction.scroll(deltaX: .greatestFiniteMagnitude, deltaY: -.infinity).shortLabel == "scroll 1000000, ?")
+    #expect(PlannedAction.move(x: 12.9, y: -34.2).shortLabel == "move to 12, -34")
+    #expect(PlannedAction.doubleClick(x: 1, y: 2).shortLabel == "double-click 1, 2")
+    #expect(PlannedAction.rightClick(x: -3, y: 4).shortLabel == "right-click -3, 4")
+}

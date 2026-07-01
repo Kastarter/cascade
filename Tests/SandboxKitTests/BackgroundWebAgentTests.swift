@@ -1,5 +1,6 @@
 import Testing
 
+@testable import AgentOrchestrator
 @testable import ProviderKit
 @testable import SandboxKit
 
@@ -90,6 +91,87 @@ func emptyTagLeavesDetailUntouched() {
     #expect(BackgroundWebAgent.taggedDetail(tag: "", "key Return") == "key Return")
 }
 
+@Test
+func sandboxHarnessAuditUsesRecallSafeDescriptor() {
+    let phrase = "Aperture-Delta Jane Example confidential runway.pdf"
+    let detail = BackgroundWebAgent.harnessAuditDescriptor(
+        name: "search_record",
+        input: ["query": phrase]
+    )
+    #expect(detail == RecordRecall.Call.search(query: phrase).auditDetail)
+    #expect(detail.contains("tool=search_record"))
+    #expect(detail.contains("queryLength=\(phrase.count)"))
+    #expect(detail.contains("queryHash="))
+    #expect(!detail.contains(phrase))
+
+    let harness = BackgroundWebAgent.harnessAuditDescriptor(
+        name: "search_files",
+        input: ["query": phrase]
+    )
+    #expect(harness.contains("tool=search_files"))
+    #expect(harness.contains("queryHash="))
+    #expect(!harness.contains(phrase))
+}
+
+@Test
+func backgroundWebAuditDescriptorsNeverPersistSandboxRawValues() {
+    let url = "https://example.invalid/private/path?token=P7_06_UNIQUE_URL"
+    let fieldLabel = "P7_06 Unique Field Label"
+    let typedValue = "P7_06 typed value should never persist"
+    let finalFinding = "P7_06 final finding with sensitive answer text"
+    let toolResult = "Filled \(fieldLabel) with \(typedValue); \(finalFinding)"
+
+    let details = [
+        BackgroundWebAgent.sandboxActionAuditDescriptor(.openURL(url)),
+        BackgroundWebAgent.sandboxActionAuditDescriptor(.type(typedValue)),
+        BackgroundWebAgent.sandboxToolAuditDescriptor(
+            name: "fill_field",
+            input: ["field": fieldLabel, "value": typedValue, "url": url],
+            result: toolResult
+        ),
+        BackgroundWebAgent.sandboxTurnAuditDescriptor("Typed \(typedValue) into \(fieldLabel)"),
+        BackgroundWebAgent.sandboxStalledAuditDescriptor("Stalled after \(typedValue); \(finalFinding)"),
+        BackgroundWebAgent.sandboxGroundAuditDescriptor("matched \(fieldLabel)"),
+        BackgroundWebAgent.sandboxGroundMissAuditDescriptor(fieldLabel),
+        BackgroundWebAgent.sandboxVerifyAuditDescriptor(status: "verified", detail: finalFinding),
+        BackgroundWebAgent.sandboxDoneAuditDescriptor(status: "finished", acted: true, detail: finalFinding),
+    ]
+    let combined = details.joined(separator: "\n")
+
+    #expect(combined.contains("urlHash="))
+    #expect(combined.contains("targetHash="))
+    #expect(combined.contains("valueChars=\(typedValue.count)"))
+    #expect(combined.contains("resultHash="))
+    #expect(combined.contains("status=stalled"))
+    #expect(combined.contains("status=finished"))
+    #expect(combined.contains("acted=true"))
+
+    for raw in [url, fieldLabel, typedValue, finalFinding, toolResult] {
+        #expect(!combined.contains(raw))
+    }
+}
+
+@Test
+func backgroundWebObservationAuditDescriptorIsHashOnly() {
+    let info = InjectionGuard.EnvelopeAuditInfo(
+        trust: .untrustedWebDOM,
+        source: "https://example.invalid/private?token=secret",
+        acquiredByTool: "read_page",
+        injectionScore: 6,
+        injectionReasons: ["instruction_override", "direct_tool_name"],
+        payloadHash: "abc123"
+    )
+    let detail = BackgroundWebAgent.observationAuditDescriptor(tool: "read_page", info: info)
+
+    #expect(detail.contains("tool=read_page"))
+    #expect(detail.contains("trust=untrustedWebDOM"))
+    #expect(detail.contains("sourceHash="))
+    #expect(detail.contains("payloadHash=abc123"))
+    #expect(detail.contains("score=6"))
+    #expect(!detail.contains("secret"))
+    #expect(!detail.contains("example.invalid/private"))
+}
+
 // MARK: - Efficiency parity: state-change classification gates both circuit-breakers
 
 @Test
@@ -112,4 +194,39 @@ func realActionsCountAsStateChange() {
     #expect(BackgroundWebAgent.isStateChanging(.type("hi")))
     #expect(BackgroundWebAgent.isStateChanging(.openURL("https://example.com")))
     #expect(BackgroundWebAgent.isStateChanging(.key("return")))
+}
+
+@Test
+func backgroundWebAgentRejectsInvalidCoordinateFormatting() {
+    let invalid = [Double.nan, .infinity, -.infinity, 1_000_000_000]
+    for value in invalid {
+        #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: value, y: 10) == nil)
+        #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: 10, y: value) == nil)
+    }
+
+    #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: 10.8, y: 20.2)?.x == 10)
+    #expect(BackgroundWebAgent.sandboxTopLeftPoint(x: 10.8, y: 20.2)?.y == 539)
+    #expect(BackgroundWebAgent.invalidCoordinateDetail("click") == "invalid-coordinate action=click")
+}
+
+@Test
+func backgroundWebAgentScrollFormattingIsBounded() {
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: 2) == 240)
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "up", amount: 2) == -240)
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: Int.max) == nil)
+    #expect(BackgroundWebAgent.sandboxScrollDelta(direction: "down", amount: 1_000_000_000) == nil)
+}
+
+@Test
+func backgroundWebAuditDetailsIncludeSelectedRecoveryAction() {
+    let transport = BackgroundWebAgent.sandboxDoneAuditDescriptor(
+        status: "transport_failure",
+        acted: false,
+        recoveryAction: .backoffRetry
+    )
+    let noEffect = BackgroundWebAgent.sandboxNoEffectAuditDescriptor(status: "unchanged", streak: 2)
+
+    #expect(transport.contains("recoveryAction=backoffRetry"))
+    #expect(noEffect.contains("noEffectStreak=2"))
+    #expect(noEffect.contains("recoveryAction=alternateTarget"))
 }

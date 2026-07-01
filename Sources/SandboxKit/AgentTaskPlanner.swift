@@ -1,6 +1,45 @@
 import Foundation
 import OSLog
+import AgentOrchestrator
 import ProviderKit
+
+/// Observable state changes the executor/verifier can check after a subtask.
+public enum ExpectedEffect: Sendable, Equatable {
+    case frontmostApp(String)
+    case windowTitleContains(String)
+    case visibleText(String)
+    case urlContains(String)
+    case artifactExists(String)
+    case noUnexpectedModal
+
+    public var auditLabel: String {
+        switch self {
+        case .frontmostApp(let value): "frontmost_app:\(value)"
+        case .windowTitleContains(let value): "window_title:\(value)"
+        case .visibleText(let value): "visible_text:\(value)"
+        case .urlContains(let value): "url_contains:\(value)"
+        case .artifactExists(let value): "artifact_exists:\(value)"
+        case .noUnexpectedModal: "no_unexpected_modal"
+        }
+    }
+}
+
+public enum AgentSubtaskRisk: String, Sendable, Equatable, Codable, CaseIterable {
+    case low
+    case medium
+    case high
+
+    static func normalized(_ raw: String?) -> AgentSubtaskRisk {
+        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "high", "dangerous", "destructive", "external_side_effect", "external-side-effect":
+            .high
+        case "medium", "moderate", "risky", "uncertain":
+            .medium
+        default:
+            .low
+        }
+    }
+}
 
 /// One part of a job, sized so a single Computer Use episode can finish it within
 /// its own step budget.
@@ -20,14 +59,177 @@ public struct AgentSubtask: Sendable, Equatable {
     public let web: Bool
     /// For non-web sandbox parts: a short reason shown to the user.
     public let note: String
+    /// Deterministic or verifier-checkable state changes expected after this part.
+    public let expectedEffects: [ExpectedEffect]
+    /// Planner-estimated risk for choosing verifier/critic/replan depth.
+    public let risk: AgentSubtaskRisk
 
-    public init(task: String, startURL: String = "", app: String = "", web: Bool = true, note: String = "") {
+    public init(
+        task: String,
+        startURL: String = "",
+        app: String = "",
+        web: Bool = true,
+        note: String = "",
+        expectedEffects: [ExpectedEffect] = [],
+        risk: AgentSubtaskRisk = .low
+    ) {
         self.task = task
         self.startURL = startURL
         self.app = app
         self.web = web
         self.note = note
+        self.expectedEffects = expectedEffects
+        self.risk = risk
     }
+}
+
+public struct AgentTaskPlan: Sendable, Equatable {
+    public let id: String
+    public let originalTask: String
+    public let subtasks: [AgentSubtask]
+
+    public init(id: String = UUID().uuidString, originalTask: String, subtasks: [AgentSubtask]) {
+        self.id = id
+        self.originalTask = originalTask
+        self.subtasks = Array(subtasks.prefix(AgentTaskPlanner.maxSubtasks))
+    }
+}
+
+public struct AgentTaskFinding: Sendable, Equatable {
+    public let task: String
+    public let result: String
+
+    public init(task: String, result: String) {
+        self.task = task
+        self.result = result
+    }
+}
+
+public enum SearchRoutingIntent: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case onScreen
+    case recordedMemory
+    case localFiles
+    case web
+    case ambiguous
+    case multi
+    case noSearch
+
+    static func normalized(_ raw: String?) -> SearchRoutingIntent? {
+        let value = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch value {
+        case "onscreen", "on_screen", "screen", "visible", "current_screen":
+            return .onScreen
+        case "recordedmemory", "recorded_memory", "memory", "recall", "record":
+            return .recordedMemory
+        case "localfiles", "local_files", "files", "file", "folder", "spotlight":
+            return .localFiles
+        case "web", "internet", "browser", "online":
+            return .web
+        case "ambiguous", "unknown", "unclear":
+            return .ambiguous
+        case "multi", "multiple", "multi_source", "multi-source":
+            return .multi
+        case "none", "no_search", "nosearch", "no_retrieval":
+            return .noSearch
+        default:
+            return nil
+        }
+    }
+}
+
+public enum SearchResource: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case onScreen
+    case recordedMemory
+    case localFiles
+    case web
+
+    static func normalized(_ raw: String?) -> SearchResource? {
+        let value = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch value {
+        case "onscreen", "on_screen", "screen", "visible", "current_screen":
+            return .onScreen
+        case "recordedmemory", "recorded_memory", "memory", "recall", "record":
+            return .recordedMemory
+        case "localfiles", "local_files", "files", "file", "folder", "spotlight":
+            return .localFiles
+        case "web", "internet", "browser", "online":
+            return .web
+        default:
+            return nil
+        }
+    }
+}
+
+public struct SearchRouteHint: Sendable, Equatable, Codable {
+    public let routingIntent: SearchRoutingIntent
+    public let candidateSources: [SearchResource]
+    public let cleanQuery: String
+
+    public init(
+        routingIntent: SearchRoutingIntent,
+        candidateSources: [SearchResource],
+        cleanQuery: String
+    ) {
+        self.routingIntent = routingIntent
+        self.candidateSources = Self.dedup(candidateSources)
+        self.cleanQuery = cleanQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var allowsWeb: Bool { candidateSources.contains(.web) || routingIntent == .web || routingIntent == .multi }
+    public var usesCheapLocalSources: Bool {
+        candidateSources.contains(.recordedMemory) || candidateSources.contains(.localFiles)
+    }
+
+    private static func dedup(_ sources: [SearchResource]) -> [SearchResource] {
+        var seen = Set<SearchResource>()
+        var output: [SearchResource] = []
+        for source in sources where seen.insert(source).inserted {
+            output.append(source)
+        }
+        return output
+    }
+}
+
+public struct AgentRecoveryMemo: Sendable, Equatable {
+    public let failedSubtask: AgentSubtask
+    public let failureKind: AgentFailureKind
+    public let attemptedRecovery: RecoveryAction?
+    public let firstBadActionHash: String?
+    public let targetHash: String?
+    public let stateSummary: String
+    public let evidenceSummary: String
+    public let completedFindings: [AgentTaskFinding]
+
+    public init(
+        failedSubtask: AgentSubtask,
+        failureKind: AgentFailureKind,
+        attemptedRecovery: RecoveryAction? = nil,
+        firstBadActionHash: String? = nil,
+        targetHash: String? = nil,
+        stateSummary: String,
+        evidenceSummary: String = "",
+        completedFindings: [AgentTaskFinding] = []
+    ) {
+        self.failedSubtask = failedSubtask
+        self.failureKind = failureKind
+        self.attemptedRecovery = attemptedRecovery
+        self.firstBadActionHash = firstBadActionHash
+        self.targetHash = targetHash
+        self.stateSummary = stateSummary
+        self.evidenceSummary = evidenceSummary
+        self.completedFindings = completedFindings
+    }
+}
+
+public enum AgentReplanDecision: Sendable, Equatable {
+    case replaceCurrent(AgentSubtask)
+    case pause(String)
 }
 
 /// Splits a request into ordered, individually-runnable subtasks before the agent
@@ -46,10 +248,25 @@ public struct AgentTaskPlanner: Sendable {
     }
 
     private let client: any MessageCompleting
+    private let cachedClient: CachedMessageCompleter?
     private let model: String
+    static let promptVersion = "agent-task-planner.prompt.v2"
+    static let replanPromptVersion = "agent-task-replanner.prompt.v1"
+    static let searchRoutePromptVersion = "agent-search-router.prompt.v1"
+    static let schemaVersion = "agent-task-planner.schema.v2"
+    static let searchRouteSchemaVersion = "agent-search-router.schema.v1"
 
-    public init(client: any MessageCompleting = AnthropicClient(), model: String = AnthropicModel.sonnet) {
-        self.client = client
+    public init(
+        client: any MessageCompleting = AnthropicClient(),
+        model: String = AnthropicModel.sonnet,
+        cache: ModelCallCache? = nil,
+        retryPolicy: RetryBackoffPolicy? = nil
+    ) {
+        let effectiveClient: any MessageCompleting = retryPolicy.map {
+            RetryingMessageCompleter(client: client, retryPolicy: $0)
+        } ?? client
+        self.client = effectiveClient
+        self.cachedClient = cache.map { CachedMessageCompleter(client: effectiveClient, cache: $0) }
         self.model = model
     }
 
@@ -61,31 +278,141 @@ public struct AgentTaskPlanner: Sendable {
     public func plan(
         for task: String, in environment: Environment, conversationContext: String = ""
     ) async -> [AgentSubtask] {
+        await taskPlan(for: task, in: environment, conversationContext: conversationContext).subtasks
+    }
+
+    public func taskPlan(
+        for task: String, in environment: Environment, conversationContext: String = ""
+    ) async -> AgentTaskPlan {
         let memo = conversationContext.trimmingCharacters(in: .whitespacesAndNewlines)
         let user = memo.isEmpty
             ? "Job: \(task)"
             : "Recent conversation (resolve references like \"it\" or \"the first one\" from here; the job below is what to plan):\n\(memo)\n\nJob: \(task)"
-        let raw = try? await client.complete(
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.promptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "AgentTaskPlanner.plan"
+        )
+        let raw = try? await complete(
             system: Self.systemPrompt(for: environment),
             user: user,
-            model: model,
-            maxTokens: 700
+            maxTokens: 700,
+            options: options,
+            validating: {
+                guard Self.parse($0) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
         )
         if let raw, let parsed = Self.parse(raw) {
-            return Array(parsed.prefix(Self.maxSubtasks))
+            return AgentTaskPlan(originalTask: task, subtasks: parsed)
         }
         // Degrading to one subtask is safe but should never be invisible — a key,
         // network, or schema problem would otherwise just look like "worse plans".
         Self.logger.error("planner fell back to a single subtask — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
         switch environment {
-        case .webSandbox: return [AgentSubtask(task: task, startURL: Self.searchURL(for: task))]
-        case .onScreen: return [AgentSubtask(task: task)]
+        case .webSandbox: return AgentTaskPlan(originalTask: task, subtasks: [AgentSubtask(task: task, startURL: Self.searchURL(for: task))])
+        case .onScreen: return AgentTaskPlan(originalTask: task, subtasks: [AgentSubtask(task: task)])
         }
+    }
+
+    public func replan(
+        originalTask: String,
+        memo: AgentRecoveryMemo,
+        environment: Environment,
+        conversationContext: String = ""
+    ) async -> AgentReplanDecision {
+        let recovery = memo.attemptedRecovery ?? AgentRecoveryPolicy.plan(for: memo.failureKind).retryRungs.first
+        guard let recovery, recovery.canRecover else {
+            return .pause(Self.pauseReason(for: memo.failureKind, action: AgentRecoveryPolicy.plan(for: memo.failureKind).terminal))
+        }
+
+        let user = Self.replanPrompt(originalTask: originalTask, memo: memo, recovery: recovery, conversationContext: conversationContext)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.replanPromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "AgentTaskPlanner.replan"
+        )
+        let raw = try? await complete(
+            system: Self.replanSystemPrompt(for: environment),
+            user: user,
+            maxTokens: 500,
+            options: options,
+            validating: {
+                guard Self.parse($0)?.first != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
+        )
+        if let raw, let subtask = Self.parse(raw)?.first {
+            return .replaceCurrent(subtask)
+        }
+        return .replaceCurrent(Self.recoveryFallbackSubtask(from: memo, recovery: recovery))
+    }
+
+    public func routeSearch(
+        for task: String,
+        in environment: Environment,
+        conversationContext: String = ""
+    ) async -> SearchRouteHint {
+        let request = Self.searchRouteRequestBody(
+            task: task,
+            environment: environment,
+            conversationContext: conversationContext
+        )
+        let user = (try? Self.jsonString(request)) ?? "Job: \(task)"
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.searchRoutePromptVersion,
+            schemaVersion: Self.searchRouteSchemaVersion,
+            callsite: "AgentTaskPlanner.searchRoute"
+        )
+        let raw = try? await complete(
+            system: Self.searchRouteSystemPrompt,
+            user: user,
+            maxTokens: 300,
+            options: options,
+            validating: {
+                guard Self.parseSearchRoute($0) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
+        )
+        if let raw, let parsed = Self.parseSearchRoute(raw) {
+            return parsed
+        }
+        return Self.heuristicSearchRoute(for: task, in: environment, conversationContext: conversationContext)
     }
 
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "planner")
 
     static let maxSubtasks = 5
+
+    static let searchRouteSystemPrompt = """
+    You route a user request across Cascade's search resources. Return only JSON:
+    {"routingIntent":"onScreen|recordedMemory|localFiles|web|ambiguous|multi|noSearch","candidateSources":["onScreen","recordedMemory","localFiles","web"],"cleanQuery":"..."}
+
+    Choose the cheapest useful source first. Use recordedMemory for things the user saw or did earlier. Use localFiles for files or folders on this Mac. Use web for current/public/world facts. Use onScreen when the answer is visible now. Use multi when more than one source is likely needed.
+    """
+
+    private func complete(
+        system: String,
+        user: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions,
+        validating validate: @Sendable @escaping (String) throws -> Void
+    ) async throws -> String {
+        if let cachedClient {
+            return try await cachedClient.complete(
+                system: system,
+                user: user,
+                model: model,
+                maxTokens: maxTokens,
+                options: options,
+                validating: validate
+            )
+        }
+        return try await client.complete(system: system, user: user, model: model, maxTokens: maxTokens, options: options)
+    }
 
     static func systemPrompt(for environment: Environment) -> String {
         switch environment {
@@ -114,8 +441,13 @@ public struct AgentTaskPlanner: Sendable {
     a part truly cannot happen in a browser (controls a local desktop app, local \
     files, system settings) and put a short reason in "note".
 
+    - Include "expectedEffects" only for observable checks: frontmost_app, \
+    window_title_contains, visible_text, url_contains, artifact_exists, no_unexpected_modal.
+    - Set "risk" to low, medium, or high. High means irreversible, external side effect, \
+    payment/send/delete, or file/system mutation.
+
     Reply with ONLY this JSON, no prose:
-    {"subtasks":[{"task":"...","startURL":"https://...","web":true,"note":""}]}
+    {"subtasks":[{"task":"...","startURL":"https://...","web":true,"note":"","expectedEffects":[{"kind":"url_contains","value":"example.com"}],"risk":"low"}]}
     """
 
     static let onScreenPrompt = """
@@ -134,16 +466,57 @@ public struct AgentTaskPlanner: Sendable {
     full https:// page in "url" instead. Leave both "" when the part continues where \
     the previous part ends.
 
+    - Include "expectedEffects" only for observable checks: frontmost_app, \
+    window_title_contains, visible_text, url_contains, artifact_exists, no_unexpected_modal.
+    - Set "risk" to low, medium, or high. High means irreversible, external side effect, \
+    payment/send/delete, or file/system mutation.
+
     Reply with ONLY this JSON, no prose:
-    {"subtasks":[{"task":"...","app":"","url":""}]}
+    {"subtasks":[{"task":"...","app":"","url":"","expectedEffects":[{"kind":"frontmost_app","value":"Notes"}],"risk":"low"}]}
     """
+
+    static func replanSystemPrompt(for environment: Environment) -> String {
+        """
+        You repair one failed subtask for Cascade's bounded GUI agent. Return at most ONE \
+        replacement subtask that avoids repeating the failed target/action and follows the \
+        requested recovery rung. If recovery is not possible, return one subtask that gathers \
+        the minimum evidence needed to pause honestly.
+
+        \(systemPrompt(for: environment))
+        """
+    }
+
+    static func replanPrompt(
+        originalTask: String,
+        memo: AgentRecoveryMemo,
+        recovery: RecoveryAction,
+        conversationContext: String
+    ) -> String {
+        let findings = memo.completedFindings.enumerated().map { index, finding in
+            "\(index + 1). \(finding.task) -> \(finding.result)"
+        }.joined(separator: "\n")
+        return """
+        Original job: \(originalTask)
+        Failed subtask: \(memo.failedSubtask.task)
+        Failure kind: \(memo.failureKind.rawValue)
+        Recovery rung to try: \(recovery.rawValue)
+        First bad action hash: \(memo.firstBadActionHash ?? "none")
+        Target hash: \(memo.targetHash ?? "none")
+        Current state: \(memo.stateSummary)
+        Evidence: \(memo.evidenceSummary.isEmpty ? "none" : memo.evidenceSummary)
+        Completed findings:
+        \(findings.isEmpty ? "none" : findings)
+        Recent conversation:
+        \(conversationContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "none" : conversationContext)
+        """
+    }
 
     /// Parses the planner reply, tolerating prose or code fences around the JSON.
     static func parse(_ raw: String) -> [AgentSubtask]? {
         guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end,
               let data = String(raw[start...end]).data(using: .utf8),
               let dto = try? JSONDecoder().decode(PlanDTO.self, from: data) else { return nil }
-        let subtasks = dto.subtasks.compactMap { item -> AgentSubtask? in
+        let subtasks = dto.subtasks.prefix(Self.maxSubtasks).compactMap { item -> AgentSubtask? in
             let task = (item.task ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !task.isEmpty else { return nil }
             var url = (item.startURL ?? item.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -153,10 +526,163 @@ public struct AgentTaskPlanner: Sendable {
                 startURL: url,
                 app: (item.app ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                 web: item.web ?? true,
-                note: (item.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                note: (item.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                expectedEffects: (item.expectedEffects ?? []).compactMap(\.effect),
+                risk: AgentSubtaskRisk.normalized(item.risk)
             )
         }
         return subtasks.isEmpty ? nil : subtasks
+    }
+
+    static func parseSearchRoute(_ raw: String) -> SearchRouteHint? {
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end,
+              let data = String(raw[start...end]).data(using: .utf8),
+              let dto = try? JSONDecoder().decode(SearchRouteDTO.self, from: data),
+              let intent = SearchRoutingIntent.normalized(dto.routingIntent) else {
+            return nil
+        }
+        let cleanQuery = (dto.cleanQuery ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuery.isEmpty else { return nil }
+        let rawSources = dto.candidateSources ?? []
+        let parsedSources = rawSources.compactMap(SearchResource.normalized)
+        guard rawSources.isEmpty || !parsedSources.isEmpty else { return nil }
+        let sources = parsedSources.isEmpty ? defaultSources(for: intent) : parsedSources
+        guard !sources.isEmpty || intent == .noSearch else { return nil }
+        return SearchRouteHint(
+            routingIntent: intent,
+            candidateSources: sources,
+            cleanQuery: cleanQuery
+        )
+    }
+
+    static func searchRouteRequestBody(
+        task: String,
+        environment: Environment,
+        conversationContext: String
+    ) -> [String: Any] {
+        let memo = conversationContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "normalizedGoal": cleanSearchQuery(task).lowercased(),
+            "originalGoal": task.trimmingCharacters(in: .whitespacesAndNewlines),
+            "conversationMemo": memo,
+            "frontmostContext": routeContextFingerprintInput(memo),
+            "environment": environment == .webSandbox ? "webSandbox" : "onScreen",
+            "availableResources": availableSearchResources(for: environment).map(\.rawValue),
+            "output": [
+                "routingIntent": "one of onScreen, recordedMemory, localFiles, web, ambiguous, multi, noSearch",
+                "candidateSources": "ordered cheapest-first subset of availableResources",
+                "cleanQuery": "short search query with voice filler removed",
+            ],
+        ]
+    }
+
+    private static func availableSearchResources(for environment: Environment) -> [SearchResource] {
+        switch environment {
+        case .webSandbox:
+            [.web, .recordedMemory, .localFiles]
+        case .onScreen:
+            [.onScreen, .recordedMemory, .localFiles, .web]
+        }
+    }
+
+    private static func routeContextFingerprintInput(_ memo: String) -> String {
+        let lines = memo
+            .split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let contextLines = lines.filter { line in
+            let lower = line.lowercased()
+            return lower.contains("frontmost") || lower.contains("window") || lower.contains("app:")
+        }
+        return contextLines.prefix(6).joined(separator: "\n")
+    }
+
+    private static func jsonString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+
+    static func heuristicSearchRoute(
+        for task: String,
+        in environment: Environment,
+        conversationContext: String = ""
+    ) -> SearchRouteHint {
+        let query = cleanSearchQuery(task)
+        let haystack = " \(task.lowercased()) \(conversationContext.lowercased()) "
+        let recordedMarkers = [
+            " earlier", "this morning", "yesterday", "last week", "last time", "i had open",
+            "i was reading", "i saw", "we saw", "remember", "history", "recorded", "timeline",
+        ]
+        let localMarkers = [
+            " file", "folder", "desktop", "downloads", "documents", "finder", "on my mac",
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".md",
+        ]
+        let webMarkers = [
+            "latest", "current", "today", "news", "weather", "stock", "price", "online",
+            "internet", "website", "web", "google", "who is", "what is", "when is",
+        ]
+        let screenMarkers = [
+            "on screen", "this screen", "this page", "visible", "what does this say",
+            "summarize this", "read this",
+        ]
+
+        var sources: [SearchResource] = []
+        if screenMarkers.contains(where: haystack.contains) { sources.append(.onScreen) }
+        if recordedMarkers.contains(where: haystack.contains) { sources.append(.recordedMemory) }
+        if localMarkers.contains(where: haystack.contains) { sources.append(.localFiles) }
+        if webMarkers.contains(where: haystack.contains) || environment == .webSandbox { sources.append(.web) }
+
+        if sources.isEmpty {
+            sources = environment == .webSandbox ? [.web] : [.onScreen, .recordedMemory, .localFiles]
+        }
+
+        let intent: SearchRoutingIntent
+        if sources.count > 1 {
+            intent = sources.contains(.web) && (sources.contains(.recordedMemory) || sources.contains(.localFiles)) ? .multi : .ambiguous
+        } else {
+            switch sources.first {
+            case .onScreen: intent = .onScreen
+            case .recordedMemory: intent = .recordedMemory
+            case .localFiles: intent = .localFiles
+            case .web: intent = .web
+            case nil: intent = .noSearch
+            }
+        }
+
+        return SearchRouteHint(routingIntent: intent, candidateSources: sources, cleanQuery: query)
+    }
+
+    private static func defaultSources(for intent: SearchRoutingIntent) -> [SearchResource] {
+        switch intent {
+        case .onScreen: [.onScreen]
+        case .recordedMemory: [.recordedMemory]
+        case .localFiles: [.localFiles]
+        case .web: [.web]
+        case .ambiguous: [.onScreen, .recordedMemory, .localFiles]
+        case .multi: [.recordedMemory, .localFiles, .web]
+        case .noSearch: []
+        }
+    }
+
+    static func cleanSearchQuery(_ task: String) -> String {
+        var query = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefixes = [
+            "please ", "can you ", "could you ", "would you ", "find ", "search for ",
+            "search ", "look up ", "lookup ", "tell me ", "show me ", "where is ",
+            "what is ", "what's ",
+        ]
+        var lowered = query.lowercased()
+        var changed = true
+        while changed {
+            changed = false
+            for prefix in prefixes where lowered.hasPrefix(prefix) {
+                query = String(query.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                lowered = query.lowercased()
+                changed = true
+                break
+            }
+        }
+        return query.isEmpty ? task.trimmingCharacters(in: .whitespacesAndNewlines) : query
     }
 
     /// Deterministic fallback start page when no better URL is known.
@@ -230,6 +756,111 @@ public struct AgentTaskPlanner: Sendable {
             let app: String?
             let web: Bool?
             let note: String?
+            let expectedEffects: [ExpectedEffectDTO]?
+            let risk: String?
         }
+    }
+
+    private struct SearchRouteDTO: Decodable {
+        let routingIntent: String?
+        let candidateSources: [String]?
+        let cleanQuery: String?
+    }
+
+    private struct ExpectedEffectDTO: Decodable {
+        let effect: ExpectedEffect?
+
+        init(from decoder: Decoder) throws {
+            if let string = try? decoder.singleValueContainer().decode(String.self) {
+                effect = Self.parse(kind: string, value: nil)
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let explicitKind = try container.decodeIfPresent(String.self, forKey: .kind)
+            let typeKind = try container.decodeIfPresent(String.self, forKey: .type)
+            let nameKind = try container.decodeIfPresent(String.self, forKey: .name)
+            let kind = explicitKind ?? typeKind ?? nameKind
+            let valueField = try container.decodeIfPresent(String.self, forKey: .value)
+            let textField = try container.decodeIfPresent(String.self, forKey: .text)
+            let appField = try container.decodeIfPresent(String.self, forKey: .app)
+            let titleField = try container.decodeIfPresent(String.self, forKey: .title)
+            let urlField = try container.decodeIfPresent(String.self, forKey: .url)
+            let pathField = try container.decodeIfPresent(String.self, forKey: .path)
+            let value = valueField ?? textField ?? appField ?? titleField ?? urlField ?? pathField
+            effect = Self.parse(kind: kind, value: value)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case kind, type, name, value, text, app, title, url, path
+        }
+
+        private static func parse(kind rawKind: String?, value rawValue: String?) -> ExpectedEffect? {
+            let kind = (rawKind ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "-", with: "_")
+            let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch kind {
+            case "frontmost_app", "frontmostapp":
+                guard let value, !value.isEmpty else { return nil }
+                return .frontmostApp(value)
+            case "window_title_contains", "window_title", "windowtitlecontains":
+                guard let value, !value.isEmpty else { return nil }
+                return .windowTitleContains(value)
+            case "visible_text", "visibletext", "ocr_visible_text":
+                guard let value, !value.isEmpty else { return nil }
+                return .visibleText(value)
+            case "url_contains", "urlcontains":
+                guard let value, !value.isEmpty else { return nil }
+                return .urlContains(value)
+            case "artifact_exists", "artifactexists", "file_exists":
+                guard let value, !value.isEmpty else { return nil }
+                return .artifactExists(value)
+            case "no_unexpected_modal", "nounexpectedmodal", "no_modal":
+                return .noUnexpectedModal
+            default:
+                return nil
+            }
+        }
+    }
+
+    private static func pauseReason(for failureKind: AgentFailureKind, action: RecoveryAction) -> String {
+        "Recovery for \(failureKind.rawValue) reached \(action.rawValue); pause with the current evidence."
+    }
+
+    private static func recoveryFallbackSubtask(from memo: AgentRecoveryMemo, recovery: RecoveryAction) -> AgentSubtask {
+        let task = "Recover from \(snakeCase(memo.failureKind.rawValue)) while doing: \(memo.failedSubtask.task). Try \(recovery.rawValue), do not repeat the failed target/action, and pause if the screen still contradicts completion."
+        return AgentSubtask(
+            task: task,
+            startURL: memo.failedSubtask.startURL,
+            app: memo.failedSubtask.app,
+            web: memo.failedSubtask.web,
+            note: memo.failedSubtask.note,
+            expectedEffects: memo.failedSubtask.expectedEffects,
+            risk: maxRisk(memo.failedSubtask.risk, .medium)
+        )
+    }
+
+    private static func maxRisk(_ lhs: AgentSubtaskRisk, _ rhs: AgentSubtaskRisk) -> AgentSubtaskRisk {
+        func rank(_ risk: AgentSubtaskRisk) -> Int {
+            switch risk {
+            case .low: 0
+            case .medium: 1
+            case .high: 2
+            }
+        }
+        return rank(lhs) >= rank(rhs) ? lhs : rhs
+    }
+
+    private static func snakeCase(_ value: String) -> String {
+        var output = ""
+        for scalar in value.unicodeScalars {
+            if CharacterSet.uppercaseLetters.contains(scalar) {
+                if !output.isEmpty { output.append("_") }
+                output.append(String(scalar).lowercased())
+            } else {
+                output.append(String(scalar))
+            }
+        }
+        return output
     }
 }

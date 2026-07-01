@@ -1,5 +1,29 @@
 import AppKit
+import ComputerUseKit
+import MacContextKit
 import WebKit
+
+enum SandboxCoordinate {
+    static let pageMaxX = 900
+    static let pageMaxY = 560
+    static let scrollMaxDelta = 100_000
+
+    static func safeInt(_ value: CGFloat, min: Int, max: Int) -> Int? {
+        guard value.isFinite else { return nil }
+        guard value >= CGFloat(min), value <= CGFloat(max) else { return nil }
+        return Int(value)
+    }
+
+    static func pagePoint(x: CGFloat, y: CGFloat) -> (x: Int, y: Int)? {
+        guard let safeX = safeInt(x, min: 0, max: pageMaxX),
+              let safeY = safeInt(y, min: 0, max: pageMaxY) else { return nil }
+        return (safeX, safeY)
+    }
+
+    static func scrollDelta(_ dy: CGFloat) -> Int? {
+        safeInt(dy, min: -scrollMaxDelta, max: scrollMaxDelta)
+    }
+}
 
 /// An isolated, off-to-the-side web environment the background agent works inside —
 /// never touching the user's real screen. It deliberately uses the DEFAULT (persistent)
@@ -34,6 +58,11 @@ public final class WebSandbox: NSObject {
         // (the agent reuses it on later tasks instead of hitting the login wall again).
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.userContentController.addUserScript(WKUserScript(
+            source: WebStateSignature.mutationObserverInstallScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: WebSandbox.width, height: WebSandbox.height), configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         super.init()
@@ -105,6 +134,29 @@ public final class WebSandbox: NSObject {
         return String(describing: result)
     }
 
+    /// Compact page state for no-effect detection. Returns `nil` when WebKit cannot
+    /// evaluate the snapshot script so callers can fall back without logging page text.
+    public func stateSignature() async -> WebStateSignature? {
+        do {
+            let result = try await webView.evaluateJavaScript(WebStateSignature.javaScriptSnippet)
+            guard let snapshot = result as? [String: Any] else { return nil }
+            return WebStateSignature(snapshot: snapshot)
+        } catch {
+            return nil
+        }
+    }
+
+    public func consumeMutations() async -> [WebStateSignature.Mutation] {
+        do {
+            guard let result = try await webView.evaluateJavaScript(WebStateSignature.mutationConsumeJavaScript) as? [Any] else {
+                return []
+            }
+            return result.map(WebStateSignature.Mutation.init(snapshot:))
+        } catch {
+            return []
+        }
+    }
+
     // MARK: - Action point (drives the native companion cursor in the watch box)
 
     /// The last page point (top-left coords) the agent acted on. The watch box reads
@@ -128,20 +180,40 @@ public final class WebSandbox: NSObject {
               let close = result.range(of: "@@", range: result.index(result.startIndex, offsetBy: 2)..<result.endIndex)
         else { return result }
         let coords = result[result.index(result.startIndex, offsetBy: 2)..<close.lowerBound].split(separator: ",").compactMap { Double($0) }
-        if coords.count == 2 { lastActionPoint = CGPoint(x: coords[0], y: coords[1]) }
+        if coords.count == 2,
+           let point = SandboxCoordinate.pagePoint(x: CGFloat(coords[0]), y: CGFloat(coords[1])) {
+            lastActionPoint = CGPoint(x: point.x, y: point.y)
+        } else {
+            lastActionPoint = nil
+        }
         return String(result[close.upperBound...])
     }
 
     /// Records where the agent's pointer is headed (top-left page coords) — there's no
     /// real pointer in the sandbox, so this only feeds the watch box's cursor overlay.
     public func moveCursor(toTopLeftX x: CGFloat, y: CGFloat) async {
-        lastActionPoint = CGPoint(x: x, y: y)
+        guard let point = SandboxCoordinate.pagePoint(x: x, y: y) else {
+            lastActionPoint = nil
+            return
+        }
+        lastActionPoint = CGPoint(x: point.x, y: point.y)
     }
 
     /// Clicks at a top-left page coordinate by synthesizing real mouse events on the
     /// element under that point.
     public func click(xTopLeft x: CGFloat, yTopLeft y: CGFloat) async {
-        lastActionPoint = CGPoint(x: x, y: y)
+        guard let point = SandboxCoordinate.pagePoint(x: x, y: y),
+              let js = Self.clickJavaScript(xTopLeft: x, yTopLeft: y) else {
+            lastActionPoint = nil
+            return
+        }
+        lastActionPoint = CGPoint(x: point.x, y: point.y)
+        _ = await runJS(js)
+        try? await Task.sleep(for: .milliseconds(150))
+    }
+
+    nonisolated static func clickJavaScript(xTopLeft x: CGFloat, yTopLeft y: CGFloat) -> String? {
+        guard let point = SandboxCoordinate.pagePoint(x: x, y: y) else { return nil }
         let js = """
         (function(x, y){
           var el = document.elementFromPoint(x, y);
@@ -163,10 +235,9 @@ public final class WebSandbox: NSObject {
             } catch(e){}
           } else if (el.focus) { try { el.focus(); } catch(e){} }
           return (el.tagName || '') + (el.href ? (' '+el.href) : '');
-        })(\(Int(x)), \(Int(y)));
+        })(\(point.x), \(point.y));
         """
-        _ = await runJS(js)
-        try? await Task.sleep(for: .milliseconds(150))
+        return js
     }
 
     /// Types text into the currently focused field.
@@ -248,8 +319,14 @@ public final class WebSandbox: NSObject {
     }
 
     public func scroll(dy: CGFloat) async {
-        _ = await runJS("window.scrollBy(0, \(Int(dy)));")
+        guard let js = Self.scrollJavaScript(dy: dy) else { return }
+        _ = await runJS(js)
         try? await Task.sleep(for: .milliseconds(150))
+    }
+
+    nonisolated static func scrollJavaScript(dy: CGFloat) -> String? {
+        guard let delta = SandboxCoordinate.scrollDelta(dy) else { return nil }
+        return "window.scrollBy(0, \(delta));"
     }
 
     // MARK: - DOM harness (the web analog of the Mac file/shell harness)
@@ -407,8 +484,10 @@ public final class WebSandbox: NSObject {
         let parts = res.split(separator: ",")
         guard parts.count == 2,
               let cx = Double(parts[0].trimmingCharacters(in: .whitespaces)),
-              let cy = Double(parts[1].trimmingCharacters(in: .whitespaces)) else { return nil }
-        return CGPoint(x: cx, y: viewportHeight - cy)
+              let cy = Double(parts[1].trimmingCharacters(in: .whitespaces)),
+              let viewport = SandboxCoordinate.safeInt(viewportHeight, min: 0, max: SandboxCoordinate.pageMaxY),
+              let point = SandboxCoordinate.pagePoint(x: CGFloat(cx), y: CGFloat(cy)) else { return nil }
+        return CGPoint(x: point.x, y: viewport - point.y)
     }
 
     /// A select-all combo (cmd+a / ctrl+a) — the key the native fill pattern presses
@@ -426,6 +505,86 @@ public final class WebSandbox: NSObject {
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "")
         return "'\(escaped)'"
+    }
+}
+
+@MainActor
+public final class WebSandboxComputerUseActuator: ComputerUseActuator, @unchecked Sendable {
+    private let sandbox: WebSandbox
+
+    public init(sandbox: WebSandbox) {
+        self.sandbox = sandbox
+    }
+
+    public func health() async -> ComputerUseHealth {
+        ComputerUseHealth(
+            ready: true,
+            permissions: CapturePermissionStatus(screenRecording: true, accessibility: true, inputMonitoring: true),
+            secureInputEnabled: false,
+            message: "Web sandbox is ready."
+        )
+    }
+
+    public func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult {
+        guard Self.isValidForSandbox(action) else {
+            return action.result(status: .invalid, failureKind: .targetNotFound, extra: ["surface": "webSandbox"])
+        }
+        do {
+            try await perform(action)
+            return action.result(extra: ["surface": "webSandbox"])
+        } catch ComputerUseError.stopped {
+            return action.result(status: .refused, failureKind: .userStop, extra: ["surface": "webSandbox"])
+        } catch {
+            return action.result(status: .failed, failureKind: .toolError, extra: ["surface": "webSandbox"])
+        }
+    }
+
+    public func perform(_ action: ComputerUseAction) async throws {
+        switch action {
+        case .move(let x, let y):
+            await sandbox.moveCursor(toTopLeftX: CGFloat(x), y: CGFloat(y))
+        case .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            await sandbox.click(xTopLeft: CGFloat(x), yTopLeft: CGFloat(y))
+        case .drag(_, _, let toX, let toY):
+            await sandbox.click(xTopLeft: CGFloat(toX), yTopLeft: CGFloat(toY))
+        case .key(let key, let modifiers):
+            await sandbox.pressKey(Self.combo(key: key, modifiers: modifiers))
+        case .typeText(let text):
+            await sandbox.typeText(text)
+        case .scroll(_, let deltaY):
+            await sandbox.scroll(dy: CGFloat(deltaY))
+        case .openURL(let url):
+            await sandbox.navigate(to: url)
+            try? await Task.sleep(for: .milliseconds(800))
+        }
+    }
+
+    private nonisolated static func isValidForSandbox(_ action: ComputerUseAction) -> Bool {
+        guard action.coordinateValid else { return false }
+        switch action {
+        case .move(let x, let y),
+             .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            return SandboxCoordinate.pagePoint(x: CGFloat(x), y: CGFloat(y)) != nil
+        case .drag(_, _, let toX, let toY):
+            return SandboxCoordinate.pagePoint(x: CGFloat(toX), y: CGFloat(toY)) != nil
+        case .scroll(_, let deltaY):
+            return SandboxCoordinate.scrollDelta(CGFloat(deltaY)) != nil
+        case .key, .typeText, .openURL:
+            return true
+        }
+    }
+
+    private nonisolated static func combo(key: String, modifiers: [String]) -> String {
+        let prefix = modifiers.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "+")
+        return prefix.isEmpty ? key : "\(prefix)+\(key)"
     }
 }
 

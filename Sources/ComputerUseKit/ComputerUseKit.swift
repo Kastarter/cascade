@@ -48,11 +48,18 @@ public final class AgentRunState: @unchecked Sendable {
 public struct ComputerUseHealth: Equatable, Sendable {
     public var ready: Bool
     public var permissions: CapturePermissionStatus
+    public var secureInputEnabled: Bool
     public var message: String
 
-    public init(ready: Bool, permissions: CapturePermissionStatus, message: String) {
+    public init(
+        ready: Bool,
+        permissions: CapturePermissionStatus,
+        secureInputEnabled: Bool = false,
+        message: String
+    ) {
         self.ready = ready
         self.permissions = permissions
+        self.secureInputEnabled = secureInputEnabled
         self.message = message
     }
 }
@@ -96,6 +103,47 @@ public struct UseDeviceHotkey: Equatable, Sendable {
             case .command: .command
             }
         }
+    }
+}
+
+public struct ComputerUseActionResult: Equatable, Sendable {
+    public enum Status: String, Equatable, Sendable {
+        case ok
+        case failed
+        case refused
+        case invalid
+    }
+
+    public let status: Status
+    public let actionKind: String
+    public let coordinateValid: Bool
+    public let failureKind: AgentFailureKind?
+    public let safeAuditAttributes: [String: String]
+
+    public init(
+        status: Status,
+        actionKind: String,
+        coordinateValid: Bool = true,
+        failureKind: AgentFailureKind? = nil,
+        safeAuditAttributes: [String: String] = [:]
+    ) {
+        self.status = status
+        self.actionKind = actionKind
+        self.coordinateValid = coordinateValid
+        self.failureKind = failureKind
+        self.safeAuditAttributes = safeAuditAttributes
+    }
+
+    public var auditDetail: String {
+        var attributes = safeAuditAttributes
+        attributes["kind"] = actionKind
+        attributes["status"] = status.rawValue
+        attributes["coordinateValid"] = coordinateValid ? "true" : "false"
+        if let failureKind { attributes["failureKind"] = failureKind.rawValue }
+        return attributes
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
     }
 }
 
@@ -167,20 +215,134 @@ public final class UseDeviceHotkeyMonitor: ObservableObject {
 
 public protocol ComputerUseActuator: Sendable {
     func health() async -> ComputerUseHealth
+    func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult
     func perform(_ action: ComputerUseAction) async throws
+}
+
+public extension ComputerUseActuator {
+    func execute(_ action: ComputerUseAction) async -> ComputerUseActionResult {
+        let base = ComputerUseActionResult(
+            status: action.coordinateValid ? .ok : .invalid,
+            actionKind: action.normalizedKind,
+            coordinateValid: action.coordinateValid,
+            safeAuditAttributes: action.safeAuditAttributes
+        )
+        guard action.coordinateValid else { return base }
+        do {
+            try await perform(action)
+            return base
+        } catch ComputerUseError.stopped {
+            return action.result(status: .refused, failureKind: .userStop)
+        } catch ComputerUseError.secureInput {
+            return action.result(status: .refused, failureKind: .secureInput)
+        } catch ComputerUseError.notReady {
+            return action.result(status: .failed, failureKind: .permissionDenied)
+        } catch {
+            return action.result(status: .failed, failureKind: .toolError)
+        }
+    }
 }
 
 public enum ComputerUseError: Error, LocalizedError {
     case notReady(String)
     case unsupported(String)
+    case secureInput(String)
     case stopped
 
     public var errorDescription: String? {
         switch self {
         case .notReady(let message): message
         case .unsupported(let message): message
+        case .secureInput(let message): message
         case .stopped: "Stopped by the user before the action ran."
         }
+    }
+}
+
+public extension ComputerUseAction {
+    var normalizedKind: String {
+        switch self {
+        case .move: "move"
+        case .click: "click"
+        case .doubleClick: "doubleClick"
+        case .tripleClick: "tripleClick"
+        case .rightClick: "rightClick"
+        case .drag: "drag"
+        case .key: "key"
+        case .typeText: "typeText"
+        case .scroll: "scroll"
+        case .openURL: "openURL"
+        }
+    }
+
+    var coordinateValid: Bool {
+        switch self {
+        case .move(let x, let y),
+             .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            return x.isFinite && y.isFinite
+        case .drag(let fromX, let fromY, let toX, let toY):
+            return fromX.isFinite && fromY.isFinite && toX.isFinite && toY.isFinite
+        case .scroll(let deltaX, let deltaY):
+            return deltaX.isFinite && deltaY.isFinite
+        case .key, .typeText, .openURL:
+            return true
+        }
+    }
+
+    var safeAuditAttributes: [String: String] {
+        switch self {
+        case .move(let x, let y),
+             .click(let x, let y),
+             .doubleClick(let x, let y),
+             .tripleClick(let x, let y),
+             .rightClick(let x, let y):
+            return ["x": Self.coordinate(x), "y": Self.coordinate(y)]
+        case .drag(let fromX, let fromY, let toX, let toY):
+            return [
+                "fromX": Self.coordinate(fromX),
+                "fromY": Self.coordinate(fromY),
+                "toX": Self.coordinate(toX),
+                "toY": Self.coordinate(toY)
+            ]
+        case .key(let key, let modifiers):
+            return [
+                "key": AuditIdentity.safeToken(key),
+                "modifiers": modifiers.map(AuditIdentity.safeToken).joined(separator: "+")
+            ]
+        case .typeText(let text):
+            return [
+                "textChars": "\(text.count)",
+                "textHash": AuditIdentity.hash(text)
+            ]
+        case .scroll(let deltaX, let deltaY):
+            return ["deltaX": Self.coordinate(deltaX), "deltaY": Self.coordinate(deltaY)]
+        case .openURL(let url):
+            return [
+                "urlChars": "\(url.count)",
+                "urlHash": AuditIdentity.hash(url)
+            ]
+        }
+    }
+
+    func result(
+        status: ComputerUseActionResult.Status = .ok,
+        failureKind: AgentFailureKind? = nil,
+        extra: [String: String] = [:]
+    ) -> ComputerUseActionResult {
+        ComputerUseActionResult(
+            status: status,
+            actionKind: normalizedKind,
+            coordinateValid: coordinateValid,
+            failureKind: failureKind,
+            safeAuditAttributes: safeAuditAttributes.merging(extra) { _, new in new }
+        )
+    }
+
+    private static func coordinate(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.1f", value) : "invalid"
     }
 }
 
@@ -211,10 +373,8 @@ enum AXClickSnap {
         guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionRef) == .success,
               AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
               let positionRef, let sizeRef else { return nil }
-        var origin = CGPoint.zero
-        var size = CGSize.zero
-        guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &origin),
-              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size),
+        guard let origin = AXElementResolver.decodeAXPoint(positionRef),
+              let size = AXElementResolver.decodeAXSize(sizeRef),
               size.width > 1, size.height > 1,
               size.width <= maxElementSize.width, size.height <= maxElementSize.height else { return nil }
         let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
@@ -237,6 +397,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         return ComputerUseHealth(
             ready: ready,
             permissions: status,
+            secureInputEnabled: SecureInputGuard.isActive(),
             message: ready
                 ? "Screen agent is ready."
                 : "Screen agent needs \(status.missingLabels.joined(separator: ", "))."
@@ -293,7 +454,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     }
 
     private func move(to point: CGPoint) throws {
-        guard let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
+        guard let moved = CGEvent(mouseEventSource: Self.eventSource(), mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create move event.")
         }
         moved.post(tap: .cghidEventTap)
@@ -310,42 +471,33 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
 
     private func click(at point: CGPoint) async throws {
         try await settleAt(point)
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
-            throw ComputerUseError.unsupported("Could not create mouse event.")
-        }
-        for event in [down, up] {
-            event.setIntegerValueField(.mouseEventClickState, value: 1)
-        }
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        try postClickPairs(at: point, count: 1, button: .left, downType: .leftMouseDown, upType: .leftMouseUp)
     }
 
     private func doubleClick(at point: CGPoint) async throws {
         try await settleAt(point)
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
-            throw ComputerUseError.unsupported("Could not create double-click event.")
-        }
-        for event in [down, up] {
-            event.setIntegerValueField(.mouseEventClickState, value: 2)
-        }
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        try postClickPairs(at: point, count: 2, button: .left, downType: .leftMouseDown, upType: .leftMouseUp)
     }
 
     private func tripleClick(at point: CGPoint) async throws {
         try await settleAt(point)
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
-            throw ComputerUseError.unsupported("Could not create triple-click event.")
-        }
-        for event in [down, up] {
-            event.setIntegerValueField(.mouseEventClickState, value: 3)
-        }
-        for _ in 0..<3 {
+        try postClickPairs(at: point, count: 3, button: .left, downType: .leftMouseDown, upType: .leftMouseUp)
+    }
+
+    private func postClickPairs(
+        at point: CGPoint,
+        count: Int,
+        button: CGMouseButton,
+        downType: CGEventType,
+        upType: CGEventType
+    ) throws {
+        for state in EventSynthesisPlan.clickStates(clickCount: count) {
+            guard let down = CGEvent(mouseEventSource: Self.eventSource(), mouseType: downType, mouseCursorPosition: point, mouseButton: button),
+                  let up = CGEvent(mouseEventSource: Self.eventSource(), mouseType: upType, mouseCursorPosition: point, mouseButton: button) else {
+                throw ComputerUseError.unsupported("Could not create click event.")
+            }
+            down.setIntegerValueField(.mouseEventClickState, value: state)
+            up.setIntegerValueField(.mouseEventClickState, value: state)
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
         }
@@ -356,7 +508,7 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     /// like motion, then up at the destination.
     private func drag(from start: CGPoint, to end: CGPoint) async throws {
         try await settleAt(start)
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left) else {
+        guard let down = CGEvent(mouseEventSource: Self.eventSource(), mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create drag event.")
         }
         down.post(tap: .cghidEventTap)
@@ -364,17 +516,17 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
         for index in 1...steps {
             if runState?.isStopRequested == true {
                 // Always release the button — a stuck drag is worse than a stop.
-                CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)?
+                CGEvent(mouseEventSource: Self.eventSource(), mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)?
                     .post(tap: .cghidEventTap)
                 throw ComputerUseError.stopped
             }
             let t = Double(index) / Double(steps)
             let point = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
-            guard let dragged = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: point, mouseButton: .left) else { continue }
+            guard let dragged = CGEvent(mouseEventSource: Self.eventSource(), mouseType: .leftMouseDragged, mouseCursorPosition: point, mouseButton: .left) else { continue }
             dragged.post(tap: .cghidEventTap)
             try? await Task.sleep(for: .milliseconds(12))
         }
-        guard let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left) else {
+        guard let up = CGEvent(mouseEventSource: Self.eventSource(), mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left) else {
             throw ComputerUseError.unsupported("Could not create drag-release event.")
         }
         up.post(tap: .cghidEventTap)
@@ -382,25 +534,24 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
 
     private func rightClick(at point: CGPoint) async throws {
         try await settleAt(point)
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right),
-              let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right) else {
-            throw ComputerUseError.unsupported("Could not create right-click event.")
-        }
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        try postClickPairs(at: point, count: 1, button: .right, downType: .rightMouseDown, upType: .rightMouseUp)
     }
 
     private func scroll(deltaX: Double, deltaY: Double) throws {
+        let config = EventSynthesisPlan.scrollConfiguration(deltaX: deltaX, deltaY: deltaY)
         guard let event = CGEvent(
-            scrollWheelEvent2Source: nil,
+            scrollWheelEvent2Source: Self.eventSource(),
             units: .pixel,
             wheelCount: 2,
-            wheel1: Int32(deltaY),
-            wheel2: Int32(deltaX),
+            wheel1: config.deltaY,
+            wheel2: config.deltaX,
             wheel3: 0
         ) else {
             throw ComputerUseError.unsupported("Could not create scroll event.")
         }
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: config.continuous ? 1 : 0)
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: config.phase)
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: config.momentumPhase)
         event.post(tap: .cghidEventTap)
     }
 
@@ -412,31 +563,37 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
     }
 
     private func pressKey(_ key: String, modifiers: [String], pid: pid_t?) throws {
-        guard let code = KeyCodes.code(for: key) else {
+        if let reason = SecureInputGuard.refusalReason(secureInputActive: SecureInputGuard.isActive()) {
+            throw ComputerUseError.secureInput(reason)
+        }
+        guard let mapping = KeyboardLayoutMapper.mapping(for: key) else {
             throw ComputerUseError.unsupported("Unknown key: \(key)")
         }
-        let flags = KeyCodes.flags(for: modifiers)
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else {
-            throw ComputerUseError.unsupported("Could not create keyboard event.")
+        let flags = KeyCodes.flags(for: modifiers).union(mapping.requiredModifiers)
+        let steps = EventSynthesisPlan.modifierEventSequence(mainKeyCode: mapping.keyCode, flags: flags)
+        guard !steps.isEmpty else { return }
+        for step in steps {
+            guard let event = CGEvent(keyboardEventSource: Self.eventSource(), virtualKey: step.keyCode, keyDown: step.keyDown) else {
+                throw ComputerUseError.unsupported("Could not create keyboard event.")
+            }
+            event.flags = step.flags
+            post(event, pid: pid)
         }
-        down.flags = flags
-        up.flags = flags
-        post(down, pid: pid)
-        post(up, pid: pid)
     }
 
     /// Types in chunks with a small pace between events. Per-character bursts with
     /// zero delay get DROPPED by Catalyst/Electron apps (WhatsApp, Slack…) — the
     /// keys "press" but nothing lands in the field.
     private func typeText(_ text: String, pid: pid_t?) async throws {
-        let units = Array(text.utf16)
-        var index = 0
-        while index < units.count {
+        if let reason = SecureInputGuard.refusalReason(secureInputActive: SecureInputGuard.isActive()) {
+            throw ComputerUseError.secureInput(reason)
+        }
+        // Grapheme-safe chunks: a raw UTF-16 window can cut a surrogate pair (emoji)
+        // in half and inject a broken glyph.
+        for chunk in TextChunker.graphemeSafeChunks(text, maxUTF16: 16) {
             if runState?.isStopRequested == true { throw ComputerUseError.stopped }
-            let chunk = Array(units[index..<min(index + 16, units.count)])
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            guard let down = CGEvent(keyboardEventSource: Self.eventSource(), virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: Self.eventSource(), virtualKey: 0, keyDown: false) else {
                 throw ComputerUseError.unsupported("Could not create text event.")
             }
             chunk.withUnsafeBufferPointer { buffer in
@@ -446,7 +603,6 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
             post(down, pid: pid)
             post(up, pid: pid)
             try? await Task.sleep(for: .milliseconds(12))
-            index += 16
         }
     }
 
@@ -459,88 +615,17 @@ public struct NativeComputerUseActuator: ComputerUseActuator {
             event.post(tap: .cghidEventTap)
         }
     }
+
+    private static func eventSource() -> CGEventSource? {
+        CGEventSource(stateID: .hidSystemState)
+    }
 }
 
 private enum KeyCodes {
     /// Full ANSI layout — a shortcut with ANY letter/digit/symbol must work; an
     /// "Unknown key" here used to abort entire agent runs (e.g. cmd+n in Figma).
     static func code(for key: String) -> CGKeyCode? {
-        switch key.lowercased() {
-        case "return", "enter": 36
-        case "escape", "esc": 53
-        case "tab": 48
-        case "space": 49
-        case "delete", "backspace": 51
-        case "forwarddelete": 117
-        case "home": 115
-        case "end": 119
-        case "pageup": 116
-        case "pagedown": 121
-        case "left": 123
-        case "right": 124
-        case "down": 125
-        case "up": 126
-        case "f1": 122
-        case "f2": 120
-        case "f3": 99
-        case "f4": 118
-        case "f5": 96
-        case "f6": 97
-        case "f7": 98
-        case "f8": 100
-        case "f9": 101
-        case "f10": 109
-        case "f11": 103
-        case "f12": 111
-        case "a": 0
-        case "s": 1
-        case "d": 2
-        case "f": 3
-        case "h": 4
-        case "g": 5
-        case "z": 6
-        case "x": 7
-        case "c": 8
-        case "v": 9
-        case "b": 11
-        case "q": 12
-        case "w": 13
-        case "e": 14
-        case "r": 15
-        case "y": 16
-        case "t": 17
-        case "o": 31
-        case "u": 32
-        case "i": 34
-        case "p": 35
-        case "l": 37
-        case "j": 38
-        case "k": 40
-        case "n": 45
-        case "m": 46
-        case "1": 18
-        case "2": 19
-        case "3": 20
-        case "4": 21
-        case "5": 23
-        case "6": 22
-        case "7": 26
-        case "8": 28
-        case "9": 25
-        case "0": 29
-        case "-", "minus": 27
-        case "=", "equal", "equals", "plus": 24
-        case "[": 33
-        case "]": 30
-        case "\\": 42
-        case ";": 41
-        case "'": 39
-        case ",", "comma": 43
-        case ".", "period": 47
-        case "/", "slash": 44
-        case "`", "grave": 50
-        default: nil
-        }
+        KeyboardLayoutMapper.mapping(for: key)?.keyCode
     }
 
     static func flags(for modifiers: [String]) -> CGEventFlags {

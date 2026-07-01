@@ -109,6 +109,17 @@ struct VisualGrounderTests {
         #expect(r.w * r.h <= 16384 * 28 * 28)
     }
 
+    @Test func smartResizeRejectsInvalidFactorAndAvoidsOverflowingProductCheck() {
+        let invalidFactor = UITARSGrounder.smartResize(width: 1280, height: 800, factor: 0)
+        #expect(invalidFactor.w > 0)
+        #expect(invalidFactor.h > 0)
+
+        let enormous = UITARSGrounder.smartResize(width: Int.max, height: Int.max)
+        #expect(enormous.w > 0)
+        #expect(enormous.h > 0)
+        #expect(enormous.w <= Int.max / max(enormous.h, 1))
+    }
+
     // MARK: boxAround — region framing for the highlight
 
     @Test func boxAroundCentersAndSizesToDisplayFraction() {

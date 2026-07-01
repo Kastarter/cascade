@@ -36,6 +36,225 @@ public enum InputCaptureGate {
     }
 }
 
+public enum AXTargetDescriptorBuilder {
+    public static let actionableRoles: Set<String> = [
+        "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
+        "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton",
+        "AXCheckBox", "AXRadioButton", "AXTab", "AXOutlineRow", "AXStaticText",
+        "AXSlider", "AXDisclosureTriangle",
+    ]
+
+    public static func descriptor(
+        for element: AXUIElement,
+        fallbackLabel: String? = nil,
+        windowTitle: String? = nil,
+        createdFrom: String? = nil
+    ) -> AXTargetDescriptorV2 {
+        AXClient.setMessagingTimeout(element)
+        let role = string(element, kAXRoleAttribute as String)
+        let label = fallbackLabel ?? labelText(of: element) ?? ""
+        let safeWindowTitle = sanitizedContextText(windowTitle)
+        let value = string(element, kAXValueAttribute as String)
+        let frame = frame(of: element)
+        let ancestorPath = ancestors(of: element)
+        let sibling = siblingInfo(for: element)
+        let bucket = frame.map(frameBucketString)
+        let exactFrame = frame.map(frameString)
+        let subtree = subtreeShape(of: element, maxDepth: 2, maxNodes: 24)
+        let semanticPhrase = AXTargetDescriptorV2.semanticPhrase(
+            label: label,
+            role: role,
+            container: ancestorPath.last,
+            ancestorPath: ancestorPath,
+            neighborLabels: sibling.neighborLabels,
+            windowTitle: safeWindowTitle
+        )
+        let structuralPath = (ancestorPath + [role, String(sibling.roleIndex ?? sibling.index ?? -1)].compactMap { $0 }).joined(separator: "|")
+
+        return AXTargetDescriptorV2(
+            label: label,
+            role: role,
+            identifier: string(element, kAXIdentifierAttribute as String),
+            container: ancestorPath.last,
+            windowTitle: safeWindowTitle,
+            ancestorPath: ancestorPath,
+            siblingIndex: sibling.index,
+            siblingRoleIndex: sibling.roleIndex,
+            neighborLabels: sibling.neighborLabels,
+            frameBucket: bucket,
+            frame: exactFrame,
+            valueHash: value.map(AuditIdentity.hash),
+            enabled: bool(element, kAXEnabledAttribute as String),
+            selected: bool(element, kAXSelectedAttribute as String),
+            focused: bool(element, kAXFocusedAttribute as String),
+            pathHash: structuralPath.isEmpty ? nil : AuditIdentity.hash(structuralPath),
+            subtree: subtree.summary,
+            subtreeHash: subtree.hash,
+            semanticTextHash: AXTargetDescriptorV2.semanticTextHash(for: semanticPhrase),
+            semanticHash: semanticHash(role: role, label: label),
+            createdFrom: createdFrom
+        )
+    }
+
+    public static func encodedDescriptor(
+        for element: AXUIElement,
+        fallbackLabel: String? = nil,
+        windowTitle: String? = nil,
+        createdFrom: String? = nil
+    ) -> String? {
+        let descriptor = descriptor(
+            for: element,
+            fallbackLabel: fallbackLabel,
+            windowTitle: windowTitle,
+            createdFrom: createdFrom
+        )
+        guard descriptor.hasSignal else { return nil }
+        return descriptor.encodedJSON()
+    }
+
+    public static func labeledActionableAncestor(
+        from element: AXUIElement,
+        maxHops: Int = 4,
+        windowTitle: String? = nil,
+        createdFrom: String? = nil
+    ) -> (element: AXUIElement, label: String, descriptor: String?)? {
+        var current = element
+        for _ in 0..<maxHops {
+            let role = string(current, kAXRoleAttribute as String) ?? ""
+            if actionableRoles.contains(role),
+               let label = labelText(of: current),
+               !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return (
+                    current,
+                    String(label.prefix(80)),
+                    encodedDescriptor(
+                        for: current,
+                        fallbackLabel: String(label.prefix(80)),
+                        windowTitle: windowTitle,
+                        createdFrom: createdFrom
+                    )
+                )
+            }
+            guard let parent = parent(of: current) else { break }
+            current = parent
+        }
+        return nil
+    }
+
+    private static func string(_ element: AXUIElement, _ attribute: String) -> String? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: String.self) else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func bool(_ element: AXUIElement, _ attribute: String) -> Bool? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: Bool.self) else { return nil }
+        return value
+    }
+
+    private static func parent(of element: AXUIElement) -> AXUIElement? {
+        guard case .success(let parent) = AXClient.elementAttribute(element, kAXParentAttribute as String) else {
+            return nil
+        }
+        return parent
+    }
+
+    private static func labelText(of element: AXUIElement) -> String? {
+        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXHelpAttribute] {
+            if let text = string(element, attribute), !PrivacyRules.isSensitiveText(text) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    private static func frame(of element: AXUIElement) -> CGRect? {
+        guard case .success(let frame) = AXClient.frame(element) else { return nil }
+        return frame
+    }
+
+    private static func ancestors(of element: AXUIElement, maxDepth: Int = 6) -> [String] {
+        var out: [String] = []
+        var current = element
+        for _ in 0..<maxDepth {
+            guard let parent = parent(of: current) else { break }
+            let role = string(parent, kAXRoleAttribute as String) ?? ""
+            let title = labelText(of: parent) ?? ""
+            if let container = AXTargetDescriptor.container(role: role, title: title) {
+                out.insert(container, at: 0)
+            }
+            current = parent
+        }
+        return out
+    }
+
+    private static func sanitizedContextText(_ text: String?) -> String? {
+        guard let text, !PrivacyRules.isSensitiveText(text) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(80))
+    }
+
+    private static func siblingInfo(for element: AXUIElement) -> (index: Int?, roleIndex: Int?, neighborLabels: [String]) {
+        guard let parent = parent(of: element),
+              case .success(let children) = AXClient.children(parent),
+              let index = children.firstIndex(where: { CFEqual($0, element) }) else {
+            return (nil, nil, [])
+        }
+        let role = string(element, kAXRoleAttribute as String)
+        let sameRoleBefore = children[..<index].filter { string($0, kAXRoleAttribute as String) == role }.count
+        let roleIndex = role == nil ? nil : sameRoleBefore
+        let labels = [index - 1, index + 1].compactMap { candidate -> String? in
+            guard children.indices.contains(candidate) else { return nil }
+            return labelText(of: children[candidate]).map { String($0.prefix(60)) }
+        }
+        return (index, roleIndex, labels)
+    }
+
+    private static func frameBucketString(_ frame: CGRect) -> String {
+        let bucket = UIStateSnapshot.FrameBucket(frame)
+        return "\(bucket.x),\(bucket.y),\(bucket.width),\(bucket.height)"
+    }
+
+    private static func frameString(_ frame: CGRect) -> String {
+        [
+            Int(frame.minX.rounded()),
+            Int(frame.minY.rounded()),
+            Int(frame.width.rounded()),
+            Int(frame.height.rounded()),
+        ].map(String.init).joined(separator: ",")
+    }
+
+    private static func subtreeShape(
+        of element: AXUIElement,
+        maxDepth: Int,
+        maxNodes: Int
+    ) -> (summary: String?, hash: String?) {
+        var parts: [String] = []
+        func walk(_ node: AXUIElement, depth: Int) {
+            guard depth <= maxDepth, parts.count < maxNodes else { return }
+            let role = string(node, kAXRoleAttribute as String) ?? "AXUnknown"
+            let labelHash = labelText(of: node).map(AuditIdentity.hash) ?? "none"
+            parts.append("\(depth):\(role):\(labelHash)")
+            guard depth < maxDepth, case .success(let children) = AXClient.children(node) else { return }
+            for child in children {
+                guard parts.count < maxNodes else { return }
+                walk(child, depth: depth + 1)
+            }
+        }
+        walk(element, depth: 0)
+        guard !parts.isEmpty else { return (nil, nil) }
+        return ("nodes=\(parts.count)", AuditIdentity.hash(parts.joined(separator: "|")))
+    }
+
+    private static func semanticHash(role: String?, label: String) -> String? {
+        let normalized = [role, label]
+            .compactMap { $0?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "|")
+        return normalized.isEmpty ? nil : AuditIdentity.hash(normalized)
+    }
+}
+
 public final class InputRecorder: @unchecked Sendable {
     private struct AppContext: Sendable {
         var app: String
@@ -61,6 +280,7 @@ public final class InputRecorder: @unchecked Sendable {
     }
 
     private let store: CascadeStore
+    private var policy: CapturePrivacyPolicy
     private let logger = Logger(subsystem: "com.humain.cascade", category: "input")
 
     private let contextLock = NSLock()
@@ -86,8 +306,18 @@ public final class InputRecorder: @unchecked Sendable {
     private var workspaceObserver: NSObjectProtocol?
     private var stopped = true
 
-    public init(store: CascadeStore) {
+    public var onActivity: (@Sendable (InputActivity) -> Void)?
+
+    public init(store: CascadeStore, policy: CapturePrivacyPolicy = .default) {
         self.store = store
+        self.policy = policy
+    }
+
+    public func updatePolicy(_ policy: CapturePrivacyPolicy) {
+        contextLock.lock()
+        self.policy = policy
+        currentContext.isSensitive = policy.privateModeEnabled
+        contextLock.unlock()
     }
 
     public var isRunning: Bool { tap != nil }
@@ -187,16 +417,16 @@ public final class InputRecorder: @unchecked Sendable {
         let now = Date()
         let location = Where(app: context.app, bundle: context.bundle, window: context.window)
 
-        switch type {
-        case .leftMouseDown:
-            let clickState = event.getIntegerValueField(.mouseEventClickState)
-            let point = event.location
-            enqueue(.click(x: Double(point.x), y: Double(point.y), double: clickState >= 2, at: now, in: location))
-            resolveClickLabel(at: point, when: now)
-        case .rightMouseDown:
-            let point = event.location
-            enqueue(.rightClick(x: Double(point.x), y: Double(point.y), at: now, in: location))
-            resolveClickLabel(at: point, when: now)
+	        switch type {
+	        case .leftMouseDown:
+	            let clickState = event.getIntegerValueField(.mouseEventClickState)
+	            let point = event.location
+	            enqueue(.click(x: Double(point.x), y: Double(point.y), double: clickState >= 2, at: now, in: location))
+	            resolveClickLabel(at: point, when: now, windowTitle: location.window)
+	        case .rightMouseDown:
+	            let point = event.location
+	            enqueue(.rightClick(x: Double(point.x), y: Double(point.y), at: now, in: location))
+	            resolveClickLabel(at: point, when: now, windowTitle: location.window)
         case .scrollWheel:
             let dy = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
             let dx = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
@@ -244,12 +474,14 @@ public final class InputRecorder: @unchecked Sendable {
     /// must stay fast). Runs only for events that already passed the app/window
     /// privacy gate; the label TEXT gets its own check — an element title can
     /// smuggle a sensitive phrase out of an otherwise unflagged window.
-    private func resolveClickLabel(at point: CGPoint, when: Date) {
+    private func resolveClickLabel(at point: CGPoint, when: Date, windowTitle: String?) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, let hit = Self.axClickTarget(atCG: point),
-                  !PrivacyRules.isSensitiveText(hit.label) else { return }
+            guard let self, let hit = Self.axClickTarget(atCG: point, windowTitle: windowTitle) else { return }
+            let label = InputEventSanitizer.sanitize(text: hit.label, kind: .click)
+            let descriptor = InputEventSanitizer.sanitize(descriptor: hit.descriptor)
+            guard label != nil || descriptor != nil else { return }
             self.labelLock.lock()
-            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: hit.label, descriptor: hit.descriptor))
+            self.clickLabels.append((at: when, x: Double(point.x), y: Double(point.y), label: label ?? "", descriptor: descriptor))
             if self.clickLabels.count > 64 { self.clickLabels.removeFirst(self.clickLabels.count - 64) }
             self.labelLock.unlock()
         }
@@ -282,42 +514,19 @@ public final class InputRecorder: @unchecked Sendable {
     /// ranks on so a moved/renamed control is still re-found (XCUIAutomation-style:
     /// identifier first, then role to disambiguate equal labels). `descriptor` is
     /// `nil` when the matched ancestor exposes neither a usable role nor identifier.
-    private static func axClickTarget(atCG point: CGPoint) -> (label: String, descriptor: String?)? {
+    private static func axClickTarget(atCG point: CGPoint, windowTitle: String?) -> (label: String, descriptor: String?)? {
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.3)
         var ref: AXUIElement?
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
-              var element = ref else { return nil }
-        let actionable: Set<String> = [
-            "AXButton", "AXMenuItem", "AXMenuBarItem", "AXRow", "AXCell", "AXLink",
-            "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXPopUpButton",
-            "AXCheckBox", "AXRadioButton", "AXTab", "AXOutlineRow", "AXStaticText",
-        ]
-        for _ in 0..<4 {
-            var roleRef: CFTypeRef?
-            let role = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success
-                ? (roleRef as? String ?? "") : ""
-            if actionable.contains(role) {
-                for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-                    var textRef: CFTypeRef?
-                    if AXUIElementCopyAttributeValue(element, attribute as CFString, &textRef) == .success,
-                       let text = textRef as? String,
-                       !text.trimmingCharacters(in: .whitespaces).isEmpty {
-                        var identifierRef: CFTypeRef?
-                        let identifier = AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &identifierRef) == .success
-                            ? (identifierRef as? String) : nil
-                        let descriptor = AXTargetDescriptor.encode(
-                            role: role, identifier: identifier, container: Self.containerLabel(of: element))
-                        return (String(text.prefix(80)), descriptor)
-                    }
-                }
-            }
-            var parentRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
-                  let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
-            element = (parent as! AXUIElement)
+              let element = ref else { return nil }
+        return AXTargetDescriptorBuilder.labeledActionableAncestor(
+            from: element,
+            windowTitle: windowTitle,
+            createdFrom: "input_recorder"
+        ).map {
+            ($0.label, $0.descriptor)
         }
-        return nil
     }
 
     /// The clicked element's structural container — its parent's "role: title" via the
@@ -409,7 +618,15 @@ public final class InputRecorder: @unchecked Sendable {
         var typedAt = Date()
         func flushTyped() {
             guard !typed.isEmpty, let location = typedWhere else { return }
-            events.append(InputEvent(capturedAt: typedAt, kind: .type, text: typed, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+            events.append(InputEvent(
+                capturedAt: typedAt,
+                kind: .type,
+                text: InputEventSanitizer.typedShape(for: typed),
+                appName: location.app,
+                bundleIdentifier: location.bundle,
+                windowTitle: location.window
+            ))
+            emitActivity(.typingRun, at: typedAt, in: location)
             typed = ""
             typedWhere = nil
         }
@@ -423,6 +640,7 @@ public final class InputRecorder: @unchecked Sendable {
             case .keyCombo(let key, let modifiers, let at, let location):
                 flushTyped()
                 events.append(InputEvent(capturedAt: at, kind: .key, key: key, modifiers: modifiers, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                emitActivity(.keyCombo, at: at, in: location)
             case .click(let x, let y, let double, let at, let location):
                 flushTyped()
                 // For clicks, `text` carries the clicked element's AX label and
@@ -430,22 +648,35 @@ public final class InputRecorder: @unchecked Sendable {
                 // cascade can re-find the target by identity, not stale pixels.
                 let hit = takeClickTarget(at: at, x: x, y: y)
                 if hit == nil { logger.debug("click stored without AX label in \(location.app, privacy: .public)") }
-                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+	                events.append(InputEvent(capturedAt: at, kind: double ? .doubleClick : .click, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+                emitActivity(.click, at: at, in: location)
             case .rightClick(let x, let y, let at, let location):
                 flushTyped()
                 let hit = takeClickTarget(at: at, x: x, y: y)
                 if hit == nil { logger.debug("right-click stored without AX label in \(location.app, privacy: .public)") }
-                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+	                events.append(InputEvent(capturedAt: at, kind: .rightClick, x: x, y: y, text: hit?.label, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window, targetDescriptor: hit?.descriptor))
+                emitActivity(.click, at: at, in: location)
             case .scroll(let x, let y, let dx, let dy, let at, let location):
                 flushTyped()
                 let modifiers = ["\(Int(dx))", "\(Int(dy))"]
                 events.append(InputEvent(capturedAt: at, kind: .scroll, x: x, y: y, modifiers: modifiers, appName: location.app, bundleIdentifier: location.bundle, windowTitle: location.window))
+                emitActivity(.scroll, at: at, in: location)
             }
         }
         flushTyped()
         if !events.isEmpty {
             try? await store.insertInputEvents(events)
         }
+    }
+
+    private func emitActivity(_ kind: InputActivityKind, at date: Date, in location: Where) {
+        onActivity?(InputActivity(
+            kind: kind,
+            capturedAt: date,
+            appName: location.app,
+            bundleIdentifier: location.bundle,
+            windowTitle: location.window
+        ))
     }
 
     // MARK: - Frontmost-app context (updated on main; read on the tap thread)
@@ -458,7 +689,7 @@ public final class InputRecorder: @unchecked Sendable {
             app: snapshot.appName,
             bundle: bundle,
             window: snapshot.windowTitle,
-            isSensitive: PrivacyRules.isSensitive(appName: snapshot.appName, bundleIdentifier: bundle, windowTitle: snapshot.windowTitle),
+	            isSensitive: !policy.decision(appName: snapshot.appName, bundleIdentifier: bundle, windowTitle: snapshot.windowTitle).allowed,
             isOwnApp: bundle == Bundle.main.bundleIdentifier
         )
         contextLock.lock()
@@ -473,7 +704,13 @@ public final class InputRecorder: @unchecked Sendable {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshContext() }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.refreshContext()
+                let context = self.snapshotContext()
+                guard !context.isOwnApp, !context.isSensitive else { return }
+                self.emitActivity(.appActivated, at: Date(), in: Where(app: context.app, bundle: context.bundle, window: context.window))
+            }
         }
     }
 
