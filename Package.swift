@@ -58,7 +58,11 @@ let package = Package(
         ),
         .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory"]),
         .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory"]),
-        .testTarget(name: "ProviderKitTests", dependencies: ["ProviderKit", "CascadeMemory"]),
+        .testTarget(
+            name: "ProviderKitTests",
+            dependencies: ["ProviderKit", "CascadeMemory"],
+            resources: [.copy("Fixtures")]
+        ),
         .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit", "AgentOrchestrator"]),
         .testTarget(
             name: "AppShellTests",

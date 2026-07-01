@@ -34,6 +34,8 @@ public enum CUAction: Sendable, Equatable {
 
 public struct CUStep: Sendable {
     public let actions: [CUAction]
+    public let actionGroups: [CUActionGroup]
+    public let chunkPlan: CUActionChunkPlan?
     public let text: String
     public let done: Bool
     /// Screen actions already executed mid-stream through `streamSink` — they are
@@ -46,13 +48,99 @@ public struct CUStep: Sendable {
     /// a real finish; `done && failed` is "the turn never happened".
     public let failed: Bool
 
-    init(actions: [CUAction], text: String, done: Bool, streamedActions: Int = 0, failed: Bool = false) {
+    init(
+        actions: [CUAction],
+        actionGroups: [CUActionGroup]? = nil,
+        chunkPlan: CUActionChunkPlan? = nil,
+        text: String,
+        done: Bool,
+        streamedActions: Int = 0,
+        failed: Bool = false
+    ) {
         self.actions = actions
+        self.actionGroups = actionGroups ?? actions.enumerated().map {
+            CUActionGroup(
+                toolUseID: nil,
+                toolName: "computer",
+                kindToken: Self.kindToken(for: $0.element),
+                actions: [$0.element]
+            )
+        }
+        self.chunkPlan = chunkPlan
         self.text = text
         self.done = done
         self.streamedActions = streamedActions
         self.failed = failed
     }
+
+    private static func kindToken(for action: CUAction) -> String {
+        switch action {
+        case .move: "move"
+        case .click: "click"
+        case .doubleClick: "double_click"
+        case .tripleClick: "triple_click"
+        case .rightClick: "right_click"
+        case .drag: "drag"
+        case .type: "type"
+        case .key: "key"
+        case .scroll: "scroll"
+        case .wait: "wait"
+        case .screenshot: "screenshot"
+        case .openApp: "open_app"
+        case .openURL: "open_url"
+        case .zoom: "zoom"
+        case .highlight: "highlight"
+        }
+    }
+}
+
+public struct CUActionGroup: Sendable, Equatable {
+    public let toolUseID: String?
+    public let toolName: String
+    public let kindToken: String
+    public let actions: [CUAction]
+    public let chunkEligible: Bool
+    public let breakReason: CUActionChunkBreakReason?
+
+    public init(
+        toolUseID: String?,
+        toolName: String,
+        kindToken: String,
+        actions: [CUAction],
+        chunkEligible: Bool = true,
+        breakReason: CUActionChunkBreakReason? = nil
+    ) {
+        self.toolUseID = toolUseID
+        self.toolName = toolName
+        self.kindToken = kindToken
+        self.actions = actions
+        self.chunkEligible = chunkEligible
+        self.breakReason = breakReason
+    }
+}
+
+public enum CUActionChunkBreakReason: String, Sendable, Equatable {
+    case none
+    case noActions
+    case nonAllowlisted
+    case riskGate
+    case pasteGate
+    case irreversibleGate
+    case groundingMiss
+    case malformed
+    case stop
+    case noEffect
+    case modal
+}
+
+public struct CUActionChunkPlan: Sendable, Equatable {
+    public let groups: [CUActionGroup]
+    public let deferredToolUseIDs: [String]
+    public let breakReason: CUActionChunkBreakReason?
+
+    public var actions: [CUAction] { groups.flatMap(\.actions) }
+    public var length: Int { actions.count }
+    public var kindTokens: [String] { groups.map(\.kindToken) }
 }
 
 public struct ComputerUseUsageSnapshot: Sendable, Equatable {
@@ -212,6 +300,11 @@ public final class ComputerUseAgent {
     private var episodePrunedImages = 0
     private var episodeCompactedToolResults = 0
     private var currentToolDefinitionCount = 0
+    nonisolated public static let screenshotKeepWindow = 8
+    nonisolated public static let historyCompactionRecentTurnDefault = 6
+    private let historyCompactionEnabled: Bool
+    private let historyCompactionRecentTurns: Int
+    private let actionChunkingEnabled: Bool
 
     private let effort: String
     /// Volatile runtime context (e.g. foreground browser/date/sandbox notes). It is
@@ -296,6 +389,56 @@ public final class ComputerUseAgent {
     private var lastThinkingPulse = ContinuousClock.now
 
     public var onUsage: (@MainActor (ComputerUseUsageSnapshot) -> Void)?
+    public var onHistoryCompacted: (@MainActor (HistoryCompactionAudit) -> Void)?
+
+    public struct HistoryCompactionAudit: Sendable, Equatable {
+        public let turns: Int
+        public let count: Int
+        public let bytesBefore: Int
+        public let bytesAfter: Int
+        public let window: Int
+        public let imageKeep: Int
+    }
+
+    public struct HistoryCompactionOptions: Sendable, Equatable {
+        public let enabled: Bool
+        public let recentTurns: Int
+        public let imageKeep: Int
+
+        public static let off = HistoryCompactionOptions(enabled: false)
+
+        public init(
+            enabled: Bool,
+            recentTurns: Int = ComputerUseAgent.historyCompactionRecentTurnDefault,
+            imageKeep: Int = ComputerUseAgent.screenshotKeepWindow
+        ) {
+            self.enabled = enabled
+            self.recentTurns = max(1, recentTurns)
+            self.imageKeep = max(1, imageKeep)
+        }
+    }
+
+    struct HistoryCompactionResult {
+        let messages: [[String: Any]]
+        let compactedTurns: Int
+        let compactedMessages: Int
+        let bytesBefore: Int
+        let bytesAfter: Int
+        let window: Int
+        let imageKeep: Int
+
+        var audit: HistoryCompactionAudit? {
+            guard compactedTurns > 0 || compactedMessages > 0 else { return nil }
+            return HistoryCompactionAudit(
+                turns: compactedTurns,
+                count: compactedMessages,
+                bytesBefore: bytesBefore,
+                bytesAfter: bytesAfter,
+                window: window,
+                imageKeep: imageKeep
+            )
+        }
+    }
 
     public private(set) var lastGroundMiss: String?
     public private(set) var lastGroundLog: String?
@@ -611,7 +754,10 @@ public final class ComputerUseAgent {
         groundingCropProvider: (@Sendable (CGRect, Int, Int) async -> GroundingCrop?)? = nil,
         groundingCache: GroundingCache? = nil,
         groundingCacheKeyProvider: GroundingCacheKeyProvider? = nil,
-        actionCritic: (any ActionCritic)? = nil
+        actionCritic: (any ActionCritic)? = nil,
+        historyCompactionEnabled: Bool = false,
+        historyCompactionRecentTurns: Int = ComputerUseAgent.historyCompactionRecentTurnDefault,
+        actionChunkingEnabled: Bool = false
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -632,6 +778,9 @@ public final class ComputerUseAgent {
         self.groundingCache = groundingCache
         self.groundingCacheKeyProvider = groundingCacheKeyProvider
         self.actionCritic = actionCritic
+        self.historyCompactionEnabled = historyCompactionEnabled
+        self.historyCompactionRecentTurns = max(1, historyCompactionRecentTurns)
+        self.actionChunkingEnabled = actionChunkingEnabled
         // Structural grounding needs a grounder to act on named targets; without
         // one, fall back to the coordinate computer tool so the agent still works.
         self.groundingMode = (groundingMode == .structural && grounder != nil) ? .structural : .coordinate
@@ -731,6 +880,13 @@ public final class ComputerUseAgent {
         messages.append(["role": "user", "content": results])
         pruneScreenshots()
         return await step()
+    }
+
+    public func deferUnexecutedToolResults(executedToolUseIDs: Set<String>, reason: CUActionChunkBreakReason) {
+        let text = Self.deferredToolResultText(reason: reason)
+        for id in pendingToolIDs where !executedToolUseIDs.contains(id) && toolResultOverrides[id] == nil {
+            toolResultOverrides[id] = text
+        }
     }
 
     /// Continue after a runtime-owned guard blocked a premature terminal answer.
@@ -905,7 +1061,26 @@ public final class ComputerUseAgent {
 
         var texts: [String] = []
         var actions: [CUAction] = []
+        var actionGroups: [CUActionGroup] = []
         pendingToolIDs = []
+        func appendActionGroup(
+            toolUseID: String?,
+            toolName: String,
+            actions newActions: [CUAction],
+            chunkEligible: Bool = true,
+            breakReason: CUActionChunkBreakReason? = nil
+        ) {
+            guard !newActions.isEmpty else { return }
+            actions.append(contentsOf: newActions)
+            actionGroups.append(CUActionGroup(
+                toolUseID: toolUseID,
+                toolName: toolName,
+                kindToken: Self.groupKindToken(toolName: toolName, actions: newActions),
+                actions: newActions,
+                chunkEligible: chunkEligible,
+                breakReason: breakReason
+            ))
+        }
         // Concurrent grounding (structural): when this turn NAMES more than one
         // target, ground them all at once against the frame the turn was generated
         // from, instead of one network round trip per target in series (a title +
@@ -946,7 +1121,7 @@ public final class ComputerUseAgent {
                             toolResultOverrides[id] = Self.critiqueToolResult(critique)
                             rememberPreActionBlock(target: nil, critique: critique, toolName: "open_app")
                         } else {
-                            actions.append(action)
+                            appendActionGroup(toolUseID: block["id"] as? String, toolName: "open_app", actions: [action])
                         }
                     }
                 case "open_url":
@@ -958,7 +1133,7 @@ public final class ComputerUseAgent {
                             toolResultOverrides[id] = Self.critiqueToolResult(critique)
                             rememberPreActionBlock(target: nil, critique: critique, toolName: "open_url")
                         } else {
-                            actions.append(action)
+                            appendActionGroup(toolUseID: block["id"] as? String, toolName: "open_url", actions: [action])
                         }
                     }
                 case "use_skill":
@@ -975,12 +1150,16 @@ public final class ComputerUseAgent {
                         }
                     }
                 case "highlight":
-                    if let action = parseHighlight(input) { actions.append(action) }
+                    if let action = parseHighlight(input) {
+                        appendActionGroup(toolUseID: block["id"] as? String, toolName: "highlight", actions: [action])
+                    }
                 case "fill_field":
                     // Expands to click → cmd+a → type → submit, all executed in
                     // THIS turn's batch (one screenshot after) — not streamed, so
                     // the chain runs together rather than one block at a time.
-                    if let expanded = parseFillField(input) { actions.append(contentsOf: expanded) }
+                    if let expanded = parseFillField(input) {
+                        appendActionGroup(toolUseID: block["id"] as? String, toolName: "fill_field", actions: expanded)
+                    }
                 case "fill_target":
                     if let safeStructuralToolUseIndices,
                        !safeStructuralToolUseIndices.contains(index) {
@@ -994,7 +1173,7 @@ public final class ComputerUseAgent {
                     // grounding miss, tell the model so it re-describes or clicks
                     // directly — answered inline (no wasted screenshot turn).
                     if let expanded = await expandFillTarget(input, cache: groundCache) {
-                        actions.append(contentsOf: expanded)
+                        appendActionGroup(toolUseID: block["id"] as? String, toolName: "fill_target", actions: expanded)
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
                         toolResultOverrides[id] = preActionBlockToolResult(target: target)
@@ -1012,7 +1191,7 @@ public final class ComputerUseAgent {
                     // the named target and clicks it. On a miss, tell the model so it
                     // re-describes — answered inline (no wasted screenshot turn).
                     if let action = await groundedClick(input, cache: groundCache) {
-                        actions.append(action)
+                        appendActionGroup(toolUseID: block["id"] as? String, toolName: "click_target", actions: [action])
                     } else if let id = block["id"] as? String {
                         let target = input["target"] as? String ?? "that"
                         toolResultOverrides[id] = preActionBlockToolResult(target: target)
@@ -1027,7 +1206,7 @@ public final class ComputerUseAgent {
                             toolResultOverrides[id] = Self.critiqueToolResult(critique)
                             rememberPreActionBlock(target: nil, critique: critique, toolName: "type_text")
                         } else {
-                            actions.append(action)
+                            appendActionGroup(toolUseID: block["id"] as? String, toolName: "type_text", actions: [action])
                         }
                     }
                 case "press_key":
@@ -1045,9 +1224,9 @@ public final class ComputerUseAgent {
 		                                  critique.verdict != .approve {
 		                            toolResultOverrides[id] = Self.critiqueToolResult(critique)
 		                            rememberPreActionBlock(target: nil, critique: critique, toolName: "press_key")
-		                        } else {
-		                            actions.append(action)
-		                        }
+			                        } else {
+			                            appendActionGroup(toolUseID: block["id"] as? String, toolName: "press_key", actions: [action])
+			                        }
                     }
                 case "scroll":
                     if let safeStructuralToolUseIndices,
@@ -1059,9 +1238,11 @@ public final class ComputerUseAgent {
                     }
                     // Scroll over a named target (grounded) or, with no target, the
                     // center of the screen.
-                    if let action = await groundedScroll(input, cache: groundCache) { actions.append(action) }
+                    if let action = await groundedScroll(input, cache: groundCache) {
+                        appendActionGroup(toolUseID: block["id"] as? String, toolName: "scroll", actions: [action])
+                    }
                 case "wait":
-                    actions.append(.wait)
+                    appendActionGroup(toolUseID: block["id"] as? String, toolName: "wait", actions: [.wait])
                 case let name? where AgentHarness.isHarnessTool(name)
                     || (recallEnabled && RecordRecall.isRecallTool(
                         name,
@@ -1090,13 +1271,35 @@ public final class ComputerUseAgent {
 		                              critique.verdict != .approve {
 		                        toolResultOverrides[id] = Self.critiqueToolResult(critique)
 		                        rememberPreActionBlock(target: nil, critique: critique, toolName: "computer")
-		                    } else {
-		                        actions.append(action)
-		                    }
+			                    } else {
+			                        appendActionGroup(toolUseID: block["id"] as? String, toolName: "computer", actions: [action])
+			                    }
                 }
             default:
                 break
             }
+        }
+        if actionChunkingEnabled {
+            let groupedIDs = Set(actionGroups.compactMap(\.toolUseID))
+            for block in content where block["type"] as? String == "tool_use" {
+                guard let id = block["id"] as? String,
+                      !groupedIDs.contains(id),
+                      toolResultOverrides[id] == nil,
+                      let name = block["name"] as? String,
+                      Self.isScreenActionTool(name) else { continue }
+                toolResultOverrides[id] = Self.deferredToolResultText(reason: .malformed)
+            }
+        }
+        var chunkPlan: CUActionChunkPlan?
+        if actionChunkingEnabled {
+            let plan = Self.actionChunkPlan(for: actionGroups)
+            let deferredText = Self.deferredToolResultText(reason: plan.breakReason)
+            for id in plan.deferredToolUseIDs {
+                toolResultOverrides[id] = deferredText
+            }
+            actionGroups = plan.groups
+            actions = plan.actions
+            chunkPlan = plan
         }
         // A turn that ONLY pulled skills or ran harness tools needs no screen
         // work — answer the tool calls with their text right away and let the
@@ -1134,6 +1337,8 @@ public final class ComputerUseAgent {
         onUsage?(episodeUsage)
         return CUStep(
             actions: actions,
+            actionGroups: actionGroups,
+            chunkPlan: chunkPlan,
             text: texts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines),
             done: done,
             streamedActions: streamed.deliveredActions
@@ -1756,6 +1961,95 @@ public final class ComputerUseAgent {
         return false
     }
 
+    nonisolated static func actionChunkPlan(for groups: [CUActionGroup]) -> CUActionChunkPlan {
+        guard !groups.isEmpty else {
+            return CUActionChunkPlan(groups: [], deferredToolUseIDs: [], breakReason: .noActions)
+        }
+        var accepted: [CUActionGroup] = []
+        var breakReason: CUActionChunkBreakReason?
+        for group in groups {
+            let reason = chunkBreakReason(for: group)
+            guard reason == nil else {
+                breakReason = reason
+                if accepted.isEmpty, reason == .nonAllowlisted {
+                    accepted.append(group)
+                }
+                break
+            }
+            accepted.append(group)
+        }
+        let acceptedIDs = Set(accepted.compactMap(\.toolUseID))
+        let deferred = groups.compactMap { group -> String? in
+            guard let id = group.toolUseID, !acceptedIDs.contains(id) else { return nil }
+            return id
+        }
+        return CUActionChunkPlan(groups: accepted, deferredToolUseIDs: deferred, breakReason: breakReason)
+    }
+
+    private nonisolated static func chunkBreakReason(for group: CUActionGroup) -> CUActionChunkBreakReason? {
+        guard group.chunkEligible else { return group.breakReason ?? .nonAllowlisted }
+        guard !group.actions.isEmpty else { return .malformed }
+        for action in group.actions {
+            switch action {
+            case .click, .doubleClick, .type, .key, .scroll, .wait:
+                break
+            default:
+                return .nonAllowlisted
+            }
+            if case .key(let combo) = action {
+                if isPasteCombo(combo) { return .pasteGate }
+                if isIrreversibleCombo(combo) { return .irreversibleGate }
+            }
+            if shouldTriggerActionCritic(for: action) {
+                return .riskGate
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func actionKindToken(_ action: CUAction) -> String {
+        switch action {
+        case .move: "move"
+        case .click: "click"
+        case .doubleClick: "double_click"
+        case .tripleClick: "triple_click"
+        case .rightClick: "right_click"
+        case .drag: "drag"
+        case .type: "type"
+        case .key(let combo): "key.\(safeHistoryToken(combo))"
+        case .scroll(_, _, let direction, _): "scroll.\(safeHistoryToken(direction))"
+        case .wait: "wait"
+        case .screenshot: "screenshot"
+        case .openApp: "open_app"
+        case .openURL: "open_url"
+        case .zoom: "zoom"
+        case .highlight: "highlight"
+        }
+    }
+
+    private nonisolated static func groupKindToken(toolName: String, actions: [CUAction]) -> String {
+        guard actions.count != 1 else {
+            return "\(toolName).\(actionKindToken(actions[0]))"
+        }
+        let kinds = actions.map(actionKindToken).joined(separator: "+")
+        return "\(toolName).\(safeHistoryToken(kinds))"
+    }
+
+    private nonisolated static func deferredToolResultText(reason: CUActionChunkBreakReason? = nil) -> String {
+        let status = reason?.rawValue ?? "needs_updated_screenshot"
+        return "Deferred until the next screenshot so this action can be checked against the updated screen. status=\(status)"
+    }
+
+    private nonisolated static func isScreenActionTool(_ name: String) -> Bool {
+        switch name {
+        case "open_app", "open_url", "highlight", "computer", "fill_field", "fill_target",
+             "click_target", "type_text", "press_key", "scroll", "wait":
+            return true
+        default:
+            return false
+        }
+    }
+
     nonisolated static func hasHighDispersion(_ candidate: GroundingCandidate, limit: Double) -> Bool {
         guard let dispersion = candidate.dispersion else { return false }
         return dispersion > limit
@@ -2227,6 +2521,7 @@ public final class ComputerUseAgent {
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .skipped }
             return await sink(.text(text)) ? .skipped : .aborted
         case "tool_use":
+            if actionChunkingEnabled { return .skipped }
             let input = block["input"] as? [String: Any] ?? [:]
             let action: CUAction?
             switch block["name"] as? String {
@@ -2620,7 +2915,7 @@ public final class ComputerUseAgent {
     /// that a single breakpoint's 20-block lookback could miss. Plus the tools
     /// breakpoint, that's the 4-breakpoint maximum. Operates on a copy — stored
     /// `messages` stay clean (value semantics make this a cheap deep copy).
-    private static func withMovingCacheBreakpoints(_ messages: [[String: Any]]) -> [[String: Any]] {
+    nonisolated static func withMovingCacheBreakpoints(_ messages: [[String: Any]]) -> [[String: Any]] {
         var out = messages
         var marked = 0
         for index in stride(from: out.count - 1, through: 0, by: -1) {
@@ -2701,18 +2996,45 @@ public final class ComputerUseAgent {
 
     /// Fixed image-window policy: keep at most the newest `keep` screenshot turns and
     /// replace older images with text placeholders while preserving notes/tool text.
-    private func pruneScreenshots(keep: Int = 8, threshold: Int = 8) {
+    private func pruneScreenshots(keep: Int = ComputerUseAgent.screenshotKeepWindow, threshold: Int = ComputerUseAgent.screenshotKeepWindow) {
         let before = Self.imageTurnCount(in: messages)
         let compactedBefore = Self.compactedToolResultCount(in: messages)
-        messages = Self.pruned(messages, keep: keep, threshold: threshold)
+        let result = Self.prunedResult(
+            messages,
+            keep: keep,
+            threshold: threshold,
+            historyCompaction: HistoryCompactionOptions(
+                enabled: historyCompactionEnabled,
+                recentTurns: historyCompactionRecentTurns,
+                imageKeep: keep
+            )
+        )
+        messages = result.messages
         let after = Self.imageTurnCount(in: messages)
         let compactedAfter = Self.compactedToolResultCount(in: messages)
         episodePrunedImages += max(0, before - after)
         episodeCompactedToolResults += max(0, compactedAfter - compactedBefore)
         episodeUsage.compactedToolResults = episodeCompactedToolResults
+        if let audit = result.audit {
+            onHistoryCompacted?(audit)
+        }
     }
 
-    nonisolated static func pruned(_ messages: [[String: Any]], keep: Int = 8, threshold: Int = 8) -> [[String: Any]] {
+    nonisolated static func pruned(
+        _ messages: [[String: Any]],
+        keep: Int = ComputerUseAgent.screenshotKeepWindow,
+        threshold: Int = ComputerUseAgent.screenshotKeepWindow,
+        historyCompaction: HistoryCompactionOptions = .off
+    ) -> [[String: Any]] {
+        prunedResult(messages, keep: keep, threshold: threshold, historyCompaction: historyCompaction).messages
+    }
+
+    nonisolated static func prunedResult(
+        _ messages: [[String: Any]],
+        keep: Int = ComputerUseAgent.screenshotKeepWindow,
+        threshold: Int = ComputerUseAgent.screenshotKeepWindow,
+        historyCompaction: HistoryCompactionOptions = .off
+    ) -> HistoryCompactionResult {
         var imageTurns: [Int] = []
         for (index, message) in messages.enumerated() {
             guard let content = message["content"] as? [[String: Any]] else { continue }
@@ -2725,7 +3047,20 @@ public final class ComputerUseAgent {
             }
             if hasImage { imageTurns.append(index) }
         }
-        guard imageTurns.count > threshold else { return messages }
+        let bytesBefore = approximateSerializedByteCount(messages)
+        guard imageTurns.count > threshold else {
+            let compacted = compactHistoryIfNeeded(messages, imageTurns: imageTurns, options: historyCompaction)
+            let out = compacted.messages
+            return HistoryCompactionResult(
+                messages: out,
+                compactedTurns: compacted.turns,
+                compactedMessages: compacted.messagesRemoved,
+                bytesBefore: bytesBefore,
+                bytesAfter: approximateSerializedByteCount(out),
+                window: historyCompaction.recentTurns,
+                imageKeep: historyCompaction.imageKeep
+            )
+        }
         var out = messages
         for index in imageTurns.dropLast(keep) {
             guard var content = out[index]["content"] as? [[String: Any]] else { continue }
@@ -2761,7 +3096,199 @@ public final class ComputerUseAgent {
             }
             out[index]["content"] = content
         }
-        return out
+        let compacted = compactHistoryIfNeeded(out, imageTurns: imageTurns, options: historyCompaction)
+        return HistoryCompactionResult(
+            messages: compacted.messages,
+            compactedTurns: compacted.turns,
+            compactedMessages: compacted.messagesRemoved,
+            bytesBefore: bytesBefore,
+            bytesAfter: approximateSerializedByteCount(compacted.messages),
+            window: historyCompaction.recentTurns,
+            imageKeep: historyCompaction.imageKeep
+        )
+    }
+
+    private nonisolated static func compactHistoryIfNeeded(
+        _ messages: [[String: Any]],
+        imageTurns: [Int],
+        options: HistoryCompactionOptions
+    ) -> (messages: [[String: Any]], turns: Int, messagesRemoved: Int) {
+        guard options.enabled, messages.count > 3 else { return (messages, 0, 0) }
+        let protected = protectedHistoryIndices(
+            messages: messages,
+            imageTurns: imageTurns,
+            recentTurns: options.recentTurns,
+            imageKeep: options.imageKeep
+        )
+        var out: [[String: Any]] = []
+        var index = 0
+        var compactedTurns = 0
+        var removedMessages = 0
+        while index < messages.count {
+            if protected.contains(index) {
+                out.append(messages[index])
+                index += 1
+                continue
+            }
+            if index + 1 < messages.count,
+               !protected.contains(index + 1),
+               isAssistantToolUseTurn(messages[index]),
+               isUserToolResultTurn(messages[index + 1]),
+               let summary = compactedHistoryTurnSummary(assistant: messages[index], result: messages[index + 1]) {
+                out.append(["role": "user", "content": [["type": "text", "text": summary]]])
+                compactedTurns += 1
+                removedMessages += 1
+                index += 2
+                continue
+            }
+            out.append(messages[index])
+            index += 1
+        }
+        return (out, compactedTurns, removedMessages)
+    }
+
+    private nonisolated static func protectedHistoryIndices(
+        messages: [[String: Any]],
+        imageTurns: [Int],
+        recentTurns: Int,
+        imageKeep: Int
+    ) -> Set<Int> {
+        var protected: Set<Int> = [0]
+        var userTurnsSeen = 0
+        for index in stride(from: messages.count - 1, through: 0, by: -1) {
+            guard messages[index]["role"] as? String == "user" else { continue }
+            userTurnsSeen += 1
+            if userTurnsSeen <= recentTurns {
+                protected.insert(index)
+                if index > 0, isAssistantToolUseTurn(messages[index - 1]) {
+                    protected.insert(index - 1)
+                }
+            }
+        }
+        for index in imageTurns.suffix(imageKeep) {
+            protected.insert(index)
+            if index > 0, isAssistantToolUseTurn(messages[index - 1]) {
+                protected.insert(index - 1)
+            }
+        }
+        return protected
+    }
+
+    private nonisolated static func isAssistantToolUseTurn(_ message: [String: Any]) -> Bool {
+        guard message["role"] as? String == "assistant",
+              let content = message["content"] as? [[String: Any]] else { return false }
+        return content.contains { $0["type"] as? String == "tool_use" }
+    }
+
+    private nonisolated static func isUserToolResultTurn(_ message: [String: Any]) -> Bool {
+        guard message["role"] as? String == "user",
+              let content = message["content"] as? [[String: Any]] else { return false }
+        return content.contains { $0["type"] as? String == "tool_result" }
+    }
+
+    private nonisolated static func compactedHistoryTurnSummary(
+        assistant: [String: Any],
+        result: [String: Any]
+    ) -> String? {
+        guard let assistantContent = assistant["content"] as? [[String: Any]],
+              let resultContent = result["content"] as? [[String: Any]] else { return nil }
+        let toolUses = assistantContent.filter { $0["type"] as? String == "tool_use" }
+        guard !toolUses.isEmpty else { return nil }
+        let resultBlocks = resultContent.filter { $0["type"] as? String == "tool_result" }
+        let status = compactedOutcomeStatus(from: resultBlocks)
+        let actionTokens = toolUses.map(compactedActionToken).prefix(8)
+        let toolIDs = Set(toolUses.compactMap { $0["id"] as? String })
+        let answered = resultBlocks.compactMap { $0["tool_use_id"] as? String }.filter { toolIDs.contains($0) }.count
+        let frontmost = resultBlocks.compactMap(compactedFrontmostApp).first
+        let urlHost = toolUses.compactMap(compactedURLHost).first
+        let object: [String: Any] = [
+            "episode_state": "compacted_history_turn",
+            "app": frontmost ?? "unknown",
+            "url_host": urlHost ?? "none",
+            "subgoal_status": status,
+            "actions": Array(actionTokens),
+            "tool_results": answered,
+            "outcome": status,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+              let rendered = String(data: data, encoding: .utf8) else { return nil }
+        return rendered
+    }
+
+    private nonisolated static func compactedActionToken(_ block: [String: Any]) -> String {
+        let name = block["name"] as? String ?? "unknown"
+        let input = block["input"] as? [String: Any] ?? [:]
+        switch name {
+        case "computer":
+            let action = (input["action"] as? String) ?? "unknown"
+            if action == "type", let text = input["text"] as? String {
+                return "computer.type.bytes=\(text.utf8.count)"
+            }
+            if action == "key", let text = input["text"] as? String {
+                return "computer.key.\(safeHistoryToken(text))"
+            }
+            if action == "scroll", let direction = input["scroll_direction"] as? String {
+                return "computer.scroll.\(safeHistoryToken(direction))"
+            }
+            return "computer.\(safeHistoryToken(action))"
+        case "type_text":
+            return "type_text.bytes=\((input["text"] as? String)?.utf8.count ?? 0)"
+        case "press_key":
+            return "press_key.\(safeHistoryToken(input["key"] as? String ?? "unknown"))"
+        case "fill_field", "fill_target":
+            return "\(name).bytes=\((input["text"] as? String)?.utf8.count ?? 0)"
+        case "open_url":
+            return "open_url.\(compactedURLHost(block) ?? "unknown")"
+        default:
+            return safeHistoryToken(name)
+        }
+    }
+
+    private nonisolated static func compactedOutcomeStatus(from resultBlocks: [[String: Any]]) -> String {
+        let text = resultBlocks.map(toolResultText).joined(separator: " ")
+        if text.contains("\"status\":\"error\"") || text.localizedCaseInsensitiveContains("error") { return "error" }
+        if text.contains("\"status\":\"refused\"") || text.localizedCaseInsensitiveContains("blocked") { return "refused" }
+        if text.contains("\"status\":\"no_result\"") { return "no_result" }
+        return resultBlocks.isEmpty ? "missing" : "ok"
+    }
+
+    private nonisolated static func toolResultText(_ block: [String: Any]) -> String {
+        if let text = block["content"] as? String { return text }
+        guard let inner = block["content"] as? [[String: Any]] else { return "" }
+        return inner.compactMap { $0["text"] as? String }.joined(separator: "\n")
+    }
+
+    private nonisolated static func compactedFrontmostApp(_ block: [String: Any]) -> String? {
+        let text = toolResultText(block)
+        guard let range = text.range(of: #"Frontmost app:\s*([^\n—]+)"#, options: .regularExpression) else { return nil }
+        let match = String(text[range])
+            .replacingOccurrences(of: "Frontmost app:", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return match.isEmpty ? nil : safeHistoryToken(match)
+    }
+
+    private nonisolated static func compactedURLHost(_ block: [String: Any]) -> String? {
+        guard let input = block["input"] as? [String: Any],
+              let raw = input["url"] as? String,
+              let host = URL(string: raw)?.host else { return nil }
+        return safeHistoryToken(host)
+    }
+
+    private nonisolated static func safeHistoryToken(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9._-]+"#, with: "_", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+            .prefix(48)
+            .description
+    }
+
+    nonisolated static func estimatedHistoryTokenCount(_ messages: [[String: Any]]) -> Int {
+        max(1, approximateSerializedByteCount(messages) / 4)
+    }
+
+    private nonisolated static func approximateSerializedByteCount(_ messages: [[String: Any]]) -> Int {
+        (try? JSONSerialization.data(withJSONObject: messages, options: [.sortedKeys]).count) ?? 0
     }
 
     private nonisolated static func compactedToolResultText(_ text: String, toolUseID: String?) -> String {

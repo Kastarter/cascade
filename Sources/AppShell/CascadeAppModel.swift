@@ -353,6 +353,9 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
+    static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
+    static let experimentalHistoryCompactionTurnsKey = "cascade.experimentalHistoryCompactionTurns"
+    static let experimentalActionChunkingKey = "cascade.experimentalActionChunking"
     nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
@@ -381,6 +384,11 @@ public final class CascadeAppModel: ObservableObject {
 
     static func experimentalWorkGraphIndexEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalWorkGraphIndexKey)
+    }
+
+    static func experimentalHistoryCompactionTurns(defaults: UserDefaults) -> Int {
+        let configured = defaults.integer(forKey: Self.experimentalHistoryCompactionTurnsKey)
+        return configured > 0 ? configured : ComputerUseAgent.historyCompactionRecentTurnDefault
     }
 
     private static func restoreCapturePrivacyPolicy(defaults: UserDefaults) -> CapturePrivacyPolicy {
@@ -2587,7 +2595,10 @@ public final class CascadeAppModel: ObservableObject {
             groundingCropProvider: Self.assistGroundingCropProvider(),
             groundingCache: groundingCache,
             groundingCacheKeyProvider: Self.assistGroundingCacheKeyProvider(),
-            actionCritic: assistActionCritic()
+            actionCritic: assistActionCritic(),
+            historyCompactionEnabled: defaultsStore.bool(forKey: Self.experimentalHistoryCompactionKey),
+            historyCompactionRecentTurns: Self.experimentalHistoryCompactionTurns(defaults: defaultsStore),
+            actionChunkingEnabled: defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
         )
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
@@ -2599,6 +2610,15 @@ public final class CascadeAppModel: ObservableObject {
                     actor: "agent",
                     action: "assist.capture",
                     detail: Self.assistCaptureAuditDetail(usage)
+                ))
+            }
+        }
+        agent.onHistoryCompacted = { [store] audit in
+            Task {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "history.compacted",
+                    detail: Self.historyCompactedAuditDetail(audit)
                 ))
             }
         }
@@ -3272,6 +3292,7 @@ public final class CascadeAppModel: ObservableObject {
         // to 15 and over-thought; reverted). Effort stays medium — CU default.
         let cuModel = AnthropicModel.opus
         let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        let actionChunkingEnabled = defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
         let actionCacheLookup = await actionTrajectoryCachePreflight(
             goal: goal,
             firstScreenshotPNG: firstScreenshotPNG
@@ -3525,32 +3546,81 @@ public final class CascadeAppModel: ObservableObject {
             // pull it out and run everything else first.
             var zoomRegion: CGRect?
             var actedThisTurn = streamActed
-            for (actionIndex, action) in step.actions.enumerated() {
-                // Re-check between every action — a barge-in or newer turn must
-                // halt mid-batch, not after the batch finishes.
-                if assistGeneration != gen || driver.runState.isStopRequested {
-                    auditTiming(outcome: "stopped")
-                    return .stopped
+            if actionChunkingEnabled, !step.actionGroups.isEmpty {
+                let result = await Self.executeActionChunkGroups(
+                    step.actionGroups,
+                    shouldStop: { assistGeneration != gen || driver.runState.isStopRequested },
+                    execute: { action in
+                        if case .zoom(let nx, let ny, let nw, let nh) = action {
+                            zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
+                            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
+                            return true
+                        }
+                        actedThisTurn = true
+                        let actionStart = ContinuousClock.now
+                        guard await executeCU(action, on: screen) else { return false }
+                        actionTime += actionStart.duration(to: .now)
+                        return true
+                    },
+                    modalTitle: { await Self.unexpectedModal() },
+                    pace: { hasMoreActions in
+                        if hasMoreActions { try? await Task.sleep(for: .milliseconds(120)) }
+                    }
+                )
+                if result.executedActions > 0 { actedThisTurn = true }
+                if result.executedActions > 1 {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "action.chunk",
+                        detail: Self.actionChunkAuditDetail(
+                            length: result.executedActions,
+                            groups: result.executedToolUseIDs.count,
+                            kindTokens: result.kindTokens,
+                            status: result.status
+                        )
+                    ))
                 }
-                if case .zoom(let nx, let ny, let nw, let nh) = action {
-                    zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
-                    // Zoom turns execute no screen action and change nothing visible —
-                    // without this row a zoom LOOP is indistinguishable from a hang
-                    // (the 2026-06-11 46s Keynote stall was unattributable).
-                    Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
-                    continue
+                if let reason = result.breakReason {
+                    switch reason {
+                    case .stop:
+                        auditTiming(outcome: "stopped")
+                        return .stopped
+                    case .modal, .noEffect:
+                        agent.deferUnexecutedToolResults(executedToolUseIDs: result.executedToolUseIDs, reason: reason)
+                        nudge = [nudge, "A blocking \(reason == .modal ? "dialog" : "no-effect state") appeared; use the new screenshot before continuing."].compactMap { $0 }.joined(separator: " ")
+                    default:
+                        auditTiming(outcome: "failed-action")
+                        return .failed
+                    }
                 }
-                actedThisTurn = true
-                let actionStart = ContinuousClock.now
-                if !(await executeCU(action, on: screen)) {
-                    auditTiming(outcome: "failed-action")
-                    return .failed
-                }
-                actionTime += actionStart.duration(to: .now)
-                // The pace gap matters BETWEEN actions; after the last one the
-                // settle sleep below covers it — no double wait.
-                if actionIndex < step.actions.count - 1 {
-                    try? await Task.sleep(for: .milliseconds(120))
+            } else {
+                for (actionIndex, action) in step.actions.enumerated() {
+                    // Re-check between every action — a barge-in or newer turn must
+                    // halt mid-batch, not after the batch finishes.
+                    if assistGeneration != gen || driver.runState.isStopRequested {
+                        auditTiming(outcome: "stopped")
+                        return .stopped
+                    }
+                    if case .zoom(let nx, let ny, let nw, let nh) = action {
+                        zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
+                        // Zoom turns execute no screen action and change nothing visible —
+                        // without this row a zoom LOOP is indistinguishable from a hang
+                        // (the 2026-06-11 46s Keynote stall was unattributable).
+                        Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
+                        continue
+                    }
+                    actedThisTurn = true
+                    let actionStart = ContinuousClock.now
+                    if !(await executeCU(action, on: screen)) {
+                        auditTiming(outcome: "failed-action")
+                        return .failed
+                    }
+                    actionTime += actionStart.duration(to: .now)
+                    // The pace gap matters BETWEEN actions; after the last one the
+                    // settle sleep below covers it — no double wait.
+                    if actionIndex < step.actions.count - 1 {
+                        try? await Task.sleep(for: .milliseconds(120))
+                    }
                 }
             }
 
@@ -3638,8 +3708,14 @@ public final class CascadeAppModel: ObservableObject {
 	                        detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
 	                    ))
 			                } else {
-		                    noEffectTurns += 1
-		                    recordGroundingNoEffect(from: agent)
+			                    noEffectTurns += 1
+			                    if actionChunkingEnabled {
+			                        agent.deferUnexecutedToolResults(
+			                            executedToolUseIDs: Set(step.actionGroups.compactMap(\.toolUseID)),
+			                            reason: .noEffect
+			                        )
+			                    }
+			                    recordGroundingNoEffect(from: agent)
 		                    if noEffectTurns >= 2, !noEffectVerifierUsed {
 		                        noEffectVerifierUsed = true
 		                        if let verifierNudge = await runNoEffectVerifier(
@@ -4952,6 +5028,31 @@ public final class CascadeAppModel: ObservableObject {
         ].joined(separator: " ")
     }
 
+    nonisolated static func historyCompactedAuditDetail(_ audit: ComputerUseAgent.HistoryCompactionAudit) -> String {
+        [
+            "turns=\(audit.turns)",
+            "count=\(audit.count)",
+            "bytesBefore=\(audit.bytesBefore)",
+            "bytesAfter=\(audit.bytesAfter)",
+            "window=\(audit.window)",
+            "imageKeep=\(audit.imageKeep)",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func actionChunkAuditDetail(
+        length: Int,
+        groups: Int,
+        kindTokens: [String],
+        status: String
+    ) -> String {
+        [
+            "length=\(length)",
+            "groups=\(groups)",
+            "kindsHash=\(auditHash(kindTokens.joined(separator: "|")))",
+            "status=\(safeAuditToken(status))",
+        ].joined(separator: " ")
+    }
+
     nonisolated static func assistStalledAuditDetail(engine: String? = nil, text: String) -> String {
         var parts = ["status=stalled", textAuditDetail("text", text)]
         if let engine { parts.insert("engine=\(safeAuditToken(engine))", at: 1) }
@@ -5210,6 +5311,82 @@ public final class CascadeAppModel: ObservableObject {
     /// wait-only turn is exempt from no-effect counting.
     nonisolated static func turnExpectsVisibleChange(_ actions: [CUAction]) -> Bool {
         actions.contains(where: expectsVisibleChange)
+    }
+
+    struct ActionChunkExecutionResult: Sendable, Equatable {
+        let executedActions: Int
+        let executedToolUseIDs: Set<String>
+        let kindTokens: [String]
+        let status: String
+        let breakReason: CUActionChunkBreakReason?
+
+        var completed: Bool { breakReason == nil }
+    }
+
+    static func executeActionChunkGroups(
+        _ groups: [CUActionGroup],
+        shouldStop: @MainActor () -> Bool,
+        execute: @MainActor (CUAction) async -> Bool,
+        modalTitle: @MainActor () async -> String?,
+        noEffectAfterGroup: @MainActor ([CUActionGroup]) async -> Bool = { _ in false },
+        pace: @MainActor (_ hasMoreActions: Bool) async -> Void = { _ in }
+    ) async -> ActionChunkExecutionResult {
+        var executedActions = 0
+        var executedIDs = Set<String>()
+        var completedGroups: [CUActionGroup] = []
+        let kindTokens = groups.map(\.kindToken)
+        for (groupIndex, group) in groups.enumerated() {
+            for (actionIndex, action) in group.actions.enumerated() {
+                guard !shouldStop() else {
+                    return ActionChunkExecutionResult(
+                        executedActions: executedActions,
+                        executedToolUseIDs: executedIDs,
+                        kindTokens: kindTokens,
+                        status: "stop",
+                        breakReason: .stop
+                    )
+                }
+                guard await execute(action) else {
+                    return ActionChunkExecutionResult(
+                        executedActions: executedActions,
+                        executedToolUseIDs: executedIDs,
+                        kindTokens: kindTokens,
+                        status: "failed",
+                        breakReason: .malformed
+                    )
+                }
+                executedActions += 1
+                if let id = group.toolUseID { executedIDs.insert(id) }
+                if await modalTitle() != nil {
+                    return ActionChunkExecutionResult(
+                        executedActions: executedActions,
+                        executedToolUseIDs: executedIDs,
+                        kindTokens: kindTokens,
+                        status: "modal",
+                        breakReason: .modal
+                    )
+                }
+                let hasMoreActions = actionIndex < group.actions.count - 1 || groupIndex < groups.count - 1
+                await pace(hasMoreActions)
+            }
+            completedGroups.append(group)
+            if await noEffectAfterGroup(completedGroups) {
+                return ActionChunkExecutionResult(
+                    executedActions: executedActions,
+                    executedToolUseIDs: executedIDs,
+                    kindTokens: kindTokens,
+                    status: "no_effect",
+                    breakReason: .noEffect
+                )
+            }
+        }
+        return ActionChunkExecutionResult(
+            executedActions: executedActions,
+            executedToolUseIDs: executedIDs,
+            kindTokens: kindTokens,
+            status: "complete",
+            breakReason: nil
+        )
     }
 
     /// Maps an element's CG-global center (top-left origin, from AX) into the
@@ -5908,21 +6085,19 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// The title of a sheet or modal dialog currently focused in the frontmost
-    /// app, or nil when the UI is in its normal state. Off-main — AX calls block.
+    /// app, or nil when the UI is in its normal state. AppKit/AX stay on main.
     private static func unexpectedModal() async -> String? {
-        await Task.detached { () -> String? in
-            guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
-            let appRef = AXUIElementCreateApplication(app.processIdentifier)
-            AXClient.setMessagingTimeout(appRef)
-            guard case .success(let window) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
-                return nil
-            }
-            let role = axString(window, kAXRoleAttribute) ?? ""
-            let subrole = axString(window, kAXSubroleAttribute) ?? ""
-            guard role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" else { return nil }
-            let title = axString(window, kAXTitleAttribute) ?? ""
-            return title.isEmpty ? (role == "AXSheet" ? "sheet" : "dialog") : title
-        }.value
+        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
+        let appRef = AXUIElementCreateApplication(app.processIdentifier)
+        AXClient.setMessagingTimeout(appRef)
+        guard case .success(let window) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
+            return nil
+        }
+        let role = axString(window, kAXRoleAttribute) ?? ""
+        let subrole = axString(window, kAXSubroleAttribute) ?? ""
+        guard role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" else { return nil }
+        let title = axString(window, kAXTitleAttribute) ?? ""
+        return title.isEmpty ? (role == "AXSheet" ? "sheet" : "dialog") : title
     }
 
     private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
