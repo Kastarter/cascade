@@ -62,7 +62,30 @@ marks them strict → 22 > Anthropic's 20-strict cap → 400).
 | 17 temporal-knowledge-graph | #61 | **APPROVED** — entity/relationship questions answered "perfectly". |
 | 18 proactive-intelligence | #62 | **FLAGGED — did NOT fire.** Proactive next-action offer never appeared in manual testing (predictor threshold / interruptibility / offer wiring). Code landed; see PR comment. |
 | 19 performance-efficiency | #63 | **APPROVED WITH FIX** — carries the **strict-tools cap fix**. |
-| 20 personalization | #64 | **UNDER TEST** — preference/profile tables, contextual-bandit ranking. |
+| 20 personalization | #64 | **APPROVED (dormant)** — preference/profile tables, contextual-bandit ranking; needs history to show effect. |
+| 21 vlm-screen-action-models | #65 | **APPROVED** — THE grounder. Clicks complete end-to-end (agent.ground hits, actions execute, 0 verifier over-reject). The last "agent can't finish" blocker cleared. |
+| 22 semantic-action-caching | #66 | **APPROVED** — grounding cache (repeated targets resolve from cache); internal speed win. |
+| 23 voice-realtime-pipeline | #67 | **APPROVED w/ FLAG** — voice PTT works; but seq-23's **local voice-endpointing gate over-filters** (dropped all speech) — keep `experimentalLocalVoiceEndpointing` OFF until tuned. |
+| 24 ui-state-diffing | #68 | **APPROVED** — Merkle snapshots + region-diff OCR + state-delta no-effect; agent completes tasks fine. |
+| 25 test-time-verification | #69 | **APPROVED** — the FINISHED grounding verifier: accepts good grounds (0.87), no over-reject storm. Kept ON. (The earlier "grounding broken" was the incomplete verifier.) |
+| 26 event-store-engineering | #70 | **APPROVED (internal)** — integer time-key indexing; adds `captured_day`. |
+| 27 multimodal-visual-retrieval | #71 | **APPROVED (dormant)** — `VisualIndex` store only; no search surface wired. |
+| 28 privacy-preserving-fleet-analytics | #72 | **APPROVED (dormant)** — internal DP/fleet analytics, no user surface. |
+| 29 self-healing-ui-robustness | #73 | **APPROVED WITH FIX** — healing engages; but it **spun ~108s on un-findable (noCandidates) targets** → added fail-fast (grounder skips retry on noCandidates; loop bails after 2 empty-view misses). |
+| 30 llm-call-determinism-caching | #74 | **APPROVED (internal)** — model-call cache, idempotency, deterministic decoding. |
+| 31 resource-routing-search | #75 | **APPROVED (internal)** — resource routing + search. Final SEQ. |
+
+## WALK COMPLETE — outcome
+All 31 SEQs validated as isolated stacked PRs (#45–#75) off the pre-SEQ base. **The agent
+now opens apps, clicks, AND types end-to-end.** Six root-cause fixes shipped + carried
+forward (each was "the agent does nothing" in disguise): private mode deny-all (seq-07),
+keyboard crash (seq-11), request timeout (seq-05), strict-tools cap (seq-19), grounder/clicks
+(seq-21), fail-fast on un-findable targets (seq-29). Runtime flags left ON for a working
+agent (visual grounder, structured content, work-graph, skill/experience/suggestion, grounding
+verifier + cache). **Follow-ups (not blockers):** seq-08 category/param mining TODO, seq-18
+proactive offer never fired, seq-23 local-voice gate (keep off), seq-15 skill-draft re-test,
+seq-07 redaction hardening. **To ship:** merge the validated stack (tip `validate/seq-31`) into
+`feat/production-grade`/`main` — it's the pre-SEQ base + all 31 SEQs + the 6 fixes.
 
 ### seq-02 finding (logged, not blocking)
 Adds `import ComputerUseKit` to `Sources/SandboxKit/BackgroundWebAgent.swift` but never
