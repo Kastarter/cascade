@@ -217,12 +217,28 @@ public struct AnthropicMessagesClient: Sendable {
         ]
         if let system { body["system"] = system }
         if let temperature { body["temperature"] = temperature }
-        if let tools { body["tools"] = tools }
+        if let tools { body["tools"] = cappingStrictTools(tools) }
         if let toolChoice { body["tool_choice"] = toolChoice }
         if let thinking { body["thinking"] = thinking }
         if let outputConfig { body["output_config"] = outputConfig }
         if let stream { body["stream"] = stream }
         return body
+    }
+
+    /// Anthropic hard-caps STRICT tools at 20 per request; a 21st strict tool → HTTP 400
+    /// "Too many strict tools" (surfaces to the user as "I couldn't reach Claude"). As the
+    /// agent's tool set grew across SEQs past 20 strict, every computer-use turn 400'd.
+    /// Relax `strict` on any tool beyond the 20th — it still works, just isn't strict-validated.
+    static func cappingStrictTools(_ tools: [[String: Any]], max: Int = 20) -> [[String: Any]] {
+        var strictCount = 0
+        return tools.map { tool in
+            guard (tool["strict"] as? Bool) == true else { return tool }
+            strictCount += 1
+            if strictCount <= max { return tool }
+            var relaxed = tool
+            relaxed.removeValue(forKey: "strict")
+            return relaxed
+        }
     }
 
     public static func bodyData(
