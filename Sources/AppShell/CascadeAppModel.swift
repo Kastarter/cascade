@@ -344,6 +344,7 @@ public final class CascadeAppModel: ObservableObject {
     private static let capturePrivacyPolicyKey = "cascade.capturePrivacyPolicy"
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
     static let experimentalEpisodeMiningKey = "cascade.experimentalEpisodeMining"
+    static let experimentalParameterizedMiningKey = "cascade.experimentalParameterizedMining"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
@@ -694,10 +695,19 @@ public final class CascadeAppModel: ObservableObject {
             personalizationSnapshot = (try? await store.personalizationSnapshot()) ?? personalizationSnapshot
             let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
             let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
+            let parameterizedMiningEnabled = episodeMiningEnabled && defaultsStore.bool(forKey: Self.experimentalParameterizedMiningKey)
             let rawDetectedWaste = try await orchestrator.detectedWaste(
                 webAppIdentity: Self.webAppIdentity,
-                useEpisodeMining: episodeMiningEnabled
+                useEpisodeMining: episodeMiningEnabled,
+                useParameterizedMining: parameterizedMiningEnabled
             )
+            if parameterizedMiningEnabled {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "workflow.parameterized_mining",
+                    detail: Self.parameterizedMiningAuditDetail(rawDetectedWaste)
+                ))
+            }
             let preferenceModel = await suggestionPreferenceModel()
             if personalizationEnabled {
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
@@ -4835,6 +4845,28 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func textAuditDetail(_ field: String, _ value: String?) -> String {
         AuditIdentity.descriptor(field, value)
+    }
+
+    nonisolated static func parameterizedMiningAuditDetail(_ candidates: [DetectedWaste]) -> String {
+        let parameterSteps = candidates.flatMap { candidate in
+            candidate.recipe.steps.filter(\.isParameter)
+        }
+        let slotKinds = parameterSteps
+            .compactMap { $0.parameterKind?.rawValue }
+            .sorted()
+            .joined(separator: "|")
+        let signatures = candidates
+            .map(\.signature)
+            .sorted()
+            .joined(separator: "|")
+        return [
+            "enabled=true",
+            "candidateCount=\(candidates.count)",
+            "clusterCount=\(candidates.count)",
+            "slotCount=\(parameterSteps.count)",
+            "slotKindsHash=\(auditHash(slotKinds))",
+            "signatureHash=\(auditHash(signatures))"
+        ].joined(separator: " ")
     }
 
     nonisolated static func policyDecisionAuditDetail(capability: String, decision: String, reason: String) -> String {

@@ -1032,6 +1032,9 @@ public enum RecipeParameterKind: String, Codable, Sendable {
     case date
     case currency
     case number
+    case ticker
+    case word
+    case name
     case email
     case url
     case filePath
