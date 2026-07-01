@@ -102,6 +102,21 @@ public struct WasteDetector: Sendable {
     private let minRunLength: Int
     private let maxRunLength: Int
 
+    private struct AbstractParameter: Sendable {
+        var position: Int
+        var parameterKey: String
+        var parameterKind: RecipeParameterKind
+        var valueExamples: [String]
+        var valueHashes: [String]
+        var sourceEventIndices: [Int]
+        var transform: String?
+    }
+
+    private struct AbstractParameterSummary: Sendable {
+        var parameters: [Int: AbstractParameter]
+        var sanitizedKinds: [Int: RecipeParameterKind]
+    }
+
     private struct RoutineCandidate: Sendable {
         let patternTokens: [String]
         let occurrences: [[InputEvent]]
@@ -109,14 +124,27 @@ public struct WasteDetector: Sendable {
         let coverage: Double
         let medianGap: TimeInterval
         let surfaces: Set<String>
+        let abstractSignatureTokens: [String]?
+        let abstractParameters: [Int: AbstractParameter]
+        let abstractSanitizedKinds: [Int: RecipeParameterKind]
 
-        init(patternTokens: [String], occurrences: [[InputEvent]], surface: (InputEvent) -> String) {
+        init(
+            patternTokens: [String],
+            occurrences: [[InputEvent]],
+            surface: (InputEvent) -> String,
+            abstractSignatureTokens: [String]? = nil,
+            abstractParameters: [Int: AbstractParameter] = [:],
+            abstractSanitizedKinds: [Int: RecipeParameterKind] = [:]
+        ) {
             self.patternTokens = patternTokens
             self.occurrences = occurrences
             self.support = occurrences.count
             self.coverage = Double(Set(occurrences.flatMap { $0.map(\.id) }).count)
             self.medianGap = Self.medianInterStepGap(occurrences)
             self.surfaces = Set(occurrences.flatMap { occurrence in occurrence.map(surface) })
+            self.abstractSignatureTokens = abstractSignatureTokens
+            self.abstractParameters = abstractParameters
+            self.abstractSanitizedKinds = abstractSanitizedKinds
         }
 
         private static func medianInterStepGap(_ occurrences: [[InputEvent]]) -> TimeInterval {
@@ -156,9 +184,18 @@ public struct WasteDetector: Sendable {
         inputEvents: [InputEvent],
         maxResults: Int = 5,
         webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
-        useEpisodeMining: Bool = true
+        useEpisodeMining: Bool = true,
+        useParameterizedMining: Bool = false
     ) -> [DetectedWaste] {
         if useEpisodeMining {
+            if useParameterizedMining {
+                return detectWithParameterizedEpisodeMining(
+                    contexts: contexts,
+                    inputEvents: inputEvents,
+                    maxResults: maxResults,
+                    webAppIdentity: webAppIdentity
+                )
+            }
             return detectWithEpisodeMining(
                 contexts: contexts,
                 inputEvents: inputEvents,
@@ -392,6 +429,137 @@ public struct WasteDetector: Sendable {
             .map { $0 }
     }
 
+    private func detectWithParameterizedEpisodeMining(
+        contexts: [RecordedContext],
+        inputEvents: [InputEvent],
+        maxResults: Int,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)?
+    ) -> [DetectedWaste] {
+        let surface: (InputEvent) -> String = { webAppIdentity?($0) ?? $0.appName }
+        let collapsed = Self.collapsingScrollBursts(
+            inputEvents.sorted {
+                if $0.capturedAt == $1.capturedAt { return $0.id < $1.id }
+                return $0.capturedAt < $1.capturedAt
+            }
+        )
+        let eventsByID = Dictionary(collapsed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let episodeEvents = ActionEpisodeSegmenter(maxIdleGap: Self.maxIdleGap)
+            .segment(collapsed, surface: webAppIdentity)
+            .map { episode in episode.eventIDs.compactMap { eventsByID[$0] } }
+            .filter { $0.count >= minRunLength }
+        guard episodeEvents.count >= 2 else { return [] }
+
+        let abstractor = TypedActionAbstractor()
+        let typedEpisodes = episodeEvents.enumerated().map { index, events in
+            TypedActionEpisode(
+                index: index,
+                actions: abstractor.abstract(events, surface: surface),
+                eventIDs: events.map(\.id),
+                startedAt: events.first?.capturedAt ?? .distantPast,
+                endedAt: events.last?.capturedAt ?? .distantPast
+            )
+        }
+        let clusters = TypedActionEpisodeClusterer().cluster(typedEpisodes)
+        let clusterByEpisode = Dictionary(uniqueKeysWithValues: clusters.flatMap { cluster in
+            cluster.episodeIndices.map { ($0, cluster) }
+        })
+        let episodeByIndex = Dictionary(uniqueKeysWithValues: typedEpisodes.map { ($0.index, $0) })
+
+        let minedEpisodes = typedEpisodes.map { episode in
+            let canonicalTokens: [String]
+            if let cluster = clusterByEpisode[episode.index],
+               let representative = episodeByIndex[cluster.representativeIndex],
+               representative.actions.count == episode.actions.count {
+                canonicalTokens = representative.abstractTokens
+            } else {
+                canonicalTokens = episode.abstractTokens
+            }
+            return canonicalTokens.enumerated().map { offset, token in
+                PrefixSpanMiner.Event(
+                    token,
+                    timestamp: episodeEvents[episode.index][offset].capturedAt.timeIntervalSince1970
+                )
+            }
+        }
+
+        let miner = PrefixSpanMiner(
+            minSupport: 1,
+            maxPatternLength: maxRunLength,
+            maxGapEvents: 3,
+            maxGapSeconds: 90,
+            maxSpanSeconds: Self.maxIdleGap,
+            closedOnly: true
+        )
+        let patterns = miner.mine(episodes: minedEpisodes)
+            .filter { $0.tokens.count >= minRunLength }
+            .sorted { lhs, rhs in
+                if lhs.tokens.count != rhs.tokens.count { return lhs.tokens.count > rhs.tokens.count }
+                if lhs.support != rhs.support { return lhs.support > rhs.support }
+                let lFirst = lhs.occurrenceSpans.first
+                let rFirst = rhs.occurrenceSpans.first
+                if lFirst?.episodeIndex != rFirst?.episodeIndex {
+                    return (lFirst?.episodeIndex ?? Int.max) < (rFirst?.episodeIndex ?? Int.max)
+                }
+                if lFirst?.startEventIndex != rFirst?.startEventIndex {
+                    return (lFirst?.startEventIndex ?? Int.max) < (rFirst?.startEventIndex ?? Int.max)
+                }
+                return lhs.tokens.lexicographicallyPrecedes(rhs.tokens)
+            }
+
+        var consumed = Set<EpisodeEventKey>()
+        var candidates: [RoutineCandidate] = []
+        for pattern in patterns {
+            var localConsumed = Set<EpisodeEventKey>()
+            var occurrences: [[InputEvent]] = []
+            var occurrenceActions: [[TypedAction]] = []
+            var occurrenceKeys: [[EpisodeEventKey]] = []
+            for span in pattern.occurrenceSpans.sorted(by: Self.episodeSpanSort) {
+                let indices = Self.matchedIndices(for: span)
+                let keys = indices.map { EpisodeEventKey(episodeIndex: span.episodeIndex, eventIndex: $0) }
+                guard keys.allSatisfy({ !consumed.contains($0) && !localConsumed.contains($0) }),
+                      let events = Self.events(for: span, matchedIndices: indices, episodeEvents: episodeEvents),
+                      events.count == pattern.tokens.count,
+                      let actions = Self.actions(for: span, matchedIndices: indices, typedEpisodes: typedEpisodes),
+                      actions.count == pattern.tokens.count
+                else { continue }
+                occurrences.append(events)
+                occurrenceActions.append(actions)
+                occurrenceKeys.append(keys)
+                localConsumed.formUnion(keys)
+            }
+            guard !occurrences.isEmpty else { continue }
+            let representative = occurrences.sorted(by: Self.newestOccurrenceFirst).first!
+            guard Self.isAutomatableInstance(representative) else { continue }
+            let abstractSummary = Self.abstractParameterSummary(in: occurrenceActions)
+
+            candidates.append(RoutineCandidate(
+                patternTokens: pattern.tokens,
+                occurrences: occurrences,
+                surface: surface,
+                abstractSignatureTokens: pattern.tokens,
+                abstractParameters: abstractSummary.parameters,
+                abstractSanitizedKinds: abstractSummary.sanitizedKinds
+            ))
+            if occurrences.count >= 2 {
+                for keys in occurrenceKeys {
+                    consumed.formUnion(keys)
+                }
+            }
+        }
+
+        let results = promoteCandidates(candidates, contexts: contexts, surface: surface)
+        let deduped = Self.mergeVariants(results)
+        let now = Date()
+        return deduped
+            .sorted { lhs, rhs in
+                let l = Self.rankingScore(lhs, now: now), r = Self.rankingScore(rhs, now: now)
+                if l != r { return l > r }
+                return lhs.signature < rhs.signature
+            }
+            .prefix(maxResults)
+            .map { $0 }
+    }
+
     private func promoteCandidates(
         _ candidates: [RoutineCandidate],
         contexts: [RecordedContext],
@@ -408,7 +576,10 @@ public struct WasteDetector: Sendable {
                 occurrences: merged.support,
                 contexts: contexts,
                 surface: surface,
-                allOccurrences: merged.occurrences
+                allOccurrences: merged.occurrences,
+                abstractSignatureTokens: merged.abstractSignatureTokens,
+                abstractParameters: merged.abstractParameters,
+                abstractSanitizedKinds: merged.abstractSanitizedKinds
             )
         }
     }
@@ -452,7 +623,10 @@ public struct WasteDetector: Sendable {
             occurrences: occurrences,
             surface: { event in
                 representative.surfaces.first(where: { $0 == event.appName }) ?? event.appName
-            }
+            },
+            abstractSignatureTokens: representative.abstractSignatureTokens,
+            abstractParameters: representative.abstractParameters,
+            abstractSanitizedKinds: representative.abstractSanitizedKinds
         )
     }
 
@@ -896,6 +1070,64 @@ public struct WasteDetector: Sendable {
         return nil
     }
 
+    private static func abstractParameterSummary(in occurrences: [[TypedAction]]) -> AbstractParameterSummary {
+        guard occurrences.count >= 2, let representative = occurrences.first else {
+            return AbstractParameterSummary(parameters: [:], sanitizedKinds: [:])
+        }
+        var inferred: [Int: AbstractParameter] = [:]
+        var sanitizedKinds: [Int: RecipeParameterKind] = [:]
+        var groupPositionByKey: [String: Int] = [:]
+
+        for position in representative.indices {
+            let slots = occurrences.compactMap { occurrence -> TypedActionSlot? in
+                guard occurrence.indices.contains(position) else { return nil }
+                return occurrence[position].dataSlot
+            }
+            guard slots.count == occurrences.count,
+                  let category = slots.first?.category,
+                  slots.allSatisfy({ $0.category == category })
+            else { continue }
+
+            let hashes = Array(Set(slots.map(\.valueHash).filter { !$0.isEmpty })).sorted()
+            guard hashes.count >= 2 else { continue }
+            let examples = Array(Set(slots.map(\.valueShape))).sorted().prefix(4).map { $0 }
+            let groupKey = "\(category.rawValue):\(hashes.joined(separator: ","))"
+            let kind = recipeParameterKind(for: category)
+            sanitizedKinds[position] = kind
+
+            if let existingPosition = groupPositionByKey[groupKey],
+               var existing = inferred[existingPosition] {
+                existing.sourceEventIndices = Array(Set(existing.sourceEventIndices + [position])).sorted()
+                inferred[existingPosition] = existing
+                continue
+            }
+
+            inferred[position] = AbstractParameter(
+                position: position,
+                parameterKey: "slot_\(category.rawValue)",
+                parameterKind: kind,
+                valueExamples: examples,
+                valueHashes: Array(hashes.prefix(8)),
+                sourceEventIndices: [],
+                transform: nil
+            )
+            groupPositionByKey[groupKey] = position
+        }
+
+        return AbstractParameterSummary(parameters: inferred, sanitizedKinds: sanitizedKinds)
+    }
+
+    private static func recipeParameterKind(for category: TypedActionSlotCategory) -> RecipeParameterKind {
+        switch category {
+        case .ticker: .ticker
+        case .number: .number
+        case .word: .word
+        case .date: .date
+        case .url: .url
+        case .name: .name
+        }
+    }
+
     private static func parameterKey(from label: String, fallbackPosition: Int) -> String {
         let cleaned = label
             .lowercased()
@@ -945,11 +1177,31 @@ public struct WasteDetector: Sendable {
 
     // MARK: - Recipe construction
 
-    private func makeWaste(instance: [InputEvent], occurrences: Int, contexts: [RecordedContext], surface: (InputEvent) -> String, allOccurrences: [[InputEvent]] = []) -> DetectedWaste {
+    private func makeWaste(
+        instance: [InputEvent],
+        occurrences: Int,
+        contexts: [RecordedContext],
+        surface: (InputEvent) -> String,
+        allOccurrences: [[InputEvent]] = [],
+        abstractSignatureTokens: [String]? = nil,
+        abstractParameters: [Int: AbstractParameter] = [:],
+        abstractSanitizedKinds: [Int: RecipeParameterKind] = [:]
+    ) -> DetectedWaste {
         // Which positions hold a typed value that CHANGES across the recorded
         // occurrences — those are parameters, not fixed content (B5/AWM). Empty for
         // the single-demonstration (Teach-once) path, which has no occurrences to diff.
-        var parameterMetadata = Self.inferredParameters(allOccurrences)
+        var parameterMetadata = abstractSignatureTokens == nil ? Self.inferredParameters(allOccurrences) : [:]
+        for (position, parameter) in abstractParameters {
+            parameterMetadata[position] = InferredParameter(
+                position: parameter.position,
+                parameterKey: parameter.parameterKey,
+                parameterKind: parameter.parameterKind,
+                valueExamples: parameter.valueExamples,
+                valueHashes: parameter.valueHashes,
+                sourceEventIndices: parameter.sourceEventIndices,
+                transform: parameter.transform
+            )
+        }
         for (position, parameter) in Self.dataflowParameters(in: instance) where parameterMetadata[position] == nil {
             parameterMetadata[position] = parameter
         }
@@ -965,20 +1217,22 @@ public struct WasteDetector: Sendable {
             }
             let parameter = parameterMetadata[position]
             let sourceStepIDs = parameter?.sourceEventIndices.compactMap { eventPositionToStepOrder[$0] } ?? []
+            let sanitizedKind = abstractSanitizedKinds[position]
+            let sanitizedByAbstractMining = sanitizedKind != nil
             eventPositionToStepOrder[position] = order
             steps.append(RecipeStep(
                 order: order,
                 kind: Self.recipeKind(event.kind),
                 x: event.x,
                 y: event.y,
-                text: event.text,
+                text: sanitizedByAbstractMining ? Self.parameterizedText(for: event, parameter: parameter, kind: sanitizedKind) : event.text,
                 key: event.key,
                 modifiers: event.modifiers,
                 appName: event.appName,
                 bundleIdentifier: event.bundleIdentifier,
                 windowTitleHint: event.windowTitle,
-                ocrAnchor: Self.ocrAnchor(for: event, contexts: contexts),
-                targetDescriptor: event.targetDescriptor,
+                ocrAnchor: sanitizedByAbstractMining ? Self.parameterizedAnchor(parameter, kind: sanitizedKind) : Self.ocrAnchor(for: event, contexts: contexts),
+                targetDescriptor: sanitizedByAbstractMining ? Self.parameterizedTargetDescriptor(for: event, parameter: parameter, kind: sanitizedKind) : event.targetDescriptor,
                 isParameter: parameter != nil,
                 parameterKey: parameter?.parameterKey,
                 parameterKind: parameter?.parameterKind,
@@ -1015,9 +1269,44 @@ public struct WasteDetector: Sendable {
             recipe: AgentRecipe(steps: steps),
             evidence: Self.evidenceIDs(instance: instance, allOccurrences: allOccurrences),
             confidence: min(0.95, 0.5 + Double(occurrences) * 0.12),
-            signature: instance.map { Self.token($0, surface: surface($0)) }.joined(separator: "|"),
+            signature: abstractSignatureTokens?.joined(separator: "|") ?? instance.map { Self.token($0, surface: surface($0)) }.joined(separator: "|"),
             lastSeenAt: instance.last!.capturedAt,
             quality: quality
+        )
+    }
+
+    private static func parameterizedText(for event: InputEvent, parameter: InferredParameter?, kind: RecipeParameterKind?) -> String? {
+        guard let parameter else {
+            guard let kind else { return event.kind == .type ? InputEventSanitizer.typedShape(for: event.text ?? "") : event.text }
+            switch event.kind {
+            case .type, .click, .doubleClick, .rightClick:
+                return "\(kind.rawValue) slot"
+            case .key, .scroll:
+                return event.text
+            }
+        }
+        switch event.kind {
+        case .type:
+            return parameter.valueExamples.first ?? "\(parameter.parameterKind.rawValue):slot"
+        case .click, .doubleClick, .rightClick:
+            return "\(parameter.parameterKind.rawValue) slot"
+        case .key, .scroll:
+            return event.text
+        }
+    }
+
+    private static func parameterizedAnchor(_ parameter: InferredParameter?, kind: RecipeParameterKind?) -> String? {
+        guard let parameterKind = parameter?.parameterKind ?? kind else { return nil }
+        return "\(parameterKind.rawValue) slot"
+    }
+
+    private static func parameterizedTargetDescriptor(for event: InputEvent, parameter: InferredParameter?, kind: RecipeParameterKind?) -> String? {
+        guard let parameterKind = parameter?.parameterKind ?? kind else { return nil }
+        let role = AXTargetDescriptorV2.decode(event.targetDescriptor)?.role
+        return AXTargetDescriptorV2.encode(
+            label: "\(parameterKind.rawValue) slot",
+            role: role,
+            createdFrom: "parameterized-mining"
         )
     }
 
@@ -1112,11 +1401,11 @@ public struct WasteDetector: Sendable {
 
     private static func parameterKindScore(_ kind: RecipeParameterKind?) -> Double {
         switch kind {
-        case .date, .currency, .number, .email, .url, .filePath:
+        case .date, .currency, .number, .ticker, .email, .url, .filePath:
             return 1.0
-        case .personName:
+        case .personName, .name:
             return 0.75
-        case .freeText:
+        case .word, .freeText:
             return 0.30
         case nil:
             return 0
@@ -1336,6 +1625,17 @@ public struct WasteDetector: Sendable {
     ) -> [InputEvent]? {
         guard episodeEvents.indices.contains(span.episodeIndex) else { return nil }
         let episode = episodeEvents[span.episodeIndex]
+        guard matchedIndices.allSatisfy({ episode.indices.contains($0) }) else { return nil }
+        return matchedIndices.map { episode[$0] }
+    }
+
+    private static func actions(
+        for span: PrefixSpanMiner.OccurrenceSpan,
+        matchedIndices: [Int],
+        typedEpisodes: [TypedActionEpisode]
+    ) -> [TypedAction]? {
+        guard typedEpisodes.indices.contains(span.episodeIndex) else { return nil }
+        let episode = typedEpisodes[span.episodeIndex].actions
         guard matchedIndices.allSatisfy({ episode.indices.contains($0) }) else { return nil }
         return matchedIndices.map { episode[$0] }
     }
