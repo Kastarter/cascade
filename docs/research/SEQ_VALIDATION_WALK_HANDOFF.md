@@ -49,7 +49,11 @@ marks them strict → 22 > Anthropic's 20-strict cap → 400).
 | 04 semantic-retrieval-memory | #48 | **APPROVED** — Reel ask/search "perfect." |
 | 06 reliability-eval | #49 | **APPROVED** — regression-only (thin surface). |
 | 07 privacy-security | #50 | **APPROVED WITH FIX** (5 commits) — see below. |
-| 08 workflow-mining | #51 | **UNDER TEST** — did not detect a real repeated workflow; see fix note below. |
+| 08 workflow-mining | #51 | **APPROVED w/ TODO** — didn't detect a real repeated workflow (crypto copy-paste); records + separates browser surfaces, but needs category/param-aware clustering. See fix note below (also a `TODO` in `WasteDetector.detect`). |
+| 09 macos-automation | #52 | **APPROVED** — agent types "hello" verified, no crash; secure-input refusal works (refused typing into a password field). Confirmed the keyboard crash is NOT born here (it's latent, exposed later). |
+| 10 market-productization | #53 | **APPROVED (dormant)** — adds enterprise-compliance surface (SIEM audit export, SLO/cost cards, privacy outbox, DLP rule counts). Data-driven → shows defaults without real fleet/run history. Additive, low-risk; validate with real data later. |
+| 11 on-device-inference | #54 | **APPROVED W/ FIX** — landed as `LocalRegionNarrower` (local AX/OCR region narrowing for grounding); real payoff needs seq-21's visual grounder. Its `async` grounding **exposed the keyboard crash** → fixed (see below). |
+| 12 prompt-injection-defense | #55 | **UNDER TEST** — InjectionGuard + provenance/injection scoring + untrusted-content confirmation. |
 
 ### seq-02 finding (logged, not blocking)
 Adds `import ComputerUseKit` to `Sources/SandboxKit/BackgroundWebAgent.swift` but never
@@ -76,6 +80,19 @@ and redacts only sensitive content**:
    gets covered too. Also improves normal-mode redaction.
 DEFERRED: redaction still leaky on some OCR splits — hardening later.
 
+### KEYBOARD CRASH FIX (seq-09 root / seq-11 exposure) — the big one
+This is the crash that made the agent "do nothing / crash" on HEAD. Signature:
+`_dispatch_assert_queue_fail` ← `HIToolbox TSMGetInputSourceProperty` ←
+`KeyboardLayoutMapper.currentLayoutMapping` ← `NativeComputerUseActuator.pressKey`.
+`TISCopyCurrentKeyboardLayoutInputSource`/`TISGetInputSourceProperty` (Carbon) **assert
+they run on the MAIN thread**; the actuation path runs them off-main → SIGTRAP on the
+first typed key. Latent in **seq-09**'s `KeyboardLayoutMapper` (`Sources/ComputerUseKit/InputSafety.swift`);
+**seq-11** made grounding `async`, which pushed actuation off-main and triggered it every run.
+FIX (committed on `validate/seq-11`, carries forward): `currentLayoutMapping` hops to the
+main thread (`DispatchQueue.main.sync`) before the Carbon calls. Verified live: agent
+typed "hello" verified, 0 crash reports, 0 `dispatch_assert`/`KeyboardLayout` log lines.
+**Typing should stay crash-free for the rest of the walk.**
+
 ## seq-08 FIX NOTE (requested)
 **We want to fix the miner so a workflow of the SAME ACTIONS with DIFFERENT DATA is
 still recognized as one repeated routine — especially when the items fall under the
@@ -93,12 +110,13 @@ So four crypto copies become a single repeatable agent, not four unrelated varia
 the generalization/clustering step.)
 
 ## Next
-- **seq-09 macos-automation** — likely home of the keyboard-actuator crash
-  (`NativeComputerUseActuator.pressKey → KeyboardLayoutMapper.currentLayoutMapping →
-  HIToolbox TSMGetInputSourceProperty → dispatch_assert_queue_fail`, an off-main-queue
-  crash seen on HEAD). Test agent typing; watch for the crash here.
-- Then 10, 11, 12 → **seq-05 (the strict-tools 400 — expect the agent to break; HEAD
-  fix caps strict tools at 20)** → 13 (multi-step/planning) → 14 … 31.
+- **seq-12 prompt-injection-defense** — currently under test (#55). InjectionGuard +
+  provenance/injection scoring + confirmation on untrusted screen/web/file content.
+- Then **seq-05 (the strict-tools 400 — expect the agent to break; HEAD fix caps strict
+  tools at 20)** → **seq-13** (multi-step/planning — watch the "terminates after step 1"
+  issue from the seq-03 finding) → 14 … 31.
+- The keyboard crash (the agent's biggest blocker) is already FIXED and carried forward,
+  so from here the agent should type without crashing.
 
 ## Deferred / known
 - seq-07 redaction hardening (OCR-split secrets).
@@ -107,7 +125,9 @@ the generalization/clustering step.)
   an Index-out-of-range crash.
 
 ## State pointers
-- Branches: `validate/base`, `validate/seq-01 … seq-08` (pushed to origin). PRs #45–#51.
+- Branches: `validate/base`, `validate/seq-01 … seq-12` (pushed to origin). PRs #45–#55.
 - Worktrees: `/tmp/wt-seqNN` (throwaway; recreate with `git worktree add`).
-- Fixed prior for cherry-pick = `validate/seq-08` (currently the tip of approved work).
+- Fixed prior for cherry-pick = `validate/seq-12` (current tip of approved work; seq-12
+  under test). Fix commits so far live on validate/seq-07 (private mode ×5) and
+  validate/seq-11 (keyboard crash) and carry forward via cherry-pick.
 - Signing cert keychain: `cascade-signing.keychain` (pw `cascade`).
