@@ -352,6 +352,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
+    nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
@@ -369,6 +370,10 @@ public final class CascadeAppModel: ObservableObject {
 
     static func experimentalGroundingCache(defaults: UserDefaults) -> GroundingCache? {
         defaults.bool(forKey: Self.experimentalGroundingCacheKey) ? GroundingCache() : nil
+    }
+
+    nonisolated static func experimentalActionTrajectoryCacheEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalActionTrajectoryCacheKey)
     }
 
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
@@ -3373,6 +3378,36 @@ public final class CascadeAppModel: ObservableObject {
         // to 15 and over-thought; reverted). Effort stays medium — CU default.
         let cuModel = AnthropicModel.opus
         let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        let actionCacheLookup = await actionTrajectoryCachePreflight(
+            goal: goal,
+            firstScreenshotPNG: firstScreenshotPNG
+        )
+        if let executable = actionCacheLookup?.executable,
+           let cachedAction = Self.actionTrajectoryCUAction(kind: executable.row.actionKind, json: executable.row.actionJSON) {
+            let before = await Self.uiState()
+            let ok = await executeCU(cachedAction, on: screen)
+            let verification = await Self.verifyUIChange(after: before)
+            if ok && (verification.changed || executable.row.actionKind == "open_app") {
+                _ = try? await store.promoteActionTrajectoryCache(
+                    source: executable.row.source,
+                    goal: goal,
+                    state: await actionTrajectoryState(firstScreenshotPNG: firstScreenshotPNG),
+                    targetDescriptor: executable.row.targetDescriptor,
+                    targetText: executable.row.targetTextNorm,
+                    action: ActionTrajectoryCacheAction(
+                        kind: executable.row.actionKind,
+                        json: executable.row.actionJSON,
+                        preconditionJSON: executable.row.preconditionJSON,
+                        postconditionJSON: executable.row.postconditionJSON
+                    )
+                )
+                return .finished("Used a verified cached action.", acted: true)
+            }
+            _ = try? await store.demoteActionTrajectoryCache(
+                id: executable.row.id,
+                reason: ok ? .wrongScreen : .disallowedAction
+            )
+        }
         var searchToolCalls = 0
         var searchFinishBlocked = false
         let agent = makeAssistAgent(model: cuModel, goal: goal, gen: gen, onSearchToolCall: { _ in
@@ -3454,7 +3489,13 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         wire(agent)
-        let initialNote = await initialAssistNote(goal: goal)
+        let initialNoteText = [
+            await initialAssistNote(goal: goal),
+            actionCacheLookup?.hints.first.map { "Action cache hint: \($0)" },
+        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let initialNote = initialNoteText.isEmpty ? nil : initialNoteText
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
@@ -7613,16 +7654,21 @@ public final class CascadeAppModel: ObservableObject {
 		                        try await clickAction(step, at: cached.point)
 		                        let cacheVerification = await Self.verifyUIChange(after: cacheInitialState)
 		                        if cacheVerification.changed {
-		                            _ = await recipeTargetCache.promote(
-                                            targetCacheContext,
+			                            _ = await recipeTargetCache.promote(
+	                                            targetCacheContext,
+	                                            point: cached.point,
+	                                            tier: cached.tier,
+	                                            verifiedScore: cached.verifiedScore,
+	                                            source: cached.source,
+	                                            anchorHash: cached.anchorHash
+	                                        )
+                                        await promoteActionTrajectoryRecipeCache(
+                                            step: step,
                                             point: cached.point,
-                                            tier: cached.tier,
-                                            verifiedScore: cached.verifiedScore,
-                                            source: cached.source,
-                                            anchorHash: cached.anchorHash
+                                            stateFingerprint: cacheInitialState.map { String($0.rootHash) }
                                         )
-		                            unverifiedStreak = 0
-		                            _ = try? await store.appendAudit(AuditEvent(
+			                            unverifiedStreak = 0
+			                            _ = try? await store.appendAudit(AuditEvent(
 		                                actor: "agent",
 		                                action: "recipe.target_cache.hit",
 		                                detail: Self.recipeTargetCacheAuditDetail(
@@ -7647,8 +7693,13 @@ public final class CascadeAppModel: ObservableObject {
 		                            try? await Task.sleep(for: .milliseconds(500))
 		                            continue
 		                        }
-		                        let demoted = await recipeTargetCache.demote(targetCacheContext)
-	                        _ = try? await store.appendAudit(AuditEvent(
+			                        let demoted = await recipeTargetCache.demote(targetCacheContext)
+                                    await demoteActionTrajectoryRecipeCache(
+                                        step: step,
+                                        stateFingerprint: cacheInitialState.map { String($0.rootHash) },
+                                        reason: .wrongScreen
+                                    )
+		                        _ = try? await store.appendAudit(AuditEvent(
 	                            actor: "agent",
 	                            action: "recipe.target_cache.demote",
 	                            detail: Self.recipeTargetCacheAuditDetail(
@@ -7658,9 +7709,69 @@ public final class CascadeAppModel: ObservableObject {
 		                                confidence: demoted?.confidence,
 		                                deltaReason: cacheVerification.reason
 		                            )
-		                        ))
-		                    }
-	                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
+			                        ))
+			                    }
+                                if previousVerifiedEntry == nil,
+                                   let targetCacheContext,
+                                   Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore) {
+                                    let persistentState = ActionTrajectoryState(
+                                        appName: step.appName,
+                                        bundleIdentifier: step.bundleIdentifier,
+                                        windowTitle: step.windowTitleHint,
+                                        axFingerprint: cacheInitialState.map { String($0.rootHash) }
+                                    )
+                                    if let persistentLookup = try? await store.lookupActionTrajectoryCache(
+                                        goal: step.humanLabel,
+                                        state: persistentState,
+                                        targetDescriptor: step.targetDescriptor,
+                                        targetText: step.ocrAnchor ?? step.text,
+                                        actionKind: "click"
+                                    ),
+                                       let persistentRow = persistentLookup.executable?.row,
+                                       case .click(let cachedX, let cachedY)? = Self.actionTrajectoryCUAction(
+                                            kind: persistentRow.actionKind,
+                                            json: persistentRow.actionJSON
+                                       ) {
+                                        let cachedPoint = CGPoint(x: cachedX, y: cachedY)
+                                        try await driver.act(.computerUse(.move(x: cachedPoint.x, y: cachedPoint.y)))
+                                        try? await Task.sleep(for: .milliseconds(320))
+                                        try await clickAction(step, at: cachedPoint)
+                                        let persistentVerification = await Self.verifyUIChange(after: cacheInitialState)
+                                        if persistentVerification.changed {
+                                            _ = await recipeTargetCache.promote(
+                                                targetCacheContext,
+                                                point: cachedPoint,
+                                                tier: .ax,
+                                                verifiedScore: persistentRow.confidence,
+                                                source: .accessibility,
+                                                anchorHash: persistentRow.targetDescriptor.map(AuditIdentity.hash)
+                                            )
+                                            _ = try? await store.promoteActionTrajectoryCache(
+                                                source: .recipe,
+                                                goal: step.humanLabel,
+                                                state: persistentState,
+                                                targetDescriptor: step.targetDescriptor,
+                                                targetText: step.ocrAnchor ?? step.text,
+                                                action: ActionTrajectoryCacheAction(
+                                                    kind: persistentRow.actionKind,
+                                                    json: persistentRow.actionJSON,
+                                                    preconditionJSON: persistentRow.preconditionJSON,
+                                                    postconditionJSON: persistentRow.postconditionJSON
+                                                )
+                                            )
+                                            unverifiedStreak = 0
+                                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+                                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "persistent_cache")))
+                                            try? await Task.sleep(for: .milliseconds(500))
+                                            continue
+                                        }
+                                        _ = try? await store.demoteActionTrajectoryCache(
+                                            id: persistentRow.id,
+                                            reason: persistentVerification.unavailable ? .missingAnchor : .wrongScreen
+                                        )
+                                    }
+                                }
+		                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
 	                    // recorded AX label in the live tree. Tier 2 (ocr): B4's ON-DEVICE
                     // OCR grounder — find the recorded target's text on the live frame
                     // via Apple Vision, no model round-trip, and it sees canvas/Electron
@@ -7848,18 +7959,23 @@ public final class CascadeAppModel: ObservableObject {
                                                 source: targetSource,
                                                 anchorHash: targetAnchorHash
                                             )
-		                                _ = try? await store.appendAudit(AuditEvent(
-		                                    actor: "agent",
-		                                    action: "recipe.target_cache.promote",
-		                                    detail: Self.recipeTargetCacheAuditDetail(
-		                                        step: step,
-		                                        tier: cacheTier,
-		                                        confidence: promoted.confidence,
-		                                        deltaReason: verification.reason
-		                                    )
-		                                ))
-		                            }
-		                        } else if verification.unavailable {
+			                                _ = try? await store.appendAudit(AuditEvent(
+			                                    actor: "agent",
+			                                    action: "recipe.target_cache.promote",
+			                                    detail: Self.recipeTargetCacheAuditDetail(
+			                                        step: step,
+			                                        tier: cacheTier,
+			                                        confidence: promoted.confidence,
+			                                        deltaReason: verification.reason
+			                                    )
+			                                ))
+			                            }
+                                        await promoteActionTrajectoryRecipeCache(
+                                            step: step,
+                                            point: target,
+                                            stateFingerprint: before.map { String($0.rootHash) }
+                                        )
+			                        } else if verification.unavailable {
 		                            unverifiedStreak = 0
 		                        } else {
 		                            // One corrective retry at the recorded coordinate (if the
@@ -7879,18 +7995,23 @@ public final class CascadeAppModel: ObservableObject {
                                                     source: .recordedPoint,
                                                     anchorHash: nil
                                                 )
-		                                    _ = try? await store.appendAudit(AuditEvent(
-		                                        actor: "agent",
-		                                        action: "recipe.target_cache.promote",
-		                                        detail: Self.recipeTargetCacheAuditDetail(
-		                                            step: step,
-		                                            tier: .recorded,
-		                                            confidence: promoted.confidence,
-		                                            deltaReason: retryVerification.reason
-		                                        )
-		                                    ))
-		                                }
-		                            } else if retryVerification.unavailable {
+			                                    _ = try? await store.appendAudit(AuditEvent(
+			                                        actor: "agent",
+			                                        action: "recipe.target_cache.promote",
+			                                        detail: Self.recipeTargetCacheAuditDetail(
+			                                            step: step,
+			                                            tier: .recorded,
+			                                            confidence: promoted.confidence,
+			                                            deltaReason: retryVerification.reason
+			                                        )
+			                                    ))
+			                                }
+                                            await promoteActionTrajectoryRecipeCache(
+                                                step: step,
+                                                point: recorded,
+                                                stateFingerprint: before.map { String($0.rootHash) }
+                                            )
+			                            } else if retryVerification.unavailable {
 		                                unverifiedStreak = 0
 		                            } else {
 	                                unverifiedStreak += 1
@@ -8193,6 +8314,162 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         return UIVerificationResult(status: .unchanged, reason: lastSummary)
+    }
+
+    private func actionTrajectoryCachePreflight(goal: String, firstScreenshotPNG: Data) async -> ActionTrajectoryCacheLookup? {
+        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore) else { return nil }
+        let state = await actionTrajectoryState(firstScreenshotPNG: firstScreenshotPNG)
+        return try? await store.lookupActionTrajectoryCache(
+            goal: goal,
+            state: state,
+            topK: 3
+        )
+    }
+
+    private func actionTrajectoryState(firstScreenshotPNG: Data) async -> ActionTrajectoryState {
+        let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
+        let grid = Self.gridHashes(ofJPEG: firstScreenshotPNG) ?? []
+        let ui = await Self.uiState()
+        let modalPresent = await Self.unexpectedModal() != nil
+        return ActionTrajectoryState(
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle,
+            screenHash: grid.first,
+            screenGridHashes: grid,
+            axFingerprint: ui.map { String($0.rootHash) },
+            modalPresent: modalPresent
+        )
+    }
+
+    private func promoteActionTrajectoryRecipeCache(
+        step: RecipeStep,
+        point: CGPoint,
+        stateFingerprint: String?
+    ) async {
+        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore),
+              step.kind == .click,
+              let actionJSON = Self.actionTrajectoryActionJSON(
+                for: .click(x: point.x, y: point.y),
+                targetDescriptor: step.targetDescriptor
+              ) else {
+            return
+        }
+        let state = ActionTrajectoryState(
+            appName: step.appName,
+            bundleIdentifier: step.bundleIdentifier,
+            windowTitle: step.windowTitleHint,
+            axFingerprint: stateFingerprint
+        )
+        _ = try? await store.promoteActionTrajectoryCache(
+            source: .recipe,
+            goal: step.humanLabel,
+            state: state,
+            targetDescriptor: step.targetDescriptor,
+            targetText: step.ocrAnchor ?? step.text,
+            action: ActionTrajectoryCacheAction(kind: "click", json: actionJSON)
+        )
+    }
+
+    private func demoteActionTrajectoryRecipeCache(
+        step: RecipeStep,
+        stateFingerprint: String?,
+        reason: ActionTrajectoryCacheDecisionReason
+    ) async {
+        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore),
+              step.kind == .click else {
+            return
+        }
+        let state = ActionTrajectoryState(
+            appName: step.appName,
+            bundleIdentifier: step.bundleIdentifier,
+            windowTitle: step.windowTitleHint,
+            axFingerprint: stateFingerprint
+        )
+        guard let lookup = try? await store.lookupActionTrajectoryCache(
+            goal: step.humanLabel,
+            state: state,
+            targetDescriptor: step.targetDescriptor,
+            targetText: step.ocrAnchor ?? step.text,
+            actionKind: "click",
+            audit: false
+        ), let row = lookup.executable?.row else {
+            return
+        }
+        _ = try? await store.demoteActionTrajectoryCache(id: row.id, reason: reason)
+    }
+
+    nonisolated static func actionTrajectoryCUAction(kind: String, json: String) -> CUAction? {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        switch ActionTrajectoryCacheAction.normalizedKind(kind) {
+        case "open_app":
+            guard let app = stringValue(object, keys: ["app", "name", "app_name"]) else { return nil }
+            return .openApp(app)
+        case "open_url":
+            guard let url = stringValue(object, keys: ["url", "url_scope", "scope"]) else { return nil }
+            return .openURL(url)
+        case "click":
+            guard let x = doubleValue(object["x"]), let y = doubleValue(object["y"]) else { return nil }
+            return .click(x: x, y: y)
+        case "scroll":
+            guard let x = doubleValue(object["x"]), let y = doubleValue(object["y"]) else { return nil }
+            let direction = stringValue(object, keys: ["direction"]) ?? "down"
+            let amount = intValue(object["amount"]) ?? 3
+            return .scroll(x: x, y: y, direction: direction, amount: amount)
+        default:
+            return nil
+        }
+    }
+
+    nonisolated static func actionTrajectoryActionJSON(for action: CUAction, targetDescriptor: String? = nil) -> String? {
+        let object: [String: Any]
+        switch action {
+        case .openApp(let name):
+            object = ["app": name]
+        case .openURL(let url):
+            object = ["url": url]
+        case .click(let x, let y):
+            var value: [String: Any] = ["x": x, "y": y]
+            if let targetDescriptor { value["target_descriptor"] = targetDescriptor }
+            object = value
+        case .scroll(let x, let y, let direction, let amount):
+            object = ["x": x, "y": y, "direction": direction, "amount": amount]
+        default:
+            return nil
+        }
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private nonisolated static func stringValue(_ object: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
+    }
+
+    private nonisolated static func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
     }
 
     private func recipeTargetCacheContext(for step: RecipeStep, stateFingerprint: String) async -> RecipeTargetCacheContext {
