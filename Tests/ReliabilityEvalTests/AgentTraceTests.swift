@@ -181,6 +181,48 @@ func auditExportPackageIncludesManifestAndAllFormatsWithoutRawDetails() throws {
 }
 
 @Test
+func actionCacheAuditRowsProduceSafeTraceMetrics() throws {
+    let base = Date(timeIntervalSince1970: 1_800_000_100)
+    let events = [
+        AuditEvent(id: 1, createdAt: base, actor: "agent", action: "assist.task", detail: "goalHash=abc"),
+        AuditEvent(
+            id: 2,
+            createdAt: base.addingTimeInterval(0.1),
+            actor: "agent",
+            action: "action_cache.hit",
+            detail: "status=hit reason=exact rowHash=row123 goalHash=goal123 appHash=app123 targetHash=target123 kind=click successes=2 failures=0 confidence=0.80"
+        ),
+        AuditEvent(
+            id: 3,
+            createdAt: base.addingTimeInterval(0.2),
+            actor: "agent",
+            action: "action_cache.hit",
+            detail: "status=semantic reason=semanticHint rowHash=row456 goalHash=goal456 appHash=app456 targetHash=target456 kind=open_app candidates=2 confidence=0.62"
+        ),
+        AuditEvent(
+            id: 4,
+            createdAt: base.addingTimeInterval(0.3),
+            actor: "agent",
+            action: "action_cache.demote",
+            detail: "status=demoted reason=wrongScreen rowHash=row123 goalHash=goal123 appHash=app123 targetHash=target123 kind=click failures=1 confidence=0.35"
+        ),
+        AuditEvent(id: 5, createdAt: base.addingTimeInterval(0.4), actor: "agent", action: "assist.timing", detail: "finished · 1 turns · total 40ms · model 0ms · actions 40ms"),
+    ]
+
+    let trace = try #require(AgentTraceBuilder.fromAuditEvents(events).first)
+    let combinedExport = trace.otelJSON() + "\n" + trace.siemJSONL() + "\n" + trace.csv()
+
+    #expect(trace.actionCacheHits == 1)
+    #expect(trace.semanticTrajectoryHits == 1)
+    #expect(trace.actionCacheDemotions == 1)
+    #expect(trace.cacheFalseHitCount == 1)
+    #expect(trace.cacheSavedModelCalls == 1)
+    #expect(trace.cacheBypassReasons.contains("wrongscreen"))
+    #expect(combinedExport.contains("action_cache.hit"))
+    #expect(!combinedExport.contains("goalHash=goal123"))
+}
+
+@Test
 func valueSummaryCountsOnlyCompletedRunsAndAppliesBudgets() {
     let agents = [
         CascadeAgent(
