@@ -324,7 +324,12 @@ public struct MixtureGrounder: VisualGrounder {
                 previousAnchor: previousAnchor,
                 candidateFailureCounts: candidateFailureCounts
             )
+            // Fail fast on noCandidates: if the verifier found NOTHING to ground (an
+            // AX-sparse view with no viable candidate), a second visual-grounding pass
+            // won't conjure one — it only adds a slow round-trip. Escalate best-of-N ONLY
+            // when there WERE candidates but none was accepted (worth another look).
             if selection.verifierResult.verdict != .accept,
+               selection.verifierResult.failureKind != .noCandidates,
                ambiguityOptions.sampleCount == options.sampleCount,
                options.sampleCount < 3 {
                 let visualResult = await base.groundResult(

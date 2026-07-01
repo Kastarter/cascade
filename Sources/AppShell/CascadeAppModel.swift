@@ -2826,6 +2826,10 @@ public final class CascadeAppModel: ObservableObject {
         // and stop after 3 in a row. This is the single biggest harness Scout lacked.
         var noEffectTurns = 0
         var noEffectVerifierUsed = false
+        // Fast-fail counter for un-findable targets: a ground miss on a view that exposes
+        // NO controls at all means the target simply isn't on screen — re-nudging can't
+        // help, so bail after a couple instead of grinding the verifier/best-of-N stack.
+        var emptyViewMissTurns = 0
         var lastFrameHashes = Self.gridHashes(ofJPEG: firstScreenshotPNG)
         var nudge: String?
 
@@ -3007,6 +3011,17 @@ public final class CascadeAppModel: ObservableObject {
                         labels: controlSummary
                     )
                 ))
+                // Fast-fail: a miss on a view exposing ZERO controls means the target
+                // isn't here — re-nudging can't help. Bail after 2 rather than grinding
+                // the grounder/verifier/best-of-N stack for a minute-plus.
+                if controls.count == 0 {
+                    emptyViewMissTurns += 1
+                    if emptyViewMissTurns >= 2 {
+                        return await scoutEnd(.stalled("I can't find “\(missed)” on this screen — there's nothing here I can target. Open the view that has it, or tell me another way."), "ground-miss-empty-view")
+                    }
+                } else {
+                    emptyViewMissTurns = 0
+                }
                 let missNote = "Couldn't locate “\(missed)” on screen — that may be the text you want to ENTER rather than a control. Name a VISIBLE field, button, or placeholder from the controls listed below (or the text already shown in it), not the text you intend to type. If you have ALREADY clicked into the field, use the type action with NO target."
                 nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
             }
