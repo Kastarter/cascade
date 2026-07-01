@@ -356,6 +356,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
     static let experimentalHistoryCompactionTurnsKey = "cascade.experimentalHistoryCompactionTurns"
     static let experimentalActionChunkingKey = "cascade.experimentalActionChunking"
+    nonisolated static let experimentalAutoRecallKey = "cascade.experimentalAutoRecall"
     nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
@@ -378,6 +379,10 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func experimentalActionTrajectoryCacheEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalActionTrajectoryCacheKey)
+    }
+
+    nonisolated static func experimentalAutoRecallEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalAutoRecallKey)
     }
 
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
@@ -4210,15 +4215,77 @@ public final class CascadeAppModel: ObservableObject {
         return .unavailable
     }
 
-    private func initialAssistNote(goal: String) async -> String? {
+    func initialAssistNote(goal: String) async -> String? {
         let snapshot = AppWindowObserver.snapshot()
-        let parts = [
+        var parts = [
             groundingNote(),
             await planningPriorNote(for: goal, frontmostApp: snapshot.appName),
             await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
             await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
         ].compactMap { $0 }
+        if let autoRecall = await autoRecallInitialNote(goal: goal, snapshot: snapshot) {
+            parts.append(autoRecall)
+        }
         return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    private func autoRecallInitialNote(goal: String, snapshot: AppWindowSnapshot) async -> String? {
+        guard Self.experimentalAutoRecallEnabled(defaults: defaultsStore) else { return nil }
+        let baseContext = AutoRecallQueryContext(
+            goal: goal,
+            frontmostAppName: snapshot.appName,
+            frontmostBundleIdentifier: snapshot.bundleIdentifier,
+            currentWindowTitle: snapshot.windowTitle
+        )
+        guard capturePrivacyPolicy.recordRecallAvailable else {
+            let result = AutoRecallResult.blocked(context: baseContext, status: "record_recall_unavailable")
+            await auditAutoRecall(result)
+            return nil
+        }
+        let queryContext = AutoRecallQueryContext(
+            goal: goal,
+            frontmostAppName: snapshot.appName,
+            frontmostBundleIdentifier: snapshot.bundleIdentifier,
+            currentWindowTitle: snapshot.windowTitle,
+            recentWindowTitles: await autoRecallRecentWindowTitles()
+        )
+        let result = await AutoRecallContextBuilder(
+            store: store,
+            privacyPolicy: capturePrivacyPolicy
+        ).build(context: queryContext)
+        await auditAutoRecall(result)
+        return result.block
+    }
+
+    private func autoRecallRecentWindowTitles(limit: Int = 20) async -> [String] {
+        let rows = (try? await store.recentContexts(limit: limit)) ?? []
+        var titles: [String] = []
+        var seen: Set<String> = []
+        for row in rows {
+            guard row.safeToShow, row.safeToSummarize else { continue }
+            guard !PrivacyRules.isSensitive(row) else { continue }
+            guard capturePrivacyPolicy.decision(
+                appName: row.appName,
+                bundleIdentifier: row.bundleIdentifier,
+                windowTitle: row.windowTitle,
+                text: row.ocrText
+            ).allowed else { continue }
+            guard let title = row.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !title.isEmpty else { continue }
+            let key = title.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            titles.append(title)
+            if titles.count >= 8 { break }
+        }
+        return titles
+    }
+
+    private func auditAutoRecall(_ result: AutoRecallResult) async {
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recall.inject",
+            detail: Self.autoRecallAuditDetail(result)
+        ))
     }
 
     private func initialScoutNote(goal: String) async -> String? {
@@ -5081,6 +5148,20 @@ public final class CascadeAppModel: ObservableObject {
             parts.append("reasons=\(info.injectionReasons.map(safeAuditToken).joined(separator: ","))")
         }
         return parts.joined(separator: " ")
+    }
+
+    nonisolated static func autoRecallAuditDetail(_ result: AutoRecallResult) -> String {
+        [
+            "enabled=true",
+            "status=\(safeAuditToken(result.status))",
+            "count=\(result.selectedContextIDs.count)",
+            "dropped=\(result.droppedCount)",
+            "chars=\(result.renderedCharacters)",
+            "candidateCount=\(result.candidateCount)",
+            "eligibleCount=\(result.eligibleCount)",
+            "queryHash=\(safeAuditToken(result.queryHash))",
+            "selectedContextHash=\(safeAuditToken(result.selectedContextHash))"
+        ].joined(separator: " ")
     }
 
     private func deniedURLReason(inHarnessInput input: [String: Any]) -> String? {
