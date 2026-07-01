@@ -221,10 +221,9 @@ public final class ContextRecorder: ObservableObject {
         options.capturePolicy = policy
         input.updatePolicy(policy)
         rewind?.updatePolicy(policy)
-        if policy.privateModeEnabled, status.running {
-            pause()
-            status.message = "Recording paused by private mode."
-        }
+        // Private mode does NOT pause recording — it keeps capturing with ALL on-screen
+        // text redacted (see FrameRedactor). Pausing here froze the entire Reel the
+        // instant private mode was toggled, which is the bug we're fixing.
     }
 
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
@@ -267,10 +266,7 @@ public final class ContextRecorder: ObservableObject {
             status.message = "Open Settings to grant Screen Recording before recording."
             return
         }
-        guard !options.capturePolicy.privateModeEnabled else {
-            status.message = "Recording paused by private mode."
-            return
-        }
+        // (Private mode no longer blocks recording — it records with text redacted.)
         guard rewind == nil else { return }
         status.running = true
         status.message = "Recording local context."
