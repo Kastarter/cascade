@@ -767,8 +767,10 @@ public final class ComputerUseAgent {
             system: system,
             messages: Self.withMovingCacheBreakpoints(messages),
             tools: tools,
-            thinking: ["type": "adaptive"],
-            outputConfig: ["effort": effort],
+            // NOTE(seq-05 validation): thinking:adaptive + outputConfig:effort caused the
+            // step request to omit max_tokens and generate unbounded → it blew past the
+            // 90s timeout → retry → timeout → 0 actions ("agent did nothing"). Reverting
+            // to the plain, max_tokens-bounded request that worked at seq-02/09.
             stream: true
         ) else {
             return CUStep(actions: [], text: "", done: true, failed: true)
