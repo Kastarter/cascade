@@ -282,6 +282,14 @@ public enum KeyboardLayoutMapper {
     }
 
     private static func currentLayoutMapping(for key: String) -> KeyboardKeyMapping? {
+        // The Carbon TIS APIs below (TISCopyCurrentKeyboardLayoutInputSource /
+        // TISGetInputSourceProperty) assert they run on the MAIN thread — calling them
+        // off-main crashes with dispatch_assert_queue_fail (SIGTRAP). The actuation path
+        // can run on a background executor (grounding became async as of seq-11), so hop
+        // to main before touching them. Root cause lives in seq-09's KeyboardLayoutMapper.
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync { currentLayoutMapping(for: key) }
+        }
         guard key.count == 1, let target = key.first else { return nil }
         #if canImport(Carbon)
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
