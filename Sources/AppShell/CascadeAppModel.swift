@@ -3022,8 +3022,24 @@ public final class CascadeAppModel: ObservableObject {
         // the planner note (d10/d11) — a mark can only be named when it was
         // surfaced, and flag-off keeps grounding byte-identical to shipped.
         let axPickerEnabled = d.bool(forKey: Self.experimentalCompressedObservationKey)
+        // d18: OPTIONAL canvas grounder — self-hosted UI-Venus owns canvas-concept
+        // targets ONLY when explicitly configured, and rides the same
+        // `cascade.experimentalCompressedObservation` cluster as d11–d17. The
+        // shipped default (no `…canvasEndpoint`, or flag off) is nil, so the
+        // baseline grounder keeps every visual call, byte-identical. The registry
+        // refuses OpenRouter endpoints — no code path assumes OpenRouter hosts
+        // UI-Venus (contract: docs/research/AX_FIRST_GROUNDING_PLAN.md).
+        let canvasGrounder: (any VisualGrounder)? = axPickerEnabled
+            ? GrounderRegistry.makeCanvasGrounder(
+                presetID: d.string(forKey: "cascade.visualGrounder.canvasPreset"),
+                endpoint: d.string(forKey: "cascade.visualGrounder.canvasEndpoint"),
+                modelOverride: d.string(forKey: "cascade.visualGrounder.canvasModel"),
+                coordSpaceOverride: d.string(forKey: "cascade.visualGrounder.canvasCoordSpace")
+            )
+            : nil
         return mixture ? MixtureGrounder(
             base: base,
+            canvasGrounder: canvasGrounder,
             skills: appSkills,
             verifyCandidates: verifyCandidates,
             axPickerEnabled: axPickerEnabled,
@@ -5870,6 +5886,11 @@ public final class CascadeAppModel: ObservableObject {
         var parts = [outcome.decision.safeAuditDetail]
         if let targetHash = outcome.targetHash {
             parts.append("targetHash=\(safeAuditToken(targetHash))")
+        }
+        // d18: only present when a configured canvas grounder owns the visual
+        // call — rows stay byte-identical while the option is unconfigured.
+        if outcome.canvasGrounderOwns {
+            parts.append("canvasGrounder=owned")
         }
         return parts.joined(separator: " ")
     }

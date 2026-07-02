@@ -55,6 +55,48 @@ Cascade already has: `AXElementResolver` (find/interactables/frontmostState), `M
 
 ---
 
+## d18 — UI-Venus-1.5 canvas grounder: narrow self-host endpoint contract
+
+UI-Venus-1.5 is the designated **canvas grounder**: the specialist consulted only for visual
+calls whose target names a drawn surface (`GroundingRouter.namesCanvasConcept` — the same pure
+predicate the d15 router audits as `canvas_concept`). **UI-TARS-1.5-7B stays the baseline** for
+every other visual call. As of 2026-07 there is **no reliable OpenRouter path** for UI-Venus —
+no code path may assume OpenRouter hosts it. `GrounderRegistry.makeCanvasGrounder` enforces
+this: it returns nil (baseline owns everything, byte-identical to shipped) unless an explicit
+self-host endpoint is configured, refuses `openrouter.ai` endpoints outright, and deliberately
+has **no localhost fallback** (a silently-assumed local server would add a failing round trip to
+every canvas target).
+
+**The contract is deliberately narrow: one crop + one query in → one point/bbox + confidence out.**
+
+- **Transport** — OpenAI-compatible `POST /v1/chat/completions`, exactly what vLLM/SGLang expose,
+  so the existing `UITARSGrounder` client speaks it unchanged. Serve with one of:
+  - `vllm serve inclusionAI/UI-Venus-1.5-8B --port 8500 --limit-mm-per-prompt image=1`
+  - `python -m sglang.launch_server --model-path inclusionAI/UI-Venus-1.5-8B --port 8500`
+  - (2B on Apple Silicon: mlx-vlm serving `inclusionAI/UI-Venus-1.5-2B`, same surface.)
+- **Request** — ONE image + one text query naming the on-canvas target, temperature 0. The image
+  is the **d16 crop of the uncertain region at native pixel resolution**, never the downscaled
+  full screen (the crop IS the resolution win; ScreenSpot-Pro/DRS-GUI). Best-of-N varies seeds,
+  not temperature.
+- **Response** — assistant text parseable by the existing `ui-tars-box` parser:
+  `click(start_box='(x,y)')`, coordinates in the **sent-image pixel space** (`coordSpace = sent`,
+  the Qwen3-VL convention — NOT UI-TARS's smart-resize space). A bbox maps to its center point;
+  **confidence** comes from cross-sample cluster agreement (existing `UITARSGrounder` logic).
+  Crop-local output maps back through the d01 `CoordinateTransform` chain — never ad-hoc scale
+  math.
+- **Probe before trusting a click** — `GrounderRegistry.probeCoordSpace` with a synthetic output;
+  a wrong coordinate space misses every click (the tonight-miss failure mode).
+- **Config** (the option activates only when ALL hold; rides the d11–d17
+  `cascade.experimentalCompressedObservation` flag):
+  - `cascade.visualGrounder.canvasEndpoint` — explicit self-host URL (**required**; OpenRouter
+    refused, no localhost assumed)
+  - `cascade.visualGrounder.canvasPreset` (default `ui-venus`), `…canvasModel` (default
+    `inclusionAI/UI-Venus-1.5-8B`), `…canvasCoordSpace` (default `sent`)
+- **Audit** — when the canvas grounder owns a request, the d15 `grounding.route` row carries
+  `canvasGrounder=owned` (enum tokens + hashes only, never target text).
+
+---
+
 ## Repos/papers to reuse (not reinvent)
 Hammerspoon `hs.axuielement` + AXSwift/Swindler (Swift AX patterns), MacPaw `macapptree` (AX JSON schema + corpus), microsoft/OmniParser (vision-fallback schema), inclusionAI/UI-Venus (canvas grounder), microsoft/UFO2 (OS-native action-layer architecture), simular-ai/Agent-S (mixture-of-grounding router). Papers: A11y-Compressor, Screen2AX, ScreenSpot-Pro, Set-of-Mark, SeeAct, GUIrilla, DRS-GUI, OSWorld.
 

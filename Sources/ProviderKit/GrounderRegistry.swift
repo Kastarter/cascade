@@ -105,14 +105,16 @@ public enum GrounderRegistry {
         ),
         GrounderPreset(
             id: "ui-venus",
-            displayName: "UI-Venus 1.5",
+            displayName: "UI-Venus 1.5 (canvas)",
             modelID: GUIGrounderModel.uiVenus15_8b,
             coordinateSpace: .sent,
             endpointClass: .byo,
             modelSize: "2B / 8B",
-            quantization: "BYO host",
+            quantization: "self-host (vLLM/SGLang)",
             license: .research,
-            note: "BYO endpoint until hosting/license is confirmed; likely sent-image coordinates."
+            note: "d18 canvas grounder: self-host via vLLM/SGLang (crop+query → point/confidence); "
+                + "sent-image coordinates. NOT on OpenRouter — see the endpoint contract in "
+                + "docs/research/AX_FIRST_GROUNDING_PLAN.md."
         ),
         GrounderPreset(
             id: "gui-aima",
@@ -225,6 +227,64 @@ public enum GrounderRegistry {
             apiKey: apiKey,
             coordSpace: coordSpace,
             enableRegionBudgeting: preset.endpointClass != .hosted
+        )
+    }
+
+    // MARK: - d18 canvas grounder (UI-Venus-1.5, self-hosted)
+
+    /// The preset that owns canvas-concept targets when a self-host endpoint is
+    /// explicitly configured. UI-TARS-1.5-7B stays the BASELINE for every other
+    /// visual call.
+    public static let canvasPresetID = "ui-venus"
+
+    /// Builds the OPTIONAL canvas grounder — the specialist consulted only for
+    /// targets that name a drawn surface (`GroundingRouter.namesCanvasConcept`),
+    /// where AX has nothing faithful to offer and the baseline grounder is
+    /// weakest (ScreenSpot-Pro-style targets).
+    ///
+    /// The endpoint contract is deliberately NARROW (documented in
+    /// docs/research/AX_FIRST_GROUNDING_PLAN.md): one crop + one query in →
+    /// one point/bbox + confidence out, over the OpenAI-compatible
+    /// `/v1/chat/completions` surface that `vllm serve` / SGLang expose — so the
+    /// existing `UITARSGrounder` client speaks it unchanged (`coordSpace: .sent`
+    /// for the Qwen3-VL family; probe with `probeCoordSpace` before trusting a
+    /// click).
+    ///
+    /// Returns nil — meaning the baseline owns EVERY visual call, byte-identical
+    /// to shipped — unless an explicit self-host endpoint is configured:
+    ///  • no endpoint (or blank/invalid) → nil. There is deliberately NO
+    ///    localhost fallback here: a silently-assumed local server would add a
+    ///    failing round trip to every canvas target.
+    ///  • an OpenRouter endpoint → nil. No reliable OpenRouter deployment
+    ///    serves UI-Venus; routing there would ground with the wrong model. No
+    ///    code path may assume OpenRouter hosts the canvas grounder.
+    ///  • a `hosted`/`claude`-class preset → nil. The canvas contract is a
+    ///    self-host (byo/local) point-grounding endpoint only.
+    public static func makeCanvasGrounder(
+        presetID: String? = nil,
+        endpoint: String?,
+        apiKey: String? = nil,
+        modelOverride: String? = nil,
+        coordSpaceOverride: String? = nil
+    ) -> (any VisualGrounder)? {
+        let preset = preset(id: presetID?.isEmpty == false ? presetID : canvasPresetID)
+        guard preset.endpointClass == .byo || preset.endpointClass == .local else { return nil }
+        guard let endpoint = endpoint?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !endpoint.isEmpty,
+              let url = URL(string: endpoint) else { return nil }
+        if let host = url.host?.lowercased(),
+           host == "openrouter.ai" || host.hasSuffix(".openrouter.ai") {
+            return nil
+        }
+        let coordSpace = coordSpaceOverride.flatMap(UITARSGrounder.CoordSpace.init(rawValue:))
+            ?? preset.coordinateSpace
+        let model = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return UITARSGrounder(
+            baseURL: url,
+            model: model?.isEmpty == false ? model! : preset.modelID,
+            apiKey: apiKey,
+            coordSpace: coordSpace,
+            enableRegionBudgeting: true
         )
     }
 

@@ -57,6 +57,14 @@ import ProviderKit
 //    (a synthesized label is never verification evidence) and never touches
 //    source or confidence — native AX keeps outranking synthetic in the d13
 //    trust order unless verification proved AX wrong.
+//  • d18 (canvas grounder; same flag cluster + explicit endpoint config): an
+//    OPTIONAL second visual grounder — self-hosted UI-Venus-1.5 via the narrow
+//    vLLM/SGLang contract in docs/research/AX_FIRST_GROUNDING_PLAN.md — owns
+//    exactly the visual calls whose target names a canvas concept (the same
+//    pure predicate the d15 router audits as `canvas_concept`). UI-TARS stays
+//    the BASELINE for every other visual call, and a nil canvas grounder (the
+//    shipped default — no self-host endpoint configured, and NEVER assumed to
+//    exist on OpenRouter) keeps every call on `base`, byte-identical.
 // Toggle off with `cascade.mixtureGrounding = false` to A/B against pure visual.
 // See [[cascade-cu-downgrade-research]].
 
@@ -199,10 +207,15 @@ public struct MixtureGrounder: VisualGrounder {
     public struct RouteOutcome: Equatable, Sendable {
         public let decision: GroundingRouter.Decision
         public let targetHash: String?
+        /// d18: true when a configured canvas grounder (self-hosted UI-Venus)
+        /// will own this request's visual call instead of the baseline —
+        /// audit-observable so a live run proves WHICH grounder answered.
+        public let canvasGrounderOwns: Bool
 
-        public init(decision: GroundingRouter.Decision, targetHash: String?) {
+        public init(decision: GroundingRouter.Decision, targetHash: String?, canvasGrounderOwns: Bool = false) {
             self.decision = decision
             self.targetHash = targetHash
+            self.canvasGrounderOwns = canvasGrounderOwns
         }
     }
 
@@ -236,6 +249,12 @@ public struct MixtureGrounder: VisualGrounder {
     }
 
     private let base: any VisualGrounder
+    /// d18 (default nil — byte-identical to shipped): the OPTIONAL canvas
+    /// specialist (self-hosted UI-Venus-1.5 built by
+    /// `GrounderRegistry.makeCanvasGrounder`). When set, it owns exactly the
+    /// visual calls whose target names a canvas concept; `base` (UI-TARS)
+    /// remains the baseline for everything else.
+    private let canvasGrounder: (any VisualGrounder)?
     private let skills: AppSkillRegistry
     /// Minimum AX label-match score to TRUST a structural hit: 2 = one string
     /// contains the other (e.g. "the Save button" ⊇ "Save"); 3 = exact. Below
@@ -289,6 +308,7 @@ public struct MixtureGrounder: VisualGrounder {
 
     public init(
         base: any VisualGrounder,
+        canvasGrounder: (any VisualGrounder)? = nil,
         skills: AppSkillRegistry,
         minAXScore: Double = 2,
         verifyCandidates: Bool = false,
@@ -308,6 +328,7 @@ public struct MixtureGrounder: VisualGrounder {
         onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
         self.base = base
+        self.canvasGrounder = canvasGrounder
         self.skills = skills
         self.minAXScore = minAXScore
         self.verifyCandidates = verifyCandidates
@@ -323,6 +344,19 @@ public struct MixtureGrounder: VisualGrounder {
         self.onRuntimeProfile = onRuntimeProfile
         self.onRouteDecision = onRouteDecision
         self.onVerifierOutcome = onVerifierOutcome
+    }
+
+    /// d18: the visual grounder that owns THIS request. A configured canvas
+    /// grounder takes the call exactly when the target names a canvas concept —
+    /// the SAME pure predicate the d15 router audits as `canvas_concept`, so
+    /// routing and grounder selection cannot drift apart. Everything else
+    /// (including the shipped default, canvasGrounder == nil) stays on `base`.
+    /// Applies to point/region grounding only; the Set-of-Marks call
+    /// (`groundMarkedCandidate`) stays on `base` — the narrow canvas contract
+    /// is crop+query → point, not marked-overlay picking.
+    func visualBase(for target: String) -> any VisualGrounder {
+        guard let canvasGrounder, GroundingRouter.namesCanvasConcept(target) else { return base }
+        return canvasGrounder
     }
 
     public func ground(
@@ -359,7 +393,7 @@ public struct MixtureGrounder: VisualGrounder {
                 ), let refinedPoint = refined.selectedPoint {
                     return refinedPoint
                 }
-                return await base.ground(
+                return await visualBase(for: target).ground(
                     screenshot: screenshot, target: target,
                     displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
                 )
@@ -441,7 +475,7 @@ public struct MixtureGrounder: VisualGrounder {
                         displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
                     )
                 }
-                let result = await base.groundResult(
+                let result = await visualBase(for: target).groundResult(
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
@@ -539,7 +573,7 @@ public struct MixtureGrounder: VisualGrounder {
             )
             let baseResult: GroundingResult
             if ambiguityOptions.sampleCount > options.sampleCount {
-                let visualResult = await base.groundResult(
+                let visualResult = await visualBase(for: target).groundResult(
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
@@ -563,7 +597,7 @@ public struct MixtureGrounder: VisualGrounder {
                 // full-screen (a second, different look).
                 baseResult = refined
             } else {
-                baseResult = await base.groundResult(
+                baseResult = await visualBase(for: target).groundResult(
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
@@ -589,7 +623,7 @@ public struct MixtureGrounder: VisualGrounder {
                selection.verifierResult.failureKind != .noCandidates,
                ambiguityOptions.sampleCount == options.sampleCount,
                options.sampleCount < 3 {
-                let visualResult = await base.groundResult(
+                let visualResult = await visualBase(for: target).groundResult(
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
@@ -741,7 +775,7 @@ public struct MixtureGrounder: VisualGrounder {
                 return synthesizedRefined
             }
             let result = synthesized(
-                await base.groundResult(
+                await visualBase(for: target).groundResult(
                     screenshot: screenshot,
                     target: target,
                     displayWidthPoints: displayWidthPoints,
@@ -798,7 +832,7 @@ public struct MixtureGrounder: VisualGrounder {
                 )
             } else {
                 result = synthesized(
-                    await base.groundResult(
+                    await visualBase(for: target).groundResult(
                         screenshot: screenshot,
                         target: target,
                         displayWidthPoints: displayWidthPoints,
@@ -857,7 +891,7 @@ public struct MixtureGrounder: VisualGrounder {
                   displayHeightPoints: displayHeightPoints
               )
         else { return nil }
-        let cropResult = await base.groundResult(
+        let cropResult = await visualBase(for: target).groundResult(
             screenshot: plan.croppedJPEG,
             target: target,
             displayWidthPoints: plan.cropWidthPoints,
@@ -1107,7 +1141,14 @@ public struct MixtureGrounder: VisualGrounder {
     /// `onRuntimeProfile` is surfaced. Hashes only — never the target text.
     private func emitRouteDecision(_ decision: GroundingRouter.Decision, target: String) {
         guard let onRouteDecision else { return }
-        let outcome = RouteOutcome(decision: decision, targetHash: Self.auditHash(target))
+        let outcome = RouteOutcome(
+            decision: decision,
+            targetHash: Self.auditHash(target),
+            // d18: record whether the configured canvas grounder will own the
+            // visual call this decision routed to — same predicate as
+            // `visualBase(for:)`, so the audit row proves which grounder ran.
+            canvasGrounderOwns: canvasGrounder != nil && GroundingRouter.namesCanvasConcept(target)
+        )
         Task { await onRouteDecision(outcome) }
     }
 
@@ -1168,7 +1209,7 @@ public struct MixtureGrounder: VisualGrounder {
                 return region
             }
         }
-        return await base.groundRegion(
+        return await visualBase(for: target).groundRegion(
             screenshot: screenshot, target: target,
             displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
         )
