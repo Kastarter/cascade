@@ -8497,7 +8497,12 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private static func uiState() async -> UIStateSnapshot? {
-        AXElementResolver.frontmostState(limit: 600, depth: 10)
+        // Off-main by design: AXUIElement calls are IPC (no TIS-style main-thread
+        // assert) and a hung frontmost app would otherwise block the main actor —
+        // and STOP — for up to 5 polls × 600 nodes × 0.3s AX timeouts.
+        await Task.detached(priority: .userInitiated) {
+            AXElementResolver.frontmostState(limit: 600, depth: 10)
+        }.value
     }
 
     /// Polls for a meaningful AX delta. Missing AX remains a skip-open condition:
