@@ -1031,7 +1031,11 @@ public final class ComputerUseAgent {
         ) else {
             return CUStep(actions: [], text: "", done: true, failed: true)
         }
-        await preflightBudget(bodyData: bodyData, maxOutputTokens: 2048)
+        // Fire-and-forget: the count_tokens preflight is pure cost/budget telemetry
+        // (skipped on failure). Detaching it lets its network round-trip OVERLAP the
+        // model request — both await concurrently on the main actor — instead of
+        // serializing ~0.5–1s of latency ahead of EVERY turn. Zero behavior change.
+        Task { [weak self] in await self?.preflightBudget(bodyData: bodyData, maxOutputTokens: 2048) }
         var request = AnthropicMessagesClient.request(
             url: endpoint,
             key: key,

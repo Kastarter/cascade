@@ -2791,9 +2791,11 @@ public final class CascadeAppModel: ObservableObject {
             groundingCache: groundingCache,
             groundingCacheKeyProvider: Self.assistGroundingCacheKeyProvider(),
             actionCritic: assistActionCritic(),
-            historyCompactionEnabled: defaultsStore.bool(forKey: Self.experimentalHistoryCompactionKey),
+            // Default-ON (opt-out) — turn reduction + smaller cached prefix cut the
+            // dominant per-turn model latency. `defaults write … -bool false` to disable.
+            historyCompactionEnabled: (defaultsStore.object(forKey: Self.experimentalHistoryCompactionKey) as? Bool) ?? true,
             historyCompactionRecentTurns: Self.experimentalHistoryCompactionTurns(defaults: defaultsStore),
-            actionChunkingEnabled: defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
+            actionChunkingEnabled: (defaultsStore.object(forKey: Self.experimentalActionChunkingKey) as? Bool) ?? true
         )
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
@@ -3489,7 +3491,7 @@ public final class CascadeAppModel: ObservableObject {
         let cuModel = AnthropicModel.opus
         let sourcePlan = routeHint ?? Self.routeIntentHeuristic(goal)
         let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.routeNeedsSourceEvidence(sourcePlan)
-        let actionChunkingEnabled = defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
+        let actionChunkingEnabled = (defaultsStore.object(forKey: Self.experimentalActionChunkingKey) as? Bool) ?? true
         let actionCacheLookup = await actionTrajectoryCachePreflight(
             goal: goal,
             firstScreenshotPNG: firstScreenshotPNG

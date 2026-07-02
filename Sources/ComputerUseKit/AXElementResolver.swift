@@ -826,7 +826,16 @@ public enum AXElementResolver {
     }
 
     static func normalize(_ text: String) -> String {
+        // Tolerate the common variations between how a control is NAMED (by the user or
+        // model) and how the app EXPOSES its AX label — so more LABELED controls resolve
+        // via exact AX (perfect + fast) instead of falling to the approximate visual
+        // grounder. "&" ↔ "and"; separators (dashes/slashes/underscores) become spaces
+        // ("Privacy & Security" ↔ "Privacy and Security", "Wi-Fi" ↔ "wi fi"). Does NOT
+        // lower the score threshold or touch role/canvas/sparse gates — purely widens
+        // text matching, so it can only add matches, never accept a lower-confidence one.
         text.lowercased()
+            .replacingOccurrences(of: "&", with: " and ")
+            .replacingOccurrences(of: #"[\p{Pd}/_]"#, with: " ", options: .regularExpression)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
