@@ -13,6 +13,7 @@ public struct AXRuntimeProfile: Equatable, Sendable {
     public let identifierCount: Int
     public let frameFailureCount: Int
     public let timeoutOrErrorCount: Int
+    public let axErrorSummary: AXElementResolver.AXErrorSummary
     public let canvasSizedElementRatio: Double
     public let manualAccessibilityAttempted: Bool
 
@@ -25,6 +26,7 @@ public struct AXRuntimeProfile: Equatable, Sendable {
         identifierCount: Int,
         frameFailureCount: Int,
         timeoutOrErrorCount: Int,
+        axErrorSummary: AXElementResolver.AXErrorSummary = .empty,
         canvasSizedElementRatio: Double,
         manualAccessibilityAttempted: Bool = false
     ) {
@@ -36,6 +38,7 @@ public struct AXRuntimeProfile: Equatable, Sendable {
         self.identifierCount = identifierCount
         self.frameFailureCount = frameFailureCount
         self.timeoutOrErrorCount = timeoutOrErrorCount
+        self.axErrorSummary = axErrorSummary
         self.canvasSizedElementRatio = canvasSizedElementRatio.isFinite ? max(0, min(1, canvasSizedElementRatio)) : 0
         self.manualAccessibilityAttempted = manualAccessibilityAttempted
     }
@@ -85,9 +88,21 @@ public struct AXRuntimeProfile: Equatable, Sendable {
             "identifiers=\(identifierCount)",
             "frameFailures=\(frameFailureCount)",
             "errors=\(timeoutOrErrorCount)",
+            axErrorSummary.safeAuditDetail,
             "canvasRatio=\(String(format: "%.2f", canvasSizedElementRatio))",
             "manualAccessibility=\(manualAccessibilityAttempted ? "true" : "false")",
             "sparse=\(isSparse ? "true" : "false")",
+        ].joined(separator: " ")
+    }
+
+    public var safeAXErrorAuditDetail: String? {
+        guard axErrorSummary.totalCount > 0 else { return nil }
+        return [
+            "bundleHash=\(AuditIdentity.hash(bundleIdentifier))",
+            "appHash=\(AuditIdentity.hash(appName))",
+            "nodes=\(sampledNodeCount)",
+            "actionable=\(actionableRoleCount)",
+            axErrorSummary.safeAuditDetail,
         ].joined(separator: " ")
     }
 }
@@ -100,6 +115,140 @@ public struct AXRuntimeProfile: Equatable, Sendable {
 // acting, verify the UI actually changed via an AX fingerprint instead of
 // trusting a fixed sleep. See docs/THIRD_PARTY_NOTICES.md.
 public enum AXElementResolver {
+    public enum AXErrorKind: String, Codable, Sendable, Equatable, CaseIterable {
+        case timeout
+        case unsupportedAttribute = "unsupported-attr"
+        case staleNode = "stale-node"
+        case permissionDenied = "permission-denied"
+    }
+
+    public struct AXErrorSummary: Sendable, Equatable {
+        public private(set) var timeoutCount: Int
+        public private(set) var unsupportedAttributeCount: Int
+        public private(set) var staleNodeCount: Int
+        public private(set) var permissionDeniedCount: Int
+
+        public init(
+            timeoutCount: Int = 0,
+            unsupportedAttributeCount: Int = 0,
+            staleNodeCount: Int = 0,
+            permissionDeniedCount: Int = 0
+        ) {
+            self.timeoutCount = max(0, timeoutCount)
+            self.unsupportedAttributeCount = max(0, unsupportedAttributeCount)
+            self.staleNodeCount = max(0, staleNodeCount)
+            self.permissionDeniedCount = max(0, permissionDeniedCount)
+        }
+
+        public static let empty = AXErrorSummary()
+
+        public var totalCount: Int {
+            timeoutCount + unsupportedAttributeCount + staleNodeCount + permissionDeniedCount
+        }
+
+        public var safeAuditDetail: String {
+            [
+                "axTimeouts=\(timeoutCount)",
+                "axUnsupportedAttrs=\(unsupportedAttributeCount)",
+                "axStaleNodes=\(staleNodeCount)",
+                "axPermissionDenied=\(permissionDeniedCount)",
+            ].joined(separator: " ")
+        }
+
+        public mutating func record(_ kind: AXErrorKind) {
+            switch kind {
+            case .timeout:
+                timeoutCount += 1
+            case .unsupportedAttribute:
+                unsupportedAttributeCount += 1
+            case .staleNode:
+                staleNodeCount += 1
+            case .permissionDenied:
+                permissionDeniedCount += 1
+            }
+        }
+
+        mutating func record(_ error: AXReadError) {
+            record(AXElementResolver.errorKind(for: error))
+        }
+    }
+
+    public struct AXDiagnostics: Sendable, Equatable {
+        public let visitedNodeCount: Int
+        public let candidateCount: Int
+        public let errorSummary: AXErrorSummary
+
+        public init(
+            visitedNodeCount: Int = 0,
+            candidateCount: Int = 0,
+            errorSummary: AXErrorSummary = .empty
+        ) {
+            self.visitedNodeCount = max(0, visitedNodeCount)
+            self.candidateCount = max(0, candidateCount)
+            self.errorSummary = errorSummary
+        }
+
+        public var safeAuditDetail: String {
+            [
+                "visited=\(visitedNodeCount)",
+                "candidates=\(candidateCount)",
+                errorSummary.safeAuditDetail,
+            ].joined(separator: " ")
+        }
+    }
+
+    public struct CandidateHarvest: Sendable, Equatable {
+        public let candidates: [Candidate]
+        public let diagnostics: AXDiagnostics
+
+        public init(candidates: [Candidate], diagnostics: AXDiagnostics) {
+            self.candidates = candidates
+            self.diagnostics = diagnostics
+        }
+    }
+
+    public struct InteractableHarvest: Sendable {
+        public let matches: [Match]
+        public let diagnostics: AXDiagnostics
+
+        public init(matches: [Match], diagnostics: AXDiagnostics) {
+            self.matches = matches
+            self.diagnostics = diagnostics
+        }
+    }
+
+    public static func errorKind(for error: AXReadError) -> AXErrorKind {
+        switch error {
+        case .copyFailed(_, let axError), .actionFailed(_, let axError):
+            return errorKind(for: axError)
+        case .missingValue, .typeMismatch:
+            return .unsupportedAttribute
+        case .invalidFrame:
+            return .staleNode
+        }
+    }
+
+    public static func errorKind(for error: AXError) -> AXErrorKind {
+        switch error {
+        case .cannotComplete:
+            return .timeout
+        case .attributeUnsupported, .actionUnsupported, .notificationUnsupported, .notImplemented, .noValue:
+            return .unsupportedAttribute
+        case .invalidUIElement, .invalidUIElementObserver, .illegalArgument:
+            return .staleNode
+        case .apiDisabled:
+            return .permissionDenied
+        default:
+            return .staleNode
+        }
+    }
+
+    public static func axErrorSummary(for error: AXError) -> AXErrorSummary {
+        var summary = AXErrorSummary()
+        summary.record(errorKind(for: error))
+        return summary
+    }
+
     public struct Match: Sendable {
         /// Element center in CGEvent global coordinates (top-left origin).
         public let id: String?
@@ -362,11 +511,23 @@ public enum AXElementResolver {
     /// Reuses the same bounded walk as `find` (≤1400 nodes, 0.3s timeout), so it
     /// can't run away on a huge tree.
     public static func interactables(limit: Int = 40) -> [Match] {
-        guard AXIsProcessTrusted(),
-              NSWorkspace.shared.frontmostApplication != nil else { return [] }
+        interactablesWithDiagnostics(limit: limit).matches
+    }
+
+    public static func interactablesWithDiagnostics(limit: Int = 40) -> InteractableHarvest {
+        guard AXIsProcessTrusted() else {
+            return InteractableHarvest(
+                matches: [],
+                diagnostics: AXDiagnostics(errorSummary: AXErrorSummary(permissionDeniedCount: 1))
+            )
+        }
+        guard NSWorkspace.shared.frontmostApplication != nil else {
+            return InteractableHarvest(matches: [], diagnostics: AXDiagnostics())
+        }
         var seen = Set<String>()
         var out: [Match] = []
-        for candidate in liveCandidates().prefix(limit * 3) {
+        let harvest = liveCandidatesWithDiagnostics()
+        for candidate in harvest.candidates.prefix(limit * 3) {
             let descriptor = candidate.descriptor
             let role = descriptor.role ?? ""
             guard out.count < limit,
@@ -387,12 +548,32 @@ public enum AXElementResolver {
                 actionableNode: candidate.actionableNode
             ))
         }
-        return out
+        return InteractableHarvest(
+            matches: out,
+            diagnostics: AXDiagnostics(
+                visitedNodeCount: harvest.diagnostics.visitedNodeCount,
+                candidateCount: out.count,
+                errorSummary: harvest.diagnostics.errorSummary
+            )
+        )
     }
 
     public static func runtimeProfileForFrontmost(limit: Int = 600, retryManualAccessibility: Bool = true) -> AXRuntimeProfile? {
-        guard AXIsProcessTrusted(),
-              let frontmost = NSWorkspace.shared.frontmostApplication else { return nil }
+        guard let frontmost = NSWorkspace.shared.frontmostApplication else { return nil }
+        guard AXIsProcessTrusted() else {
+            return AXRuntimeProfile(
+                bundleIdentifier: frontmost.bundleIdentifier,
+                appName: frontmost.localizedName,
+                sampledNodeCount: 0,
+                actionableRoleCount: 0,
+                labeledActionableCount: 0,
+                identifierCount: 0,
+                frameFailureCount: 0,
+                timeoutOrErrorCount: 1,
+                axErrorSummary: AXErrorSummary(permissionDeniedCount: 1),
+                canvasSizedElementRatio: 0
+            )
+        }
         let app = AXUIElementCreateApplication(frontmost.processIdentifier)
         AXClient.setMessagingTimeout(app)
         let first = runtimeProfile(
@@ -911,24 +1092,51 @@ public enum AXElementResolver {
     // MARK: - AX plumbing
 
     private static func windows(of app: AXUIElement) -> [AXUIElement] {
-        guard case .success(let windows) = AXClient.attribute(app, kAXWindowsAttribute as String, as: [AXUIElement].self) else {
+        var errors = AXErrorSummary()
+        return windows(of: app, errors: &errors)
+    }
+
+    private static func windows(of app: AXUIElement, errors: inout AXErrorSummary) -> [AXUIElement] {
+        switch AXClient.attribute(app, kAXWindowsAttribute as String, as: [AXUIElement].self) {
+        case .success(let windows):
+            return windows
+        case .failure(let error):
+            errors.record(error)
             return []
         }
-        return windows
     }
 
     public static func liveCandidates(limit: Int = 1_400) -> [Candidate] {
-        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
+        liveCandidatesWithDiagnostics(limit: limit).candidates
+    }
+
+    public static func liveCandidatesWithDiagnostics(limit: Int = 1_400) -> CandidateHarvest {
+        guard AXIsProcessTrusted() else {
+            return CandidateHarvest(
+                candidates: [],
+                diagnostics: AXDiagnostics(errorSummary: AXErrorSummary(permissionDeniedCount: 1))
+            )
+        }
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+            return CandidateHarvest(candidates: [], diagnostics: AXDiagnostics())
+        }
         let app = AXUIElementCreateApplication(pid)
         AXClient.setMessagingTimeout(app)
         var candidates: [Candidate] = []
         var visited = 0
-        for window in windows(of: app) {
-            walk(window, depth: 0, limit: limit, visited: &visited) { element, role in
-                guard pointableRoles.contains(role),
-                      let frame = frame(of: element),
-                      frame.width > 1,
-                      frame.height > 1 else { return }
+        var errors = AXErrorSummary()
+        for window in windows(of: app, errors: &errors) {
+            walk(window, depth: 0, limit: limit, visited: &visited, errors: &errors) { element, role, errors in
+                guard pointableRoles.contains(role) else { return }
+                let frame: CGRect
+                switch frameResult(of: element) {
+                case .success(let rect):
+                    guard rect.width > 1, rect.height > 1 else { return }
+                    frame = rect
+                case .failure(let error):
+                    errors.record(error)
+                    return
+                }
                 let text = labelText(of: element) ?? ""
                 let descriptor = AXTargetDescriptorBuilder.descriptor(for: element, fallbackLabel: text)
                 let node = actionableNode(for: element, role: role, descriptor: descriptor, frame: frame)
@@ -943,7 +1151,14 @@ public enum AXElementResolver {
             }
             guard visited < limit else { break }
         }
-        return candidates
+        return CandidateHarvest(
+            candidates: candidates,
+            diagnostics: AXDiagnostics(
+                visitedNodeCount: visited,
+                candidateCount: candidates.count,
+                errorSummary: errors
+            )
+        )
     }
 
     static func stableNodeID(
@@ -1012,14 +1227,31 @@ public enum AXElementResolver {
         _ element: AXUIElement, depth: Int, limit: Int = maxNodes,
         visited: inout Int, visit: (AXUIElement, String) -> Void
     ) {
+        var errors = AXErrorSummary()
+        walk(element, depth: depth, limit: limit, visited: &visited, errors: &errors) { element, role, _ in
+            visit(element, role)
+        }
+    }
+
+    private static func walk(
+        _ element: AXUIElement, depth: Int, limit: Int = maxNodes,
+        visited: inout Int, errors: inout AXErrorSummary, visit: (AXUIElement, String, inout AXErrorSummary) -> Void
+    ) {
         guard depth <= maxDepth, visited < limit else { return }
         visited += 1
         let role = string(of: element, kAXRoleAttribute) ?? ""
-        visit(element, role)
-        guard case .success(let children) = AXClient.children(element) else { return }
+        visit(element, role, &errors)
+        let children: [AXUIElement]
+        switch AXClient.children(element) {
+        case .success(let value):
+            children = value
+        case .failure(let error):
+            errors.record(error)
+            return
+        }
         for child in children {
             guard visited < limit else { return }
-            walk(child, depth: depth + 1, limit: limit, visited: &visited, visit: visit)
+            walk(child, depth: depth + 1, limit: limit, visited: &visited, errors: &errors, visit: visit)
         }
     }
 
@@ -1076,8 +1308,11 @@ public enum AXElementResolver {
 
     /// Element frame in CG global (top-left) coordinates.
     private static func frame(of element: AXUIElement) -> CGRect? {
-        guard case .success(let frame) = AXClient.frame(element) else { return nil }
-        return frame
+        try? frameResult(of: element).get()
+    }
+
+    private static func frameResult(of element: AXUIElement) -> Result<CGRect, AXReadError> {
+        AXClient.frame(element)
     }
 
     private static func frameString(_ frame: CGRect) -> String {
@@ -1122,6 +1357,7 @@ public enum AXElementResolver {
         var identifiers = 0
         var frameFailures = 0
         var errors = 0
+        var errorSummary = AXErrorSummary()
         var canvasSized = 0
 
         func sample(_ element: AXUIElement, depth: Int) {
@@ -1137,8 +1373,9 @@ public enum AXElementResolver {
                 if displayArea > 0, rect.width * rect.height / displayArea >= 0.35 {
                     canvasSized += 1
                 }
-            case .failure:
+            case .failure(let error):
                 frameFailures += 1
+                errorSummary.record(error)
             }
             guard depth < maxDepth, sampled < limit else { return }
             switch AXClient.children(element) {
@@ -1147,12 +1384,13 @@ public enum AXElementResolver {
                     guard sampled < limit else { return }
                     sample(child, depth: depth + 1)
                 }
-            case .failure:
+            case .failure(let error):
                 errors += 1
+                errorSummary.record(error)
             }
         }
 
-        let roots = windows(of: app)
+        let roots = windows(of: app, errors: &errorSummary)
         if roots.isEmpty {
             sample(app, depth: 0)
         } else {
@@ -1171,6 +1409,7 @@ public enum AXElementResolver {
             identifierCount: identifiers,
             frameFailureCount: frameFailures,
             timeoutOrErrorCount: errors,
+            axErrorSummary: errorSummary,
             canvasSizedElementRatio: ratio,
             manualAccessibilityAttempted: manualAccessibilityAttempted
         )

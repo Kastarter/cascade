@@ -1,6 +1,7 @@
 import ApplicationServices
 import CascadeMemory
 import Foundation
+import MacContextKit
 import Testing
 
 @testable import ComputerUseKit
@@ -49,6 +50,34 @@ struct AXElementResolverTests {
         #expect(AXElementResolver.decodeAXSize(value) == size)
         #expect(AXElementResolver.decodeAXSize("not an AXValue" as CFString) == nil)
         #expect(AXElementResolver.decodeAXSize(NSNumber(value: 7)) == nil)
+    }
+
+    @Test func axErrorsMapToGroundingTaxonomy() {
+        #expect(AXElementResolver.errorKind(for: AXError.cannotComplete) == .timeout)
+        #expect(AXElementResolver.errorKind(for: AXError.attributeUnsupported) == .unsupportedAttribute)
+        #expect(AXElementResolver.errorKind(for: AXError.actionUnsupported) == .unsupportedAttribute)
+        #expect(AXElementResolver.errorKind(for: AXError.invalidUIElement) == .staleNode)
+        #expect(AXElementResolver.errorKind(for: AXError.apiDisabled) == .permissionDenied)
+    }
+
+    @Test func axReadErrorsMapToGroundingTaxonomy() {
+        #expect(AXElementResolver.errorKind(for: AXReadError.copyFailed(attribute: "AXChildren", error: .cannotComplete)) == .timeout)
+        #expect(AXElementResolver.errorKind(for: AXReadError.missingValue(attribute: "AXTitle")) == .unsupportedAttribute)
+        #expect(AXElementResolver.errorKind(for: AXReadError.typeMismatch(attribute: "AXRole", expected: "String", actual: "Number")) == .unsupportedAttribute)
+        #expect(AXElementResolver.errorKind(for: AXReadError.invalidFrame(attribute: "AXFrame", rect: .zero)) == .staleNode)
+        #expect(AXElementResolver.errorKind(for: AXReadError.copyFailed(attribute: "AXWindows", error: .apiDisabled)) == .permissionDenied)
+    }
+
+    @Test func axErrorSummaryAuditDetailUsesOnlyCounts() {
+        var summary = AXElementResolver.AXErrorSummary()
+        summary.record(.timeout)
+        summary.record(.unsupportedAttribute)
+        summary.record(.unsupportedAttribute)
+        summary.record(.staleNode)
+        summary.record(.permissionDenied)
+
+        #expect(summary.totalCount == 5)
+        #expect(summary.safeAuditDetail == "axTimeouts=1 axUnsupportedAttrs=2 axStaleNodes=1 axPermissionDenied=1")
     }
 
     // MARK: - B1 ranked locator: rank(recorded:candidate:)
@@ -299,13 +328,24 @@ struct AXElementResolverTests {
             identifierCount: 0,
             frameFailureCount: 9,
             timeoutOrErrorCount: 0,
+            axErrorSummary: AXElementResolver.AXErrorSummary(
+                timeoutCount: 1,
+                unsupportedAttributeCount: 2,
+                staleNodeCount: 3,
+                permissionDeniedCount: 4
+            ),
             canvasSizedElementRatio: 0.50,
             manualAccessibilityAttempted: true
         )
 
         #expect(profile.safeAuditDetail.contains("sparse=true"))
         #expect(profile.safeAuditDetail.contains("manualAccessibility=true"))
+        #expect(profile.safeAuditDetail.contains("axTimeouts=1"))
+        #expect(profile.safeAuditDetail.contains("axUnsupportedAttrs=2"))
+        #expect(profile.safeAXErrorAuditDetail?.contains("axPermissionDenied=4") == true)
         #expect(!profile.safeAuditDetail.contains("Secret App"))
         #expect(!profile.safeAuditDetail.contains("com.secret.App"))
+        #expect(profile.safeAXErrorAuditDetail?.contains("Secret App") == false)
+        #expect(profile.safeAXErrorAuditDetail?.contains("com.secret.App") == false)
     }
 }

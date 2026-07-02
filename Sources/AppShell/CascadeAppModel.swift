@@ -3031,6 +3031,13 @@ public final class CascadeAppModel: ObservableObject {
                     action: "grounding.ax_profile",
                     detail: profile.safeAuditDetail
                 ))
+                if let detail = profile.safeAXErrorAuditDetail {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "grounding.ax_error",
+                        detail: detail
+                    ))
+                }
             },
             onVerifierOutcome: { [weak self, store = self.store] outcome in
                 _ = try? await store.appendAudit(AuditEvent(
@@ -3109,6 +3116,13 @@ public final class CascadeAppModel: ObservableObject {
                     action: "grounding.ax_profile",
                     detail: profile.safeAuditDetail
                 ))
+                if let detail = profile.safeAXErrorAuditDetail {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "grounding.ax_error",
+                        detail: detail
+                    ))
+                }
             }
         )
         return await narrower.narrow(
@@ -3405,7 +3419,9 @@ public final class CascadeAppModel: ObservableObject {
             // planner EVERY turn — not only on a failure — so it names targets that
             // exist and the grounder (AX-first, then visual) hits them. Bounded AX
             // walk (≤24, ≤0.3s); empty on canvas/Electron apps that expose nothing.
-            let controls = AXElementResolver.interactables(limit: 24)
+            let controlHarvest = AXElementResolver.interactablesWithDiagnostics(limit: 24)
+            await auditAXDiagnosticsIfNeeded(controlHarvest.diagnostics)
+            let controls = controlHarvest.matches
             let controlSummary = AXElementResolver.interactableSummary(controls)
             // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
             // a partially-grounded batch (where step.actions is non-empty so the idle
@@ -3888,7 +3904,9 @@ public final class CascadeAppModel: ObservableObject {
                 ))
             }
             if let missed = agent.lastGroundMiss {
-                let controls = AXElementResolver.interactables(limit: 24)
+                let controlHarvest = AXElementResolver.interactablesWithDiagnostics(limit: 24)
+                await auditAXDiagnosticsIfNeeded(controlHarvest.diagnostics)
+                let controls = controlHarvest.matches
                 let summary = AXElementResolver.interactableSummary(controls)
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
@@ -3998,7 +4016,9 @@ public final class CascadeAppModel: ObservableObject {
                     // grounding>reasoning finding): hand the model the controls that
                     // ARE actually on screen so it re-grounds on real elements
                     // instead of re-guessing the same dead pixel.
-                    let controls = AXElementResolver.interactables()
+                    let controlHarvest = AXElementResolver.interactablesWithDiagnostics()
+                    await auditAXDiagnosticsIfNeeded(controlHarvest.diagnostics)
+                    let controls = controlHarvest.matches
                     if structuralGrounding {
                         // Structural mode names targets — pushing coordinates would be
                         // useless (it can't emit them). Push the control LABELS and
@@ -5078,6 +5098,21 @@ public final class CascadeAppModel: ObservableObject {
     /// turn (`scoutContextNote`) and each subsequent turn so the listing is identical.
     private func scoutControlsLine(_ summary: String?) -> String? {
         summary.map { "Controls on screen now (name one of these to click or fill, or open a menu/panel to reveal others): \($0)" }
+    }
+
+    private func auditAXDiagnosticsIfNeeded(_ diagnostics: AXElementResolver.AXDiagnostics) async {
+        guard diagnostics.errorSummary.totalCount > 0 else { return }
+        let snapshot = AppWindowObserver.snapshot()
+        let detail = [
+            "bundleHash=\(Self.auditHash(snapshot.bundleIdentifier))",
+            "appHash=\(Self.auditHash(snapshot.appName))",
+            diagnostics.safeAuditDetail,
+        ].joined(separator: " ")
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "grounding.ax_error",
+            detail: detail
+        ))
     }
 
     /// The first turn's pushed context for Scout: frontmost app/window + the controls
@@ -6607,6 +6642,7 @@ public final class CascadeAppModel: ObservableObject {
         let actionCount: Int
         let frame: CGRect?
         let fallbackReason: String?
+        let axErrorKind: AXElementResolver.AXErrorKind?
 
         func auditDetail(kind: String, point: CGPoint) -> String {
             CascadeAppModel.axActionAuditDetail(
@@ -6619,7 +6655,8 @@ public final class CascadeAppModel: ObservableObject {
                 subrole: subrole,
                 actionCount: actionCount,
                 frame: frame,
-                fallbackReason: fallbackReason
+                fallbackReason: fallbackReason,
+                axErrorKind: axErrorKind
             )
         }
     }
@@ -6634,7 +6671,8 @@ public final class CascadeAppModel: ObservableObject {
         subrole: String? = nil,
         actionCount: Int = 0,
         frame: CGRect? = nil,
-        fallbackReason: String? = nil
+        fallbackReason: String? = nil,
+        axErrorKind: AXElementResolver.AXErrorKind? = nil
     ) -> String {
         var parts = [
             "kind=\(safeAuditToken(kind))",
@@ -6659,6 +6697,9 @@ public final class CascadeAppModel: ObservableObject {
         }
         if let fallbackReason {
             parts.append("fallbackReason=\(safeAuditToken(fallbackReason))")
+        }
+        if let axErrorKind {
+            parts.append("axErrorKind=\(safeAuditToken(axErrorKind.rawValue))")
         }
         return parts.joined(separator: " ")
     }
@@ -6689,7 +6730,11 @@ public final class CascadeAppModel: ObservableObject {
     /// unlabeled child inside the actual control. A failed result means the caller
     /// should run the legacy coordinate click.
     private static func axSemanticActivate(atCG point: CGPoint, showMenu: Bool = false) -> AXSemanticActivationResult {
-        guard case .success(let hitElement) = AXClient.elementAtPosition(point) else {
+        let hitElement: AXUIElement
+        switch AXClient.elementAtPosition(point) {
+        case .success(let element):
+            hitElement = element
+        case .failure(let error):
             return AXSemanticActivationResult(
                 succeeded: false,
                 path: "coordinate",
@@ -6699,7 +6744,8 @@ public final class CascadeAppModel: ObservableObject {
                 subrole: nil,
                 actionCount: 0,
                 frame: nil,
-                fallbackReason: "element_at_position_failed"
+                fallbackReason: "element_at_position_failed",
+                axErrorKind: AXElementResolver.errorKind(for: error)
             )
         }
 
@@ -6709,8 +6755,9 @@ public final class CascadeAppModel: ObservableObject {
         var lastActions: [String] = []
         var lastFrame: CGRect?
         var failedAction: String?
+        var lastErrorKind: AXElementResolver.AXErrorKind?
 
-        for _ in 0..<5 {
+        ancestorWalk: for _ in 0..<5 {
             let summary = axElementSummary(element)
             lastRole = summary.role
             lastSubrole = summary.subrole
@@ -6728,10 +6775,12 @@ public final class CascadeAppModel: ObservableObject {
                         subrole: summary.subrole,
                         actionCount: summary.actions.count,
                         frame: summary.frame,
-                        fallbackReason: "coordinate_places_caret"
+                        fallbackReason: "coordinate_places_caret",
+                        axErrorKind: nil
                     )
                 }
-                if AXClient.setAttribute(element, kAXFocusedAttribute as String, value: kCFBooleanTrue) == .success {
+                let focusError = AXClient.setAttribute(element, kAXFocusedAttribute as String, value: kCFBooleanTrue)
+                if focusError == .success {
                     return AXSemanticActivationResult(
                         succeeded: true,
                         path: "ax_semantic",
@@ -6741,8 +6790,11 @@ public final class CascadeAppModel: ObservableObject {
                         subrole: summary.subrole,
                         actionCount: summary.actions.count,
                         frame: summary.frame,
-                        fallbackReason: nil
+                        fallbackReason: nil,
+                        axErrorKind: nil
                     )
+                } else {
+                    lastErrorKind = AXElementResolver.errorKind(for: focusError)
                 }
             }
 
@@ -6751,7 +6803,8 @@ public final class CascadeAppModel: ObservableObject {
                 : [kAXPressAction, kAXConfirmAction, kAXPickAction]
             for action in wanted where summary.actions.contains(action) {
                 failedAction = action
-                if AXClient.performAction(element, action) == .success {
+                let actionError = AXClient.performAction(element, action)
+                if actionError == .success {
                     return AXSemanticActivationResult(
                         succeeded: true,
                         path: "ax_semantic",
@@ -6761,14 +6814,18 @@ public final class CascadeAppModel: ObservableObject {
                         subrole: summary.subrole,
                         actionCount: summary.actions.count,
                         frame: summary.frame,
-                        fallbackReason: nil
+                        fallbackReason: nil,
+                        axErrorKind: nil
                     )
+                } else {
+                    lastErrorKind = AXElementResolver.errorKind(for: actionError)
                 }
             }
 
             if !showMenu, summary.actions.contains(kAXRaiseAction) {
                 failedAction = kAXRaiseAction
-                if AXClient.performAction(element, kAXRaiseAction) == .success {
+                let raiseError = AXClient.performAction(element, kAXRaiseAction)
+                if raiseError == .success {
                     return AXSemanticActivationResult(
                         succeeded: true,
                         path: "ax_semantic",
@@ -6778,15 +6835,21 @@ public final class CascadeAppModel: ObservableObject {
                         subrole: summary.subrole,
                         actionCount: summary.actions.count,
                         frame: summary.frame,
-                        fallbackReason: nil
+                        fallbackReason: nil,
+                        axErrorKind: nil
                     )
+                } else {
+                    lastErrorKind = AXElementResolver.errorKind(for: raiseError)
                 }
             }
 
-            guard case .success(let parent) = AXClient.elementAttribute(element, kAXParentAttribute as String) else {
-                break
+            switch AXClient.elementAttribute(element, kAXParentAttribute as String) {
+            case .success(let parent):
+                element = parent
+            case .failure(let error):
+                lastErrorKind = AXElementResolver.errorKind(for: error)
+                break ancestorWalk
             }
-            element = parent
         }
 
         return AXSemanticActivationResult(
@@ -6798,7 +6861,8 @@ public final class CascadeAppModel: ObservableObject {
             subrole: lastSubrole,
             actionCount: lastActions.count,
             frame: lastFrame,
-            fallbackReason: "semantic_not_applied"
+            fallbackReason: "semantic_not_applied",
+            axErrorKind: lastErrorKind
         )
     }
 
