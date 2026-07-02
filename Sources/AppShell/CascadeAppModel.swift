@@ -2129,6 +2129,7 @@ public final class CascadeAppModel: ObservableObject {
         agentDidHighlight = false
         episodeAppActions = [:]
         episodeGroundingSelections = []
+        lastAXActionTargetPID = nil
         episodeSparseAXProfiles.reset()
         ScreenCaptureUtility.prewarm()  // warm the capture pipeline for fast re-observes
         dock.show(title: "Cascade is doing it", detail: "\(goal) · press STOP to take control.")
@@ -6090,6 +6091,23 @@ public final class CascadeAppModel: ObservableObject {
         let skill = frontmostSkill()
         let keepPointer = skill?.keysFollowPointer == true
         let semanticAXActions = defaultsStore.bool(forKey: Self.experimentalGroundingVerifierKey)
+        func actionAXFocusPoint(_ action: CUAction) -> CGPoint? {
+            switch action {
+            case .click(let x, let y),
+                 .doubleClick(let x, let y),
+                 .tripleClick(let x, let y),
+                 .rightClick(let x, let y),
+                 .scroll(let x, let y, _, _):
+                cg(x, y)
+            case .drag(let fromX, let fromY, _, _):
+                cg(fromX, fromY)
+            default:
+                nil
+            }
+        }
+        let axTargetBefore = semanticAXActions
+            ? await prepareAXActionTargetFocus(for: action, point: actionAXFocusPoint(action), skill: skill)
+            : nil
         do {
             switch action {
             case .move(let x, let y):
@@ -6352,6 +6370,9 @@ public final class CascadeAppModel: ObservableObject {
                     if !wasAlreadyRunning {
                         try? await Task.sleep(for: .milliseconds(1200))
                     }
+                    if semanticAXActions {
+                        lastAXActionTargetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    }
                 }
                 // On failure the next screenshot shows nothing changed and Claude
                 // falls back to the visual path.
@@ -6362,7 +6383,13 @@ public final class CascadeAppModel: ObservableObject {
                     NSWorkspace.shared.open(url)
                     // Give the browser a beat to come forward and start loading.
                     try? await Task.sleep(for: .milliseconds(900))
+                    if semanticAXActions {
+                        lastAXActionTargetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    }
                 }
+            }
+            if semanticAXActions {
+                await verifyAXPostAction(action, targetBefore: axTargetBefore)
             }
             await verifyPostAction(action)
             return true
@@ -6501,6 +6528,509 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
+    private struct AXActionTargetRead {
+        let snapshot: AXActionTargetSnapshot
+        let window: AXUIElement?
+    }
+
+    private struct AXActionTargetSnapshot: Sendable, Equatable {
+        let point: CGPoint?
+        let status: String
+        let pid: pid_t?
+        let appName: String?
+        let bundleIdentifier: String?
+        let elementHash: String?
+        let windowHash: String?
+        let role: String?
+        let subrole: String?
+        let actionCount: Int
+        let frame: CGRect?
+        let windowFrame: CGRect?
+        let axErrorKind: AXElementResolver.AXErrorKind?
+    }
+
+    private struct AXActionFocusOutcome: Sendable, Equatable {
+        var status: String
+        let activateStatus: String
+        let appFocusStatus: String
+        let focusedWindowStatus: String
+        let raiseStatus: String
+        let frontmostBefore: Bool
+        var frontmostAfter: Bool
+        let axErrorKind: AXElementResolver.AXErrorKind?
+
+        var shouldSettle: Bool {
+            activateStatus == "attempted"
+                || appFocusStatus == "success"
+                || focusedWindowStatus == "success"
+                || raiseStatus == "success"
+        }
+    }
+
+    private func prepareAXActionTargetFocus(
+        for action: CUAction,
+        point: CGPoint?,
+        skill: AppSkill?
+    ) async -> AXActionTargetSnapshot? {
+        let kind = Self.cuActionAuditKind(action)
+        let snapshot: AXActionTargetSnapshot
+        var focus: AXActionFocusOutcome
+        if let point {
+            do {
+                let read = Self.axTargetRead(atCG: point)
+                snapshot = read.snapshot
+                focus = Self.focusAXTarget(pid: read.snapshot.pid, window: read.window)
+            }
+            if let pid = snapshot.pid {
+                lastAXActionTargetPID = pid
+            }
+        } else {
+            guard Self.actionCanUseRetainedAXFocus(action),
+                  let pid = lastAXActionTargetPID else { return nil }
+            do {
+                let read = Self.axFocusedTargetRead(pid: pid)
+                snapshot = read.snapshot
+                focus = Self.focusAXTarget(pid: pid, window: read.window)
+            }
+        }
+        if focus.shouldSettle {
+            try? await Task.sleep(for: .milliseconds(90))
+        }
+        focus.frontmostAfter = Self.frontmostPIDMatches(snapshot.pid)
+        if focus.frontmostAfter {
+            focus.status = "focused"
+        } else if focus.status == "attempted" && !focus.shouldSettle {
+            focus.status = "unavailable"
+        }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.focus.ax_target",
+            detail: Self.axTargetFocusAuditDetail(
+                kind: kind,
+                snapshot: snapshot,
+                focus: focus,
+                skill: skill
+            )
+        ))
+        return snapshot
+    }
+
+    private func verifyAXPostAction(_ action: CUAction, targetBefore: AXActionTargetSnapshot?) async {
+        guard let targetBefore else { return }
+        try? await Task.sleep(for: .milliseconds(90))
+        let targetAfter: AXActionTargetSnapshot
+        if let point = targetBefore.point {
+            targetAfter = Self.axTargetRead(atCG: point).snapshot
+        } else if let pid = targetBefore.pid {
+            targetAfter = Self.axFocusedTargetRead(pid: pid).snapshot
+        } else {
+            return
+        }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.verify.ax_sanity",
+            detail: Self.axPostActionAuditDetail(
+                kind: Self.cuActionAuditKind(action),
+                before: targetBefore,
+                after: targetAfter
+            )
+        ))
+    }
+
+    private static func axTargetRead(atCG point: CGPoint) -> AXActionTargetRead {
+        guard AXIsProcessTrusted() else {
+            return AXActionTargetRead(
+                snapshot: AXActionTargetSnapshot(
+                    point: point,
+                    status: "permission_denied",
+                    pid: nil,
+                    appName: nil,
+                    bundleIdentifier: nil,
+                    elementHash: nil,
+                    windowHash: nil,
+                    role: nil,
+                    subrole: nil,
+                    actionCount: 0,
+                    frame: nil,
+                    windowFrame: nil,
+                    axErrorKind: .permissionDenied
+                ),
+                window: nil
+            )
+        }
+        switch AXClient.elementAtPosition(point) {
+        case .success(let element):
+            let window = axWindow(for: element)
+            return AXActionTargetRead(
+                snapshot: axTargetSnapshot(point: point, element: element, window: window, status: "hit", errorKind: nil),
+                window: window
+            )
+        case .failure(let error):
+            return AXActionTargetRead(
+                snapshot: AXActionTargetSnapshot(
+                    point: point,
+                    status: "no_ax_element",
+                    pid: nil,
+                    appName: nil,
+                    bundleIdentifier: nil,
+                    elementHash: nil,
+                    windowHash: nil,
+                    role: nil,
+                    subrole: nil,
+                    actionCount: 0,
+                    frame: nil,
+                    windowFrame: nil,
+                    axErrorKind: AXElementResolver.errorKind(for: error)
+                ),
+                window: nil
+            )
+        }
+    }
+
+    private static func axFocusedTargetRead(pid: pid_t) -> AXActionTargetRead {
+        guard AXIsProcessTrusted() else {
+            return AXActionTargetRead(
+                snapshot: AXActionTargetSnapshot(
+                    point: nil,
+                    status: "permission_denied",
+                    pid: pid,
+                    appName: nil,
+                    bundleIdentifier: nil,
+                    elementHash: nil,
+                    windowHash: nil,
+                    role: nil,
+                    subrole: nil,
+                    actionCount: 0,
+                    frame: nil,
+                    windowFrame: nil,
+                    axErrorKind: .permissionDenied
+                ),
+                window: nil
+            )
+        }
+        let appRef = AXUIElementCreateApplication(pid)
+        AXClient.setMessagingTimeout(appRef)
+        let window: AXUIElement?
+        let status: String
+        let errorKind: AXElementResolver.AXErrorKind?
+        switch AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) {
+        case .success(let focusedWindow):
+            window = focusedWindow
+            status = "focused_window"
+            errorKind = nil
+        case .failure(let error):
+            window = nil
+            status = "no_focused_window"
+            errorKind = AXElementResolver.errorKind(for: error)
+        }
+        return AXActionTargetRead(
+            snapshot: axTargetSnapshot(point: nil, element: nil, window: window, pid: pid, status: status, errorKind: errorKind),
+            window: window
+        )
+    }
+
+    private static func axTargetSnapshot(
+        point: CGPoint?,
+        element: AXUIElement?,
+        window: AXUIElement?,
+        pid explicitPID: pid_t? = nil,
+        status: String,
+        errorKind: AXElementResolver.AXErrorKind?
+    ) -> AXActionTargetSnapshot {
+        let pid = explicitPID ?? element.flatMap(axPID(of:)) ?? window.flatMap(axPID(of:))
+        let app = pid.flatMap { NSRunningApplication(processIdentifier: $0) }
+        let role = element.flatMap { axString($0, kAXRoleAttribute) }
+        let subrole = element.flatMap { axString($0, kAXSubroleAttribute) }
+        let actions = element.map { AXClient.actionNames($0).sorted() } ?? []
+        let frame: CGRect?
+        if let element, case .success(let rect) = AXClient.frame(element) {
+            frame = rect
+        } else {
+            frame = nil
+        }
+        let windowFrame: CGRect?
+        if let window, case .success(let rect) = AXClient.frame(window) {
+            windowFrame = rect
+        } else {
+            windowFrame = nil
+        }
+        let windowHash = window.flatMap { window in
+            UIStateSnapshot.snapshot(
+                fromAXRoot: window,
+                options: UIStateSnapshot.AXBuildOptions(nodeLimit: 220, maxDepth: 6)
+            ).map { String($0.rootHash) }
+        }
+        let elementHash = element.map { _ in
+            axElementIdentityHash(
+                pid: pid,
+                role: role,
+                subrole: subrole,
+                actions: actions,
+                frame: frame
+            )
+        }
+        return AXActionTargetSnapshot(
+            point: point,
+            status: status,
+            pid: pid,
+            appName: app?.localizedName,
+            bundleIdentifier: app?.bundleIdentifier,
+            elementHash: elementHash,
+            windowHash: windowHash,
+            role: role,
+            subrole: subrole,
+            actionCount: actions.count,
+            frame: frame,
+            windowFrame: windowFrame,
+            axErrorKind: errorKind
+        )
+    }
+
+    private static func focusAXTarget(pid: pid_t?, window: AXUIElement?) -> AXActionFocusOutcome {
+        let frontmostBefore = frontmostPIDMatches(pid)
+        guard let pid else {
+            return AXActionFocusOutcome(
+                status: "no_pid",
+                activateStatus: "skipped",
+                appFocusStatus: "skipped",
+                focusedWindowStatus: "skipped",
+                raiseStatus: "skipped",
+                frontmostBefore: frontmostBefore,
+                frontmostAfter: false,
+                axErrorKind: nil
+            )
+        }
+        let appRef = AXUIElementCreateApplication(pid)
+        AXClient.setMessagingTimeout(appRef)
+
+        let activateStatus: String
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            app.activate()
+            activateStatus = "attempted"
+        } else {
+            activateStatus = "missing_app"
+        }
+
+        let appFocusError = AXClient.setAttribute(appRef, kAXFocusedAttribute as String, value: kCFBooleanTrue)
+        let appFocusStatus = appFocusError == .success ? "success" : "failed"
+        var firstErrorKind: AXElementResolver.AXErrorKind? = appFocusError == .success
+            ? nil
+            : AXElementResolver.errorKind(for: appFocusError)
+
+        let focusedWindowStatus: String
+        if let window {
+            let focusWindowError = AXClient.setAttribute(appRef, kAXFocusedWindowAttribute as String, value: window)
+            focusedWindowStatus = focusWindowError == .success ? "success" : "failed"
+            if focusWindowError != .success, firstErrorKind == nil {
+                firstErrorKind = AXElementResolver.errorKind(for: focusWindowError)
+            }
+        } else {
+            focusedWindowStatus = "missing_window"
+        }
+
+        let raiseStatus: String
+        if let window {
+            if AXClient.actionNames(window).contains(kAXRaiseAction) {
+                let raiseError = AXClient.performAction(window, kAXRaiseAction)
+                raiseStatus = raiseError == .success ? "success" : "failed"
+                if raiseError != .success, firstErrorKind == nil {
+                    firstErrorKind = AXElementResolver.errorKind(for: raiseError)
+                }
+            } else {
+                raiseStatus = "unsupported"
+            }
+        } else {
+            raiseStatus = "missing_window"
+        }
+
+        return AXActionFocusOutcome(
+            status: "attempted",
+            activateStatus: activateStatus,
+            appFocusStatus: appFocusStatus,
+            focusedWindowStatus: focusedWindowStatus,
+            raiseStatus: raiseStatus,
+            frontmostBefore: frontmostBefore,
+            frontmostAfter: false,
+            axErrorKind: firstErrorKind
+        )
+    }
+
+    private static func axWindow(for element: AXUIElement) -> AXUIElement? {
+        if case .success(let window) = AXClient.elementAttribute(element, kAXWindowAttribute as String) {
+            return window
+        }
+        var current = element
+        for _ in 0..<6 {
+            if let role = axString(current, kAXRoleAttribute),
+               role == "AXWindow" || role == "AXSheet" {
+                return current
+            }
+            guard case .success(let parent) = AXClient.elementAttribute(current, kAXParentAttribute as String) else {
+                return nil
+            }
+            current = parent
+        }
+        return nil
+    }
+
+    private static func axPID(of element: AXUIElement) -> pid_t? {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return nil }
+        return pid
+    }
+
+    private static func frontmostPIDMatches(_ pid: pid_t?) -> Bool {
+        guard let pid else { return false }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+    }
+
+    private nonisolated static func axElementIdentityHash(
+        pid: pid_t?,
+        role: String?,
+        subrole: String?,
+        actions: [String],
+        frame: CGRect?
+    ) -> String {
+        let frameIdentity = frame.map {
+            "\(Int($0.minX.rounded())),\(Int($0.minY.rounded())),\(Int($0.width.rounded())),\(Int($0.height.rounded()))"
+        } ?? "none"
+        return auditHash([
+            pid.map(String.init) ?? "no-pid",
+            role ?? "no-role",
+            subrole ?? "no-subrole",
+            actions.joined(separator: ","),
+            frameIdentity,
+        ].joined(separator: "|"))
+    }
+
+    private nonisolated static func cuActionAuditKind(_ action: CUAction) -> String {
+        switch action {
+        case .move: return "move"
+        case .click: return "click"
+        case .doubleClick: return "double_click"
+        case .tripleClick: return "triple_click"
+        case .rightClick: return "right_click"
+        case .drag: return "drag"
+        case .type: return "type"
+        case .key: return "key"
+        case .scroll: return "scroll"
+        case .wait: return "wait"
+        case .screenshot: return "screenshot"
+        case .openApp: return "open_app"
+        case .openURL: return "open_url"
+        case .zoom: return "zoom"
+        case .highlight: return "highlight"
+        }
+    }
+
+    private nonisolated static func actionCanUseRetainedAXFocus(_ action: CUAction) -> Bool {
+        switch action {
+        case .type, .key:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private nonisolated static func axTargetFocusAuditDetail(
+        kind: String,
+        snapshot: AXActionTargetSnapshot,
+        focus: AXActionFocusOutcome,
+        skill: AppSkill?
+    ) -> String {
+        var parts = [
+            "kind=\(safeAuditToken(kind))",
+            "status=\(safeAuditToken(focus.status))",
+            "activate=\(safeAuditToken(focus.activateStatus))",
+            "appFocus=\(safeAuditToken(focus.appFocusStatus))",
+            "windowFocus=\(safeAuditToken(focus.focusedWindowStatus))",
+            "raise=\(safeAuditToken(focus.raiseStatus))",
+            "frontBefore=\(focus.frontmostBefore ? 1 : 0)",
+            "frontAfter=\(focus.frontmostAfter ? 1 : 0)",
+        ]
+        parts.append(contentsOf: axTargetSnapshotAuditParts(snapshot, prefix: "target"))
+        if let axErrorKind = focus.axErrorKind {
+            parts.append("focusAXErrorKind=\(safeAuditToken(axErrorKind.rawValue))")
+        }
+        if let skill {
+            parts.append("skillHash=\(auditHash(skill.name))")
+            parts.append("skillHints=\(skill.hints.inputPolicies.count)")
+            parts.append("skillAXUnreliable=\(skill.axUnreliable ? 1 : 0)")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private nonisolated static func axPostActionAuditDetail(
+        kind: String,
+        before: AXActionTargetSnapshot,
+        after: AXActionTargetSnapshot
+    ) -> String {
+        let sameApp = before.pid != nil && after.pid == before.pid
+        let sameElement = before.elementHash != nil && after.elementHash == before.elementHash
+        let sameWindow = before.windowHash != nil && after.windowHash == before.windowHash
+        let pointChecked = before.point != nil && after.point != nil
+        let status: String
+        if before.pid == nil {
+            status = "unavailable"
+        } else if after.pid == nil {
+            status = "unavailable"
+        } else if !sameApp {
+            status = "wrong_app"
+        } else {
+            status = "verified"
+        }
+        var parts = [
+            "kind=\(safeAuditToken(kind))",
+            "status=\(safeAuditToken(status))",
+            "pointChecked=\(pointChecked ? 1 : 0)",
+            "sameApp=\(sameApp ? 1 : 0)",
+            "sameElement=\(sameElement ? 1 : 0)",
+            "sameWindow=\(sameWindow ? 1 : 0)",
+        ]
+        parts.append(contentsOf: axTargetSnapshotAuditParts(before, prefix: "before"))
+        parts.append(contentsOf: axTargetSnapshotAuditParts(after, prefix: "after"))
+        return parts.joined(separator: " ")
+    }
+
+    private nonisolated static func axTargetSnapshotAuditParts(
+        _ snapshot: AXActionTargetSnapshot,
+        prefix: String
+    ) -> [String] {
+        var parts = [
+            "\(prefix)Status=\(safeAuditToken(snapshot.status))",
+            "\(prefix)PidHash=\(auditHash(snapshot.pid.map(String.init)))",
+            "\(prefix)AppHash=\(auditHash(snapshot.appName))",
+            "\(prefix)BundleHash=\(auditHash(snapshot.bundleIdentifier))",
+            "\(prefix)ElementHash=\(safeAuditToken(snapshot.elementHash ?? "none"))",
+            "\(prefix)WindowHash=\(safeAuditToken(snapshot.windowHash ?? "none"))",
+            "\(prefix)RoleHash=\(auditHash(snapshot.role))",
+            "\(prefix)RoleChars=\(snapshot.role?.count ?? 0)",
+            "\(prefix)SubroleHash=\(auditHash(snapshot.subrole))",
+            "\(prefix)SubroleChars=\(snapshot.subrole?.count ?? 0)",
+            "\(prefix)ActionCount=\(max(0, snapshot.actionCount))",
+        ]
+        if let point = snapshot.point {
+            parts.append("\(prefix)X=\(Int(point.x.rounded()))")
+            parts.append("\(prefix)Y=\(Int(point.y.rounded()))")
+        }
+        if let frame = snapshot.frame {
+            parts.append("\(prefix)FrameX=\(Int(frame.minX.rounded()))")
+            parts.append("\(prefix)FrameY=\(Int(frame.minY.rounded()))")
+            parts.append("\(prefix)FrameW=\(Int(frame.width.rounded()))")
+            parts.append("\(prefix)FrameH=\(Int(frame.height.rounded()))")
+        }
+        if let frame = snapshot.windowFrame {
+            parts.append("\(prefix)WindowX=\(Int(frame.minX.rounded()))")
+            parts.append("\(prefix)WindowY=\(Int(frame.minY.rounded()))")
+            parts.append("\(prefix)WindowW=\(Int(frame.width.rounded()))")
+            parts.append("\(prefix)WindowH=\(Int(frame.height.rounded()))")
+        }
+        if let axErrorKind = snapshot.axErrorKind {
+            parts.append("\(prefix)AXErrorKind=\(safeAuditToken(axErrorKind.rawValue))")
+        }
+        return parts
+    }
+
     private static func focusedAXValueContains(_ text: String) -> Bool? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, AXIsProcessTrusted() else { return nil }
@@ -6618,6 +7148,11 @@ public final class CascadeAppModel: ObservableObject {
     /// Where the agent last clicked/hovered in a pointer-routed app — the point
     /// its hotkeys should keep acting at after the cursor restore.
     private var lastPointerRoutedPoint: CGPoint?
+
+    /// Target app discovered from the last coordinate action while experimental AX
+    /// verification is enabled. Immediate key/type follow-ups re-activate it if
+    /// Cascade or the agent terminal steals focus between actions.
+    private var lastAXActionTargetPID: pid_t?
 
     /// Runs a CGEvent click body, then snaps the real cursor back to exactly where
     /// it was — the fallback for targets Accessibility can't press. The actuator

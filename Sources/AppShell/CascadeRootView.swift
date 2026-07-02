@@ -2328,7 +2328,7 @@ private struct AgentActivityItem {
             detail = Self.counts(event.detail, keys: ["turn", "controlCount", "ocrLineCount", "ocrMarksHash"])
             icon = "text.viewfinder"
             tint = Color.cascadeAccentWarm
-        case "assist.verify.action", "assist.verify.unavailable", "assist.validate", "sandbox.verify":
+        case "assist.verify.action", "assist.verify.unavailable", "assist.validate", "assist.focus.ax_target", "assist.verify.ax_sanity", "sandbox.verify":
             title = "Verifier"
             detail = Self.verifierDetail(event.detail)
             icon = "checkmark.seal"
