@@ -4362,6 +4362,15 @@ public final class CascadeAppModel: ObservableObject {
         switch affordanceMode {
         case .assist:
             add("screen", groundingNote(), freshness: .live, order: 10, maxCharacters: 700)
+            // d11: AX Set-of-Marks candidate list for the on-screen planner —
+            // stable id + label + exact frame per control, so the model picks a
+            // REAL control instead of inventing a description that the grounder
+            // then has to guess at. Only for the on-screen assist surface: the
+            // background web agent drives its own sandboxed browser, where the
+            // frontmost native app's controls would misground it.
+            if surface == .assist {
+                add("controls", await assistControlsNote(goal: goal), freshness: .live, order: 12, maxCharacters: 1_200)
+            }
         case .scout:
             add("screen", await scoutContextNote(goal: goal), freshness: .live, order: 10, maxCharacters: 1_000)
         case .none:
@@ -5133,6 +5142,49 @@ public final class CascadeAppModel: ObservableObject {
             actor: "agent",
             action: "scout.observe.compressed",
             detail: "turn=\(turn) " + rendering.metrics.safeAuditDetail
+        ))
+        return rendering.text
+    }
+
+    /// Candidate bounds for the assist note's AX-SoM list, sized so a full
+    /// render fits the context pack's 1_200-char `controls` section without
+    /// mid-line truncation (header ≈230 chars + ~80 chars/line): the pack's
+    /// `clipped()` cuts on characters, and a chopped line loses exactly the
+    /// frame/id the planner needs.
+    static let assistControlsMaxCandidates = 11
+    static let assistControlsMaxPerGroup = 6
+
+    /// d11: the AX Set-of-Marks candidate list for the ASSIST planner note
+    /// (`initialAssistNote` + the per-turn `episodeNote`). Until now the Opus
+    /// path saw controls only at flail moments (no-effect / ground-miss); every
+    /// normal turn it had to invent a target description from pixels. This
+    /// pushes the same compressed observation the Scout path gets (d10): a
+    /// bounded, task-relevant candidate list with a stable id, label, and exact
+    /// frame per control, so the model names a REAL control and the AX-first
+    /// grounder hits it. Same flag as d10 (`cascade.experimentalCompressedObservation`,
+    /// default-off — flag off keeps the shipped assist note byte-identical) and
+    /// nil on canvas/Electron surfaces exposing nothing. Audited as
+    /// `assist.observe.compressed` with token + candidate COUNTS only — never
+    /// labels, values, or coordinates.
+    private func assistControlsNote(goal: String) async -> String? {
+        guard defaultsStore.bool(forKey: Self.experimentalCompressedObservationKey) else { return nil }
+        let harvest = AXElementResolver.interactablesWithDiagnostics(limit: 24)
+        await auditAXDiagnosticsIfNeeded(harvest.diagnostics)
+        let controls = harvest.matches
+        // Baseline = the legacy flat summary's size, so the audit row shows the
+        // same compression ratio the scout rows do.
+        let legacySummary = AXElementResolver.interactableSummary(controls)
+        guard let rendering = AXCompressedObservation.render(
+            matches: controls,
+            goal: goal,
+            maxCandidates: Self.assistControlsMaxCandidates,
+            maxPerGroup: Self.assistControlsMaxPerGroup,
+            baselineCharacterCount: legacySummary?.count ?? 0
+        ) else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.observe.compressed",
+            detail: rendering.metrics.safeAuditDetail
         ))
         return rendering.text
     }
