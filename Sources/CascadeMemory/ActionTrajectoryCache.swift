@@ -667,7 +667,14 @@ private struct ActionTrajectoryPreparedInput {
         self.sanitizedPostconditionJSON = action.postconditionJSON.flatMap { ActionTrajectoryPrivacy.sanitizedJSON($0, actionKind: action.kind) }
         self.embedding = LocalSemanticVector.vector(for: [goalNorm, targetDescriptorNorm, targetTextNorm, action.kind].compactMap { $0 }.joined(separator: " "))
         self.ttlPolicy = ttlPolicy
-        self.actionKeyHash = ActionTrajectoryPrivacy.sha256Hex([
+        // Pre-computed into locals + explicit [String] so the type-checker resolves each
+        // element in constant time. Inline, this 16-element heterogeneous literal (with
+        // radix-16 transforms) blew the type-check time budget on the CI runner (compiled
+        // fine locally on a fast M1). Same components/order/separator/hash → identical keys.
+        let hexScreenHash = screenHash.map { String($0, radix: 16) } ?? ""
+        let hexGridHashes = screenGridHashes.map { String($0, radix: 16) }.joined(separator: ",")
+        let hexOcrSimhash = ocrSimhash.map { String($0, radix: 16) } ?? ""
+        let keyComponents: [String] = [
             "v2",
             source.rawValue,
             goalNorm,
@@ -676,15 +683,16 @@ private struct ActionTrajectoryPreparedInput {
             windowTitleNorm ?? "",
             webAppID ?? "",
             urlScope ?? "",
-            screenHash.map { String($0, radix: 16) } ?? "",
-            screenGridHashes.map { String($0, radix: 16) }.joined(separator: ","),
-            ocrSimhash.map { String($0, radix: 16) } ?? "",
+            hexScreenHash,
+            hexGridHashes,
+            hexOcrSimhash,
             axFingerprint ?? "",
             targetDescriptorNorm ?? "",
             targetTextNorm ?? "",
             action.kind,
             sanitizedActionJSON,
-        ].joined(separator: "\u{1f}"))
+        ]
+        self.actionKeyHash = ActionTrajectoryPrivacy.sha256Hex(keyComponents.joined(separator: "\u{1f}"))
     }
 }
 
