@@ -1120,9 +1120,31 @@ public enum AXElementResolver {
         guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
             return CandidateHarvest(candidates: [], diagnostics: AXDiagnostics())
         }
+        // d09: event-driven per-app snapshot cache (default-off behind
+        // `cascade.experimentalGroundingCache`). Serves the bounded full-tree
+        // walk from an AXObserver-invalidated snapshot instead of re-walking
+        // up to `maxNodes` elements on every harvest in the same turn. Only the
+        // default-limit walk is cached so callers asking for a different bound
+        // keep exact scrape semantics; misses run the same walk as before.
+        if limit == maxNodes, AXSnapshotCache.shared.isEnabled {
+            return AXSnapshotCache.shared.harvest(pid: pid) {
+                scrapeLiveSnapshot(pid: pid, limit: limit, collectCacheMaterial: true)
+            }
+        }
+        return scrapeLiveSnapshot(pid: pid, limit: limit, collectCacheMaterial: false).harvest
+    }
+
+    /// The bounded full-tree scrape (unchanged walk limits: ≤`limit` nodes,
+    /// ≤`maxDepth` depth, 0.3s AX messaging timeout), packaged with the live
+    /// probe references + focused-window identity the d09 observer cache needs
+    /// for stale-node detection. With `collectCacheMaterial` false (the cache
+    /// disabled/bypassed path) the walk's AX traffic is byte-identical to the
+    /// pre-d09 scrape — no extra focused-window read, no probe bookkeeping.
+    static func scrapeLiveSnapshot(pid: pid_t, limit: Int, collectCacheMaterial: Bool) -> AXLiveSnapshot {
         let app = AXUIElementCreateApplication(pid)
         AXClient.setMessagingTimeout(app)
         var candidates: [Candidate] = []
+        var probePool: [AXSnapshotProbe] = []
         var visited = 0
         var errors = AXErrorSummary()
         for window in windows(of: app, errors: &errors) {
@@ -1148,10 +1170,13 @@ public enum AXElementResolver {
                     source: .accessibility,
                     actionableNode: node
                 ))
+                if collectCacheMaterial {
+                    probePool.append(AXSnapshotProbe(element: element, frame: frame))
+                }
             }
             guard visited < limit else { break }
         }
-        return CandidateHarvest(
+        let harvest = CandidateHarvest(
             candidates: candidates,
             diagnostics: AXDiagnostics(
                 visitedNodeCount: visited,
@@ -1159,6 +1184,12 @@ public enum AXElementResolver {
                 errorSummary: errors
             )
         )
+        guard collectCacheMaterial else {
+            return AXLiveSnapshot(harvest: harvest)
+        }
+        let probes = AXSnapshotCache.probeSampleIndices(count: probePool.count).map { probePool[$0] }
+        let focusedWindow = element(of: app, attribute: kAXFocusedWindowAttribute)
+        return AXLiveSnapshot(harvest: harvest, probes: probes, focusedWindow: focusedWindow)
     }
 
     static func stableNodeID(

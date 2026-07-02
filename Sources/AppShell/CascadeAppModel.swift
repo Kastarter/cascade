@@ -5102,6 +5102,22 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func auditAXDiagnosticsIfNeeded(_ diagnostics: AXElementResolver.AXDiagnostics) async {
+        // d09: observer-cache accounting whenever the AX snapshot cache saw
+        // activity since the last audit — hit/miss/invalidation COUNTS plus app
+        // hashes only, never labels/values/coordinates. No row when the
+        // `cascade.experimentalGroundingCache` path is off or idle.
+        if let cacheMetrics = AXSnapshotCache.shared.drainMetrics() {
+            let snapshot = AppWindowObserver.snapshot()
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "grounding.ax_cache",
+                detail: [
+                    "bundleHash=\(Self.auditHash(snapshot.bundleIdentifier))",
+                    "appHash=\(Self.auditHash(snapshot.appName))",
+                    cacheMetrics.safeAuditDetail,
+                ].joined(separator: " ")
+            ))
+        }
         guard diagnostics.errorSummary.totalCount > 0 else { return }
         let snapshot = AppWindowObserver.snapshot()
         let detail = [
