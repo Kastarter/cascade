@@ -344,6 +344,7 @@ public final class CascadeAppModel: ObservableObject {
     private static let capturePrivacyPolicyKey = "cascade.capturePrivacyPolicy"
     static let experimentalExperienceLedgerKey = "cascade.experimentalExperienceLedger"
     static let experimentalEpisodeMiningKey = "cascade.experimentalEpisodeMining"
+    static let experimentalParameterizedMiningKey = "cascade.experimentalParameterizedMining"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
@@ -352,6 +353,11 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
+    static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
+    static let experimentalHistoryCompactionTurnsKey = "cascade.experimentalHistoryCompactionTurns"
+    static let experimentalActionChunkingKey = "cascade.experimentalActionChunking"
+    nonisolated static let experimentalAutoRecallKey = "cascade.experimentalAutoRecall"
+    nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
@@ -369,12 +375,25 @@ public final class CascadeAppModel: ObservableObject {
         defaults.bool(forKey: Self.experimentalGroundingCacheKey) ? GroundingCache() : nil
     }
 
+    nonisolated static func experimentalActionTrajectoryCacheEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalActionTrajectoryCacheKey)
+    }
+
+    nonisolated static func experimentalAutoRecallEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalAutoRecallKey)
+    }
+
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalStructuredContentKey)
     }
 
     static func experimentalWorkGraphIndexEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalWorkGraphIndexKey)
+    }
+
+    static func experimentalHistoryCompactionTurns(defaults: UserDefaults) -> Int {
+        let configured = defaults.integer(forKey: Self.experimentalHistoryCompactionTurnsKey)
+        return configured > 0 ? configured : ComputerUseAgent.historyCompactionRecentTurnDefault
     }
 
     private static func restoreCapturePrivacyPolicy(defaults: UserDefaults) -> CapturePrivacyPolicy {
@@ -689,10 +708,19 @@ public final class CascadeAppModel: ObservableObject {
             personalizationSnapshot = (try? await store.personalizationSnapshot()) ?? personalizationSnapshot
             let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
             let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
+            let parameterizedMiningEnabled = episodeMiningEnabled && defaultsStore.bool(forKey: Self.experimentalParameterizedMiningKey)
             let rawDetectedWaste = try await orchestrator.detectedWaste(
                 webAppIdentity: Self.webAppIdentity,
-                useEpisodeMining: episodeMiningEnabled
+                useEpisodeMining: episodeMiningEnabled,
+                useParameterizedMining: parameterizedMiningEnabled
             )
+            if parameterizedMiningEnabled {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "workflow.parameterized_mining",
+                    detail: Self.parameterizedMiningAuditDetail(rawDetectedWaste)
+                ))
+            }
             let preferenceModel = await suggestionPreferenceModel()
             if personalizationEnabled {
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
@@ -2572,7 +2600,10 @@ public final class CascadeAppModel: ObservableObject {
             groundingCropProvider: Self.assistGroundingCropProvider(),
             groundingCache: groundingCache,
             groundingCacheKeyProvider: Self.assistGroundingCacheKeyProvider(),
-            actionCritic: assistActionCritic()
+            actionCritic: assistActionCritic(),
+            historyCompactionEnabled: defaultsStore.bool(forKey: Self.experimentalHistoryCompactionKey),
+            historyCompactionRecentTurns: Self.experimentalHistoryCompactionTurns(defaults: defaultsStore),
+            actionChunkingEnabled: defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
         )
         // Pre-action safety gate (default OFF): refuse irreversible quit/trash keys
         // unless the goal asks. Set here so it re-applies when escalation rebuilds
@@ -2584,6 +2615,15 @@ public final class CascadeAppModel: ObservableObject {
                     actor: "agent",
                     action: "assist.capture",
                     detail: Self.assistCaptureAuditDetail(usage)
+                ))
+            }
+        }
+        agent.onHistoryCompacted = { [store] audit in
+            Task {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "history.compacted",
+                    detail: Self.historyCompactedAuditDetail(audit)
                 ))
             }
         }
@@ -3257,6 +3297,43 @@ public final class CascadeAppModel: ObservableObject {
         // to 15 and over-thought; reverted). Effort stays medium — CU default.
         let cuModel = AnthropicModel.opus
         let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        let actionChunkingEnabled = defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
+        let actionCacheLookup = await actionTrajectoryCachePreflight(
+            goal: goal,
+            firstScreenshotPNG: firstScreenshotPNG
+        )
+        if let executable = actionCacheLookup?.executable,
+           let cachedAction = Self.actionTrajectoryCUAction(kind: executable.row.actionKind, json: executable.row.actionJSON) {
+            let before = await Self.uiState()
+            let ok = await executeCU(cachedAction, on: screen)
+            let verification = await Self.verifyUIChange(after: before)
+            let openAppVerified: Bool
+            if case .openApp(let name) = cachedAction {
+                openAppVerified = await Self.frontmostAppMatches(name)
+            } else {
+                openAppVerified = false
+            }
+            if ok && (verification.changed || openAppVerified) {
+                _ = try? await store.promoteActionTrajectoryCache(
+                    source: executable.row.source,
+                    goal: goal,
+                    state: await actionTrajectoryState(firstScreenshotPNG: firstScreenshotPNG),
+                    targetDescriptor: executable.row.targetDescriptor,
+                    targetText: executable.row.targetTextNorm,
+                    action: ActionTrajectoryCacheAction(
+                        kind: executable.row.actionKind,
+                        json: executable.row.actionJSON,
+                        preconditionJSON: executable.row.preconditionJSON,
+                        postconditionJSON: executable.row.postconditionJSON
+                    )
+                )
+                return .finished("Used a verified cached action.", acted: true)
+            }
+            _ = try? await store.demoteActionTrajectoryCache(
+                id: executable.row.id,
+                reason: ok ? .wrongScreen : .disallowedAction
+            )
+        }
         var searchToolCalls = 0
         var searchFinishBlocked = false
         let agent = makeAssistAgent(model: cuModel, goal: goal, gen: gen, onSearchToolCall: { _ in
@@ -3291,6 +3368,23 @@ public final class CascadeAppModel: ObservableObject {
             agent.onActionRefused = { [weak self] detail in
                 guard let self else { return }
                 Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.action.refused", detail: detail)) }
+            }
+            agent.onActionChunkPlanned = { [weak self] plan in
+                guard let self else { return }
+                Task {
+                    _ = try? await self.store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "action.chunk",
+                        detail: Self.actionChunkAuditDetail(
+                            length: plan.length,
+                            groups: plan.groups.count,
+                            kindTokens: plan.kindTokens + plan.deferredKindTokens,
+                            status: "deferred",
+                            deferred: plan.deferredToolUseIDs.count,
+                            breakReason: plan.breakReason
+                        )
+                    ))
+                }
             }
             // A long think used to look like a hang — the dock kept showing the
             // previous turn's line for 30+ seconds. The pulse carries the thinking
@@ -3338,7 +3432,13 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         wire(agent)
-        let initialNote = await initialAssistNote(goal: goal)
+        let initialNoteText = [
+            await initialAssistNote(goal: goal),
+            actionCacheLookup?.hints.first.map { "Action cache hint: \($0)" },
+        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let initialNote = initialNoteText.isEmpty ? nil : initialNoteText
         var step = await agent.begin(
             goal: goal,
             screenshot: firstScreenshotPNG,
@@ -3474,32 +3574,115 @@ public final class CascadeAppModel: ObservableObject {
             // pull it out and run everything else first.
             var zoomRegion: CGRect?
             var actedThisTurn = streamActed
-            for (actionIndex, action) in step.actions.enumerated() {
-                // Re-check between every action — a barge-in or newer turn must
-                // halt mid-batch, not after the batch finishes.
-                if assistGeneration != gen || driver.runState.isStopRequested {
-                    auditTiming(outcome: "stopped")
-                    return .stopped
+            var chunkExecutedToolUseIDs: Set<String>?
+            var chunkBaselineHashes = lastFrameHashes
+            if actionChunkingEnabled, !step.actionGroups.isEmpty {
+                let result = await Self.executeActionChunkGroups(
+                    step.actionGroups,
+                    shouldStop: { assistGeneration != gen || driver.runState.isStopRequested },
+                    execute: { action in
+                        if case .zoom(let nx, let ny, let nw, let nh) = action {
+                            zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
+                            Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
+                            return true
+                        }
+                        actedThisTurn = true
+                        let actionStart = ContinuousClock.now
+                        guard await executeCU(action, on: screen) else { return false }
+                        actionTime += actionStart.duration(to: .now)
+                        return true
+                    },
+                    modalTitle: { await Self.unexpectedModal() },
+                    noEffectAfterGroup: { completed in
+                        guard let lastGroup = completed.last,
+                              Self.turnExpectsVisibleChange(lastGroup.actions),
+                              let baseline = chunkBaselineHashes else {
+                            return false
+                        }
+                        let size = agent.captureSize
+                        try? await Task.sleep(for: .milliseconds(260))
+                        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height),
+                              let first = Self.gridHashes(ofJPEG: shot) else {
+                            return false
+                        }
+                        if !PerceptualHash.isDuplicateGrid(first, of: baseline, threshold: Self.noEffectThreshold) {
+                            chunkBaselineHashes = first
+                            return false
+                        }
+                        try? await Task.sleep(for: .milliseconds(400))
+                        guard let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height),
+                              let confirmed = Self.gridHashes(ofJPEG: recheck) else {
+                            return true
+                        }
+                        if PerceptualHash.isDuplicateGrid(confirmed, of: baseline, threshold: Self.noEffectThreshold) {
+                            return true
+                        }
+                        chunkBaselineHashes = confirmed
+                        return false
+                    },
+                    pace: { hasMoreActions in
+                        if hasMoreActions { try? await Task.sleep(for: .milliseconds(120)) }
+                    }
+                )
+                chunkExecutedToolUseIDs = result.executedToolUseIDs
+                if result.executedActions > 0 { actedThisTurn = true }
+                let plannedDeferredCount = step.chunkPlan?.deferredToolUseIDs.count ?? 0
+                let planBreakReason = step.chunkPlan?.breakReason
+                if result.executedActions > 1 || plannedDeferredCount > 0 {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "action.chunk",
+                        detail: Self.actionChunkAuditDetail(
+                            length: result.executedActions,
+                            groups: result.executedToolUseIDs.count,
+                            kindTokens: result.kindTokens + (step.chunkPlan?.deferredKindTokens ?? []),
+                            status: plannedDeferredCount > 0 ? "deferred" : result.status,
+                            deferred: plannedDeferredCount,
+                            breakReason: planBreakReason ?? result.breakReason
+                        )
+                    ))
                 }
-                if case .zoom(let nx, let ny, let nw, let nh) = action {
-                    zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
-                    // Zoom turns execute no screen action and change nothing visible —
-                    // without this row a zoom LOOP is indistinguishable from a hang
-                    // (the 2026-06-11 46s Keynote stall was unattributable).
-                    Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
-                    continue
+                if let reason = result.breakReason {
+                    switch reason {
+                    case .stop:
+                        auditTiming(outcome: "stopped")
+                        return .stopped
+                    case .modal, .noEffect:
+                        agent.deferUnexecutedToolResults(executedToolUseIDs: result.executedToolUseIDs, reason: reason)
+                        nudge = [nudge, "A blocking \(reason == .modal ? "dialog" : "no-effect state") appeared; use the new screenshot before continuing."].compactMap { $0 }.joined(separator: " ")
+                    default:
+                        auditTiming(outcome: "failed-action")
+                        return .failed
+                    }
                 }
-                actedThisTurn = true
-                let actionStart = ContinuousClock.now
-                if !(await executeCU(action, on: screen)) {
-                    auditTiming(outcome: "failed-action")
-                    return .failed
-                }
-                actionTime += actionStart.duration(to: .now)
-                // The pace gap matters BETWEEN actions; after the last one the
-                // settle sleep below covers it — no double wait.
-                if actionIndex < step.actions.count - 1 {
-                    try? await Task.sleep(for: .milliseconds(120))
+            } else {
+                for (actionIndex, action) in step.actions.enumerated() {
+                    // Re-check between every action — a barge-in or newer turn must
+                    // halt mid-batch, not after the batch finishes.
+                    if assistGeneration != gen || driver.runState.isStopRequested {
+                        auditTiming(outcome: "stopped")
+                        return .stopped
+                    }
+                    if case .zoom(let nx, let ny, let nw, let nh) = action {
+                        zoomRegion = CGRect(x: nx, y: ny, width: nw, height: nh)
+                        // Zoom turns execute no screen action and change nothing visible —
+                        // without this row a zoom LOOP is indistinguishable from a hang
+                        // (the 2026-06-11 46s Keynote stall was unattributable).
+                        Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.zoom", detail: String(format: "region %.2f,%.2f %.2f×%.2f", nx, ny, nw, nh))) }
+                        continue
+                    }
+                    actedThisTurn = true
+                    let actionStart = ContinuousClock.now
+                    if !(await executeCU(action, on: screen)) {
+                        auditTiming(outcome: "failed-action")
+                        return .failed
+                    }
+                    actionTime += actionStart.duration(to: .now)
+                    // The pace gap matters BETWEEN actions; after the last one the
+                    // settle sleep below covers it — no double wait.
+                    if actionIndex < step.actions.count - 1 {
+                        try? await Task.sleep(for: .milliseconds(120))
+                    }
                 }
             }
 
@@ -3587,8 +3770,14 @@ public final class CascadeAppModel: ObservableObject {
 	                        detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
 	                    ))
 			                } else {
-		                    noEffectTurns += 1
-		                    recordGroundingNoEffect(from: agent)
+                    noEffectTurns += 1
+                    if actionChunkingEnabled {
+                        agent.deferUnexecutedToolResults(
+                            executedToolUseIDs: chunkExecutedToolUseIDs ?? Set(step.actionGroups.compactMap(\.toolUseID)),
+                            reason: .noEffect
+                        )
+                    }
+			                    recordGroundingNoEffect(from: agent)
 		                    if noEffectTurns >= 2, !noEffectVerifierUsed {
 		                        noEffectVerifierUsed = true
 		                        if let verifierNudge = await runNoEffectVerifier(
@@ -3967,15 +4156,77 @@ public final class CascadeAppModel: ObservableObject {
         return .unavailable
     }
 
-    private func initialAssistNote(goal: String) async -> String? {
+    func initialAssistNote(goal: String) async -> String? {
         let snapshot = AppWindowObserver.snapshot()
-        let parts = [
+        var parts = [
             groundingNote(),
             await planningPriorNote(for: goal, frontmostApp: snapshot.appName),
             await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
             await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
         ].compactMap { $0 }
+        if let autoRecall = await autoRecallInitialNote(goal: goal, snapshot: snapshot) {
+            parts.append(autoRecall)
+        }
         return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    private func autoRecallInitialNote(goal: String, snapshot: AppWindowSnapshot) async -> String? {
+        guard Self.experimentalAutoRecallEnabled(defaults: defaultsStore) else { return nil }
+        let baseContext = AutoRecallQueryContext(
+            goal: goal,
+            frontmostAppName: snapshot.appName,
+            frontmostBundleIdentifier: snapshot.bundleIdentifier,
+            currentWindowTitle: snapshot.windowTitle
+        )
+        guard capturePrivacyPolicy.recordRecallAvailable else {
+            let result = AutoRecallResult.blocked(context: baseContext, status: "record_recall_unavailable")
+            await auditAutoRecall(result)
+            return nil
+        }
+        let queryContext = AutoRecallQueryContext(
+            goal: goal,
+            frontmostAppName: snapshot.appName,
+            frontmostBundleIdentifier: snapshot.bundleIdentifier,
+            currentWindowTitle: snapshot.windowTitle,
+            recentWindowTitles: await autoRecallRecentWindowTitles()
+        )
+        let result = await AutoRecallContextBuilder(
+            store: store,
+            privacyPolicy: capturePrivacyPolicy
+        ).build(context: queryContext)
+        await auditAutoRecall(result)
+        return result.block
+    }
+
+    private func autoRecallRecentWindowTitles(limit: Int = 20) async -> [String] {
+        let rows = (try? await store.recentContexts(limit: limit)) ?? []
+        var titles: [String] = []
+        var seen: Set<String> = []
+        for row in rows {
+            guard row.safeToShow, row.safeToSummarize else { continue }
+            guard !PrivacyRules.isSensitive(row) else { continue }
+            guard capturePrivacyPolicy.decision(
+                appName: row.appName,
+                bundleIdentifier: row.bundleIdentifier,
+                windowTitle: row.windowTitle,
+                text: row.ocrText
+            ).allowed else { continue }
+            guard let title = row.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !title.isEmpty else { continue }
+            let key = title.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            titles.append(title)
+            if titles.count >= 8 { break }
+        }
+        return titles
+    }
+
+    private func auditAutoRecall(_ result: AutoRecallResult) async {
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recall.inject",
+            detail: Self.autoRecallAuditDetail(result)
+        ))
     }
 
     private func initialScoutNote(goal: String) async -> String? {
@@ -4796,6 +5047,28 @@ public final class CascadeAppModel: ObservableObject {
         AuditIdentity.descriptor(field, value)
     }
 
+    nonisolated static func parameterizedMiningAuditDetail(_ candidates: [DetectedWaste]) -> String {
+        let parameterSteps = candidates.flatMap { candidate in
+            candidate.recipe.steps.filter(\.isParameter)
+        }
+        let slotKinds = parameterSteps
+            .compactMap { $0.parameterKind?.rawValue }
+            .sorted()
+            .joined(separator: "|")
+        let signatures = candidates
+            .map(\.signature)
+            .sorted()
+            .joined(separator: "|")
+        return [
+            "enabled=true",
+            "candidateCount=\(candidates.count)",
+            "clusterCount=\(candidates.count)",
+            "slotCount=\(parameterSteps.count)",
+            "slotKindsHash=\(auditHash(slotKinds))",
+            "signatureHash=\(auditHash(signatures))"
+        ].joined(separator: " ")
+    }
+
     nonisolated static func policyDecisionAuditDetail(capability: String, decision: String, reason: String) -> String {
         [
             "capability=\(safeAuditToken(capability))",
@@ -4816,6 +5089,20 @@ public final class CascadeAppModel: ObservableObject {
             parts.append("reasons=\(info.injectionReasons.map(safeAuditToken).joined(separator: ","))")
         }
         return parts.joined(separator: " ")
+    }
+
+    nonisolated static func autoRecallAuditDetail(_ result: AutoRecallResult) -> String {
+        [
+            "enabled=true",
+            "status=\(safeAuditToken(result.status))",
+            "count=\(result.selectedContextIDs.count)",
+            "dropped=\(result.droppedCount)",
+            "chars=\(result.renderedCharacters)",
+            "candidateCount=\(result.candidateCount)",
+            "eligibleCount=\(result.eligibleCount)",
+            "queryHash=\(safeAuditToken(result.queryHash))",
+            "selectedContextHash=\(safeAuditToken(result.selectedContextHash))"
+        ].joined(separator: " ")
     }
 
     private func deniedURLReason(inHarnessInput input: [String: Any]) -> String? {
@@ -4877,6 +5164,38 @@ public final class CascadeAppModel: ObservableObject {
             "actionCount=\(usage.actionCount)",
             "noEffectCount=\(usage.noEffectCount)",
         ].joined(separator: " ")
+    }
+
+    nonisolated static func historyCompactedAuditDetail(_ audit: ComputerUseAgent.HistoryCompactionAudit) -> String {
+        [
+            "turns=\(audit.turns)",
+            "count=\(audit.count)",
+            "bytesBefore=\(audit.bytesBefore)",
+            "bytesAfter=\(audit.bytesAfter)",
+            "window=\(audit.window)",
+            "imageKeep=\(audit.imageKeep)",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func actionChunkAuditDetail(
+        length: Int,
+        groups: Int,
+        kindTokens: [String],
+        status: String,
+        deferred: Int = 0,
+        breakReason: CUActionChunkBreakReason? = nil
+    ) -> String {
+        var parts = [
+            "length=\(length)",
+            "groups=\(groups)",
+            "kindsHash=\(auditHash(kindTokens.joined(separator: "|")))",
+            "status=\(safeAuditToken(status))",
+            "deferred=\(deferred)",
+        ]
+        if let breakReason {
+            parts.append("breakReason=\(safeAuditToken(breakReason.rawValue))")
+        }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func assistStalledAuditDetail(engine: String? = nil, text: String) -> String {
@@ -5137,6 +5456,82 @@ public final class CascadeAppModel: ObservableObject {
     /// wait-only turn is exempt from no-effect counting.
     nonisolated static func turnExpectsVisibleChange(_ actions: [CUAction]) -> Bool {
         actions.contains(where: expectsVisibleChange)
+    }
+
+    struct ActionChunkExecutionResult: Sendable, Equatable {
+        let executedActions: Int
+        let executedToolUseIDs: Set<String>
+        let kindTokens: [String]
+        let status: String
+        let breakReason: CUActionChunkBreakReason?
+
+        var completed: Bool { breakReason == nil }
+    }
+
+    static func executeActionChunkGroups(
+        _ groups: [CUActionGroup],
+        shouldStop: @MainActor () -> Bool,
+        execute: @MainActor (CUAction) async -> Bool,
+        modalTitle: @MainActor () async -> String?,
+        noEffectAfterGroup: @MainActor ([CUActionGroup]) async -> Bool = { _ in false },
+        pace: @MainActor (_ hasMoreActions: Bool) async -> Void = { _ in }
+    ) async -> ActionChunkExecutionResult {
+        var executedActions = 0
+        var executedIDs = Set<String>()
+        var completedGroups: [CUActionGroup] = []
+        let kindTokens = groups.map(\.kindToken)
+        for (groupIndex, group) in groups.enumerated() {
+            for (actionIndex, action) in group.actions.enumerated() {
+                guard !shouldStop() else {
+                    return ActionChunkExecutionResult(
+                        executedActions: executedActions,
+                        executedToolUseIDs: executedIDs,
+                        kindTokens: kindTokens,
+                        status: "stop",
+                        breakReason: .stop
+                    )
+                }
+                guard await execute(action) else {
+                    return ActionChunkExecutionResult(
+                        executedActions: executedActions,
+                        executedToolUseIDs: executedIDs,
+                        kindTokens: kindTokens,
+                        status: "failed",
+                        breakReason: .malformed
+                    )
+                }
+                executedActions += 1
+                if let id = group.toolUseID { executedIDs.insert(id) }
+                if await modalTitle() != nil {
+                    return ActionChunkExecutionResult(
+                        executedActions: executedActions,
+                        executedToolUseIDs: executedIDs,
+                        kindTokens: kindTokens,
+                        status: "modal",
+                        breakReason: .modal
+                    )
+                }
+                let hasMoreActions = actionIndex < group.actions.count - 1 || groupIndex < groups.count - 1
+                await pace(hasMoreActions)
+            }
+            completedGroups.append(group)
+            if await noEffectAfterGroup(completedGroups) {
+                return ActionChunkExecutionResult(
+                    executedActions: executedActions,
+                    executedToolUseIDs: executedIDs,
+                    kindTokens: kindTokens,
+                    status: "no_effect",
+                    breakReason: .noEffect
+                )
+            }
+        }
+        return ActionChunkExecutionResult(
+            executedActions: executedActions,
+            executedToolUseIDs: executedIDs,
+            kindTokens: kindTokens,
+            status: "complete",
+            breakReason: nil
+        )
     }
 
     /// Maps an element's CG-global center (top-left origin, from AX) into the
@@ -5835,21 +6230,19 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     /// The title of a sheet or modal dialog currently focused in the frontmost
-    /// app, or nil when the UI is in its normal state. Off-main — AX calls block.
+    /// app, or nil when the UI is in its normal state. AppKit/AX stay on main.
     private static func unexpectedModal() async -> String? {
-        await Task.detached { () -> String? in
-            guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
-            let appRef = AXUIElementCreateApplication(app.processIdentifier)
-            AXClient.setMessagingTimeout(appRef)
-            guard case .success(let window) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
-                return nil
-            }
-            let role = axString(window, kAXRoleAttribute) ?? ""
-            let subrole = axString(window, kAXSubroleAttribute) ?? ""
-            guard role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" else { return nil }
-            let title = axString(window, kAXTitleAttribute) ?? ""
-            return title.isEmpty ? (role == "AXSheet" ? "sheet" : "dialog") : title
-        }.value
+        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
+        let appRef = AXUIElementCreateApplication(app.processIdentifier)
+        AXClient.setMessagingTimeout(appRef)
+        guard case .success(let window) = AXClient.elementAttribute(appRef, kAXFocusedWindowAttribute as String) else {
+            return nil
+        }
+        let role = axString(window, kAXRoleAttribute) ?? ""
+        let subrole = axString(window, kAXSubroleAttribute) ?? ""
+        guard role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" else { return nil }
+        let title = axString(window, kAXTitleAttribute) ?? ""
+        return title.isEmpty ? (role == "AXSheet" ? "sheet" : "dialog") : title
     }
 
     private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
@@ -7457,16 +7850,21 @@ public final class CascadeAppModel: ObservableObject {
 		                        try await clickAction(step, at: cached.point)
 		                        let cacheVerification = await Self.verifyUIChange(after: cacheInitialState)
 		                        if cacheVerification.changed {
-		                            _ = await recipeTargetCache.promote(
-                                            targetCacheContext,
+			                            _ = await recipeTargetCache.promote(
+	                                            targetCacheContext,
+	                                            point: cached.point,
+	                                            tier: cached.tier,
+	                                            verifiedScore: cached.verifiedScore,
+	                                            source: cached.source,
+	                                            anchorHash: cached.anchorHash
+	                                        )
+                                        await promoteActionTrajectoryRecipeCache(
+                                            step: step,
                                             point: cached.point,
-                                            tier: cached.tier,
-                                            verifiedScore: cached.verifiedScore,
-                                            source: cached.source,
-                                            anchorHash: cached.anchorHash
+                                            stateFingerprint: cacheInitialState.map { String($0.rootHash) }
                                         )
-		                            unverifiedStreak = 0
-		                            _ = try? await store.appendAudit(AuditEvent(
+			                            unverifiedStreak = 0
+			                            _ = try? await store.appendAudit(AuditEvent(
 		                                actor: "agent",
 		                                action: "recipe.target_cache.hit",
 		                                detail: Self.recipeTargetCacheAuditDetail(
@@ -7491,8 +7889,13 @@ public final class CascadeAppModel: ObservableObject {
 		                            try? await Task.sleep(for: .milliseconds(500))
 		                            continue
 		                        }
-		                        let demoted = await recipeTargetCache.demote(targetCacheContext)
-	                        _ = try? await store.appendAudit(AuditEvent(
+			                        let demoted = await recipeTargetCache.demote(targetCacheContext)
+                                    await demoteActionTrajectoryRecipeCache(
+                                        step: step,
+                                        stateFingerprint: cacheInitialState.map { String($0.rootHash) },
+                                        reason: .wrongScreen
+                                    )
+		                        _ = try? await store.appendAudit(AuditEvent(
 	                            actor: "agent",
 	                            action: "recipe.target_cache.demote",
 	                            detail: Self.recipeTargetCacheAuditDetail(
@@ -7502,9 +7905,80 @@ public final class CascadeAppModel: ObservableObject {
 		                                confidence: demoted?.confidence,
 		                                deltaReason: cacheVerification.reason
 		                            )
-		                        ))
-		                    }
-	                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
+			                        ))
+			                    }
+                                    if previousVerifiedEntry == nil,
+                                       let targetCacheContext,
+                                       await ensureActionTrajectoryCacheSchema() {
+                                    let persistentState = ActionTrajectoryState(
+                                        appName: step.appName,
+                                        bundleIdentifier: step.bundleIdentifier,
+                                        windowTitle: step.windowTitleHint,
+                                        axFingerprint: cacheInitialState.map { String($0.rootHash) }
+                                    )
+                                    if let persistentLookup = try? await store.lookupActionTrajectoryCache(
+                                        goal: step.humanLabel,
+                                        state: persistentState,
+                                        targetDescriptor: step.targetDescriptor,
+                                        targetText: step.ocrAnchor ?? step.text,
+                                        actionKind: "click"
+                                    ),
+                                       let persistentRow = persistentLookup.executable?.row,
+                                       case .click(let cachedX, let cachedY)? = Self.actionTrajectoryCUAction(
+                                            kind: persistentRow.actionKind,
+                                            json: persistentRow.actionJSON
+                                       ) {
+                                        let cachedPoint = CGPoint(x: cachedX, y: cachedY)
+                                        try await driver.act(.computerUse(.move(x: cachedPoint.x, y: cachedPoint.y)))
+                                        try? await Task.sleep(for: .milliseconds(320))
+                                        try await clickAction(step, at: cachedPoint)
+                                        let persistentVerification = await Self.verifyUIChange(after: cacheInitialState)
+                                        if persistentVerification.changed {
+                                            _ = await recipeTargetCache.promote(
+                                                targetCacheContext,
+                                                point: cachedPoint,
+                                                tier: .ax,
+                                                verifiedScore: persistentRow.confidence,
+                                                source: .accessibility,
+                                                anchorHash: persistentRow.targetDescriptor.map(AuditIdentity.hash)
+                                            )
+                                            _ = try? await store.promoteActionTrajectoryCache(
+                                                source: .recipe,
+                                                goal: step.humanLabel,
+                                                state: persistentState,
+                                                targetDescriptor: step.targetDescriptor,
+                                                targetText: step.ocrAnchor ?? step.text,
+                                                action: ActionTrajectoryCacheAction(
+                                                    kind: persistentRow.actionKind,
+                                                    json: persistentRow.actionJSON,
+                                                    preconditionJSON: persistentRow.preconditionJSON,
+                                                    postconditionJSON: persistentRow.postconditionJSON
+                                                )
+                                            )
+                                            unverifiedStreak = 0
+                                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+                                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "persistent_cache")))
+                                            try? await Task.sleep(for: .milliseconds(500))
+                                            continue
+                                        }
+                                        if persistentVerification.unavailable {
+                                            unverifiedStreak = 0
+                                            if !verifyUnavailableLogged {
+                                                verifyUnavailableLogged = true
+                                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
+                                            }
+                                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+                                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "persistent_cache")))
+                                            try? await Task.sleep(for: .milliseconds(500))
+                                            continue
+                                        }
+                                        _ = try? await store.demoteActionTrajectoryCache(
+                                            id: persistentRow.id,
+                                            reason: .wrongScreen
+                                        )
+                                    }
+                                }
+		                    // Re-grounding cascade. Tier 1 (ax): re-find the element by its
 	                    // recorded AX label in the live tree. Tier 2 (ocr): B4's ON-DEVICE
                     // OCR grounder — find the recorded target's text on the live frame
                     // via Apple Vision, no model round-trip, and it sees canvas/Electron
@@ -7692,18 +8166,23 @@ public final class CascadeAppModel: ObservableObject {
                                                 source: targetSource,
                                                 anchorHash: targetAnchorHash
                                             )
-		                                _ = try? await store.appendAudit(AuditEvent(
-		                                    actor: "agent",
-		                                    action: "recipe.target_cache.promote",
-		                                    detail: Self.recipeTargetCacheAuditDetail(
-		                                        step: step,
-		                                        tier: cacheTier,
-		                                        confidence: promoted.confidence,
-		                                        deltaReason: verification.reason
-		                                    )
-		                                ))
-		                            }
-		                        } else if verification.unavailable {
+			                                _ = try? await store.appendAudit(AuditEvent(
+			                                    actor: "agent",
+			                                    action: "recipe.target_cache.promote",
+			                                    detail: Self.recipeTargetCacheAuditDetail(
+			                                        step: step,
+			                                        tier: cacheTier,
+			                                        confidence: promoted.confidence,
+			                                        deltaReason: verification.reason
+			                                    )
+			                                ))
+			                            }
+                                        await promoteActionTrajectoryRecipeCache(
+                                            step: step,
+                                            point: target,
+                                            stateFingerprint: before.map { String($0.rootHash) }
+                                        )
+			                        } else if verification.unavailable {
 		                            unverifiedStreak = 0
 		                        } else {
 		                            // One corrective retry at the recorded coordinate (if the
@@ -7723,18 +8202,23 @@ public final class CascadeAppModel: ObservableObject {
                                                     source: .recordedPoint,
                                                     anchorHash: nil
                                                 )
-		                                    _ = try? await store.appendAudit(AuditEvent(
-		                                        actor: "agent",
-		                                        action: "recipe.target_cache.promote",
-		                                        detail: Self.recipeTargetCacheAuditDetail(
-		                                            step: step,
-		                                            tier: .recorded,
-		                                            confidence: promoted.confidence,
-		                                            deltaReason: retryVerification.reason
-		                                        )
-		                                    ))
-		                                }
-		                            } else if retryVerification.unavailable {
+			                                    _ = try? await store.appendAudit(AuditEvent(
+			                                        actor: "agent",
+			                                        action: "recipe.target_cache.promote",
+			                                        detail: Self.recipeTargetCacheAuditDetail(
+			                                            step: step,
+			                                            tier: .recorded,
+			                                            confidence: promoted.confidence,
+			                                            deltaReason: retryVerification.reason
+			                                        )
+			                                    ))
+			                                }
+                                            await promoteActionTrajectoryRecipeCache(
+                                                step: step,
+                                                point: recorded,
+                                                stateFingerprint: before.map { String($0.rootHash) }
+                                            )
+			                            } else if retryVerification.unavailable {
 		                                unverifiedStreak = 0
 		                            } else {
 	                                unverifiedStreak += 1
@@ -8013,6 +8497,9 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private static func uiState() async -> UIStateSnapshot? {
+        // Off-main by design: AXUIElement calls are IPC (no TIS-style main-thread
+        // assert) and a hung frontmost app would otherwise block the main actor —
+        // and STOP — for up to 5 polls × 600 nodes × 0.3s AX timeouts.
         await Task.detached(priority: .userInitiated) {
             AXElementResolver.frontmostState(limit: 600, depth: 10)
         }.value
@@ -8037,6 +8524,186 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         return UIVerificationResult(status: .unchanged, reason: lastSummary)
+    }
+
+    private func actionTrajectoryCachePreflight(goal: String, firstScreenshotPNG: Data) async -> ActionTrajectoryCacheLookup? {
+        guard await ensureActionTrajectoryCacheSchema() else { return nil }
+        let state = await actionTrajectoryState(firstScreenshotPNG: firstScreenshotPNG)
+        return try? await store.lookupActionTrajectoryCache(
+            goal: goal,
+            state: state,
+            topK: 3
+        )
+    }
+
+    private func ensureActionTrajectoryCacheSchema() async -> Bool {
+        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore) else { return false }
+        do {
+            try await store.ensureActionTrajectoryCacheSchema()
+            return true
+        } catch {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "action_cache.schema",
+                detail: "status=failed errorHash=\(Self.auditHash(String(describing: error)))"
+            ))
+            return false
+        }
+    }
+
+    private func actionTrajectoryState(firstScreenshotPNG: Data) async -> ActionTrajectoryState {
+        let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
+        let grid = Self.gridHashes(ofJPEG: firstScreenshotPNG) ?? []
+        let ui = await Self.uiState()
+        let modalPresent = await Self.unexpectedModal() != nil
+        return ActionTrajectoryState(
+            appName: snapshot.appName,
+            bundleIdentifier: snapshot.bundleIdentifier,
+            windowTitle: snapshot.windowTitle,
+            screenHash: grid.first,
+            screenGridHashes: grid,
+            axFingerprint: ui.map { String($0.rootHash) },
+            modalPresent: modalPresent
+        )
+    }
+
+    private nonisolated static func frontmostAppMatches(_ name: String) async -> Bool {
+        await MainActor.run {
+            guard let front = NSWorkspace.shared.frontmostApplication?.localizedName else {
+                return false
+            }
+            return front.localizedCaseInsensitiveContains(name)
+                || name.localizedCaseInsensitiveContains(front)
+        }
+    }
+
+    private func promoteActionTrajectoryRecipeCache(
+        step: RecipeStep,
+        point: CGPoint,
+        stateFingerprint: String?
+    ) async {
+        guard await ensureActionTrajectoryCacheSchema(),
+              step.kind == .click,
+              let actionJSON = Self.actionTrajectoryActionJSON(
+                for: .click(x: point.x, y: point.y),
+                targetDescriptor: step.targetDescriptor
+              ) else {
+            return
+        }
+        let state = ActionTrajectoryState(
+            appName: step.appName,
+            bundleIdentifier: step.bundleIdentifier,
+            windowTitle: step.windowTitleHint,
+            axFingerprint: stateFingerprint
+        )
+        _ = try? await store.promoteActionTrajectoryCache(
+            source: .recipe,
+            goal: step.humanLabel,
+            state: state,
+            targetDescriptor: step.targetDescriptor,
+            targetText: step.ocrAnchor ?? step.text,
+            action: ActionTrajectoryCacheAction(kind: "click", json: actionJSON)
+        )
+    }
+
+    private func demoteActionTrajectoryRecipeCache(
+        step: RecipeStep,
+        stateFingerprint: String?,
+        reason: ActionTrajectoryCacheDecisionReason
+    ) async {
+        guard await ensureActionTrajectoryCacheSchema(),
+              step.kind == .click else {
+            return
+        }
+        let state = ActionTrajectoryState(
+            appName: step.appName,
+            bundleIdentifier: step.bundleIdentifier,
+            windowTitle: step.windowTitleHint,
+            axFingerprint: stateFingerprint
+        )
+        guard let lookup = try? await store.lookupActionTrajectoryCache(
+            goal: step.humanLabel,
+            state: state,
+            targetDescriptor: step.targetDescriptor,
+            targetText: step.ocrAnchor ?? step.text,
+            actionKind: "click",
+            audit: false
+        ), let row = lookup.executable?.row else {
+            return
+        }
+        _ = try? await store.demoteActionTrajectoryCache(id: row.id, reason: reason)
+    }
+
+    nonisolated static func actionTrajectoryCUAction(kind: String, json: String) -> CUAction? {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        switch ActionTrajectoryCacheAction.normalizedKind(kind) {
+        case "open_app":
+            guard let app = stringValue(object, keys: ["app", "name", "app_name"]) else { return nil }
+            return .openApp(app)
+        case "open_url":
+            return nil
+        case "click":
+            guard let x = doubleValue(object["x"]), let y = doubleValue(object["y"]) else { return nil }
+            return .click(x: x, y: y)
+        case "scroll":
+            guard let x = doubleValue(object["x"]), let y = doubleValue(object["y"]) else { return nil }
+            let direction = stringValue(object, keys: ["direction"]) ?? "down"
+            let amount = intValue(object["amount"]) ?? 3
+            return .scroll(x: x, y: y, direction: direction, amount: amount)
+        default:
+            return nil
+        }
+    }
+
+    nonisolated static func actionTrajectoryActionJSON(for action: CUAction, targetDescriptor: String? = nil) -> String? {
+        let object: [String: Any]
+        switch action {
+        case .openApp(let name):
+            object = ["app": name]
+        case .openURL(let url):
+            object = ["url": url]
+        case .click(let x, let y):
+            var value: [String: Any] = ["x": x, "y": y]
+            if let targetDescriptor { value["target_descriptor"] = targetDescriptor }
+            object = value
+        case .scroll(let x, let y, let direction, let amount):
+            object = ["x": x, "y": y, "direction": direction, "amount": amount]
+        default:
+            return nil
+        }
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private nonisolated static func stringValue(_ object: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
+    }
+
+    private nonisolated static func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
     }
 
     private func recipeTargetCacheContext(for step: RecipeStep, stateFingerprint: String) async -> RecipeTargetCacheContext {

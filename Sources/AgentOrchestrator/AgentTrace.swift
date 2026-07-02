@@ -131,6 +131,23 @@ public struct AgentTrace: Sendable, Equatable, Codable {
     }
     public var modelCallCount: Int { spans.filter { $0.kind == .model }.count }
     public var toolCallCount: Int { spans.filter { $0.kind == .tool }.count }
+    public var actionCacheHits: Int {
+        spans.filter { $0.attributes["audit.action"] == "action_cache.hit" && $0.attributes["status"] == "hit" }.count
+    }
+    public var semanticTrajectoryHits: Int {
+        spans.filter { $0.attributes["audit.action"] == "action_cache.hit" && $0.attributes["status"] == "semantic" }.count
+    }
+    public var actionCacheDemotions: Int {
+        spans.filter { $0.attributes["audit.action"] == "action_cache.demote" }.count
+    }
+    public var cacheFalseHitCount: Int { actionCacheDemotions }
+    public var cacheSavedModelCalls: Int { actionCacheHits }
+    public var cacheBypassReasons: [String] {
+        spans.compactMap { span in
+            guard span.attributes["audit.action"]?.hasPrefix("action_cache.") == true else { return nil }
+            return span.attributes["reason"]
+        }
+    }
     public var durationMs: Int { spans.map { $0.startMs + $0.durationMs }.max() ?? 0 }
     public var failureKinds: [AgentFailureKind] { spans.compactMap(\.failureKind) }
     public var succeeded: Bool { spans.allSatisfy { $0.status == .ok } }
@@ -1384,6 +1401,9 @@ public enum AgentTraceBuilder {
             } else if event.action == "assist.noeffect" || event.action == "assist.stalled" {
                 self.kind = .eval
                 self.name = event.action
+            } else if event.action.hasPrefix("action_cache.") {
+                self.kind = event.action == "action_cache.hit" ? .retrieval : .eval
+                self.name = event.action
             } else if event.action == "computer.act" || event.action == "computer.zoom" {
                 self.kind = .step
                 self.name = event.action
@@ -1677,6 +1697,16 @@ public enum AgentTraceBuilder {
         for key in ["status", "outcome", "failure", "failureKind", "recoveryAction"] {
             if let value = auditValue(key, in: event.detail) {
                 attributes[key] = safeToken(value)
+            }
+        }
+        if event.action.hasPrefix("action_cache.") {
+            for key in ["reason", "rowHash", "goalHash", "appHash", "bundleHash", "windowHash", "targetHash", "kind", "successes", "failures", "candidates"] {
+                if let value = auditValue(key, in: event.detail) {
+                    attributes["action_cache.\(key)"] = safeToken(value)
+                    if key == "reason" || key == "kind" || key == "candidates" {
+                        attributes[key] = safeToken(value)
+                    }
+                }
             }
         }
         return attributes
