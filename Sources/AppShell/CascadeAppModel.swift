@@ -6054,6 +6054,7 @@ public final class CascadeAppModel: ObservableObject {
         // instead of being restored to the user's parked position.
         let skill = frontmostSkill()
         let keepPointer = skill?.keysFollowPointer == true
+        let semanticAXActions = defaultsStore.bool(forKey: Self.experimentalGroundingVerifierKey)
         do {
             switch action {
             case .move(let x, let y):
@@ -6079,9 +6080,44 @@ public final class CascadeAppModel: ObservableObject {
                     // but afterwards the cursor goes back to the user — the app's
                     // learned position stays at p because warps emit no events.
                     lastPointerRoutedPoint = p
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: Self.axActionAuditDetail(kind: "click", point: p, path: "coordinate", status: "pointer_routed")
+                    ))
                     try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
-                } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p) {
+                } else if skill?.axUnreliable == true {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: Self.axActionAuditDetail(kind: "click", point: p, path: "coordinate", status: "ax_unreliable")
+                    ))
                     try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
+                } else if semanticAXActions {
+                    let axResult = Self.axSemanticActivate(atCG: p)
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: axResult.auditDetail(kind: "click", point: p)
+                    ))
+                    if !axResult.succeeded {
+                        try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
+                    }
+                } else {
+                    let usedAX = Self.axActivate(atCG: p)
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: Self.axActionAuditDetail(
+                            kind: "click",
+                            point: p,
+                            path: usedAX ? "ax_legacy" : "coordinate",
+                            status: usedAX ? "success" : "fallback"
+                        )
+                    ))
+                    if !usedAX {
+                        try await clickRestoringCursor { try await driver.act(.computerUse(.click(x: p.x, y: p.y))) }
+                    }
                 }
             case .doubleClick(let x, let y):
                 let flight = guidanceOverlay.navigate(toGlobalPoint: globalAppKit(x, y))
@@ -6124,9 +6160,44 @@ public final class CascadeAppModel: ObservableObject {
                 let p = cg(x, y)
                 if keepPointer {
                     lastPointerRoutedPoint = p
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: Self.axActionAuditDetail(kind: "right_click", point: p, path: "coordinate", status: "pointer_routed")
+                    ))
                     try await clickRestoringCursor(settleMs: 30) { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
-                } else if skill?.axUnreliable == true || !Self.axActivate(atCG: p, showMenu: true) {
+                } else if skill?.axUnreliable == true {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: Self.axActionAuditDetail(kind: "right_click", point: p, path: "coordinate", status: "ax_unreliable")
+                    ))
                     try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
+                } else if semanticAXActions {
+                    let axResult = Self.axSemanticActivate(atCG: p, showMenu: true)
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: axResult.auditDetail(kind: "right_click", point: p)
+                    ))
+                    if !axResult.succeeded {
+                        try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
+                    }
+                } else {
+                    let usedAX = Self.axActivate(atCG: p, showMenu: true)
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "computer.click",
+                        detail: Self.axActionAuditDetail(
+                            kind: "right_click",
+                            point: p,
+                            path: usedAX ? "ax_legacy" : "coordinate",
+                            status: usedAX ? "success" : "fallback"
+                        )
+                    ))
+                    if !usedAX {
+                        try await clickRestoringCursor { try await driver.act(.computerUse(.rightClick(x: p.x, y: p.y))) }
+                    }
                 }
             case .type(let text):
                 // Tiered text entry (tiptour-macos ActionExecutor pattern): AX
@@ -6159,7 +6230,7 @@ public final class CascadeAppModel: ObservableObject {
                 } else if skill?.axUnreliable != true {
                     // Skipped for axUnreliable apps: their AX tree can accept the
                     // write and report success while nothing visible changes.
-                    let axResult = Self.axInsertText(text)
+                    let axResult = Self.axInsertText(text, allowValueSet: semanticAXActions)
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "computer.type", detail: axResult.auditDetail))
                     if axResult.succeeded { break }
                     let pasteResult = try await pasteText(text, pointerRouted: keepPointer)
@@ -6526,6 +6597,211 @@ public final class CascadeAppModel: ObservableObject {
         CGWarpMouseCursorPosition(origin)
     }
 
+    private struct AXSemanticActivationResult {
+        let succeeded: Bool
+        let path: String
+        let status: String
+        let axAction: String?
+        let role: String?
+        let subrole: String?
+        let actionCount: Int
+        let frame: CGRect?
+        let fallbackReason: String?
+
+        func auditDetail(kind: String, point: CGPoint) -> String {
+            CascadeAppModel.axActionAuditDetail(
+                kind: kind,
+                point: point,
+                path: path,
+                status: status,
+                axAction: axAction,
+                role: role,
+                subrole: subrole,
+                actionCount: actionCount,
+                frame: frame,
+                fallbackReason: fallbackReason
+            )
+        }
+    }
+
+    private nonisolated static func axActionAuditDetail(
+        kind: String,
+        point: CGPoint,
+        path: String,
+        status: String,
+        axAction: String? = nil,
+        role: String? = nil,
+        subrole: String? = nil,
+        actionCount: Int = 0,
+        frame: CGRect? = nil,
+        fallbackReason: String? = nil
+    ) -> String {
+        var parts = [
+            "kind=\(safeAuditToken(kind))",
+            "path=\(safeAuditToken(path))",
+            "status=\(safeAuditToken(status))",
+            "x=\(Int(point.x.rounded()))",
+            "y=\(Int(point.y.rounded()))",
+            "actionCount=\(max(0, actionCount))",
+            "roleHash=\(auditHash(role))",
+            "roleChars=\(role?.count ?? 0)",
+            "subroleHash=\(auditHash(subrole))",
+            "subroleChars=\(subrole?.count ?? 0)",
+        ]
+        if let axAction {
+            parts.append("axAction=\(safeAuditToken(shortAXActionName(axAction)))")
+        }
+        if let frame {
+            parts.append("frameX=\(Int(frame.minX.rounded()))")
+            parts.append("frameY=\(Int(frame.minY.rounded()))")
+            parts.append("frameW=\(Int(frame.width.rounded()))")
+            parts.append("frameH=\(Int(frame.height.rounded()))")
+        }
+        if let fallbackReason {
+            parts.append("fallbackReason=\(safeAuditToken(fallbackReason))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private nonisolated static func shortAXActionName(_ action: String) -> String {
+        var name = action.hasPrefix("AX") ? String(action.dropFirst(2)) : action
+        if name.hasSuffix("Action") {
+            name = String(name.dropLast("Action".count))
+        }
+        return name.lowercased()
+    }
+
+    private static func axElementSummary(_ element: AXUIElement) -> (role: String?, subrole: String?, actions: [String], frame: CGRect?) {
+        let role = axString(element, kAXRoleAttribute)
+        let subrole = axString(element, kAXSubroleAttribute)
+        let actions = AXClient.actionNames(element)
+        let frame: CGRect?
+        if case .success(let rect) = AXClient.frame(element) {
+            frame = rect
+        } else {
+            frame = nil
+        }
+        return (role, subrole, actions, frame)
+    }
+
+    /// Tries semantic AX activation on the live element under a CG-global point,
+    /// climbing through a few ancestors because hit-testing often lands on an
+    /// unlabeled child inside the actual control. A failed result means the caller
+    /// should run the legacy coordinate click.
+    private static func axSemanticActivate(atCG point: CGPoint, showMenu: Bool = false) -> AXSemanticActivationResult {
+        guard case .success(let hitElement) = AXClient.elementAtPosition(point) else {
+            return AXSemanticActivationResult(
+                succeeded: false,
+                path: "coordinate",
+                status: "no_ax_element",
+                axAction: nil,
+                role: nil,
+                subrole: nil,
+                actionCount: 0,
+                frame: nil,
+                fallbackReason: "element_at_position_failed"
+            )
+        }
+
+        var element = hitElement
+        var lastRole: String?
+        var lastSubrole: String?
+        var lastActions: [String] = []
+        var lastFrame: CGRect?
+        var failedAction: String?
+
+        for _ in 0..<5 {
+            let summary = axElementSummary(element)
+            lastRole = summary.role
+            lastSubrole = summary.subrole
+            lastActions = summary.actions
+            lastFrame = summary.frame
+
+            if !showMenu, let role = summary.role, textRoles.contains(role) {
+                if role == "AXTextArea" {
+                    return AXSemanticActivationResult(
+                        succeeded: false,
+                        path: "coordinate",
+                        status: "text_area_caret",
+                        axAction: nil,
+                        role: summary.role,
+                        subrole: summary.subrole,
+                        actionCount: summary.actions.count,
+                        frame: summary.frame,
+                        fallbackReason: "coordinate_places_caret"
+                    )
+                }
+                if AXClient.setAttribute(element, kAXFocusedAttribute as String, value: kCFBooleanTrue) == .success {
+                    return AXSemanticActivationResult(
+                        succeeded: true,
+                        path: "ax_semantic",
+                        status: "success",
+                        axAction: "AXSetFocused",
+                        role: summary.role,
+                        subrole: summary.subrole,
+                        actionCount: summary.actions.count,
+                        frame: summary.frame,
+                        fallbackReason: nil
+                    )
+                }
+            }
+
+            let wanted = showMenu
+                ? [kAXShowMenuAction]
+                : [kAXPressAction, kAXConfirmAction, kAXPickAction]
+            for action in wanted where summary.actions.contains(action) {
+                failedAction = action
+                if AXClient.performAction(element, action) == .success {
+                    return AXSemanticActivationResult(
+                        succeeded: true,
+                        path: "ax_semantic",
+                        status: "success",
+                        axAction: action,
+                        role: summary.role,
+                        subrole: summary.subrole,
+                        actionCount: summary.actions.count,
+                        frame: summary.frame,
+                        fallbackReason: nil
+                    )
+                }
+            }
+
+            if !showMenu, summary.actions.contains(kAXRaiseAction) {
+                failedAction = kAXRaiseAction
+                if AXClient.performAction(element, kAXRaiseAction) == .success {
+                    return AXSemanticActivationResult(
+                        succeeded: true,
+                        path: "ax_semantic",
+                        status: "success",
+                        axAction: kAXRaiseAction,
+                        role: summary.role,
+                        subrole: summary.subrole,
+                        actionCount: summary.actions.count,
+                        frame: summary.frame,
+                        fallbackReason: nil
+                    )
+                }
+            }
+
+            guard case .success(let parent) = AXClient.elementAttribute(element, kAXParentAttribute as String) else {
+                break
+            }
+            element = parent
+        }
+
+        return AXSemanticActivationResult(
+            succeeded: false,
+            path: "coordinate",
+            status: failedAction == nil ? "no_ax_action" : "ax_action_failed",
+            axAction: failedAction,
+            role: lastRole,
+            subrole: lastSubrole,
+            actionCount: lastActions.count,
+            frame: lastFrame,
+            fallbackReason: "semantic_not_applied"
+        )
+    }
+
     /// Presses the UI element at a global top-left point through the Accessibility
     /// API — a real activation with **zero cursor movement**. Focuses text inputs so
     /// a following `type` lands. Returns false if nothing actionable is there (the
@@ -6627,7 +6903,7 @@ public final class CascadeAppModel: ObservableObject {
     /// `AXSelectedText` (the tiptour-macos `ActionExecutor` pattern — see
     /// docs/THIRD_PARTY_NOTICES.md). Returns false when there's no focused,
     /// settable text element — the caller falls back to synthetic keystrokes.
-    private static func axInsertText(_ text: String) -> TextInjectionResult {
+    private static func axInsertText(_ text: String, allowValueSet: Bool = false) -> TextInjectionResult {
         let start = Date()
         let secureInput = SecureInputGuard.isActive()
         let front = NSWorkspace.shared.frontmostApplication
@@ -6650,6 +6926,25 @@ public final class CascadeAppModel: ObservableObject {
                 elapsedMs: elapsedMilliseconds(since: start)
             )
         }
+        func setValueResult(on element: AXUIElement, previousReason: String) -> TextInjectionResult {
+            guard allowValueSet else {
+                return result(succeeded: false, element: element, reason: previousReason)
+            }
+            guard AXClient.isSettable(element, kAXValueAttribute as String) else {
+                return result(succeeded: false, element: element, reason: previousReason + "-value-not-settable")
+            }
+            guard AXClient.setAttribute(element, kAXValueAttribute as String, value: text as CFString) == .success else {
+                return result(succeeded: false, element: element, reason: previousReason + "-set-value-failed")
+            }
+            let after = axString(element, kAXValueAttribute as String)
+            let matched = after?.contains(text)
+            return result(
+                succeeded: matched == true,
+                element: element,
+                readback: Self.textReadbackStatus(matched),
+                reason: matched == true ? "ax-value" : previousReason + "-value-readback-mismatch"
+            )
+        }
         guard let app = front,
               // Never AX-insert into Cascade's OWN focused element — if Cascade is
               // frontmost the insert "succeeds" silently and the text never reaches
@@ -6662,10 +6957,10 @@ public final class CascadeAppModel: ObservableObject {
             return result(succeeded: false, reason: "no-focused-element")
         }
         guard AXClient.isSettable(element, kAXSelectedTextAttribute as String) else {
-            return result(succeeded: false, element: element, reason: "selected-text-not-settable")
+            return setValueResult(on: element, previousReason: "selected-text-not-settable")
         }
         guard AXClient.setAttribute(element, kAXSelectedTextAttribute as String, value: text as CFString) == .success else {
-            return result(succeeded: false, element: element, reason: "set-selected-text-failed")
+            return setValueResult(on: element, previousReason: "set-selected-text-failed")
         }
         // VERIFY the insert actually took. Web <input>/combobox elements (Google
         // Flights, most sites) ACCEPT the set and report .success while the value
