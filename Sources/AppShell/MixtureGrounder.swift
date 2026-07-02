@@ -39,6 +39,15 @@ import ProviderKit
 //    never a weak word-overlap, and must land on the captured display.
 //  • The no-effect detector remains the backstop: a wrong AX click is caught and
 //    re-grounded exactly like a wrong visual click.
+//  • d16 (crop-and-refine, ScreenSpot-Pro / DRS-GUI; rides the same
+//    `cascade.experimentalCompressedObservation` flag as the d12 picker): when a
+//    request DOES reach the visual grounder, weak local AX/OCR evidence first
+//    narrows an uncertain region (`LocalRegionNarrower.narrowUncertainRegion`),
+//    the capture is cropped to it at native pixel resolution, and the model
+//    grounds the CROP — higher effective resolution than a downscaled full
+//    screen. Crop-local output maps back through the d01 `CoordinateTransform`
+//    (never ad-hoc scale math); any miss falls back to the unchanged full-screen
+//    call, so the flag-off path and the no-evidence path are byte-identical.
 // Toggle off with `cascade.mixtureGrounding = false` to A/B against pure visual.
 // See [[cascade-cu-downgrade-research]].
 
@@ -245,6 +254,12 @@ public struct MixtureGrounder: VisualGrounder {
     private let cacheMode: GroundingCacheMode
     private let cacheContextProvider: @Sendable () async -> AppWindowSnapshot
     private let regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
+    /// d16 (test seam only): replaces the live `LocalRegionNarrower` uncertain-
+    /// region harvest that decides WHERE to crop before a visual round trip.
+    /// nil — the shipped default — keeps the real AX/OCR narrowing; tests
+    /// inject a fixed region so the crop → ground → map-back chain is provable
+    /// without live accessibility.
+    private let cropRefineRegionOverride: (@Sendable (Data, String, Int, Int) async -> CGRect?)?
     /// d14 (test seam only): replaces the LIVE bounded AX harvest the d12 mark
     /// picker resolves planner-named ids against. nil — the shipped default —
     /// keeps the real `AXElementResolver.interactables` walk (including the
@@ -277,6 +292,7 @@ public struct MixtureGrounder: VisualGrounder {
             await MainActor.run { AppWindowObserver.snapshot() }
         },
         regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
+        cropRefineRegionOverride: (@Sendable (Data, String, Int, Int) async -> CGRect?)? = nil,
         markPickHarvestOverride: (@MainActor @Sendable () -> [AXElementResolver.Match])? = nil,
         onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)? = nil,
         onRouteDecision: (@Sendable (RouteOutcome) async -> Void)? = nil,
@@ -293,6 +309,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.cacheMode = cacheMode
         self.cacheContextProvider = cacheContextProvider
         self.regionNarrower = regionNarrower
+        self.cropRefineRegionOverride = cropRefineRegionOverride
         self.markPickHarvestOverride = markPickHarvestOverride
         self.onRuntimeProfile = onRuntimeProfile
         self.onRouteDecision = onRouteDecision
@@ -323,6 +340,16 @@ public struct MixtureGrounder: VisualGrounder {
                 return axPoint
             }
             guard groundingCache != nil else {
+                // d16: try the crop-refined pass first; a nil (flag off / no
+                // local evidence / crop miss) leaves the full-screen call
+                // exactly as shipped.
+                if let refined = await cropRefinedVisualResult(
+                    screenshot: screenshot, target: target,
+                    displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints,
+                    options: .default
+                ), let refinedPoint = refined.selectedPoint {
+                    return refinedPoint
+                }
                 return await base.ground(
                     screenshot: screenshot, target: target,
                     displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
@@ -390,6 +417,17 @@ public struct MixtureGrounder: VisualGrounder {
                     return indexed
                 }
                 let start = ContinuousClock.now
+                // d16: crop-and-refine before the full-screen visual call; nil
+                // falls through to the unchanged shipped path.
+                if let refined = await cropRefinedVisualResult(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints,
+                    options: options
+                ) {
+                    return refined
+                }
                 let result = await base.groundResult(
                     screenshot: screenshot,
                     target: target,
@@ -493,6 +531,19 @@ public struct MixtureGrounder: VisualGrounder {
                 baseResult = Self.mergedGroundingResult(indexedResult, visualResult)
             } else if let indexedResult {
                 baseResult = indexedResult
+            } else if let refined = await cropRefinedVisualResult(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                options: options
+            ) {
+                // d16: the primary visual call grounds a CROP of the uncertain
+                // region when local evidence can localize it; the verifier and
+                // any best-of-N escalation below still see display-local
+                // points, and the escalation retry deliberately stays
+                // full-screen (a second, different look).
+                baseResult = refined
             } else {
                 baseResult = await base.groundResult(
                     screenshot: screenshot,
@@ -646,6 +697,18 @@ public struct MixtureGrounder: VisualGrounder {
         case .miss:
             return GroundingResult()
         case .key(let key):
+            // d16: crop-and-refine before the full-screen visual call; the
+            // remapped result is display-local, so it caches like any other.
+            if let refined = await cropRefinedVisualResult(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                options: .default
+            ) {
+                await storeGroundingCacheResult(refined, key: key)
+                return refined
+            }
             let result = await base.groundResult(
                 screenshot: screenshot,
                 target: target,
@@ -684,6 +747,15 @@ public struct MixtureGrounder: VisualGrounder {
                 displayHeightPoints: displayHeightPoints
             ) {
                 result = indexed
+            } else if let refined = await cropRefinedVisualResult(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                options: options
+            ) {
+                // d16: crop-and-refine before the full-screen visual call.
+                result = refined
             } else {
                 result = await base.groundResult(
                     screenshot: screenshot,
@@ -696,6 +768,128 @@ public struct MixtureGrounder: VisualGrounder {
             await storeGroundingCacheResult(result, key: key)
             return result
         }
+    }
+
+    /// d16 (crop-and-refine, ScreenSpot-Pro / DRS-GUI; default OFF — rides the
+    /// same `cascade.experimentalCompressedObservation` flag as the d12 picker):
+    /// before a full-screen visual round trip, ask the local narrower for the
+    /// UNCERTAIN region (the padded union of weak AX/OCR matches), crop the
+    /// capture to it at native pixel resolution, and ground the crop — the
+    /// model sees the region at far higher effective resolution than the
+    /// downscaled full screen. Crop-local output maps back to display points
+    /// through the d01 `CoordinateTransform`. Returns nil whenever the flag is
+    /// off, no region was found, the crop could not be built, or the crop pass
+    /// produced nothing actionable — the caller then runs its existing
+    /// full-screen path unchanged, so behavior never regresses.
+    private func cropRefinedVisualResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        options: GroundingRequestOptions
+    ) async -> GroundingResult? {
+        guard axPickerEnabled else { return nil }
+        let region: CGRect?
+        if let cropRefineRegionOverride {
+            region = await cropRefineRegionOverride(screenshot, target, displayWidthPoints, displayHeightPoints)
+        } else {
+            let narrower = LocalRegionNarrower(
+                skills: skills,
+                policy: Self.trustPolicy,
+                onRuntimeProfile: onRuntimeProfile
+            )
+            region = await narrower.narrowUncertainRegion(
+                screenshot: screenshot,
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints
+            )
+        }
+        guard let region,
+              let plan = LocalRegionNarrower.cropRefinePlan(
+                  screenshot: screenshot,
+                  region: region,
+                  displayWidthPoints: displayWidthPoints,
+                  displayHeightPoints: displayHeightPoints
+              )
+        else { return nil }
+        let cropResult = await base.groundResult(
+            screenshot: plan.croppedJPEG,
+            target: target,
+            displayWidthPoints: plan.cropWidthPoints,
+            displayHeightPoints: plan.cropHeightPoints,
+            options: Self.cropRefineOptions(from: options, plan: plan)
+        )
+        let refined = Self.cropRefinedResult(cropResult, plan: plan)
+        guard refined.isActionable(minConfidence: options.minimumConfidence) else { return nil }
+        return refined
+    }
+
+    /// Request options for the crop-local pass: sampling/confidence/risk carry
+    /// over; priority regions are remapped into crop-local points; region
+    /// budgeting is off because the crop IS the focus region.
+    static func cropRefineOptions(
+        from options: GroundingRequestOptions,
+        plan: LocalRegionNarrower.CropRefinePlan
+    ) -> GroundingRequestOptions {
+        GroundingRequestOptions(
+            sampleCount: options.sampleCount,
+            maxDispersion: options.maxDispersion,
+            minimumConfidence: options.minimumConfidence,
+            risk: options.risk,
+            priorityRegions: options.priorityRegions.compactMap(plan.cropLocalRect(fromDisplayRect:)),
+            useRegionBudgeting: false,
+            hostedMode: options.hostedMode
+        )
+    }
+
+    /// Maps every candidate of a crop-local grounding result back into
+    /// display-local AppKit points via the plan's typed transforms, and
+    /// rebuilds each coordinate chain against the REAL screenshot geometry so
+    /// the `agent.ground` audit shows the true crop rect (numeric geometry
+    /// only). Verdicts, selection, and confidences carry over untouched.
+    static func cropRefinedResult(
+        _ result: GroundingResult,
+        plan: LocalRegionNarrower.CropRefinePlan
+    ) -> GroundingResult {
+        let candidates = result.candidates.map { candidate -> GroundingCandidate in
+            let mappedPoint = candidate.point.flatMap(plan.displayPoint(fromCropLocalPoint:))
+            return GroundingCandidate(
+                point: mappedPoint,
+                region: candidate.region.flatMap(plan.displayRect(fromCropLocalRect:)),
+                confidence: candidate.confidence,
+                source: candidate.source,
+                coordinateSpace: candidate.coordinateSpace,
+                rawModel: candidate.rawModel,
+                latency: candidate.latency,
+                dispersion: candidate.dispersion,
+                reason: candidate.reason.map { "\($0) crop_refined" } ?? "crop_refined",
+                candidateID: candidate.candidateID,
+                markNumber: candidate.markNumber,
+                displayBounds: candidate.displayBounds.flatMap(plan.displayRect(fromCropLocalRect:)),
+                imageBounds: candidate.imageBounds,
+                role: candidate.role,
+                label: candidate.label,
+                nearbyOCRText: candidate.nearbyOCRText,
+                ocrDistancePoints: candidate.ocrDistancePoints,
+                agreeingSources: candidate.agreeingSources,
+                coordinateChain: candidate.point == nil
+                    ? candidate.coordinateChain
+                    : plan.refinedCoordinateChain(
+                        from: candidate.coordinateChain,
+                        cropLocalPoint: candidate.point,
+                        displayPoint: mappedPoint
+                    )
+            )
+        }
+        return GroundingResult(
+            candidates: candidates,
+            selectedIndex: result.selectedIndex,
+            selectedCandidateID: result.selectedCandidateID,
+            verifierVerdict: result.verifierVerdict,
+            verifierFailureKind: result.verifierFailureKind,
+            alternativeCount: result.alternativeCount
+        )
     }
 
     private func groundingCacheProbe(
