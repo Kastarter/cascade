@@ -68,15 +68,103 @@ public struct MixtureGrounder: VisualGrounder {
         public let result: GroundingResult
         public let outcome: VerifiedGroundingOutcome
         public let verifierResult: GroundingVerifierResult
+        /// d13: set whenever candidates from DIFFERENT sources (AX vs OCR vs
+        /// vision) pointed at materially different places — records who won,
+        /// how the conflict was resolved, and the losers. Audit-safe: hashes,
+        /// counts, and numeric coordinates only.
+        public let disagreement: DisagreementDecision?
 
         public init(
             result: GroundingResult,
             outcome: VerifiedGroundingOutcome,
-            verifierResult: GroundingVerifierResult
+            verifierResult: GroundingVerifierResult,
+            disagreement: DisagreementDecision? = nil
         ) {
             self.result = result
             self.outcome = outcome
             self.verifierResult = verifierResult
+            self.disagreement = disagreement
+        }
+    }
+
+    // MARK: - d13 disagreement/confidence gate
+
+    /// A non-selected contender in a cross-source grounding disagreement.
+    /// Carries ONLY audit-safe fields (source, hash, scores, numeric coords).
+    public struct DisagreementLoser: Equatable, Sendable {
+        public let source: GroundingSource
+        public let candidateHash: String?
+        public let score: Double
+        public let confidence: Double
+        public let x: Double?
+        public let y: Double?
+
+        public init(
+            source: GroundingSource,
+            candidateHash: String?,
+            score: Double,
+            confidence: Double,
+            x: Double?,
+            y: Double?
+        ) {
+            self.source = source
+            self.candidateHash = candidateHash
+            self.score = score
+            self.confidence = confidence
+            self.x = x
+            self.y = y
+        }
+    }
+
+    /// How a cross-source grounding disagreement (AX vs OCR vs vision naming
+    /// different spots for the same target) was decided.
+    public struct DisagreementDecision: Equatable, Sendable {
+        public enum Resolution: String, Equatable, Sendable {
+            /// The verifier's own arbitration already picked a winner — the
+            /// decision is recorded for the audit trail only.
+            case verifier
+            /// The trust-order gate picked the higher-trust source (native AX
+            /// over OCR over synthetic-from-vision) among viable contenders.
+            case trustOrder = "trust_order"
+            /// Contenders shared a trust tier — verifier score + candidate
+            /// confidence broke the tie.
+            case confidence
+            /// Disagreement detected but the gate is off (flag disabled) — the
+            /// would-be winner is recorded so the A/B is observable, with no
+            /// behavior change.
+            case observed
+        }
+
+        public let resolution: Resolution
+        public let winnerSource: GroundingSource?
+        public let winnerHash: String?
+        public let winnerScore: Double?
+        public let winnerX: Double?
+        public let winnerY: Double?
+        public let sourceCount: Int
+        public let clusterCount: Int
+        public let losers: [DisagreementLoser]
+
+        public init(
+            resolution: Resolution,
+            winnerSource: GroundingSource?,
+            winnerHash: String?,
+            winnerScore: Double?,
+            winnerX: Double?,
+            winnerY: Double?,
+            sourceCount: Int,
+            clusterCount: Int,
+            losers: [DisagreementLoser]
+        ) {
+            self.resolution = resolution
+            self.winnerSource = winnerSource
+            self.winnerHash = winnerHash
+            self.winnerScore = winnerScore
+            self.winnerX = winnerX
+            self.winnerY = winnerY
+            self.sourceCount = sourceCount
+            self.clusterCount = clusterCount
+            self.losers = losers
         }
     }
 
@@ -87,6 +175,8 @@ public struct MixtureGrounder: VisualGrounder {
         public let candidateCount: Int
         public let selectedSource: GroundingSource?
         public let selectedCandidateHash: String?
+        /// d13: present when cross-source candidates disagreed on this ground.
+        public let disagreement: DisagreementDecision?
 
         public init(
             target: String,
@@ -94,7 +184,8 @@ public struct MixtureGrounder: VisualGrounder {
             verifierResult: GroundingVerifierResult,
             candidateCount: Int,
             selectedSource: GroundingSource? = nil,
-            selectedCandidateHash: String? = nil
+            selectedCandidateHash: String? = nil,
+            disagreement: DisagreementDecision? = nil
         ) {
             self.target = target
             self.outcome = outcome
@@ -102,6 +193,7 @@ public struct MixtureGrounder: VisualGrounder {
             self.candidateCount = candidateCount
             self.selectedSource = selectedSource
             self.selectedCandidateHash = selectedCandidateHash
+            self.disagreement = disagreement
         }
     }
 
@@ -316,7 +408,8 @@ public struct MixtureGrounder: VisualGrounder {
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints,
                 previousAnchor: previousAnchor,
-                candidateFailureCounts: candidateFailureCounts
+                candidateFailureCounts: candidateFailureCounts,
+                trustOrderGateEnabled: axPickerEnabled
             )
             if axOnly.verifierResult.verdict == .accept, axOnly.result.selectedPoint != nil {
                 await recordVerifierOutcomeIfNeeded(axOnly, target: target)
@@ -376,7 +469,8 @@ public struct MixtureGrounder: VisualGrounder {
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints,
                 previousAnchor: previousAnchor,
-                candidateFailureCounts: candidateFailureCounts
+                candidateFailureCounts: candidateFailureCounts,
+                trustOrderGateEnabled: axPickerEnabled
             )
             // Fail fast on noCandidates: if the verifier found NOTHING to ground (an
             // AX-sparse view with no viable candidate), a second visual-grounding pass
@@ -401,7 +495,8 @@ public struct MixtureGrounder: VisualGrounder {
                     displayWidthPoints: displayWidthPoints,
                     displayHeightPoints: displayHeightPoints,
                     previousAnchor: previousAnchor,
-                    candidateFailureCounts: candidateFailureCounts
+                    candidateFailureCounts: candidateFailureCounts,
+                    trustOrderGateEnabled: axPickerEnabled
                 )
             }
             await recordVerifierOutcomeIfNeeded(selection, target: target)
@@ -703,7 +798,8 @@ public struct MixtureGrounder: VisualGrounder {
                     ?? selection.result.selectedCandidate?.rawModel
                     ?? selection.result.selectedCandidateID
                     ?? selection.result.selectedCandidate?.label
-            )
+            ),
+            disagreement: selection.disagreement
         ))
     }
 
@@ -1066,6 +1162,7 @@ public struct MixtureGrounder: VisualGrounder {
         displayHeightPoints: Int,
         previousAnchor: VerifiedGroundingAnchor? = nil,
         candidateFailureCounts: [String: Int] = [:],
+        trustOrderGateEnabled: Bool = false,
         now: Date = Date()
     ) -> VerifiedGroundingSelection {
         let context = GroundingVerifierContext(
@@ -1077,6 +1174,34 @@ public struct MixtureGrounder: VisualGrounder {
             axCandidate: axCandidate,
             baseResult: baseResult
         )
+        let selection = Self.arbitratedSelection(
+            verifierCandidates: verifierCandidates,
+            baseResult: baseResult,
+            context: context,
+            previousAnchor: previousAnchor,
+            candidateFailureCounts: candidateFailureCounts,
+            now: now
+        )
+        // d13: when AX / OCR / vision candidates named materially DIFFERENT
+        // places, record the decision + the losers, and — gate on — resolve a
+        // verifier-ambiguous stall by trust order (native AX > OCR >
+        // synthetic-from-vision) + confidence instead of abstaining.
+        return Self.applyingDisagreementGate(
+            selection,
+            candidates: verifierCandidates,
+            context: context,
+            gateEnabled: trustOrderGateEnabled
+        )
+    }
+
+    private static func arbitratedSelection(
+        verifierCandidates: [GroundingVerifierCandidate],
+        baseResult: GroundingResult,
+        context: GroundingVerifierContext,
+        previousAnchor: VerifiedGroundingAnchor?,
+        candidateFailureCounts: [String: Int],
+        now: Date
+    ) -> VerifiedGroundingSelection {
         let verifierResult = GroundingVerifier().verify(verifierCandidates, context: context)
 
         guard let previousAnchor else {
@@ -1211,6 +1336,208 @@ public struct MixtureGrounder: VisualGrounder {
                 verifierResult: verifierResult
             )
         }
+    }
+
+    /// One per-source best viable candidate competing in a disagreement.
+    struct DisagreementContender {
+        let candidate: GroundingVerifierCandidate
+        let score: Double
+    }
+
+    /// d13 disagreement/confidence gate. Detects a CROSS-SOURCE disagreement —
+    /// viable candidates from at least two different sources whose points sit at
+    /// materially different places — and:
+    ///  • always attaches an audit-safe `DisagreementDecision` (who won, who
+    ///    lost, how) to the selection, so every conflict is visible in the
+    ///    `grounding.disagreement` audit row;
+    ///  • when `gateEnabled` (rides the same `cascade.experimentalCompressedObservation`
+    ///    flag as the d11/d12 AX-first cluster) and the verifier ABSTAINED as
+    ///    ambiguous, resolves the stall by trust order — native AX > DOM > OCR >
+    ///    synthetic-from-vision (`sourceRank`) — then verifier score, then the
+    ///    candidate's own confidence. A native AX contender only competes at all
+    ///    when verification did NOT prove it wrong (it must clear the same viable
+    ///    floor as everyone else), honoring "AX outranks synthetic unless
+    ///    verification proves AX wrong".
+    /// Gate off (the default) keeps shipped behavior byte-identical apart from
+    /// the added audit record. Same-source ambiguity ("which of two buttons?")
+    /// is NOT a trust-order question and always stays ambiguous.
+    static func applyingDisagreementGate(
+        _ selection: VerifiedGroundingSelection,
+        candidates: [GroundingVerifierCandidate],
+        context: GroundingVerifierContext,
+        gateEnabled: Bool
+    ) -> VerifiedGroundingSelection {
+        let contenders = disagreementContenders(
+            candidates: candidates,
+            verifierResult: selection.verifierResult,
+            context: context
+        )
+        guard contenders.count >= 2 else { return selection }
+        let clusterCount = locationClusterCount(contenders.compactMap(\.candidate.candidate.point))
+        // All sources point at essentially the same spot: corroboration, not
+        // disagreement — nothing to arbitrate or audit here.
+        guard clusterCount >= 2 else { return selection }
+        let sourceCount = Set(contenders.map(\.candidate.candidate.source.rawValue)).count
+
+        switch selection.outcome {
+        case .selected, .retryNextCandidate:
+            guard selection.result.selectedPoint != nil else { return selection }
+            let winnerID = selection.result.selectedCandidateID
+            let winner = candidates.first { $0.id == winnerID }
+            let winnerScore = selection.verifierResult.scores.first { $0.id == winnerID }?.score
+                ?? selection.verifierResult.confidence
+            return VerifiedGroundingSelection(
+                result: selection.result,
+                outcome: selection.outcome,
+                verifierResult: selection.verifierResult,
+                disagreement: disagreementDecision(
+                    resolution: .verifier,
+                    winner: winner,
+                    winnerScore: winnerScore,
+                    contenders: contenders,
+                    sourceCount: sourceCount,
+                    clusterCount: clusterCount
+                )
+            )
+        case .abstained(.ambiguous), .ambiguous:
+            // Contenders arrive pre-sorted by (trust order, score, confidence).
+            guard let top = contenders.first else { return selection }
+            guard gateEnabled else {
+                // Observe-only: record the would-be winner so the flag A/B is
+                // measurable, keep the abstain.
+                return VerifiedGroundingSelection(
+                    result: selection.result,
+                    outcome: selection.outcome,
+                    verifierResult: selection.verifierResult,
+                    disagreement: disagreementDecision(
+                        resolution: .observed,
+                        winner: top.candidate,
+                        winnerScore: top.score,
+                        contenders: contenders,
+                        sourceCount: sourceCount,
+                        clusterCount: clusterCount
+                    )
+                )
+            }
+            let runnerUp = contenders.dropFirst().first
+            let wonByTrust = runnerUp.map {
+                sourceRank(top.candidate.candidate.source) > sourceRank($0.candidate.candidate.source)
+            } ?? false
+            let accepted = bestOfNAcceptedResult(
+                selectedID: top.candidate.id,
+                verifierResult: selection.verifierResult
+            )
+            let resolved = Self.selection(
+                from: candidates,
+                selectedID: top.candidate.id,
+                outcome: .selected,
+                verifierResult: accepted
+            )
+            return VerifiedGroundingSelection(
+                result: resolved.result,
+                outcome: resolved.outcome,
+                verifierResult: resolved.verifierResult,
+                disagreement: disagreementDecision(
+                    resolution: wonByTrust ? .trustOrder : .confidence,
+                    winner: top.candidate,
+                    winnerScore: top.score,
+                    contenders: contenders,
+                    sourceCount: sourceCount,
+                    clusterCount: clusterCount
+                )
+            )
+        default:
+            return selection
+        }
+    }
+
+    /// The best VIABLE candidate per source (no verifier failure, score above
+    /// the ambiguity floor, an actual point), sorted by trust order → verifier
+    /// score → candidate confidence → id. Fewer than two distinct sources means
+    /// there is no cross-source disagreement to arbitrate.
+    static func disagreementContenders(
+        candidates: [GroundingVerifierCandidate],
+        verifierResult: GroundingVerifierResult,
+        context: GroundingVerifierContext
+    ) -> [DisagreementContender] {
+        // Anyone the verifier would have accepted alone, or that sat inside the
+        // ambiguity margin of an acceptable best, is a legitimate contender; a
+        // score below this floor was "proven wrong" and never wins by trust.
+        let floor = max(0.45, context.acceptThreshold - context.ambiguityMargin)
+        let candidatesByID = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var bestPerSource: [GroundingSource: DisagreementContender] = [:]
+        let orderedScores = verifierResult.scores.sorted {
+            if $0.score == $1.score { return $0.id < $1.id }
+            return $0.score > $1.score
+        }
+        for score in orderedScores where score.failureKind == nil && score.score >= floor {
+            guard let candidate = candidatesByID[score.id], candidate.candidate.point != nil else { continue }
+            let source = candidate.candidate.source
+            guard bestPerSource[source] == nil else { continue }
+            bestPerSource[source] = DisagreementContender(candidate: candidate, score: score.score)
+        }
+        guard bestPerSource.count >= 2 else { return [] }
+        return bestPerSource.values.sorted { lhs, rhs in
+            let lhsRank = sourceRank(lhs.candidate.candidate.source)
+            let rhsRank = sourceRank(rhs.candidate.candidate.source)
+            if lhsRank != rhsRank { return lhsRank > rhsRank }
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            if lhs.candidate.candidate.confidence != rhs.candidate.candidate.confidence {
+                return lhs.candidate.candidate.confidence > rhs.candidate.candidate.confidence
+            }
+            return lhs.candidate.id < rhs.candidate.id
+        }
+    }
+
+    /// Number of distinct locations among the contenders, using the same
+    /// agreement tolerance as the rest of the mixture (`pointsAgree`, 24pt).
+    static func locationClusterCount(_ points: [CGPoint]) -> Int {
+        var clusters: [CGPoint] = []
+        for point in points where !clusters.contains(where: { pointsAgree($0, point) }) {
+            clusters.append(point)
+        }
+        return clusters.count
+    }
+
+    private static func disagreementDecision(
+        resolution: DisagreementDecision.Resolution,
+        winner: GroundingVerifierCandidate?,
+        winnerScore: Double?,
+        contenders: [DisagreementContender],
+        sourceCount: Int,
+        clusterCount: Int
+    ) -> DisagreementDecision {
+        let losers = contenders
+            .filter { $0.candidate.id != winner?.id }
+            .map { contender in
+                DisagreementLoser(
+                    source: contender.candidate.candidate.source,
+                    candidateHash: auditHash(
+                        contender.candidate.candidate.candidateID
+                            ?? contender.candidate.candidate.rawModel
+                            ?? contender.candidate.label
+                    ),
+                    score: contender.score,
+                    confidence: contender.candidate.candidate.confidence,
+                    x: contender.candidate.candidate.point.map { Double($0.x) },
+                    y: contender.candidate.candidate.point.map { Double($0.y) }
+                )
+            }
+        return DisagreementDecision(
+            resolution: resolution,
+            winnerSource: winner?.candidate.source,
+            winnerHash: auditHash(
+                winner?.candidate.candidateID
+                    ?? winner?.candidate.rawModel
+                    ?? winner?.label
+            ),
+            winnerScore: winnerScore,
+            winnerX: winner?.candidate.point.map { Double($0.x) },
+            winnerY: winner?.candidate.point.map { Double($0.y) },
+            sourceCount: sourceCount,
+            clusterCount: clusterCount,
+            losers: losers
+        )
     }
 
     private func runtimeProfileForFrontmost() async -> AXRuntimeProfile? {

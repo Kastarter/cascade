@@ -3052,6 +3052,16 @@ public final class CascadeAppModel: ObservableObject {
                     action: "grounding.verifier",
                     detail: Self.groundingVerifierAuditDetail(outcome)
                 ))
+                // d13: cross-source disagreement (AX vs OCR vs vision) gets its
+                // own row — the decision, the trust order that made it, and the
+                // losers. Hashes/counts + numeric coords only, never raw text.
+                if let disagreement = outcome.disagreement {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "grounding.disagreement",
+                        detail: Self.groundingDisagreementAuditDetail(disagreement)
+                    ))
+                }
                 guard outcome.verifierResult.verdict != .accept else { return }
                 guard let self else { return }
                 let appName = await MainActor.run { AppWindowObserver.snapshot().appName }
@@ -5838,6 +5848,49 @@ public final class CascadeAppModel: ObservableObject {
         }
         if let selectedCandidateHash = outcome.selectedCandidateHash {
             parts.append("selectedCandidateHash=\(safeAuditToken(selectedCandidateHash))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// d13 `grounding.disagreement` audit row: which source won a cross-source
+    /// grounding conflict, how it was resolved (verifier | trust_order |
+    /// confidence | observed), and every loser's source/hash/score/coords.
+    /// Privacy: enum raw values, FNV hashes, counts, and numeric coordinates
+    /// only — no labels, no OCR text, no target text.
+    nonisolated static func groundingDisagreementAuditDetail(
+        _ decision: MixtureGrounder.DisagreementDecision
+    ) -> String {
+        var parts = [
+            "resolution=\(safeAuditToken(decision.resolution.rawValue))",
+            "sources=\(decision.sourceCount)",
+            "clusters=\(decision.clusterCount)",
+            "losers=\(decision.losers.count)",
+        ]
+        if let winnerSource = decision.winnerSource {
+            parts.append("winnerSource=\(safeAuditToken(winnerSource.rawValue))")
+        }
+        if let winnerHash = decision.winnerHash {
+            parts.append("winnerHash=\(safeAuditToken(winnerHash))")
+        }
+        if let winnerScore = decision.winnerScore {
+            parts.append("winnerScore=\(String(format: "%.2f", winnerScore))")
+        }
+        if let winnerX = decision.winnerX, let winnerY = decision.winnerY,
+           winnerX.isFinite, winnerY.isFinite {
+            parts.append("winnerX=\(Int(winnerX.rounded()))")
+            parts.append("winnerY=\(Int(winnerY.rounded()))")
+        }
+        for (index, loser) in decision.losers.prefix(3).enumerated() {
+            parts.append("loser\(index)Source=\(safeAuditToken(loser.source.rawValue))")
+            if let hash = loser.candidateHash {
+                parts.append("loser\(index)Hash=\(safeAuditToken(hash))")
+            }
+            parts.append("loser\(index)Score=\(String(format: "%.2f", loser.score))")
+            parts.append("loser\(index)Conf=\(String(format: "%.2f", loser.confidence))")
+            if let x = loser.x, let y = loser.y, x.isFinite, y.isFinite {
+                parts.append("loser\(index)X=\(Int(x.rounded()))")
+                parts.append("loser\(index)Y=\(Int(y.rounded()))")
+            }
         }
         return parts.joined(separator: " ")
     }

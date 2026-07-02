@@ -243,8 +243,120 @@ struct MixtureGrounderVerifierTests {
         #expect(demote.result.selectedPoint == nil)
     }
 
+    // MARK: - d13 disagreement/confidence gate
+
+    @Test func crossSourceDisagreementResolvesByTrustOrderWhenGateEnabled() {
+        let axPoint = CGPoint(x: 200, y: 300)
+        let visionPoint = CGPoint(x: 600, y: 300)
+        let selection = MixtureGrounder.selectVerifiedCandidate(
+            axCandidate: verifierCandidate(
+                id: "ax:send",
+                point: axPoint,
+                role: "AXButton",
+                label: "Send",
+                confidence: 0.9
+            ),
+            baseResult: result([barePointCandidate(point: visionPoint, source: .uiTars)]),
+            target: "Send",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700,
+            trustOrderGateEnabled: true
+        )
+
+        #expect(selection.outcome == .selected)
+        #expect(selection.result.selectedPoint == axPoint)
+        #expect(selection.result.selectedCandidate?.source == .accessibility)
+        #expect(selection.verifierResult.verdict == .accept)
+        let decision = selection.disagreement
+        #expect(decision?.resolution == .trustOrder)
+        #expect(decision?.winnerSource == .accessibility)
+        #expect(decision?.sourceCount == 2)
+        #expect(decision?.clusterCount == 2)
+        #expect(decision?.losers.count == 1)
+        #expect(decision?.losers.first?.source == .uiTars)
+        #expect(decision?.losers.first?.x == Double(visionPoint.x))
+        #expect(decision?.losers.first?.y == Double(visionPoint.y))
+    }
+
+    @Test func crossSourceDisagreementIsObservedOnlyWhenGateDisabled() {
+        let selection = MixtureGrounder.selectVerifiedCandidate(
+            axCandidate: verifierCandidate(
+                id: "ax:send",
+                point: CGPoint(x: 200, y: 300),
+                role: "AXButton",
+                label: "Send",
+                confidence: 0.9
+            ),
+            baseResult: result([barePointCandidate(point: CGPoint(x: 600, y: 300), source: .uiTars)]),
+            target: "Send",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700
+        )
+
+        #expect(selection.outcome == .abstained(.ambiguous))
+        #expect(selection.result.selectedPoint == nil)
+        #expect(selection.disagreement?.resolution == .observed)
+        #expect(selection.disagreement?.winnerSource == .accessibility)
+        #expect(selection.disagreement?.losers.count == 1)
+    }
+
+    @Test func sameSourceAmbiguityCarriesNoDisagreementDecision() {
+        let selection = MixtureGrounder.selectVerifiedCandidate(
+            axCandidate: nil,
+            baseResult: result([
+                candidate(point: CGPoint(x: 420, y: 320), rawModel: "Send"),
+                candidate(point: CGPoint(x: 470, y: 320), rawModel: "Send"),
+            ]),
+            target: "Send",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700,
+            trustOrderGateEnabled: true
+        )
+
+        #expect(selection.outcome == .abstained(.ambiguous))
+        #expect(selection.disagreement == nil)
+    }
+
+    @Test func agreeingCrossSourceCandidatesAreCorroborationNotDisagreement() {
+        let axPoint = CGPoint(x: 200, y: 300)
+        let selection = MixtureGrounder.selectVerifiedCandidate(
+            axCandidate: verifierCandidate(
+                id: "ax:send",
+                point: axPoint,
+                role: "AXButton",
+                label: "Send",
+                confidence: 0.9
+            ),
+            baseResult: result([
+                barePointCandidate(point: CGPoint(x: 210, y: 305), source: .uiTars)
+            ]),
+            target: "Send",
+            displayWidthPoints: 1000,
+            displayHeightPoints: 700,
+            trustOrderGateEnabled: true
+        )
+
+        #expect(selection.disagreement == nil)
+        #expect(selection.outcome == .selected)
+    }
+
     private func result(_ candidates: [GroundingCandidate]) -> GroundingResult {
         GroundingResult(candidates: candidates, selectedIndex: candidates.isEmpty ? nil : 0)
+    }
+
+    /// A metadata-less visual-grounder hit: no role/label/OCR evidence, just a
+    /// confident point — the shape UI-TARS returns for canvas targets.
+    private func barePointCandidate(
+        point: CGPoint,
+        source: GroundingSource,
+        confidence: Double = 0.95
+    ) -> GroundingCandidate {
+        GroundingCandidate(
+            point: point,
+            confidence: confidence,
+            source: source,
+            coordinateSpace: .displayLocalAppKitPoints
+        )
     }
 
     private func candidate(
@@ -267,15 +379,17 @@ struct MixtureGrounderVerifierTests {
         id: String,
         point: CGPoint,
         role: String,
-        label: String
+        label: String,
+        confidence: Double = 0.95
     ) -> GroundingVerifierCandidate {
         GroundingVerifierCandidate(
             id: id,
             candidate: GroundingCandidate(
                 point: point,
-                confidence: 0.95,
+                confidence: confidence,
                 source: .accessibility,
-                coordinateSpace: .displayLocalAppKitPoints
+                coordinateSpace: .displayLocalAppKitPoints,
+                candidateID: id
             ),
             role: role,
             label: label,
