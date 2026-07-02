@@ -3,6 +3,7 @@ import CoreGraphics
 import Testing
 
 @testable import AppShell
+@testable import ComputerUseKit
 
 /// Pins the mixture grounder's coordinate conversion — the one number that, if
 /// wrong, sends every AX-grounded click into empty space. `displayLocalPoint`
@@ -46,6 +47,48 @@ struct MixtureGrounderTests {
             cgGlobalCenter: CGPoint(x: 2080, y: 360), displayCGBounds: bounds, displayHeightPoints: 720
         )
         #expect(p == CGPoint(x: 640, y: 360))
+    }
+
+    @Test func knownAXElementFrameMapsThroughCoordinateTransformToLogicalClickPoint() throws {
+        // d04 deterministic harness: the final proof still needs a live click-lands
+        // run, but this pins the AX-frame -> typed-transform -> executor point chain.
+        let displayCGBounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let screen = try #require(CoordinateTransform.ScreenGeometry(
+            displayID: 42,
+            logicalFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            backingPixelSize: CGSize(width: 2880, height: 1800)
+        ))
+        let transform = try #require(CoordinateTransform(screen: screen))
+        let axFrame = CGRect(x: 96, y: 4, width: 112, height: 28)
+        let axMatch = AXElementResolver.Match(
+            center: CGPoint(x: axFrame.midX, y: axFrame.midY),
+            role: "AXMenuBarItem",
+            title: "d04 live target",
+            score: 3
+        )
+
+        let mapping = try #require(MixtureGrounder.displayLocalMapping(
+            cgGlobalCenter: axMatch.center,
+            displayCGBounds: displayCGBounds,
+            transform: transform
+        ))
+
+        #expect(mapping.point == CGPoint(x: 152, y: 882))
+        #expect(mapping.chain.mappedPoint == CGPoint(x: 152, y: 882))
+        #expect(mapping.chain.backingPoint == CGPoint(x: 304, y: 36))
+        #expect(mapping.chain.cropPoint == CGPoint(x: 304, y: 36))
+
+        let auditTokens = mapping.chain.auditTokens(rawModel: axMatch.title).joined(separator: " ")
+        #expect(auditTokens.contains("coordChain=CoordinateTransform.v1"))
+        #expect(auditTokens.contains("screenW=1440.00"))
+        #expect(auditTokens.contains("screenH=900.00"))
+        #expect(auditTokens.contains("backingScaleX=2.00"))
+        #expect(auditTokens.contains("backingScaleY=2.00"))
+        #expect(auditTokens.contains("backingX=304.00"))
+        #expect(auditTokens.contains("backingY=36.00"))
+        #expect(auditTokens.contains("mappedX=152.00"))
+        #expect(auditTokens.contains("mappedY=882.00"))
+        #expect(!auditTokens.contains(axMatch.title))
     }
 
     @Test func pointOffTheDisplayIsRejected() {
