@@ -532,7 +532,7 @@ private struct ActionTrajectoryPreparedQuery {
         self.bundleIdentifier = ActionTrajectoryPrivacy.safeIdentifier(state.bundleIdentifier)
         self.windowTitleNorm = ActionTrajectoryPrivacy.normalizedStorageText(state.windowTitle)
         self.webAppID = ActionTrajectoryPrivacy.safeIdentifier(state.webAppID)
-        self.urlScope = ActionTrajectoryState.urlScope(from: state.urlScope)
+        self.urlScope = ActionTrajectoryPrivacy.safeURLScope(state.urlScope)
         self.screenHash = state.screenHash
         self.screenGridHashes = state.screenGridHashes
         self.ocrSimhash = state.ocrSimhash
@@ -580,7 +580,7 @@ private struct ActionTrajectoryPreparedInput {
         guard !PrivacyRules.isSensitive(appName: state.appName, bundleIdentifier: state.bundleIdentifier, windowTitle: state.windowTitle) else {
             return nil
         }
-        guard action.kind != "type", action.kind != "key", action.kind != "drag" else {
+        guard action.kind != "type", action.kind != "key", action.kind != "drag", action.kind != "open_url" else {
             return nil
         }
         guard let goalNorm = ActionTrajectoryPrivacy.normalizedStorageText(goal), !goalNorm.isEmpty else { return nil }
@@ -599,7 +599,7 @@ private struct ActionTrajectoryPreparedInput {
         self.bundleIdentifier = ActionTrajectoryPrivacy.safeIdentifier(state.bundleIdentifier)
         self.windowTitleNorm = ActionTrajectoryPrivacy.normalizedStorageText(state.windowTitle)
         self.webAppID = ActionTrajectoryPrivacy.safeIdentifier(state.webAppID)
-        self.urlScope = ActionTrajectoryState.urlScope(from: state.urlScope)
+        self.urlScope = ActionTrajectoryPrivacy.safeURLScope(state.urlScope)
         self.screenHash = state.screenHash
         self.screenGridHashes = state.screenGridHashes
         self.ocrSimhash = state.ocrSimhash
@@ -613,7 +613,7 @@ private struct ActionTrajectoryPreparedInput {
         self.embedding = LocalSemanticVector.vector(for: [goalNorm, targetDescriptorNorm, targetTextNorm, action.kind].compactMap { $0 }.joined(separator: " "))
         self.ttlPolicy = ttlPolicy
         self.actionKeyHash = ActionTrajectoryPrivacy.sha256Hex([
-            "v1",
+            "v2",
             source.rawValue,
             goalNorm,
             appNameNorm,
@@ -635,6 +635,24 @@ private struct ActionTrajectoryPreparedInput {
 
 private enum ActionTrajectoryPrivacy {
     static func normalizedStorageText(_ text: String?) -> String? {
+        guard let normalized = normalizedPlainText(text) else { return nil }
+        return privateDescriptor(field: "text", normalized: normalized)
+    }
+
+    static func safeIdentifier(_ text: String?) -> String? {
+        guard let normalized = normalizedPlainText(text) else { return nil }
+        return "id_\(AuditIdentity.hash(normalized))_chars_\(normalized.count)"
+    }
+
+    static func safeURLScope(_ text: String?) -> String? {
+        guard let scope = ActionTrajectoryState.urlScope(from: text),
+              let normalized = normalizedPlainText(scope) else {
+            return nil
+        }
+        return "url_\(AuditIdentity.hash(normalized))_chars_\(normalized.count)"
+    }
+
+    private static func normalizedPlainText(_ text: String?) -> String? {
         guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
             return nil
         }
@@ -644,16 +662,15 @@ private enum ActionTrajectoryPrivacy {
         return SemanticEmbeddingText.normalized(keywordRedacted).nilIfEmpty
     }
 
-    static func safeIdentifier(_ text: String?) -> String? {
-        guard let normalized = normalizedStorageText(text) else { return nil }
-        return normalized.replacingOccurrences(of: " ", with: ".").nilIfEmpty
+    private static func privateDescriptor(field: String, normalized: String) -> String {
+        "\(field)Hash=\(AuditIdentity.hash(normalized)) \(field)Chars=\(normalized.count)"
     }
 
     static func sanitizedJSON(_ json: String, actionKind: String) -> String? {
         guard actionKind != "type" else { return nil }
         guard let data = json.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) else {
-            return normalizedStorageText(json).map { #"{"valueHash":"\#(AuditIdentity.hash($0))","valueChars":\#($0.count)}"# }
+            return normalizedPlainText(json).map { #"{"valueHash":"\#(AuditIdentity.hash($0))","valueChars":\#($0.count)}"# }
         }
         let scrubbed = scrub(object, path: [])
         guard JSONSerialization.isValidJSONObject(scrubbed),
@@ -679,7 +696,11 @@ private enum ActionTrajectoryPrivacy {
                           let string = item.value as? String {
                     result[key] = ["textHash": AuditIdentity.hash(string), "textChars": string.count]
                 } else if normalizedKey == "url" || normalizedKey == "url_string" || normalizedKey == "href" {
-                    result[key] = ActionTrajectoryState.urlScope(from: item.value as? String) ?? "url_scope_unavailable"
+                    if let scope = ActionTrajectoryState.urlScope(from: item.value as? String) {
+                        result[key] = ["urlScopeHash": AuditIdentity.hash(scope), "urlScopeChars": scope.count]
+                    } else {
+                        result[key] = ["urlScopeHash": "none", "urlScopeChars": 0]
+                    }
                 } else {
                     result[key] = scrub(item.value, path: path + [key])
                 }
@@ -690,7 +711,7 @@ private enum ActionTrajectoryPrivacy {
         }
         if let string = value as? String {
             if let scope = ActionTrajectoryState.urlScope(from: string), string.contains("://") {
-                return scope
+                return ["urlScopeHash": AuditIdentity.hash(scope), "urlScopeChars": scope.count]
             }
             if PrivacyRules.isSensitiveText(string) || PIIDetector.containsHighConfidencePII(string) {
                 return ["textHash": AuditIdentity.hash(string), "textChars": string.count]
@@ -904,8 +925,8 @@ private extension CascadeStore {
 
     static func autoExecutable(row: ActionTrajectoryCacheRow, query: ActionTrajectoryPreparedQuery, anchorCompatible: Bool) -> Bool {
         switch row.actionKind {
-        case "open_app", "open_url", "scroll":
-            return true
+        case "open_app", "scroll":
+            return row.goalNorm == query.goalNorm
         case "click":
             return anchorCompatible && row.targetDescriptor != nil && query.targetDescriptorNorm != nil
         default:

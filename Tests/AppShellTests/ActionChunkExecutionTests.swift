@@ -89,12 +89,26 @@ struct ActionChunkExecutionTests {
             status: "modal"
         )
 
-        #expect(detail.contains("length=3"))
-        #expect(detail.contains("groups=2"))
-        #expect(detail.contains("kindsHash="))
-        #expect(detail.contains("status=modal"))
-        #expect(!detail.contains(rawText))
-        #expect(!detail.contains(rawURL))
+	        #expect(detail.contains("length=3"))
+	        #expect(detail.contains("groups=2"))
+	        #expect(detail.contains("kindsHash="))
+	        #expect(detail.contains("status=modal"))
+            #expect(detail.contains("deferred=0"))
+	        #expect(!detail.contains(rawText))
+	        #expect(!detail.contains(rawURL))
+
+        let deferred = CascadeAppModel.actionChunkAuditDetail(
+            length: 1,
+            groups: 1,
+            kindTokens: ["computer.click", "computer.open_url.\(rawURL)"],
+            status: "deferred",
+            deferred: 1,
+            breakReason: .nonAllowlisted
+        )
+        #expect(deferred.contains("status=deferred"))
+        #expect(deferred.contains("deferred=1"))
+        #expect(deferred.contains("breakReason=nonAllowlisted"))
+        #expect(!deferred.contains(rawURL))
 
         let compacted = CascadeAppModel.historyCompactedAuditDetail(.init(
             turns: 12,

@@ -111,16 +111,18 @@ func refreshAllUsesParameterizedMiningAndAuditsSafeSummaryWhenFlagIsEnabled() as
     defaults.set(true, forKey: CascadeAppModel.experimentalParameterizedMiningKey)
     try await store.insertInputEvents(events)
 
-    await model.refreshAll()
+	    await model.refreshAll()
 
-    #expect(model.detectedWaste.count == 1)
-    #expect(model.detectedWaste.first?.recipe.steps.filter(\.isParameter).first?.parameterKind == .ticker)
-    let audit = try await store.recentAudit(limit: 20)
-    let miningAudit = try #require(audit.first { $0.action == "workflow.parameterized_mining" })
+	    #expect(model.detectedWaste.count == 1)
+	    #expect(model.detectedWaste.first?.recipe.steps.filter(\.isParameter).first?.parameterKind == .ticker)
+        let windowHints = model.detectedWaste.first?.recipe.steps.compactMap(\.windowTitleHint).joined(separator: "|") ?? ""
+	    let audit = try await store.recentAudit(limit: 20)
+	    let miningAudit = try #require(audit.first { $0.action == "workflow.parameterized_mining" })
     #expect(miningAudit.detail.contains("enabled=true"))
     #expect(miningAudit.detail.contains("candidateCount=1"))
     #expect(miningAudit.detail.contains("slotCount=1"))
-    for raw in ["ETH", "SOL", "BTC", "LTC"] {
-        #expect(!miningAudit.detail.localizedCaseInsensitiveContains(raw))
-    }
-}
+	    for raw in ["ETH", "SOL", "BTC", "LTC"] {
+	        #expect(!miningAudit.detail.localizedCaseInsensitiveContains(raw))
+            #expect(!windowHints.localizedCaseInsensitiveContains(raw))
+	    }
+	}

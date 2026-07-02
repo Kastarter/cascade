@@ -3307,7 +3307,13 @@ public final class CascadeAppModel: ObservableObject {
             let before = await Self.uiState()
             let ok = await executeCU(cachedAction, on: screen)
             let verification = await Self.verifyUIChange(after: before)
-            if ok && (verification.changed || executable.row.actionKind == "open_app") {
+            let openAppVerified: Bool
+            if case .openApp(let name) = cachedAction {
+                openAppVerified = await Self.frontmostAppMatches(name)
+            } else {
+                openAppVerified = false
+            }
+            if ok && (verification.changed || openAppVerified) {
                 _ = try? await store.promoteActionTrajectoryCache(
                     source: executable.row.source,
                     goal: goal,
@@ -3362,6 +3368,23 @@ public final class CascadeAppModel: ObservableObject {
             agent.onActionRefused = { [weak self] detail in
                 guard let self else { return }
                 Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "agent", action: "agent.action.refused", detail: detail)) }
+            }
+            agent.onActionChunkPlanned = { [weak self] plan in
+                guard let self else { return }
+                Task {
+                    _ = try? await self.store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "action.chunk",
+                        detail: Self.actionChunkAuditDetail(
+                            length: plan.length,
+                            groups: plan.groups.count,
+                            kindTokens: plan.kindTokens + plan.deferredKindTokens,
+                            status: "deferred",
+                            deferred: plan.deferredToolUseIDs.count,
+                            breakReason: plan.breakReason
+                        )
+                    ))
+                }
             }
             // A long think used to look like a hang — the dock kept showing the
             // previous turn's line for 30+ seconds. The pulse carries the thinking
@@ -3573,15 +3596,19 @@ public final class CascadeAppModel: ObservableObject {
                     }
                 )
                 if result.executedActions > 0 { actedThisTurn = true }
-                if result.executedActions > 1 {
+                let plannedDeferredCount = step.chunkPlan?.deferredToolUseIDs.count ?? 0
+                let planBreakReason = step.chunkPlan?.breakReason
+                if result.executedActions > 1 || plannedDeferredCount > 0 {
                     _ = try? await store.appendAudit(AuditEvent(
                         actor: "agent",
                         action: "action.chunk",
                         detail: Self.actionChunkAuditDetail(
                             length: result.executedActions,
                             groups: result.executedToolUseIDs.count,
-                            kindTokens: result.kindTokens,
-                            status: result.status
+                            kindTokens: result.kindTokens + (step.chunkPlan?.deferredKindTokens ?? []),
+                            status: plannedDeferredCount > 0 ? "deferred" : result.status,
+                            deferred: plannedDeferredCount,
+                            breakReason: planBreakReason ?? result.breakReason
                         )
                     ))
                 }
@@ -5124,14 +5151,21 @@ public final class CascadeAppModel: ObservableObject {
         length: Int,
         groups: Int,
         kindTokens: [String],
-        status: String
+        status: String,
+        deferred: Int = 0,
+        breakReason: CUActionChunkBreakReason? = nil
     ) -> String {
-        [
+        var parts = [
             "length=\(length)",
             "groups=\(groups)",
             "kindsHash=\(auditHash(kindTokens.joined(separator: "|")))",
             "status=\(safeAuditToken(status))",
-        ].joined(separator: " ")
+            "deferred=\(deferred)",
+        ]
+        if let breakReason {
+            parts.append("breakReason=\(safeAuditToken(breakReason.rawValue))")
+        }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func assistStalledAuditDetail(engine: String? = nil, text: String) -> String {
@@ -7897,9 +7931,20 @@ public final class CascadeAppModel: ObservableObject {
                                             try? await Task.sleep(for: .milliseconds(500))
                                             continue
                                         }
+                                        if persistentVerification.unavailable {
+                                            unverifiedStreak = 0
+                                            if !verifyUnavailableLogged {
+                                                verifyUnavailableLogged = true
+                                                _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.verify.unavailable", detail: "AX fingerprint unavailable — steps run unverified"))
+                                            }
+                                            dock.show(title: "Step \(index + 1) of \(steps.count)", detail: Self.recipeLabel(step))
+                                            _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "recipe.step", detail: Self.recipeAuditDetail(step, tier: "persistent_cache")))
+                                            try? await Task.sleep(for: .milliseconds(500))
+                                            continue
+                                        }
                                         _ = try? await store.demoteActionTrajectoryCache(
                                             id: persistentRow.id,
-                                            reason: persistentVerification.unavailable ? .missingAnchor : .wrongScreen
+                                            reason: .wrongScreen
                                         )
                                     }
                                 }
@@ -8474,6 +8519,16 @@ public final class CascadeAppModel: ObservableObject {
         )
     }
 
+    private nonisolated static func frontmostAppMatches(_ name: String) async -> Bool {
+        await MainActor.run {
+            guard let front = NSWorkspace.shared.frontmostApplication?.localizedName else {
+                return false
+            }
+            return front.localizedCaseInsensitiveContains(name)
+                || name.localizedCaseInsensitiveContains(front)
+        }
+    }
+
     private func promoteActionTrajectoryRecipeCache(
         step: RecipeStep,
         point: CGPoint,
@@ -8541,8 +8596,7 @@ public final class CascadeAppModel: ObservableObject {
             guard let app = stringValue(object, keys: ["app", "name", "app_name"]) else { return nil }
             return .openApp(app)
         case "open_url":
-            guard let url = stringValue(object, keys: ["url", "url_scope", "scope"]) else { return nil }
-            return .openURL(url)
+            return nil
         case "click":
             guard let x = doubleValue(object["x"]), let y = doubleValue(object["y"]) else { return nil }
             return .click(x: x, y: y)

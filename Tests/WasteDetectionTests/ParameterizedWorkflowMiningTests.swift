@@ -117,12 +117,13 @@ func parameterizedMiningDoesNotLeakRawTickerValues() throws {
         useEpisodeMining: true,
         useParameterizedMining: true
     ).first)
-    let exposed = [
-        waste.signature,
-        waste.title,
-        waste.recipe.steps.map { $0.valueExamples.joined(separator: "|") }.joined(separator: "|"),
-        waste.recipe.humanSteps.joined(separator: "|")
-    ].joined(separator: "\n")
+	    let exposed = [
+	        waste.signature,
+	        waste.title,
+	        waste.recipe.steps.map { $0.valueExamples.joined(separator: "|") }.joined(separator: "|"),
+	        waste.recipe.humanSteps.joined(separator: "|"),
+            waste.recipe.steps.compactMap(\.windowTitleHint).joined(separator: "|")
+	    ].joined(separator: "\n")
 
     for raw in ["ETH", "SOL", "BTC", "LTC"] {
         #expect(!exposed.localizedCaseInsensitiveContains(raw))

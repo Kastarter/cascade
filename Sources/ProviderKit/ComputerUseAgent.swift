@@ -136,6 +136,7 @@ public enum CUActionChunkBreakReason: String, Sendable, Equatable {
 public struct CUActionChunkPlan: Sendable, Equatable {
     public let groups: [CUActionGroup]
     public let deferredToolUseIDs: [String]
+    public let deferredKindTokens: [String]
     public let breakReason: CUActionChunkBreakReason?
 
     public var actions: [CUAction] { groups.flatMap(\.actions) }
@@ -379,6 +380,10 @@ public final class ComputerUseAgent {
     /// cmd+v with an unowned clipboard) — the caller audits it; the model learns
     /// from the refusal text delivered as that call's tool_result.
     public var onActionRefused: (@MainActor (String) -> Void)?
+
+    /// Called when action chunking defers the entire screen-action plan before the
+    /// caller sees a `CUStep`. Partial plans are audited by the caller after execution.
+    public var onActionChunkPlanned: (@MainActor (CUActionChunkPlan) -> Void)?
 
     /// Fires (throttled, ~1.2s) while a thinking block streams, carrying the tail
     /// of its summary text. Thinking precedes every action in a turn, so during a
@@ -1293,6 +1298,9 @@ public final class ComputerUseAgent {
         var chunkPlan: CUActionChunkPlan?
         if actionChunkingEnabled {
             let plan = Self.actionChunkPlan(for: actionGroups)
+            if plan.groups.isEmpty, !plan.deferredToolUseIDs.isEmpty {
+                onActionChunkPlanned?(plan)
+            }
             let deferredText = Self.deferredToolResultText(reason: plan.breakReason)
             for id in plan.deferredToolUseIDs {
                 toolResultOverrides[id] = deferredText
@@ -1963,7 +1971,7 @@ public final class ComputerUseAgent {
 
     nonisolated static func actionChunkPlan(for groups: [CUActionGroup]) -> CUActionChunkPlan {
         guard !groups.isEmpty else {
-            return CUActionChunkPlan(groups: [], deferredToolUseIDs: [], breakReason: .noActions)
+            return CUActionChunkPlan(groups: [], deferredToolUseIDs: [], deferredKindTokens: [], breakReason: .noActions)
         }
         var accepted: [CUActionGroup] = []
         var breakReason: CUActionChunkBreakReason?
@@ -1979,11 +1987,13 @@ public final class ComputerUseAgent {
             accepted.append(group)
         }
         let acceptedIDs = Set(accepted.compactMap(\.toolUseID))
+        var deferredKindTokens: [String] = []
         let deferred = groups.compactMap { group -> String? in
             guard let id = group.toolUseID, !acceptedIDs.contains(id) else { return nil }
+            deferredKindTokens.append(group.kindToken)
             return id
         }
-        return CUActionChunkPlan(groups: accepted, deferredToolUseIDs: deferred, breakReason: breakReason)
+        return CUActionChunkPlan(groups: accepted, deferredToolUseIDs: deferred, deferredKindTokens: deferredKindTokens, breakReason: breakReason)
     }
 
     private nonisolated static func chunkBreakReason(for group: CUActionGroup) -> CUActionChunkBreakReason? {
