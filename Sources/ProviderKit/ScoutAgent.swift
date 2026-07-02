@@ -1,3 +1,4 @@
+import CascadeMemory
 import Foundation
 
 /// The downgraded on-screen brain (Tier 2 of the model-downgrade roadmap): a
@@ -363,7 +364,16 @@ public final class ScoutAgent {
                 let dispersion = candidate.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
                 let verdict = r.result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
                 let failure = r.result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
-                logs.append("hit \"\(r.target)\" source=\(candidate.source.rawValue)\(id) confidence=\(String(format: "%.2f", candidate.confidence))\(dispersion) risk=\(route.risk.rawValue) @(\(Int(safePoint.x)),\(Int(safePoint.y))) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)\(reason)")
+                let safeAudit = Self.groundingAuditTokens(
+                    status: "hit",
+                    target: r.target,
+                    candidate: candidate,
+                    selectedCandidateID: r.result.selectedCandidateID,
+                    point: safePoint,
+                    risk: route.risk,
+                    alternatives: r.result.alternativeCount
+                )
+                logs.append("hit \"\(r.target)\" \(safeAudit)\(id)\(dispersion)\(verdict)\(failure)\(reason)")
             } else {
                 if lastGroundMiss == nil { lastGroundMiss = r.target }
                 let candidate = r.result.selectedCandidate
@@ -372,7 +382,7 @@ public final class ScoutAgent {
                 let dispersion = candidate?.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
                 let verdict = r.result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
                 let failure = r.result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
-                logs.append("miss \"\(r.target)\"\(source)\(confidence)\(dispersion) risk=\(route.risk.rawValue) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)")
+                logs.append("miss \"\(r.target)\" status=miss \(AuditIdentity.descriptor("target", r.target))\(source)\(confidence)\(dispersion) risk=\(route.risk.rawValue) alternatives=\(r.result.alternativeCount)\(verdict)\(failure)")
             }
         }
         lastGroundLog = logs.isEmpty ? nil : logs.joined(separator: "; ")
@@ -401,6 +411,33 @@ public final class ScoutAgent {
             .replacingOccurrences(of: "\r", with: " ")
             .prefix(48)
             .description
+    }
+
+    private nonisolated static func groundingAuditTokens(
+        status: String,
+        target: String,
+        candidate: GroundingCandidate,
+        selectedCandidateID: String?,
+        point: CGPoint,
+        risk: GroundingActionRisk,
+        alternatives: Int
+    ) -> String {
+        var parts = [
+            "status=\(AuditIdentity.safeToken(status))",
+            AuditIdentity.descriptor("target", target),
+            "source=\(AuditIdentity.safeToken(candidate.source.rawValue))",
+            "confidence=\(String(format: "%.2f", candidate.confidence))",
+            "risk=\(AuditIdentity.safeToken(risk.rawValue))",
+            "x=\(Int(point.x.rounded()))",
+            "y=\(Int(point.y.rounded()))",
+            "alternatives=\(alternatives)",
+            "candidateHash=\(AuditIdentity.hash(candidate.candidateID ?? selectedCandidateID))",
+        ]
+        if let markNumber = candidate.markNumber {
+            parts.append("mark=\(markNumber)")
+        }
+        parts.append(contentsOf: candidate.coordinateChain?.auditTokens(rawModel: candidate.rawModel) ?? [])
+        return parts.joined(separator: " ")
     }
 
     /// Resolves one in-process tool call to a text result. use_skill goes through

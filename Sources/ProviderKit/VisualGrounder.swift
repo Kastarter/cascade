@@ -1,4 +1,6 @@
 import AppKit
+import CascadeMemory
+import ComputerUseKit
 import Foundation
 
 /// Provenance for a grounded target candidate. Kept small and Codable so later
@@ -27,6 +29,202 @@ public enum GroundingCoordinateSpace: String, Codable, Equatable, Sendable {
     /// Web viewport CSS pixels, top-left origin.
     case viewportCSSPixelsTopLeft
     case unknown
+}
+
+/// Auditable typed coordinate chain for a grounded candidate.
+///
+/// This deliberately stores only numeric geometry plus hashes/counts for model text
+/// when rendered into audit rows. It is attached to candidates so executor-level
+/// `agent.ground` events can prove exactly which coordinate spaces were traversed.
+public struct GroundingCoordinateChain: Codable, Equatable, Sendable {
+    public let transformVersion: String
+    public let screenDisplayID: UInt32?
+    public let screenFrame: CGRect
+    public let backingPixelSize: CGSize
+    public let cropRectInBackingPixels: CGRect
+    public let resizedInputSize: CGSize?
+    public let modelCoordinateSpace: String?
+    public let modelOutputPoint: CGPoint?
+    public let modelMappedPoint: CGPoint?
+    public let cropPoint: CGPoint?
+    public let backingPoint: CGPoint?
+    public let mappedPoint: CGPoint?
+    public let modelOutputCount: Int
+
+    public init(
+        transformVersion: String = "CoordinateTransform.v1",
+        screenDisplayID: UInt32? = nil,
+        screenFrame: CGRect,
+        backingPixelSize: CGSize,
+        cropRectInBackingPixels: CGRect,
+        resizedInputSize: CGSize?,
+        modelCoordinateSpace: String? = nil,
+        modelOutputPoint: CGPoint? = nil,
+        modelMappedPoint: CGPoint? = nil,
+        cropPoint: CGPoint? = nil,
+        backingPoint: CGPoint? = nil,
+        mappedPoint: CGPoint? = nil,
+        modelOutputCount: Int = 0
+    ) {
+        self.transformVersion = transformVersion
+        self.screenDisplayID = screenDisplayID
+        self.screenFrame = screenFrame
+        self.backingPixelSize = backingPixelSize
+        self.cropRectInBackingPixels = cropRectInBackingPixels
+        self.resizedInputSize = resizedInputSize
+        self.modelCoordinateSpace = modelCoordinateSpace
+        self.modelOutputPoint = modelOutputPoint
+        self.modelMappedPoint = modelMappedPoint
+        self.cropPoint = cropPoint
+        self.backingPoint = backingPoint
+        self.mappedPoint = mappedPoint
+        self.modelOutputCount = max(0, modelOutputCount)
+    }
+
+    public init(
+        transform: CoordinateTransform,
+        modelCoordinateSpace: String? = nil,
+        modelOutputPoint: CGPoint? = nil,
+        modelMappedPoint: CGPoint? = nil,
+        cropPoint: CGPoint? = nil,
+        backingPoint: CGPoint? = nil,
+        mappedPoint: CGPoint? = nil,
+        modelOutputCount: Int = 0
+    ) {
+        self.init(
+            screenDisplayID: transform.screen.displayID,
+            screenFrame: transform.screen.logicalFrame,
+            backingPixelSize: transform.screen.backingPixelSize,
+            cropRectInBackingPixels: transform.cropInBackingPixels.rect,
+            resizedInputSize: transform.modelInputSize?.size,
+            modelCoordinateSpace: modelCoordinateSpace,
+            modelOutputPoint: modelOutputPoint,
+            modelMappedPoint: modelMappedPoint,
+            cropPoint: cropPoint,
+            backingPoint: backingPoint,
+            mappedPoint: mappedPoint,
+            modelOutputCount: modelOutputCount
+        )
+    }
+
+    public var backingScaleX: CGFloat {
+        guard screenFrame.width > 0 else { return 0 }
+        return backingPixelSize.width / screenFrame.width
+    }
+
+    public var backingScaleY: CGFloat {
+        guard screenFrame.height > 0 else { return 0 }
+        return backingPixelSize.height / screenFrame.height
+    }
+
+    public func translatedMappedPoint(by offset: CGPoint, mappedPoint: CGPoint?) -> GroundingCoordinateChain {
+        GroundingCoordinateChain(
+            transformVersion: transformVersion,
+            screenDisplayID: screenDisplayID,
+            screenFrame: screenFrame,
+            backingPixelSize: backingPixelSize,
+            cropRectInBackingPixels: cropRectInBackingPixels,
+            resizedInputSize: resizedInputSize,
+            modelCoordinateSpace: modelCoordinateSpace,
+            modelOutputPoint: modelOutputPoint,
+            modelMappedPoint: modelMappedPoint,
+            cropPoint: cropPoint,
+            backingPoint: backingPoint,
+            mappedPoint: mappedPoint ?? self.mappedPoint.map {
+                CGPoint(x: $0.x + offset.x, y: $0.y + offset.y)
+            },
+            modelOutputCount: modelOutputCount
+        )
+    }
+
+    public func auditTokens(rawModel: String?) -> [String] {
+        var parts = [
+            "coordChain=\(AuditIdentity.safeToken(transformVersion))",
+            "screenX=\(Self.fmt(screenFrame.minX))",
+            "screenY=\(Self.fmt(screenFrame.minY))",
+            "screenW=\(Self.fmt(screenFrame.width))",
+            "screenH=\(Self.fmt(screenFrame.height))",
+            "backingW=\(Self.fmt(backingPixelSize.width))",
+            "backingH=\(Self.fmt(backingPixelSize.height))",
+            "backingScaleX=\(Self.fmt(backingScaleX))",
+            "backingScaleY=\(Self.fmt(backingScaleY))",
+            "cropPX=\(Self.fmt(cropRectInBackingPixels.minX))",
+            "cropPY=\(Self.fmt(cropRectInBackingPixels.minY))",
+            "cropPW=\(Self.fmt(cropRectInBackingPixels.width))",
+            "cropPH=\(Self.fmt(cropRectInBackingPixels.height))",
+            "modelOutputCount=\(modelOutputCount)",
+            "modelResponseHash=\(AuditIdentity.hash(rawModel))",
+            "modelResponseChars=\(AuditIdentity.count(rawModel))",
+            "chainHash=\(AuditIdentity.hash(canonicalHashInput(rawModel: rawModel)))",
+        ]
+        if let screenDisplayID {
+            parts.append("displayIDHash=\(AuditIdentity.hash(String(screenDisplayID)))")
+        }
+        if let modelCoordinateSpace {
+            parts.append("modelCoordSpace=\(AuditIdentity.safeToken(modelCoordinateSpace))")
+        }
+        if let resizedInputSize {
+            parts.append("inputW=\(Self.fmt(resizedInputSize.width))")
+            parts.append("inputH=\(Self.fmt(resizedInputSize.height))")
+        }
+        if let modelOutputPoint {
+            parts.append("modelOutX=\(Self.fmt(modelOutputPoint.x))")
+            parts.append("modelOutY=\(Self.fmt(modelOutputPoint.y))")
+        }
+        if let modelMappedPoint {
+            parts.append("modelX=\(Self.fmt(modelMappedPoint.x))")
+            parts.append("modelY=\(Self.fmt(modelMappedPoint.y))")
+        }
+        if let cropPoint {
+            parts.append("cropPointX=\(Self.fmt(cropPoint.x))")
+            parts.append("cropPointY=\(Self.fmt(cropPoint.y))")
+        }
+        if let backingPoint {
+            parts.append("backingX=\(Self.fmt(backingPoint.x))")
+            parts.append("backingY=\(Self.fmt(backingPoint.y))")
+        }
+        if let mappedPoint {
+            parts.append("mappedX=\(Self.fmt(mappedPoint.x))")
+            parts.append("mappedY=\(Self.fmt(mappedPoint.y))")
+        }
+        return parts
+    }
+
+    private func canonicalHashInput(rawModel: String?) -> String {
+        var parts: [String] = []
+        parts.append(transformVersion)
+        parts.append(screenDisplayID.map(String.init) ?? "none")
+        parts.append(Self.rect(screenFrame))
+        parts.append(Self.size(backingPixelSize))
+        parts.append(Self.rect(cropRectInBackingPixels))
+        parts.append(resizedInputSize.map(Self.size) ?? "none")
+        parts.append(modelCoordinateSpace ?? "none")
+        parts.append(modelOutputPoint.map(Self.point) ?? "none")
+        parts.append(modelMappedPoint.map(Self.point) ?? "none")
+        parts.append(cropPoint.map(Self.point) ?? "none")
+        parts.append(backingPoint.map(Self.point) ?? "none")
+        parts.append(mappedPoint.map(Self.point) ?? "none")
+        parts.append(String(modelOutputCount))
+        parts.append(AuditIdentity.hash(rawModel))
+        parts.append(String(AuditIdentity.count(rawModel)))
+        return parts.joined(separator: "|")
+    }
+
+    private static func point(_ point: CGPoint) -> String {
+        "\(fmt(point.x)),\(fmt(point.y))"
+    }
+
+    private static func size(_ size: CGSize) -> String {
+        "\(fmt(size.width))x\(fmt(size.height))"
+    }
+
+    private static func rect(_ rect: CGRect) -> String {
+        "\(fmt(rect.minX)),\(fmt(rect.minY)),\(fmt(rect.width)),\(fmt(rect.height))"
+    }
+
+    private static func fmt(_ value: CGFloat) -> String {
+        String(format: "%.2f", Double(value))
+    }
 }
 
 /// A candidate shown to a model with a visible Set-of-Mark label. ProviderKit keeps
@@ -90,6 +288,7 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
     public let nearbyOCRText: String?
     public let ocrDistancePoints: Double?
     public let agreeingSources: [GroundingSource]
+    public let coordinateChain: GroundingCoordinateChain?
 
     enum CodingKeys: String, CodingKey {
         case point
@@ -110,6 +309,7 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         case nearbyOCRText
         case ocrDistancePoints
         case agreeingSources
+        case coordinateChain
     }
 
     public init(
@@ -130,7 +330,8 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         label: String? = nil,
         nearbyOCRText: String? = nil,
         ocrDistancePoints: Double? = nil,
-        agreeingSources: [GroundingSource] = []
+        agreeingSources: [GroundingSource] = [],
+        coordinateChain: GroundingCoordinateChain? = nil
     ) {
         self.point = point
         self.region = region
@@ -150,6 +351,7 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         self.nearbyOCRText = nearbyOCRText
         self.ocrDistancePoints = ocrDistancePoints
         self.agreeingSources = agreeingSources
+        self.coordinateChain = coordinateChain
     }
 
     public init(from decoder: Decoder) throws {
@@ -172,6 +374,7 @@ public struct GroundingCandidate: Codable, Equatable, Sendable {
         self.nearbyOCRText = try container.decodeIfPresent(String.self, forKey: .nearbyOCRText)
         self.ocrDistancePoints = try container.decodeIfPresent(Double.self, forKey: .ocrDistancePoints)
         self.agreeingSources = try container.decodeIfPresent([GroundingSource].self, forKey: .agreeingSources) ?? []
+        self.coordinateChain = try container.decodeIfPresent(GroundingCoordinateChain.self, forKey: .coordinateChain)
     }
 }
 
@@ -660,13 +863,19 @@ public struct UITARSGrounder: VisualGrounder {
             sentH: res.h,
             space: coordSpace
         )
-        let point = Self.toDisplayPoint(
-            imagePoint: space.point,
-            imageW: space.imageW,
-            imageH: space.imageH,
+        let mapping = Self.coordinateMapping(
+            modelPoint: space.point,
+            modelInputW: space.imageW,
+            modelInputH: space.imageH,
+            cropBackingW: res.w,
+            cropBackingH: res.h,
             displayW: displayWidthPoints,
-            displayH: displayHeightPoints
+            displayH: displayHeightPoints,
+            modelCoordinateSpace: coordSpace.rawValue,
+            modelOutputPoint: imagePoint,
+            modelOutputCount: parsedPoints.count
         )
+        let point = mapping.point
         let parseRate = Double(parsedPoints.count) / Double(sampleCount)
         let dispersionOK = cluster.dispersion <= options.maxDispersion
         let sampleAgreement = Double(cluster.points.count) / Double(max(1, parsedPoints.count))
@@ -686,7 +895,8 @@ public struct UITARSGrounder: VisualGrounder {
                     latency: start.duration(to: ContinuousClock.now).timeInterval,
                     dispersion: cluster.dispersion,
                     reason: accepted ? reason : "\(reason) rejected",
-                    displayBounds: Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints)
+                    displayBounds: Self.boxAround(point: point, displayW: displayWidthPoints, displayH: displayHeightPoints),
+                    coordinateChain: mapping.chain
                 )
             ],
             selectedIndex: 0,
@@ -1123,12 +1333,64 @@ public struct UITARSGrounder: VisualGrounder {
     static func toDisplayPoint(
         imagePoint: CGPoint, imageW: Int, imageH: Int, displayW: Int, displayH: Int
     ) -> CGPoint {
-        let clampedX = max(0, min(imagePoint.x, CGFloat(imageW)))
-        let clampedY = max(0, min(imagePoint.y, CGFloat(imageH)))
-        let scaledX = (clampedX / CGFloat(imageW)) * CGFloat(displayW)
-        let scaledYFromTop = (clampedY / CGFloat(imageH)) * CGFloat(displayH)
-        let scaledYFromBottom = CGFloat(displayH) - scaledYFromTop
-        return CGPoint(x: scaledX, y: scaledYFromBottom)
+        coordinateMapping(
+            modelPoint: imagePoint,
+            modelInputW: imageW,
+            modelInputH: imageH,
+            cropBackingW: imageW,
+            cropBackingH: imageH,
+            displayW: displayW,
+            displayH: displayH,
+            modelCoordinateSpace: nil,
+            modelOutputPoint: imagePoint,
+            modelOutputCount: 1
+        ).point
+    }
+
+    static func coordinateMapping(
+        modelPoint: CGPoint,
+        modelInputW: Int,
+        modelInputH: Int,
+        cropBackingW: Int,
+        cropBackingH: Int,
+        displayW: Int,
+        displayH: Int,
+        modelCoordinateSpace: String?,
+        modelOutputPoint: CGPoint?,
+        modelOutputCount: Int
+    ) -> (point: CGPoint, chain: GroundingCoordinateChain?) {
+        let displaySize = CGSize(width: max(1, displayW), height: max(1, displayH))
+        let backingSize = CGSize(width: max(1, cropBackingW), height: max(1, cropBackingH))
+        guard let screen = CoordinateTransform.ScreenGeometry(
+            logicalFrame: CGRect(origin: .zero, size: displaySize),
+            backingPixelSize: backingSize
+        ), let crop = CoordinateTransform.BackingPixelRect(CGRect(origin: .zero, size: backingSize)),
+           let modelSize = CoordinateTransform.ModelSize(
+               width: CGFloat(max(1, modelInputW)),
+               height: CGFloat(max(1, modelInputH))
+           ), let transform = CoordinateTransform(
+               screen: screen,
+               cropInBackingPixels: crop,
+               modelInputSize: modelSize
+           ) else {
+            return (.zero, nil)
+        }
+        let model = CoordinateTransform.ModelPoint(modelPoint)
+        let cropPoint = transform.cropPixel(fromModelPoint: model, bounds: .clamp)
+        let backingPoint = transform.backingPixel(fromModelPoint: model, bounds: .clamp)
+        let logical = transform.logicalPoint(fromModelPoint: model, bounds: .clamp)
+        let point = logical?.point ?? .zero
+        let chain = GroundingCoordinateChain(
+            transform: transform,
+            modelCoordinateSpace: modelCoordinateSpace,
+            modelOutputPoint: modelOutputPoint,
+            modelMappedPoint: modelPoint,
+            cropPoint: cropPoint?.point,
+            backingPoint: backingPoint?.point,
+            mappedPoint: point,
+            modelOutputCount: modelOutputCount
+        )
+        return (point, chain)
     }
 
     /// Exact-pixel JPEG resize (bypasses NSImage's Retina 2× backing) so the image

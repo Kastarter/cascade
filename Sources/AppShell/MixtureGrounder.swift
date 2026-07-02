@@ -582,7 +582,8 @@ public struct MixtureGrounder: VisualGrounder {
                     label: candidate.label,
                     nearbyOCRText: candidate.nearbyOCRText,
                     ocrDistancePoints: candidate.ocrDistancePoints,
-                    agreeingSources: candidate.agreeingSources
+                    agreeingSources: candidate.agreeingSources,
+                    coordinateChain: candidate.coordinateChain
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -614,7 +615,8 @@ public struct MixtureGrounder: VisualGrounder {
                     label: candidate.label,
                     nearbyOCRText: candidate.nearbyOCRText,
                     ocrDistancePoints: candidate.ocrDistancePoints,
-                    agreeingSources: candidate.agreeingSources
+                    agreeingSources: candidate.agreeingSources,
+                    coordinateChain: candidate.coordinateChain
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -1216,15 +1218,17 @@ public struct MixtureGrounder: VisualGrounder {
         }
         guard let match = AXElementResolver.find(label: target),
               match.score >= minAXScore else { return nil }
-        // Map the matched element center (CG-global, top-left) into the display-local
-        // AppKit point the executor consumes. Use the display the screenshot came
-        // from — the cursor's — selected by matching the declared dimensions.
-        guard let bounds = Self.captureDisplayBounds(widthPoints: displayWidthPoints, heightPoints: displayHeightPoints) else {
+        // Map the matched element center through the typed transform for the display
+        // the screenshot came from, selected by matching dimensions.
+        guard let capture = Self.captureDisplayGeometry(widthPoints: displayWidthPoints, heightPoints: displayHeightPoints) else {
             return nil
         }
-        guard let point = Self.displayLocalPoint(
-            cgGlobalCenter: match.center, displayCGBounds: bounds, displayHeightPoints: displayHeightPoints
+        guard let mapping = Self.displayLocalMapping(
+            cgGlobalCenter: match.center,
+            displayCGBounds: capture.cgBounds,
+            transform: capture.transform
         ) else { return nil }
+        let point = mapping.point
         let candidateBounds = ScreenElementIndex.Bounds(
             x: Double(point.x - 48),
             y: Double(point.y - 14),
@@ -1252,7 +1256,8 @@ public struct MixtureGrounder: VisualGrounder {
                 rawModel: match.title,
                 reason: "accessibility label match score \(String(format: "%.2f", match.score))",
                 candidateID: candidateID,
-                displayBounds: candidateBounds.cgRect
+                displayBounds: candidateBounds.cgRect,
+                coordinateChain: mapping.chain
             ),
             role: match.role,
             label: match.title,
@@ -1282,13 +1287,49 @@ public struct MixtureGrounder: VisualGrounder {
               bounds.width > 0, bounds.height > 0,
               displayHeightPoints > 0
         else { return nil }
-        let mapper = DisplayCoordinateMapper(
-            displayID: CGMainDisplayID(),
-            appKitFrame: CGRect(x: 0, y: 0, width: bounds.width, height: CGFloat(displayHeightPoints)),
-            cgBounds: bounds,
-            backingScaleFactor: 1
+        guard let screen = CoordinateTransform.ScreenGeometry(
+            logicalFrame: CGRect(x: 0, y: 0, width: bounds.width, height: CGFloat(displayHeightPoints)),
+            backingPixelSize: CGSize(width: bounds.width, height: CGFloat(displayHeightPoints))
+        ), let transform = CoordinateTransform(screen: screen) else { return nil }
+        return displayLocalMapping(cgGlobalCenter: c, displayCGBounds: bounds, transform: transform)?.point
+    }
+
+    nonisolated static func displayLocalMapping(
+        cgGlobalCenter c: CGPoint,
+        displayCGBounds bounds: CGRect,
+        transform: CoordinateTransform
+    ) -> (point: CGPoint, chain: GroundingCoordinateChain)? {
+        guard bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0,
+              bounds.insetBy(dx: -1, dy: -1).contains(c)
+        else { return nil }
+        let fx = min(max((c.x - bounds.minX) / bounds.width, 0), 1)
+        let fy = min(max((c.y - bounds.minY) / bounds.height, 0), 1)
+        let backing = CoordinateTransform.BackingPixelPoint(
+            x: fx * transform.screen.backingPixelSize.width,
+            y: fy * transform.screen.backingPixelSize.height
         )
-        return mapper.screenLocalAppKit(fromCGGlobal: c)
+        guard let logical = transform.logicalPoint(fromBackingPixel: backing, bounds: .clamp),
+              let displayLocal = transform.displayLocalPoint(fromLogical: logical, bounds: .clamp) else {
+            return nil
+        }
+        let crop = transform.cropPixel(fromBackingPixel: backing, bounds: .clamp)
+        let chain = GroundingCoordinateChain(
+            transform: transform,
+            modelCoordinateSpace: nil,
+            modelOutputPoint: nil,
+            modelMappedPoint: nil,
+            cropPoint: crop?.point,
+            backingPoint: backing.point,
+            mappedPoint: displayLocal,
+            modelOutputCount: 0
+        )
+        return (displayLocal, chain)
+    }
+
+    private struct CaptureDisplayGeometry {
+        let cgBounds: CGRect
+        let transform: CoordinateTransform
     }
 
     /// CG-global bounds of the display the screenshot came from. The capture path is
@@ -1297,14 +1338,21 @@ public struct MixtureGrounder: VisualGrounder {
     /// never mapped against the wrong monitor). nil → caller falls back to visual.
     @MainActor
     private static func captureDisplayBounds(widthPoints: Int, heightPoints: Int) -> CGRect? {
+        captureDisplayGeometry(widthPoints: widthPoints, heightPoints: heightPoints)?.cgBounds
+    }
+
+    @MainActor
+    private static func captureDisplayGeometry(widthPoints: Int, heightPoints: Int) -> CaptureDisplayGeometry? {
         func dims(_ s: NSScreen) -> Bool {
             Int(s.frame.width.rounded()) == widthPoints && Int(s.frame.height.rounded()) == heightPoints
         }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { dims($0) && NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.screens.first(where: dims)
-        guard let screen, let mapper = DisplayCoordinateMapper(screen: screen) else { return nil }
-        return mapper.cgBounds
+        guard let screen,
+              let mapper = DisplayCoordinateMapper(screen: screen),
+              let transform = CoordinateTransform(screen: screen) else { return nil }
+        return CaptureDisplayGeometry(cgBounds: mapper.cgBounds, transform: transform)
     }
 
     private static func verifierCandidates(

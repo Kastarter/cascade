@@ -5627,7 +5627,47 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     nonisolated static func groundAuditDetail(_ detail: String) -> String {
-        textAuditDetail("ground", detail)
+        let safeFields = safeGroundAuditFields(detail)
+        return ([textAuditDetail("ground", detail)] + safeFields).joined(separator: " ")
+    }
+
+    private nonisolated static func safeGroundAuditFields(_ detail: String) -> [String] {
+        let allowed: Set<String> = [
+            "status", "targetHash", "targetChars", "source", "confidence", "dispersion",
+            "risk", "x", "y", "alternatives", "verdict", "failure", "candidateHash",
+            "mark", "coordChain", "displayIDHash", "screenX", "screenY", "screenW",
+            "screenH", "backingW", "backingH", "backingScaleX", "backingScaleY",
+            "cropPX", "cropPY", "cropPW", "cropPH", "inputW", "inputH",
+            "modelCoordSpace", "modelOutX", "modelOutY", "modelX", "modelY",
+            "cropPointX", "cropPointY", "backingX", "backingY", "mappedX", "mappedY",
+            "modelOutputCount", "modelResponseHash", "modelResponseChars", "chainHash",
+        ]
+        return unquotedAuditTokenSource(detail)
+            .split { $0 == " " || $0 == ";" }
+            .compactMap { raw -> String? in
+                let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let separator = token.firstIndex(of: "=") else { return nil }
+                let key = String(token[..<separator])
+                guard allowed.contains(key) else { return nil }
+                let value = String(token[token.index(after: separator)...])
+                return "\(key)=\(safeAuditToken(value))"
+            }
+    }
+
+    private nonisolated static func unquotedAuditTokenSource(_ detail: String) -> String {
+        var output = ""
+        var insideQuote = false
+        for character in detail {
+            if character == "\"" {
+                insideQuote.toggle()
+                output.append(" ")
+            } else if insideQuote {
+                output.append(" ")
+            } else {
+                output.append(character)
+            }
+        }
+        return output
     }
 
     nonisolated static func groundingVerifierAuditDetail(_ outcome: MixtureGrounder.VerifierOutcome) -> String {

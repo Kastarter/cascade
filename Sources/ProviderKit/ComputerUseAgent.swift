@@ -1,4 +1,5 @@
 import AppKit
+import CascadeMemory
 import Foundation
 import OSLog
 
@@ -1625,7 +1626,8 @@ public final class ComputerUseAgent {
                     label: candidate.label,
                     nearbyOCRText: candidate.nearbyOCRText,
                     ocrDistancePoints: candidate.ocrDistancePoints,
-                    agreeingSources: candidate.agreeingSources
+                    agreeingSources: candidate.agreeingSources,
+                    coordinateChain: candidate.coordinateChain
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -1804,7 +1806,11 @@ public final class ComputerUseAgent {
                     label: candidate.label,
                     nearbyOCRText: candidate.nearbyOCRText,
                     ocrDistancePoints: candidate.ocrDistancePoints,
-                    agreeingSources: candidate.agreeingSources
+                    agreeingSources: candidate.agreeingSources,
+                    coordinateChain: candidate.coordinateChain?.translatedMappedPoint(
+                        by: offset,
+                        mappedPoint: mappedPoint
+                    )
                 )
             },
             selectedIndex: result.selectedIndex,
@@ -1891,17 +1897,26 @@ public final class ComputerUseAgent {
             let failure = result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
             let dispersion = candidate.dispersion.map { " dispersion=\(String(format: "%.1f", $0))" } ?? ""
             let actionable = result.isActionable(minConfidence: Self.minimumConfidence(for: risk, source: candidate.source)) ? "hit" : "blocked"
+            let safeAudit = Self.groundingAuditTokens(
+                status: actionable,
+                target: target,
+                candidate: candidate,
+                selectedCandidateID: result.selectedCandidateID,
+                point: point,
+                risk: risk,
+                alternatives: result.alternativeCount
+            )
             if actionable == "blocked", lastGroundMiss == nil {
                 lastGroundMiss = target
                 lastGroundFailureReason = result.abstainReason ?? "low_confidence"
             }
-            appendGroundLog("\(actionable) \"\(target)\" source=\(candidate.source.rawValue)\(id)\(mark) confidence=\(String(format: "%.2f", candidate.confidence))\(dispersion) risk=\(risk.rawValue) @(\(Int(point.x)),\(Int(point.y))) alternatives=\(result.alternativeCount)\(verdict)\(failure)\(reason)")
+            appendGroundLog("\(actionable) \"\(target)\" \(safeAudit)\(id)\(mark)\(dispersion)\(verdict)\(failure)\(reason)")
         } else {
             if lastGroundMiss == nil { lastGroundMiss = target }
             lastGroundFailureReason = result.abstainReason ?? "target_not_found"
             let verdict = result.verifierVerdict.map { " verdict=\($0.rawValue)" } ?? ""
             let failure = result.verifierFailureKind.map { " failure=\($0.rawValue)" } ?? ""
-            appendGroundLog("miss \"\(target)\" risk=\(risk.rawValue) alternatives=\(result.alternativeCount)\(verdict)\(failure)")
+            appendGroundLog("miss \"\(target)\" status=miss \(AuditIdentity.descriptor("target", target)) risk=\(risk.rawValue) alternatives=\(result.alternativeCount)\(verdict)\(failure)")
         }
     }
 
@@ -2101,6 +2116,33 @@ public final class ComputerUseAgent {
         } else {
             lastGroundLog = line
         }
+    }
+
+    private nonisolated static func groundingAuditTokens(
+        status: String,
+        target: String,
+        candidate: GroundingCandidate,
+        selectedCandidateID: String?,
+        point: CGPoint,
+        risk: GroundingActionRisk,
+        alternatives: Int
+    ) -> String {
+        var parts = [
+            "status=\(AuditIdentity.safeToken(status))",
+            AuditIdentity.descriptor("target", target),
+            "source=\(AuditIdentity.safeToken(candidate.source.rawValue))",
+            "confidence=\(String(format: "%.2f", candidate.confidence))",
+            "risk=\(AuditIdentity.safeToken(risk.rawValue))",
+            "x=\(Int(point.x.rounded()))",
+            "y=\(Int(point.y.rounded()))",
+            "alternatives=\(alternatives)",
+            "candidateHash=\(AuditIdentity.hash(candidate.candidateID ?? selectedCandidateID))",
+        ]
+        if let markNumber = candidate.markNumber {
+            parts.append("mark=\(markNumber)")
+        }
+        parts.append(contentsOf: candidate.coordinateChain?.auditTokens(rawModel: candidate.rawModel) ?? [])
+        return parts.joined(separator: " ")
     }
 
     private nonisolated static func safeLogToken(_ value: String) -> String {

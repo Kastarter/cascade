@@ -24,7 +24,7 @@ let package = Package(
             dependencies: ["CascadeMemory", "MacContextKit"],
             resources: [.copy("Skills")]
         ),
-        .target(name: "ProviderKit", dependencies: ["CascadeMemory"]),
+        .target(name: "ProviderKit", dependencies: ["CascadeMemory", "ComputerUseKit"]),
         .target(name: "SandboxKit", dependencies: ["ProviderKit", "CascadeMemory", "AgentOrchestrator"]),
         .target(name: "WasteDetection", dependencies: ["CascadeMemory"]),
         .target(
