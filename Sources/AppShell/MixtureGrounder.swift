@@ -222,6 +222,13 @@ public struct MixtureGrounder: VisualGrounder {
     private let cacheMode: GroundingCacheMode
     private let cacheContextProvider: @Sendable () async -> AppWindowSnapshot
     private let regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
+    /// d14 (test seam only): replaces the LIVE bounded AX harvest the d12 mark
+    /// picker resolves planner-named ids against. nil — the shipped default —
+    /// keeps the real `AXElementResolver.interactables` walk (including the
+    /// never-Cascade / never-distrusted-AX guards); tests inject a synthetic
+    /// harvest so the mark-id → exact-frame path is provable without live
+    /// accessibility.
+    private let markPickHarvestOverride: (@MainActor @Sendable () -> [AXElementResolver.Match])?
 
     /// AX roles a CLICK target may legitimately resolve to. Excludes the passive
     /// roles `AXElementResolver.find` will also match (AXStaticText, AXImage) — a
@@ -247,6 +254,7 @@ public struct MixtureGrounder: VisualGrounder {
             await MainActor.run { AppWindowObserver.snapshot() }
         },
         regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
+        markPickHarvestOverride: (@MainActor @Sendable () -> [AXElementResolver.Match])? = nil,
         onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)? = nil,
         onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
@@ -261,6 +269,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.cacheMode = cacheMode
         self.cacheContextProvider = cacheContextProvider
         self.regionNarrower = regionNarrower
+        self.markPickHarvestOverride = markPickHarvestOverride
         self.onRuntimeProfile = onRuntimeProfile
         self.onVerifierOutcome = onVerifierOutcome
     }
@@ -1739,19 +1748,49 @@ public struct MixtureGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) -> GroundingCandidate? {
-        let front = NSWorkspace.shared.frontmostApplication
-        if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
-        let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
-        if skill?.axUnreliable == true { return nil }
-        let matches = AXElementResolver.interactables(limit: Self.markPickHarvestLimit)
-        guard let match = AXCompressedObservation.resolveMark(token, in: matches) else { return nil }
+        let matches: [AXElementResolver.Match]
+        if let markPickHarvestOverride {
+            // d14 test seam: a synthetic harvest replaces ONLY the live AX walk;
+            // the resolve → exact-frame → candidate math below stays shipped.
+            matches = markPickHarvestOverride()
+        } else {
+            let front = NSWorkspace.shared.frontmostApplication
+            if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
+            let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+            if skill?.axUnreliable == true { return nil }
+            matches = AXElementResolver.interactables(limit: Self.markPickHarvestLimit)
+        }
         guard let capture = Self.captureDisplayGeometry(
             widthPoints: displayWidthPoints, heightPoints: displayHeightPoints
         ) else { return nil }
-        guard let mapping = Self.displayLocalMapping(
-            cgGlobalCenter: match.center,
+        return Self.markPickCandidate(
+            mark: token,
+            matches: matches,
             displayCGBounds: capture.cgBounds,
             transform: capture.transform
+        )
+    }
+
+    /// d14 (pure, unit-pinned): the mark-id → exact-frame half of the d12
+    /// picker. Resolves the token against ONE harvest (deterministic prefix
+    /// resolution — ambiguity refuses rather than guesses) and maps the
+    /// element's center through the typed transform, returning a candidate
+    /// whose `point` is the EXACT frame center in the executor's display-local
+    /// AppKit space and whose `region`/`displayBounds` is the exact element
+    /// frame recentred there — so the d06 semantic activation's
+    /// `elementAtPosition(point)` hit-tests inside the very control the
+    /// planner named. nil → the caller falls back to ordinary grounding.
+    nonisolated static func markPickCandidate(
+        mark token: String,
+        matches: [AXElementResolver.Match],
+        displayCGBounds: CGRect,
+        transform: CoordinateTransform
+    ) -> GroundingCandidate? {
+        guard let match = AXCompressedObservation.resolveMark(token, in: matches) else { return nil }
+        guard let mapping = Self.displayLocalMapping(
+            cgGlobalCenter: match.center,
+            displayCGBounds: displayCGBounds,
+            transform: transform
         ) else { return nil }
         let point = mapping.point
         // The exact element frame recentred on the mapped point — logical sizes
