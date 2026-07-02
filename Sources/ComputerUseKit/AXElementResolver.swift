@@ -253,6 +253,10 @@ public enum AXElementResolver {
         /// Element center in CGEvent global coordinates (top-left origin).
         public let id: String?
         public let center: CGPoint
+        /// Full element frame in the same CG global coordinates, when the
+        /// harvest read one (d10: the compressed planner observation renders
+        /// exact frames, not just centers). nil on legacy paths.
+        public let frame: CGRect?
         public let role: String
         public let title: String
         public let score: Double
@@ -262,6 +266,7 @@ public enum AXElementResolver {
         public init(
             id: String? = nil,
             center: CGPoint,
+            frame: CGRect? = nil,
             role: String,
             title: String,
             score: Double,
@@ -270,6 +275,7 @@ public enum AXElementResolver {
         ) {
             self.id = id
             self.center = center
+            self.frame = frame
             self.role = role
             self.title = title
             self.score = score
@@ -541,6 +547,7 @@ public enum AXElementResolver {
             out.append(Match(
                 id: candidate.id,
                 center: center,
+                frame: candidate.frame,
                 role: role,
                 title: String(descriptor.label.prefix(60)),
                 score: candidate.confidence,

@@ -352,6 +352,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalWorkGraphIndexKey = "cascade.experimentalWorkGraphIndex"
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
+    static let experimentalCompressedObservationKey = AXCompressedObservation.flagKey
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
     static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
     static let experimentalHistoryCompactionTurnsKey = "cascade.experimentalHistoryCompactionTurns"
@@ -3460,7 +3461,15 @@ public final class CascadeAppModel: ObservableObject {
             // so it stops ASSUMING what's on the page. Mirrors the AX controls push —
             // structural, gated to sparse-AX turns, off-main so it doesn't stall the loop.
             let ocrMarks = await ocrSetOfMarks(forFrame: observedShot, axControlCount: controls.count, turn: count)
-            let turnNote = [scoutGroundingNote(), scoutControlsLine(controlSummary), ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
+            // d10: flag-gated compressed observation replaces the flat controls
+            // line for the planner; flag off (default) pushes the legacy line.
+            let controlsNote = await compressedControlsNote(
+                controls: controls,
+                goal: goal,
+                turn: count,
+                legacySummary: controlSummary
+            ) ?? scoutControlsLine(controlSummary)
+            let turnNote = [scoutGroundingNote(), controlsNote, ocrMarks, nudge].compactMap { $0 }.joined(separator: "\n")
             modelStart = ContinuousClock.now
             currentShot = observedShot
             step = await agent.proceed(
@@ -4354,7 +4363,7 @@ public final class CascadeAppModel: ObservableObject {
         case .assist:
             add("screen", groundingNote(), freshness: .live, order: 10, maxCharacters: 700)
         case .scout:
-            add("screen", scoutContextNote(), freshness: .live, order: 10, maxCharacters: 1_000)
+            add("screen", await scoutContextNote(goal: goal), freshness: .live, order: 10, maxCharacters: 1_000)
         case .none:
             break
         }
@@ -5101,6 +5110,33 @@ public final class CascadeAppModel: ObservableObject {
         summary.map { "Controls on screen now (name one of these to click or fill, or open a menu/panel to reveal others): \($0)" }
     }
 
+    /// d10: compressed planner observation (A11y-Compressor style) — grouped,
+    /// task-relevant AX candidates with stable ids + role/name/value/frame/
+    /// actions/modality/hierarchy, replacing the flat legacy controls line for
+    /// the planner note. Renders from the SAME harvest (no extra AX walk).
+    /// Default-off behind `cascade.experimentalCompressedObservation`; nil
+    /// (flag off / nothing to render) keeps the legacy push unchanged. Audited
+    /// as `scout.observe.compressed` with token + candidate COUNTS only.
+    private func compressedControlsNote(
+        controls: [AXElementResolver.Match],
+        goal: String,
+        turn: Int,
+        legacySummary: String?
+    ) async -> String? {
+        guard defaultsStore.bool(forKey: Self.experimentalCompressedObservationKey),
+              let rendering = AXCompressedObservation.render(
+                  matches: controls,
+                  goal: goal,
+                  baselineCharacterCount: legacySummary.map { $0.count } ?? 0
+              ) else { return nil }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "scout.observe.compressed",
+            detail: "turn=\(turn) " + rendering.metrics.safeAuditDetail
+        ))
+        return rendering.text
+    }
+
     private func auditAXDiagnosticsIfNeeded(_ diagnostics: AXElementResolver.AXDiagnostics) async {
         // d09: observer-cache accounting whenever the AX snapshot cache saw
         // activity since the last audit — hit/miss/invalidation COUNTS plus app
@@ -5134,10 +5170,18 @@ public final class CascadeAppModel: ObservableObject {
 
     /// The first turn's pushed context for Scout: frontmost app/window + the controls
     /// actually on screen. Subsequent turns rebuild the same shape inline (reusing a
-    /// single AX harvest alongside the no-effect/miss feedback).
-    private func scoutContextNote() -> String? {
-        let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
-        let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
+    /// single AX harvest alongside the no-effect/miss feedback). `goal` only feeds
+    /// the d10 compressed observation's task-relevance pruning (flag-gated).
+    private func scoutContextNote(goal: String) async -> String? {
+        let controls = AXElementResolver.interactables(limit: 24)
+        let controlSummary = AXElementResolver.interactableSummary(controls)
+        let controlsNote = await compressedControlsNote(
+            controls: controls,
+            goal: goal,
+            turn: 0,
+            legacySummary: controlSummary
+        ) ?? scoutControlsLine(controlSummary)
+        let parts = [scoutGroundingNote(), controlsNote].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
 
