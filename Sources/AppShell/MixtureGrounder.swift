@@ -25,6 +25,11 @@ import ProviderKit
 // it now grounds for free instead of round-tripping the flaky hosted grounder.
 //
 // SAFETY (the canvas case must not regress — it is why the visual grounder exists):
+//  • d15: ALL "AX vs vision" routing lives in ONE gate — `GroundingRouter`
+//    (ComputerUseKit). AX-first is the default; a request goes to the visual
+//    grounder only for canvas concepts, Cascade's own UI, distrusted-AX apps,
+//    or a sparse/stale live tree — and every such route carries an audited
+//    reason (`grounding.route`). The bullets below describe those rules.
 //  • Apps whose AX tree Cascade explicitly distrusts (`axUnreliable`: Blender,
 //    Figma, Photoshop) skip AX entirely — the visual grounder owns them.
 //  • Only ACTIONABLE-role matches are trusted (a button/field/menu item, never a
@@ -168,6 +173,21 @@ public struct MixtureGrounder: VisualGrounder {
         }
     }
 
+    /// d15: one routed-away-from-AX decision, surfaced for the audit trail.
+    /// Emitted ONLY when the routing gate sends a request to the visual
+    /// grounder (canvas concept / own UI / distrusted AX / sparse / stale) —
+    /// AX-first is the default and needs no row. Audit-safe: enum tokens,
+    /// hashes, and counts only.
+    public struct RouteOutcome: Equatable, Sendable {
+        public let decision: GroundingRouter.Decision
+        public let targetHash: String?
+
+        public init(decision: GroundingRouter.Decision, targetHash: String?) {
+            self.decision = decision
+            self.targetHash = targetHash
+        }
+    }
+
     public struct VerifierOutcome: Equatable, Sendable {
         public let target: String
         public let outcome: VerifiedGroundingOutcome
@@ -218,6 +238,9 @@ public struct MixtureGrounder: VisualGrounder {
     private let candidateFailureCounts: [String: Int]
     private let onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)?
     private let onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)?
+    /// d15: observes every routing-gate decision that sent a request to the
+    /// visual grounder, so the reason lands in the `grounding.route` audit.
+    private let onRouteDecision: (@Sendable (RouteOutcome) async -> Void)?
     private let groundingCache: GroundingCache?
     private let cacheMode: GroundingCacheMode
     private let cacheContextProvider: @Sendable () async -> AppWindowSnapshot
@@ -256,6 +279,7 @@ public struct MixtureGrounder: VisualGrounder {
         regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
         markPickHarvestOverride: (@MainActor @Sendable () -> [AXElementResolver.Match])? = nil,
         onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)? = nil,
+        onRouteDecision: (@Sendable (RouteOutcome) async -> Void)? = nil,
         onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
     ) {
         self.base = base
@@ -271,6 +295,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.regionNarrower = regionNarrower
         self.markPickHarvestOverride = markPickHarvestOverride
         self.onRuntimeProfile = onRuntimeProfile
+        self.onRouteDecision = onRouteDecision
         self.onVerifierOutcome = onVerifierOutcome
     }
 
@@ -289,8 +314,10 @@ public struct MixtureGrounder: VisualGrounder {
             break
         }
         guard verifyCandidates else {
-            if !Self.namesCanvasConcept(target),
-               let axPoint = await axGround(
+            // d15: no per-call-site canvas/AX checks here — `axGround` consults
+            // the single routing gate (`GroundingRouter`) and returns nil, with
+            // the reason audited, whenever the request belongs to vision.
+            if let axPoint = await axGround(
                 target: target, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
             ) {
                 return axPoint
@@ -376,8 +403,9 @@ public struct MixtureGrounder: VisualGrounder {
                     : result
             }
             let start = ContinuousClock.now
-            if !Self.namesCanvasConcept(target),
-               let axPoint = await axGround(
+            // d15: routing (canvas / own UI / distrusted / sparse / stale AX)
+            // is decided inside `axGround` by the single `GroundingRouter`.
+            if let axPoint = await axGround(
                 target: target,
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints
@@ -398,7 +426,10 @@ public struct MixtureGrounder: VisualGrounder {
                 : result
         }
 
-        let axCandidate = Self.namesCanvasConcept(target) ? nil : await axVerifierCandidate(
+        // d15: `axVerifierCandidate` consults the single routing gate and is
+        // nil (reason audited) for canvas / own-UI / distrusted / sparse /
+        // stale-AX requests — no duplicated checks at this call site.
+        let axCandidate = await axVerifierCandidate(
             target: target,
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
@@ -789,6 +820,15 @@ public struct MixtureGrounder: VisualGrounder {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
         return PerceptualHash.gridHashes(image)
+    }
+
+    /// d15: hand a visual-only routing decision to the audit sink. Fire-and-
+    /// forget from the synchronous MainActor resolve, mirroring how
+    /// `onRuntimeProfile` is surfaced. Hashes only — never the target text.
+    private func emitRouteDecision(_ decision: GroundingRouter.Decision, target: String) {
+        guard let onRouteDecision else { return }
+        let outcome = RouteOutcome(decision: decision, targetHash: Self.auditHash(target))
+        Task { await onRouteDecision(outcome) }
     }
 
     private func recordVerifierOutcomeIfNeeded(
@@ -1578,34 +1618,36 @@ public struct MixtureGrounder: VisualGrounder {
         displayWidthPoints: Int,
         displayHeightPoints: Int
     ) -> GroundingVerifierCandidate? {
-        // Canvas concepts are visual-only: a target named as a "placeholder" or
-        // "canvas" element (Keynote/Pages slide boxes, drawing surfaces) has no
-        // faithful AX node, but a short generic chrome label CAN substring-match it
-        // (naming "the title placeholder" would hijack a Format-panel "Title"
-        // checkbox — actionable, and toggling it even defeats the no-effect
-        // backstop). Such targets go straight to the visual grounder. General, not
-        // app-specific: these words denote a drawn surface in any app.
-        if Self.namesCanvasConcept(target) { return nil }
         let front = NSWorkspace.shared.frontmostApplication
-        // NEVER ground Cascade's OWN UI. When Cascade's window is frontmost, AX-first
-        // reads ITS tree and matches Cascade's buttons/fields (the audited
-        // "Agents"/"Create new…" hijack) — the agent then clicks and types into
-        // Cascade instead of the target app behind it (the "can't type" report). The
-        // captured screenshot excludes Cascade's own windows, so the visual grounder
-        // sees the real target — defer to it.
-        if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
-        // Distrusted-AX apps (canvas/Electron) are the visual grounder's domain.
         let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
-        if skill?.axUnreliable == true {
-            return nil
-        }
-        let runtimeProfile = AXElementResolver.runtimeProfileForFrontmost()
-        if runtimeProfile?.isSparse == true {
-            if let runtimeProfile {
-                Task { await onRuntimeProfile?(runtimeProfile) }
+        // d15: THE routing gate. AX-first by default; the visual grounder gets
+        // the request ONLY for canvas concepts (a "placeholder"/"canvas" target
+        // has no faithful AX node and a fuzzy match would hijack chrome),
+        // Cascade's own UI (the audited "Agents"/"Create new…" hijack — the
+        // screenshot excludes Cascade's windows, so vision sees the real
+        // target), apps whose skill distrusts AX (`axUnreliable`), and sparse
+        // or stale-node-dominated live trees. The stale rule is new and rides
+        // the d11–d13 experimental flag; everything else reproduces the
+        // previously scattered checks in one audited place.
+        let decision = GroundingRouter.route(
+            target: target,
+            requestKind: .labelMatch,
+            frontmostBundleIdentifier: front?.bundleIdentifier,
+            ownBundleIdentifier: Self.cascadeBundleID,
+            axUnreliable: skill?.axUnreliable == true,
+            staleAXGateEnabled: axPickerEnabled,
+            runtimeProfile: { AXElementResolver.runtimeProfileForFrontmost() }
+        )
+        guard decision.allowsAX else {
+            // Sparse/stale routes still surface the profile to the existing
+            // `grounding.ax_profile` audit, exactly like the pre-d15 path.
+            if let profile = decision.runtimeProfile {
+                Task { await onRuntimeProfile?(profile) }
             }
+            emitRouteDecision(decision, target: target)
             return nil
         }
+        let runtimeProfile = decision.runtimeProfile
         guard let match = AXElementResolver.find(label: target),
               match.score >= minAXScore else { return nil }
         // Map the matched element center through the typed transform for the display
@@ -1755,9 +1797,22 @@ public struct MixtureGrounder: VisualGrounder {
             matches = markPickHarvestOverride()
         } else {
             let front = NSWorkspace.shared.frontmostApplication
-            if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
             let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
-            if skill?.axUnreliable == true { return nil }
+            // d15: same routing gate as the label path. `.markPick` applies
+            // only the app-level distrust rules (own UI / `axUnreliable`) —
+            // a planner-named stable id is exact identity, so the fuzzy-label
+            // protections (canvas words, sparse/stale tree) don't gate it.
+            let decision = GroundingRouter.route(
+                target: token,
+                requestKind: .markPick,
+                frontmostBundleIdentifier: front?.bundleIdentifier,
+                ownBundleIdentifier: Self.cascadeBundleID,
+                axUnreliable: skill?.axUnreliable == true
+            )
+            guard decision.allowsAX else {
+                emitRouteDecision(decision, target: token)
+                return nil
+            }
             matches = AXElementResolver.interactables(limit: Self.markPickHarvestLimit)
         }
         guard let capture = Self.captureDisplayGeometry(
@@ -1821,11 +1876,11 @@ public struct MixtureGrounder: VisualGrounder {
     }
 
     /// Words that denote a drawn surface with no faithful accessibility node, so a
-    /// target naming one must be grounded visually, not by AX label match. Pure +
-    /// pinned. Kept tiny and generic — these are not app-specific UI labels.
+    /// target naming one must be grounded visually, not by AX label match. d15
+    /// moved the list into `GroundingRouter` (the single routing gate); this
+    /// shim keeps the existing symbol pinned by tests and callers.
     nonisolated static func namesCanvasConcept(_ target: String) -> Bool {
-        let t = target.lowercased()
-        return t.contains("placeholder") || t.contains("canvas")
+        GroundingRouter.namesCanvasConcept(target)
     }
 
     /// CG-global top-left element center → display-local AppKit point (bottom-left

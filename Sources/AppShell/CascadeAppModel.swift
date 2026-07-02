@@ -3046,6 +3046,17 @@ public final class CascadeAppModel: ObservableObject {
                     ))
                 }
             },
+            onRouteDecision: { [store = self.store] outcome in
+                // d15: every request the routing gate sent AWAY from AX-first
+                // gets a row with its reason (canvas_concept / own_ui /
+                // ax_unreliable_app / sparse_ax / stale_ax). Hashes + counts
+                // only, never the target text.
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "grounding.route",
+                    detail: Self.groundingRouteAuditDetail(outcome)
+                ))
+            },
             onVerifierOutcome: { [weak self, store = self.store] outcome in
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
@@ -5848,6 +5859,17 @@ public final class CascadeAppModel: ObservableObject {
         }
         if let selectedCandidateHash = outcome.selectedCandidateHash {
             parts.append("selectedCandidateHash=\(safeAuditToken(selectedCandidateHash))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// d15 `grounding.route` audit row: why the routing gate sent a grounding
+    /// request to the visual grounder instead of AX-first. Privacy: enum raw
+    /// values, hashes, and counts only — no target text, labels, or OCR.
+    nonisolated static func groundingRouteAuditDetail(_ outcome: MixtureGrounder.RouteOutcome) -> String {
+        var parts = [outcome.decision.safeAuditDetail]
+        if let targetHash = outcome.targetHash {
+            parts.append("targetHash=\(safeAuditToken(targetHash))")
         }
         return parts.joined(separator: " ")
     }
