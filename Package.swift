@@ -11,7 +11,9 @@ let package = Package(
         .library(name: "CascadeMemory", targets: ["CascadeMemory"]),
         .library(name: "MacContextKit", targets: ["MacContextKit"]),
         .library(name: "ComputerUseKit", targets: ["ComputerUseKit"]),
-        .library(name: "AgentOrchestrator", targets: ["AgentOrchestrator"])
+        .library(name: "AgentOrchestrator", targets: ["AgentOrchestrator"]),
+        .library(name: "GroundingBench", targets: ["GroundingBench"]),
+        .executable(name: "grounding-bench", targets: ["GroundingBenchCLI"])
     ],
     targets: [
         .target(name: "CascadeDesignSystem"),
@@ -29,6 +31,7 @@ let package = Package(
             name: "AgentOrchestrator",
             dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
+        .target(name: "GroundingBench", dependencies: ["CascadeMemory", "ProviderKit"]),
         .target(
             name: "AppShell",
             dependencies: [
@@ -46,6 +49,10 @@ let package = Package(
             name: "CascadeApp",
             dependencies: ["AppShell"],
             resources: [.process("Resources")]
+        ),
+        .executableTarget(
+            name: "GroundingBenchCLI",
+            dependencies: ["GroundingBench", "ProviderKit"]
         ),
         .testTarget(name: "CascadeMemoryTests", dependencies: ["CascadeMemory"]),
         .testTarget(
@@ -71,6 +78,10 @@ let package = Package(
         .testTarget(
             name: "ReliabilityEvalTests",
             dependencies: ["AgentOrchestrator", "CascadeMemory"]
+        ),
+        .testTarget(
+            name: "GroundingBenchTests",
+            dependencies: ["GroundingBench", "ProviderKit"]
         )
     ]
 )
