@@ -48,6 +48,15 @@ import ProviderKit
 //    screen. Crop-local output maps back through the d01 `CoordinateTransform`
 //    (never ad-hoc scale math); any miss falls back to the unchanged full-screen
 //    call, so the flag-off path and the no-evidence path are byte-identical.
+//  • d17 (Screen2AX; same flag): what LEAVES the mixture for a vision-grounded
+//    target is no longer a bare point — every vision candidate is converted
+//    into a synthetic AX-like node `{source: vision, role, label, frame,
+//    confidence, actions}` (`Screen2AX` + `SyntheticAXNode`), filling ONLY the
+//    structural fields AX candidates already populate, so downstream consumers
+//    see one structural interface. Conversion runs AFTER verifier arbitration
+//    (a synthesized label is never verification evidence) and never touches
+//    source or confidence — native AX keeps outranking synthetic in the d13
+//    trust order unless verification proved AX wrong.
 // Toggle off with `cascade.mixtureGrounding = false` to A/B against pure visual.
 // See [[cascade-cu-downgrade-research]].
 
@@ -426,7 +435,11 @@ public struct MixtureGrounder: VisualGrounder {
                     displayHeightPoints: displayHeightPoints,
                     options: options
                 ) {
-                    return refined
+                    // d17: vision output leaves as synthetic AX-like nodes.
+                    return synthesized(
+                        refined, target: target,
+                        displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+                    )
                 }
                 let result = await base.groundResult(
                     screenshot: screenshot,
@@ -436,9 +449,14 @@ public struct MixtureGrounder: VisualGrounder {
                     options: options
                 )
                 let elapsed = start.duration(to: ContinuousClock.now)
-                return result.selectedCandidate?.latency == nil
+                let timed = result.selectedCandidate?.latency == nil
                     ? Self.withLatency(result, elapsed.mixtureTimeInterval)
                     : result
+                // d17: vision output leaves as synthetic AX-like nodes.
+                return synthesized(
+                    timed, target: target,
+                    displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+                )
             }
             let start = ContinuousClock.now
             // d15: routing (canvas / own UI / distrusted / sparse / stale AX)
@@ -591,8 +609,15 @@ public struct MixtureGrounder: VisualGrounder {
                 )
             }
             await recordVerifierOutcomeIfNeeded(selection, target: target)
-            await storeGroundingCacheResult(selection.result, key: key)
-            return selection.result
+            // d17: the verifier saw the RAW candidates (no synthesized labels
+            // as evidence); the result that leaves — and is cached — carries
+            // the synthetic AX-like structure for every vision candidate.
+            let finalResult = synthesized(
+                selection.result, target: target,
+                displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+            )
+            await storeGroundingCacheResult(finalResult, key: key)
+            return finalResult
         }
     }
 
@@ -706,14 +731,24 @@ public struct MixtureGrounder: VisualGrounder {
                 displayHeightPoints: displayHeightPoints,
                 options: .default
             ) {
-                await storeGroundingCacheResult(refined, key: key)
-                return refined
+                // d17: enrich BEFORE the store so cache hits replay the
+                // synthetic AX-like structure, not a bare point.
+                let synthesizedRefined = synthesized(
+                    refined, target: target,
+                    displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+                )
+                await storeGroundingCacheResult(synthesizedRefined, key: key)
+                return synthesizedRefined
             }
-            let result = await base.groundResult(
-                screenshot: screenshot,
+            let result = synthesized(
+                await base.groundResult(
+                    screenshot: screenshot,
+                    target: target,
+                    displayWidthPoints: displayWidthPoints,
+                    displayHeightPoints: displayHeightPoints
+                ),
                 target: target,
-                displayWidthPoints: displayWidthPoints,
-                displayHeightPoints: displayHeightPoints
+                displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
             )
             await storeGroundingCacheResult(result, key: key)
             return result
@@ -746,6 +781,7 @@ public struct MixtureGrounder: VisualGrounder {
                 displayWidthPoints: displayWidthPoints,
                 displayHeightPoints: displayHeightPoints
             ) {
+                // Already structural (AX/OCR index candidates) — d17 no-ops.
                 result = indexed
             } else if let refined = await cropRefinedVisualResult(
                 screenshot: screenshot,
@@ -755,14 +791,22 @@ public struct MixtureGrounder: VisualGrounder {
                 options: options
             ) {
                 // d16: crop-and-refine before the full-screen visual call.
-                result = refined
+                // d17: vision output leaves as synthetic AX-like nodes.
+                result = synthesized(
+                    refined, target: target,
+                    displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+                )
             } else {
-                result = await base.groundResult(
-                    screenshot: screenshot,
+                result = synthesized(
+                    await base.groundResult(
+                        screenshot: screenshot,
+                        target: target,
+                        displayWidthPoints: displayWidthPoints,
+                        displayHeightPoints: displayHeightPoints,
+                        options: options
+                    ),
                     target: target,
-                    displayWidthPoints: displayWidthPoints,
-                    displayHeightPoints: displayHeightPoints,
-                    options: options
+                    displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
                 )
             }
             await storeGroundingCacheResult(result, key: key)
@@ -889,6 +933,48 @@ public struct MixtureGrounder: VisualGrounder {
             verifierVerdict: result.verifierVerdict,
             verifierFailureKind: result.verifierFailureKind,
             alternativeCount: result.alternativeCount
+        )
+    }
+
+    /// d17 (Screen2AX; rides the same `cascade.experimentalCompressedObservation`
+    /// flag as the d12 picker): convert visual-grounder output into synthetic
+    /// AX-like nodes at the OUTPUT boundary — each vision candidate gains the
+    /// same structural fields an AX candidate carries (role, label, frame,
+    /// stable `vax:` id, with AX-vocabulary actions on the node) so the rest
+    /// of the pipeline sees ONE structural interface. Runs AFTER verifier
+    /// arbitration (a synthesized label can never masquerade as observed text
+    /// evidence during verification) and never touches `source` or
+    /// `confidence`, so the d13 trust order still ranks native AX above the
+    /// synthetic node unless verification proved AX wrong. `enabled == false`
+    /// (the shipped default) returns the result untouched — byte-identical.
+    static func synthesizedAXResult(
+        _ result: GroundingResult,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int,
+        enabled: Bool
+    ) -> GroundingResult {
+        guard enabled else { return result }
+        return Screen2AX.enriched(
+            result,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        )
+    }
+
+    private func synthesized(
+        _ result: GroundingResult,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) -> GroundingResult {
+        Self.synthesizedAXResult(
+            result,
+            target: target,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints,
+            enabled: axPickerEnabled
         )
     }
 
