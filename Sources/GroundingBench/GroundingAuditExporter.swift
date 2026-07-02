@@ -181,12 +181,13 @@ public struct GroundingAuditExporter: Sendable {
                 && click.matches(context: context)
         }) else { return nil }
 
-        let verifierMax = click.capturedMilliseconds + Int64((verifierWindow * 1000).rounded())
-        let hasPositiveVerifier = positiveVerifierRows.contains { row in
-            row.capturedMilliseconds >= click.capturedMilliseconds
-                && row.capturedMilliseconds <= verifierMax
-                && (targetHash == Self.targetHash(from: row) || Self.targetHash(from: row) == nil)
-        }
+	        let verifierMax = click.capturedMilliseconds + Int64((verifierWindow * 1000).rounded())
+	        let hasPositiveVerifier = positiveVerifierRows.contains { row in
+	            guard let verifierTargetHash = Self.targetHash(from: row) else { return false }
+	            return row.capturedMilliseconds >= click.capturedMilliseconds
+	                && row.capturedMilliseconds <= verifierMax
+	                && targetHash == verifierTargetHash
+	        }
         guard hasPositiveVerifier else { return nil }
         return .point(CGPoint(x: click.x, y: click.y), radius: 24)
     }

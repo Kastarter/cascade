@@ -166,14 +166,14 @@ public struct GroundingBenchmarkRunner: Sendable {
                 accuracy: appScored == 0 ? 0 : Double(appHits) / Double(appScored)
             )
         }
-        return GroundingBenchmarkReport(
-            totalCases: cases.count,
-            scoredCases: scored,
-            hits: hits,
-            misses: misses,
-            skippedUnlabeled: cases.filter { $0.expectedBoxOrPoint == nil }.count,
-            skippedMissingTarget: cases.filter { ($0.targetText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count,
-            accuracy: scored == 0 ? 0 : Double(hits) / Double(scored),
+	        return GroundingBenchmarkReport(
+	            totalCases: cases.count,
+	            scoredCases: scored,
+	            hits: hits,
+	            misses: misses,
+	            skippedUnlabeled: observations.filter { $0.status == .skippedUnlabeled }.count,
+	            skippedMissingTarget: observations.filter { $0.status == .skippedMissingTarget }.count,
+	            accuracy: scored == 0 ? 0 : Double(hits) / Double(scored),
             p50Latency: percentile(latencies, 0.50),
             p95Latency: percentile(latencies, 0.95),
             perApp: perApp,

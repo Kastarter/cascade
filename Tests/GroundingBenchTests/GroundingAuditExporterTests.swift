@@ -113,6 +113,34 @@ struct GroundingAuditExporterTests {
         #expect(expected.contains(CGPoint(x: 74, y: 91)))
         #expect(source.outcome == .accept)
     }
+
+    @Test
+    func exporterDoesNotTreatHashlessAcceptVerifierAsTargetMatch() throws {
+        let fixture = try ExportFixture()
+        try fixture.insertContext(id: 10, milliseconds: 1_800_000_030_000, imagePath: fixture.framePath)
+        try fixture.insertAudit(
+            id: 15,
+            milliseconds: 1_800_000_030_000,
+            action: "agent.ground.miss",
+            detail: "turn=5 missedTargetHash=submit controlCount=2 labelsHash=abc"
+        )
+        try fixture.insertClick(milliseconds: 1_800_000_031_000, x: 321, y: 654)
+        try fixture.insertAudit(
+            id: 16,
+            milliseconds: 1_800_000_032_000,
+            action: "grounding.verifier",
+            detail: "verdict=accept outcome=accepted failure=none confidence=0.99"
+        )
+
+        let cases = try GroundingAuditExporter().cases(
+            databasePath: fixture.dbURL,
+            options: .init(targetTextByHash: ["submit": "Submit"])
+        )
+        let source = try #require(cases.first { $0.sourceAuditEventID == 15 })
+
+        #expect(source.expectedBoxOrPoint == nil)
+        #expect(source.outcome == .unlabeled)
+    }
 }
 
 private final class ExportFixture {

@@ -24,10 +24,11 @@ struct GroundingBenchFixtureTests {
         #expect(loaded.count == 3)
         #expect(report.totalCases == 3)
         #expect(report.scoredCases == 2)
-        #expect(report.hits == 2)
-        #expect(report.misses == 0)
-        #expect(report.skippedMissingTarget == 1)
-        #expect(report.skippedUnlabeled == 1)
-        #expect(report.accuracy == 1.0)
-    }
-}
+	        #expect(report.hits == 2)
+	        #expect(report.misses == 0)
+	        #expect(report.skippedMissingTarget == 1)
+	        #expect(report.skippedUnlabeled == 0)
+        #expect(report.scoredCases + report.skippedMissingTarget + report.skippedUnlabeled == report.totalCases)
+	        #expect(report.accuracy == 1.0)
+	    }
+	}

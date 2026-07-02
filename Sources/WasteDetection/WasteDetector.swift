@@ -1230,7 +1230,7 @@ public struct WasteDetector: Sendable {
                 modifiers: event.modifiers,
                 appName: event.appName,
                 bundleIdentifier: event.bundleIdentifier,
-                windowTitleHint: event.windowTitle,
+                windowTitleHint: abstractSignatureTokens == nil ? event.windowTitle : Self.parameterizedWindowTitleHint(surface: surface(event)),
                 ocrAnchor: sanitizedByAbstractMining ? Self.parameterizedAnchor(parameter, kind: sanitizedKind) : Self.ocrAnchor(for: event, contexts: contexts),
                 targetDescriptor: sanitizedByAbstractMining ? Self.parameterizedTargetDescriptor(for: event, parameter: parameter, kind: sanitizedKind) : event.targetDescriptor,
                 isParameter: parameter != nil,
@@ -1308,6 +1308,12 @@ public struct WasteDetector: Sendable {
             role: role,
             createdFrom: "parameterized-mining"
         )
+    }
+
+    private static func parameterizedWindowTitleHint(surface: String) -> String? {
+        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return "\(normalized) window"
     }
 
     /// A title that says what the workflow IS, not just where it happened: the

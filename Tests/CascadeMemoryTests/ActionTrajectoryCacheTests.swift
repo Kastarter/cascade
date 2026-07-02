@@ -74,14 +74,26 @@ func actionTrajectoryKeysAreStableAndRowsExcludePrivateText() async throws {
         targetText: "Body",
         action: ActionTrajectoryCacheAction(kind: "type", json: #"{"text":"secret payroll 4111111111111111"}"#)
     )
+    let businessPrivate = try await store.promoteActionTrajectoryCache(
+        source: .assist,
+        goal: "Review Aperture Delta term sheet",
+        state: safeState(windowTitle: "Aperture Delta term sheet - Safari"),
+        targetDescriptor: "AXButton Aperture Delta",
+        targetText: "Aperture Delta term sheet",
+        action: clickAction(descriptor: "AXButton Aperture Delta")
+    )
 
     #expect(first?.actionKeyHash == second?.actionKeyHash)
     #expect(typed == nil)
+    #expect(businessPrivate != nil)
     let storedText = rawJoinedText(path, table: "action_trajectory_cache")
     let actionJSON = rawText(path, "SELECT action_json FROM action_trajectory_cache LIMIT 1;")
     #expect(!storedText.localizedCaseInsensitiveContains("jane@example.com"))
     #expect(!storedText.localizedCaseInsensitiveContains("4111111111111111"))
     #expect(!storedText.localizedCaseInsensitiveContains("secret payroll"))
+    #expect(!storedText.localizedCaseInsensitiveContains("Aperture"))
+    #expect(!storedText.localizedCaseInsensitiveContains("Delta"))
+    #expect(!storedText.localizedCaseInsensitiveContains("term sheet"))
     #expect(!actionJSON.localizedCaseInsensitiveContains("AXButton Send"))
     #expect(actionJSON.localizedCaseInsensitiveContains("textHash"))
     let audits = try await store.recentAudit(limit: 10).map(\.detail).joined(separator: "\n")
@@ -204,6 +216,12 @@ func actionTrajectoryAllowlistOnlyExecutesVerifiedIdempotentActions() async thro
         actionKind: "open_app",
         audit: false
     )
+    let broadOpenApp = try await store.lookupActionTrajectoryCache(
+        goal: "open mail and write a draft",
+        state: safeState(screenHash: 0x9999, grid: [0x9999]),
+        actionKind: "open_app",
+        audit: false
+    )
     let coordinateOnlyClick = try await store.lookupActionTrajectoryCache(
         goal: "click send",
         state: safeState(),
@@ -219,9 +237,26 @@ func actionTrajectoryAllowlistOnlyExecutesVerifiedIdempotentActions() async thro
     )
 
     #expect(openApp.executable?.executable == true)
+    #expect(broadOpenApp.executable == nil)
     #expect(coordinateOnlyClick.executable == nil)
     #expect(!coordinateOnlyClick.hints.isEmpty)
     #expect(typeRow == nil)
+}
+
+@Test
+func actionTrajectoryCacheDoesNotPromoteURLReplayActions() async throws {
+    let (store, _) = try makeActionCacheStore()
+    let row = try await store.promoteActionTrajectoryCache(
+        source: .assist,
+        goal: "open customer report",
+        state: safeState(appName: "Safari", bundleIdentifier: "com.apple.Safari"),
+        action: ActionTrajectoryCacheAction(
+            kind: "open_url",
+            json: #"{"url":"https://intranet.example.com/customers/123/report?token=abc"}"#
+        )
+    )
+
+    #expect(row == nil)
 }
 
 @Test
@@ -248,8 +283,8 @@ func actionTrajectoryTTLPrunesExpiredRowsAndKeepsFreshSuccesses() async throws {
     _ = try await store.pruneActionTrajectoryCache(now: now.addingTimeInterval(2 * 24 * 60 * 60))
     let rows = try await store.actionTrajectoryCacheRows()
 
-    #expect(!rows.contains { $0.goalNorm.contains("short") })
-    #expect(rows.contains { $0.goalNorm.contains("long") })
+    #expect(rows.count == 1)
+    #expect(rows.first?.ttlPolicy == .long)
 }
 
 private func rawInt(_ path: String, _ sql: String) -> Int {
