@@ -45,7 +45,7 @@ public struct CuratedAgent: Identifiable, Sendable, Equatable {
 /// raw detector list, so curation is never worse than showing everything.
 public struct WorkflowCurator: Sendable {
     private let client: any MessageCompleting
-    private let cachedClient: CachedMessageCompleter?
+    private let cachedClient: ValidatingCachedMessageCompleter?
     private let model: String
     static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
     static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v1"
@@ -61,7 +61,7 @@ public struct WorkflowCurator: Sendable {
             RetryingMessageCompleter(client: client, retryPolicy: $0)
         } ?? client
         self.client = effectiveClient
-        self.cachedClient = cache.map { CachedMessageCompleter(client: effectiveClient, cache: $0) }
+        self.cachedClient = cache.map { ValidatingCachedMessageCompleter(client: effectiveClient, cache: $0) }
         self.model = model
     }
 
@@ -198,6 +198,8 @@ public struct WorkflowCurator: Sendable {
         var lines = ["The recorded demonstration:"]
         var line = "[0] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps) · ~\(waste.estimatedSecondsPerRun)s"
         if !steps.isEmpty { line += " · steps: \(steps)" }
+        let liveFacts = workflowPromptSummaries(for: waste.recipe.steps)
+        if !liveFacts.isEmpty { line += " · " + liveFacts.joined(separator: "; ") }
         lines.append(line)
         if let onScreen, !onScreen.isEmpty {
             lines.append("    on screen: “\(onScreen)”")
@@ -275,10 +277,12 @@ public struct WorkflowCurator: Sendable {
             var line = "[\(index)] “\(waste.title)” · apps: \(apps.isEmpty ? "—" : apps)"
             line += " · seen \(waste.occurrences)× (~\(waste.estimatedSecondsPerRun)s each)"
             if !steps.isEmpty { line += " · steps: \(steps)" }
-            let parameters = parameterPromptSummaries(for: waste.recipe.steps)
-            if !parameters.isEmpty { line += " · " + parameters.joined(separator: "; ") }
+            let liveFacts = workflowPromptSummaries(for: waste.recipe.steps)
+            if !liveFacts.isEmpty { line += " · " + liveFacts.joined(separator: "; ") }
             // The canonical high-value automatable routine: data moved between apps.
-            if WasteDetector.hasCrossAppCopyPaste(waste.recipe.steps) { line += " · moves data between apps" }
+            if WasteDetector.hasCrossAppCopyPaste(waste.recipe.steps) || hasDataflowEdges(waste.recipe.steps) {
+                line += " · moves data between apps"
+            }
             lines.append(line)
             if let screen = onScreen[waste.signature], !screen.isEmpty {
                 lines.append("    on screen: “\(screen)”")
@@ -287,31 +291,82 @@ public struct WorkflowCurator: Sendable {
         return lines.joined(separator: "\n")
     }
 
-    private static func parameterPromptSummaries(for steps: [RecipeStep]) -> [String] {
-        let parameterSteps = steps.filter(\.isParameter)
-        guard !parameterSteps.isEmpty else { return [] }
-        return parameterSteps.prefix(4).map { step in
-            let field = parameterDisplayName(step.parameterKey) ?? parameterDisplayName(step.ocrAnchor) ?? "field"
-            let kind = step.parameterKind?.rawValue ?? "freeText"
-            var summary = "parameter \(field) (\(kind)) changes each run"
-            if !step.sourceStepIDs.isEmpty {
-                summary += " from earlier selected/copied value"
+    private static func workflowPromptSummaries(for steps: [RecipeStep]) -> [String] {
+        liveValueSlotPromptSummaries(for: steps) + dataflowEdgePromptSummaries(for: steps)
+    }
+
+    private static func liveValueSlotPromptSummaries(for steps: [RecipeStep]) -> [String] {
+        let liveSteps = steps.filter(isLiveValueStep)
+        guard !liveSteps.isEmpty else { return [] }
+        return liveSteps.prefix(4).map { step in
+            let key = step.parameterKey ?? step.dataflowEdgeID ?? step.ocrAnchor ?? "step-\(step.order)"
+            var parts = [
+                "live slot",
+                "keyHash=\(AuditIdentity.hash(key))",
+                "keyChars=\(AuditIdentity.count(key))",
+                "kind=\(AuditIdentity.safeToken(step.parameterKind?.rawValue ?? "freeText"))",
+                "shapeCount=\(step.valueExamples.count)",
+                "shapeHash=\(AuditIdentity.hash(step.valueExamples.joined(separator: "|")))",
+                "valueHashCount=\(step.valueHashes.count)",
+                "valueHashesHash=\(AuditIdentity.hash(step.valueHashes.sorted().joined(separator: "|")))",
+                "sourceStepCount=\(step.sourceStepIDs.count)",
+                "targetSurfaceHash=\(AuditIdentity.hash(surfaceIdentity(step)))"
+            ]
+            if let documentIdentityHash = step.documentIdentityHash {
+                parts.append("targetDocumentHash=\(documentIdentityHash)")
             }
-            return summary
+            if let dataflowEdgeID = step.dataflowEdgeID {
+                parts.append("edgeHash=\(AuditIdentity.hash(dataflowEdgeID))")
+            }
+            if isPasteShortcut(step) {
+                parts.append("pasteShortcut=true")
+            }
+            return parts.joined(separator: " ")
         }
     }
 
-    private static func parameterDisplayName(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-        let spaced = raw
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !spaced.isEmpty, !PrivacyRules.isSensitiveText(spaced) else { return nil }
-        return spaced
-            .split(separator: " ")
-            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
-            .joined(separator: " ")
+    private static func dataflowEdgePromptSummaries(for steps: [RecipeStep]) -> [String] {
+        let byOrder = Dictionary(uniqueKeysWithValues: steps.map { ($0.order, $0) })
+        let edgeTargets = steps.filter { $0.dataflowEdgeID != nil || !$0.sourceStepIDs.isEmpty }
+        guard !edgeTargets.isEmpty else { return [] }
+        return edgeTargets.prefix(3).map { target in
+            let sources = target.sourceStepIDs.compactMap { byOrder[$0] }
+            var parts = [
+                "dataflow edge",
+                "edgeHash=\(AuditIdentity.hash(target.dataflowEdgeID ?? "target:\(target.order)"))",
+                "sourceStepCount=\(sources.count)",
+                "sourceSurfaceHash=\(AuditIdentity.hash(sources.map(surfaceIdentity).joined(separator: "|")))",
+                "targetSurfaceHash=\(AuditIdentity.hash(surfaceIdentity(target)))",
+                "sourceDocumentHash=\(AuditIdentity.hash(sources.compactMap(\.documentIdentityHash).joined(separator: "|")))"
+            ]
+            if let documentIdentityHash = target.documentIdentityHash {
+                parts.append("targetDocumentHash=\(documentIdentityHash)")
+            }
+            if let transform = target.transform {
+                parts.append("transform=\(AuditIdentity.safeToken(transform))")
+            }
+            return parts.joined(separator: " ")
+        }
+    }
+
+    private static func hasDataflowEdges(_ steps: [RecipeStep]) -> Bool {
+        steps.contains { $0.dataflowEdgeID != nil || !$0.sourceStepIDs.isEmpty }
+    }
+
+    private static func isLiveValueStep(_ step: RecipeStep) -> Bool {
+        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+    }
+
+    private static func isPasteShortcut(_ step: RecipeStep) -> Bool {
+        guard step.kind == .key, step.key?.lowercased() == "v" else { return false }
+        let modifiers = Set(step.modifiers.map { $0.lowercased() })
+        return modifiers.contains("command") || modifiers.contains("cmd") || modifiers.contains("control") || modifiers.contains("ctrl")
+    }
+
+    private static func surfaceIdentity(_ step: RecipeStep) -> String {
+        let surface = step.surface?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let surface, !surface.isEmpty { return surface }
+        return step.appName
     }
 
     /// Parses the reply, tolerating prose or code fences. Returns nil ONLY when the

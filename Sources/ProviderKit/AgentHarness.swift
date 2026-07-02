@@ -243,6 +243,15 @@ public enum AgentHarness {
         }
     }
 
+    public static func performEvidence(_ call: HarnessCall, powerEnabled: Bool) async -> SourceEvidence {
+        let result = await perform(call, powerEnabled: powerEnabled)
+        return SourceEvidence.fromToolResult(
+            result,
+            source: call.isPower ? .action : .localFiles,
+            defaultTool: call.toolName
+        )
+    }
+
     // MARK: - Read-only tier
 
     private static func searchFiles(query: String, folder: String?) async -> String {

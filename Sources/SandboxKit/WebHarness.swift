@@ -237,33 +237,49 @@ public enum WebHarness {
             policyContext?.rememberListedLabels([])
             return raw
         }
-        let limits = ["field": 24, "button": 24, "link": 32]
-        var counts: [String: Int] = [:]
+        let tokens = policyContext?.relevantTokens() ?? []
+        let candidates = raw.components(separatedBy: .newlines).enumerated().compactMap { offset, line -> InteractiveCandidate? in
+            guard let item = parseInteractiveLine(line) else { return nil }
+            let label = WebHarnessPolicyContext.sanitizedVisibleText(item.label, limit: 96)
+            return InteractiveCandidate(
+                role: item.role,
+                label: label,
+                domOrder: offset,
+                relevance: relevanceScore(label: label, tokens: tokens),
+                injectionScore: InjectionGuard.analyze(label).score
+            )
+        }
+        let ranked = candidates.sorted(by: sortInteractiveCandidates).prefix(48)
         var output: [String] = []
         var safeLabels: [String] = []
-        for line in raw.components(separatedBy: .newlines) {
-            guard let item = parseInteractiveLine(line) else { continue }
-            let role = item.role
-            let limit = limits[role] ?? 16
-            guard (counts[role] ?? 0) < limit else { continue }
-            counts[role, default: 0] += 1
-            let label = WebHarnessPolicyContext.sanitizedVisibleText(item.label, limit: 96)
-            let analysis = InjectionGuard.analyze(label)
-            let prefix = "\(output.count + 1). [\(role)] "
-            if analysis.score >= 4 {
-                output.append(prefix + "[label suppressed: suspicious page text]")
+        for (index, item) in ranked.enumerated() {
+            let mark = "A\(index + 1)"
+            if item.injectionScore >= 4 {
+                output.append("\(mark) [\(item.role)] [label suppressed: suspicious page text]")
                 continue
             }
-            if analysis.score > 0 {
-                output.append(prefix + "\(label) [suspicious label]")
-                continue
+            let rendered = item.label.isEmpty ? "(unlabeled \(item.role))" : item.label
+            var line = "\(mark) [\(item.role)] \(rendered)"
+            if item.injectionScore > 0 {
+                line += " [suspicious label]"
+            } else if let action = actionHint(for: item.role, label: item.label) {
+                line += " -> \(action)"
+                safeLabels.append(rendered)
+            } else if !item.label.isEmpty {
+                safeLabels.append(rendered)
             }
-            let rendered = label.isEmpty ? "(unlabeled \(role))" : label
-            output.append(prefix + rendered)
-            safeLabels.append(rendered)
+            output.append(line)
         }
         policyContext?.rememberListedLabels(safeLabels)
         return output.isEmpty ? "No safe interactive elements found." : output.joined(separator: "\n")
+    }
+
+    private struct InteractiveCandidate: Sendable {
+        let role: String
+        let label: String
+        let domOrder: Int
+        let relevance: Int
+        let injectionScore: Int
     }
 
     private static func parseInteractiveLine(_ line: String) -> (role: String, label: String)? {
@@ -277,6 +293,48 @@ public enum WebHarness {
         let role = matched[roleRange].dropFirst().dropLast()
         let label = matched[roleRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
         return (String(role), label)
+    }
+
+    private static func sortInteractiveCandidates(_ lhs: InteractiveCandidate, _ rhs: InteractiveCandidate) -> Bool {
+        if lhs.injectionScore != rhs.injectionScore { return lhs.injectionScore < rhs.injectionScore }
+        if lhs.relevance != rhs.relevance { return lhs.relevance > rhs.relevance }
+        let lhsRole = rolePriority(lhs.role)
+        let rhsRole = rolePriority(rhs.role)
+        if lhsRole != rhsRole { return lhsRole > rhsRole }
+        if lhs.label.count != rhs.label.count { return lhs.label.count < rhs.label.count }
+        return lhs.domOrder < rhs.domOrder
+    }
+
+    private static func relevanceScore(label: String, tokens: Set<String>) -> Int {
+        guard !tokens.isEmpty else { return 0 }
+        let normalized = InjectionGuard.normalizedForDetection(label)
+        return tokens.reduce(into: 0) { score, token in
+            if normalized.contains(token) { score += 1 }
+        }
+    }
+
+    private static func rolePriority(_ role: String) -> Int {
+        switch role {
+        case "field": return 3
+        case "button": return 2
+        case "link": return 1
+        default: return 0
+        }
+    }
+
+    private static func actionHint(for role: String, label: String) -> String? {
+        guard !label.isEmpty else { return nil }
+        let escaped = label
+            .replacingOccurrences(of: #"\"#, with: #"\\"#)
+            .replacingOccurrences(of: #"""#, with: #"\""#)
+        switch role {
+        case "field":
+            return #"fill_field field="\#(escaped)" value="...""#
+        case "button", "link":
+            return #"click_text text="\#(escaped)""#
+        default:
+            return nil
+        }
     }
 
     private static func dedupeAdjacent(_ lines: [String]) -> [String] {

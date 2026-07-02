@@ -663,7 +663,7 @@ func wasteFromInstanceHonorsTheWebSurfaceResolver() {
     var i = 0
     events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .click, x: 10, y: 10, text: "Compose", appName: "Google Chrome", windowTitle: "Inbox - Gmail")); i += 1
     events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(Double(i)), kind: .key, key: "c", modifiers: ["command"], appName: "Google Chrome", windowTitle: "Inbox - Gmail")); i += 1
-    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.from(windowTitle: $0.windowTitle) }
+    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.surface(fromWindowTitle: $0.windowTitle) }
     let taught = try! #require(detector.waste(fromInstance: events, contexts: [], surface: resolver))
     #expect(taught.title.contains("Gmail"))
     #expect(taught.apps == ["Google Chrome"])
@@ -688,7 +688,7 @@ func webAppsInSameBrowserAreDistinctWorkflows() {
     for _ in 0..<2 { events.append(click(i, gmail)); i += 1; events.append(copy(i, gmail)); i += 1 }
     for _ in 0..<2 { events.append(click(i, notion)); i += 1; events.append(copy(i, notion)); i += 1 }
 
-    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.from(windowTitle: $0.windowTitle) }
+    let resolver: @Sendable (InputEvent) -> String? = { WebAppIdentity.surface(fromWindowTitle: $0.windowTitle) }
     let results = WasteDetector().detect(contexts: [], inputEvents: events, webAppIdentity: resolver, useEpisodeMining: false)
     #expect(results.count == 2)
     #expect(results.contains { $0.title.contains("Gmail") })

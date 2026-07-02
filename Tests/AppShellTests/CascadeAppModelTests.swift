@@ -874,11 +874,11 @@ func isSameGoalDetectsReFiresButNotDifferentCommands() {
 }
 
 @Test
-func searchShapedGoalDetectorCoversCommonLookupForms() {
-    #expect(CascadeAppModel.isSearchShapedGoal("Find the invoice from yesterday"))
-    #expect(CascadeAppModel.isSearchShapedGoal("look up the latest exchange rate"))
-    #expect(CascadeAppModel.isSearchShapedGoal("ابحث عن ملف العقد"))
-    #expect(!CascadeAppModel.isSearchShapedGoal("Open Notes and write hello"))
+func routeIntentHeuristicCoversCommonLookupForms() {
+    #expect(CascadeAppModel.routeIntentHeuristic("Find the invoice from yesterday").routingIntent == .answerRecord)
+    #expect(CascadeAppModel.routeIntentHeuristic("look up the latest exchange rate").routingIntent == .webFact)
+    #expect(CascadeAppModel.routeIntentHeuristic("ابحث عن ملف العقد").routingIntent == .mixed)
+    #expect(CascadeAppModel.routeIntentHeuristic("Open Notes and write hello").routingIntent == .action)
 }
 
 @Test

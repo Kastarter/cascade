@@ -719,18 +719,11 @@ public final class ComputerUseAgent {
     """
 
     nonisolated public static func resourceCatalogNote(harnessTier: HarnessTier, recallEnabled: Bool) -> String {
-        var cards = [
-            "- On screen now: use the live screenshot/AX context. Best for \"what does this say?\", \"summarize this page\", or anything visibly present. Cost: free, zero latency."
-        ]
-        if recallEnabled {
-            cards.append("- Recorded memory: search_record, get_timeframe, inspect_moment, list_sessions. Best for \"the email I had open earlier\", \"what did I work on this morning?\", or \"that dashboard number\". Cost: cheap, local, instant.")
-        }
-        if harnessTier != .off {
-            cards.append("- Local files: search_files, list_folder, read_file. Best for \"find X on my Mac\", \"what is in that folder?\", or \"open/read the contract\". Cost: cheap, local, instant.")
-        }
-        cards.append("- Web: use the browser/web sandbox when the answer is current, public, or not on this Mac. Best for \"latest/current facts\", world knowledge, prices, news, and external sites. Cost: expensive, slower, network.")
-        cards.append("Pick the cheapest source that can answer the ask. For ambiguous searches, try recorded memory or local files before web; only finish after actually searching a matching source.")
-        return cards.joined(separator: "\n")
+        SourceCardRegistry.renderCatalog(
+            harnessTier: harnessTier,
+            recallEnabled: recallEnabled,
+            includeWeb: true
+        )
     }
 
     /// Browser-tab guidance for the FOREGROUND (real-screen) agent — a real browser with
