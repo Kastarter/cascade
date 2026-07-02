@@ -3582,43 +3582,6 @@ public actor CascadeStore {
         CREATE INDEX IF NOT EXISTS idx_model_call_cache_identity
             ON model_call_cache(model, callsite, prompt_version, schema_version);
 
-        CREATE TABLE IF NOT EXISTS action_trajectory_cache (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_used_at TEXT NOT NULL,
-            source TEXT NOT NULL,
-            action_key_hash TEXT NOT NULL UNIQUE,
-            goal_norm TEXT NOT NULL,
-            app_name TEXT NOT NULL,
-            bundle_identifier TEXT,
-            window_title_norm TEXT,
-            web_app_id TEXT,
-            url_scope TEXT,
-            screen_hash INTEGER,
-            screen_grid_hashes TEXT NOT NULL DEFAULT '[]',
-            ocr_simhash INTEGER,
-            ax_fingerprint TEXT,
-            target_descriptor TEXT,
-            target_text_norm TEXT,
-            action_kind TEXT NOT NULL,
-            action_json TEXT NOT NULL,
-            precondition_json TEXT,
-            postcondition_json TEXT,
-            success_count INTEGER NOT NULL DEFAULT 0,
-            failure_count INTEGER NOT NULL DEFAULT 0,
-            confidence REAL NOT NULL DEFAULT 0,
-            embedding BLOB,
-            ttl_policy TEXT NOT NULL DEFAULT 'standard',
-            expires_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_action_trajectory_cache_lookup
-            ON action_trajectory_cache(action_kind, bundle_identifier, web_app_id, url_scope, confidence DESC, last_used_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_action_trajectory_cache_expiry
-            ON action_trajectory_cache(expires_at);
-        CREATE INDEX IF NOT EXISTS idx_action_trajectory_cache_goal
-            ON action_trajectory_cache(goal_norm, target_text_norm);
-
         CREATE TABLE IF NOT EXISTS model_request_attempt (
             key_sha256 TEXT NOT NULL,
             attempt INTEGER NOT NULL,

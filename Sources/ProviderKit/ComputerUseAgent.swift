@@ -1298,7 +1298,11 @@ public final class ComputerUseAgent {
         }
         var chunkPlan: CUActionChunkPlan?
         if actionChunkingEnabled {
-            let plan = Self.actionChunkPlan(for: actionGroups)
+            let plan = Self.actionChunkPlan(
+                for: actionGroups,
+                pasteKeysAllowed: episodeCopied || goalAsksForPaste,
+                irreversibleKeysAllowed: !guardIrreversibleActions || goalAsksForDestruction
+            )
             if plan.groups.isEmpty, !plan.deferredToolUseIDs.isEmpty {
                 onActionChunkPlanned?(plan)
             }
@@ -1970,14 +1974,22 @@ public final class ComputerUseAgent {
         return false
     }
 
-    nonisolated static func actionChunkPlan(for groups: [CUActionGroup]) -> CUActionChunkPlan {
+    nonisolated static func actionChunkPlan(
+        for groups: [CUActionGroup],
+        pasteKeysAllowed: Bool = false,
+        irreversibleKeysAllowed: Bool = false
+    ) -> CUActionChunkPlan {
         guard !groups.isEmpty else {
             return CUActionChunkPlan(groups: [], deferredToolUseIDs: [], deferredKindTokens: [], breakReason: .noActions)
         }
         var accepted: [CUActionGroup] = []
         var breakReason: CUActionChunkBreakReason?
         for group in groups {
-            let reason = chunkBreakReason(for: group)
+            let reason = chunkBreakReason(
+                for: group,
+                pasteKeysAllowed: pasteKeysAllowed,
+                irreversibleKeysAllowed: irreversibleKeysAllowed
+            )
             guard reason == nil else {
                 breakReason = reason
                 if accepted.isEmpty, reason == .nonAllowlisted {
@@ -1997,7 +2009,11 @@ public final class ComputerUseAgent {
         return CUActionChunkPlan(groups: accepted, deferredToolUseIDs: deferred, deferredKindTokens: deferredKindTokens, breakReason: breakReason)
     }
 
-    private nonisolated static func chunkBreakReason(for group: CUActionGroup) -> CUActionChunkBreakReason? {
+    private nonisolated static func chunkBreakReason(
+        for group: CUActionGroup,
+        pasteKeysAllowed: Bool,
+        irreversibleKeysAllowed: Bool
+    ) -> CUActionChunkBreakReason? {
         guard group.chunkEligible else { return group.breakReason ?? .nonAllowlisted }
         guard !group.actions.isEmpty else { return .malformed }
         for action in group.actions {
@@ -2007,11 +2023,15 @@ public final class ComputerUseAgent {
             default:
                 return .nonAllowlisted
             }
+            let allowedIrreversibleKey: Bool
             if case .key(let combo) = action {
-                if isPasteCombo(combo) { return .pasteGate }
-                if isIrreversibleCombo(combo) { return .irreversibleGate }
+                if isPasteCombo(combo), !pasteKeysAllowed { return .pasteGate }
+                if isIrreversibleCombo(combo), !irreversibleKeysAllowed { return .irreversibleGate }
+                allowedIrreversibleKey = isIrreversibleCombo(combo) && irreversibleKeysAllowed
+            } else {
+                allowedIrreversibleKey = false
             }
-            if shouldTriggerActionCritic(for: action) {
+            if !allowedIrreversibleKey, shouldTriggerActionCritic(for: action) {
                 return .riskGate
             }
         }

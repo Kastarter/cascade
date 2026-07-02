@@ -3690,6 +3690,8 @@ public final class CascadeAppModel: ObservableObject {
             // pull it out and run everything else first.
             var zoomRegion: CGRect?
             var actedThisTurn = streamActed
+            var chunkExecutedToolUseIDs: Set<String>?
+            var chunkBaselineHashes = lastFrameHashes
             if actionChunkingEnabled, !step.actionGroups.isEmpty {
                 let result = await Self.executeActionChunkGroups(
                     step.actionGroups,
@@ -3707,10 +3709,38 @@ public final class CascadeAppModel: ObservableObject {
                         return true
                     },
                     modalTitle: { await Self.unexpectedModal() },
+                    noEffectAfterGroup: { completed in
+                        guard let lastGroup = completed.last,
+                              Self.turnExpectsVisibleChange(lastGroup.actions),
+                              let baseline = chunkBaselineHashes else {
+                            return false
+                        }
+                        let size = agent.captureSize
+                        try? await Task.sleep(for: .milliseconds(260))
+                        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height),
+                              let first = Self.gridHashes(ofJPEG: shot) else {
+                            return false
+                        }
+                        if !PerceptualHash.isDuplicateGrid(first, of: baseline, threshold: Self.noEffectThreshold) {
+                            chunkBaselineHashes = first
+                            return false
+                        }
+                        try? await Task.sleep(for: .milliseconds(400))
+                        guard let recheck = await ScreenCaptureUtility.captureCursorScreenJPEG(width: size.width, height: size.height),
+                              let confirmed = Self.gridHashes(ofJPEG: recheck) else {
+                            return true
+                        }
+                        if PerceptualHash.isDuplicateGrid(confirmed, of: baseline, threshold: Self.noEffectThreshold) {
+                            return true
+                        }
+                        chunkBaselineHashes = confirmed
+                        return false
+                    },
                     pace: { hasMoreActions in
                         if hasMoreActions { try? await Task.sleep(for: .milliseconds(120)) }
                     }
                 )
+                chunkExecutedToolUseIDs = result.executedToolUseIDs
                 if result.executedActions > 0 { actedThisTurn = true }
                 let plannedDeferredCount = step.chunkPlan?.deferredToolUseIDs.count ?? 0
                 let planBreakReason = step.chunkPlan?.breakReason
@@ -3856,13 +3886,13 @@ public final class CascadeAppModel: ObservableObject {
 	                        detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "recheck-cleared", noEffectStreak: noEffectTurns)
 	                    ))
 			                } else {
-			                    noEffectTurns += 1
-			                    if actionChunkingEnabled {
-			                        agent.deferUnexecutedToolResults(
-			                            executedToolUseIDs: Set(step.actionGroups.compactMap(\.toolUseID)),
-			                            reason: .noEffect
-			                        )
-			                    }
+                    noEffectTurns += 1
+                    if actionChunkingEnabled {
+                        agent.deferUnexecutedToolResults(
+                            executedToolUseIDs: chunkExecutedToolUseIDs ?? Set(step.actionGroups.compactMap(\.toolUseID)),
+                            reason: .noEffect
+                        )
+                    }
 			                    recordGroundingNoEffect(from: agent)
 		                    if noEffectTurns >= 2, !noEffectVerifierUsed {
 		                        noEffectVerifierUsed = true
@@ -8033,9 +8063,9 @@ public final class CascadeAppModel: ObservableObject {
 		                            )
 			                        ))
 			                    }
-                                if previousVerifiedEntry == nil,
-                                   let targetCacheContext,
-                                   Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore) {
+                                    if previousVerifiedEntry == nil,
+                                       let targetCacheContext,
+                                       await ensureActionTrajectoryCacheSchema() {
                                     let persistentState = ActionTrajectoryState(
                                         appName: step.appName,
                                         bundleIdentifier: step.bundleIdentifier,
@@ -8623,9 +8653,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private static func uiState() async -> UIStateSnapshot? {
-        await Task.detached(priority: .userInitiated) {
-            AXElementResolver.frontmostState(limit: 600, depth: 10)
-        }.value
+        AXElementResolver.frontmostState(limit: 600, depth: 10)
     }
 
     /// Polls for a meaningful AX delta. Missing AX remains a skip-open condition:
@@ -8650,13 +8678,28 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func actionTrajectoryCachePreflight(goal: String, firstScreenshotPNG: Data) async -> ActionTrajectoryCacheLookup? {
-        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore) else { return nil }
+        guard await ensureActionTrajectoryCacheSchema() else { return nil }
         let state = await actionTrajectoryState(firstScreenshotPNG: firstScreenshotPNG)
         return try? await store.lookupActionTrajectoryCache(
             goal: goal,
             state: state,
             topK: 3
         )
+    }
+
+    private func ensureActionTrajectoryCacheSchema() async -> Bool {
+        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore) else { return false }
+        do {
+            try await store.ensureActionTrajectoryCacheSchema()
+            return true
+        } catch {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "action_cache.schema",
+                detail: "status=failed errorHash=\(Self.auditHash(String(describing: error)))"
+            ))
+            return false
+        }
     }
 
     private func actionTrajectoryState(firstScreenshotPNG: Data) async -> ActionTrajectoryState {
@@ -8690,7 +8733,7 @@ public final class CascadeAppModel: ObservableObject {
         point: CGPoint,
         stateFingerprint: String?
     ) async {
-        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore),
+        guard await ensureActionTrajectoryCacheSchema(),
               step.kind == .click,
               let actionJSON = Self.actionTrajectoryActionJSON(
                 for: .click(x: point.x, y: point.y),
@@ -8719,7 +8762,7 @@ public final class CascadeAppModel: ObservableObject {
         stateFingerprint: String?,
         reason: ActionTrajectoryCacheDecisionReason
     ) async {
-        guard Self.experimentalActionTrajectoryCacheEnabled(defaults: defaultsStore),
+        guard await ensureActionTrajectoryCacheSchema(),
               step.kind == .click else {
             return
         }

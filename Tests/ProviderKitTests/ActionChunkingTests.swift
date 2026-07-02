@@ -84,6 +84,24 @@ struct ActionChunkingTests {
         #expect(quit.breakReason == .irreversibleGate)
     }
 
+    @Test func runtimeApprovedPasteAndIrreversibleKeysRemainExecutable() {
+        let paste = ComputerUseAgent.actionChunkPlan(
+            for: [group("paste", .key("cmd+v"))],
+            pasteKeysAllowed: true
+        )
+        #expect(paste.groups.compactMap(\.toolUseID) == ["paste"])
+        #expect(paste.deferredToolUseIDs.isEmpty)
+        #expect(paste.breakReason == nil)
+
+        let quit = ComputerUseAgent.actionChunkPlan(
+            for: [group("quit", .key("cmd+q"))],
+            irreversibleKeysAllowed: true
+        )
+        #expect(quit.groups.compactMap(\.toolUseID) == ["quit"])
+        #expect(quit.deferredToolUseIDs.isEmpty)
+        #expect(quit.breakReason == nil)
+    }
+
     @Test func nonAllowlistedActionsFallBackToOneActionThenDeferTail() {
         let front = ComputerUseAgent.actionChunkPlan(for: [
             group("open", .openURL("https://example.com/path")),
