@@ -264,4 +264,78 @@ struct AXCompressedObservationTests {
     @Test func flagKeyIsTheExperimentalFamilyKey() {
         #expect(AXCompressedObservation.flagKey == "cascade.experimentalCompressedObservation")
     }
+
+    // MARK: - d12 mark picking
+
+    @Test func markTokenParsesRenderedDisplayIDForms() {
+        // Bare, bracketed, embedded in prose, uppercase, and duplicate-suffixed
+        // forms all normalize to the same lowercased ax:<hash> token.
+        #expect(AXCompressedObservation.markToken(in: "ax:0123abcd") == "ax:0123abcd")
+        #expect(AXCompressedObservation.markToken(in: "click [ax:0123abcd] now") == "ax:0123abcd")
+        #expect(AXCompressedObservation.markToken(in: "the [AX:0123ABCD#2] button") == "ax:0123abcd")
+        #expect(AXCompressedObservation.markToken(in: "[ax:0123abcd1234] “New Note”") == "ax:0123abcd1234")
+    }
+
+    @Test func markTokenRejectsProseAndShortHashes() {
+        // A stray "ax:" mention or a too-short hash is prose, not a mark.
+        #expect(AXCompressedObservation.markToken(in: "the Save button") == nil)
+        #expect(AXCompressedObservation.markToken(in: "fix the ax: handling") == nil)
+        #expect(AXCompressedObservation.markToken(in: "ax:12ab") == nil)
+        // "ax:" embedded inside a longer word is not a mark reference.
+        #expect(AXCompressedObservation.markToken(in: "max:0123abcd is not a mark prefix") == nil)
+    }
+
+    @Test func strippingMarkTokensLeavesTheDescription() {
+        #expect(
+            AXCompressedObservation.strippingMarkTokens(from: "[ax:0123abcd#2] the “New Note” button")
+                == "the “New Note” button"
+        )
+        #expect(AXCompressedObservation.strippingMarkTokens(from: "ax:0123abcd") == "")
+        #expect(AXCompressedObservation.strippingMarkTokens(from: "plain target") == "plain target")
+    }
+
+    @Test func resolveMarkFindsTheUniquePrefixOwner() {
+        let matches = [
+            Self.match(id: "ax:0123456789abcdef01234567", label: "New Note", role: "AXButton"),
+            Self.match(id: "ax:aaaabbbbccccddddeeeeffff", label: "Delete", role: "AXButton"),
+        ]
+        let resolved = AXCompressedObservation.resolveMark("ax:01234567", in: matches)
+        #expect(resolved?.title == "New Note")
+        #expect(AXCompressedObservation.resolveMark("ax:aaaabbbb", in: matches)?.title == "Delete")
+        #expect(AXCompressedObservation.resolveMark("ax:deadbeef", in: matches) == nil)
+    }
+
+    @Test func resolveMarkRefusesAmbiguousPrefixes() {
+        // Two DIFFERENT identities sharing the named prefix → nil (never guess),
+        // but the same identity rendered twice resolves to the first.
+        let colliding = [
+            Self.match(id: "ax:0123456711110000aaaa1111", label: "One", role: "AXButton"),
+            Self.match(id: "ax:0123456722220000bbbb2222", label: "Two", role: "AXButton"),
+        ]
+        #expect(AXCompressedObservation.resolveMark("ax:01234567", in: colliding) == nil)
+        #expect(AXCompressedObservation.resolveMark("ax:012345671111", in: colliding)?.title == "One")
+        let duplicated = [
+            Self.match(id: "ax:0123456789abcdef01234567", label: "First", role: "AXButton"),
+            Self.match(id: "ax:0123456789abcdef01234567", label: "Second", role: "AXButton"),
+        ]
+        #expect(AXCompressedObservation.resolveMark("ax:01234567", in: duplicated)?.title == "First")
+    }
+
+    @Test func stableIDPrefersNodeThenMatchIDThenSyntheticHash() {
+        let withNode = Self.match(id: "ax:0123456789ab", label: "Save", role: "AXButton")
+        #expect(AXCompressedObservation.stableID(for: withNode) == "ax:0123456789ab")
+        let withoutNode = AXElementResolver.Match(
+            id: "ax:ffff0000ffff",
+            center: CGPoint(x: 1, y: 2),
+            role: "AXButton",
+            title: "Save",
+            score: 1
+        )
+        #expect(AXCompressedObservation.stableID(for: withoutNode) == "ax:ffff0000ffff")
+        let bare = AXElementResolver.Match(
+            center: CGPoint(x: 1, y: 2), role: "AXButton", title: "Save", score: 1
+        )
+        #expect(AXCompressedObservation.stableID(for: bare).hasPrefix("ax:"))
+        #expect(AXCompressedObservation.stableID(for: bare) == AXCompressedObservation.stableID(for: bare))
+    }
 }

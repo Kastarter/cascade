@@ -3018,10 +3018,15 @@ public final class CascadeAppModel: ObservableObject {
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
         let verifyCandidates = (d.object(forKey: Self.experimentalGroundingVerifierKey) as? Bool) ?? mixture
+        // d12: the AX-SoM picker rides the SAME flag that renders mark ids into
+        // the planner note (d10/d11) — a mark can only be named when it was
+        // surfaced, and flag-off keeps grounding byte-identical to shipped.
+        let axPickerEnabled = d.bool(forKey: Self.experimentalCompressedObservationKey)
         return mixture ? MixtureGrounder(
             base: base,
             skills: appSkills,
             verifyCandidates: verifyCandidates,
+            axPickerEnabled: axPickerEnabled,
             previousAnchor: previousGroundingAnchor,
             candidateFailureCounts: groundingCandidateFailureCounts,
             groundingCache: ownsGroundingCache ? groundingCache : nil,

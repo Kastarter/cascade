@@ -109,6 +109,18 @@ struct MixtureGrounderTests {
         ) == nil)
     }
 
+    @Test func markFallbackTargetStripsTheMarkButNeverGoesEmpty() {
+        // d12: an unresolvable mark falls back to grounding the remaining
+        // description; a mark-only target keeps the original so the miss is
+        // honest instead of grounding an empty string.
+        #expect(
+            MixtureGrounder.markFallbackTarget(from: "[ax:0123abcd] the “New Note” button")
+                == "the “New Note” button"
+        )
+        #expect(MixtureGrounder.markFallbackTarget(from: "ax:0123abcd") == "ax:0123abcd")
+        #expect(MixtureGrounder.markFallbackTarget(from: "the Save button") == "the Save button")
+    }
+
     @Test func canvasConceptsBypassAX() {
         // Canvas placeholders/surfaces must go to the visual grounder, never an AX
         // substring match (the Keynote inspector-checkbox hijack).

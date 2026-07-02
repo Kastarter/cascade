@@ -113,6 +113,15 @@ public struct MixtureGrounder: VisualGrounder {
     /// risk a confident click on a vague match.
     private let minAXScore: Double
     private let verifyCandidates: Bool
+    /// d12 (AX-SoM picker, default OFF — gated on the same
+    /// `cascade.experimentalCompressedObservation` flag that surfaces the mark
+    /// ids to the planner in the first place): when the planner names a mark id
+    /// from the d10/d11 candidate list, execute via that element's EXACT frame
+    /// (semantic AX action at the frame center — the d06 path) with no visual
+    /// model round trip; and when the planner names a plain label, try the AX
+    /// candidate FIRST, falling to the visual grounder only when AX offers no
+    /// candidate.
+    private let axPickerEnabled: Bool
     private let previousAnchor: VerifiedGroundingAnchor?
     private let candidateFailureCounts: [String: Int]
     private let onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)?
@@ -137,6 +146,7 @@ public struct MixtureGrounder: VisualGrounder {
         skills: AppSkillRegistry,
         minAXScore: Double = 2,
         verifyCandidates: Bool = false,
+        axPickerEnabled: Bool = false,
         previousAnchor: VerifiedGroundingAnchor? = nil,
         candidateFailureCounts: [String: Int] = [:],
         groundingCache: GroundingCache? = nil,
@@ -152,6 +162,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.skills = skills
         self.minAXScore = minAXScore
         self.verifyCandidates = verifyCandidates
+        self.axPickerEnabled = axPickerEnabled
         self.previousAnchor = previousAnchor
         self.candidateFailureCounts = candidateFailureCounts
         self.groundingCache = groundingCache
@@ -165,7 +176,17 @@ public struct MixtureGrounder: VisualGrounder {
     public func ground(
         screenshot: Data, target: String, displayWidthPoints: Int, displayHeightPoints: Int
     ) async -> CGPoint? {
-        let target = await targetWithRuntimeHints(target)
+        var target = await targetWithRuntimeHints(target)
+        switch await markPickOutcome(
+            target: target, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        ) {
+        case .picked(let result):
+            return result.selectedPoint
+        case .fallback(let stripped):
+            target = stripped
+        case .noMark:
+            break
+        }
         guard verifyCandidates else {
             if !Self.namesCanvasConcept(target),
                let axPoint = await axGround(
@@ -217,7 +238,19 @@ public struct MixtureGrounder: VisualGrounder {
         displayHeightPoints: Int,
         options: GroundingRequestOptions
     ) async -> GroundingResult {
-        let target = await targetWithRuntimeHints(target)
+        var target = await targetWithRuntimeHints(target)
+        // d12: a planner-named AX-SoM mark resolves structurally to the exact
+        // element frame — no visual model, no cache, no verifier round trip.
+        switch await markPickOutcome(
+            target: target, displayWidthPoints: displayWidthPoints, displayHeightPoints: displayHeightPoints
+        ) {
+        case .picked(let result):
+            return result
+        case .fallback(let stripped):
+            target = stripped
+        case .noMark:
+            break
+        }
         guard verifyCandidates else {
             guard groundingCache != nil else {
                 if let indexed = await screenElementIndexGrounding(
@@ -269,6 +302,27 @@ public struct MixtureGrounder: VisualGrounder {
             displayWidthPoints: displayWidthPoints,
             displayHeightPoints: displayHeightPoints
         )
+        // d12 AX-first gate (flag-gated): when AX offers a candidate, verify it
+        // ALONE first and — on a clean accept — return it without ever calling
+        // the visual grounder. AX candidates are free, exact, and live; the
+        // visual model stays the fallback for targets AX cannot see. Anything
+        // short of an accept falls through to the existing merged
+        // candidates-plus-verifier path, so the safety net is unchanged.
+        if axPickerEnabled, let axCandidate {
+            let axOnly = Self.selectVerifiedCandidate(
+                axCandidate: axCandidate,
+                baseResult: GroundingResult(),
+                target: target,
+                displayWidthPoints: displayWidthPoints,
+                displayHeightPoints: displayHeightPoints,
+                previousAnchor: previousAnchor,
+                candidateFailureCounts: candidateFailureCounts
+            )
+            if axOnly.verifierResult.verdict == .accept, axOnly.result.selectedPoint != nil {
+                await recordVerifierOutcomeIfNeeded(axOnly, target: target)
+                return axOnly.result
+            }
+        }
         let cacheProbe = await groundingCacheProbe(
             screenshot: screenshot,
             target: target,
@@ -1263,6 +1317,140 @@ public struct MixtureGrounder: VisualGrounder {
             label: match.title,
             nearbyOCRText: match.title,
             ocrDistancePoints: 0
+        )
+    }
+
+    // MARK: - d12 AX-SoM mark picking
+
+    /// Confidence assigned to a mark pick. The planner referenced a control BY
+    /// ITS STABLE ID from the d10/d11 observation — identity is exact, not a
+    /// fuzzy label match — so this clears every per-risk minimum-confidence
+    /// gate. The no-effect detector remains the backstop for a stale pick.
+    static let markPickConfidence = 0.97
+
+    /// How many controls the mark resolver re-harvests. Must be at least the
+    /// d10/d11 note harvests (24) so every id the planner can possibly have
+    /// seen is re-findable; 40 is `interactables`' own bound.
+    static let markPickHarvestLimit = 40
+
+    /// Outcome of the flag-gated d12 pre-step shared by every grounding entry
+    /// point. `.picked` short-circuits with the exact-frame result; `.fallback`
+    /// carries the target with the unresolvable mark stripped so the ordinary
+    /// path grounds the remaining description; `.noMark` means the target names
+    /// no mark (or the picker is off) — proceed unchanged.
+    private enum MarkPickOutcome {
+        case picked(GroundingResult)
+        case fallback(String)
+        case noMark
+    }
+
+    private func markPickOutcome(
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> MarkPickOutcome {
+        guard axPickerEnabled, let token = AXCompressedObservation.markToken(in: target) else { return .noMark }
+        let start = ContinuousClock.now
+        guard let candidate = await axMarkPickCandidate(
+            token: token,
+            displayWidthPoints: displayWidthPoints,
+            displayHeightPoints: displayHeightPoints
+        ) else {
+            // Stale / vanished / ambiguous mark: ground the remaining
+            // descriptive text ("[ax:1a2b3c4d] the New Note button" → "the New
+            // Note button") through the unchanged AX-label-then-visual path.
+            return .fallback(Self.markFallbackTarget(from: target))
+        }
+        let elapsed = start.duration(to: ContinuousClock.now)
+        let result = Self.withLatency(
+            GroundingResult(
+                candidates: [candidate],
+                selectedIndex: 0,
+                selectedCandidateID: candidate.candidateID,
+                verifierVerdict: .accept,
+                alternativeCount: 0
+            ),
+            elapsed.mixtureTimeInterval
+        )
+        if let onVerifierOutcome {
+            // Audit the pick through the same `grounding.verifier` row the
+            // arbitration path writes — hashes/counts only, no raw text.
+            await onVerifierOutcome(VerifierOutcome(
+                target: target,
+                outcome: .selected,
+                verifierResult: GroundingVerifierResult(
+                    verdict: .accept,
+                    selectedCandidateID: candidate.candidateID,
+                    confidence: candidate.confidence,
+                    failureKind: nil,
+                    scores: []
+                ),
+                candidateCount: 1,
+                selectedSource: .accessibility,
+                selectedCandidateHash: Self.auditHash(candidate.candidateID)
+            ))
+        }
+        return .picked(result)
+    }
+
+    /// The fallback target once a mark failed to resolve: the mark reference
+    /// stripped, unless the planner sent ONLY the mark — then keep the original
+    /// so the miss is honest instead of grounding an empty string.
+    nonisolated static func markFallbackTarget(from target: String) -> String {
+        let stripped = AXCompressedObservation.strippingMarkTokens(from: target)
+        return stripped.isEmpty ? target : stripped
+    }
+
+    /// Resolves a normalized mark token against a fresh bounded AX harvest and
+    /// maps the element's EXACT frame into the executor's display-local AppKit
+    /// space through the typed transform. Same hard guards as the label path
+    /// (never Cascade's own UI, never a distrusted-AX app); nil falls back to
+    /// ordinary grounding. AX/NSWorkspace/NSScreen are main-thread surfaces.
+    @MainActor
+    private func axMarkPickCandidate(
+        token: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) -> GroundingCandidate? {
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.bundleIdentifier == Self.cascadeBundleID { return nil }
+        let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+        if skill?.axUnreliable == true { return nil }
+        let matches = AXElementResolver.interactables(limit: Self.markPickHarvestLimit)
+        guard let match = AXCompressedObservation.resolveMark(token, in: matches) else { return nil }
+        guard let capture = Self.captureDisplayGeometry(
+            widthPoints: displayWidthPoints, heightPoints: displayHeightPoints
+        ) else { return nil }
+        guard let mapping = Self.displayLocalMapping(
+            cgGlobalCenter: match.center,
+            displayCGBounds: capture.cgBounds,
+            transform: capture.transform
+        ) else { return nil }
+        let point = mapping.point
+        // The exact element frame recentred on the mapped point — logical sizes
+        // are identical between CG-global and display-local AppKit spaces.
+        let size = match.frame?.size ?? CGSize(width: 96, height: 28)
+        let displayBounds = CGRect(
+            x: point.x - size.width / 2,
+            y: point.y - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+        return GroundingCandidate(
+            point: point,
+            region: displayBounds,
+            confidence: Self.markPickConfidence,
+            source: .accessibility,
+            coordinateSpace: .displayLocalAppKitPoints,
+            rawModel: match.title,
+            reason: "ax_som_mark_pick",
+            candidateID: AXCompressedObservation.stableID(for: match),
+            displayBounds: displayBounds,
+            role: match.role,
+            label: match.title,
+            nearbyOCRText: match.title,
+            ocrDistancePoints: 0,
+            coordinateChain: mapping.chain
         )
     }
 

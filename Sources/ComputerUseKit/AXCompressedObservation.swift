@@ -150,8 +150,9 @@ public enum AXCompressedObservation {
         let displayIDs = uniqueDisplayIDs(for: renderOrder.map(fullStableID))
         var lines: [String] = [
             "Controls on screen now — a compressed, grouped view of the app's real controls "
-                + "(NOT everything; open a menu/panel to reveal more). Act on one by naming its "
-                + "quoted name exactly; [ids] are stable references; frames are (x,y,w×h) in screen points:",
+                + "(NOT everything; open a menu/panel to reveal more). Act on one by including its "
+                + "[ax:…] id in the target for an exact pick, or by naming its quoted name exactly; "
+                + "frames are (x,y,w×h) in screen points:",
         ]
         var cursor = 0
         for group in groups {
@@ -374,17 +375,95 @@ public enum AXCompressedObservation {
     // MARK: - Stable ids
 
     static func fullStableID(for item: Item) -> String {
-        if let node = item.match.actionableNode { return node.stableID }
-        if let id = item.match.id, !id.isEmpty { return id }
+        stableID(for: item.match)
+    }
+
+    /// The full stable id for one harvested control — the SAME identity the
+    /// rendered note derives its `[ax:…]` display ids from, exposed so the d12
+    /// picker (MixtureGrounder) resolves a planner-named mark against identical
+    /// material and the two can never diverge.
+    public static func stableID(for match: AXElementResolver.Match) -> String {
+        if let node = match.actionableNode { return node.stableID }
+        if let id = match.id, !id.isEmpty { return id }
         // Last-resort synthetic identity (a Match built without the d05
         // actionable-node capture): hash the same structural material the
         // resolver would have used, so the id is still deterministic.
         let material = [
-            item.match.role,
-            item.match.title,
-            item.match.descriptor?.container ?? "",
+            match.role,
+            match.title,
+            match.descriptor?.container ?? "",
         ].joined(separator: "|")
         return "ax:\(AuditIdentity.hash(material))"
+    }
+
+    // MARK: - Mark picking (d12)
+
+    /// Minimum hash characters a planner-named mark must carry to count as a
+    /// pick — the note never renders fewer than `shortIDLength`, so anything
+    /// shorter is prose (e.g. a stray "ax:" mention), not a mark reference.
+    static let minMarkHashLength = shortIDLength
+
+    /// Extracts the first AX-SoM mark reference (`ax:<hash>` as rendered by
+    /// `uniqueDisplayIDs`, with or without the surrounding brackets and an
+    /// optional `#n` duplicate suffix) from a planner-provided target string.
+    /// Returns the normalized `ax:<hash>` token (lowercased, suffix stripped),
+    /// or nil when the target names no mark — the caller then grounds the
+    /// target text exactly as before.
+    public static func markToken(in target: String) -> String? {
+        guard target.localizedCaseInsensitiveContains("ax:") else { return nil }
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<![0-9a-z])ax:([0-9a-f]{\(minMarkHashLength),64})",
+            options: [.caseInsensitive]
+        ) else { return nil }
+        let range = NSRange(target.startIndex..<target.endIndex, in: target)
+        guard let match = regex.firstMatch(in: target, options: [], range: range),
+              let hashRange = Range(match.range(at: 1), in: target) else { return nil }
+        return "ax:" + target[hashRange].lowercased()
+    }
+
+    /// Removes every mark reference (and its optional brackets / `#n` suffix)
+    /// from a target string, so a mark that fails to resolve (stale id, control
+    /// gone) falls back to grounding the REMAINING descriptive text instead of
+    /// feeding hash noise to the label matcher / visual grounder.
+    public static func strippingMarkTokens(from target: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: "\\[?(?<![0-9a-z])ax:[0-9a-f]{\(minMarkHashLength),64}(#[0-9]+)?\\]?",
+            options: [.caseInsensitive]
+        ) else { return target }
+        let range = NSRange(target.startIndex..<target.endIndex, in: target)
+        let stripped = regex.stringByReplacingMatches(in: target, options: [], range: range, withTemplate: " ")
+        return stripped
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Resolves a normalized mark token against a live harvest by stable-id
+    /// prefix (display ids are prefixes of the full hash). Deterministic and
+    /// conservative: the token must select exactly ONE distinct control
+    /// identity — a prefix that suddenly matches two different controls (hash
+    /// collision after a screen change) resolves to nil rather than guessing,
+    /// and the caller falls back to the ordinary grounding path.
+    public static func resolveMark(
+        _ token: String,
+        in matches: [AXElementResolver.Match]
+    ) -> AXElementResolver.Match? {
+        let normalized = token.lowercased()
+        guard normalized.hasPrefix("ax:") else { return nil }
+        let hashPrefix = normalized.dropFirst(3)
+        guard hashPrefix.count >= minMarkHashLength else { return nil }
+        var resolved: (id: String, match: AXElementResolver.Match)?
+        for match in matches {
+            let fullID = stableID(for: match).lowercased()
+            guard fullID.hasPrefix("ax:"), fullID.dropFirst(3).hasPrefix(hashPrefix) else { continue }
+            if let resolved {
+                // Two DIFFERENT identities share the prefix → ambiguous.
+                if resolved.id != fullID { return nil }
+                // Same identity rendered twice (#n duplicates) → keep the first.
+                continue
+            }
+            resolved = (fullID, match)
+        }
+        return resolved?.match
     }
 
     /// Shortens `ax:<hash>` ids to 8 hash chars for the note, extending only
