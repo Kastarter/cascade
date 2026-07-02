@@ -65,11 +65,13 @@ public struct GroundingBenchmarkExpected: Codable, Equatable, Sendable {
 }
 
 public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
     public let caseID: String
     public let framePath: String
+    public let displayWidthPoints: Int?
+    public let displayHeightPoints: Int?
     public let targetText: String?
     public let targetHash: String?
     public let expectedBoxOrPoint: GroundingBenchmarkExpected?
@@ -83,6 +85,8 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         schemaVersion: Int = GroundingBenchmarkCase.currentSchemaVersion,
         caseID: String,
         framePath: String,
+        displayWidthPoints: Int? = nil,
+        displayHeightPoints: Int? = nil,
         targetText: String?,
         targetHash: String?,
         expectedBoxOrPoint: GroundingBenchmarkExpected?,
@@ -95,6 +99,8 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.caseID = caseID
         self.framePath = framePath
+        self.displayWidthPoints = displayWidthPoints
+        self.displayHeightPoints = displayHeightPoints
         self.targetText = targetText
         self.targetHash = targetHash
         self.expectedBoxOrPoint = expectedBoxOrPoint
@@ -109,6 +115,8 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         case schemaVersion = "schema_version"
         case caseID = "case_id"
         case framePath = "frame_path"
+        case displayWidthPoints = "display_width_points"
+        case displayHeightPoints = "display_height_points"
         case targetText = "target_text"
         case targetHash = "target_hash"
         case expectedBoxOrPoint = "expected_box_or_point"
@@ -124,6 +132,8 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         try container.encode(schemaVersion, forKey: .schemaVersion)
         try container.encode(caseID, forKey: .caseID)
         try container.encode(framePath, forKey: .framePath)
+        try Self.encodeNullable(displayWidthPoints, in: &container, forKey: .displayWidthPoints)
+        try Self.encodeNullable(displayHeightPoints, in: &container, forKey: .displayHeightPoints)
         try Self.encodeNullable(targetText, in: &container, forKey: .targetText)
         try Self.encodeNullable(targetHash, in: &container, forKey: .targetHash)
         try Self.encodeNullable(expectedBoxOrPoint, in: &container, forKey: .expectedBoxOrPoint)

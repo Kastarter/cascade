@@ -3,11 +3,13 @@ import Foundation
 import SQLite3
 import Testing
 
-private func makeActionCacheStore() throws -> (CascadeStore, String) {
+private func makeActionCacheStore() async throws -> (CascadeStore, String) {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("CascadeActionTrajectoryCache-\(UUID().uuidString).sqlite")
         .path
-    return (try CascadeStore(path: path), path)
+    let store = try CascadeStore(path: path)
+    try await store.ensureActionTrajectoryCacheSchema()
+    return (store, path)
 }
 
 private func safeState(
@@ -36,9 +38,15 @@ private func clickAction(x: Double = 10, y: Double = 20, descriptor: String = "A
 }
 
 @Test
-func actionTrajectoryMigrationCreatesTableAndIndexesIdempotently() async throws {
-    let (_, path) = try makeActionCacheStore()
-    _ = try CascadeStore(path: path)
+func actionTrajectorySchemaIsDefaultOffAndExplicitlyIdempotent() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeActionTrajectoryCache-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+
+    #expect(rawInt(path, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='action_trajectory_cache';") == 0)
+    try await store.ensureActionTrajectoryCacheSchema()
+    try await store.ensureActionTrajectoryCacheSchema()
 
     #expect(rawInt(path, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='action_trajectory_cache';") == 1)
     #expect(rawInt(path, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_action_trajectory_cache_lookup';") == 1)
@@ -47,7 +55,7 @@ func actionTrajectoryMigrationCreatesTableAndIndexesIdempotently() async throws 
 
 @Test
 func actionTrajectoryKeysAreStableAndRowsExcludePrivateText() async throws {
-    let (store, path) = try makeActionCacheStore()
+    let (store, path) = try await makeActionCacheStore()
     let state = safeState(windowTitle: "Inbox jane@example.com")
     let first = try await store.promoteActionTrajectoryCache(
         source: .assist,
@@ -103,7 +111,7 @@ func actionTrajectoryKeysAreStableAndRowsExcludePrivateText() async throws {
 
 @Test
 func actionTrajectoryPromoteAndDemoteAdjustConfidenceAndExpiry() async throws {
-    let (store, _) = try makeActionCacheStore()
+    let (store, _) = try await makeActionCacheStore()
     let row = try #require(try await store.promoteActionTrajectoryCache(
         source: .assist,
         goal: "click send",
@@ -145,7 +153,7 @@ func actionTrajectoryPromoteAndDemoteAdjustConfidenceAndExpiry() async throws {
 
 @Test
 func actionTrajectoryStage2RejectsWrongAppWrongScreenAndModal() async throws {
-    let (store, _) = try makeActionCacheStore()
+    let (store, _) = try await makeActionCacheStore()
     _ = try #require(try await store.promoteActionTrajectoryCache(
         source: .assist,
         goal: "click send",
@@ -195,7 +203,7 @@ func actionTrajectoryStage2RejectsWrongAppWrongScreenAndModal() async throws {
 
 @Test
 func actionTrajectoryAllowlistOnlyExecutesVerifiedIdempotentActions() async throws {
-    let (store, _) = try makeActionCacheStore()
+    let (store, _) = try await makeActionCacheStore()
     _ = try #require(try await store.promoteActionTrajectoryCache(
         source: .assist,
         goal: "open mail",
@@ -245,7 +253,7 @@ func actionTrajectoryAllowlistOnlyExecutesVerifiedIdempotentActions() async thro
 
 @Test
 func actionTrajectoryCacheDoesNotPromoteURLReplayActions() async throws {
-    let (store, _) = try makeActionCacheStore()
+    let (store, _) = try await makeActionCacheStore()
     let row = try await store.promoteActionTrajectoryCache(
         source: .assist,
         goal: "open customer report",
@@ -261,7 +269,7 @@ func actionTrajectoryCacheDoesNotPromoteURLReplayActions() async throws {
 
 @Test
 func actionTrajectoryTTLPrunesExpiredRowsAndKeepsFreshSuccesses() async throws {
-    let (store, _) = try makeActionCacheStore()
+    let (store, _) = try await makeActionCacheStore()
     let now = Date(timeIntervalSince1970: 1_000)
     _ = try #require(try await store.promoteActionTrajectoryCache(
         source: .assist,

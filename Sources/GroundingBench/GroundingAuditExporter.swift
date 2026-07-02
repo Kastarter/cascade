@@ -85,6 +85,8 @@ public struct GroundingAuditExporter: Sendable {
             return GroundingBenchmarkCase(
                 caseID: "audit-\(audit.id)",
                 framePath: framePath,
+                displayWidthPoints: context.displayWidthPoints,
+                displayHeightPoints: context.displayHeightPoints,
                 targetText: options.targetTextByHash[targetHash],
                 targetHash: targetHash,
                 expectedBoxOrPoint: expected,
@@ -175,21 +177,29 @@ public struct GroundingAuditExporter: Sendable {
         verifierWindow: TimeInterval
     ) -> GroundingBenchmarkExpected? {
         let clickMax = audit.capturedMilliseconds + Int64((clickLabelWindow * 1000).rounded())
-        guard let click = clicks.first(where: { click in
-            click.capturedMilliseconds >= audit.capturedMilliseconds
-                && click.capturedMilliseconds <= clickMax
-                && click.matches(context: context)
-        }) else { return nil }
-
-	        let verifierMax = click.capturedMilliseconds + Int64((verifierWindow * 1000).rounded())
-	        let hasPositiveVerifier = positiveVerifierRows.contains { row in
-	            guard let verifierTargetHash = Self.targetHash(from: row) else { return false }
-	            return row.capturedMilliseconds >= click.capturedMilliseconds
-	                && row.capturedMilliseconds <= verifierMax
-	                && targetHash == verifierTargetHash
-	        }
-        guard hasPositiveVerifier else { return nil }
-        return .point(CGPoint(x: click.x, y: click.y), radius: 24)
+        let verifierMax = clickMax + Int64((verifierWindow * 1000).rounded())
+        let matchingVerifiers = positiveVerifierRows.filter { row in
+            guard let verifierTargetHash = Self.targetHash(from: row) else { return false }
+            return row.capturedMilliseconds >= audit.capturedMilliseconds
+                && row.capturedMilliseconds <= verifierMax
+                && targetHash == verifierTargetHash
+        }
+        for verifier in matchingVerifiers {
+            let clickMin = max(
+                audit.capturedMilliseconds,
+                verifier.capturedMilliseconds - Int64((verifierWindow * 1000).rounded())
+            )
+            let eligibleClicks = clicks.filter { click in
+                click.capturedMilliseconds >= clickMin
+                    && click.capturedMilliseconds <= clickMax
+                    && click.capturedMilliseconds <= verifier.capturedMilliseconds
+                    && click.matches(context: context)
+            }
+            if let click = eligibleClicks.last {
+                return .point(CGPoint(x: click.x, y: click.y), radius: 24)
+            }
+        }
+        return nil
     }
 }
 
@@ -217,6 +227,8 @@ private struct ContextRow: Equatable {
     let appName: String
     let bundleIdentifier: String?
     let imagePath: String
+    let displayWidthPoints: Int?
+    let displayHeightPoints: Int?
 }
 
 private struct ClickRow: Equatable {
@@ -274,7 +286,7 @@ private final class ReadOnlyDatabase {
 
     func safeFrameContexts() throws -> [ContextRow] {
         try query("""
-        SELECT id, captured_at, captured_ms, app_name, bundle_identifier, image_path
+        SELECT id, captured_at, captured_ms, app_name, bundle_identifier, image_path, metadata_json
         FROM recorded_context
         WHERE image_path IS NOT NULL
           AND image_path <> ''
@@ -282,14 +294,38 @@ private final class ReadOnlyDatabase {
         ORDER BY captured_ms ASC, id ASC;
         """) { statement in
             let capturedAt = text(statement, 1) ?? ""
+            let display = Self.displayPointDimensions(from: text(statement, 6))
             return ContextRow(
                 id: sqlite3_column_int64(statement, 0),
                 capturedMilliseconds: int64(statement, 2) ?? Self.capturedMilliseconds(from: capturedAt),
                 appName: text(statement, 3) ?? "Unknown",
                 bundleIdentifier: text(statement, 4),
-                imagePath: text(statement, 5) ?? ""
+                imagePath: text(statement, 5) ?? "",
+                displayWidthPoints: display?.width,
+                displayHeightPoints: display?.height
             )
         }
+    }
+
+    private static func displayPointDimensions(from metadata: String?) -> (width: Int, height: Int)? {
+        guard let metadata,
+              let data = metadata.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let display = object["display"] as? [String: Any],
+              let rawWidth = number(display["width"]),
+              let rawHeight = number(display["height"]) else {
+            return nil
+        }
+        let width = Int(rawWidth.rounded())
+        let height = Int(rawHeight.rounded())
+        guard width > 0, height > 0 else { return nil }
+        return (width, height)
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
     }
 
     func clickRows() throws -> [ClickRow] {

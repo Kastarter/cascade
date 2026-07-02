@@ -48,6 +48,31 @@ struct GroundingBenchmarkRunnerTests {
         #expect(abs((GroundingBenchmarkRunner.percentile(values, 0.95) ?? 0) - 0.385) < 0.000_001)
         #expect(GroundingBenchmarkRunner.percentile([0.42], 0.95) == 0.42)
     }
+
+    @Test
+    func runnerUsesDisplayPointDimensionsWhenCaseProvidesThem() async throws {
+        let directory = try temporaryDirectory("GroundingBenchmarkRunner")
+        let frame = try #require(GroundingBenchFixtures.generate(into: directory).first?.framePath)
+        let retinaCase = benchmarkCase(
+            id: "retina-point",
+            frame: frame,
+            target: "center",
+            expected: .point(CGPoint(x: 80, y: 55), radius: 1),
+            bundle: "app.retina",
+            app: "Retina",
+            displayWidthPoints: 160,
+            displayHeightPoints: 110
+        )
+
+        let report = try await GroundingBenchmarkRunner().run(
+            cases: [retinaCase],
+            grounder: CenterOfDisplayGrounder()
+        )
+
+        #expect(report.hits == 1)
+        #expect(report.observations.first?.predictedX == 80)
+        #expect(report.observations.first?.predictedY == 55)
+    }
 }
 
 struct StubGrounder: VisualGrounder {
@@ -72,17 +97,44 @@ struct StubGrounder: VisualGrounder {
     }
 }
 
+struct CenterOfDisplayGrounder: VisualGrounder {
+    func ground(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> CGPoint? {
+        CGPoint(x: Double(displayWidthPoints) / 2, y: Double(displayHeightPoints) / 2)
+    }
+
+    func groundResult(
+        screenshot: Data,
+        target: String,
+        displayWidthPoints: Int,
+        displayHeightPoints: Int
+    ) async -> GroundingResult {
+        result(
+            point: CGPoint(x: Double(displayWidthPoints) / 2, y: Double(displayHeightPoints) / 2),
+            latency: 0.01
+        )
+    }
+}
+
 private func benchmarkCase(
     id: String,
     frame: String,
     target: String?,
     expected: GroundingBenchmarkExpected?,
     bundle: String,
-    app: String
+    app: String,
+    displayWidthPoints: Int? = nil,
+    displayHeightPoints: Int? = nil
 ) -> GroundingBenchmarkCase {
     GroundingBenchmarkCase(
         caseID: id,
         framePath: frame,
+        displayWidthPoints: displayWidthPoints,
+        displayHeightPoints: displayHeightPoints,
         targetText: target,
         targetHash: "hash-\(id)",
         expectedBoxOrPoint: expected,

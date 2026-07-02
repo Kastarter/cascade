@@ -32,6 +32,8 @@ struct GroundingAuditExporterTests {
             "app_name",
             "case_id",
             "context_id",
+            "display_height_points",
+            "display_width_points",
             "expected_box_or_point",
             "frame_path",
             "outcome",
@@ -43,6 +45,8 @@ struct GroundingAuditExporterTests {
         #expect(object["target_hash"] as? String == "targetabc")
         #expect(object["target_text"] as? String == "Submit")
         #expect(object["expected_box_or_point"] is NSNull)
+        #expect(object["display_width_points"] is NSNull)
+        #expect(object["display_height_points"] is NSNull)
         #expect(object["outcome"] as? String == "reject")
         #expect(!line.contains("privateCandidate"))
         #expect(!line.contains("targetChars"))
@@ -115,6 +119,64 @@ struct GroundingAuditExporterTests {
     }
 
     @Test
+    func exporterLabelsLatestMatchingClickBeforeAcceptVerifier() throws {
+        let fixture = try ExportFixture()
+        try fixture.insertContext(id: 19, milliseconds: 1_800_000_025_000, imagePath: fixture.framePath)
+        try fixture.insertAudit(
+            id: 23,
+            milliseconds: 1_800_000_025_000,
+            action: "agent.ground.miss",
+            detail: "turn=4 missedTargetHash=labeledtarget controlCount=1 labelsHash=abc"
+        )
+        try fixture.insertClick(milliseconds: 1_800_000_026_000, x: 11, y: 12)
+        try fixture.insertClick(milliseconds: 1_800_000_028_000, x: 74, y: 91)
+        try fixture.insertAudit(
+            id: 24,
+            milliseconds: 1_800_000_029_000,
+            action: "grounding.verifier",
+            detail: "verdict=accept outcome=accepted failure=none confidence=0.94 targetChars=6 targetHash=labeledtarget"
+        )
+
+        let cases = try GroundingAuditExporter().cases(
+            databasePath: fixture.dbURL,
+            options: .init(targetTextByHash: ["labeledtarget": "Continue"])
+        )
+        let source = try #require(cases.first { $0.sourceAuditEventID == 23 })
+        let expected = try #require(source.expectedBoxOrPoint)
+
+        #expect(expected.kind == .point)
+        #expect(expected.contains(CGPoint(x: 74, y: 91)))
+        #expect(!expected.contains(CGPoint(x: 11, y: 12)))
+        #expect(source.outcome == .accept)
+    }
+
+    @Test
+    func exporterCarriesDisplayPointDimensionsFromMetadata() throws {
+        let fixture = try ExportFixture()
+        try fixture.insertContext(
+            id: 20,
+            milliseconds: 1_800_000_026_000,
+            imagePath: fixture.framePath,
+            metadataJSON: #"{"rewind":true,"w":320,"h":220,"display":{"id":1,"x":0,"y":0,"width":160,"height":110}}"#
+        )
+        try fixture.insertAudit(
+            id: 25,
+            milliseconds: 1_800_000_026_100,
+            action: "grounding.verifier",
+            detail: "verdict=reject outcome=rejected failure=offscreen confidence=0.21 candidates=2 selectedCandidateHash=privateCandidate targetChars=6 targetHash=targetabc"
+        )
+
+        let cases = try GroundingAuditExporter().cases(
+            databasePath: fixture.dbURL,
+            options: .init(targetTextByHash: ["targetabc": "Submit"])
+        )
+        let source = try #require(cases.first { $0.sourceAuditEventID == 25 })
+
+        #expect(source.displayWidthPoints == 160)
+        #expect(source.displayHeightPoints == 110)
+    }
+
+    @Test
     func exporterDoesNotTreatHashlessAcceptVerifierAsTargetMatch() throws {
         let fixture = try ExportFixture()
         try fixture.insertContext(id: 10, milliseconds: 1_800_000_030_000, imagePath: fixture.framePath)
@@ -178,6 +240,7 @@ private final class ExportFixture {
             app_name TEXT NOT NULL,
             bundle_identifier TEXT,
             image_path TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             safe_to_show INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE input_event (
@@ -197,10 +260,10 @@ private final class ExportFixture {
         sqlite3_close(db)
     }
 
-    func insertContext(id: Int64, milliseconds: Int64, imagePath: String) throws {
+    func insertContext(id: Int64, milliseconds: Int64, imagePath: String, metadataJSON: String = "{}") throws {
         try exec("""
-        INSERT INTO recorded_context (id, captured_at, captured_ms, app_name, bundle_identifier, image_path, safe_to_show)
-        VALUES (\(id), '\(Self.iso(milliseconds))', \(milliseconds), 'FixtureApp', 'com.cascade.fixture', '\(imagePath)', 1);
+        INSERT INTO recorded_context (id, captured_at, captured_ms, app_name, bundle_identifier, image_path, metadata_json, safe_to_show)
+        VALUES (\(id), '\(Self.iso(milliseconds))', \(milliseconds), 'FixtureApp', 'com.cascade.fixture', '\(imagePath)', '\(metadataJSON)', 1);
         """)
     }
 

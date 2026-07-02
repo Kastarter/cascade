@@ -115,12 +115,14 @@ public struct GroundingBenchmarkRunner: Sendable {
             let frameURL = URL(fileURLWithPath: benchmarkCase.framePath)
             let data = try Data(contentsOf: frameURL)
             let dimensions = try Self.imageDimensions(data: data, path: benchmarkCase.framePath)
+            let displayWidth = benchmarkCase.displayWidthPoints.flatMap { $0 > 0 ? $0 : nil } ?? dimensions.width
+            let displayHeight = benchmarkCase.displayHeightPoints.flatMap { $0 > 0 ? $0 : nil } ?? dimensions.height
             let started = ContinuousClock.now
             let result = await grounder.groundResult(
                 screenshot: data,
                 target: target,
-                displayWidthPoints: dimensions.width,
-                displayHeightPoints: dimensions.height,
+                displayWidthPoints: displayWidth,
+                displayHeightPoints: displayHeight,
                 options: options
             )
             let measuredLatency = started.duration(to: .now).timeInterval
