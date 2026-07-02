@@ -52,12 +52,15 @@ public enum AXTargetDescriptorBuilder {
     ) -> AXTargetDescriptorV2 {
         AXClient.setMessagingTimeout(element)
         let role = string(element, kAXRoleAttribute as String)
+        let subrole = string(element, kAXSubroleAttribute as String)
         let label = fallbackLabel ?? labelText(of: element) ?? ""
         let safeWindowTitle = sanitizedContextText(windowTitle)
         let value = string(element, kAXValueAttribute as String)
+        let axDescription = string(element, kAXDescriptionAttribute as String)
         let frame = frame(of: element)
         let ancestorPath = ancestors(of: element)
         let sibling = siblingInfo(for: element)
+        let supportedActions = AXClient.actionNames(element).sorted()
         let bucket = frame.map(frameBucketString)
         let exactFrame = frame.map(frameString)
         let subtree = subtreeShape(of: element, maxDepth: 2, maxNodes: 24)
@@ -74,6 +77,7 @@ public enum AXTargetDescriptorBuilder {
         return AXTargetDescriptorV2(
             label: label,
             role: role,
+            subrole: subrole,
             identifier: string(element, kAXIdentifierAttribute as String),
             container: ancestorPath.last,
             windowTitle: safeWindowTitle,
@@ -84,6 +88,8 @@ public enum AXTargetDescriptorBuilder {
             frameBucket: bucket,
             frame: exactFrame,
             valueHash: value.map(AuditIdentity.hash),
+            descriptionHash: axDescription.map(AuditIdentity.hash),
+            supportedActions: supportedActions,
             enabled: bool(element, kAXEnabledAttribute as String),
             selected: bool(element, kAXSelectedAttribute as String),
             focused: bool(element, kAXFocusedAttribute as String),

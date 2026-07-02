@@ -408,10 +408,13 @@ struct AXElementResolverRankingTests {
         let descriptor = AXTargetDescriptorV2(
             label: "Save",
             role: "AXButton",
+            subrole: "AXCloseButton",
             identifier: "save",
             frameBucket: "1,2,3,4",
             frame: "8,16,24,32",
             valueHash: "value-hash",
+            descriptionHash: "description-hash",
+            supportedActions: ["AXShowMenu", "AXPress"],
             enabled: true,
             selected: false,
             focused: true,
@@ -421,7 +424,10 @@ struct AXElementResolverRankingTests {
         )
 
         let decoded = try #require(AXTargetDescriptorV2.decode(descriptor.encodedJSON()))
+        #expect(decoded.subrole == "AXCloseButton")
         #expect(decoded.valueHash == "value-hash")
+        #expect(decoded.descriptionHash == "description-hash")
+        #expect(decoded.supportedActions == ["AXPress", "AXShowMenu"])
         #expect(decoded.enabled == true)
         #expect(decoded.selected == false)
         #expect(decoded.focused == true)

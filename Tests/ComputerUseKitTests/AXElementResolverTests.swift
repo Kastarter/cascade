@@ -186,8 +186,66 @@ struct AXElementResolverTests {
 	                )
 	            )
 	        ])
-	        #expect(summary == "“Approve” (button; id expense.approve; in AXRow: Q2 Expense; disabled; selected; focused; roleSibling 3; frame 1,2,3,4; source fixture)")
-	    }
+        #expect(summary == "“Approve” (button; id expense.approve; in AXRow: Q2 Expense; disabled; selected; focused; roleSibling 3; frame 1,2,3,4; source fixture)")
+    }
+
+    @Test func interactableSummaryIncludesRicherActionableNodeHints() {
+        let node = AXElementResolver.ActionableNode(
+            stableID: "ax:close",
+            role: "AXButton",
+            subrole: "AXCloseButton",
+            identifier: "window.close",
+            title: "Close",
+            axDescription: "Close the private document",
+            value: "private document title",
+            supportedActions: ["AXShowMenu", "AXPress"],
+            enabled: true,
+            focused: false,
+            selected: false
+        )
+        let summary = AXElementResolver.interactableSummary([
+            AXElementResolver.Match(
+                id: node.stableID,
+                center: .zero,
+                role: "AXButton",
+                title: "Close",
+                score: 1,
+                descriptor: AXTargetDescriptorV2(label: "Close", role: "AXButton"),
+                actionableNode: node
+            )
+        ])
+
+        #expect(summary == "“Close” (button; id window.close; subrole AXCloseButton; actions press/showmenu)")
+        #expect(summary?.contains("private document") == false)
+    }
+
+    @Test func stableNodeIDPrefersIdentifierOverMovingFrame() {
+        let before = AXTargetDescriptorV2(
+            label: "Send",
+            role: "AXButton",
+            identifier: "compose.send",
+            frame: "10,20,90,32",
+            pathHash: "path-a"
+        )
+        let after = AXTargetDescriptorV2(
+            label: "Send Now",
+            role: "AXButton",
+            identifier: "compose.send",
+            frame: "500,600,90,32",
+            pathHash: "path-b"
+        )
+
+        #expect(AXElementResolver.stableNodeID(descriptor: before) == AXElementResolver.stableNodeID(descriptor: after))
+    }
+
+    @Test func stableNodeIDUsesStructuralHashWithoutIdentifier() {
+        let first = AXTargetDescriptorV2(label: "OK", role: "AXButton", pathHash: "same-path")
+        let second = AXTargetDescriptorV2(label: "OK", role: "AXButton", pathHash: "same-path")
+        let moved = AXTargetDescriptorV2(label: "OK", role: "AXButton", pathHash: "other-path")
+
+        #expect(AXElementResolver.stableNodeID(descriptor: first) == AXElementResolver.stableNodeID(descriptor: second))
+        #expect(AXElementResolver.stableNodeID(descriptor: first) != AXElementResolver.stableNodeID(descriptor: moved))
+    }
 
     @Test func interactableSummaryIsNilWhenEmpty() {
         // Canvas/Electron apps expose no AX controls — caller must degrade to a

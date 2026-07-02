@@ -102,24 +102,30 @@ public struct AXRuntimeProfile: Equatable, Sendable {
 public enum AXElementResolver {
     public struct Match: Sendable {
         /// Element center in CGEvent global coordinates (top-left origin).
+        public let id: String?
         public let center: CGPoint
         public let role: String
         public let title: String
         public let score: Double
         public let descriptor: AXTargetDescriptorV2?
+        public let actionableNode: ActionableNode?
 
         public init(
+            id: String? = nil,
             center: CGPoint,
             role: String,
             title: String,
             score: Double,
-            descriptor: AXTargetDescriptorV2? = nil
+            descriptor: AXTargetDescriptorV2? = nil,
+            actionableNode: ActionableNode? = nil
         ) {
+            self.id = id
             self.center = center
             self.role = role
             self.title = title
             self.score = score
             self.descriptor = descriptor
+            self.actionableNode = actionableNode
         }
     }
 
@@ -148,6 +154,46 @@ public enum AXElementResolver {
         case accessibility
         case synthetic
         case unknown
+    }
+
+    public struct ActionableNode: Sendable, Equatable {
+        public let stableID: String
+        public let role: String
+        public let subrole: String?
+        public let identifier: String?
+        public let title: String?
+        public let axDescription: String?
+        public let value: String?
+        public let supportedActions: [String]
+        public let enabled: Bool?
+        public let focused: Bool?
+        public let selected: Bool?
+
+        public init(
+            stableID: String,
+            role: String,
+            subrole: String? = nil,
+            identifier: String? = nil,
+            title: String? = nil,
+            axDescription: String? = nil,
+            value: String? = nil,
+            supportedActions: [String] = [],
+            enabled: Bool? = nil,
+            focused: Bool? = nil,
+            selected: Bool? = nil
+        ) {
+            self.stableID = stableID
+            self.role = role
+            self.subrole = subrole
+            self.identifier = identifier
+            self.title = title
+            self.axDescription = axDescription
+            self.value = value
+            self.supportedActions = supportedActions.sorted()
+            self.enabled = enabled
+            self.focused = focused
+            self.selected = selected
+        }
     }
 
     public struct ScoreBreakdown: Sendable, Equatable {
@@ -198,6 +244,7 @@ public enum AXElementResolver {
         public let frame: CGRect?
         public let descriptor: AXTargetDescriptorV2
         public let source: CandidateSource
+        public let actionableNode: ActionableNode?
         public let componentScores: ScoreBreakdown
         public let totalScore: Double
         public let confidence: Double
@@ -208,6 +255,7 @@ public enum AXElementResolver {
             center: CGPoint? = nil,
             frame: CGRect? = nil,
             source: CandidateSource = .unknown,
+            actionableNode: ActionableNode? = nil,
             componentScores: ScoreBreakdown = .empty,
             totalScore: Double = 0,
             confidence: Double = 0
@@ -217,6 +265,7 @@ public enum AXElementResolver {
             self.frame = frame
             self.descriptor = descriptor
             self.source = source
+            self.actionableNode = actionableNode
             self.componentScores = componentScores
             self.totalScore = totalScore
             self.confidence = confidence
@@ -229,6 +278,7 @@ public enum AXElementResolver {
                 center: center,
                 frame: frame,
                 source: source,
+                actionableNode: actionableNode,
                 componentScores: components,
                 totalScore: components.totalScore,
                 confidence: components.confidence
@@ -328,11 +378,13 @@ public enum AXElementResolver {
             guard !seen.contains(dedupe) else { continue }
             seen.insert(dedupe)
             out.append(Match(
+                id: candidate.id,
                 center: center,
                 role: role,
                 title: String(descriptor.label.prefix(60)),
                 score: candidate.confidence,
-                descriptor: descriptor
+                descriptor: descriptor,
+                actionableNode: candidate.actionableNode
             ))
         }
         return out
@@ -368,22 +420,30 @@ public enum AXElementResolver {
     public static func interactableSummary(_ matches: [Match], limit: Int = 40) -> String? {
         let items = matches.prefix(limit).map { match -> String in
             let descriptor = match.descriptor
+            let node = match.actionableNode
             let title = bounded(descriptor?.label ?? match.title, limit: 60) ?? ""
             let role = shortRole(descriptor?.role ?? match.role)
             var hints: [String] = [role]
-            if let identifier = bounded(descriptor?.identifier, limit: 48) {
+            if let identifier = bounded(node?.identifier ?? descriptor?.identifier, limit: 48) {
                 hints.append("id \(identifier)")
+            }
+            if let subrole = bounded(node?.subrole ?? descriptor?.subrole, limit: 40) {
+                hints.append("subrole \(subrole)")
             }
             if let container = bounded(descriptor?.container ?? descriptor?.ancestorPath.last, limit: 60) {
                 hints.append("in \(container)")
             }
-            if let enabled = descriptor?.enabled, !enabled {
+            let supportedActions = node?.supportedActions ?? descriptor?.supportedActions ?? []
+            if !supportedActions.isEmpty {
+                hints.append("actions \(supportedActions.prefix(4).map(shortAction).joined(separator: "/"))")
+            }
+            if let enabled = node?.enabled ?? descriptor?.enabled, !enabled {
                 hints.append("disabled")
             }
-            if descriptor?.selected == true {
+            if node?.selected == true || descriptor?.selected == true {
                 hints.append("selected")
             }
-            if descriptor?.focused == true {
+            if node?.focused == true || descriptor?.focused == true {
                 hints.append("focused")
             }
             if let sibling = descriptor?.siblingRoleIndex ?? descriptor?.siblingIndex {
@@ -402,6 +462,14 @@ public enum AXElementResolver {
 
     private static func shortRole(_ role: String) -> String {
         role.hasPrefix("AX") ? String(role.dropFirst(2)).lowercased() : role.lowercased()
+    }
+
+    private static func shortAction(_ action: String) -> String {
+        var name = action.hasPrefix("AX") ? String(action.dropFirst(2)) : action
+        if name.hasSuffix("Action") {
+            name = String(name.dropLast("Action".count))
+        }
+        return name.lowercased()
     }
 
     private static func bounded(_ value: String?, limit: Int) -> String? {
@@ -863,20 +931,81 @@ public enum AXElementResolver {
                       frame.height > 1 else { return }
                 let text = labelText(of: element) ?? ""
                 let descriptor = AXTargetDescriptorBuilder.descriptor(for: element, fallbackLabel: text)
-                let id = descriptor.identifier
-                    ?? descriptor.pathHash
-                    ?? "\(role)|\(descriptor.label)|\(candidates.count)"
-	                candidates.append(Candidate(
-	                    id: id,
-	                    descriptor: descriptor,
-	                    center: CGPoint(x: frame.midX, y: frame.midY),
-	                    frame: frame,
-	                    source: .accessibility
-	                ))
-	            }
-	            guard visited < limit else { break }
-	        }
+                let node = actionableNode(for: element, role: role, descriptor: descriptor, frame: frame)
+                candidates.append(Candidate(
+                    id: node.stableID,
+                    descriptor: descriptor,
+                    center: CGPoint(x: frame.midX, y: frame.midY),
+                    frame: frame,
+                    source: .accessibility,
+                    actionableNode: node
+                ))
+            }
+            guard visited < limit else { break }
+        }
         return candidates
+    }
+
+    static func stableNodeID(
+        descriptor: AXTargetDescriptorV2,
+        role: String? = nil,
+        subrole: String? = nil,
+        frame: CGRect? = nil
+    ) -> String {
+        let resolvedRole = role ?? descriptor.role
+        let resolvedSubrole = subrole ?? descriptor.subrole
+        let material: String
+        if let identifier = descriptor.identifier {
+            material = ["identifier", resolvedRole, resolvedSubrole, identifier].compactMap { $0 }.joined(separator: "|")
+        } else if let pathHash = descriptor.pathHash {
+            material = ["path", resolvedRole, resolvedSubrole, pathHash].compactMap { $0 }.joined(separator: "|")
+        } else {
+            let frameIdentity = descriptor.frame
+                ?? descriptor.frameBucket
+                ?? frame.map(frameString)
+            material = [
+                "structural",
+                resolvedRole,
+                resolvedSubrole,
+                descriptor.label,
+                descriptor.container,
+                descriptor.subtreeHash,
+                descriptor.semanticTextHash,
+                frameIdentity,
+            ].compactMap { $0 }.joined(separator: "|")
+        }
+        return "ax:\(AuditIdentity.hash(material))"
+    }
+
+    private static func actionableNode(
+        for element: AXUIElement,
+        role: String,
+        descriptor: AXTargetDescriptorV2,
+        frame: CGRect
+    ) -> ActionableNode {
+        let subrole = descriptor.subrole ?? textAttribute(of: element, kAXSubroleAttribute as String)
+        let supportedActions = descriptor.supportedActions.isEmpty
+            ? AXClient.actionNames(element).sorted()
+            : descriptor.supportedActions
+        let stableID = stableNodeID(
+            descriptor: descriptor,
+            role: role,
+            subrole: subrole,
+            frame: frame
+        )
+        return ActionableNode(
+            stableID: stableID,
+            role: role,
+            subrole: subrole,
+            identifier: descriptor.identifier ?? identifier(of: element),
+            title: textAttribute(of: element, kAXTitleAttribute as String),
+            axDescription: textAttribute(of: element, kAXDescriptionAttribute as String),
+            value: textAttribute(of: element, kAXValueAttribute as String),
+            supportedActions: supportedActions,
+            enabled: descriptor.enabled ?? bool(of: element, kAXEnabledAttribute as String),
+            focused: descriptor.focused ?? bool(of: element, kAXFocusedAttribute as String),
+            selected: descriptor.selected ?? bool(of: element, kAXSelectedAttribute as String)
+        )
     }
 
     private static func walk(
@@ -927,6 +1056,19 @@ public enum AXElementResolver {
         return value
     }
 
+    private static func textAttribute(of element: AXUIElement, _ attribute: String, limit: Int = 512) -> String? {
+        guard let value = string(of: element, attribute)?
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !value.isEmpty else { return nil }
+        return String(value.prefix(limit))
+    }
+
+    private static func bool(of element: AXUIElement, _ attribute: String) -> Bool? {
+        guard case .success(let value) = AXClient.attribute(element, attribute, as: Bool.self) else { return nil }
+        return value
+    }
+
     private static func element(of parent: AXUIElement, attribute: String) -> AXUIElement? {
         guard case .success(let value) = AXClient.elementAttribute(parent, attribute) else { return nil }
         return value
@@ -936,6 +1078,15 @@ public enum AXElementResolver {
     private static func frame(of element: AXUIElement) -> CGRect? {
         guard case .success(let frame) = AXClient.frame(element) else { return nil }
         return frame
+    }
+
+    private static func frameString(_ frame: CGRect) -> String {
+        [
+            Int(frame.minX.rounded()),
+            Int(frame.minY.rounded()),
+            Int(frame.width.rounded()),
+            Int(frame.height.rounded()),
+        ].map(String.init).joined(separator: ",")
     }
 
     static func decodeAXPoint(_ ref: CFTypeRef?) -> CGPoint? {

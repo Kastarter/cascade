@@ -745,6 +745,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let label: String
     public let role: String?
+    public let subrole: String?
     public let identifier: String?
     public let container: String?
     public let windowTitle: String?
@@ -756,6 +757,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public let frame: String?
     public let visualPatchHash: String?
     public let valueHash: String?
+    public let descriptionHash: String?
+    public let supportedActions: [String]
     public let enabled: Bool?
     public let selected: Bool?
     public let focused: Bool?
@@ -770,6 +773,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         schemaVersion: Int = 2,
         label: String,
         role: String? = nil,
+        subrole: String? = nil,
         identifier: String? = nil,
         container: String? = nil,
         windowTitle: String? = nil,
@@ -781,6 +785,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         frame: String? = nil,
         visualPatchHash: String? = nil,
         valueHash: String? = nil,
+        descriptionHash: String? = nil,
+        supportedActions: [String] = [],
         enabled: Bool? = nil,
         selected: Bool? = nil,
         focused: Bool? = nil,
@@ -794,6 +800,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.label = label.trimmingCharacters(in: .whitespacesAndNewlines)
         self.role = Self.cleaned(role)
+        self.subrole = Self.cleaned(subrole)
         self.identifier = Self.cleaned(identifier)
         self.container = Self.cleaned(container)
         self.windowTitle = Self.cleaned(windowTitle)
@@ -805,6 +812,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         self.frame = Self.cleaned(frame)
         self.visualPatchHash = Self.cleaned(visualPatchHash)
         self.valueHash = Self.cleaned(valueHash)
+        self.descriptionHash = Self.cleaned(descriptionHash)
+        self.supportedActions = supportedActions.compactMap(Self.cleaned).sorted()
         self.enabled = enabled
         self.selected = selected
         self.focused = focused
@@ -820,6 +829,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         case schemaVersion
         case label
         case role
+        case subrole
         case identifier
         case container
         case windowTitle
@@ -831,6 +841,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         case frame
         case visualPatchHash
         case valueHash
+        case descriptionHash
+        case supportedActions
         case enabled
         case selected
         case focused
@@ -851,6 +863,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             schemaVersion: try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 2,
             label: try container.decodeIfPresent(String.self, forKey: .label) ?? "",
             role: try container.decodeIfPresent(String.self, forKey: .role),
+            subrole: try container.decodeIfPresent(String.self, forKey: .subrole),
             identifier: try container.decodeIfPresent(String.self, forKey: .identifier),
             container: try container.decodeIfPresent(String.self, forKey: .container),
             windowTitle: try container.decodeIfPresent(String.self, forKey: .windowTitle),
@@ -862,6 +875,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             frame: try container.decodeIfPresent(String.self, forKey: .frame),
             visualPatchHash: try container.decodeIfPresent(String.self, forKey: .visualPatchHash),
             valueHash: try container.decodeIfPresent(String.self, forKey: .valueHash),
+            descriptionHash: try container.decodeIfPresent(String.self, forKey: .descriptionHash),
+            supportedActions: try container.decodeIfPresent([String].self, forKey: .supportedActions) ?? [],
             enabled: try container.decodeIfPresent(Bool.self, forKey: .enabled),
             selected: try container.decodeIfPresent(Bool.self, forKey: .selected),
             focused: try container.decodeIfPresent(Bool.self, forKey: .focused),
@@ -884,6 +899,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public static func encode(
         label: String,
         role: String? = nil,
+        subrole: String? = nil,
         identifier: String? = nil,
         container: String? = nil,
         windowTitle: String? = nil,
@@ -895,6 +911,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         frame: String? = nil,
         visualPatchHash: String? = nil,
         valueHash: String? = nil,
+        descriptionHash: String? = nil,
+        supportedActions: [String] = [],
         enabled: Bool? = nil,
         selected: Bool? = nil,
         focused: Bool? = nil,
@@ -908,6 +926,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
         let descriptor = AXTargetDescriptorV2(
             label: label,
             role: role,
+            subrole: subrole,
             identifier: identifier,
             container: container,
             windowTitle: windowTitle,
@@ -919,6 +938,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             frame: frame,
             visualPatchHash: visualPatchHash,
             valueHash: valueHash,
+            descriptionHash: descriptionHash,
+            supportedActions: supportedActions,
             enabled: enabled,
             selected: selected,
             focused: focused,
@@ -940,6 +961,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
                     schemaVersion: descriptor.schemaVersion,
                     label: fallbackLabel,
                     role: descriptor.role,
+                    subrole: descriptor.subrole,
                     identifier: descriptor.identifier,
                     container: descriptor.container,
                     windowTitle: descriptor.windowTitle,
@@ -951,6 +973,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
                     frame: descriptor.frame,
                     visualPatchHash: descriptor.visualPatchHash,
                     valueHash: descriptor.valueHash,
+                    descriptionHash: descriptor.descriptionHash,
+                    supportedActions: descriptor.supportedActions,
                     enabled: descriptor.enabled,
                     selected: descriptor.selected,
                     focused: descriptor.focused,
@@ -993,6 +1017,7 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
     public var hasSignal: Bool {
         !label.isEmpty
             || role != nil
+            || subrole != nil
             || identifier != nil
             || container != nil
             || windowTitle != nil
@@ -1004,6 +1029,8 @@ public struct AXTargetDescriptorV2: Codable, Equatable, Sendable {
             || frame != nil
             || visualPatchHash != nil
             || valueHash != nil
+            || descriptionHash != nil
+            || !supportedActions.isEmpty
             || enabled != nil
             || selected != nil
             || focused != nil
