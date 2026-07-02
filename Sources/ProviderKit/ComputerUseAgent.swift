@@ -2647,6 +2647,16 @@ public final class ComputerUseAgent {
             alternativeCount: alternativeCount
         )
         guard !reasons.isEmpty, let actionCritic else { return nil }
+        // The hard-blocking pre-action critic fires ONLY for genuine SAFETY reasons
+        // (destructive / external side-effect / privacy / irreversible / power-harness).
+        // Grounding-confidence reasons (low_confidence_grounding, ambiguous_grounding,
+        // repeated_grounding_miss, repeated_no_effect) must NOT invoke it: the grounding
+        // verifier already accepted the target, a wrong click is reversible and caught by
+        // the no-effect backstop + re-grounding, and an LLM "refuse" here dead-ends the
+        // agent — the Keynote bug where it grounded the button fine, refused its OWN click
+        // as "unsafe", did nothing, and then falsely reported "finished". Grounding
+        // uncertainty is the verifier/best-of-N's job, never a hard block.
+        guard reasons.contains(where: { Self.safetyCriticReasons.contains($0) }) else { return nil }
         return await actionCritic.critique(ActionCritiqueRequest(
             goal: currentGoal,
             actionSummary: Self.actionSummaryForCritic(action),
@@ -2654,6 +2664,17 @@ public final class ComputerUseAgent {
             triggerReasons: reasons
         ))
     }
+
+    /// Trigger reasons that warrant the hard-blocking pre-action critic — genuinely
+    /// risky, irreversible, or externally-visible actions where blocking-before-acting
+    /// is correct. Deliberately EXCLUDES the grounding-confidence reasons, which are
+    /// handled by the grounding verifier + best-of-N + no-effect backstop rather than by
+    /// refusing a reversible action.
+    nonisolated static let safetyCriticReasons: Set<String> = [
+        "destructive_or_submit_intent", "irreversible_key", "external_side_effect_key",
+        "external_side_effect_text", "external_url", "privacy_sensitive_form",
+        "power_harness_tool", "file_write",
+    ]
 
     nonisolated public static func actionCriticTriggerReasons(
         for action: CUAction? = nil,
