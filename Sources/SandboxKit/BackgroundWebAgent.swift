@@ -65,7 +65,8 @@ public final class BackgroundWebAgent {
     /// intentionally changing so no-effect detection fails open instead of treating
     /// an unreadable page as unchanged.
     private var pageSignatureFallbackGeneration = 0
-    private var scoutContextCache: (signature: String, context: String?)?
+    private var webAffordanceContextCache: (signature: String, context: String?)?
+    private var jobContext: String?
 
     // The current plan. Survives a login pause so `resume()` re-enters at
     // `nextIndex` with the earlier parts' findings intact.
@@ -112,6 +113,7 @@ public final class BackgroundWebAgent {
     /// `harnessProvider`).
     public var recallEnabled = false
     public var includeStructuredRecallContent = false
+    public var planningContextProvider: (@MainActor (String) async -> String?)?
 
     /// Emits an audit row through `onAudit`, prefixing the run tag so the row stays
     /// attributable to this run even when several agents log into the same stream.
@@ -198,9 +200,10 @@ public final class BackgroundWebAgent {
         skipped = []
         replannedSubtaskKeys = []
         droppedOriginalPlanForSteer = false
-        scoutContextCache = nil
+        webAffordanceContextCache = nil
+        jobContext = await planningContext(for: task)
         onUpdate(Update(status: "Planning…", snapshotPNG: nil, url: "", done: false, result: nil))
-        plan = await planner.plan(for: task, in: .webSandbox)
+        plan = await planner.plan(for: task, in: .webSandbox, conversationContext: jobContext ?? "")
         await execute(onUpdate: onUpdate)
     }
 
@@ -210,6 +213,24 @@ public final class BackgroundWebAgent {
         guard !plan.isEmpty else { return }
         stopped = false
         await execute(onUpdate: onUpdate)
+    }
+
+    private func planningContext(for task: String) async -> String? {
+        guard let planningContextProvider else { return nil }
+        let context = await planningContextProvider(task)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let context, !context.isEmpty else { return nil }
+        audit("sandbox.context.inject", Self.contextInjectAuditDescriptor(context))
+        return context
+    }
+
+    private func runtimeNote(_ parts: [String?]) -> String? {
+        let values = ([jobContext] + parts).compactMap { part -> String? in
+            let trimmed = part?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        let joined = values.joined(separator: "\n\n")
+        return joined.isEmpty ? nil : joined
     }
 
     private func execute(onUpdate: @escaping @MainActor (Update) -> Void) async {
@@ -281,7 +302,8 @@ public final class BackgroundWebAgent {
         switch await planner.replan(
             originalTask: originalTask,
             memo: memo,
-            environment: .webSandbox
+            environment: .webSandbox,
+            conversationContext: jobContext ?? ""
         ) {
         case .replaceCurrent(let replacement):
             plan[nextIndex] = replacement
@@ -429,23 +451,37 @@ public final class BackgroundWebAgent {
         // once per loop iteration.
         var turnStateChanges = 0
         let webPolicy = WebHarnessPolicyContext(originalTask: originalTask, subtask: sub.task)
+        let injectedHarness = harnessProvider
+        let combinedHarnessProvider: @MainActor (String, [String: Any]) async -> String = { [weak self, sandbox, webPolicy, injectedHarness] name, input in
+            guard let self, !self.stopped else { return "The user stopped this task. Do not continue — end now." }
+            acted = true
+            if name == "click_text" || name == "fill_field" { turnStateChanges += 1 }
+            if WebHarness.toolNames.contains(name) {
+                let result = await WebHarness.run(name, input, sandbox: sandbox, policyContext: webPolicy)
+                if let pt = sandbox.consumeActionPoint() { self.onCursor?(pt) }
+                self.audit("sandbox.tool", Self.sandboxToolAuditDescriptor(name: name, input: input, result: result))
+                self.auditObservationResultIfNeeded(tool: name, result: result)
+                return result
+            }
+            guard let injectedHarness else {
+                return "Unknown sandbox harness tool \(name)."
+            }
+            self.audit("sandbox.harness", Self.harnessAuditDescriptor(
+                name: name,
+                input: input,
+                includeStructuredContent: self.includeStructuredRecallContent
+            ))
+            return await injectedHarness(name, input)
+        }
         let agent = ComputerUseAgent(
             keyStore: keyStore, model: model, environmentNote: Self.sandboxNote + "\n\n" + AgentDateContext.line(),
             skillProvider: { WebSkills.content(named: $0) },
-            harnessProvider: { [weak self, sandbox, webPolicy] name, input in
-                // Using any tool IS acting (reading/clicking/filling) — not the model
-                // narrating instead of working, so it must clear the firmer-retry guard.
-                acted = true
-                if name == "click_text" || name == "fill_field" { turnStateChanges += 1 }
-                let result = await WebHarness.run(name, input, sandbox: sandbox, policyContext: webPolicy)
-                // DOM tools (click_text / fill_field) act by element — surface where they
-                // landed so the watch-box cursor follows them too.
-                if let pt = sandbox.consumeActionPoint() { self?.onCursor?(pt) }
-                self?.audit("sandbox.tool", Self.sandboxToolAuditDescriptor(name: name, input: input, result: result))
-                self?.auditObservationResultIfNeeded(tool: name, result: result)
-                return result
-            },
-            extraTools: WebHarness.toolDefinitions()
+            harnessTier: injectedHarness == nil ? .off : harnessTier,
+            harnessProvider: combinedHarnessProvider,
+            extraTools: WebHarness.toolDefinitions(),
+            recallEnabled: injectedHarness != nil && recallEnabled,
+            includeStructuredRecallContent: includeStructuredRecallContent,
+            resourceCatalogEnabled: true
         )
         // Stream like the cursor agent: each narration clause lands in the chat AND each
         // action runs the instant it's generated (the cursor moves seconds sooner) rather
@@ -479,6 +515,9 @@ public final class BackgroundWebAgent {
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height),
+            note: runtimeNote([
+                await webAffordanceContext(policyContext: webPolicy, forceRefresh: true)
+            ]),
             skillIndex: WebSkills.index()
         )
 
@@ -553,9 +592,11 @@ public final class BackgroundWebAgent {
             // text) did nothing — don't let it repeat the dead action. The DOM tools
             // already report "no element found"; this catches the subtler case of a
             // click that "succeeded" but changed nothing.
+            var pageChangedThisTurn = false
             if turnActed {
                 let signature = await pageSignature()
                 let mutations = await sandbox.consumeMutations()
+                pageChangedThisTurn = signature != lastSignature || !mutations.isEmpty
                 if signature == lastSignature && mutations.isEmpty {
                     noEffectTurns += 1
                     if noEffectTurns >= Self.recoveryAttemptLimit(for: .noEffect) {
@@ -602,8 +643,11 @@ public final class BackgroundWebAgent {
                 plan.append(AgentSubtask(task: steer, web: true))
             }
             // A user steer is authoritative; a stall/no-effect nudge rides alongside it.
-            let note = [steerNote, nudge].compactMap { $0 }.joined(separator: "\n\n")
-            step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
+            step = await agent.proceed(screenshot: shot, note: runtimeNote([
+                steerNote,
+                nudge,
+                await webAffordanceContext(policyContext: webPolicy, forceRefresh: pageChangedThisTurn)
+            ]))
             count += 1
         }
         return (stopped ? .stopped : .stepLimit, acted)
@@ -686,7 +730,9 @@ public final class BackgroundWebAgent {
             screenshot: shot,
             displayWidthPoints: Int(WebSandbox.width),
             displayHeightPoints: Int(WebSandbox.height),
-            note: await scoutWebContext(policyContext: webPolicy, forceRefresh: true)
+            note: runtimeNote([
+                await webAffordanceContext(policyContext: webPolicy, forceRefresh: true)
+            ])
         )
 
         let maxSteps = 80
@@ -804,18 +850,21 @@ public final class BackgroundWebAgent {
             // Proactive context (the web Set-of-Marks push): the page text + the
             // clickable/fillable elements, every turn, so the weak planner names
             // targets that exist and the DOM grounder hits them.
-            let note = [steerNote, nudge, await scoutWebContext(policyContext: webPolicy, forceRefresh: pageChangedThisTurn)].compactMap { $0 }.joined(separator: "\n\n")
-            step = await agent.proceed(screenshot: shot, note: note.isEmpty ? nil : note)
+            step = await agent.proceed(screenshot: shot, note: runtimeNote([
+                steerNote,
+                nudge,
+                await webAffordanceContext(policyContext: webPolicy, forceRefresh: pageChangedThisTurn)
+            ]))
             count += 1
         }
         return (stopped ? .stopped : .stepLimit, acted)
     }
 
-    /// The page's text + clickable/fillable elements, pushed to Scout each turn
-    /// (the web analog of the on-screen AX-label push) so it names real targets.
-    private func scoutWebContext(policyContext: WebHarnessPolicyContext, forceRefresh: Bool = false) async -> String? {
+    /// The page's text + clickable/fillable elements, pushed to web agents each turn
+    /// (the web analog of the on-screen AX-label push) so they name real targets.
+    private func webAffordanceContext(policyContext: WebHarnessPolicyContext, forceRefresh: Bool = false) async -> String? {
         let signature = await pageSignature()
-        if !forceRefresh, let cached = scoutContextCache, cached.signature == signature {
+        if !forceRefresh, let cached = webAffordanceContextCache, cached.signature == signature {
             return cached.context
         }
         let page = await WebHarness.run("read_page", [:], sandbox: sandbox, policyContext: policyContext)
@@ -828,7 +877,7 @@ public final class BackgroundWebAgent {
             parts.append("CLICKABLE / FILLABLE NOW (name one of these to click or fill):\n" + String(interactives.prefix(1200)))
         }
         let context = parts.isEmpty ? nil : parts.joined(separator: "\n\n")
-        scoutContextCache = (signature, context)
+        webAffordanceContextCache = (signature, context)
         return context
     }
 
@@ -1122,6 +1171,14 @@ public final class BackgroundWebAgent {
 
     nonisolated static func sandboxTurnAuditDescriptor(_ text: String) -> String {
         "status=message textChars=\(text.count) textHash=\(auditHash(text))"
+    }
+
+    nonisolated static func contextInjectAuditDescriptor(_ context: String) -> String {
+        [
+            "contextChars=\(context.count)",
+            "contextHash=\(auditHash(context))",
+            "lineCount=\(context.split(separator: "\n", omittingEmptySubsequences: false).count)"
+        ].joined(separator: " ")
     }
 
     nonisolated static func sandboxStalledAuditDescriptor(_ text: String) -> String {

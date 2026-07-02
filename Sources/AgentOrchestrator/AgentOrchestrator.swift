@@ -74,6 +74,305 @@ public struct AgentVerification: Sendable, Equatable {
     }
 }
 
+public struct AgentCreationPlan: Sendable, Equatable {
+    public let schemaVersion: String
+    public let signatureHash: String
+    public let goalHash: String
+    public let goalCharacterCount: Int
+    public let traceHash: String
+    public let recipeStepCount: Int
+    public let occurrenceCount: Int
+    public let occurrenceIDCount: Int
+    public let occurrenceIDsHash: String
+    public let appCount: Int
+    public let surfaceFlow: [SurfaceSummary]
+    public let targetChecks: [TargetCheck]
+    public let liveValueSlots: [LiveValueSlot]
+    public let dataflowEdges: [DataflowEdge]
+
+    public struct SurfaceSummary: Sendable, Equatable {
+        public let order: Int
+        public let surfaceHash: String
+        public let surfaceCharacterCount: Int
+        public let appHash: String
+        public let documentHash: String?
+    }
+
+    public struct TargetCheck: Sendable, Equatable {
+        public let order: Int
+        public let kind: RecipeStepKind
+        public let surfaceHash: String
+        public let documentHash: String?
+        public let hasCoordinate: Bool
+        public let targetDescriptorHash: String?
+        public let anchorHash: String?
+
+        public var hasReplayTarget: Bool {
+            hasCoordinate || targetDescriptorHash != nil || anchorHash != nil
+        }
+    }
+
+    public struct LiveValueSlot: Sendable, Equatable {
+        public let order: Int
+        public let keyHash: String
+        public let keyCharacterCount: Int
+        public let kind: RecipeParameterKind?
+        public let valueShapeCount: Int
+        public let valueHashCount: Int
+        public let sourceStepCount: Int
+        public let dataflowEdgeHash: String?
+        public let targetSurfaceHash: String
+        public let targetDocumentHash: String?
+        public let isPasteShortcut: Bool
+    }
+
+    public struct DataflowEdge: Sendable, Equatable {
+        public let edgeHash: String
+        public let targetOrder: Int
+        public let sourceOrders: [Int]
+        public let sourceSurfaceHashes: [String]
+        public let targetSurfaceHash: String
+        public let sourceDocumentHashes: [String]
+        public let targetDocumentHash: String?
+        public let transform: String?
+    }
+
+    public func auditDetail(issueCodes: [String] = []) -> String {
+        var fields = [
+            "schema=\(schemaVersion)",
+            "signatureHash=\(signatureHash)",
+            "goalHash=\(goalHash)",
+            "goalChars=\(goalCharacterCount)",
+            "traceHash=\(traceHash)",
+            "stepCount=\(recipeStepCount)",
+            "occurrenceCount=\(occurrenceCount)",
+            "occurrenceIDCount=\(occurrenceIDCount)",
+            "occurrenceIDsHash=\(occurrenceIDsHash)",
+            "appCount=\(appCount)",
+            "surfaceCount=\(surfaceFlow.count)",
+            "surfaceFlowHash=\(AuditIdentity.hash(surfaceFlow.map(\.surfaceHash).joined(separator: "|")))",
+            "targetCount=\(targetChecks.count)",
+            "anchoredTargetCount=\(targetChecks.filter(\.hasReplayTarget).count)",
+            "liveSlotCount=\(liveValueSlots.count)",
+            "dataflowEdgeCount=\(dataflowEdges.count)",
+            "dataflowEdgeHash=\(AuditIdentity.hash(dataflowEdges.map(\.edgeHash).joined(separator: "|")))"
+        ]
+        if !issueCodes.isEmpty {
+            fields.append("issueCount=\(issueCodes.count)")
+            fields.append("issueCodes=\(issueCodes.map(AuditIdentity.safeToken).joined(separator: ","))")
+        }
+        return fields.joined(separator: " ")
+    }
+}
+
+public struct AgentPlanSynthesizer: Sendable {
+    public init() {}
+
+    public func synthesize(from curated: CuratedAgent) -> AgentCreationPlan {
+        synthesize(
+            goal: curated.goal,
+            signature: curated.signature,
+            recipe: curated.source.recipe,
+            apps: curated.source.apps,
+            occurrenceCount: curated.source.occurrences,
+            occurrenceIDs: curated.source.evidence
+        )
+    }
+
+    public func synthesize(
+        goal: String,
+        signature: String,
+        recipe: AgentRecipe,
+        apps: [String],
+        occurrenceCount: Int,
+        occurrenceIDs: [Int64]
+    ) -> AgentCreationPlan {
+        let steps = recipe.steps.sorted { $0.order < $1.order }
+        let byOrder = Dictionary(uniqueKeysWithValues: steps.map { ($0.order, $0) })
+        let surfaceFlow = Self.surfaceFlow(for: steps)
+        let targetChecks = steps.compactMap(Self.targetCheck(for:))
+        let liveValueSlots = steps.filter(Self.isLiveValueStep).map(Self.liveValueSlot(for:))
+        let dataflowEdges = liveValueSlots.compactMap { slot -> AgentCreationPlan.DataflowEdge? in
+            guard let target = byOrder[slot.order] else { return nil }
+            let sources = target.sourceStepIDs.compactMap { byOrder[$0] }
+            guard !sources.isEmpty || target.dataflowEdgeID != nil else { return nil }
+            let sourceOrders = sources.map(\.order).sorted()
+            let sourceSurfaceHashes = Self.uniqueSortedHashes(sources.map(Self.surfaceIdentity))
+            let sourceDocumentHashes = Self.uniqueSortedHashes(sources.compactMap(\.documentIdentityHash))
+            let edgeIdentity = target.dataflowEdgeID ?? [
+                "target:\(target.order)",
+                "sources:\(sourceOrders.map(String.init).joined(separator: ","))"
+            ].joined(separator: "|")
+            return AgentCreationPlan.DataflowEdge(
+                edgeHash: AuditIdentity.hash(edgeIdentity),
+                targetOrder: target.order,
+                sourceOrders: sourceOrders,
+                sourceSurfaceHashes: sourceSurfaceHashes,
+                targetSurfaceHash: AuditIdentity.hash(Self.surfaceIdentity(target)),
+                sourceDocumentHashes: sourceDocumentHashes,
+                targetDocumentHash: target.documentIdentityHash,
+                transform: target.transform.map(AuditIdentity.safeToken)
+            )
+        }
+        return AgentCreationPlan(
+            schemaVersion: "agent-creation-plan.v1",
+            signatureHash: AuditIdentity.hash(signature),
+            goalHash: AuditIdentity.hash(goal),
+            goalCharacterCount: AuditIdentity.count(goal),
+            traceHash: Self.traceHash(for: steps),
+            recipeStepCount: steps.count,
+            occurrenceCount: occurrenceCount,
+            occurrenceIDCount: occurrenceIDs.count,
+            occurrenceIDsHash: AuditIdentity.hash(occurrenceIDs.sorted().map(String.init).joined(separator: ",")),
+            appCount: Set(apps.map(AuditIdentity.safeToken)).count,
+            surfaceFlow: surfaceFlow,
+            targetChecks: targetChecks,
+            liveValueSlots: liveValueSlots,
+            dataflowEdges: dataflowEdges
+        )
+    }
+
+    private static func surfaceFlow(for steps: [RecipeStep]) -> [AgentCreationPlan.SurfaceSummary] {
+        var summaries: [AgentCreationPlan.SurfaceSummary] = []
+        var previousKey: String?
+        for step in steps {
+            let surface = surfaceIdentity(step)
+            let document = step.documentIdentityHash
+            let key = "\(surface)|\(document ?? "none")"
+            guard key != previousKey else { continue }
+            summaries.append(AgentCreationPlan.SurfaceSummary(
+                order: step.order,
+                surfaceHash: AuditIdentity.hash(surface),
+                surfaceCharacterCount: AuditIdentity.count(surface),
+                appHash: AuditIdentity.hash(step.appName),
+                documentHash: document
+            ))
+            previousKey = key
+        }
+        return summaries
+    }
+
+    private static func targetCheck(for step: RecipeStep) -> AgentCreationPlan.TargetCheck? {
+        guard step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick else { return nil }
+        return AgentCreationPlan.TargetCheck(
+            order: step.order,
+            kind: step.kind,
+            surfaceHash: AuditIdentity.hash(surfaceIdentity(step)),
+            documentHash: step.documentIdentityHash,
+            hasCoordinate: step.x != nil && step.y != nil,
+            targetDescriptorHash: step.targetDescriptor.map(AuditIdentity.hash),
+            anchorHash: step.ocrAnchor.map(AuditIdentity.hash)
+        )
+    }
+
+    private static func liveValueSlot(for step: RecipeStep) -> AgentCreationPlan.LiveValueSlot {
+        let key = step.parameterKey ?? step.dataflowEdgeID ?? step.ocrAnchor ?? "step-\(step.order)"
+        return AgentCreationPlan.LiveValueSlot(
+            order: step.order,
+            keyHash: AuditIdentity.hash(key),
+            keyCharacterCount: AuditIdentity.count(key),
+            kind: step.parameterKind,
+            valueShapeCount: step.valueExamples.count,
+            valueHashCount: step.valueHashes.count,
+            sourceStepCount: step.sourceStepIDs.count,
+            dataflowEdgeHash: step.dataflowEdgeID.map(AuditIdentity.hash),
+            targetSurfaceHash: AuditIdentity.hash(surfaceIdentity(step)),
+            targetDocumentHash: step.documentIdentityHash,
+            isPasteShortcut: isPasteShortcut(step)
+        )
+    }
+
+    private static func traceHash(for steps: [RecipeStep]) -> String {
+        let components = steps.map { step in
+            [
+                "order:\(step.order)",
+                "kind:\(step.kind.rawValue)",
+                "surface:\(AuditIdentity.hash(surfaceIdentity(step)))",
+                "document:\(step.documentIdentityHash ?? "none")",
+                "target:\(step.idempotentActionKeyHash)",
+                "edge:\(AuditIdentity.hash(step.dataflowEdgeID))",
+                "parameter:\(step.isParameter ? "1" : "0")"
+            ].joined(separator: ",")
+        }
+        return AuditIdentity.hash(components.joined(separator: "|"))
+    }
+
+    private static func isLiveValueStep(_ step: RecipeStep) -> Bool {
+        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+    }
+
+    private static func isPasteShortcut(_ step: RecipeStep) -> Bool {
+        guard step.kind == .key, step.key?.lowercased() == "v" else { return false }
+        let modifiers = Set(step.modifiers.map { $0.lowercased() })
+        return modifiers.contains("command") || modifiers.contains("cmd") || modifiers.contains("control") || modifiers.contains("ctrl")
+    }
+
+    private static func surfaceIdentity(_ step: RecipeStep) -> String {
+        let surface = step.surface?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let surface, !surface.isEmpty { return surface }
+        return step.appName
+    }
+
+    private static func uniqueSortedHashes(_ values: [String]) -> [String] {
+        Array(Set(values.map(AuditIdentity.hash))).sorted()
+    }
+}
+
+public struct AgentPlanValidator: Sendable {
+    public init() {}
+
+    public func validate(_ plan: AgentCreationPlan) throws {
+        var issues: [String] = []
+        if plan.goalCharacterCount == 0 { issues.append("empty_goal") }
+        if plan.signatureHash == AuditIdentity.hash(nil) { issues.append("empty_signature") }
+        if plan.recipeStepCount == 0 { issues.append("empty_recipe") }
+        if plan.occurrenceCount <= 0 { issues.append("empty_occurrences") }
+        if plan.surfaceFlow.isEmpty { issues.append("empty_surface_flow") }
+
+        let missingTargets = plan.targetChecks.filter { !$0.hasReplayTarget }
+        if !missingTargets.isEmpty { issues.append("missing_replay_targets") }
+
+        let targetOrders = Set(plan.targetChecks.map(\.order))
+        if targetOrders.count != plan.targetChecks.count { issues.append("duplicate_target_orders") }
+
+        for edge in plan.dataflowEdges {
+            if edge.sourceOrders.isEmpty {
+                issues.append("dataflow_missing_source")
+            }
+            if edge.sourceOrders.contains(where: { $0 >= edge.targetOrder }) {
+                issues.append("dataflow_source_not_before_target")
+            }
+            if edge.sourceSurfaceHashes.isEmpty && edge.sourceDocumentHashes.isEmpty {
+                issues.append("dataflow_missing_source_identity")
+            }
+        }
+
+        for slot in plan.liveValueSlots {
+            if slot.kind == nil { issues.append("live_slot_missing_kind") }
+            if slot.keyCharacterCount == 0 { issues.append("live_slot_missing_key") }
+            if slot.isPasteShortcut && slot.sourceStepCount == 0 {
+                issues.append("paste_slot_missing_source")
+            }
+        }
+
+        if !issues.isEmpty {
+            throw AgentPlanValidationError(issueCodes: Array(Set(issues)).sorted())
+        }
+    }
+}
+
+public struct AgentPlanValidationError: Error, LocalizedError, Sendable, Equatable {
+    public let issueCodes: [String]
+
+    public init(issueCodes: [String]) {
+        self.issueCodes = issueCodes
+    }
+
+    public var errorDescription: String? {
+        "Agent synthesis validation failed: \(issueCodes.joined(separator: ", "))"
+    }
+}
+
 public protocol AgentDriver: Sendable {
     func observe() async throws -> AgentObservation
     func act(_ action: AgentAction) async throws
@@ -216,6 +515,8 @@ public actor LocalMacDriver: AgentDriver {
 }
 
 public actor CascadeOrchestrator {
+    private static let experimentalParameterizedMiningKey = "cascade.experimentalParameterizedMining"
+
     private let store: CascadeStore
     private let localAnswerer: ContextQuestionAnswering
     private let claudeAnswerer: ContextQuestionAnswering
@@ -259,19 +560,53 @@ public actor CascadeOrchestrator {
     /// per-moment inspection) and returns the answer WITH the moments it used.
     /// Falls back to single-shot grounding, then to the local heuristic, so a
     /// missing key or a flaky network never breaks asking.
-    public func askRecord(_ question: String, conversation: [(user: String, assistant: String)] = []) async throws -> RecordAnswer {
+    public func askRecord(
+        _ question: String,
+        conversation: [(user: String, assistant: String)] = [],
+        sourcePlan: SourcePlan? = nil
+    ) async throws -> RecordAnswer {
+        if let sourcePlan, !Self.planAllowsRecordedMemory(sourcePlan) {
+            return RecordAnswer(text: "source-mismatch: this ask was not routed to recorded memory.", citedMomentIDs: [])
+        }
+        let cleanPlanQuery = sourcePlan?.cleanQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let routedQuestion = cleanPlanQuery?.isEmpty == false
+            ? (cleanPlanQuery ?? question)
+            : question
         if keyStore.hasKey(),
-           let answer = try? await recordAnswerer.answer(question: question, conversation: conversation) {
+           let answer = try? await answerRecord(
+            question: routedQuestion,
+            conversation: conversation,
+            sourcePlan: sourcePlan
+           ) {
             return answer
         }
-        let grounding = try await chatGrounding(for: question)
-        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: question, grounding: grounding) {
+        let grounding = try await chatGrounding(for: routedQuestion)
+        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: routedQuestion, grounding: grounding) {
             return RecordAnswer(text: answer, citedMomentIDs: [])
         }
         return RecordAnswer(
-            text: try await localAnswerer.answer(question: question, grounding: grounding),
+            text: try await localAnswerer.answer(question: routedQuestion, grounding: grounding),
             citedMomentIDs: []
         )
+    }
+
+    private func answerRecord(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        sourcePlan: SourcePlan?
+    ) async throws -> RecordAnswer {
+        if let planned = recordAnswerer as? SourcePlanRecordAnswering {
+            return try await planned.answer(question: question, conversation: conversation, sourcePlan: sourcePlan)
+        }
+        return try await recordAnswerer.answer(question: question, conversation: conversation)
+    }
+
+    private static func planAllowsRecordedMemory(_ plan: SourcePlan) -> Bool {
+        plan.candidateSources.contains(.recordedMemory)
+            || plan.routingIntent == .answerRecord
+            || plan.routingIntent == .instructionalWithRecordDependency
+            || plan.routingIntent == .mixed
+            || plan.routingIntent == .ambiguous
     }
 
     /// Resolves cited moment ids to renderable chips (privacy-filtered).
@@ -322,6 +657,24 @@ public actor CascadeOrchestrator {
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)
         return wasteDetector.detect(
+            contexts: contexts,
+            inputEvents: events,
+            maxResults: maxResults,
+            webAppIdentity: webAppIdentity,
+            useEpisodeMining: useEpisodeMining,
+            useParameterizedMining: useParameterizedMining
+        )
+    }
+
+    public func detectedWasteReport(
+        maxResults: Int = 5,
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        useEpisodeMining: Bool = true,
+        useParameterizedMining: Bool = false
+    ) async throws -> WasteDetectionReport {
+        let contexts = try await store.recentContexts(limit: 400)
+        let events = try await store.recentInputEvents(limit: 3000)
+        return wasteDetector.detectReport(
             contexts: contexts,
             inputEvents: events,
             maxResults: maxResults,
@@ -426,7 +779,7 @@ public actor CascadeOrchestrator {
         let demoSketch = TrajectorySketchBuilder(maxActions: 6, maxAnchors: 4, maxChecks: 3, maxCorrections: 2)
             .build(goal: curated.goal, recipe: waste.recipe)
         let persistedSketches = [AgentDemoSketch(demoSketch)].filter { !$0.promptText.isEmpty }
-        return try await store.upsertAgent(CascadeAgent(
+        let agent = CascadeAgent(
             name: curated.name,
             source: .detected,
             signature: waste.signature,
@@ -438,11 +791,44 @@ public actor CascadeOrchestrator {
             evidenceIDs: curated.evidence,
             goal: curated.goal,
             demoSketches: Array(persistedSketches.prefix(3))
+        )
+        guard Self.agentSynthesisEnabled() else {
+            return try await store.upsertAgent(agent)
+        }
+
+        let plan = AgentPlanSynthesizer().synthesize(from: curated)
+        do {
+            try AgentPlanValidator().validate(plan)
+        } catch let validationError as AgentPlanValidationError {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "agent.synthesis.failed",
+                detail: plan.auditDetail(issueCodes: validationError.issueCodes)
+            ))
+            throw validationError
+        } catch {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "agent.synthesis.failed",
+                detail: plan.auditDetail(issueCodes: ["unknown_validation_error"])
+            ))
+            throw error
+        }
+
+        _ = try await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "agent.synthesis.validated",
+            detail: plan.auditDetail()
         ))
+        return try await store.upsertAgent(agent)
     }
 
     public func agents() async throws -> [CascadeAgent] {
         try await store.agents()
+    }
+
+    private nonisolated static func agentSynthesisEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: Self.experimentalParameterizedMiningKey)
     }
 }
 

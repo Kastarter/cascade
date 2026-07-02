@@ -32,10 +32,24 @@ public enum StableToolDefinition {
 /// Machine-readable non-success tool_result text. Successful untrusted payloads
 /// should keep using InjectionGuard envelopes so their trust boundary stays explicit.
 public enum ToolResultStatusEnvelope {
-    public enum Status: String {
+    public enum Status: String, Codable, Sendable, Equatable {
         case error
         case refused
         case noResult = "no_result"
+    }
+
+    public struct Parsed: Sendable, Equatable {
+        public let status: Status
+        public let kind: String
+        public let message: String
+        public let tool: String?
+
+        public init(status: Status, kind: String, message: String, tool: String? = nil) {
+            self.status = status
+            self.kind = kind
+            self.message = message
+            self.tool = tool
+        }
     }
 
     public static func render(
@@ -56,5 +70,25 @@ public enum ToolResultStatusEnvelope {
             return "[tool_result status=\(status.rawValue) kind=\(kind)] \(message)"
         }
         return text
+    }
+
+    public static func parse(_ rendered: String) -> Parsed? {
+        guard let data = rendered.data(using: .utf8),
+              let object = try? JSONDecoder().decode(StatusDTO.self, from: data) else {
+            return nil
+        }
+        return Parsed(
+            status: object.status,
+            kind: object.kind,
+            message: object.message,
+            tool: object.tool
+        )
+    }
+
+    private struct StatusDTO: Decodable {
+        let status: Status
+        let kind: String
+        let message: String
+        let tool: String?
     }
 }

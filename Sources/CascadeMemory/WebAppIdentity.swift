@@ -1,8 +1,7 @@
 import Foundation
 
-/// Identifies the web app / site a browser window is showing, from its title — so a
-/// workflow done INSIDE the browser is recognized as the real app (Gmail, Outlook,
-/// Google Flights, LinkedIn, GitHub…) instead of being lumped under "Chrome".
+/// Derives privacy-safe browser document identity from a window title, while also
+/// exposing a web-app surface resolver for browser routing/display.
 ///
 /// Real Chrome titles look like:
 ///   "Mail - Mohanad Bahammam - Outlook - Google Chrome – Mohanad"   → Outlook
@@ -10,7 +9,7 @@ import Foundation
 ///   "Messaging | LinkedIn - High memory usage - 830 MB - Google Chrome – Mohanad" → LinkedIn
 ///   "GitHub - Google Chrome – Mohanad"                              → GitHub
 ///
-/// The trick the earlier version got wrong: the browser appends its OWN name and the
+/// The trick the surface resolver handles: the browser appends its OWN name and the
 /// PROFILE name ("… - Google Chrome – Mohanad"), and Chrome's memory saver injects
 /// "High memory usage - NNN MB". The real app brand sits BEFORE all that. So: drop the
 /// browser tail + the noise, then match the remaining segments against known brands.
@@ -81,28 +80,21 @@ public enum WebAppIdentity {
         return map
     }()
 
+    /// Privacy-safe document identity. This strips browser chrome/noise, normalizes
+    /// the content-bearing title segments, and returns only the short audit hash.
     public static func from(windowTitle: String?) -> String? {
-        guard let raw = windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard let normalized = normalizedDocumentTitle(windowTitle) else { return nil }
+        return AuditIdentity.hash(normalized)
+    }
 
-        // 1) Split into segments on any common title separator.
-        var working = raw
-        for sep in separators { working = working.replacingOccurrences(of: sep, with: "\u{1}") }
-        var segments = working
-            .split(separator: "\u{1}")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        // 2) Drop the browser's own chrome: the browser name and everything after it
-        //    (the profile name browsers append — "… - Google Chrome – Mohanad").
-        if let browserIdx = segments.firstIndex(where: { browserNames.contains($0.lowercased()) }) {
-            segments = Array(segments[..<browserIdx])
-        }
-        // 3) Drop Chrome's memory-saver noise ("High memory usage", "830 MB").
-        segments = segments.filter { !isNoise($0) }
+    /// The web app / site a browser window is showing, suitable for UI labels and
+    /// route identity. This returns a known brand only, never an arbitrary page title.
+    public static func surface(fromWindowTitle windowTitle: String?) -> String? {
+        let segments = contentSegments(from: windowTitle)
         guard !segments.isEmpty else { return nil }
 
-        // 4) The app brand sits nearest the (now-removed) browser suffix — check from the
-        //    end first ("… - Outlook", "… - Google Flights").
+        // The app brand sits nearest the (now-removed) browser suffix — check from the
+        // end first ("… - Outlook", "… - Google Flights").
         for segment in segments.reversed() {
             let key = segment.lowercased()
             if let brand = canonicalByLowercased[key] { return brand }
@@ -112,6 +104,36 @@ public enum WebAppIdentity {
             if key.hasPrefix("google ") { return segment.count <= 24 ? segment : "Google" }
         }
         return nil
+    }
+
+    private static func normalizedDocumentTitle(_ windowTitle: String?) -> String? {
+        let normalized = contentSegments(from: windowTitle)
+            .joined(separator: " ")
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func contentSegments(from windowTitle: String?) -> [String] {
+        guard let raw = windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return [] }
+
+        var working = raw
+        for sep in separators { working = working.replacingOccurrences(of: sep, with: "\u{1}") }
+        var segments = working
+            .split(separator: "\u{1}")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        if let browserIdx = segments.firstIndex(where: { browserNames.contains($0.lowercased()) }) {
+            segments = Array(segments[..<browserIdx])
+        }
+        return segments.filter { !isNoise($0) }
     }
 
     /// Chrome's memory-saver tooltip ("High memory usage", "830 MB") leaks into the

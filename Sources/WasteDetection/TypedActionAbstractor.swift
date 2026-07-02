@@ -45,19 +45,28 @@ public struct TypedAction: Codable, Equatable, Hashable, Sendable {
     public let targetRole: String
     public let targetLabelClass: String
     public let dataSlot: TypedActionSlot?
+    public let normalizedTargetKey: String?
+    public let documentIdentityHash: String?
+    public let dataSlotRole: String?
 
     public init(
         verb: TypedActionVerb,
         surface: String,
         targetRole: String,
         targetLabelClass: String,
-        dataSlot: TypedActionSlot? = nil
+        dataSlot: TypedActionSlot? = nil,
+        normalizedTargetKey: String? = nil,
+        documentIdentityHash: String? = nil,
+        dataSlotRole: String? = nil
     ) {
         self.verb = verb
         self.surface = surface
         self.targetRole = targetRole
         self.targetLabelClass = targetLabelClass
         self.dataSlot = dataSlot
+        self.normalizedTargetKey = normalizedTargetKey
+        self.documentIdentityHash = documentIdentityHash
+        self.dataSlotRole = dataSlotRole
     }
 
     public var abstractToken: String {
@@ -77,8 +86,20 @@ public struct TypedAction: Codable, Equatable, Hashable, Sendable {
             surface,
             targetRole,
             targetLabelClass,
-            dataSlot?.category.rawValue
+            dataSlot?.category.rawValue,
+            dataSlotRole
         ].compactMap { $0 }.joined(separator: " ")
+    }
+
+    var profileToken: String {
+        [
+            "verb=\(verb.rawValue)",
+            "surface=\(surface)",
+            "role=\(targetRole)",
+            "label=\(targetLabelClass)",
+            "target=\(normalizedTargetKey ?? "none")",
+            "slotRole=\(dataSlotRole ?? "none")"
+        ].joined(separator: "|")
     }
 }
 
@@ -130,7 +151,10 @@ public struct TypedActionAbstractor: Sendable {
             surface: resolvedSurface,
             targetRole: Self.targetRole(for: event, descriptor: descriptor),
             targetLabelClass: Self.labelClass(for: displayLabel, slot: slot),
-            dataSlot: slot
+            dataSlot: slot,
+            normalizedTargetKey: Self.normalizedTargetKey(for: event, descriptor: descriptor, labelClass: Self.labelClass(for: displayLabel, slot: slot)),
+            documentIdentityHash: WebAppIdentity.from(windowTitle: event.windowTitle),
+            dataSlotRole: slot.map { "\($0.category.rawValue):\(Self.targetRole(for: event, descriptor: descriptor))" }
         )
     }
 
@@ -236,6 +260,7 @@ public struct TypedActionEpisodeClusterer: Sendable {
         _ rhs: TypedActionEpisode,
         vectors: [Int: [Float]?]
     ) -> Double {
+        guard Self.profileCompatible(lhs.actions, rhs.actions) else { return 0 }
         let structural = Self.sequenceSimilarity(lhs.abstractTokens, rhs.abstractTokens)
         if let lhsVector = vectors[lhs.index] ?? nil,
            let rhsVector = vectors[rhs.index] ?? nil,
@@ -244,6 +269,25 @@ public struct TypedActionEpisodeClusterer: Sendable {
             return max(structural, semantic)
         }
         return structural
+    }
+
+    private static func profileCompatible(_ lhs: [TypedAction], _ rhs: [TypedAction]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for (left, right) in zip(lhs, rhs) {
+            guard left.surface == right.surface,
+                  left.targetRole == right.targetRole,
+                  left.targetLabelClass == right.targetLabelClass
+            else { return false }
+            if let leftSlot = left.dataSlotRole, let rightSlot = right.dataSlotRole, leftSlot == rightSlot {
+                continue
+            }
+            if let leftTarget = left.normalizedTargetKey,
+               let rightTarget = right.normalizedTargetKey,
+               leftTarget != rightTarget {
+                return false
+            }
+        }
+        return true
     }
 
     private static func episodeSort(_ lhs: TypedActionEpisode, _ rhs: TypedActionEpisode) -> Bool {
@@ -339,6 +383,20 @@ private extension TypedActionAbstractor {
             return "grid"
         }
         return classifySlotValue(label).rawValue
+    }
+
+    static func normalizedTargetKey(for event: InputEvent, descriptor: AXTargetDescriptorV2?, labelClass: String) -> String? {
+        let parts = [
+            descriptor?.role,
+            descriptor?.identifier,
+            descriptor?.container,
+            labelClass,
+            event.kind.rawValue,
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return nil }
+        return AuditIdentity.hash(parts.map(component).joined(separator: "|"))
     }
 
     static func surfaceKey(_ value: String) -> String {

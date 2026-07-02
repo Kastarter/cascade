@@ -444,32 +444,41 @@ public enum RecipeActionIdentity {
     public static func key(for step: RecipeStep) -> String {
         key(
             kind: step.kind.rawValue,
-            appSurface: step.appName,
+            appSurface: step.surface ?? step.appName,
             bundleIdentifier: step.bundleIdentifier,
-            windowTitle: step.windowTitleHint,
+            windowTitle: step.documentIdentityHash == nil ? step.windowTitleHint : nil,
+            documentIdentityHash: step.documentIdentityHash,
             targetDescriptor: step.targetDescriptor,
             label: step.kind == .type ? nil : (step.ocrAnchor ?? step.text),
             key: step.kind == .key ? step.key : nil,
             modifiers: step.kind == .key ? step.modifiers : [],
             isParameter: step.isParameter,
             parameterKey: step.parameterKey,
-            parameterKind: step.parameterKind?.rawValue
+            parameterKind: step.parameterKind?.rawValue,
+            dataflowEdgeID: step.dataflowEdgeID
         )
     }
 
-    public static func key(for event: InputEvent, surface: String? = nil) -> String {
+    public static func key(
+        for event: InputEvent,
+        surface: String? = nil,
+        documentIdentityHash: String? = nil,
+        dataflowEdgeID: String? = nil
+    ) -> String {
         key(
             kind: recipeKind(for: event.kind),
             appSurface: surface ?? event.appName,
             bundleIdentifier: event.bundleIdentifier,
-            windowTitle: event.windowTitle,
+            windowTitle: documentIdentityHash == nil ? event.windowTitle : nil,
+            documentIdentityHash: documentIdentityHash,
             targetDescriptor: event.targetDescriptor,
             label: event.kind == .type ? nil : event.text,
             key: event.kind == .key ? event.key : nil,
             modifiers: event.kind == .key ? event.modifiers : [],
             isParameter: false,
             parameterKey: nil,
-            parameterKind: nil
+            parameterKind: nil,
+            dataflowEdgeID: dataflowEdgeID
         )
     }
 
@@ -495,16 +504,18 @@ public enum RecipeActionIdentity {
         appSurface: String,
         bundleIdentifier: String?,
         windowTitle: String?,
+        documentIdentityHash: String?,
         targetDescriptor: String?,
         label: String?,
         key: String?,
         modifiers: [String],
         isParameter: Bool,
         parameterKey: String?,
-        parameterKind: String?
+        parameterKind: String?,
+        dataflowEdgeID: String?
     ) -> String {
         let modifierKey = modifiers.map { normalizedComponent($0) }.filter { !$0.isEmpty }.sorted().joined(separator: "+")
-        let parts = [
+        var parts = [
             "v1",
             "kind=\(normalizedComponent(kind))",
             "surface=\(normalizedComponent(appSurface))",
@@ -518,6 +529,12 @@ public enum RecipeActionIdentity {
             "parameterKey=\(normalizedComponent(parameterKey))",
             "parameterKind=\(normalizedComponent(parameterKind))",
         ]
+        if let documentIdentityHash, !documentIdentityHash.isEmpty {
+            parts.append("document=\(normalizedComponent(documentIdentityHash))")
+        }
+        if let dataflowEdgeID, !dataflowEdgeID.isEmpty {
+            parts.append("dataflow=\(normalizedComponent(dataflowEdgeID))")
+        }
         return parts.joined(separator: "|")
     }
 
@@ -534,12 +551,31 @@ public enum RecipeActionIdentity {
 }
 
 public extension InputEvent {
-    func idempotentActionKey(surface: String? = nil) -> String {
-        RecipeActionIdentity.key(for: self, surface: surface)
+    func idempotentActionKey(
+        surface: String? = nil,
+        documentIdentityHash: String? = nil,
+        dataflowEdgeID: String? = nil
+    ) -> String {
+        RecipeActionIdentity.key(
+            for: self,
+            surface: surface,
+            documentIdentityHash: documentIdentityHash,
+            dataflowEdgeID: dataflowEdgeID
+        )
     }
 
-    func idempotentActionKeyHash(surface: String? = nil) -> String {
-        RecipeActionIdentity.hash(idempotentActionKey(surface: surface))
+    func idempotentActionKeyHash(
+        surface: String? = nil,
+        documentIdentityHash: String? = nil,
+        dataflowEdgeID: String? = nil
+    ) -> String {
+        RecipeActionIdentity.hash(
+            idempotentActionKey(
+                surface: surface,
+                documentIdentityHash: documentIdentityHash,
+                dataflowEdgeID: dataflowEdgeID
+            )
+        )
     }
 }
 
@@ -1056,6 +1092,13 @@ public struct RecipeStep: Codable, Equatable, Sendable {
     public let appName: String
     public let bundleIdentifier: String?
     public let windowTitleHint: String?
+    /// Workflow-level surface identity, e.g. the web app inside a browser. The
+    /// recorded `appName` remains the macOS app to activate during replay.
+    public let surface: String?
+    /// Privacy-safe document/window identity derived from the title; never raw title text.
+    public let documentIdentityHash: String?
+    /// Privacy-safe copy/paste dataflow edge identity when this step consumes a live value.
+    public let dataflowEdgeID: String?
     public let ocrAnchor: String?
     /// Stable AX locator of a click target (encoded `role`+`identifier` via
     /// `AXTargetDescriptor`), carried from the recorded `InputEvent`. The replay
@@ -1083,7 +1126,7 @@ public struct RecipeStep: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case order, kind, x, y, text, key, modifiers, appName, bundleIdentifier
-        case windowTitleHint, ocrAnchor, targetDescriptor, isParameter
+        case windowTitleHint, surface, documentIdentityHash, dataflowEdgeID, ocrAnchor, targetDescriptor, isParameter
         case parameterKey, parameterKind, valueExamples, valueHashes, sourceStepIDs, transform
     }
 
@@ -1098,6 +1141,9 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         appName: String,
         bundleIdentifier: String? = nil,
         windowTitleHint: String? = nil,
+        surface: String? = nil,
+        documentIdentityHash: String? = nil,
+        dataflowEdgeID: String? = nil,
         ocrAnchor: String? = nil,
         targetDescriptor: String? = nil,
         isParameter: Bool = false,
@@ -1118,6 +1164,9 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         self.appName = appName
         self.bundleIdentifier = bundleIdentifier
         self.windowTitleHint = windowTitleHint
+        self.surface = surface
+        self.documentIdentityHash = documentIdentityHash
+        self.dataflowEdgeID = dataflowEdgeID
         self.ocrAnchor = ocrAnchor
         self.targetDescriptor = targetDescriptor
         self.isParameter = isParameter
@@ -1141,6 +1190,9 @@ public struct RecipeStep: Codable, Equatable, Sendable {
         self.appName = try container.decode(String.self, forKey: .appName)
         self.bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier)
         self.windowTitleHint = try container.decodeIfPresent(String.self, forKey: .windowTitleHint)
+        self.surface = try container.decodeIfPresent(String.self, forKey: .surface)
+        self.documentIdentityHash = try container.decodeIfPresent(String.self, forKey: .documentIdentityHash)
+        self.dataflowEdgeID = try container.decodeIfPresent(String.self, forKey: .dataflowEdgeID)
         self.ocrAnchor = try container.decodeIfPresent(String.self, forKey: .ocrAnchor)
         self.targetDescriptor = try container.decodeIfPresent(String.self, forKey: .targetDescriptor)
         self.isParameter = try container.decodeIfPresent(Bool.self, forKey: .isParameter) ?? false

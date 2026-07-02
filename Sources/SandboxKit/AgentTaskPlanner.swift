@@ -105,97 +105,6 @@ public struct AgentTaskFinding: Sendable, Equatable {
     }
 }
 
-public enum SearchRoutingIntent: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
-    case onScreen
-    case recordedMemory
-    case localFiles
-    case web
-    case ambiguous
-    case multi
-    case noSearch
-
-    static func normalized(_ raw: String?) -> SearchRoutingIntent? {
-        let value = (raw ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-        switch value {
-        case "onscreen", "on_screen", "screen", "visible", "current_screen":
-            return .onScreen
-        case "recordedmemory", "recorded_memory", "memory", "recall", "record":
-            return .recordedMemory
-        case "localfiles", "local_files", "files", "file", "folder", "spotlight":
-            return .localFiles
-        case "web", "internet", "browser", "online":
-            return .web
-        case "ambiguous", "unknown", "unclear":
-            return .ambiguous
-        case "multi", "multiple", "multi_source", "multi-source":
-            return .multi
-        case "none", "no_search", "nosearch", "no_retrieval":
-            return .noSearch
-        default:
-            return nil
-        }
-    }
-}
-
-public enum SearchResource: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
-    case onScreen
-    case recordedMemory
-    case localFiles
-    case web
-
-    static func normalized(_ raw: String?) -> SearchResource? {
-        let value = (raw ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-        switch value {
-        case "onscreen", "on_screen", "screen", "visible", "current_screen":
-            return .onScreen
-        case "recordedmemory", "recorded_memory", "memory", "recall", "record":
-            return .recordedMemory
-        case "localfiles", "local_files", "files", "file", "folder", "spotlight":
-            return .localFiles
-        case "web", "internet", "browser", "online":
-            return .web
-        default:
-            return nil
-        }
-    }
-}
-
-public struct SearchRouteHint: Sendable, Equatable, Codable {
-    public let routingIntent: SearchRoutingIntent
-    public let candidateSources: [SearchResource]
-    public let cleanQuery: String
-
-    public init(
-        routingIntent: SearchRoutingIntent,
-        candidateSources: [SearchResource],
-        cleanQuery: String
-    ) {
-        self.routingIntent = routingIntent
-        self.candidateSources = Self.dedup(candidateSources)
-        self.cleanQuery = cleanQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    public var allowsWeb: Bool { candidateSources.contains(.web) || routingIntent == .web || routingIntent == .multi }
-    public var usesCheapLocalSources: Bool {
-        candidateSources.contains(.recordedMemory) || candidateSources.contains(.localFiles)
-    }
-
-    private static func dedup(_ sources: [SearchResource]) -> [SearchResource] {
-        var seen = Set<SearchResource>()
-        var output: [SearchResource] = []
-        for source in sources where seen.insert(source).inserted {
-            output.append(source)
-        }
-        return output
-    }
-}
-
 public struct AgentRecoveryMemo: Sendable, Equatable {
     public let failedSubtask: AgentSubtask
     public let failureKind: AgentFailureKind
@@ -355,21 +264,27 @@ public struct AgentTaskPlanner: Sendable {
         in environment: Environment,
         conversationContext: String = ""
     ) async -> SearchRouteHint {
+        let fallback = SourceRouter().route(
+            task,
+            environment: environment == .webSandbox ? .webSandbox : .onScreen,
+            conversationContext: conversationContext,
+            availableSources: Self.availableSearchResources(for: environment)
+        )
         let request = Self.searchRouteRequestBody(
             task: task,
             environment: environment,
             conversationContext: conversationContext
         )
-        let user = (try? Self.jsonString(request)) ?? "Job: \(task)"
+        guard let user = try? Self.jsonString(request) else { return fallback }
         let options = AnthropicCompletionOptions.deterministic(
             promptVersion: Self.searchRoutePromptVersion,
             schemaVersion: Self.searchRouteSchemaVersion,
-            callsite: "AgentTaskPlanner.searchRoute"
+            callsite: "AgentTaskPlanner.routeSearch"
         )
         let raw = try? await complete(
             system: Self.searchRouteSystemPrompt,
             user: user,
-            maxTokens: 300,
+            maxTokens: 350,
             options: options,
             validating: {
                 guard Self.parseSearchRoute($0) != nil else {
@@ -377,10 +292,11 @@ public struct AgentTaskPlanner: Sendable {
                 }
             }
         )
-        if let raw, let parsed = Self.parseSearchRoute(raw) {
-            return parsed
+        guard let raw, let route = Self.parseSearchRoute(raw) else {
+            Self.logger.error("search router fell back to heuristic routing — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
+            return fallback
         }
-        return Self.heuristicSearchRoute(for: task, in: environment, conversationContext: conversationContext)
+        return route
     }
 
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "planner")
@@ -389,7 +305,7 @@ public struct AgentTaskPlanner: Sendable {
 
     static let searchRouteSystemPrompt = """
     You route a user request across Cascade's search resources. Return only JSON:
-    {"routingIntent":"onScreen|recordedMemory|localFiles|web|ambiguous|multi|noSearch","candidateSources":["onScreen","recordedMemory","localFiles","web"],"cleanQuery":"..."}
+    {"routingIntent":"onScreen|recordedMemory|localFiles|web|ambiguous|multi|noSearch","candidateSources":["onScreen","recordedMemory","localFiles","web"],"cleanQuery":"...","reason":"...","requiredSource":"onScreen|recordedMemory|localFiles|web|null","escalationPolicy":"ordered|web_if_unsupported|ask_user|none","stopPolicy":"first_supported|require_required_source|check_all"}
 
     Choose the cheapest useful source first. Use recordedMemory for things the user saw or did earlier. Use localFiles for files or folders on this Mac. Use web for current/public/world facts. Use onScreen when the answer is visible now. Use multi when more than one source is likely needed.
     """
@@ -551,7 +467,11 @@ public struct AgentTaskPlanner: Sendable {
         return SearchRouteHint(
             routingIntent: intent,
             candidateSources: sources,
-            cleanQuery: cleanQuery
+            cleanQuery: cleanQuery,
+            reason: dto.reason ?? "",
+            requiredSource: SearchResource.normalized(dto.requiredSource),
+            escalationPolicy: SourceEscalationPolicy.normalized(dto.escalationPolicy) ?? .ordered,
+            stopPolicy: SourceStopPolicy.normalized(dto.stopPolicy) ?? .firstSupported
         )
     }
 
@@ -572,6 +492,10 @@ public struct AgentTaskPlanner: Sendable {
                 "routingIntent": "one of onScreen, recordedMemory, localFiles, web, ambiguous, multi, noSearch",
                 "candidateSources": "ordered cheapest-first subset of availableResources",
                 "cleanQuery": "short search query with voice filler removed",
+                "reason": "brief routing reason",
+                "requiredSource": "single mandatory source when the request names one, otherwise null",
+                "escalationPolicy": "ordered, web_if_unsupported, ask_user, or none",
+                "stopPolicy": "first_supported, require_required_source, or check_all",
             ],
         ]
     }
@@ -638,13 +562,14 @@ public struct AgentTaskPlanner: Sendable {
 
         let intent: SearchRoutingIntent
         if sources.count > 1 {
-            intent = sources.contains(.web) && (sources.contains(.recordedMemory) || sources.contains(.localFiles)) ? .multi : .ambiguous
+            intent = sources.contains(.web) && (sources.contains(.recordedMemory) || sources.contains(.localFiles)) ? .mixed : .ambiguous
         } else {
             switch sources.first {
-            case .onScreen: intent = .onScreen
-            case .recordedMemory: intent = .recordedMemory
-            case .localFiles: intent = .localFiles
-            case .web: intent = .web
+            case .onScreen: intent = .locateVisible
+            case .recordedMemory: intent = .answerRecord
+            case .localFiles: intent = .findFile
+            case .web: intent = .webFact
+            case .action: intent = .action
             case nil: intent = .noSearch
             }
         }
@@ -654,12 +579,13 @@ public struct AgentTaskPlanner: Sendable {
 
     private static func defaultSources(for intent: SearchRoutingIntent) -> [SearchResource] {
         switch intent {
-        case .onScreen: [.onScreen]
-        case .recordedMemory: [.recordedMemory]
-        case .localFiles: [.localFiles]
-        case .web: [.web]
+        case .locateVisible: [.onScreen]
+        case .answerRecord, .instructionalWithRecordDependency: [.recordedMemory]
+        case .findFile: [.localFiles]
+        case .webFact: [.web]
+        case .action: [.action]
         case .ambiguous: [.onScreen, .recordedMemory, .localFiles]
-        case .multi: [.recordedMemory, .localFiles, .web]
+        case .mixed: [.recordedMemory, .localFiles, .web]
         case .noSearch: []
         }
     }
@@ -765,6 +691,10 @@ public struct AgentTaskPlanner: Sendable {
         let routingIntent: String?
         let candidateSources: [String]?
         let cleanQuery: String?
+        let reason: String?
+        let requiredSource: String?
+        let escalationPolicy: String?
+        let stopPolicy: String?
     }
 
     private struct ExpectedEffectDTO: Decodable {

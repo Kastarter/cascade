@@ -709,35 +709,46 @@ public final class CascadeAppModel: ObservableObject {
             let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
             let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
             let parameterizedMiningEnabled = episodeMiningEnabled && defaultsStore.bool(forKey: Self.experimentalParameterizedMiningKey)
-            let rawDetectedWaste = try await orchestrator.detectedWaste(
+            let detectionReport = try await orchestrator.detectedWasteReport(
                 webAppIdentity: Self.webAppIdentity,
                 useEpisodeMining: episodeMiningEnabled,
                 useParameterizedMining: parameterizedMiningEnabled
             )
-            if parameterizedMiningEnabled {
-                _ = try? await store.appendAudit(AuditEvent(
-                    actor: "agent",
-                    action: "workflow.parameterized_mining",
-                    detail: Self.parameterizedMiningAuditDetail(rawDetectedWaste)
-                ))
-            }
+            let rawDetectedWaste = detectionReport.results
             let preferenceModel = await suggestionPreferenceModel()
+            var reviewableCount = 0
             if personalizationEnabled {
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
-                let curated = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0, using: preferenceModel) })
+                let reviewable = detectedWaste.filter { Self.isAutomatable($0, using: preferenceModel) }
+                reviewableCount = reviewable.count
+                let curated = await orchestrator.curate(reviewable)
                 curatedWaste = Self.rankCuratedSuggestions(curated, using: preferenceModel)
                 await recordCuratedProposalsShown(curatedWaste)
                 await refreshProactiveNextActionOffer(now: Date())
             } else {
                 detectedWaste = rawDetectedWaste
                 // Only genuinely repeated, time-saving workflows (the automatable filter)
-	                // reach the curator and the manager's review queue.
-		                curatedWaste = await orchestrator.curate(detectedWaste.filter { Self.isAutomatable($0) })
-		                proactiveNextActionOffer = nil
-		                proactiveOffer = nil
-		            }
-	            await refreshLearningOpportunities(from: detectedWaste)
-	            statusLine = recorder.status.message
+		                // reach the curator and the manager's review queue.
+                let reviewable = detectedWaste.filter { Self.isAutomatable($0) }
+                reviewableCount = reviewable.count
+			                curatedWaste = await orchestrator.curate(reviewable)
+			                proactiveNextActionOffer = nil
+			                proactiveOffer = nil
+			            }
+            if parameterizedMiningEnabled {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "workflow.parameterized_mining",
+                    detail: Self.parameterizedMiningAuditDetail(
+                        detectionReport,
+                        reviewableCount: reviewableCount,
+                        curatedCount: curatedWaste.count,
+                        managerPendingCount: taughtForReview.count + curatedWaste.count
+                    )
+                ))
+            }
+		            await refreshLearningOpportunities(from: detectedWaste)
+		            statusLine = recorder.status.message
         } catch {
             auditIntegrityStatus = .verificationFailed(error.localizedDescription)
             if auditIntegrityEnforcementEnabled { audit = [] }
@@ -940,6 +951,34 @@ public final class CascadeAppModel: ObservableObject {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        if defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) {
+            let routePlan = Self.routeIntentHeuristic(trimmed)
+            if routePlan.routingIntent != .noSearch, routePlan.routingIntent != .action {
+                if routePlan.candidateSources.first == .onScreen {
+                    Task {
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "source.route",
+                            detail: Self.sourceRouteAuditDetail(goal: trimmed, plan: routePlan, status: "chat")
+                        ))
+                    }
+                    showOnScreen(trimmed)
+                    return
+                }
+                answer = "Checking the right source…"
+                thinking = true
+                let history = conversation.suffix(4).map { (user: $0.question, assistant: $0.answer) }
+                Task {
+                    let routed = await answerChat(trimmed, routePlan: routePlan, history: Array(history))
+                    answer = routed.text
+                    conversation.append(QATurn(question: trimmed, answer: routed.text, citations: routed.citations))
+                    assistMemory.remember(user: trimmed, assistant: routed.text, ok: routed.answered)
+                    thinking = false
+                }
+                return
+            }
+        }
+
         if Self.refersToScreen(trimmed) {
             showOnScreen(trimmed)
             return
@@ -1045,6 +1084,58 @@ public final class CascadeAppModel: ObservableObject {
     private func answerAsText(_ q: String) async {
         let result = (try? await orchestrator.ask(q)) ?? "I couldn't answer that from the local record."
         conversation.append(QATurn(question: q, answer: Self.brief(result)))
+    }
+
+    private func answerChat(
+        _ question: String,
+        routePlan: SourcePlan,
+        history: [(user: String, assistant: String)]
+    ) async -> (text: String, citations: [CitedMoment], answered: Bool) {
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "source.route",
+            detail: Self.sourceRouteAuditDetail(goal: question, plan: routePlan, status: "chat")
+        ))
+        let evidence = await collectEvidence(for: routePlan)
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "source.evidence",
+            detail: Self.sourceEvidenceAuditDetail(evidence)
+        ))
+        for source in routePlan.candidateSources {
+            switch source {
+            case .onScreen:
+                return ("I need the live screen for that; ask again with the screen visible.", [], false)
+            case .recordedMemory:
+                do {
+                    let recordAnswer = try await orchestrator.askRecord(question, conversation: history, sourcePlan: routePlan)
+                    guard !recordAnswer.text.hasPrefix("source-mismatch:") else { continue }
+                    let citations = await orchestrator.citedMoments(recordAnswer.citedMomentIDs).map {
+                        CitedMoment(id: $0.id, appName: $0.appName, capturedAt: $0.capturedAt, imagePath: $0.imagePath)
+                    }
+                    return (recordAnswer.text.trimmingCharacters(in: .whitespacesAndNewlines), citations, true)
+                } catch {
+                    continue
+                }
+            case .localFiles:
+                if evidence.evidenceBySource[.localFiles]?.state == .checkedSupported,
+                   let text = evidence.textBySource[.localFiles]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !text.isEmpty {
+                    return (String(text.prefix(1800)), [], true)
+                }
+            case .web:
+                if capturePrivacyPolicy.backgroundWebRunsAvailable, hasAnthropicKey {
+                    let started = createSandboxAgent(task: "Find and answer: \(question)")
+                    if started {
+                        return ("I started a background web check for that.", [], true)
+                    }
+                }
+                return ("That needs web access, but background web is unavailable right now.", [], false)
+            case .action:
+                continue
+            }
+        }
+        return (evidence.hasEvidence ? evidence.findingText : "I couldn't find supporting evidence in the routed sources.", [], evidence.hasEvidence)
     }
 
     /// Whether a chat question is about the *current screen* (point the cursor) vs.
@@ -1174,6 +1265,11 @@ public final class CascadeAppModel: ObservableObject {
                     detail: String(detail.prefix(240))
                 ))
             }
+        }
+        runtime.planningContextProvider = { [weak self] goal in
+            guard let self else { return nil }
+            let rendered = await self.contextPack(goal: goal, surface: .backgroundWeb, affordanceMode: .assist)
+            return rendered.text.isEmpty ? nil : rendered.text
         }
         runtime.harnessTier = effectivePowerHarnessEnabled ? .full : .readOnly
         runtime.recallEnabled = capturePrivacyPolicy.recordRecallAvailable
@@ -1653,6 +1749,21 @@ public final class CascadeAppModel: ObservableObject {
         ].joined(separator: " ")
     }
 
+    nonisolated static func reflectionInjectAuditDetail(_ memory: AgentFailureMemory) -> String {
+        [
+            "status=saved",
+            "id=\(memory.id)",
+            "failureKind=\(safeAuditToken(memory.failureKind.rawValue))",
+            "appHash=\(auditHash(memory.appName))",
+            "goalTokenCount=\(memory.normalizedGoalTokens.count)",
+            "firstActionHash=\(memory.firstBadAction.map(auditHash) ?? "none")",
+            "targetHash=\(memory.targetHash ?? "none")",
+            "stateHash=\(memory.stateSummary.map(auditHash) ?? "none")",
+            "repairHintHash=\(auditHash(memory.repairHint))",
+            "evidenceHash=\(memory.recoveryEvidenceHash ?? "none")",
+        ].joined(separator: " ")
+    }
+
     private static func firstNonBlank(_ values: String?...) -> String {
         values.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty } ?? "unknown"
     }
@@ -2052,12 +2163,21 @@ public final class CascadeAppModel: ObservableObject {
         if searchRoutingEnabled {
             let h = TextHelperModel.resolve()
             let router = AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache)
-            for subtask in plan where Self.isSearchShapedGoal(subtask.task) {
-                routeHints[subtask.task] = await router.routeSearch(
+            for subtask in plan {
+                let fallback = Self.routeIntentHeuristic(subtask.task)
+                guard Self.routeNeedsSourceEvidence(fallback) else { continue }
+                let routed = await router.routeSearch(
                     for: subtask.task,
                     in: .onScreen,
                     conversationContext: planningContext
                 )
+                let routeHint = Self.routeNeedsSourceEvidence(routed) ? routed : fallback
+                routeHints[subtask.task] = routeHint
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "source.route",
+                    detail: Self.sourceRouteAuditDetail(goal: subtask.task, plan: routeHint, status: "assist")
+                ))
             }
         }
         _ = try? await store.appendAudit(AuditEvent(
@@ -2109,8 +2229,13 @@ public final class CascadeAppModel: ObservableObject {
                    appliedSearchRoutingKeys.insert(Self.auditHash(sub.task)).inserted {
                     var localVerdict: SearchEvidenceVerdict?
                     if routeHint.usesCheapLocalSources {
-                        let evidence = await collectCheapLocalEvidence(routeHint: routeHint)
-                        let verdict = await judgeSearchEvidence(evidence)
+                        let evidence = await collectEvidence(for: routeHint)
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "source.evidence",
+                            detail: Self.sourceEvidenceAuditDetail(evidence)
+                        ))
+                        let verdict = await reviewEvidence(plan: routeHint, evidence: evidence)
                         localVerdict = verdict
                         if verdict == .sufficient {
                             findings.append((task: sub.task, result: evidence.findingText))
@@ -2148,6 +2273,12 @@ public final class CascadeAppModel: ObservableObject {
                             stalledOn = sub.task
                             break parts
                         case .unavailable:
+                            if Self.webRequired(routeHint) {
+                                let reason = "This subtask needs web evidence, but background web is unavailable right now."
+                                findings.append((task: sub.task, result: reason))
+                                stalledOn = sub.task
+                                break parts
+                            }
                             break
                         }
                     }
@@ -2437,17 +2568,54 @@ public final class CascadeAppModel: ObservableObject {
         reason: String,
         recovery: RecoveryAction
     ) async {
-        let appName = Self.normalizedFrontmostApp(AppWindowObserver.snapshot().appName) ?? subtask.app
-        guard !appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let tokens = TrajectorySketch.normalizedGoalTokens(from: goal)
+        await recordReflectionFailureMemory(
+            appName: Self.normalizedFrontmostApp(AppWindowObserver.snapshot().appName) ?? subtask.app,
+            goal: goal,
+            failureKind: Self.experienceFailureKind(for: failureKind),
+            stateSummary: reason,
+            repairHint: "Recovery rung: \(recovery.rawValue). Replan the current subgoal before advancing.",
+            recoveryEvidenceSeed: "\(failureKind.rawValue)|\(recovery.rawValue)|\(reason)"
+        )
+    }
+
+    private func recordReflectionFailureMemory(
+        appName: String?,
+        goal: String,
+        failureKind: CascadeMemory.AgentFailureKind,
+        firstBadAction: String? = nil,
+        targetHash: String? = nil,
+        stateSummary: String?,
+        repairHint: String,
+        recoveryEvidenceSeed: String? = nil
+    ) async {
+        guard defaultsStore.bool(forKey: Self.experimentalExperienceLedgerKey) else { return }
+        guard let appName = Self.normalizedFrontmostApp(appName) else { return }
+        let redactedGoal = PIIDetector.redact(goal).redacted
+        let tokens = TrajectorySketch.normalizedGoalTokens(from: redactedGoal)
         guard !tokens.isEmpty else { return }
-        _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
+        let redactedAction = firstBadAction.map { String(PIIDetector.redact($0).redacted.prefix(120)) }
+        let redactedState = stateSummary.map { String(PIIDetector.redact($0).redacted.prefix(180)) }
+        let redactedHint = String(PIIDetector.redact(repairHint).redacted.prefix(240))
+        let memory = AgentFailureMemory(
             appName: appName,
             normalizedGoalTokens: Array(tokens.prefix(10)),
-            failureKind: Self.experienceFailureKind(for: failureKind),
-            firstBadAction: nil,
-            stateSummary: String(PIIDetector.redact(reason).redacted.prefix(180)),
-            repairHint: "Recovery rung: \(recovery.rawValue). Replan the current subgoal before advancing."
+            failureKind: failureKind,
+            firstBadAction: redactedAction?.isEmpty == true ? nil : redactedAction,
+            targetHash: targetHash,
+            stateSummary: redactedState?.isEmpty == true ? nil : redactedState,
+            repairHint: redactedHint,
+            recoveryEvidenceHash: recoveryEvidenceSeed.map(Self.auditHash)
+        )
+        guard let saved = try? await store.recordAgentFailureMemory(memory) else { return }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "reflection.inject",
+            detail: Self.reflectionInjectAuditDetail(saved)
+        ))
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "agent.failure_memory.saved",
+            detail: Self.failureMemorySavedAuditDetail(saved)
         ))
     }
 
@@ -2461,32 +2629,54 @@ public final class CascadeAppModel: ObservableObject {
         case failed
     }
 
-    struct SearchEvidenceBundle: Sendable, Equatable {
+    struct SourceEvidenceBundle: Sendable, Equatable {
         let query: String
-        let routeHint: SearchRouteHint
-        var recordResult: String?
-        var fileSearchResult: String?
-        var fileReadResult: String?
+        let sourcePlan: SourcePlan
+        var evidenceBySource: [SourceID: SourceEvidence]
+        var textBySource: [SourceID: String]
+
+        init(query: String, sourcePlan: SourcePlan) {
+            self.query = query
+            self.sourcePlan = sourcePlan
+            var evidence: [SourceID: SourceEvidence] = [:]
+            for source in sourcePlan.candidateSources {
+                evidence[source] = SourceEvidence.notChecked(source: source)
+            }
+            self.evidenceBySource = evidence
+            self.textBySource = [:]
+        }
 
         var hasEvidence: Bool {
-            [recordResult, fileSearchResult, fileReadResult].contains { text in
-                guard let text else { return false }
-                return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
+            evidenceBySource.values.contains { $0.state == .checkedSupported }
         }
 
         var combinedText: String {
-            [
-                recordResult.map { "Recorded memory:\n\($0)" },
-                fileSearchResult.map { "Local file search:\n\($0)" },
-                fileReadResult.map { "Local file read:\n\($0)" },
-            ].compactMap { $0 }.joined(separator: "\n\n")
+            sourcePlan.candidateSources.compactMap { source -> String? in
+                guard let text = textBySource[source]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty else { return nil }
+                let label: String
+                switch source {
+                case .recordedMemory: label = "Recorded memory"
+                case .localFiles: label = "Local files"
+                case .onScreen: label = "On-screen"
+                case .web: label = "Web"
+                case .action: label = "Action"
+                }
+                return "\(label):\n\(text)"
+            }.joined(separator: "\n\n")
         }
 
         var findingText: String {
             let text = combinedText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return "No local evidence found." }
             return String(text.prefix(1800))
+        }
+
+        mutating func set(_ evidence: SourceEvidence, text: String? = nil) {
+            evidenceBySource[evidence.source] = evidence
+            if let text {
+                textBySource[evidence.source] = text
+            }
         }
     }
 
@@ -2840,25 +3030,25 @@ public final class CascadeAppModel: ObservableObject {
                     detail: profile.safeAuditDetail
                 ))
             },
-            onVerifierOutcome: { [store = self.store] outcome in
+            onVerifierOutcome: { [weak self, store = self.store] outcome in
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
                     action: "grounding.verifier",
                     detail: Self.groundingVerifierAuditDetail(outcome)
                 ))
                 guard outcome.verifierResult.verdict != .accept else { return }
+                guard let self else { return }
                 let appName = await MainActor.run { AppWindowObserver.snapshot().appName }
-                let tokens = TrajectorySketch.normalizedGoalTokens(from: outcome.target)
-                guard !tokens.isEmpty, appName != "Unknown app" else { return }
-                _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
+                await self.recordReflectionFailureMemory(
                     appName: appName,
-                    normalizedGoalTokens: Array(tokens.prefix(10)),
+                    goal: outcome.target,
                     failureKind: .groundingMiss,
-                    firstBadAction: "ground \(outcome.target)",
+                    firstBadAction: "ground target",
                     targetHash: outcome.selectedCandidateHash ?? Self.auditHash(outcome.target),
                     stateSummary: "verifier=\(outcome.verifierResult.verdict.rawValue) failure=\(outcome.verifierResult.failureKind?.rawValue ?? "none") source=\(outcome.selectedSource?.rawValue ?? "unknown")",
-                    repairHint: "Re-describe the visible target once and prefer independent AX/OCR agreement over the rejected source."
-                ))
+                    repairHint: "Re-describe the visible target once and prefer independent AX/OCR agreement over the rejected source.",
+                    recoveryEvidenceSeed: "\(outcome.verifierResult.verdict.rawValue)|\(outcome.selectedCandidateHash ?? Self.auditHash(outcome.target))"
+                )
             }
         ) : base
     }
@@ -2972,7 +3162,8 @@ public final class CascadeAppModel: ObservableObject {
         // multimodal model on OpenRouter (e.g. qwen/qwen3.6-plus). The grounder is
         // configured separately (`cascade.visualGrounder.*`).
         let planner = ScoutPlannerBackend.resolve(defaults: defaultsStore)
-        let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        let sourcePlan = routeHint ?? Self.routeIntentHeuristic(goal)
+        let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.routeNeedsSourceEvidence(sourcePlan)
         var searchToolCalls = 0
         var searchFinishBlocked = false
         let agent = ScoutAgent(
@@ -3296,7 +3487,8 @@ public final class CascadeAppModel: ObservableObject {
         // wall-clock (Sonnet-first ballooned the same Keynote task from ~10 turns
         // to 15 and over-thought; reverted). Effort stays medium — CU default.
         let cuModel = AnthropicModel.opus
-        let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.isSearchShapedGoal(goal)
+        let sourcePlan = routeHint ?? Self.routeIntentHeuristic(goal)
+        let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.routeNeedsSourceEvidence(sourcePlan)
         let actionChunkingEnabled = defaultsStore.bool(forKey: Self.experimentalActionChunkingKey)
         let actionCacheLookup = await actionTrajectoryCachePreflight(
             goal: goal,
@@ -3525,7 +3717,7 @@ public final class CascadeAppModel: ObservableObject {
                     let modelStart = ContinuousClock.now
                     step = await agent.continueAfterNudge(
                         screenshot: currentShot,
-                        note: episodeNote(nudge) ?? Self.searchSufficiencyNudge(routeHint: routeHint)
+                        note: await episodeNote(nudge) ?? Self.searchSufficiencyNudge(routeHint: routeHint)
                     )
                     modelTime += modelStart.duration(to: .now) - streamActionTime
                     count += 1
@@ -3720,7 +3912,7 @@ public final class CascadeAppModel: ObservableObject {
                     streamExpectedChange = false
                     pendingNarration = nil
                     let modelStart = ContinuousClock.now
-                    step = await agent.proceed(screenshot: crop, note: episodeNote(nudge), zoomResult: true)
+                    step = await agent.proceed(screenshot: crop, note: await episodeNote(nudge), zoomResult: true)
                     modelTime += modelStart.duration(to: .now) - streamActionTime
                     count += 1
                     continue
@@ -3913,7 +4105,7 @@ public final class CascadeAppModel: ObservableObject {
             pendingNarration = nil
             let modelStart = ContinuousClock.now
             currentShot = observedShot
-            step = await agent.proceed(screenshot: observedShot, note: episodeNote(nudge))
+            step = await agent.proceed(screenshot: observedShot, note: await episodeNote(nudge))
             modelTime += modelStart.duration(to: .now) - streamActionTime
             count += 1
         }
@@ -4089,26 +4281,196 @@ public final class CascadeAppModel: ObservableObject {
         """
     }
 
-    /// The per-turn grounding note plus, when the stall guard fired, the firm
-    /// "act now or stop" nudge appended so the model can't keep idling.
-    private func episodeNote(_ nudge: String?) -> String? {
-        guard let nudge else { return groundingNote() }
-        return [groundingNote(), nudge].compactMap { $0 }.joined(separator: "\n")
+    private enum AgentContextSurface: String {
+        case assist
+        case scout
+        case backgroundWeb = "background_web"
     }
 
-    nonisolated static func isSearchShapedGoal(_ goal: String) -> Bool {
+    private enum AgentContextAffordanceMode {
+        case assist
+        case scout
+        case none
+    }
+
+    /// The per-turn grounding note plus, when the stall guard fired, the firm
+    /// "act now or stop" nudge appended so the model can't keep idling.
+    private func episodeNote(_ nudge: String?) async -> String? {
+        let rendered = await contextPack(goal: assistTaskGoal ?? "", surface: .assist, nudge: nudge, affordanceMode: .assist)
+        return rendered.text.isEmpty ? nil : rendered.text
+    }
+
+    private func contextPack(
+        goal: String,
+        surface: AgentContextSurface,
+        nudge: String? = nil,
+        affordanceMode: AgentContextAffordanceMode
+    ) async -> RenderedAgentContextPack {
+        let snapshot = AppWindowObserver.snapshot()
+        var sections: [AgentContextSection] = []
+        func add(
+            _ name: String,
+            _ body: String?,
+            freshness: AgentContextFreshness,
+            order: Int,
+            maxCharacters: Int? = nil
+        ) {
+            let trimmed = body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !trimmed.isEmpty else { return }
+            sections.append(AgentContextSection(
+                name: name,
+                body: trimmed,
+                freshness: freshness,
+                order: order,
+                maxCharacters: maxCharacters
+            ))
+        }
+
+        add("conversation", assistMemory.contextMemo(), freshness: .recent, order: 5, maxCharacters: 900)
+        switch affordanceMode {
+        case .assist:
+            add("screen", groundingNote(), freshness: .live, order: 10, maxCharacters: 700)
+        case .scout:
+            add("screen", scoutContextNote(), freshness: .live, order: 10, maxCharacters: 1_000)
+        case .none:
+            break
+        }
+        add("nudge", nudge, freshness: .current, order: 15, maxCharacters: 800)
+        add("auto_recall", await autoRecallInitialNote(goal: goal, snapshot: snapshot), freshness: .recent, order: 30, maxCharacters: 1_200)
+        add("planning_priors", await planningPriorNote(for: goal, frontmostApp: snapshot.appName), freshness: .historical, order: 40, maxCharacters: 1_000)
+        add("trajectory_sketch", await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName), freshness: .historical, order: 50, maxCharacters: 1_200)
+        add("failure_reflections", await failureMemoryNote(for: goal, frontmostApp: snapshot.appName), freshness: .historical, order: 60, maxCharacters: 1_000)
+
+        let rendered = AgentContextPack(
+            sections: sections,
+            budget: AgentContextBudget(totalCharacters: 6_000, perSectionCharacters: 1_200)
+        ).render()
+        await auditContextPack(rendered, surface: surface)
+        return rendered
+    }
+
+    private func auditContextPack(_ rendered: RenderedAgentContextPack, surface: AgentContextSurface) async {
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "context_pack.inject",
+            detail: "surface=\(Self.safeAuditToken(surface.rawValue)) \(rendered.auditDescriptor)"
+        ))
+    }
+
+    nonisolated static func routeIntentHeuristic(_ goal: String) -> SourcePlan {
         let normalized = " " + goal.lowercased()
             .folding(options: [.diacriticInsensitive, .widthInsensitive], locale: .current)
             .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "ابتثجحخدذرزسشصضطظعغفقكلمنهويءأإآةىؤئ")).inverted)
             .filter { !$0.isEmpty }
             .joined(separator: " ") + " "
-        let markers = [
-            " find ", " search ", " look up ", " lookup ", " where is ", " where are ",
-            " what is ", " what's ", " who is ", " when is ", " how much ", " how many ",
-            " latest ", " current ", " price ", " locate ", " show me ", " ابحث ",
-            " دور ", " وين ", " اين ", " أين ", " ما هو ", " كم ",
+        let screenMarkers = [
+            " on screen ", " this screen ", " this page ", " visible ", " locate ", " show me ",
+            " point ", " highlight ", " what does this say ", " summarize this ", " read this ",
         ]
-        return markers.contains { normalized.contains($0.lowercased()) }
+        let recordMarkers = [
+            " earlier ", " yesterday ", " last week ", " last time ", " this morning ",
+            " history ", " recorded ", " remember ", " what did ", " what was i ", " did i ",
+            " i saw ", " i was reading ", " recap ", " summarize my ",
+        ]
+        let localMarkers = [
+            " file ", " files ", " folder ", " desktop ", " downloads ", " documents ",
+            " finder ", " on my mac ", " pdf ", " docx ", " xlsx ", " csv ", " txt ", " md ",
+        ]
+        let webMarkers = [
+            " latest ", " current ", " news ", " weather ", " stock ", " price ", " online ",
+            " internet ", " website ", " web ", " google ", " who is ", " what is ", " when is ",
+            " how much ", " how many ", " ما هو ", " كم ",
+        ]
+        let actionMarkers = [
+            " click ", " type ", " open ", " create ", " send ", " delete ", " rename ", " move ",
+            " update ", " change ", " schedule ", " book ", " fill ", " submit ",
+        ]
+        let explicitSearchMarkers = [
+            " find ", " search ", " look up ", " lookup ", " where is ", " where are ",
+            " locate ", " show me ", " ابحث ", " دور ", " وين ", " اين ", " أين ",
+        ]
+        let cleanQuery = SourceRouter.cleanSearchQuery(goal)
+        var sources: [SourceID] = []
+        if screenMarkers.contains(where: normalized.contains) { sources.append(.onScreen) }
+        if recordMarkers.contains(where: normalized.contains) { sources.append(.recordedMemory) }
+        if localMarkers.contains(where: normalized.contains) { sources.append(.localFiles) }
+        if webMarkers.contains(where: normalized.contains), !recordMarkers.contains(where: normalized.contains) {
+            sources.append(.web)
+        }
+        if sources.isEmpty, explicitSearchMarkers.contains(where: normalized.contains) {
+            sources = [.onScreen, .recordedMemory, .localFiles]
+        }
+        if sources.isEmpty {
+            if actionMarkers.contains(where: normalized.contains) {
+                return SourcePlan(routingIntent: .action, candidateSources: [.action], cleanQuery: cleanQuery, reason: "heuristic_action", requiredSource: .action, escalationPolicy: .none)
+            }
+            return SourcePlan(routingIntent: .noSearch, candidateSources: [], cleanQuery: cleanQuery, reason: "heuristic_no_search", escalationPolicy: .none)
+        }
+        let intent: SourceIntent
+        if sources.count > 1 {
+            intent = .mixed
+        } else {
+            switch sources.first {
+            case .onScreen: intent = .locateVisible
+            case .recordedMemory: intent = .answerRecord
+            case .localFiles: intent = .findFile
+            case .web: intent = .webFact
+            case .action: intent = .action
+            case nil: intent = .noSearch
+            }
+        }
+        return SourcePlan(
+            routingIntent: intent,
+            candidateSources: sources,
+            cleanQuery: cleanQuery,
+            reason: "heuristic",
+            requiredSource: sources.count == 1 ? sources.first : nil,
+            escalationPolicy: sources.contains(.web) ? .ordered : .webIfUnsupported,
+            stopPolicy: .firstSupported
+        )
+    }
+
+    nonisolated static func routeNeedsSourceEvidence(_ plan: SourcePlan) -> Bool {
+        switch plan.routingIntent {
+        case .answerRecord, .findFile, .webFact, .instructionalWithRecordDependency, .mixed, .ambiguous:
+            return plan.candidateSources.contains { $0 == .recordedMemory || $0 == .localFiles || $0 == .web }
+        case .locateVisible:
+            return false
+        case .action, .noSearch:
+            return false
+        }
+    }
+
+    nonisolated static func routeCanAnswerWithoutCU(_ plan: SourcePlan) -> Bool {
+        routeNeedsSourceEvidence(plan) && !plan.candidateSources.contains(.onScreen)
+    }
+
+    nonisolated static func sourceRouteAuditDetail(goal: String, plan: SourcePlan, status: String = "planned") -> String {
+        [
+            "status=\(safeAuditToken(status))",
+            textAuditDetail("goal", goal),
+            textAuditDetail("cleanQuery", plan.cleanQuery),
+            textAuditDetail("reason", plan.reason),
+            "intent=\(safeAuditToken(plan.routingIntent.rawValue))",
+            "sources=\(plan.candidateSources.map { safeAuditToken($0.rawValue) }.joined(separator: ","))",
+            "required=\(safeAuditToken(plan.requiredSource?.rawValue ?? "none"))",
+            "escalation=\(safeAuditToken(plan.escalationPolicy.rawValue))",
+            "stop=\(safeAuditToken(plan.stopPolicy.rawValue))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func sourceEvidenceAuditDetail(_ bundle: SourceEvidenceBundle) -> String {
+        let evidence = bundle.sourcePlan.candidateSources.compactMap { bundle.evidenceBySource[$0] }
+        let states = evidence.map { "\($0.source.rawValue):\($0.state.rawValue):\($0.resultCount):\($0.citationIDs.count):\($0.contentHash)" }
+            .joined(separator: "|")
+        return [
+            textAuditDetail("cleanQuery", bundle.query),
+            "sourceCount=\(bundle.sourcePlan.candidateSources.count)",
+            "checkedCount=\(evidence.filter { $0.state != .notChecked }.count)",
+            "supportedCount=\(evidence.filter { $0.state == .checkedSupported }.count)",
+            "stateHash=\(auditHash(states))",
+            evidence.map(\.auditDescriptor).joined(separator: " | "),
+        ].filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     nonisolated static func searchSufficiencyNudge(routeHint: SearchRouteHint?) -> String {
@@ -4157,17 +4519,8 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     func initialAssistNote(goal: String) async -> String? {
-        let snapshot = AppWindowObserver.snapshot()
-        var parts = [
-            groundingNote(),
-            await planningPriorNote(for: goal, frontmostApp: snapshot.appName),
-            await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
-            await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
-        ].compactMap { $0 }
-        if let autoRecall = await autoRecallInitialNote(goal: goal, snapshot: snapshot) {
-            parts.append(autoRecall)
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+        let rendered = await contextPack(goal: goal, surface: .assist, affordanceMode: .assist)
+        return rendered.text.isEmpty ? nil : rendered.text
     }
 
     private func autoRecallInitialNote(goal: String, snapshot: AppWindowSnapshot) async -> String? {
@@ -4230,14 +4583,8 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private func initialScoutNote(goal: String) async -> String? {
-        let snapshot = AppWindowObserver.snapshot()
-        let parts = [
-            scoutContextNote(),
-            await planningPriorNote(for: goal, frontmostApp: snapshot.appName),
-            await trajectorySketchNote(for: goal, frontmostApp: snapshot.appName),
-            await failureMemoryNote(for: goal, frontmostApp: snapshot.appName)
-        ].compactMap { $0 }
-        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+        let rendered = await contextPack(goal: goal, surface: .scout, affordanceMode: .scout)
+        return rendered.text.isEmpty ? nil : rendered.text
     }
 
     private func planningPriorNote(for goal: String, frontmostApp: String?) async -> String? {
@@ -4417,32 +4764,54 @@ public final class CascadeAppModel: ObservableObject {
         return Self.parseAssistVerdict(reply)
     }
 
-    private func collectCheapLocalEvidence(routeHint: SearchRouteHint) async -> SearchEvidenceBundle {
-        var bundle = SearchEvidenceBundle(
-            query: routeHint.cleanQuery,
-            routeHint: routeHint,
-            recordResult: nil,
-            fileSearchResult: nil,
-            fileReadResult: nil
-        )
-        if routeHint.candidateSources.contains(.recordedMemory), capturePrivacyPolicy.recordRecallAvailable {
-            bundle.recordResult = await RecordRecall(store: store).perform(.search(query: routeHint.cleanQuery))
+    private func collectEvidence(for sourcePlan: SourcePlan) async -> SourceEvidenceBundle {
+        var bundle = SourceEvidenceBundle(query: sourcePlan.cleanQuery, sourcePlan: sourcePlan)
+        if sourcePlan.candidateSources.contains(.recordedMemory) {
+            if capturePrivacyPolicy.recordRecallAvailable {
+                let result = await RecordRecall(store: store).perform(.search(query: sourcePlan.cleanQuery))
+                bundle.set(
+                    SourceEvidence.fromToolResult(result, source: .recordedMemory, defaultTool: "search_record"),
+                    text: result
+                )
+            } else {
+                bundle.set(.unavailable(source: .recordedMemory, tool: "search_record", statusKind: "record_recall_unavailable"))
+            }
         }
-        if routeHint.candidateSources.contains(.localFiles) {
+        if sourcePlan.candidateSources.contains(.localFiles) {
             let search = await AgentHarness.perform(
-                .searchFiles(query: routeHint.cleanQuery, folder: nil),
+                .searchFiles(query: sourcePlan.cleanQuery, folder: nil),
                 powerEnabled: false
             )
-            bundle.fileSearchResult = search
-            if let path = Self.firstConcreteLocalPath(from: search) {
-                bundle.fileReadResult = await AgentHarness.perform(.readFile(path: path), powerEnabled: false)
+            var fileText = search
+            var fileEvidence = SourceEvidence.fromToolResult(search, source: .localFiles, defaultTool: "search_files")
+            if fileEvidence.state == .checkedSupported, let path = Self.firstConcreteLocalPath(from: search) {
+                let read = await AgentHarness.perform(.readFile(path: path), powerEnabled: false)
+                fileText += "\n\n" + read
+                let readEvidence = SourceEvidence.fromToolResult(read, source: .localFiles, defaultTool: "read_file")
+                if readEvidence.state == .checkedSupported || fileEvidence.state != .checkedSupported {
+                    fileEvidence = readEvidence
+                }
             }
+            bundle.set(fileEvidence, text: fileText)
+        }
+        if sourcePlan.candidateSources.contains(.web), !capturePrivacyPolicy.backgroundWebRunsAvailable {
+            bundle.set(.unavailable(source: .web, tool: "browser", statusKind: "background_web_unavailable"))
         }
         return bundle
     }
 
-    private func judgeSearchEvidence(_ bundle: SearchEvidenceBundle) async -> SearchEvidenceVerdict {
-        guard bundle.hasEvidence, hasAnthropicKey else { return .abstain }
+    private func reviewEvidence(plan: SourcePlan, evidence bundle: SourceEvidenceBundle) async -> SearchEvidenceVerdict {
+        let requiredSupported = plan.requiredSource.flatMap { bundle.evidenceBySource[$0]?.state == .checkedSupported } ?? false
+        if plan.stopPolicy == .requireRequiredSource, requiredSupported {
+            return .sufficient
+        }
+        guard bundle.hasEvidence else {
+            if bundle.evidenceBySource.values.contains(where: { $0.state == .checkedNoEvidence || $0.state == .unavailable || $0.state == .refused }) {
+                return .insufficient
+            }
+            return .abstain
+        }
+        guard hasAnthropicKey else { return .sufficient }
         let user = """
         Query:
         \(bundle.query)
@@ -4477,6 +4846,12 @@ public final class CascadeAppModel: ObservableObject {
         routeHint.candidateSources.first == .web || routeHint.routingIntent == .web
     }
 
+    nonisolated static func webRequired(_ routeHint: SearchRouteHint) -> Bool {
+        routeHint.requiredSource == .web
+            || routeHint.routingIntent == .webFact
+            || (routeHint.candidateSources.first == .web && routeHint.stopPolicy == .requireRequiredSource)
+    }
+
     private func runAssistBackgroundWebSearch(
         subtask: AgentSubtask,
         routeHint: SearchRouteHint
@@ -4509,6 +4884,18 @@ public final class CascadeAppModel: ObservableObject {
             if update.done { terminal = update }
         }
         guard let terminal else { return .unavailable }
+        var evidence = SourceEvidenceBundle(query: routeHint.cleanQuery, sourcePlan: routeHint)
+        let terminalText = (terminal.result?.isEmpty == false ? terminal.result : nil) ?? terminal.status
+        if terminal.completed, !terminalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            evidence.set(SourceEvidence.fromToolResult(terminalText, source: .web, defaultTool: "browser"))
+        } else {
+            evidence.set(SourceEvidence(source: .web, state: .checkedInsufficient, tool: "browser", statusKind: terminal.needsLogin ? "needs_login" : "not_completed", contentHash: Self.auditHash(terminalText), contentCharCount: terminalText.count))
+        }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "source.evidence",
+            detail: Self.sourceEvidenceAuditDetail(evidence)
+        ))
         return Self.classifyAssistBackgroundWebUpdate(task: subtask.task, update: terminal)
     }
 
@@ -4546,17 +4933,15 @@ public final class CascadeAppModel: ObservableObject {
             detail: Self.noEffectVerifierAuditDetail(turn: turn, engine: engine, result: result)
         ))
         let appName = AppWindowObserver.snapshot().appName
-        let tokens = TrajectorySketch.normalizedGoalTokens(from: goal)
-        if !tokens.isEmpty, appName != "Unknown app" {
-            _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
-                appName: appName,
-                normalizedGoalTokens: Array(tokens.prefix(10)),
-                failureKind: .noEffect,
-                firstBadAction: lastAction,
-                stateSummary: result.state,
-                repairHint: "\(result.nextStrategy) Avoid: \(result.avoid)"
-            ))
-        }
+        await recordReflectionFailureMemory(
+            appName: appName,
+            goal: goal,
+            failureKind: .noEffect,
+            firstBadAction: lastAction,
+            stateSummary: result.state,
+            repairHint: "\(result.nextStrategy) Avoid: \(result.avoid)",
+            recoveryEvidenceSeed: "noEffect|\(engine)|\(result.state)|\(result.nextStrategy)"
+        )
         return "Verifier state: \(result.state). Next: \(result.nextStrategy). Avoid: \(result.avoid)."
     }
 
@@ -4597,18 +4982,16 @@ public final class CascadeAppModel: ObservableObject {
         ))
         guard result.verdict == .negative else { return nil }
         let appName = AppWindowObserver.snapshot().appName
-        let tokens = TrajectorySketch.normalizedGoalTokens(from: goal)
-        if !tokens.isEmpty, appName != "Unknown app" {
-            _ = try? await store.recordAgentFailureMemory(AgentFailureMemory(
-                appName: appName,
-                normalizedGoalTokens: Array(tokens.prefix(10)),
-                failureKind: .groundingMiss,
-                firstBadAction: "visual click \(risky.target)",
-                targetHash: Self.auditHash(risky.target),
-                stateSummary: result.state,
-                repairHint: result.nextStrategy
-            ))
-        }
+        await recordReflectionFailureMemory(
+            appName: appName,
+            goal: goal,
+            failureKind: .groundingMiss,
+            firstBadAction: "visual click",
+            targetHash: Self.auditHash(risky.target),
+            stateSummary: result.state,
+            repairHint: result.nextStrategy,
+            recoveryEvidenceSeed: "visualState|\(engine)|\(Self.auditHash(risky.target))|\(result.state)"
+        )
         return "Visual check: \(result.state). Try: \(result.nextStrategy)."
     }
 
@@ -5048,6 +5431,30 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     nonisolated static func parameterizedMiningAuditDetail(_ candidates: [DetectedWaste]) -> String {
+        let report = WasteDetectionReport(
+            rawCount: 0,
+            episodeCount: 0,
+            literalCount: candidates.count,
+            parameterizedCount: candidates.count,
+            minedCount: candidates.count,
+            finalCount: candidates.count,
+            results: candidates
+        )
+        return parameterizedMiningAuditDetail(
+            report,
+            reviewableCount: candidates.count,
+            curatedCount: candidates.count,
+            managerPendingCount: candidates.count
+        )
+    }
+
+    nonisolated static func parameterizedMiningAuditDetail(
+        _ report: WasteDetectionReport,
+        reviewableCount: Int,
+        curatedCount: Int,
+        managerPendingCount: Int
+    ) -> String {
+        let candidates = report.results
         let parameterSteps = candidates.flatMap { candidate in
             candidate.recipe.steps.filter(\.isParameter)
         }
@@ -5061,8 +5468,17 @@ public final class CascadeAppModel: ObservableObject {
             .joined(separator: "|")
         return [
             "enabled=true",
-            "candidateCount=\(candidates.count)",
-            "clusterCount=\(candidates.count)",
+            "rawCount=\(report.rawCount)",
+            "episodeCount=\(report.episodeCount)",
+            "literalCount=\(report.literalCount)",
+            "parameterizedCount=\(report.parameterizedCount)",
+            "minedCount=\(report.minedCount)",
+            "finalCount=\(report.finalCount)",
+            "reviewableCount=\(reviewableCount)",
+            "curatedCount=\(curatedCount)",
+            "managerPendingCount=\(managerPendingCount)",
+            "candidateCount=\(report.finalCount)",
+            "clusterCount=\(report.minedCount)",
             "slotCount=\(parameterSteps.count)",
             "slotKindsHash=\(auditHash(slotKinds))",
             "signatureHash=\(auditHash(signatures))"
@@ -5979,15 +6395,9 @@ public final class CascadeAppModel: ObservableObject {
         return appSkills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
     }
 
-    /// The full skill text to PUSH into Scout this turn: the frontmost app's skill
-    /// PLUS its related task/recipe skills. The Opus path reaches the recipe skills
-    /// (e.g. `keynote-consulting` — how to actually build a good deck) via the
-    /// use_skill tool; Scout has no pull, so they must be pushed. Related skills are
-    /// found by the `<app>-<task>` naming convention (the app skill's name is their
-    /// prefix), so it generalizes to any app pack without hardcoding. Scripting
-    /// playbooks (`explicitAskOnly`) are included only when the goal asks for a
-    /// script — the same gate the Opus skillProvider applies. nil when no app skill
-    /// matches (so applySkill leaves the prompt unchanged). See [[cascade-cu-downgrade-research]].
+    /// Compact frontmost skill summary for Scout. Full recipes stay pull-based via
+    /// use_skill; this only tells Scout which skill family applies and what caveats
+    /// matter before it decides which playbook to fetch.
     private func scoutSkillPush(goal: String) -> String? {
         guard let app = frontmostSkill() else { return nil }
         let asksScript = AppSkill.goalAsksForScript(goal)
@@ -5995,8 +6405,30 @@ public final class CascadeAppModel: ObservableObject {
             (skill.name == app.name || skill.name.hasPrefix(app.name + "-"))
                 && (!skill.explicitAskOnly || asksScript)
         }
-        let blocks = related.map(\.promptBlock)
-        return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n---\n\n")
+        guard !related.isEmpty else { return nil }
+        let lines = related.prefix(8).map { skill -> String in
+            let caveats = Self.scoutSkillCaveats(skill)
+            let caveatText = caveats.isEmpty ? "none" : caveats.joined(separator: ", ")
+            return "- \(skill.name): \(skill.useWhen)\n  caveats: \(caveatText)"
+        }
+        return """
+        Frontmost app skill summary. Pull full instructions with use_skill before following a recipe:
+        \(lines.joined(separator: "\n"))
+        """
+    }
+
+    nonisolated private static func scoutSkillCaveats(_ skill: AppSkill) -> [String] {
+        var caveats: [String] = []
+        if skill.explicitAskOnly { caveats.append("explicit user ask required") }
+        if skill.axUnreliable { caveats.append("AX unreliable") }
+        if skill.keysFollowPointer { caveats.append("keys follow pointer") }
+        if !skill.hints.inputPolicies.isEmpty {
+            caveats.append("input policies \(skill.hints.inputPolicies.count)")
+        }
+        if let source = skill.hints.preferredGroundingSource, !source.isEmpty {
+            caveats.append("prefer \(source) grounding")
+        }
+        return caveats
     }
 
     /// Pointer-routed apps (Blender) send hotkeys to the editor at the position
@@ -6518,10 +6950,10 @@ public final class CascadeAppModel: ObservableObject {
     /// "Add to my agents": the employee self-serves the taught recipe straight into
     /// their Cascades, ready to deploy — the same `createAgent` the manager path uses.
     public func createTaughtAgent(_ curated: CuratedAgent) {
-        teachPreview = nil
         Task {
             do {
                 _ = try await orchestrator.createAgent(from: curated)
+                teachPreview = nil
                 _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "agent.taught", detail: Self.curatedAgentAuditDetail(curated)))
                 selectedTab = .cascades
                 flashTeachStatus("Added “\(curated.name)” to your agents.")
@@ -7451,10 +7883,10 @@ public final class CascadeAppModel: ObservableObject {
     /// approved agent lands in the employee's Cascades tab ("Your agents"), ready to
     /// deploy (in the background sandbox for web work, on-screen for native).
     public func approveCurated(_ curated: CuratedAgent) {
-        clearTaughtForReview(signature: curated.signature)
         Task {
             do {
                 let agent = try await orchestrator.createAgent(from: curated)
+                clearTaughtForReview(signature: curated.signature)
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "manager",
                     action: "agent.approved",
@@ -7637,7 +8069,7 @@ public final class CascadeAppModel: ObservableObject {
     /// detector so two web apps in one browser become two distinct agents.
     nonisolated static func webAppIdentity(for event: InputEvent) -> String? {
         guard webBrowserNames.contains(event.appName.lowercased()) else { return nil }
-        return WebAppIdentity.from(windowTitle: event.windowTitle)
+        return WebAppIdentity.surface(fromWindowTitle: event.windowTitle)
     }
 
     /// The app to SHOW for a recorded moment in the Reel: the web app inside the
@@ -7646,7 +8078,7 @@ public final class CascadeAppModel: ObservableObject {
     /// everything. Native moments return their own name unchanged.
     nonisolated static func displayApp(appName: String, windowTitle: String?) -> String {
         guard webBrowserNames.contains(appName.lowercased()) else { return appName }
-        return WebAppIdentity.from(windowTitle: windowTitle) ?? appName
+        return WebAppIdentity.surface(fromWindowTitle: windowTitle) ?? appName
     }
 
     /// Installed https-handling apps (i.e. the user's browsers), in every name form
@@ -8377,7 +8809,13 @@ public final class CascadeAppModel: ObservableObject {
     /// and pre-`isParameter` recipes return false and replay normally. Pure +
     /// pinned. See [[cascade-cu-downgrade-research]].
     nonisolated static func recipeStepNeedsLiveValue(_ step: RecipeStep) -> Bool {
-        step.kind == .type && step.isParameter
+        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+    }
+
+    nonisolated static func isPasteShortcut(_ step: RecipeStep) -> Bool {
+        guard step.kind == .key, step.key?.lowercased() == "v" else { return false }
+        let modifiers = step.modifiers.map { $0.lowercased() }
+        return modifiers.contains("command") || modifiers.contains("control")
     }
 
     nonisolated static func appMatches(frontmostName: String?, frontmostBundle: String?, expectedName: String, expectedBundle: String?) -> Bool {
@@ -8820,6 +9258,9 @@ public final class CascadeAppModel: ObservableObject {
             appName: step.appName,
             bundleIdentifier: step.bundleIdentifier,
             windowTitleHint: step.windowTitleHint,
+            surface: step.surface,
+            documentIdentityHash: step.documentIdentityHash,
+            dataflowEdgeID: step.dataflowEdgeID,
             ocrAnchor: step.ocrAnchor,
             targetDescriptor: step.targetDescriptor,
             isParameter: step.isParameter,

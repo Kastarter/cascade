@@ -21,6 +21,20 @@ public protocol RecordAnswering: Sendable {
     func answer(question: String, conversation: [(user: String, assistant: String)]) async throws -> RecordAnswer
 }
 
+public protocol SourcePlanRecordAnswering: RecordAnswering {
+    func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)],
+        sourcePlan: SourcePlan?
+    ) async throws -> RecordAnswer
+}
+
+public extension SourcePlanRecordAnswering {
+    func answer(question: String, conversation: [(user: String, assistant: String)]) async throws -> RecordAnswer {
+        try await answer(question: question, conversation: conversation, sourcePlan: nil)
+    }
+}
+
 /// Agentic Q&A over the local record: instead of one scoop of grounding, the
 /// model HUNTS — full-text search, time-window pulls, and per-moment inspection,
 /// multi-hop, until it can answer or honestly can't. The same pull pattern as
@@ -29,7 +43,7 @@ public protocol RecordAnswering: Sendable {
 ///
 /// Every moment shown to the model carries its `[#id]`; the model cites the ids
 /// it used and the final answer returns them as structured citations.
-public struct RecordSearchAnswerer: RecordAnswering, Sendable {
+public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
     private let store: CascadeStore
     private let recall: RecordRecall
     private let keyStore: AnthropicKeyStore
@@ -70,12 +84,21 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
     /// follow-ups ("and after that?"). Throws only on missing key / transport
     /// failure — the caller falls back to the single-shot answerer.
     public func answer(question: String, conversation: [(user: String, assistant: String)] = []) async throws -> RecordAnswer {
+        try await answer(question: question, conversation: conversation, sourcePlan: nil)
+    }
+
+    public func answer(
+        question: String,
+        conversation: [(user: String, assistant: String)] = [],
+        sourcePlan: SourcePlan?
+    ) async throws -> RecordAnswer {
         guard let key = keyStore.readKey(), !key.isEmpty else {
             throw AnthropicError.missingKey
         }
+        let routedQuestion = Self.routedQuestion(question, sourcePlan: sourcePlan)
 
-        if Self.isBroadQuestion(question),
-           let broad = try? await answerBroadQuestion(question: question, conversation: conversation) {
+        if Self.isBroadQuestion(routedQuestion),
+           let broad = try? await answerBroadQuestion(question: routedQuestion, conversation: conversation, sourcePlan: sourcePlan) {
             return broad
         }
 
@@ -84,7 +107,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             messages.append(["role": "user", "content": turn.user])
             messages.append(["role": "assistant", "content": turn.assistant])
         }
-        messages.append(["role": "user", "content": question])
+        messages.append(["role": "user", "content": Self.userQuestionPayload(question: routedQuestion, sourcePlan: sourcePlan)])
 
         for hop in 0..<maxHops {
             let isLastHop = hop == maxHops - 1
@@ -172,7 +195,8 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
 
     private func answerBroadQuestion(
         question: String,
-        conversation: [(user: String, assistant: String)]
+        conversation: [(user: String, assistant: String)],
+        sourcePlan: SourcePlan?
     ) async throws -> RecordAnswer {
         let intents = Self.searchIntents(for: question)
         guard intents.count >= 2 else { throw AnthropicError.emptyResponse }
@@ -189,7 +213,7 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
             "Intent: \(item.intent)\n\(item.output)"
         }.joined(separator: "\n\n")
         let user = """
-        Question: \(question)
+        Question: \(Self.userQuestionPayload(question: question, sourcePlan: sourcePlan))
 
         Recent conversation:
         \(prior.isEmpty ? "(none)" : prior)
@@ -224,6 +248,23 @@ public struct RecordSearchAnswerer: RecordAnswering, Sendable {
         let parsed = Self.parseCitations(from: response.text)
         let validIDs = parsed.citedMomentIDs.filter { allowedIDs.contains($0) }
         return RecordAnswer(text: parsed.text, citedMomentIDs: Array(validIDs.prefix(4)))
+    }
+
+    private static func routedQuestion(_ question: String, sourcePlan: SourcePlan?) -> String {
+        let clean = sourcePlan?.cleanQuery.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return clean.isEmpty ? question : clean
+    }
+
+    private static func userQuestionPayload(question: String, sourcePlan: SourcePlan?) -> String {
+        guard let sourcePlan else { return question }
+        var lines = [
+            "Routed record query: \(question)",
+            "Source intent: \(sourcePlan.routingIntent.rawValue)",
+        ]
+        if !sourcePlan.reason.isEmpty {
+            lines.append("Routing reason: \(sourcePlan.reason)")
+        }
+        return lines.joined(separator: "\n")
     }
 
     public static func isBroadQuestion(_ question: String) -> Bool {

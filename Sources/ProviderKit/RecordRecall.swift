@@ -58,6 +58,27 @@ public struct RecordRecall: Sendable {
         case sessions(startISO: String?, endISO: String?)
         case unknown(String)
 
+        public var toolName: String {
+            switch self {
+            case .search:
+                "search_record"
+            case .timeframe:
+                "get_timeframe"
+            case .inspect:
+                "inspect_moment"
+            case .inspectStructure:
+                "inspect_structure"
+            case .extractTable:
+                "extract_table"
+            case .extractFields:
+                "extract_fields"
+            case .sessions:
+                "list_sessions"
+            case .unknown(let name):
+                name
+            }
+        }
+
         public init(name: String, input: [String: Any]) {
             switch name {
             case "search_record":
@@ -266,6 +287,19 @@ public struct RecordRecall: Sendable {
     /// `perform(_:)` so the untyped dictionary never crosses isolation.
     public func perform(tool: String, input: [String: Any]) async -> String {
         await perform(Call(name: tool, input: input))
+    }
+
+    public func performEvidence(tool: String, input: [String: Any]) async -> SourceEvidence {
+        await performEvidence(Call(name: tool, input: input))
+    }
+
+    public func performEvidence(_ call: Call) async -> SourceEvidence {
+        let result = await perform(call)
+        return SourceEvidence.fromToolResult(
+            result,
+            source: .recordedMemory,
+            defaultTool: call.toolName
+        )
     }
 
     /// Runs one recall call and returns the text to feed back to the model.
