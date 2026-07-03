@@ -32,6 +32,8 @@ struct GroundingBenchCommand {
                 try axEval(options)
             case "ax-ablation":
                 try await axAblation(options)
+            case "mab-score":
+                try mabScore(options)
             default:
                 throw CLIError.usage("Unknown command: \(command)\n\n\(Self.usage)")
             }
@@ -230,6 +232,40 @@ struct GroundingBenchCommand {
         }
     }
 
+    /// d22 (stretch): MacAgentBench adapter stub — grade a task file's
+    /// checkpoints (AX-state predicates) against the CURRENT screen state, after
+    /// an external driver ran Cascade on the task's instruction. Read-only; the
+    /// remaining wiring (official schema, per-task driver, submission format) is
+    /// documented in docs/research/AX_FIRST_GROUNDING_PLAN.md.
+    private static func mabScore(_ options: ArgumentParser) throws {
+        var tasks = try MacAgentBenchTaskFile.load(from: options.requiredURL("--tasks"))
+        if let taskID = options.value("--task") {
+            tasks = tasks.filter { $0.taskID == taskID }
+            guard !tasks.isEmpty else { throw MacAgentBenchTaskFileError.unknownTaskID(taskID) }
+        }
+        if options.value("--activate") == "true" {
+            // Bring each task's app forward before grading (already-running apps
+            // only). Default off — the external driver owns the screen.
+            for bundleID in Set(tasks.map(\.appBundle)) {
+                do {
+                    try AXGroundingCrawler.activate(bundleIdentifier: bundleID)
+                } catch {
+                    FileHandle.standardError.write(Data("\(bundleID): \(error) — its element checkpoints will be skipped\n".utf8))
+                }
+            }
+        }
+        let report = MacAgentBenchScorer().run(tasks: tasks)
+        let json = try report.jsonString()
+        if let out = options.optionalURL("--out") {
+            try json.appending("\n").write(to: out, atomically: true, encoding: .utf8)
+        }
+        print(json)
+        for score in report.taskScores {
+            print("\(score.taskID): \(score.satisfied)/\(score.checkpointCount) checkpoints (score \(String(format: "%.3f", score.checkpointScore))) — \(score.success ? "SUCCESS" : "not complete")")
+        }
+        print("mean checkpoint score \(String(format: "%.3f", report.meanCheckpointScore)), task success \(report.taskSuccessCount)/\(report.taskCount) (bench hash \(report.benchHash))")
+    }
+
     private static let usage = """
     Usage:
       swift run grounding-bench export --db <copy/Cascade.sqlite> --out <cases.jsonl> [--frame-root <dir>] [--target-sidecar <hash-to-text.json>]
@@ -239,6 +275,7 @@ struct GroundingBenchCommand {
       swift run grounding-bench ax-corpus --out-dir <dir> [--apps <bundle,bundle,…>] [--limit <n>] [--max-per-kind <n>]
       swift run grounding-bench ax-eval (--targets <targets.jsonl> | --tasks <bundle.tasks.jsonl>) [--app <bundle-id>] [--out <report.json>]
       swift run grounding-bench ax-ablation (--corpus-dir <dir> | --tasks <bundle.tasks.jsonl> | --targets <targets.jsonl>) [--arms ax_only,vision_only,hybrid] [--preset <id>] [--endpoint <url>] [--model <id>] [--coord-space <smartResize|sent|normalized>] [--api-key-env <ENV>] [--out <report.json>]
+      swift run grounding-bench mab-score --tasks <mab-tasks.json> [--task <task-id>] [--activate true] [--out <report.json>]
 
     Required flag:
       defaults write -g cascade.experimentalGroundingBench -bool true
@@ -247,6 +284,7 @@ struct GroundingBenchCommand {
     ax-crawl/ax-corpus/ax-eval need Accessibility permission and the app under test running; crawling and the eval are read-only (AX hit-tests, no synthetic clicks).
     ax-corpus defaults to Notes, System Settings, and Safari; apps that are not running are recorded in manifest.json instead of failing the run.
     ax-ablation (d21) replays the corpus through three arms — ax_only (d19 AX probe), vision_only (live capture + the configured visual grounder), hybrid (d15 route, AX-first, vision fallback) — and reports per-arm land/failure rates plus the hybrid deltas. It additionally needs Screen Recording permission and, for the vision arms, a reachable grounder endpoint (e.g. OPENROUTER_API_KEY for the hosted preset). Read-only: resolved points are hit-tested, never clicked. Keep the cursor on the display of the apps under test.
+    mab-score (d22 stub) grades MacAgentBench-style checkpoints (frontmost_app / element_exists / element_value AX predicates) against the CURRENT screen state — run it AFTER an external driver executed the task's instruction through Cascade. Read-only; report rows are bench ids, status tokens, counts, and ax:<hash> stable ids only. Remaining wiring (official schema, per-task driver, submission format) is documented in docs/research/AX_FIRST_GROUNDING_PLAN.md.
     """
 }
 

@@ -97,6 +97,33 @@ every canvas target).
 
 ---
 
+## d22 — MacAgentBench adapter stub: what shipped, what remains
+
+Shipped (harness-only, rides `cascade.experimentalGroundingBench`): the **scoring half** of the
+external-bench contract. `MacAgentBenchAdapter.swift` defines a schema-versioned local task
+format (`MacAgentBenchTask` v1: task id + instruction + app bundle + checkpoints) where each
+checkpoint is an AX-state predicate (`frontmost_app` / `element_exists` / `element_value`)
+graded through the SAME machinery as the d19 eval — `AXElementResolver.find` with the d19
+frontmost discipline, read-only, never a synthetic click. `grounding-bench mab-score --tasks
+<mab-tasks.json>` grades the current screen state at **checkpoint level** (satisfied/total per
+task, success = all satisfied, mean checkpoint score across tasks); skipped-unverifiable
+checkpoints count against the score. Report rows are bench ids, status tokens, counts, and
+`ax:<hash>` stable ids — instruction/label/expected-value text lives only in the local task
+file, never in the report. Decode + scoring math are pure and unit-pinned.
+
+**Remaining wiring** (deliberately NOT stubbed — each needs the external artifact in hand):
+1. **Official schema mapping** — pin the released MacAgentBench task/checkpoint JSON and write
+   the translation into `MacAgentBenchTask` (the decoder is schema-versioned and accepts both a
+   bare task array and `{"tasks": [...]}` for exactly this). Checkpoint kinds beyond the three
+   AX predicates (e.g. file-system or clipboard assertions) get added as new `kind` cases with
+   their own read-only probes.
+2. **Per-task driver** — the loop that, for each task: resets/sets up app state, hands
+   `instruction` to a Cascade run (the `executeCU` agent loop), waits for termination, then
+   invokes `mab-score`. This is external-harness territory; Cascade's side only needs a
+   headless "run one instruction to completion" entry point.
+3. **Submission format** — map `MacAgentBenchReport` (schema v1) onto whatever result file the
+   external leaderboard ingests once published.
+
 ## Repos/papers to reuse (not reinvent)
 Hammerspoon `hs.axuielement` + AXSwift/Swindler (Swift AX patterns), MacPaw `macapptree` (AX JSON schema + corpus), microsoft/OmniParser (vision-fallback schema), inclusionAI/UI-Venus (canvas grounder), microsoft/UFO2 (OS-native action-layer architecture), simular-ai/Agent-S (mixture-of-grounding router). Papers: A11y-Compressor, Screen2AX, ScreenSpot-Pro, Set-of-Mark, SeeAct, GUIrilla, DRS-GUI, OSWorld.
 
