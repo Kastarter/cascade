@@ -31,7 +31,7 @@ let package = Package(
             name: "AgentOrchestrator",
             dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
-        .target(name: "GroundingBench", dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit"]),
+        .target(name: "GroundingBench", dependencies: ["CascadeMemory", "ComputerUseKit", "MacContextKit", "ProviderKit"]),
         .target(
             name: "AppShell",
             dependencies: [

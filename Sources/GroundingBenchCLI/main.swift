@@ -1,3 +1,4 @@
+import ComputerUseKit
 import Foundation
 import GroundingBench
 import ProviderKit
@@ -29,6 +30,8 @@ struct GroundingBenchCommand {
                 try axCorpus(options)
             case "ax-eval":
                 try axEval(options)
+            case "ax-ablation":
+                try await axAblation(options)
             default:
                 throw CLIError.usage("Unknown command: \(command)\n\n\(Self.usage)")
             }
@@ -142,6 +145,91 @@ struct GroundingBenchCommand {
         print(json)
     }
 
+    /// d21: the ablation — AX-only vs vision-only vs hybrid over the SAME
+    /// corpus, scored by the same execution/final-state landing check, so the
+    /// only variable is the grounding stack. The hybrid arm's failure rate is
+    /// the number the AX-first plan tracks. Needs a LIVE run: Accessibility +
+    /// Screen Recording granted, the corpus apps running, and (for the vision
+    /// arms) a reachable grounder endpoint.
+    private static func axAblation(_ options: ArgumentParser) async throws {
+        let arms: [AXGroundingAblationArm]
+        if let raw = options.value("--arms") {
+            arms = try raw.split(separator: ",").map { token in
+                let name = token.trimmingCharacters(in: .whitespaces)
+                guard let arm = AXGroundingAblationArm(rawValue: name) else {
+                    throw CLIError.usage("Unknown arm \(name). Arms: ax_only, vision_only, hybrid.")
+                }
+                return arm
+            }
+        } else {
+            arms = AXGroundingAblationArm.allCases
+        }
+        var grounder: (any VisualGrounder)?
+        if arms.contains(where: \.needsVisualGrounder) {
+            let apiKeyEnv = options.value("--api-key-env") ?? "OPENROUTER_API_KEY"
+            grounder = GrounderRegistry.makeGrounder(
+                presetID: options.value("--preset"),
+                apiKey: ProcessInfo.processInfo.environment[apiKeyEnv],
+                endpointOverride: options.value("--endpoint"),
+                modelOverride: options.value("--model"),
+                coordSpaceOverride: options.value("--coord-space")
+            )
+            guard grounder != nil else {
+                throw CLIError.usage(
+                    "vision_only/hybrid need a visual grounder. Check --preset, --endpoint, --model, --coord-space, and --api-key-env."
+                )
+            }
+        }
+        let groups: [AXGroundingAblationCorpus.AppGroup]
+        if let corpusDir = options.optionalURL("--corpus-dir") {
+            groups = try AXGroundingAblationCorpus.loadGroups(fromCorpusDirectory: corpusDir)
+        } else if let tasksURL = options.optionalURL("--tasks") {
+            groups = AXGroundingAblationCorpus.groups(
+                fromTargets: try AXRegressionTaskJSONL.load(from: tasksURL).map(\.target)
+            )
+        } else {
+            groups = AXGroundingAblationCorpus.groups(
+                fromTargets: try AXGroundingTargetJSONL.load(from: options.requiredURL("--targets"))
+            )
+        }
+        let allTargets = groups.flatMap(\.targets)
+        guard !allTargets.isEmpty else { throw AXGroundingAblationCorpusError.emptyCorpus }
+        let probes = AXGroundingAblationRunner.liveProbes(
+            arms: arms,
+            grounder: grounder,
+            skills: AppSkillRegistry.load()
+        )
+        let runner = AXGroundingAblationRunner()
+        var observationsByArm: [AXGroundingAblationArm: [AXGroundingEvalObservation]] = [:]
+        // One activation per app covers every arm — probes score targets of a
+        // non-frontmost app as skipped, so a failed activation is recorded,
+        // never fatal for the other apps.
+        for group in groups {
+            do {
+                try AXGroundingCrawler.activate(bundleIdentifier: group.bundleID)
+            } catch {
+                FileHandle.standardError.write(Data("\(group.bundleID): \(error) — its targets will be skipped\n".utf8))
+            }
+            for arm in AXGroundingAblationArm.allCases {
+                guard let probe = probes[arm] else { continue }
+                let rows = await runner.observations(targets: group.targets, probe: probe)
+                observationsByArm[arm, default: []].append(contentsOf: rows)
+            }
+        }
+        let report = AXGroundingAblationRunner.report(targets: allTargets, observationsByArm: observationsByArm)
+        let json = try report.jsonString()
+        if let out = options.optionalURL("--out") {
+            try json.appending("\n").write(to: out, atomically: true, encoding: .utf8)
+        }
+        print(json)
+        for summary in report.summaries {
+            print("\(summary.arm): landed \(summary.landed)/\(summary.scored) (land \(String(format: "%.3f", summary.landRate)), failure \(String(format: "%.3f", summary.failureRate)))")
+        }
+        if let failureRate = report.hybridFailureRate, let wins = report.hybridWins {
+            print("hybrid failure rate: \(String(format: "%.3f", failureRate)) — hybrid \(wins ? "WINS" : "does NOT win") on this corpus (hash \(report.corpusHash))")
+        }
+    }
+
     private static let usage = """
     Usage:
       swift run grounding-bench export --db <copy/Cascade.sqlite> --out <cases.jsonl> [--frame-root <dir>] [--target-sidecar <hash-to-text.json>]
@@ -150,6 +238,7 @@ struct GroundingBenchCommand {
       swift run grounding-bench ax-crawl --out <targets.jsonl> [--app <bundle-id>] [--limit <n>]
       swift run grounding-bench ax-corpus --out-dir <dir> [--apps <bundle,bundle,…>] [--limit <n>] [--max-per-kind <n>]
       swift run grounding-bench ax-eval (--targets <targets.jsonl> | --tasks <bundle.tasks.jsonl>) [--app <bundle-id>] [--out <report.json>]
+      swift run grounding-bench ax-ablation (--corpus-dir <dir> | --tasks <bundle.tasks.jsonl> | --targets <targets.jsonl>) [--arms ax_only,vision_only,hybrid] [--preset <id>] [--endpoint <url>] [--model <id>] [--coord-space <smartResize|sent|normalized>] [--api-key-env <ENV>] [--out <report.json>]
 
     Required flag:
       defaults write -g cascade.experimentalGroundingBench -bool true
@@ -157,6 +246,7 @@ struct GroundingBenchCommand {
     Export reads a closed/checkpointed copy of Cascade.sqlite. Never pass the live database in ~/Library/Application Support/Cascade.
     ax-crawl/ax-corpus/ax-eval need Accessibility permission and the app under test running; crawling and the eval are read-only (AX hit-tests, no synthetic clicks).
     ax-corpus defaults to Notes, System Settings, and Safari; apps that are not running are recorded in manifest.json instead of failing the run.
+    ax-ablation (d21) replays the corpus through three arms — ax_only (d19 AX probe), vision_only (live capture + the configured visual grounder), hybrid (d15 route, AX-first, vision fallback) — and reports per-arm land/failure rates plus the hybrid deltas. It additionally needs Screen Recording permission and, for the vision arms, a reachable grounder endpoint (e.g. OPENROUTER_API_KEY for the hosted preset). Read-only: resolved points are hit-tested, never clicked. Keep the cursor on the display of the apps under test.
     """
 }
 
