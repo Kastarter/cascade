@@ -31,7 +31,7 @@ let package = Package(
             name: "AgentOrchestrator",
             dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
-        .target(name: "GroundingBench", dependencies: ["CascadeMemory", "ProviderKit"]),
+        .target(name: "GroundingBench", dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit"]),
         .target(
             name: "AppShell",
             dependencies: [
@@ -81,7 +81,7 @@ let package = Package(
         ),
         .testTarget(
             name: "GroundingBenchTests",
-            dependencies: ["GroundingBench", "ProviderKit"]
+            dependencies: ["GroundingBench", "ComputerUseKit", "ProviderKit"]
         )
     ]
 )

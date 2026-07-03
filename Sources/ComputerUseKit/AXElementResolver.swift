@@ -727,6 +727,48 @@ public enum AXElementResolver {
         return nil
     }
 
+    /// d19 (AX-grounding eval): the execution/final-state probe — which actionable
+    /// element would the window server actually deliver a click at `point` (CG global
+    /// top-left) to? Hit-tests systemwide, then climbs to the nearest pointable
+    /// ancestor (the same climb as `clickLabel(atCG:)` — hit-tests often land on an
+    /// unlabeled leaf inside the control) and returns it as a full `Match` (stable id
+    /// + role + descriptor + exact frame). The eval compares this landed identity
+    /// against the crawled target, so a case scores by where the click LANDS in the
+    /// final screen state, never by the fact that a click was emitted.
+    public static func hitTestActionableMatch(atCG point: CGPoint) -> Match? {
+        guard AXIsProcessTrusted() else { return nil }
+        guard case .success(let hit) = AXClient.elementAtPosition(point) else { return nil }
+        var element = hit
+        for _ in 0..<4 {
+            let role = string(of: element, kAXRoleAttribute) ?? ""
+            if pointableRoles.contains(role), case .success(let frame) = frameResult(of: element) {
+                let text = labelText(of: element) ?? ""
+                let descriptor = AXTargetDescriptorBuilder.descriptor(for: element, fallbackLabel: text)
+                let node = actionableNode(for: element, role: role, descriptor: descriptor, frame: frame)
+                return Match(
+                    id: node.stableID,
+                    center: CGPoint(x: frame.midX, y: frame.midY),
+                    frame: frame,
+                    role: role,
+                    title: String(descriptor.label.prefix(80)),
+                    score: 1,
+                    descriptor: descriptor,
+                    actionableNode: node
+                )
+            }
+            guard let parent = self.element(of: element, attribute: kAXParentAttribute) else { break }
+            element = parent
+        }
+        return nil
+    }
+
+    /// d19: public wrapper over the resolver's label normalization so the
+    /// AX-grounding eval compares crawled-vs-landed labels with the exact
+    /// tolerance `rank`/`find` use — never a second, drifting normalizer.
+    public static func normalizedLabel(_ text: String) -> String {
+        normalize(text)
+    }
+
     // MARK: - Matching
 
     public typealias SemanticSimilarity = @Sendable (_ recordedPhrase: String, _ candidatePhrase: String) -> Double?
