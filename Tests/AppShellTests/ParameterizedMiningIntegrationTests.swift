@@ -100,8 +100,13 @@ func refreshAllKeepsParameterizedMiningDefaultOff() async throws {
 
     await model.refreshAll()
 
+    // Parity with the detector's own default-off path. The literal miner's
+    // text-agnostic tokens DO find the shared search->copy->paste spine (the
+    // per-coin click is dropped), so the default path yields the routine WITHOUT
+    // parameter slots rather than nothing.
     #expect(model.detectedWaste.map(\.signature) == expected)
-    #expect(model.detectedWaste.isEmpty)
+    #expect(!model.detectedWaste.isEmpty)
+    #expect(model.detectedWaste.allSatisfy { !$0.signature.hasPrefix("routine:v2:") })
 }
 
 @MainActor @Test
@@ -113,14 +118,20 @@ func refreshAllUsesParameterizedMiningAndAuditsSafeSummaryWhenFlagIsEnabled() as
 
 	    await model.refreshAll()
 
-	    #expect(model.detectedWaste.count == 1)
-	    #expect(model.detectedWaste.first?.recipe.steps.filter(\.isParameter).first?.parameterKind == .ticker)
-        let windowHints = model.detectedWaste.first?.recipe.steps.compactMap(\.windowTitleHint).joined(separator: "|") ?? ""
+	    // Two variants surface: the literal 6-step spine plus the parameterized
+	    // 7-step routine that recovers the per-coin click as a ticker slot.
+	    #expect(model.detectedWaste.count == 2)
+	    let parameterized = try #require(model.detectedWaste.first { waste in
+	        waste.recipe.steps.contains { $0.isParameter && $0.parameterKind == .ticker }
+	    })
+        // The PARAMETERIZED recipe must scrub run-varying values from its window
+        // hints; the literal variant keeps raw recorder window titles by design.
+        let windowHints = parameterized.recipe.steps.compactMap(\.windowTitleHint).joined(separator: "|")
 	    let audit = try await store.recentAudit(limit: 20)
 	    let miningAudit = try #require(audit.first { $0.action == "workflow.parameterized_mining" })
     #expect(miningAudit.detail.contains("enabled=true"))
-    #expect(miningAudit.detail.contains("candidateCount=1"))
-    #expect(miningAudit.detail.contains("slotCount=1"))
+    #expect(miningAudit.detail.contains("candidateCount=2"))
+    #expect(miningAudit.detail.contains("slotCount=2"))
 	    for raw in ["ETH", "SOL", "BTC", "LTC"] {
 	        #expect(!miningAudit.detail.localizedCaseInsensitiveContains(raw))
             #expect(!windowHints.localizedCaseInsensitiveContains(raw))

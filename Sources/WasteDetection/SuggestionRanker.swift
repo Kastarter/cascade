@@ -87,9 +87,12 @@ public struct PreferenceModel: Sendable, Equatable {
     }
 
     public func preference(for key: String, context: PreferenceContext) -> Double {
+        // Context buckets vote only where they have evidence of their own — an
+        // unobserved bucket is silence, not a 0.5 vote. Otherwise six unknown
+        // buckets dilute a dozen unambiguous accepts/declines back to neutral.
         var weighted = preference(key) * 2.0
         var totalWeight = 2.0
-        for bucket in context.bucketKeys {
+        for bucket in context.bucketKeys where evidenceCount(bucket) > 0 {
             weighted += preference(bucket)
             totalWeight += 1
         }

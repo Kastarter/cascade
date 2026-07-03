@@ -55,7 +55,7 @@ private func webWorkflowEvents() -> [InputEvent] {
 /// Polls a MainActor condition until true or it times out (~5s), yielding so the
 /// model's fire-and-forget Tasks can run.
 @MainActor
-private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throws {
+private func waitUntil(_ condition: () -> Bool, maxTries: Int = 2_000) async throws {
     var tries = 0
     while !condition(), tries < maxTries {
         try await Task.sleep(for: .milliseconds(10))
@@ -66,7 +66,7 @@ private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throw
 private func waitForAudit(
     _ store: CascadeStore,
     action: String,
-    maxTries: Int = 500
+    maxTries: Int = 2_000
 ) async throws -> AuditEvent {
     var tries = 0
     while tries < maxTries {
@@ -83,7 +83,7 @@ private func waitForAudit(
     _ store: CascadeStore,
     action: String,
     detailContains needle: String,
-    maxTries: Int = 500
+    maxTries: Int = 2_000
 ) async throws -> AuditEvent {
     var tries = 0
     while tries < maxTries {

@@ -392,7 +392,11 @@ func crossAppPasteCarriesDataflowParameterMetadata() {
     let paste = waste.recipe.steps.first { $0.kind == .key && $0.key == "v" }
 
     #expect(paste?.isParameter == true)
-    #expect(paste?.parameterKey == "a1")
+    // Dataflow parameter keys are stable hashed field identities (destination ← source),
+    // never raw on-screen labels.
+    #expect(paste?.parameterKey?.hasPrefix("paste:field_") == true)
+    #expect(paste?.parameterKey?.contains(":from:field_") == true)
+    #expect(paste?.parameterKey?.lowercased().contains("invoice") != true)
     #expect(paste?.parameterKind == .freeText)
     #expect(paste?.valueExamples == ["freeText:clipboard"])
     #expect(paste?.valueHashes.isEmpty == true)

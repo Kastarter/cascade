@@ -546,7 +546,7 @@ public enum SourceCardRegistry {
             .map { card in
                 let tools = card.toolNames.isEmpty ? "none" : card.toolNames.joined(separator: ", ")
                 return """
-                - \(card.source.rawValue) [\(card.availability.rawValue)]: \(card.scope)
+                - \(card.title) (\(card.source.rawValue)) [\(card.availability.rawValue)]: \(card.scope)
                   freshness: \(card.freshness)
                   privacy: \(card.privacy)
                   cost: \(card.cost)

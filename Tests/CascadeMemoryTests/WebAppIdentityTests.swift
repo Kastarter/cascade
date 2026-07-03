@@ -57,5 +57,6 @@ func webAppIdentityFromReturnsOnlyStableDocumentHashes() {
     #expect(first != nil)
     #expect(first == second)
     #expect(first != other)
-    #expect(first?.count == 12)
+    // AuditIdentity.hash keeps 12 bytes of SHA-256 -> 24 hex characters.
+    #expect(first?.count == 24)
 }

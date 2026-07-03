@@ -32,7 +32,7 @@ func resourceCatalogPromptReplacesSeparateFileAndRecallBlocks() {
     )
 
     #expect(prompt.components(separatedBy: "<resource_catalog>").count == 2)
-    #expect(prompt.contains("On screen now"))
+    #expect(prompt.contains("On-screen state"))
     #expect(prompt.contains("Recorded memory"))
     #expect(prompt.contains("Local files"))
     #expect(prompt.contains("Web"))

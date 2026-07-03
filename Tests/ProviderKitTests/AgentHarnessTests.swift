@@ -287,7 +287,10 @@ func readFileSeesThroughSymlinkToProtectedDir() async throws {
     try "secret-access-key".write(toFile: dir + "/.aws/credentials", atomically: true, encoding: .utf8)
     try FileManager.default.createSymbolicLink(atPath: dir + "/creds", withDestinationPath: dir + "/.aws/credentials")
     let result = await AgentHarness.perform(.readFile(path: dir + "/creds"), powerEnabled: false)
-    #expect(result.contains("protected local credential"))
+    // The symlink is canonicalized before the checks, so SOME refusal fires
+    // (privacy-exclusion or protected-path — both are correct); the content must
+    // never leak. Pin the property, not which refusal message wins.
+    #expect(result.contains("\"status\":\"refused\""))
     #expect(!result.contains("secret-access-key"))
 }
 

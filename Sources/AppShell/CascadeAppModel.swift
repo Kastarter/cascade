@@ -722,6 +722,7 @@ public final class CascadeAppModel: ObservableObject {
                 let reviewable = detectedWaste.filter { Self.isAutomatable($0, using: preferenceModel) }
                 reviewableCount = reviewable.count
                 let curated = await orchestrator.curate(reviewable)
+                    .filter { !dismissedWasteSignatures.contains($0.signature) }
                 curatedWaste = Self.rankCuratedSuggestions(curated, using: preferenceModel)
                 await recordCuratedProposalsShown(curatedWaste)
                 await refreshProactiveNextActionOffer(now: Date())
@@ -2205,7 +2206,7 @@ public final class CascadeAppModel: ObservableObject {
         // before the first frame instead, so turn 1 already sees it frontmost.
         if let first = plan.first, first.app.isEmpty,
            let named = appNameHint(forCompletedVoiceGoal: goal) {
-            await executeCU(.openApp(named), on: screen)
+            _ = await executeCU(.openApp(named), on: screen)
             if let fresh = await freshShot() { shot = fresh }
         }
 
@@ -2286,10 +2287,10 @@ public final class CascadeAppModel: ObservableObject {
 
                 // Jump straight to the part's app or site — instant, no vision round-trip.
                 if !sub.app.isEmpty {
-                    await executeCU(.openApp(sub.app), on: screen)
+                    _ = await executeCU(.openApp(sub.app), on: screen)
                     shot = nil
                 } else if !sub.startURL.isEmpty {
-                    await executeCU(.openURL(sub.startURL), on: screen)
+                    _ = await executeCU(.openURL(sub.startURL), on: screen)
                     shot = nil
                 }
                 if shot == nil {
@@ -5211,7 +5212,7 @@ public final class CascadeAppModel: ObservableObject {
         reason: String,
         failureKind: CascadeMemory.AgentFailureKind? = .unsafeAction
     ) -> String {
-        var parts = [
+        let parts = [
             "tool=\(safeAuditToken(toolName))",
             "verdict=\(safeAuditToken(verdict.rawValue))",
             "failureKind=\(safeAuditToken(failureKind?.rawValue ?? "unsafe_action"))",
@@ -5723,6 +5724,8 @@ public final class CascadeAppModel: ObservableObject {
         if let tier { parts.append("tier=\(safeAuditToken(tier))") }
         if let bundleIdentifier = step.bundleIdentifier { parts.append(textAuditDetail("bundle", bundleIdentifier)) }
         if let windowTitleHint = step.windowTitleHint { parts.append(textAuditDetail("window", windowTitleHint)) }
+        if let text = step.text { parts.append(textAuditDetail("text", text)) }
+        if let ocrAnchor = step.ocrAnchor { parts.append(textAuditDetail("anchor", ocrAnchor)) }
         return parts.joined(separator: " ")
     }
 

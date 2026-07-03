@@ -137,11 +137,11 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         windowTitle: String?,
         text: String? = nil
     ) -> CapturePrivacyDecision {
-        // Private mode must NOT drop the whole capture — that stopped ALL recording
-        // (the Reel froze the instant it was toggled). Recording continues; instead,
-        // FrameRedactor redacts EVERY on-screen text box in private mode (screenshots
-        // stay, text is kept private), and genuinely sensitive frames are still dropped
-        // by the keyword checks below.
+        // Private mode = the employee said "don't record right now." Fail CLOSED:
+        // the whole frame is dropped. The Settings toggle promises "Capture is
+        // paused" and InputRecorder marks all input sensitive for the same reason —
+        // an empty Reel while it's on is the feature working, not a bug.
+        if privateModeEnabled { return .deny("private_mode") }
         if !allowedBundleIdentifiers.isEmpty {
             guard let bundleIdentifier,
                   allowedBundleIdentifiers.contains(where: { matches($0, bundleIdentifier) }) else {
@@ -160,15 +160,9 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         let haystack = [appName, bundleIdentifier ?? "", windowTitle ?? "", text ?? ""]
             .joined(separator: " ")
             .lowercased()
-        // In private mode, KEEP the frame (recording continues) and let FrameRedactor +
-        // PII/keyword redaction blur only the sensitive boxes — don't drop the whole
-        // frame just because a keyword appears somewhere on screen. Normal mode still
-        // drops sensitive frames outright.
-        if !privateModeEnabled {
-            if haystack.contains("<sensitive_text>") { return .deny("redacted_sensitive_text") }
-            if let keyword = sensitiveKeywords.first(where: { haystack.contains($0.lowercased()) }) {
-                return .deny("sensitive_keyword:\(keyword)")
-            }
+        if haystack.contains("<sensitive_text>") { return .deny("redacted_sensitive_text") }
+        if let keyword = sensitiveKeywords.first(where: { haystack.contains($0.lowercased()) }) {
+            return .deny("sensitive_keyword:\(keyword)")
         }
         return .allow
     }

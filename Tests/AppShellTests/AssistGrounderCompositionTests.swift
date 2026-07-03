@@ -96,10 +96,12 @@ func assistGrounderFlagOnRejectsOffDisplayCandidateAndAuditsVerifierOutcome() as
     let audit = try await store.recentAudit()
 
     #expect(result.selectedPoint == nil)
-    #expect(audit.count == 1)
-    #expect(audit.first?.action == "grounding.verifier")
-    #expect(audit.first?.detail.contains("verdict=reject") == true)
-    #expect(audit.first?.detail.contains("failure=offscreen") == true)
+    // The reject path may also emit ax-profile / failure-memory rows; pin the
+    // verifier row itself, not the total row count.
+    let verifierRows = audit.filter { $0.action == "grounding.verifier" }
+    #expect(verifierRows.count == 1)
+    #expect(verifierRows.first?.detail.contains("verdict=reject") == true)
+    #expect(verifierRows.first?.detail.contains("failure=offscreen") == true)
 }
 
 @MainActor @Test
@@ -122,10 +124,10 @@ func assistGrounderFlagOnAbstainsOnConflictingCandidatesAndAuditsVerifierOutcome
     let audit = try await store.recentAudit()
 
     #expect(result.selectedPoint == nil)
-    #expect(audit.count == 1)
-    #expect(audit.first?.action == "grounding.verifier")
-    #expect(audit.first?.detail.contains("verdict=abstain") == true)
-    #expect(audit.first?.detail.contains("failure=ambiguous") == true)
+    let verifierRows = audit.filter { $0.action == "grounding.verifier" }
+    #expect(verifierRows.count == 1)
+    #expect(verifierRows.first?.detail.contains("verdict=abstain") == true)
+    #expect(verifierRows.first?.detail.contains("failure=ambiguous") == true)
 }
 
 private func groundingResult(_ candidates: [GroundingCandidate]) -> GroundingResult {

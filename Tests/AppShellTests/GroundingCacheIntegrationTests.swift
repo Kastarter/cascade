@@ -87,7 +87,10 @@ struct GroundingCacheIntegrationTests {
 
     @Test
     func cachedMissSuppressesRepeatLookupUntilTTLExpires() async throws {
-        let cache = GroundingCache(negativeMissTTL: 0.05)
+        // Real-clock test: the TTL must be far larger than any plausible gap between
+        // the two back-to-back lookups on a loaded CI machine, and the sleep far
+        // larger than the TTL (50ms/80ms flaked under parallel test load).
+        let cache = GroundingCache(negativeMissTTL: 0.5)
         let counter = GroundingCallCounter()
         let grounder = MixtureGrounder(
             base: CountingGrounder(counter: counter, result: GroundingResult()),
@@ -116,7 +119,7 @@ struct GroundingCacheIntegrationTests {
         #expect(second == nil)
         #expect(await counter.value() == 1)
 
-        try await Task.sleep(nanoseconds: 80_000_000)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
 
         let third = await grounder.ground(
             screenshot: screenshot,

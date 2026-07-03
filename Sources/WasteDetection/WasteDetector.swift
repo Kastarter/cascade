@@ -1712,11 +1712,27 @@ public struct WasteDetector: Sendable {
         collapsingScrollBursts(events)
     }
 
+    /// Compact mining token (`kind:label@Surface`). This grammar is load-bearing:
+    /// signatures join tokens with `|` and `signatureTokens`/`mergeVariants`/the
+    /// offline eval split on `|`, so the token itself must never contain one. The
+    /// pipe-delimited `idempotentActionKey` is the ACTION-CACHE identity, not the
+    /// mining token — routing it here exploded every token into 13 fields and made
+    /// distinct workflows (Gmail vs Notion) 85% "similar", so mergeVariants fused them.
     static func token(_ event: InputEvent, surface: String) -> String {
-        event.idempotentActionKey(
-            surface: surface,
-            documentIdentityHash: WebAppIdentity.from(windowTitle: event.windowTitle)
-        )
+        switch event.kind {
+        case .key:
+            let mods = event.modifiers.sorted().joined(separator: "+")
+            return "key:\(mods)+\(event.key ?? "")@\(surface)"
+        case .type:
+            return "type@\(surface)"
+        case .click, .doubleClick, .rightClick:
+            let label = normalizedLabel(event.text)
+            return label.isEmpty
+                ? "\(event.kind.rawValue)@\(surface)"
+                : "\(event.kind.rawValue):\(label)@\(surface)"
+        case .scroll:
+            return "scroll@\(surface)"
+        }
     }
 
     private static func signature(tokens: [String], traceProfile: TraceProfile?) -> String {

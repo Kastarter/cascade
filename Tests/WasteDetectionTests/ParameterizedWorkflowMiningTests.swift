@@ -73,10 +73,13 @@ private func cryptoPriceFixture() -> [InputEvent] {
 }
 
 @Test
-func cryptoFixtureLiteralPathYieldsNoCandidatesButParameterizedPathFindsOne() throws {
+func cryptoFixtureParameterizedPathRecoversTheTickerParameterTheLiteralPathDrops() throws {
     let events = cryptoPriceFixture()
     let detector = WasteDetector()
 
+    // The literal miner's text-agnostic tokens find the shared 6-step spine
+    // (search → copy → paste) but must DROP the per-coin "<coin> tracker row"
+    // click — each run's label differs, so it can't be part of a literal pattern.
     let literal = detector.detect(
         contexts: [],
         inputEvents: events,
@@ -85,8 +88,12 @@ func cryptoFixtureLiteralPathYieldsNoCandidatesButParameterizedPathFindsOne() th
         useEpisodeMining: true,
         useParameterizedMining: false
     )
-    #expect(literal.isEmpty)
+    #expect(literal.count == 1)
+    #expect(literal.first?.occurrences == 4)
+    #expect(literal.first?.recipe.steps.contains { $0.text?.localizedCaseInsensitiveContains("tracker row") == true } != true)
 
+    // Parameterized mining recovers the FULL routine including the varying step,
+    // abstracted as a ticker parameter with per-run value hashes.
     let parameterized = detector.detect(
         contexts: [],
         inputEvents: events,
@@ -96,13 +103,11 @@ func cryptoFixtureLiteralPathYieldsNoCandidatesButParameterizedPathFindsOne() th
         useParameterizedMining: true
     )
 
-    #expect(parameterized.count == 1)
-    let waste = try #require(parameterized.first)
+    let waste = try #require(parameterized.first { result in
+        result.recipe.steps.contains { $0.isParameter && $0.parameterKind == .ticker }
+    })
     #expect(waste.occurrences == 4)
-    let parameterSteps = waste.recipe.steps.filter(\.isParameter)
-    #expect(parameterSteps.count == 1)
-    let parameter = try #require(parameterSteps.first)
-    #expect(parameter.parameterKind == .ticker)
+    let parameter = try #require(waste.recipe.steps.first { $0.isParameter && $0.parameterKind == .ticker })
     #expect(parameter.valueHashes.count == 4)
     #expect(parameter.valueExamples.allSatisfy { $0.hasPrefix("ticker:") })
 }
