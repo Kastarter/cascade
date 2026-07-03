@@ -510,20 +510,19 @@ public struct AgentTrace: Sendable, Equatable, Codable {
         var rows = ["trace_id,span_id,provider,model,response_id,price_card_version,input_tokens,cache_read_input_tokens,cache_creation_input_tokens,output_tokens,reasoning_output_tokens,cost_microusd"]
         for span in spans where span.usage != nil || span.costUSD != nil {
             let usage = span.usage
-            let fields = [
-                traceID,
-                span.id,
-                usage?.provider ?? "",
-                usage?.model ?? "",
-                usage?.responseID ?? "",
-                usage?.priceCardVersion ?? ModelPriceCard.defaultVersion,
-                String(usage?.inputTokens ?? 0),
-                String(usage?.cacheReadTokens ?? 0),
-                String(usage?.cacheWriteTokens ?? 0),
-                String(usage?.outputTokens ?? 0),
-                String(usage?.reasoningTokens ?? 0),
-                String(Self.costMicrousd(for: span)),
-            ]
+            let priceCardVersion: String = usage?.priceCardVersion ?? ModelPriceCard.defaultVersion
+            let costMicrousd: String = String(Self.costMicrousd(for: span))
+            var fields: [String] = [traceID, span.id]
+            fields.append(usage?.provider ?? "")
+            fields.append(usage?.model ?? "")
+            fields.append(usage?.responseID ?? "")
+            fields.append(priceCardVersion)
+            fields.append(String(usage?.inputTokens ?? 0))
+            fields.append(String(usage?.cacheReadTokens ?? 0))
+            fields.append(String(usage?.cacheWriteTokens ?? 0))
+            fields.append(String(usage?.outputTokens ?? 0))
+            fields.append(String(usage?.reasoningTokens ?? 0))
+            fields.append(costMicrousd)
             rows.append(fields.map(AgentTraceCSVFieldEscaper.escape).joined(separator: ","))
         }
         return rows.joined(separator: "\n")
@@ -1122,7 +1121,7 @@ public enum AgentTraceBuilder {
             if let root = TraceRoot(event: event) {
                 finishCurrent()
                 if pendingEvents.isEmpty {
-                    var run = RunDraft(index: runs.count, root: root, taskEvent: event, eventOrder: item.offset)
+                    let run = RunDraft(index: runs.count, root: root, taskEvent: event, eventOrder: item.offset)
                     if root.closesImmediately {
                         runs.append(run)
                     } else {
