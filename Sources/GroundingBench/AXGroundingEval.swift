@@ -21,7 +21,9 @@ import Foundation
 // MARK: - Target corpus (from a live AX crawl)
 
 public struct AXGroundingTarget: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 1
+    /// v2 (d20): adds optional `supportedActions` so the regression corpus can
+    /// derive semantic action traces. v1 rows decode unchanged (nil actions).
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
     /// Stable AX node id (`ax:<hash>`) from `AXElementResolver.stableNodeID` — the
@@ -36,6 +38,9 @@ public struct AXGroundingTarget: Codable, Equatable, Sendable {
     public let subrole: String?
     public let identifier: String?
     public let container: String?
+    /// Semantic AX actions the node supported at crawl time (AXPress/…), as
+    /// captured by the d05 actionable-node harvest. nil on v1 corpus rows.
+    public let supportedActions: [String]?
     public let frameX: Double
     public let frameY: Double
     public let frameWidth: Double
@@ -51,6 +56,7 @@ public struct AXGroundingTarget: Codable, Equatable, Sendable {
         subrole: String? = nil,
         identifier: String? = nil,
         container: String? = nil,
+        supportedActions: [String]? = nil,
         frame: CGRect
     ) {
         self.schemaVersion = schemaVersion
@@ -62,6 +68,7 @@ public struct AXGroundingTarget: Codable, Equatable, Sendable {
         self.subrole = subrole
         self.identifier = identifier
         self.container = container
+        self.supportedActions = supportedActions.map { $0.sorted() }
         self.frameX = frame.minX
         self.frameY = frame.minY
         self.frameWidth = frame.width
@@ -90,6 +97,7 @@ public struct AXGroundingTarget: Codable, Equatable, Sendable {
         case subrole
         case identifier
         case container
+        case supportedActions = "supported_actions"
         case frameX = "frame_x"
         case frameY = "frame_y"
         case frameWidth = "frame_width"
@@ -205,6 +213,7 @@ public enum AXGroundingCrawler {
                 subrole: match.actionableNode?.subrole,
                 identifier: match.actionableNode?.identifier ?? match.descriptor?.identifier,
                 container: match.descriptor?.container,
+                supportedActions: match.actionableNode?.supportedActions,
                 frame: frame
             )
         }

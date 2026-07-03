@@ -25,6 +25,8 @@ struct GroundingBenchCommand {
                 try await run(options)
             case "ax-crawl":
                 try axCrawl(options)
+            case "ax-corpus":
+                try axCorpus(options)
             case "ax-eval":
                 try axEval(options)
             default:
@@ -89,15 +91,49 @@ struct GroundingBenchCommand {
         print("crawled \(crawl.targets.count) targets from \(crawl.appBundle ?? crawl.appName) (visited \(crawl.visitedNodeCount) nodes) to \(out.path)")
     }
 
+    /// d20: crawl the canonical target apps (Notes, System Settings, Safari by
+    /// default; --apps adds e.g. Keynote) into a regression corpus: per-app
+    /// grounded-task fixtures (`<bundle>.tasks.jsonl` — instruction + target +
+    /// semantic action trace) plus a counts/hashes-only manifest.json. Apps that
+    /// aren't running are recorded in the manifest, not fatal.
+    private static func axCorpus(_ options: ArgumentParser) throws {
+        let outDir = try options.requiredURL("--out-dir")
+        let limit = options.value("--limit").flatMap(Int.init) ?? 40
+        let maxPerKind = options.value("--max-per-kind").flatMap(Int.init)
+            ?? AXRegressionCorpusBuilder.defaultMaxTasksPerKind
+        let apps: [AXRegressionCorpusApp]
+        if let raw = options.value("--apps") {
+            apps = raw.split(separator: ",")
+                .map { AXRegressionCorpusApp.named(bundleID: $0.trimmingCharacters(in: .whitespaces)) }
+        } else {
+            apps = AXRegressionCorpusGenerator.defaultApps
+        }
+        let manifest = try AXRegressionCorpusGenerator.generate(
+            apps: apps,
+            outDirectory: outDir,
+            maxPerKind: maxPerKind,
+            crawl: AXRegressionCorpusGenerator.liveCrawl(limit: limit)
+        )
+        for app in manifest.apps {
+            print("\(app.bundleID): \(app.status.rawValue) — \(app.taskCount) tasks (hash \(app.corpusHash))")
+        }
+        print("corpus: \(manifest.totalTaskCount) tasks across \(manifest.apps.count) apps (hash \(manifest.corpusHash)) -> \(outDir.path)")
+    }
+
     /// d19: score a crawled corpus — per app/target, does AX still expose the
     /// target, and does the resolved click LAND on it (systemwide hit-test of the
-    /// final screen state), never click-count.
+    /// final screen state), never click-count. d20: `--tasks` replays a stored
+    /// regression-corpus fixture through the same scorer.
     private static func axEval(_ options: ArgumentParser) throws {
-        let targetsURL = try options.requiredURL("--targets")
         if let bundleID = options.value("--app") {
             try AXGroundingCrawler.activate(bundleIdentifier: bundleID)
         }
-        let targets = try AXGroundingTargetJSONL.load(from: targetsURL)
+        let targets: [AXGroundingTarget]
+        if let tasksURL = options.optionalURL("--tasks") {
+            targets = try AXRegressionTaskJSONL.load(from: tasksURL).map(\.target)
+        } else {
+            targets = try AXGroundingTargetJSONL.load(from: options.requiredURL("--targets"))
+        }
         let report = AXGroundingEvalRunner().run(targets: targets)
         let json = try report.jsonString()
         if let out = options.optionalURL("--out") {
@@ -112,13 +148,15 @@ struct GroundingBenchCommand {
       swift run grounding-bench fixture --out-dir <dir> [--jsonl <cases.jsonl>]
       swift run grounding-bench run --jsonl <cases.jsonl> [--preset <id>] [--endpoint <url>] [--model <id>] [--coord-space <smartResize|sent|normalized>] [--api-key-env <ENV>]
       swift run grounding-bench ax-crawl --out <targets.jsonl> [--app <bundle-id>] [--limit <n>]
-      swift run grounding-bench ax-eval --targets <targets.jsonl> [--app <bundle-id>] [--out <report.json>]
+      swift run grounding-bench ax-corpus --out-dir <dir> [--apps <bundle,bundle,…>] [--limit <n>] [--max-per-kind <n>]
+      swift run grounding-bench ax-eval (--targets <targets.jsonl> | --tasks <bundle.tasks.jsonl>) [--app <bundle-id>] [--out <report.json>]
 
     Required flag:
       defaults write -g cascade.experimentalGroundingBench -bool true
 
     Export reads a closed/checkpointed copy of Cascade.sqlite. Never pass the live database in ~/Library/Application Support/Cascade.
-    ax-crawl/ax-eval need Accessibility permission and the app under test running; the eval is read-only (AX hit-tests, no synthetic clicks).
+    ax-crawl/ax-corpus/ax-eval need Accessibility permission and the app under test running; crawling and the eval are read-only (AX hit-tests, no synthetic clicks).
+    ax-corpus defaults to Notes, System Settings, and Safari; apps that are not running are recorded in manifest.json instead of failing the run.
     """
 }
 
