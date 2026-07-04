@@ -358,6 +358,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalActionChunkingKey = "cascade.experimentalActionChunking"
     nonisolated static let experimentalAutoRecallKey = "cascade.experimentalAutoRecall"
     nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
+    nonisolated static let experimentalPostActionVerifierKey = "cascade.postActionVerifier"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
@@ -381,6 +382,14 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func experimentalAutoRecallEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalAutoRecallKey)
+    }
+
+    /// §4a post-action verification ladder (PostActionVerifier) — default OFF.
+    /// Unset/false ⇒ the shipped `verifyPostAction(_:)` path runs byte-identically
+    /// with zero new captures. Flipping ON is only ever earned by live
+    /// audit_event rows (LAW 3); there is deliberately no settings UI yet.
+    private var postActionVerifierEnabled: Bool {
+        defaultsStore.bool(forKey: Self.experimentalPostActionVerifierKey)
     }
 
     static func experimentalStructuredContentEnabled(defaults: UserDefaults) -> Bool {
@@ -5571,6 +5580,32 @@ public final class CascadeAppModel: ObservableObject {
         return parts.joined(separator: " ")
     }
 
+    /// Additive ladder variant of `assistVerifyAuditDetail` — same shape (so the
+    /// FailureLedger keeps parsing) plus rung=/mechanism= tokens identifying
+    /// which ladder rung decided. The existing helper stays byte-untouched.
+    nonisolated static func assistVerifyLadderAuditDetail(
+        verdict: PostActionVerdict,
+        actionKind: String,
+        evidenceName: String,
+        evidence: String,
+        skill: AppSkill?
+    ) -> String {
+        assistVerifyAuditDetail(
+            status: verdict.status.rawValue,
+            actionKind: actionKind,
+            failureKind: verdict.failureKind,
+            evidenceName: evidenceName,
+            evidence: evidence,
+            skill: skill,
+            // A ladder FAILED row must carry the same postEffect token the
+            // shipped OFF-path emits for the identical failure (`mismatch`) —
+            // the FailureLedger bins `postEffect=mismatch` as .effectMismatch;
+            // `postEffect=failed` would misclassify it as .preconditionFailed.
+            postEffect: verdict.status == .failed ? "mismatch" : verdict.status.rawValue,
+            expectedEffect: actionKind
+        ) + " rung=\(verdict.rung) mechanism=\(safeAuditToken(verdict.mechanism))"
+    }
+
     nonisolated static func assistCaptureAuditDetail(_ usage: ComputerUseUsageSnapshot) -> String {
         [
             "imageTurns=\(usage.imageTurns)",
@@ -6041,6 +6076,11 @@ public final class CascadeAppModel: ObservableObject {
         // instead of being restored to the user's parked position.
         let skill = frontmostSkill()
         let keepPointer = skill?.keysFollowPointer == true
+        // §4a ladder pre-action evidence — flag OFF evaluates to nil with no
+        // side effects (no capture, no OCR, no work).
+        let ladderPre: LadderPreActionEvidence? = postActionVerifierEnabled
+            ? await ladderPreActionEvidence(for: action, on: screen)
+            : nil
         do {
             switch action {
             case .move(let x, let y):
@@ -6245,7 +6285,18 @@ public final class CascadeAppModel: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(900))
                 }
             }
-            await verifyPostAction(action)
+            if postActionVerifierEnabled {
+                // ON path REPLACES (not duplicates) the inline verifier — one
+                // assist.verify.* row per action, now with rung=/mechanism=.
+                await verifyPostActionViaLadder(
+                    action,
+                    on: screen,
+                    preOCR: ladderPre?.ocrBefore,
+                    hashesBefore: ladderPre?.gridHashesBefore
+                )
+            } else {
+                await verifyPostAction(action)
+            }
             return true
         } catch ComputerUseError.stopped {
             return false
@@ -6394,6 +6445,188 @@ public final class CascadeAppModel: ObservableObject {
             }
         }
         return nil
+    }
+
+    // MARK: - §4a post-action verification ladder (cascade.postActionVerifier)
+
+    /// Focused-element AX value read-back — mirrors `focusedAXValueContains`
+    /// but returns the VALUE so the ladder (not the probe) decides what it
+    /// means. Nonisolated: AX reads are safe off-main and must not stall the
+    /// @MainActor loop.
+    nonisolated private static func ladderFocusedAXValue() -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+        let system = AXUIElementCreateSystemWide()
+        AXClient.setMessagingTimeout(system)
+        guard case .success(let element) = AXClient.elementAttribute(system, kAXFocusedUIElementAttribute as String) else { return nil }
+        for attribute in [kAXValueAttribute, kAXSelectedTextAttribute] {
+            if case .success(let value) = AXClient.attribute(element, attribute as String, as: String.self) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    /// Maps a ProviderKit `CUAction` to the module-neutral `VerifiableAction`
+    /// descriptor. Lives here because ComputerUseKit cannot import ProviderKit;
+    /// the exhaustive switch forces a compiler error on any future CUAction
+    /// case (kindToken drift guard). Every field is STRUCTURAL — derived from
+    /// the action itself, never from a model-reported effect (152df62).
+    nonisolated static func postActionVerifiableAction(for action: CUAction, on screen: NSScreen) -> VerifiableAction {
+        postActionVerifiableAction(for: action, displaySize: screen.frame.size)
+    }
+
+    /// Pure, testable core of the mapping. `displaySize` clamps the OCR target
+    /// rect to the display; coordinates are display-local AppKit points.
+    nonisolated static func postActionVerifiableAction(for action: CUAction, displaySize: CGSize) -> VerifiableAction {
+        func targetRect(_ x: Double, _ y: Double) -> CGRect? {
+            let rect = CGRect(x: x - 160, y: y - 80, width: 320, height: 160)
+            let bounds = CGRect(origin: .zero, size: displaySize)
+            let clamped = rect.intersection(bounds)
+            guard !clamped.isNull, !clamped.isEmpty else { return nil }
+            return clamped
+        }
+        switch action {
+        case .move:
+            return VerifiableAction(kindToken: "move")
+        case .click(let x, let y):
+            return VerifiableAction(kindToken: "click", targetRect: targetRect(x, y))
+        case .doubleClick(let x, let y):
+            return VerifiableAction(kindToken: "double_click", targetRect: targetRect(x, y))
+        case .tripleClick(let x, let y):
+            return VerifiableAction(kindToken: "triple_click", targetRect: targetRect(x, y))
+        case .rightClick(let x, let y):
+            return VerifiableAction(kindToken: "right_click", targetRect: targetRect(x, y))
+        case .drag(_, _, let toX, let toY):
+            return VerifiableAction(kindToken: "drag", targetRect: targetRect(toX, toY))
+        case .type(let text):
+            return VerifiableAction(kindToken: "type", typedText: text)
+        case .key:
+            // No structural save target is inferable from a bare key combo —
+            // expectedFileURL stays nil until a caller knows the artifact path.
+            return VerifiableAction(kindToken: "key")
+        case .scroll(let x, let y, _, _):
+            return VerifiableAction(kindToken: "scroll", targetRect: targetRect(x, y))
+        case .wait:
+            return VerifiableAction(kindToken: "wait")
+        case .screenshot:
+            return VerifiableAction(kindToken: "screenshot")
+        case .openApp(let name):
+            return VerifiableAction(kindToken: "open_app", expectedApp: name)
+        case .openURL:
+            return VerifiableAction(kindToken: "open_url")
+        case .zoom:
+            return VerifiableAction(kindToken: "zoom")
+        case .highlight:
+            return VerifiableAction(kindToken: "highlight")
+        }
+    }
+
+    /// Pre-action evidence for the ladder, in-memory only (§7 carve-out — the
+    /// OCR text is never persisted). Captured ONLY when the flag is on, and
+    /// only for kinds whose verification actually needs it: rung-0-exempt kinds
+    /// and rung-1-mechanism kinds (type/open_app/save) skip the expensive
+    /// pre-OCR entirely; the rect OCR runs only for visual-delta kinds with a
+    /// target rect (HP-12 cost honesty).
+    struct LadderPreActionEvidence: Sendable {
+        let ocrBefore: String?
+        let gridHashesBefore: [UInt64]?
+    }
+
+    private func ladderPreActionEvidence(for action: CUAction, on screen: NSScreen) async -> LadderPreActionEvidence? {
+        let descriptor = Self.postActionVerifiableAction(for: action, on: screen)
+        let predicted = descriptor.predictedEffect
+        guard predicted != .none else { return nil }  // rung-0 exempt: zero work
+        let displayW = Int(screen.frame.width)
+        let displayH = Int(screen.frame.height)
+        var ocrBefore: String?
+        if predicted == .visualDelta, let rect = descriptor.targetRect {
+            ocrBefore = await Self.ladderRectOCR(rect, displayWidth: displayW, displayHeight: displayH)
+        }
+        var hashesBefore: [UInt64]?
+        if let jpeg = await ScreenCaptureUtility.captureCursorScreenJPEG(width: displayW, height: displayH) {
+            hashesBefore = Self.gridHashes(ofJPEG: jpeg)
+        }
+        guard ocrBefore != nil || hashesBefore != nil else { return nil }
+        return LadderPreActionEvidence(ocrBefore: ocrBefore, gridHashesBefore: hashesBefore)
+    }
+
+    /// Bounded on-demand Vision over the target rect: native-res crop capture +
+    /// `.fast` recognition. Result is held in-memory only, never persisted.
+    /// Any capture/permission failure degrades to nil (MISSED, never FALSE).
+    nonisolated private static func ladderRectOCR(_ rect: CGRect, displayWidth: Int, displayHeight: Int) async -> String? {
+        let normalized = normalizedTopLeftRect(
+            displayLocalRect: rect,
+            displayWidth: displayWidth,
+            displayHeight: displayHeight
+        )
+        guard let crop = await ScreenCaptureUtility.captureCursorScreenZoomJPEG(normalizedRect: normalized) else {
+            return nil
+        }
+        return await ScreenTextRecognizer.recognize(inPNG: crop, level: .fast)
+    }
+
+    /// The ON-path replacement for `verifyPostAction(_:)`: builds real probes,
+    /// runs the `PostActionVerifier` ladder, and appends the assist.verify.*
+    /// audit row (rung=/mechanism= tokens) — these rows ARE the FailureLedger's
+    /// feed. Every probe error degrades down the ladder to unclear, never to a
+    /// false "failed" (LAW 7).
+    private func verifyPostActionViaLadder(
+        _ action: CUAction,
+        on screen: NSScreen,
+        preOCR: String?,
+        hashesBefore: [UInt64]?
+    ) async {
+        let descriptor = Self.postActionVerifiableAction(for: action, on: screen)
+        let displayW = Int(screen.frame.width)
+        let displayH = Int(screen.frame.height)
+
+        // Post-action grid hashes only when a pre-action baseline exists.
+        var hashesAfter: [UInt64]?
+        if hashesBefore != nil,
+           let jpeg = await ScreenCaptureUtility.captureCursorScreenJPEG(width: displayW, height: displayH) {
+            hashesAfter = Self.gridHashes(ofJPEG: jpeg)
+        }
+
+        // Frontmost fingerprint is read on the MainActor NOW and closed over as
+        // plain values, so the @Sendable probe needs no actor hop.
+        let front = NSWorkspace.shared.frontmostApplication
+        let frontName = front?.localizedName
+        let frontBundle = front?.bundleIdentifier
+
+        let evidence = PostActionEvidence(
+            readFocusedAXValue: { Self.ladderFocusedAXValue() },
+            frontmostFingerprint: { (frontName, frontBundle) },
+            fileExists: { FileManager.default.fileExists(atPath: $0.path) },
+            ocrBefore: preOCR,
+            ocrAfter: { rect in
+                await Self.ladderRectOCR(rect, displayWidth: displayW, displayHeight: displayH)
+            },
+            gridHashesBefore: hashesBefore,
+            gridHashesAfter: hashesAfter
+        )
+
+        let verdict = await PostActionVerifier().verify(descriptor, evidence: evidence)
+
+        let (evidenceName, evidenceText): (String, String)
+        switch action {
+        case .type(let text): (evidenceName, evidenceText) = ("text", text)
+        case .openApp(let name): (evidenceName, evidenceText) = ("target", name)
+        case .openURL(let url): (evidenceName, evidenceText) = ("url", url)
+        default: (evidenceName, evidenceText) = ("ladder", verdict.evidenceSummary)
+        }
+        // The ladder never yields "unavailable" (probe misses degrade down the
+        // ladder to rung-3 unclear), so every ladder row is assist.verify.action.
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "assist.verify.action",
+            detail: Self.assistVerifyLadderAuditDetail(
+                verdict: verdict,
+                actionKind: descriptor.kindToken,
+                evidenceName: evidenceName,
+                evidence: evidenceText,
+                skill: frontmostSkill()
+            )
+        ))
     }
 
     private var lastNarrationAt = Date.distantPast
