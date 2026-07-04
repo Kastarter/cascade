@@ -5,6 +5,7 @@ import CascadeMemory
 import Combine
 import ComputerUseKit
 import Foundation
+import GovernanceKit
 import ImageIO
 import MacContextKit
 import PerceptionCore
@@ -570,6 +571,11 @@ public final class CascadeAppModel: ObservableObject {
     private let visualGrounderOverride: (any VisualGrounder)?
     private let localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
     private let actionCriticOverride: (any ActionCritic)?
+    /// §3.2/§7 governance actuation gate. Resolved ONCE at init from
+    /// `cascade.governance` (default OFF ⇒ nil ⇒ executeCU adds a single nil-check
+    /// and zero other work). The default enforcer allows every action — today's
+    /// behavior; refusal lists stay in ComputerUseAgent/actuator.
+    private let governanceEnforcer: (any PolicyEnforcing)?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -594,6 +600,12 @@ public final class CascadeAppModel: ObservableObject {
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
         let initialCapturePolicy = Self.restoreCapturePrivacyPolicy(defaults: defaults)
+        self.governanceEnforcer = GovernanceFlag.isEnabled(defaults: defaults)
+            ? DefaultGovernancePolicy(
+                capture: initialCapturePolicy,
+                tenant: TenantPolicy.loadManaged(defaults: defaults)
+            )
+            : nil
         // Production store anchors its audit-chain head in the Keychain so
         // truncation/rewrite of the local audit log is detectable. Tests inject a
         // store and never hit this path.
@@ -629,6 +641,7 @@ public final class CascadeAppModel: ObservableObject {
             options: ContextRecorder.Options(
                 indexWorkGraph: true,
                 structuredContent: experimentalStructuredContent,
+                governanceEnabled: GovernanceFlag.isEnabled(defaults: defaults),
                 capturePolicy: initialCapturePolicy
             )
         )
@@ -6441,6 +6454,19 @@ public final class CascadeAppModel: ObservableObject {
         // An action means the thinking freeze is over — drop the sonar pulse so the
         // cursor's flight/press reads cleanly (the next turn re-arms it).
         guidanceOverlay.setThinking(false)
+        // §3.2/§7 governance actuation gate. Flag OFF (default): governanceEnforcer
+        // is nil, so this is one nil-check and nothing else — no descriptor, no
+        // defaults read, no audit row. The default enforcer allows every action.
+        if let blockDetail = Self.governanceBlockDetail(enforcer: governanceEnforcer, action: action) {
+            Task {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "policy",
+                    action: "governance.action.blocked",
+                    detail: blockDetail
+                ))
+            }
+            return false
+        }
         let mapper = DisplayCoordinateMapper(screen: screen)
         func globalAppKit(_ x: Double, _ y: Double) -> CGPoint {
             mapper?.appKitGlobal(fromScreenLocal: CGPoint(x: x, y: y))

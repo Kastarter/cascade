@@ -188,15 +188,20 @@ public final class ContextRecorder: ObservableObject {
     public struct Options: Equatable, Sendable {
         public var indexWorkGraph: Bool
         public var structuredContent: Bool
+        /// `cascade.governance` — resolved ONCE by the caller (GovernanceFlag),
+        /// default false ⇒ the capture gate is byte-identical to today.
+        public var governanceEnabled: Bool
         public var capturePolicy: CapturePrivacyPolicy
 
         public init(
             indexWorkGraph: Bool = true,
             structuredContent: Bool = false,
+            governanceEnabled: Bool = false,
             capturePolicy: CapturePrivacyPolicy = .default
         ) {
             self.indexWorkGraph = indexWorkGraph
             self.structuredContent = structuredContent
+            self.governanceEnabled = governanceEnabled
             self.capturePolicy = capturePolicy
         }
     }
@@ -279,6 +284,7 @@ public final class ContextRecorder: ObservableObject {
             store: store,
             indexWorkGraph: options.indexWorkGraph,
             structuredContent: options.structuredContent,
+            governanceEnabled: options.governanceEnabled,
             maintenanceScheduler: maintenanceScheduler,
             policy: options.capturePolicy
         ) { [weak self] context in

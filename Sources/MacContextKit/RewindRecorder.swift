@@ -4,6 +4,7 @@ import CoreImage
 import CoreMedia
 import CoreVideo
 import Foundation
+import GovernanceKit
 import OSLog
 import ScreenCaptureKit
 import Vision
@@ -632,6 +633,7 @@ actor RewindEngine {
     private let store: CascadeStore
     private let indexWorkGraph: Bool
     private let structuredContent: Bool
+    private let governanceEnabled: Bool
     private let maintenanceScheduler: RecorderMaintenanceScheduler?
     private let writeBuffer: ContextWriteBuffer
     private var policy: CapturePrivacyPolicy
@@ -657,6 +659,7 @@ actor RewindEngine {
         store: CascadeStore,
         indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
+        governanceEnabled: Bool = false,
         maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
@@ -664,6 +667,7 @@ actor RewindEngine {
         self.store = store
         self.indexWorkGraph = indexWorkGraph
         self.structuredContent = structuredContent
+        self.governanceEnabled = governanceEnabled
         self.maintenanceScheduler = maintenanceScheduler
         self.policy = policy
         self.onMoment = onMoment
@@ -717,6 +721,50 @@ actor RewindEngine {
         processing = false
     }
 
+    /// The pre-OCR capture gate, extracted so tests can pin ON/OFF parity at the
+    /// real choke point. OFF branch = today's inline
+    /// `policy.decision(appName:bundleIdentifier:windowTitle:)` check moved
+    /// verbatim (same call, same three arguments, same allow/drop outcome). ON
+    /// branch constructs `DefaultGovernancePolicy(capture:)` per call — a value
+    /// struct, so `updatePolicy` stays authoritative — and returns its verdict.
+    internal nonisolated static func captureGateVerdict(
+        appName: String,
+        bundleIdentifier: String?,
+        windowTitle: String?,
+        policy: CapturePrivacyPolicy,
+        governanceEnabled: Bool
+    ) -> PolicyVerdict {
+        guard governanceEnabled else {
+            let decision = policy.decision(
+                appName: appName,
+                bundleIdentifier: bundleIdentifier,
+                windowTitle: windowTitle
+            )
+            if decision.allowed { return .allow }
+            return .drop(reason: decision.reason ?? "denied")
+        }
+        return DefaultGovernancePolicy(capture: policy).evaluateCapture(CaptureContext(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle
+        ))
+    }
+
+    /// Verdict → may-this-frame-persist mapping at the pre-OCR choke point.
+    /// `.redact` has NO wired redactor here yet (the default policy never emits
+    /// it — dab9e5c; FrameRedactor runs downstream on a different trigger), so
+    /// until redaction wiring exists it degrades to drop: a MISSED frame, never
+    /// an un-redacted frame shipped as if it were redacted (LAW 7 — degrade to
+    /// MISSED, never FALSE). Revisit when a capture-gate redactor is wired.
+    internal nonisolated static func captureVerdictAllowsPersist(_ verdict: PolicyVerdict) -> Bool {
+        switch verdict {
+        case .allow:
+            return true
+        case .redact, .drop, .pause:
+            return false
+        }
+    }
+
     private func process(_ frame: ChangedFrame, reason: CaptureReason) async {
         let snapshot = await MainActor.run { AppWindowObserver.snapshot() }
 
@@ -729,14 +777,16 @@ actor RewindEngine {
         }
 
         // Cheap pre-OCR privacy gate on app/bundle/window — drop sensitive surfaces
-        // before paying for OCR or writing a frame to disk.
-        if !policy.decision(
+        // before paying for OCR or writing a frame to disk. With `cascade.governance`
+        // OFF (the default) this is byte-for-byte today's `policy.decision` early
+        // return; ON routes through GovernanceKit's default policy (same outcome).
+        guard Self.captureVerdictAllowsPersist(Self.captureGateVerdict(
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier,
-            windowTitle: snapshot.windowTitle
-        ).allowed {
-            return
-        }
+            windowTitle: snapshot.windowTitle,
+            policy: policy,
+            governanceEnabled: governanceEnabled
+        )) else { return }
 
         // The exact-text channel: the focused window's accessibility tree.
         // Character-perfect for native apps, immune to the resolution cap.
@@ -956,6 +1006,7 @@ final class RewindRecorder {
         fps: Int32 = 1,
         indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
+        governanceEnabled: Bool = false,
         maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
@@ -964,6 +1015,7 @@ final class RewindRecorder {
             store: store,
             indexWorkGraph: indexWorkGraph,
             structuredContent: structuredContent,
+            governanceEnabled: governanceEnabled,
             maintenanceScheduler: maintenanceScheduler,
             policy: policy,
             onMoment: onMoment

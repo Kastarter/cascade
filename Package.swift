@@ -18,7 +18,11 @@ let package = Package(
     targets: [
         .target(name: "CascadeDesignSystem"),
         .target(name: "CascadeMemory"),
-        .target(name: "MacContextKit", dependencies: ["CascadeMemory"]),
+        // GovernanceKit is deliberately ProviderKit-free: it speaks PerceptionCore's
+        // ActionDescriptor, never CUAction, so MacContextKit/AppShell can link it
+        // without a dependency cycle.
+        .target(name: "GovernanceKit", dependencies: ["CascadeMemory", "PerceptionCore"]),
+        .target(name: "MacContextKit", dependencies: ["CascadeMemory", "GovernanceKit"]),
         .target(
             name: "ComputerUseKit",
             dependencies: ["CascadeMemory", "MacContextKit", "PerceptionCore"],
@@ -40,6 +44,7 @@ let package = Package(
                 "CascadeDesignSystem",
                 "CascadeMemory",
                 "ComputerUseKit",
+                "GovernanceKit",
                 "MacContextKit",
                 "PerceptionCore",
                 "ProviderKit",
@@ -67,7 +72,8 @@ let package = Package(
             dependencies: ["AgentOrchestrator", "AppShell", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
         .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory", "PerceptionCore"]),
-        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory"]),
+        .testTarget(name: "GovernanceKitTests", dependencies: ["GovernanceKit", "CascadeMemory", "PerceptionCore"]),
+        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory", "GovernanceKit"]),
         .testTarget(
             name: "ProviderKitTests",
             dependencies: ["ProviderKit", "CascadeMemory"],
@@ -76,7 +82,7 @@ let package = Package(
         .testTarget(name: "SandboxKitTests", dependencies: ["ProviderKit", "SandboxKit", "AgentOrchestrator"]),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection", "SandboxKit", "MacContextKit"]
+            dependencies: ["AppShell", "AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "GovernanceKit", "PerceptionCore", "ProviderKit", "WasteDetection", "SandboxKit", "MacContextKit"]
         ),
         .testTarget(
             name: "ReliabilityEvalTests",
