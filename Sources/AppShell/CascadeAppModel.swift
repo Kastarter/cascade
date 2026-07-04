@@ -5634,7 +5634,27 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     nonisolated static func groundAuditDetail(_ detail: String) -> String {
-        textAuditDetail("ground", detail)
+        // P7-05/P7-07 sanitize the raw in-agent ground log down to hash/count
+        // descriptors. The grounding SOURCE routing decision (accessibility /
+        // ocr / uiTars / …) is a closed enum token, not user identity — persist
+        // it structurally so reliability baselines (FailureLedger's
+        // groundingSourceShares) measure the real mechanism from audit rows
+        // instead of a token the sanitizer strips. Absent when the log carries
+        // no source (e.g. a miss with no candidate) — readers degrade to
+        // `unknown`, never guess.
+        let descriptor = textAuditDetail("ground", detail)
+        guard let source = groundLogSourceToken(detail) else { return descriptor }
+        return "\(descriptor) source=\(source)"
+    }
+
+    /// First `source=<GroundingSource.rawValue>` token of an in-agent ground
+    /// log (`ComputerUseAgent`/`ScoutAgent` `appendGroundLog` format; a Scout
+    /// turn may join several logs with "; " — the first grounded target
+    /// represents the row).
+    nonisolated static func groundLogSourceToken(_ detail: String) -> String? {
+        guard let range = detail.range(of: "source=") else { return nil }
+        let token = String(detail[range.upperBound...].prefix { $0.isLetter })
+        return token.isEmpty ? nil : safeAuditToken(token)
     }
 
     nonisolated static func groundingVerifierAuditDetail(_ outcome: MixtureGrounder.VerifierOutcome) -> String {

@@ -77,12 +77,17 @@ public enum AgentFailureKind: String, Sendable, Equatable, CaseIterable, Codable
 
     /// Detail-aware mapping for audit actions that are emitted for BOTH success and
     /// failure and can only be classified by their detail. `assist.validate` /
-    /// `sandbox.verify` carry an `INCOMPLETE: …` detail on failure and `verified: …`
-    /// on success; the latter is not a failure. Falls back to the action-only map.
+    /// `sandbox.verify` persist a `status=incomplete` token on failure (P7-era
+    /// sanitized emitters `CascadeAppModel.assistValidationAuditDetail` /
+    /// `BackgroundWebAgent.sandboxVerifyAuditDescriptor`) and `status=verified`
+    /// on success; pre-sanitization history carried a raw `INCOMPLETE: …`
+    /// prefix, still recognized so old rows keep classifying. Falls back to the
+    /// action-only map.
     public init?(auditAction: String, detail: String) {
         switch auditAction {
         case "assist.validate", "sandbox.verify":
-            guard detail.uppercased().hasPrefix("INCOMPLETE") else { return nil }
+            let normalized = detail.lowercased()
+            guard normalized.hasPrefix("incomplete") || normalized.contains("status=incomplete") else { return nil }
             self = .validatorIncomplete
         case "assist.verify.action":
             guard detail.contains("status=failed") || detail.contains("postEffect=mismatch") else { return nil }

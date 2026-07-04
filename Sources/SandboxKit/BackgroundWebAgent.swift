@@ -1186,7 +1186,15 @@ public final class BackgroundWebAgent {
     }
 
     nonisolated static func sandboxGroundAuditDescriptor(_ detail: String) -> String {
-        "status=hit targetChars=\(detail.count) targetHash=\(auditHash(detail))"
+        // The web grounding SOURCE (dom / uiTars / …) is a closed enum token,
+        // not page identity — persist it as a structured safe-token beside the
+        // hash/count descriptor (mirrors CascadeAppModel.groundAuditDetail) so
+        // per-surface grounding source shares stay measurable from audit rows.
+        let descriptor = "status=hit targetChars=\(detail.count) targetHash=\(auditHash(detail))"
+        guard let range = detail.range(of: "source=") else { return descriptor }
+        let token = String(detail[range.upperBound...].prefix { $0.isLetter })
+        guard !token.isEmpty else { return descriptor }
+        return "\(descriptor) source=\(safeAuditToken(token))"
     }
 
     nonisolated static func sandboxGroundMissAuditDescriptor(_ target: String) -> String {
