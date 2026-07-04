@@ -430,7 +430,7 @@ public struct AnthropicMessagesClient: Sendable {
             ?? response.value(forHTTPHeaderField: "anthropic-request-id")
     }
 
-    private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
+    static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
         guard let raw = response.value(forHTTPHeaderField: "retry-after") else { return nil }
         if let seconds = TimeInterval(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
             return max(0, seconds)

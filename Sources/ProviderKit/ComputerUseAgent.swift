@@ -283,6 +283,19 @@ public final class ComputerUseAgent {
     private let model: String
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
 
+    /// UserDefaults bool key gating the ModelTransporting send path
+    /// (`defaults write com.humain.cascade cascade.transportPolicy -bool YES`).
+    /// Read ONCE at agent construction, like the other cascade.* flags — flipping
+    /// it mid-episode takes effect on the next constructed agent, not a running
+    /// one. Default false ⇒ `transport` is nil ⇒ `streamMessage` runs the shipped
+    /// single-retry loop byte-identically.
+    nonisolated public static let transportPolicyDefaultsKey = "cascade.transportPolicy"
+    /// Flag-gated transport that owns the retry loop around one turn's model send
+    /// (transient-only retry + SideEffectFence). nil = today's exact behavior.
+    private let transport: (any ModelTransporting)?
+    /// Test hook: which transport (if any) the flag resolution wired in.
+    var transportForTesting: (any ModelTransporting)? { transport }
+
     private var messages: [[String: Any]] = []
     private var pendingToolIDs: [String] = []
     /// Text answers for tool_use ids resolved in-process (use_skill pulls) —
@@ -763,7 +776,9 @@ public final class ComputerUseAgent {
         actionCritic: (any ActionCritic)? = nil,
         historyCompactionEnabled: Bool = false,
         historyCompactionRecentTurns: Int = ComputerUseAgent.historyCompactionRecentTurnDefault,
-        actionChunkingEnabled: Bool = false
+        actionChunkingEnabled: Bool = false,
+        transport: (any ModelTransporting)? = nil,
+        transportDefaults: UserDefaults = .standard
     ) {
         self.keyStore = keyStore
         self.model = model
@@ -787,9 +802,23 @@ public final class ComputerUseAgent {
         self.historyCompactionEnabled = historyCompactionEnabled
         self.historyCompactionRecentTurns = max(1, historyCompactionRecentTurns)
         self.actionChunkingEnabled = actionChunkingEnabled
+        self.transport = Self.resolveTransport(explicit: transport, defaults: transportDefaults)
         // Structural grounding needs a grounder to act on named targets; without
         // one, fall back to the coordinate computer tool so the agent still works.
         self.groundingMode = (groundingMode == .structural && grounder != nil) ? .structural : .coordinate
+    }
+
+    /// The flag resolution for `cascade.transportPolicy`: an explicitly injected
+    /// transport always wins (tests); otherwise `DefaultModelTransport` only when
+    /// the UserDefaults flag is true, nil (today's exact no-retry behavior) when
+    /// unset or false.
+    static func resolveTransport(
+        explicit: (any ModelTransporting)?,
+        defaults: UserDefaults
+    ) -> (any ModelTransporting)? {
+        if let explicit { return explicit }
+        guard defaults.bool(forKey: transportPolicyDefaultsKey) else { return nil }
+        return DefaultModelTransport()
     }
 
     /// The resolution screenshots are sent to the model at, fixed by `begin`.
@@ -2377,7 +2406,9 @@ public final class ComputerUseAgent {
 
     private enum StreamOutcome {
         case success(StreamedMessage)
-        case retry(after: Double?)
+        // `kind` classifies the failure for the flag-gated ModelTransporting
+        // path; the OFF path ignores it.
+        case retry(after: Double?, kind: ModelTransportFailure.Kind)
         case fatal
     }
 
@@ -2387,18 +2418,43 @@ public final class ComputerUseAgent {
     /// mid-stream: it would generate a fresh plan against a screen the half-finished
     /// turn already changed.
     private func streamMessage(_ request: URLRequest) async -> StreamedMessage? {
+        if let transport { return await streamMessage(request, via: transport) }
         for attempt in 0..<2 {
             switch await attemptStream(request, canRetry: attempt == 0) {
             case .success(let message): return message
             case .fatal: return nil
-            case .retry(let after):
+            case .retry(let after, _):
                 try? await Task.sleep(for: .seconds(min(after ?? 1.0, 5)))
             }
         }
         return nil
     }
 
-    private func attemptStream(_ request: URLRequest, canRetry: Bool) async -> StreamOutcome {
+    /// The flag-gated (`cascade.transportPolicy`) send path: the transport owns
+    /// the retry loop (≤2 transient-only retries with jittered backoff), and one
+    /// SideEffectFence per turn arms on the first EXECUTED action — after which
+    /// retry is structurally forbidden and only salvage can produce a message.
+    private func streamMessage(
+        _ request: URLRequest, via transport: any ModelTransporting
+    ) async -> StreamedMessage? {
+        let fence = SideEffectFence()
+        return await transport.send(fence: fence) {
+            // canRetry: true — the transport, not the attempt, owns the retry
+            // ceiling; a real 4xx still comes back .fatal from the shipped guard.
+            switch await self.attemptStream(request, canRetry: true, fence: fence) {
+            case .success(let message):
+                return .success(message)
+            case .fatal:
+                return .fatal
+            case .retry(let after, let kind):
+                return .failure(ModelTransportFailure(kind: kind, retryAfter: after))
+            }
+        }
+    }
+
+    private func attemptStream(
+        _ request: URLRequest, canRetry: Bool, fence: SideEffectFence? = nil
+    ) async -> StreamOutcome {
         // TTFT instrumentation: time-to-first-token isolates the lever effort:low
         // and the TLS prewarm move. Without it the only signals are tokens
         // (logUsage) and whole-episode model ms (assist.timing) — neither shows
@@ -2412,7 +2468,7 @@ public final class ComputerUseAgent {
         } catch {
             guard canRetry else { return .fatal }
             Self.logger.notice("step transport error — retrying once: \(error.localizedDescription, privacy: .public)")
-            return .retry(after: nil)
+            return .retry(after: nil, kind: .transport)
         }
         guard let http = response as? HTTPURLResponse else { return .fatal }
         guard (200..<300).contains(http.statusCode) else {
@@ -2421,7 +2477,12 @@ public final class ComputerUseAgent {
                 return .fatal
             }
             Self.logger.notice("step got HTTP \(http.statusCode) — retrying once")
-            return .retry(after: http.value(forHTTPHeaderField: "retry-after").flatMap(Double.init))
+            // ON (fence != nil) reuses AnthropicMessagesClient's numeric+HTTP-date
+            // Retry-After parser; OFF keeps the shipped numeric-only expression.
+            let after: Double? = fence != nil
+                ? AnthropicMessagesClient.retryAfter(from: http)
+                : http.value(forHTTPHeaderField: "retry-after").flatMap(Double.init)
+            return .retry(after: after, kind: .http(status: http.statusCode))
         }
 
         var message = StreamedMessage()
@@ -2474,6 +2535,7 @@ public final class ComputerUseAgent {
                     case .skipped:
                         break
                     case .delivered:
+                        fence?.arm()
                         message.deliveredIndices.insert(message.content.count - 1)
                         message.deliveredActions += 1
                     case .aborted:
@@ -2513,7 +2575,7 @@ public final class ComputerUseAgent {
         var message = message
         let hasToolUse = message.content.contains { ($0["type"] as? String) == "tool_use" }
         if message.deliveredActions == 0, !hasToolUse {
-            return canRetry ? .retry(after: nil) : .fatal
+            return canRetry ? .retry(after: nil, kind: .transport) : .fatal
         }
         if message.stopReason == nil, hasToolUse { message.stopReason = "tool_use" }
         Self.logger.notice("salvaged \(message.content.count) blocks from a broken stream")
