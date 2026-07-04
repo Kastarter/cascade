@@ -23,6 +23,8 @@ struct GroundingBenchCommand {
                 try fixture(options)
             case "run":
                 try await run(options)
+            case "ablation":
+                try ablation(options)
             default:
                 throw CLIError.usage("Unknown command: \(command)\n\n\(Self.usage)")
             }
@@ -70,11 +72,23 @@ struct GroundingBenchCommand {
         print(try report.jsonString())
     }
 
+    private static func ablation(_ options: ArgumentParser) throws {
+        let jsonl = try options.requiredURL("--jsonl")
+        let report = try GroundingAblationRunner().run(jsonlURL: jsonl)
+        print(try report.jsonString())
+    }
+
     private static let usage = """
     Usage:
       swift run grounding-bench export --db <copy/Cascade.sqlite> --out <cases.jsonl> [--frame-root <dir>] [--target-sidecar <hash-to-text.json>]
       swift run grounding-bench fixture --out-dir <dir> [--jsonl <cases.jsonl>]
       swift run grounding-bench run --jsonl <cases.jsonl> [--preset <id>] [--endpoint <url>] [--model <id>] [--coord-space <smartResize|sent|normalized>] [--api-key-env <ENV>]
+      swift run grounding-bench ablation --jsonl <cases.jsonl>
+
+    `ablation` is the offline d21 pre-gate for ANY grounding change: it scores recorded
+    ax_only / vision_only / hybrid candidates by landing hit-test and prints
+    hybrid_failure_rate. It validates the scoring/policy machinery over RECORDED points --
+    it is NOT the live AX-first number (live audit_event evidence gates any default flip).
 
     Required flag:
       defaults write -g cascade.experimentalGroundingBench -bool true

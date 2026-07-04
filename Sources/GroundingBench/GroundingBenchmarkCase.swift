@@ -80,6 +80,10 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
     public let outcome: GroundingBenchmarkOutcome
     public let sourceAuditEventID: Int64?
     public let contextID: Int64?
+    /// Optional recorded per-source grounding candidates for the offline ablation runner.
+    /// Coordinates are in the SAME space as `expectedBoxOrPoint`. Purely additive:
+    /// old JSONL lines decode with nil, and nil never writes the key (see encode(to:)).
+    public let ablationCandidates: [GroundingAblationCandidate]?
 
     public init(
         schemaVersion: Int = GroundingBenchmarkCase.currentSchemaVersion,
@@ -94,7 +98,8 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         appName: String,
         outcome: GroundingBenchmarkOutcome,
         sourceAuditEventID: Int64? = nil,
-        contextID: Int64? = nil
+        contextID: Int64? = nil,
+        ablationCandidates: [GroundingAblationCandidate]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.caseID = caseID
@@ -109,6 +114,7 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         self.outcome = outcome
         self.sourceAuditEventID = sourceAuditEventID
         self.contextID = contextID
+        self.ablationCandidates = ablationCandidates
     }
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
@@ -125,6 +131,7 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         case outcome
         case sourceAuditEventID = "source_audit_event_id"
         case contextID = "context_id"
+        case ablationCandidates = "ablation_candidates"
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -142,6 +149,11 @@ public struct GroundingBenchmarkCase: Codable, Equatable, Sendable {
         try container.encode(outcome, forKey: .outcome)
         try Self.encodeNullable(sourceAuditEventID, in: &container, forKey: .sourceAuditEventID)
         try Self.encodeNullable(contextID, in: &container, forKey: .contextID)
+        // DELIBERATELY encodeIfPresent, NOT encodeNullable: the key must be ABSENT when nil so
+        // every previously-generated JSONL line re-encodes byte-identically. Do not "normalize"
+        // this to the file's encodeNullable convention -- that would change every re-exported
+        // file's bytes. schemaVersion stays 2 (purely additive, ignored by old readers).
+        try container.encodeIfPresent(ablationCandidates, forKey: .ablationCandidates)
     }
 
     public func jsonLine() throws -> String {

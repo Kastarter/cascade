@@ -9,6 +9,7 @@ public enum GroundingBenchFixtures {
         let firstFrame = directory.appendingPathComponent("synthetic-submit.png")
         let secondFrame = directory.appendingPathComponent("synthetic-search.png")
         let thirdFrame = directory.appendingPathComponent("synthetic-unlabeled.png")
+        let fourthFrame = directory.appendingPathComponent("synthetic-save.png")
 
         try drawFrame(
             to: firstFrame,
@@ -28,7 +29,18 @@ public enum GroundingBenchFixtures {
             highlight: CGRect(x: 82, y: 138, width: 92, height: 38),
             fill: CGColor(red: 0.62, green: 0.34, blue: 0.11, alpha: 1)
         )
+        try drawFrame(
+            to: fourthFrame,
+            title: "Save",
+            highlight: CGRect(x: 58, y: 120, width: 96, height: 40),
+            fill: CGColor(red: 0.44, green: 0.18, blue: 0.58, alpha: 1)
+        )
 
+        // Ablation candidates are RECORDED points in the fixture image's pixel space (the
+        // same space as expectedBoxOrPoint). The three labeled cases are built so the arms
+        // provably diverge: axOnly fails search (no AX candidate -- the canvas case),
+        // visionOnly fails save (vision candidate deliberately off-target), hybrid hits
+        // both => hybrid_failure_rate 0.0 on fixtures.
         let cases = [
             GroundingBenchmarkCase(
                 caseID: "fixture-box-submit",
@@ -38,7 +50,11 @@ public enum GroundingBenchFixtures {
                 expectedBoxOrPoint: .box(CGRect(x: 42, y: 58, width: 118, height: 46)),
                 appBundle: "com.cascade.fixture",
                 appName: "Fixture",
-                outcome: .accept
+                outcome: .accept,
+                ablationCandidates: [
+                    GroundingAblationCandidate(source: .accessibility, x: 101, y: 81, confidence: 0.94),
+                    GroundingAblationCandidate(source: .uiTars, x: 101, y: 81, confidence: 0.82),
+                ]
             ),
             GroundingBenchmarkCase(
                 caseID: "fixture-point-search",
@@ -48,7 +64,11 @@ public enum GroundingBenchFixtures {
                 expectedBoxOrPoint: .point(CGPoint(x: 207, y: 107), radius: 14),
                 appBundle: "com.cascade.fixture",
                 appName: "Fixture",
-                outcome: .accept
+                outcome: .accept,
+                ablationCandidates: [
+                    // Canvas-style case: NO AX candidate, accurate vision candidate.
+                    GroundingAblationCandidate(source: .uiTars, x: 207, y: 107, confidence: 0.78)
+                ]
             ),
             GroundingBenchmarkCase(
                 caseID: "fixture-unlabeled-later",
@@ -59,6 +79,22 @@ public enum GroundingBenchFixtures {
                 appBundle: "com.cascade.fixture",
                 appName: "Fixture",
                 outcome: .unlabeled
+            ),
+            GroundingBenchmarkCase(
+                caseID: "fixture-ax-favored-save",
+                framePath: fourthFrame.path,
+                targetText: "Save",
+                targetHash: "fixture-save",
+                expectedBoxOrPoint: .box(CGRect(x: 58, y: 120, width: 96, height: 40)),
+                appBundle: "com.cascade.fixture",
+                appName: "Fixture",
+                outcome: .accept,
+                ablationCandidates: [
+                    // AX-favored case: accurate AX candidate, vision candidate deliberately
+                    // outside the expected box (the vision-miss arm case).
+                    GroundingAblationCandidate(source: .accessibility, x: 106, y: 140, confidence: 0.91),
+                    GroundingAblationCandidate(source: .uiTars, x: 262, y: 34, confidence: 0.66),
+                ]
             ),
         ]
         if let jsonlURL {
