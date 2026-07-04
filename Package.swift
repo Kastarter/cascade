@@ -24,7 +24,8 @@ let package = Package(
             dependencies: ["CascadeMemory", "MacContextKit"],
             resources: [.copy("Skills")]
         ),
-        .target(name: "ProviderKit", dependencies: ["CascadeMemory"]),
+        .target(name: "PerceptionCore"),
+        .target(name: "ProviderKit", dependencies: ["CascadeMemory", "PerceptionCore"]),
         .target(name: "SandboxKit", dependencies: ["ProviderKit", "CascadeMemory", "AgentOrchestrator"]),
         .target(name: "WasteDetection", dependencies: ["CascadeMemory"]),
         .target(
@@ -54,6 +55,7 @@ let package = Package(
             name: "GroundingBenchCLI",
             dependencies: ["GroundingBench", "ProviderKit"]
         ),
+        .testTarget(name: "PerceptionCoreTests", dependencies: ["PerceptionCore"]),
         .testTarget(name: "CascadeMemoryTests", dependencies: ["CascadeMemory"]),
         .testTarget(
             name: "WasteDetectionTests",

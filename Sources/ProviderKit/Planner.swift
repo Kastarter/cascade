@@ -1,5 +1,6 @@
 import CascadeMemory
 import Foundation
+import PerceptionCore
 
 /// The safe action vocabulary a planner may propose. There is deliberately **no**
 /// shell/exec/file case — a model that tries to emit one decodes to `.unsupported`
@@ -132,12 +133,8 @@ public protocol ActionCritic: Sendable {
     func critique(_ request: ActionCritiqueRequest) async -> ActionCritique
 }
 
-public enum ActionRisk: String, Sendable, Equatable, Codable {
-    case low
-    case elevated
-    case high
-    case destructive
-}
+// ActionRisk moved to Sources/PerceptionCore/ActionRisk.swift (t06); shim keeps callsites compiling unchanged.
+public typealias ActionRisk = PerceptionCore.ActionRisk
 
 public struct PreActionVerification: Sendable, Equatable {
     public let risk: ActionRisk
