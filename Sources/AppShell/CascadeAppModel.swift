@@ -3482,13 +3482,20 @@ public final class CascadeAppModel: ObservableObject {
         // skill's full instructions itself via the use_skill tool. Content
         // never rides the prompt (token cost stays flat as the library grows).
         //
-        // On-screen assist runs on Opus 4.8 (the most capable model that still
-        // supports the computer-use-2025-11-24 beta). Slower per turn than Sonnet,
-        // but its stronger planning does the work in far fewer turns — and the
-        // 2026-06-22 audit confirmed turns, not per-turn latency, dominate
-        // wall-clock (Sonnet-first ballooned the same Keynote task from ~10 turns
-        // to 15 and over-thought; reverted). Effort stays medium — CU default.
-        let cuModel = AnthropicModel.opus
+        // On-screen assist model is runtime-swappable via cascade.onScreenModel
+        // (opus|sonnet; haiku coerced to sonnet — no computer-use-2025-11-24 beta).
+        // DEFAULT sonnet (under test for cost); flip to opus for max accuracy with
+        //   defaults write com.humain.cascade cascade.onScreenModel opus
+        // Opus plans in fewer turns — the 2026-06-22 audit found turns, not
+        // per-turn latency, dominate wall-clock — so opus stays the accuracy floor.
+        let cuModel: String = {
+            switch defaultsStore.string(forKey: "cascade.onScreenModel")?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "opus": return AnthropicModel.opus
+            case "haiku": return AnthropicModel.sonnet
+            default: return AnthropicModel.sonnet
+            }
+        }()
         let sourcePlan = routeHint ?? Self.routeIntentHeuristic(goal)
         let searchShapedGoal = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey) && Self.routeNeedsSourceEvidence(sourcePlan)
         let actionChunkingEnabled = (defaultsStore.object(forKey: Self.experimentalActionChunkingKey) as? Bool) ?? true
