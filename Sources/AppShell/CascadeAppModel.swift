@@ -373,6 +373,12 @@ public final class CascadeAppModel: ObservableObject {
     nonisolated static let experimentalAutoRecallKey = "cascade.experimentalAutoRecall"
     nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
     nonisolated static let experimentalPostActionVerifierKey = "cascade.postActionVerifier"
+    /// §4b RecipeReplayRunner V2 (ensemble AX replay ladder, t11) — default OFF.
+    /// Unset/false ⇒ the shipped `runAgentRecipe` body executes byte-identically.
+    /// Never registered as a default; flipping ON is only ever earned by the
+    /// user's live audit_event rows (LAW 3): recipe.target tier distribution +
+    /// recipe.unverified rate at parity or better vs a flag-OFF run.
+    nonisolated static let experimentalReplayRunnerV2Key = "cascade.replayRunnerV2"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
@@ -396,6 +402,12 @@ public final class CascadeAppModel: ObservableObject {
 
     nonisolated static func experimentalAutoRecallEnabled(defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: Self.experimentalAutoRecallKey)
+    }
+
+    /// §4b replay runner V2 gate — pure and testable; never registers a default
+    /// (`bool(forKey:)` on an absent key is false, so the flag ships OFF).
+    nonisolated static func replayRunnerV2Enabled(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: Self.experimentalReplayRunnerV2Key)
     }
 
     /// §4a post-action verification ladder (PostActionVerifier) — default OFF.
@@ -8860,6 +8872,14 @@ public final class CascadeAppModel: ObservableObject {
             refuseUntrustedAuditHistory()
             return
         }
+        // §4b (t11): V2 ensemble replay ladder behind cascade.replayRunnerV2.
+        // Placed AFTER the audit-trust gate so V2 can never bypass it. With the
+        // flag absent/false this branch is dead and every existing line below
+        // executes byte-identically (LAW 6).
+        if Self.replayRunnerV2Enabled(defaultsStore) {
+            await runAgentRecipeV2(agent)
+            return
+        }
         let steps = agent.recipe.steps.sorted { $0.order < $1.order }
         _ = try? await store.appendAudit(AuditEvent(
             actor: "agent",
@@ -9515,14 +9535,11 @@ public final class CascadeAppModel: ObservableObject {
     /// the right value from context — never blindly retype last run's. Fixed steps
     /// and pre-`isParameter` recipes return false and replay normally. Pure +
     /// pinned. See [[cascade-cu-downgrade-research]].
+    /// Delegates to the ONE shared symbol (`RecipeReplayRunner.stepNeedsLiveValue`,
+    /// t11) so the V1 and V2 parameter gates can never silently diverge —
+    /// byte-for-byte the same pure predicate this wrapper carried before.
     nonisolated static func recipeStepNeedsLiveValue(_ step: RecipeStep) -> Bool {
-        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
-    }
-
-    nonisolated static func isPasteShortcut(_ step: RecipeStep) -> Bool {
-        guard step.kind == .key, step.key?.lowercased() == "v" else { return false }
-        let modifiers = step.modifiers.map { $0.lowercased() }
-        return modifiers.contains("command") || modifiers.contains("control")
+        RecipeReplayRunner.stepNeedsLiveValue(step)
     }
 
     nonisolated static func appMatches(frontmostName: String?, frontmostBundle: String?, expectedName: String, expectedBundle: String?) -> Bool {
@@ -11151,5 +11168,389 @@ private extension MixtureGrounder.VerifierOutcome {
         case .retryNextCandidate:
             return "retryNextCandidate"
         }
+    }
+}
+
+// MARK: - §4b Recipe replay V2 (RecipeReplayRunner behind cascade.replayRunnerV2, t11)
+//
+// Appended at the END of CascadeAppModel.swift on purpose: the live Hooks reach
+// the same PRIVATE helpers the shipped path uses (resolveByAX's descriptor
+// construction, regroundedByOCR, regroundedTarget, verifyUIChange, uiState,
+// unexpectedModal, startStateMismatch, axActivate, escalateRecipeToAssist,
+// recipeTargetCache, the ActionTrajectoryCache lookup/promote/demote) with zero
+// access-level churn. Only reachable when `cascade.replayRunnerV2` is true.
+
+extension CascadeAppModel {
+    /// Mutable per-step context shared by the live replay hooks. The runner owns
+    /// the ladder policy; this box carries the pre-click AX snapshot and the
+    /// step's cache context between stateless hook calls so promote/demote hit
+    /// the EXACT same cache entries the shipped path would.
+    @MainActor final class ReplayV2HookState {
+        var snapshot: UIStateSnapshot?
+        var cacheContext: RecipeTargetCacheContext?
+        var currentStep: RecipeStep?
+    }
+
+    func runAgentRecipeV2(_ agent: CascadeAgent) async {
+        let steps = agent.recipe.steps.sorted { $0.order < $1.order }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recipe.run.started",
+            detail: Self.recipeRunAuditDetail(agent: agent) + " engine=replay_v2"
+        ))
+        let outcome = await RecipeReplayRunner().run(
+            steps: steps,
+            hooks: makeReplayV2Hooks(state: ReplayV2HookState())
+        )
+        let status = outcome == .completed ? "completed" : "paused"
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recipe.run.ended",
+            detail: Self.recipeRunAuditDetail(agent: agent, status: status) + " engine=replay_v2"
+        ))
+        switch outcome {
+        case .completed:
+            agentMessage = "Done — ran “\(agent.name)”."
+            dock.show(title: "Done", detail: agentMessage)
+            // Only COMPLETED runs count toward reclaimed time (parity with V1).
+            await recordOnScreenAgentCompletion(agent)
+        case .stopped:
+            agentMessage = "Stopped. Control returned to you."
+            dock.show(title: "Stopped", detail: agentMessage)
+        case .failed(let message):
+            agentMessage = "Stopped: \(message)"
+            dock.show(title: "Stopped", detail: agentMessage)
+        case .replan(let reason):
+            await escalateReplayV2(agent, reason: reason)
+        }
+        await refreshAll()
+    }
+
+    /// Maps the runner's typed REPLAN contract onto today's escalation path with
+    /// the same AgentFailureKind mapping the shipped body uses.
+    private func escalateReplayV2(_ agent: CascadeAgent, reason: RecipeReplanReason) async {
+        switch reason {
+        case .wrongStartState(_, let actual):
+            await escalateRecipeToAssist(
+                agent,
+                reason: actual ?? "the screen isn’t where the recording started",
+                failureKind: .wrongStartState,
+                recoveryAction: Self.recoveryAction(for: .wrongStartState, attempt: 1)
+            )
+        case .unexpectedModal(let title):
+            await escalateRecipeToAssist(
+                agent,
+                reason: "an unexpected dialog (“\(title)”) appeared",
+                failureKind: .unexpectedModal,
+                recoveryAction: AgentRecoveryPolicy.plan(for: AgentOrchestrator.AgentFailureKind.unexpectedModal).terminal
+            )
+        case .parameterNeedsLiveValue:
+            await escalateRecipeToAssist(
+                agent,
+                reason: "this step enters a value that changes each run, and I need the current one",
+                failureKind: .parameterNeedsLiveValue,
+                recoveryAction: Self.recoveryAction(for: .parameterNeedsLiveValue, attempt: 1)
+            )
+        case .ambiguousTarget(_, let choices, let frames):
+            await escalateRecipeToAssist(
+                agent,
+                reason: "multiple current targets match this recorded click",
+                failureKind: .targetNotFound,
+                recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
+                ambiguityChoices: choices,
+                ambiguityFrames: frames
+            )
+        case .targetNotFound:
+            await escalateRecipeToAssist(
+                agent,
+                reason: "the recorded target can’t be found in the current UI",
+                failureKind: .targetNotFound,
+                recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1)
+            )
+        case .driftNoEffect:
+            await escalateRecipeToAssist(
+                agent,
+                reason: "the screen no longer matches the recorded steps",
+                failureKind: .noEffect,
+                recoveryAction: Self.recoveryAction(for: .noEffect, attempt: RecipeReplayRunner.driftReplanStreak)
+            )
+        }
+    }
+
+    /// Builds the live Hooks on the MainActor; each closure hops back via the
+    /// captured `self` (the same implicit-hop pattern resolveByAX's Task.detached
+    /// AX walk already uses).
+    private func makeReplayV2Hooks(state: ReplayV2HookState) -> RecipeReplayRunner.Hooks {
+        RecipeReplayRunner.Hooks(
+            isStopRequested: { [weak self] in
+                await self?.replayV2IsStopRequested() ?? true
+            },
+            activateApp: { [weak self] name, bundle in
+                await self?.activateAndConfirm(name: name, bundle: bundle)
+            },
+            startStateMismatch: { step in
+                await Self.startStateMismatch(step: step)
+            },
+            unexpectedModalTitle: {
+                await Self.unexpectedModal()
+            },
+            uiFingerprint: { [weak self] in
+                await self?.replayV2Fingerprint(state: state)
+            },
+            stepAXUnreliable: { [weak self] step in
+                await self?.replayV2StepAXUnreliable(step) ?? false
+            },
+            mergedAnchors: { [weak self] step, fingerprint in
+                await self?.replayV2MergedAnchors(step: step, stateFingerprint: fingerprint, state: state) ?? []
+            },
+            ensembleCandidates: { descriptor, near in
+                guard descriptor.hasSignal else { return [] }
+                return await Task.detached(priority: .userInitiated) {
+                    AXElementResolver.rank(recorded: descriptor, near: near, limit: 5)
+                }.value
+            },
+            axPress: { point in
+                await Self.axActivate(atCG: point)
+            },
+            click: { [weak self] step, point in
+                try await self?.replayV2Click(step, at: point)
+            },
+            performOther: { [weak self] step in
+                try await self?.replayV2PerformOther(step)
+            },
+            ocrRegroundPoint: { [weak self] anchor in
+                await self?.regroundedByOCR(anchor: anchor)
+            },
+            visionRegroundPoint: { [weak self] anchor, recorded in
+                // The SAME full-screen `regroundedTarget` → ElementLocator call
+                // the shipped vision tier makes; nil when vision could not
+                // improve on the recorded point.
+                guard let self else { return nil }
+                let point = await self.regroundedTarget(anchor: anchor, recorded: recorded)
+                return point == recorded ? nil : point
+            },
+            verifyChanged: { [weak self] _ in
+                await self?.replayV2Verify(state: state) ?? .unavailable
+            },
+            promoteVerified: { [weak self] step, point, descriptor, tier, verifiedScore, source in
+                await self?.replayV2Promote(
+                    step: step,
+                    point: point,
+                    descriptor: descriptor,
+                    tier: tier,
+                    verifiedScore: verifiedScore,
+                    source: source,
+                    state: state
+                )
+            },
+            demoteAnchor: { [weak self] anchor, reason in
+                await self?.replayV2Demote(anchor: anchor, reason: reason, state: state)
+            },
+            audit: { [weak self] action, detail in
+                await self?.replayV2Audit(action: action, detail: detail)
+            },
+            progress: { [weak self] title, detail in
+                Task { @MainActor [weak self] in
+                    self?.dock.show(title: title, detail: detail)
+                }
+            }
+        )
+    }
+
+    private func replayV2IsStopRequested() -> Bool {
+        driver.runState.isStopRequested
+    }
+
+    /// V1 parity (`axUnreliable` at the top of the shipped click branch): canvas
+    /// apps whose skill declares the AX tree unreliable skip the AX tiers and
+    /// fingerprint verification in the runner.
+    private func replayV2StepAXUnreliable(_ step: RecipeStep) -> Bool {
+        appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)?.axUnreliable == true
+    }
+
+    private func replayV2Fingerprint(state: ReplayV2HookState) async -> Int? {
+        let snapshot = await Self.uiState()
+        state.snapshot = snapshot
+        return snapshot.map { Int(truncatingIfNeeded: $0.rootHash) }
+    }
+
+    /// Healed in-memory RecipeTargetCache entry + historical persistent
+    /// ActionTrajectoryCache row for this step, verified-score order, deduped by
+    /// anchorHash — the merged anchor queue the runner tries BEFORE live ensemble.
+    private func replayV2MergedAnchors(
+        step: RecipeStep,
+        stateFingerprint: String?,
+        state: ReplayV2HookState
+    ) async -> [ReplayAnchor] {
+        state.currentStep = step
+        state.cacheContext = nil
+        let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
+        let axUnreliable = stepSkill?.axUnreliable == true
+        guard Self.recipeTargetCacheSkipReason(step: step, axUnreliable: axUnreliable) == nil else { return [] }
+        // Use the full-precision snapshot fingerprint (String(rootHash)) so the
+        // cache context matches what the shipped path writes — the runner's Int
+        // fingerprint is only its opaque verify token.
+        guard let fingerprint = state.snapshot.map({ String($0.rootHash) }) ?? stateFingerprint else { return [] }
+        let context = await recipeTargetCacheContext(for: step, stateFingerprint: fingerprint)
+        state.cacheContext = context
+
+        var anchors: [ReplayAnchor] = []
+        if let cached = await recipeTargetCache.lookup(context) {
+            anchors.append(ReplayAnchor(
+                point: cached.point,
+                descriptor: nil,
+                anchorHash: cached.anchorHash,
+                verifiedScore: cached.verifiedScore,
+                verifiedSource: cached.source,
+                source: "target_cache_\(cached.tier.rawValue)",
+                origin: .healed
+            ))
+        }
+        if await ensureActionTrajectoryCacheSchema() {
+            let persistentState = ActionTrajectoryState(
+                appName: step.appName,
+                bundleIdentifier: step.bundleIdentifier,
+                windowTitle: step.windowTitleHint,
+                axFingerprint: fingerprint
+            )
+            if let lookup = try? await store.lookupActionTrajectoryCache(
+                goal: step.humanLabel,
+                state: persistentState,
+                targetDescriptor: step.targetDescriptor,
+                targetText: step.ocrAnchor ?? step.text,
+                actionKind: "click"
+            ),
+               let row = lookup.executable?.row,
+               case .click(let x, let y)? = Self.actionTrajectoryCUAction(kind: row.actionKind, json: row.actionJSON) {
+                anchors.append(ReplayAnchor(
+                    point: CGPoint(x: x, y: y),
+                    descriptor: nil,
+                    anchorHash: row.targetDescriptor.map(AuditIdentity.hash),
+                    verifiedScore: row.confidence,
+                    // V1 parity: a persistent trajectory row re-promotes as an
+                    // accessibility-sourced anchor (see the shipped persistent-
+                    // cache hit path).
+                    verifiedSource: .accessibility,
+                    source: "trajectory_cache",
+                    origin: .historical
+                ))
+            }
+        }
+        var seen = Set<String>()
+        return anchors
+            .sorted { ($0.verifiedScore ?? 0) > ($1.verifiedScore ?? 0) }
+            .filter { anchor in
+                guard let hash = anchor.anchorHash else { return true }
+                return seen.insert(hash).inserted
+            }
+    }
+
+    private func replayV2Click(_ step: RecipeStep, at point: CGPoint) async throws {
+        try await driver.act(.computerUse(.move(x: point.x, y: point.y)))
+        try? await Task.sleep(for: .milliseconds(320))
+        try await clickAction(step, at: point)
+    }
+
+    private func replayV2PerformOther(_ step: RecipeStep) async throws {
+        if step.kind == .type, let text = step.text,
+           appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)?
+               .shouldTypePhysicalKeys(text) == true,
+           let keys = AppSkillRegistry.physicalKeySequence(for: text) {
+            // Recorded modal numeric input (Blender) — replay as real keys,
+            // exactly as the shipped body does.
+            for key in keys {
+                try await driver.act(.computerUse(.key(key, modifiers: [])))
+                try? await Task.sleep(for: .milliseconds(30))
+            }
+        } else if let action = AgentAction(recipeStep: step) {
+            try await driver.act(action)
+        }
+        try? await Task.sleep(for: .milliseconds(500))
+    }
+
+    private func replayV2Verify(state: ReplayV2HookState) async -> ReplayVerification {
+        let result = await Self.verifyUIChange(after: state.snapshot)
+        switch result.status {
+        case .changed: return .changed
+        case .unchanged: return .unchanged
+        case .unavailable: return .unavailable
+        }
+    }
+
+    /// Effect-confirmed promote only (SEQ-29): feeds the same
+    /// `recipeTargetCache.promote` + `promoteActionTrajectoryRecipeCache` the
+    /// shipped path calls after a verified click — including the verified
+    /// score + typed source (V1's `targetScore`/`targetSource`), so healed
+    /// entries keep the confidence metadata `replayV2MergedAnchors` ordering
+    /// and AnchorDriftScorer previous-score comparisons consume.
+    private func replayV2Promote(
+        step: RecipeStep,
+        point: CGPoint,
+        descriptor: AXTargetDescriptorV2?,
+        tier: String,
+        verifiedScore: Double?,
+        source: AnchorDriftScorer.AnchorSource?,
+        state: ReplayV2HookState
+    ) async {
+        let anchorHash = descriptor.flatMap { d in
+            d.identifier ?? d.pathHash ?? d.subtreeHash ?? d.semanticTextHash ?? d.semanticHash
+        }
+        if let context = state.cacheContext {
+            let cacheTier = RecipeTargetCacheTier(rawValue: tier) ?? .ax
+            let promoted = await recipeTargetCache.promote(
+                context,
+                point: point,
+                tier: cacheTier,
+                verifiedScore: verifiedScore,
+                source: source,
+                anchorHash: anchorHash
+            )
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "recipe.target_cache.promote",
+                detail: Self.recipeTargetCacheAuditDetail(
+                    step: step,
+                    tier: cacheTier,
+                    confidence: promoted.confidence
+                ) + " engine=replay_v2"
+            ))
+        }
+        await promoteActionTrajectoryRecipeCache(
+            step: step,
+            point: point,
+            stateFingerprint: state.snapshot.map { String($0.rootHash) }
+        )
+    }
+
+    /// Routes a failed anchor's demotion to the EXACT existing demote function
+    /// for its origin, so persistence semantics are unchanged.
+    private func replayV2Demote(anchor: ReplayAnchor, reason: String, state: ReplayV2HookState) async {
+        switch anchor.origin {
+        case .healed:
+            if let context = state.cacheContext {
+                _ = await recipeTargetCache.demote(context)
+            }
+        case .historical:
+            if let step = state.currentStep {
+                await demoteActionTrajectoryRecipeCache(
+                    step: step,
+                    stateFingerprint: state.snapshot.map { String($0.rootHash) },
+                    reason: .wrongScreen
+                )
+            }
+        }
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: "recipe.target_cache.demote",
+            detail: "origin=\(anchor.origin.rawValue) reason=\(Self.safeAuditToken(reason)) engine=replay_v2"
+        ))
+    }
+
+    private func replayV2Audit(action: String, detail: String) async {
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent",
+            action: action,
+            detail: detail + " engine=replay_v2"
+        ))
     }
 }
