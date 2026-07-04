@@ -21,7 +21,7 @@ let package = Package(
         .target(name: "MacContextKit", dependencies: ["CascadeMemory"]),
         .target(
             name: "ComputerUseKit",
-            dependencies: ["CascadeMemory", "MacContextKit"],
+            dependencies: ["CascadeMemory", "MacContextKit", "PerceptionCore"],
             resources: [.copy("Skills")]
         ),
         .target(name: "PerceptionCore"),
@@ -41,6 +41,7 @@ let package = Package(
                 "CascadeMemory",
                 "ComputerUseKit",
                 "MacContextKit",
+                "PerceptionCore",
                 "ProviderKit",
                 "SandboxKit",
                 "WasteDetection"
@@ -65,7 +66,7 @@ let package = Package(
             name: "AgentOrchestratorTests",
             dependencies: ["AgentOrchestrator", "CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
         ),
-        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory"]),
+        .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory", "PerceptionCore"]),
         .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory"]),
         .testTarget(
             name: "ProviderKitTests",

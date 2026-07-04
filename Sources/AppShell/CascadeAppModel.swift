@@ -7,6 +7,7 @@ import ComputerUseKit
 import Foundation
 import ImageIO
 import MacContextKit
+import PerceptionCore
 import ProviderKit
 import SandboxKit
 import WasteDetection
@@ -472,7 +473,9 @@ public final class CascadeAppModel: ObservableObject {
     private struct GroundingSelectionEvidence: Sendable {
         let app: String
         let target: String
-        let source: GroundingSource
+        // Module-qualified: `import PerceptionCore` (t07) makes the bare name
+        // ambiguous with PerceptionCore.GroundingSource; this stays ProviderKit's.
+        let source: ProviderKit.GroundingSource
         let candidateID: String
         let confidence: Double
         let screenChanged: Bool
@@ -3430,7 +3433,7 @@ public final class CascadeAppModel: ObservableObject {
             // planner EVERY turn — not only on a failure — so it names targets that
             // exist and the grounder (AX-first, then visual) hits them. Bounded AX
             // walk (≤24, ≤0.3s); empty on canvas/Electron apps that expose nothing.
-            let controls = AXElementResolver.interactables(limit: 24)
+            let controls = await perceptionInteractables(limit: 24)
             let controlSummary = AXElementResolver.interactableSummary(controls)
             // Grounding-miss feedback — fires on ANY missed target this turn, idle OR
             // a partially-grounded batch (where step.actions is non-empty so the idle
@@ -3920,7 +3923,7 @@ public final class CascadeAppModel: ObservableObject {
                 ))
             }
             if let missed = agent.lastGroundMiss {
-                let controls = AXElementResolver.interactables(limit: 24)
+                let controls = await perceptionInteractables(limit: 24)
                 let summary = AXElementResolver.interactableSummary(controls)
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
@@ -4030,7 +4033,7 @@ public final class CascadeAppModel: ObservableObject {
                     // grounding>reasoning finding): hand the model the controls that
                     // ARE actually on screen so it re-grounds on real elements
                     // instead of re-guessing the same dead pixel.
-                    let controls = AXElementResolver.interactables()
+                    let controls = await perceptionInteractables()
                     if structuralGrounding {
                         // Structural mode names targets — pushing coordinates would be
                         // useless (it can't emit them). Push the control LABELS and
@@ -4365,7 +4368,7 @@ public final class CascadeAppModel: ObservableObject {
         case .assist:
             add("screen", groundingNote(), freshness: .live, order: 10, maxCharacters: 700)
         case .scout:
-            add("screen", scoutContextNote(), freshness: .live, order: 10, maxCharacters: 1_000)
+            add("screen", await scoutContextNote(), freshness: .live, order: 10, maxCharacters: 1_000)
         case .none:
             break
         }
@@ -5115,10 +5118,46 @@ public final class CascadeAppModel: ObservableObject {
     /// The first turn's pushed context for Scout: frontmost app/window + the controls
     /// actually on screen. Subsequent turns rebuild the same shape inline (reusing a
     /// single AX harvest alongside the no-effect/miss feedback).
-    private func scoutContextNote() -> String? {
-        let controlSummary = AXElementResolver.interactableSummary(AXElementResolver.interactables(limit: 24))
+    private func scoutContextNote() async -> String? {
+        let controlSummary = AXElementResolver.interactableSummary(await perceptionInteractables(limit: 24))
         let parts = [scoutGroundingNote(), scoutControlsLine(controlSummary)].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
+    /// The seam this app model's flail/context-push AX harvests route through
+    /// (LAW 6: the flag routes real behavior, no no-op shape). NOT yet every
+    /// harvest — the SoM candidate-index reads (`ScreenElementIndex`,
+    /// `MixtureGrounder.axGround`) still call `AXElementResolver.interactables`
+    /// directly, single-sample, flag or not. OFF (the default) is the literal
+    /// `AXElementResolver.interactables(limit:)` call each site made before —
+    /// byte-identical. ON pins the frontmost app ONCE into a
+    /// `PerceptionCore.AppTarget` (the pid is fixed BEFORE sampling — no
+    /// per-sample flickering-instant frontmost read; a future subtask-pinned
+    /// AppTarget slots in here), reads a constructor-enforced multi-sampled
+    /// `StableAXSnapshot`, audits a counts-only row, and filters through the
+    /// same shipped `interactableMatches`. AX untrusted fast-bails to []
+    /// (parity with the shipped path's `AXIsProcessTrusted()` guard — no
+    /// doomed IPC samples, no audit row); missing frontmost/bundleID or an
+    /// own-UI target degrade to [] exactly like today's empty-AX path.
+    private func perceptionInteractables(limit: Int = 40) async -> [AXElementResolver.Match] {
+        guard PerceptionSnapshotFlag.isEnabled else {
+            return AXElementResolver.interactables(limit: limit)
+        }
+        guard AXIsProcessTrusted(),
+              let frontmost = NSWorkspace.shared.frontmostApplication,
+              let bundleID = frontmost.bundleIdentifier else { return [] }
+        let target = PerceptionCore.AppTarget(pid: frontmost.processIdentifier, bundleID: bundleID)
+        let snapshot = await StableAXSnapshot(target: target)
+        // Counts only — AuditIdentity-safe, no labels.
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "agent", action: "perception.snapshot",
+            detail: "samples=\(snapshot.sampleCount)"
+                + " richness=\(snapshot.sampleRichness.map(String.init).joined(separator: ","))"
+                + " kept=\(snapshot.candidates.count)"
+                + " ownUI=\(snapshot.isOwnUI ? "true" : "false")"
+        ))
+        if snapshot.isOwnUI { return [] }
+        return snapshot.interactables(limit: limit)
     }
 
     /// OCR Set-of-Marks for the planner on canvas / sparse-AX surfaces. When the AX

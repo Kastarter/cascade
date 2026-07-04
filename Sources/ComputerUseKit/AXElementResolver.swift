@@ -314,9 +314,17 @@ public enum AXElementResolver {
     public static func interactables(limit: Int = 40) -> [Match] {
         guard AXIsProcessTrusted(),
               NSWorkspace.shared.frontmostApplication != nil else { return [] }
+        return interactableMatches(from: liveCandidates(), limit: limit)
+    }
+
+    /// The filter loop of `interactables(limit:)`, extracted verbatim as a PURE
+    /// static so the flag-gated `StableAXSnapshot` ON-path runs the SAME filter
+    /// (roles, dedupe, normalization, prefix bounds, Match construction) as the
+    /// shipped path — same inputs, same outputs, call-graph-only change.
+    public static func interactableMatches(from candidates: [Candidate], limit: Int = 40) -> [Match] {
         var seen = Set<String>()
         var out: [Match] = []
-        for candidate in liveCandidates().prefix(limit * 3) {
+        for candidate in candidates.prefix(limit * 3) {
             let descriptor = candidate.descriptor
             let role = descriptor.role ?? ""
             guard out.count < limit,
@@ -851,6 +859,14 @@ public enum AXElementResolver {
 
     public static func liveCandidates(limit: Int = 1_400) -> [Candidate] {
         guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return [] }
+        return liveCandidates(pid: pid, limit: limit)
+    }
+
+    /// The pid-PINNED walk behind `liveCandidates(limit:)` — verbatim body, minus
+    /// the frontmost lookup. `StableAXSnapshot` reads through this overload so a
+    /// perception pass targets one pinned app, never whatever happens to be
+    /// frontmost at a flickering instant.
+    public static func liveCandidates(pid: pid_t, limit: Int = 1_400) -> [Candidate] {
         let app = AXUIElementCreateApplication(pid)
         AXClient.setMessagingTimeout(app)
         var candidates: [Candidate] = []
