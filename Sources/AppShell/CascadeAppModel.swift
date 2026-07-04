@@ -381,6 +381,20 @@ public final class CascadeAppModel: ObservableObject {
     /// recipe.unverified rate at parity or better vs a flag-OFF run.
     nonisolated static let experimentalReplayRunnerV2Key = "cascade.replayRunnerV2"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
+    /// §7 encryption at rest (open wound #5) — default OFF. Unset/false ⇒ store
+    /// construction is literally today's plaintext
+    /// `CascadeStore(auditAnchor: KeychainAuditAnchor())`. ON does NOT encrypt
+    /// anything yet (`SQLCipherEnvelope.isSQLCipherLinked` is false — no
+    /// SQLCipher dependency exists): it only ensures a Keychain key exists via
+    /// `KeyCustodian` (real lifecycle), constructs the store with
+    /// `UnavailableStoreEncryptionEnvelope` so `encryptionStatus` reads
+    /// `.unavailable` STRUCTURALLY, and appends a
+    /// `store.encryption.unavailable` audit row (with the key-mint outcome)
+    /// saying the store is still
+    /// PLAINTEXT (LAW 7: visible degradation, never fake-encrypted). Never
+    /// registered as a default; no settings UI — arm via
+    /// `defaults write com.humain.cascade cascade.encryptAtRest -bool YES`.
+    nonisolated static let encryptAtRestKey = "cascade.encryptAtRest"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
     static let valueMonthlyActionBudgetKey = "cascade.value.monthlyActionBudget"
@@ -409,6 +423,46 @@ public final class CascadeAppModel: ObservableObject {
     /// (`bool(forKey:)` on an absent key is false, so the flag ships OFF).
     nonisolated static func replayRunnerV2Enabled(_ defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: Self.experimentalReplayRunnerV2Key)
+    }
+
+    /// §7 encryption-at-rest gate — pure and testable; never registers a default
+    /// (`bool(forKey:)` on an absent key is false, so the flag ships OFF).
+    /// Read ONLY here in AppShell at store construction; CascadeMemory itself
+    /// stays UserDefaults-free (the envelope is injected, same pattern as
+    /// `auditAnchor`).
+    nonisolated static func encryptAtRestEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.encryptAtRestKey)
+    }
+
+    /// How `init` must construct the production store under the
+    /// `cascade.encryptAtRest` flag. Pure and injectable (LAW 6: the flag's
+    /// actual wiring — key string, default-OFF, linked/unlinked split — is
+    /// exercised in CI without touching the production database path).
+    enum EncryptionBootDecision: Equatable, Sendable {
+        /// Flag OFF (the shipped default): today's plaintext store, byte-identical.
+        case plaintext
+        /// Flag ON but no cipher linked: plaintext store that STRUCTURALLY
+        /// carries `.unavailable` status via `UnavailableStoreEncryptionEnvelope`
+        /// (LAW 7: visible degradation, never fake-encrypted).
+        case plaintextEncryptionUnavailable
+        /// Flag ON and a cipher IS linked — unreachable today
+        /// (`SQLCipherEnvelope.isSQLCipherLinked` is pinned false by test).
+        /// Structural (LAW 1): linked+enabled can NEVER fall through to a
+        /// silent plaintext store; until `SQLCipherEnvelope.prepareConnection`
+        /// is implemented this path fails boot fast (the envelope throws
+        /// `cipherUnavailable`), never opens-and-pretends.
+        case cipher
+    }
+
+    /// §7 boot-path split for the encryption flag. `cipherLinked` is injectable
+    /// so tests exercise the (today unreachable) linked branch; production
+    /// callers pass `SQLCipherEnvelope.isSQLCipherLinked`.
+    nonisolated static func encryptionBootDecision(
+        defaults: UserDefaults,
+        cipherLinked: Bool = SQLCipherEnvelope.isSQLCipherLinked
+    ) -> EncryptionBootDecision {
+        guard encryptAtRestEnabled(defaults: defaults) else { return .plaintext }
+        return cipherLinked ? .cipher : .plaintextEncryptionUnavailable
     }
 
     /// §4a post-action verification ladder (PostActionVerifier) — default OFF.
@@ -609,7 +663,66 @@ public final class CascadeAppModel: ObservableObject {
         // Production store anchors its audit-chain head in the Keychain so
         // truncation/rewrite of the local audit log is detectable. Tests inject a
         // store and never hit this path.
-        let store = try injectedStore ?? CascadeStore(auditAnchor: KeychainAuditAnchor())
+        let store: CascadeStore
+        if let injectedStore {
+            store = injectedStore
+        } else {
+            // §7 encryption flag: the boot path is a STRUCTURAL three-way split
+            // (LAW 1) — linked+enabled maps to `.cipher` and can never silently
+            // fall through to a plaintext store.
+            switch Self.encryptionBootDecision(defaults: defaults) {
+            case .plaintext:
+                // Flag OFF (the shipped default) — today's path, byte-identical.
+                store = try CascadeStore(auditAnchor: KeychainAuditAnchor())
+            case .plaintextEncryptionUnavailable:
+                // Flag ON but SQLCipher is not linked (it never is today —
+                // Package.swift has no SQLCipher dependency). LAW 7: degrade to
+                // "not yet encrypted" VISIBLY, never fake-encrypted, and never
+                // pass the throwing SQLCipherEnvelope into a store the app must
+                // boot from. What IS real here: the KeyCustodian key lifecycle
+                // runs (best-effort — a Keychain denial in an unsigned build
+                // must not brick boot) and its outcome is RECORDED, so the
+                // audit row says whether the future cipher's key exists.
+                let databasePath = CascadeStore.defaultDatabasePath()
+                let keyNote: String
+                do {
+                    _ = try KeyCustodian(databasePath: databasePath).loadOrCreateKey()
+                    keyNote = "key=present"
+                } catch {
+                    keyNote = "key=unavailable(\(error.localizedDescription))"
+                }
+                let reason = "cascade.encryptAtRest ON but SQLCipher not linked; store is PLAINTEXT"
+                // The requested-but-unavailable state is carried STRUCTURALLY by
+                // the live store's `encryptionStatus` (.unavailable), not only
+                // by the best-effort audit row below.
+                store = try CascadeStore(
+                    auditAnchor: KeychainAuditAnchor(),
+                    encryptionEnvelope: UnavailableStoreEncryptionEnvelope(reason: reason)
+                )
+                Task {
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "system",
+                        action: "store.encryption.unavailable",
+                        detail: "\(reason); \(keyNote)"
+                    ))
+                }
+            case .cipher:
+                // Flag ON and SQLCipher linked — UNREACHABLE today
+                // (`isSQLCipherLinked` is pinned false by test). When the cipher
+                // lands, this is the real path: key the connection via
+                // SQLCipherEnvelope + run the one-time sqlcipher_export
+                // migration documented in EncryptionAtRest.swift. Until
+                // `prepareConnection` is implemented it THROWS `cipherUnavailable`
+                // → boot fails fast (LAW 8), never opens-and-pretends.
+                let databasePath = CascadeStore.defaultDatabasePath()
+                store = try CascadeStore(
+                    auditAnchor: KeychainAuditAnchor(),
+                    encryptionEnvelope: SQLCipherEnvelope(
+                        custodian: KeyCustodian(databasePath: databasePath)
+                    )
+                )
+            }
+        }
         self.store = store
         self.modelCallCache = Self.experimentalModelCallCache(defaults: defaults, store: store)
         cursorTheme = defaults.string(forKey: Self.cursorThemeKey)

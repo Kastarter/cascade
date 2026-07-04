@@ -1485,16 +1485,23 @@ public actor CascadeStore {
     private let path: String
     private let auditAnchor: AuditAnchorStore
     private let auditSigner: AuditSigner
+    /// §7 encryption seam (see EncryptionAtRest.swift). Defaults to the no-op
+    /// envelope so every existing call site keeps today's plaintext store
+    /// byte-identically; a real cipher envelope would key the connection in
+    /// `prepareConnection` before any other SQL runs.
+    private let encryptionEnvelope: any StoreEncryptionEnvelope
     private var batchBindFailureInjector: CascadeBatchBindFailureInjector?
 
     public init(
         path: String? = nil,
         auditAnchor: AuditAnchorStore = NullAuditAnchor(),
-        auditSigner: AuditSigner = NullAuditSigner()
+        auditSigner: AuditSigner = NullAuditSigner(),
+        encryptionEnvelope: any StoreEncryptionEnvelope = NullStoreEncryptionEnvelope()
     ) throws {
         self.path = path ?? Self.defaultDatabasePath()
         self.auditAnchor = auditAnchor
         self.auditSigner = auditSigner
+        self.encryptionEnvelope = encryptionEnvelope
         try Self.ensureParentDirectory(for: self.path)
 
         var handle: OpaquePointer?
@@ -1506,9 +1513,30 @@ public actor CascadeStore {
             throw CascadeStoreError.openFailed(message)
         }
 
+        // THE ENCRYPTION SEAM: runs on the fresh handle BEFORE migrate issues
+        // any SQL — exactly where SQLCipher's `PRAGMA key` must be the first
+        // statement on the connection. A throwing envelope aborts construction
+        // (fail fast, LAW 8) and must not leak the open handle.
+        if let openedHandle = handle {
+            do {
+                try encryptionEnvelope.prepareConnection(openedHandle, path: self.path)
+            } catch {
+                sqlite3_close(openedHandle)
+                throw error
+            }
+        }
+
         connection = SQLiteConnection(handle)
         try Self.migrate(handle)
         try Self.configureConnection(handle)
+    }
+
+    /// Honest encryption state of this store (LAW 7): `.notEncrypted` today in
+    /// every configuration, `.unavailable(reason:)` when encryption was requested
+    /// but no cipher is linked. UI/audit surface this instead of implying
+    /// encryption that does not exist.
+    public nonisolated var encryptionStatus: EncryptionAtRestStatus {
+        encryptionEnvelope.status
     }
 
     public static func defaultDatabasePath() -> String {
