@@ -986,3 +986,39 @@ func assistBackgroundWebResultClassificationIsPure() {
         #expect(Bool(false))
     }
 }
+
+// t09: EpisodeReliabilityKernel shadow glue — the verdict→token mapper and the
+// divergence rule the ON path actually switches on, including the rule that a
+// kernel-only groundmiss-bail (4f62dab is Scout-only inline) is NOT divergence
+// on the Opus lane.
+@Test func kernelShadowTokenMappingAndDivergenceRule() {
+    #expect(CascadeAppModel.kernelShadowToken(.proceed) == "proceed")
+    #expect(CascadeAppModel.kernelShadowToken(.recheckCleared) == "recheck-cleared")
+    #expect(CascadeAppModel.kernelShadowToken(.nudge(.idleActNow)) == "idle-nudge")
+    #expect(CascadeAppModel.kernelShadowToken(.nudge(.noEffect)) == "noeffect-nudge")
+    #expect(CascadeAppModel.kernelShadowToken(.nudge(.groundMiss)) == "groundmiss-nudge")
+    #expect(CascadeAppModel.kernelShadowToken(.bail(.idleStall)) == "idle-stall")
+    #expect(CascadeAppModel.kernelShadowToken(.bail(.noEffectStall)) == "noeffect-stall")
+    #expect(CascadeAppModel.kernelShadowToken(.bail(.emptyViewMisses)) == "groundmiss-bail")
+
+    // Equal tokens agree.
+    #expect(!CascadeAppModel.kernelShadowDiverged(inline: "proceed", kernel: "proceed"))
+    #expect(!CascadeAppModel.kernelShadowDiverged(inline: "noeffect-stall", kernel: "noeffect-stall"))
+    // Different tokens diverge.
+    #expect(CascadeAppModel.kernelShadowDiverged(inline: "proceed", kernel: "noeffect-nudge"))
+    #expect(CascadeAppModel.kernelShadowDiverged(inline: "idle-nudge", kernel: "idle-stall"))
+    // Kernel-extra empty-view bail is NOT divergence against ANY inline token.
+    #expect(!CascadeAppModel.kernelShadowDiverged(inline: "proceed", kernel: "groundmiss-bail"))
+    #expect(!CascadeAppModel.kernelShadowDiverged(inline: "groundmiss-nudge", kernel: "groundmiss-bail"))
+
+    // Divergence audit detail stays counts/tokens only (P7): no labels or goals.
+    let detail = CascadeAppModel.kernelShadowDivergedAuditDetail(
+        turn: 4, inline: "proceed", kernel: "noeffect-nudge", idleTurns: 0, noEffectTurns: 1
+    )
+    #expect(detail == "turn=4 inline=proceed kernel=noeffect-nudge idleTurns=0 noEffectStreak=1")
+
+    let summary = CascadeAppModel.kernelShadowSummaryAuditDetail(
+        outcome: "finished", turnsObserved: 9, divergences: 0, repetitionCount: 1, oscillationCount: 2
+    )
+    #expect(summary == "outcome=finished turnsObserved=9 diverged=0 repetition=1 oscillation=2")
+}

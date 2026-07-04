@@ -30,7 +30,7 @@ let package = Package(
         .target(name: "WasteDetection", dependencies: ["CascadeMemory"]),
         .target(
             name: "AgentOrchestrator",
-            dependencies: ["CascadeMemory", "ComputerUseKit", "ProviderKit", "WasteDetection"]
+            dependencies: ["CascadeMemory", "ComputerUseKit", "PerceptionCore", "ProviderKit", "WasteDetection"]
         ),
         .target(name: "GroundingBench", dependencies: ["CascadeMemory", "ProviderKit"]),
         .target(

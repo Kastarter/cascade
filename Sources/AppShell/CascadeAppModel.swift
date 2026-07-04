@@ -357,6 +357,14 @@ public final class CascadeAppModel: ObservableObject {
     /// the live MixtureGrounder selection and never actuated. Promotion gate
     /// (LAW 3): live `grounding.route` rows with zero `grounding.route.diverged`.
     static let perceptionRouterKey = "cascade.perceptionRouter"
+    /// EpisodeReliabilityKernel shadow (§3.1/§4a) — default OFF. SHADOW-ONLY
+    /// semantics even when ON (b40ede8 extraction discipline): the kernel computes
+    /// its idle/no-effect/ground-miss/validator verdicts ALONGSIDE the inline
+    /// scaffolding in runAssistEpisode and writes kernel.shadow /
+    /// kernel.shadow.diverged audit rows on disagreement; it NEVER changes what is
+    /// actuated. Promotion to authoritative is a later task gated on N live runs
+    /// with zero kernel.shadow.diverged rows (LAW 3).
+    static let reliabilityKernelKey = "cascade.reliabilityKernel"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
     static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
@@ -2353,7 +2361,36 @@ public final class CascadeAppModel: ObservableObject {
 
                 switch attempt {
                 case .finished(let text, _):
-                    let forceValidator = plan.count > 1 || sub.risk == .high || Self.onScreenBackendIsScout()
+                    // One backend read shared by the inline gate AND the kernel
+                    // shadow below — a second read could flip mid-flight and
+                    // manufacture a spurious divergence row (the only row the
+                    // old double-read shape could ever produce).
+                    let scoutBackend = Self.onScreenBackendIsScout()
+                    let forceValidator = plan.count > 1 || sub.risk == .high || scoutBackend
+                    // EpisodeReliabilityKernel shadow (default OFF): compare the
+                    // kernel's forced-validator predicate against the inline bool
+                    // above, on the SAME inputs, and audit any disagreement — this
+                    // guards the extracted predicate against drifting from the
+                    // inline expression. The inline value stays the one used —
+                    // nothing actuated changes.
+                    if (defaultsStore.object(forKey: Self.reliabilityKernelKey) as? Bool) ?? false {
+                        let kernelForce = EpisodeReliabilityKernel.requiresForcedValidator(
+                            partCount: plan.count,
+                            highRisk: sub.risk == .high,
+                            scoutBackend: scoutBackend
+                        )
+                        if kernelForce != forceValidator {
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent",
+                                action: "kernel.shadow.diverged",
+                                detail: Self.kernelShadowForcedValidatorAuditDetail(
+                                    inline: forceValidator,
+                                    kernel: kernelForce,
+                                    partCount: plan.count
+                                )
+                            ))
+                        }
+                    }
                     let verification = await verifyAssistSubgoal(
                         subtask: sub,
                         claimed: text,
@@ -3729,12 +3766,97 @@ public final class CascadeAppModel: ObservableObject {
         var noEffectTurns = 0
         var noEffectVerifierUsed = false
         var lastFrameHashes = Self.gridHashes(ofJPEG: firstScreenshotPNG)
+        // EpisodeReliabilityKernel SHADOW (cascade.reliabilityKernel, default OFF):
+        // the kernel re-derives every idle/no-effect/ground-miss verdict from the
+        // SAME observations the inline logic below acts on — zero extra captures,
+        // AX walks, or sleeps — and any disagreement is audited as
+        // kernel.shadow.diverged. Nothing the kernel says is actuated; the inline
+        // branches remain the sole driver (b40ede8 shadow-first discipline).
+        // actionChunking interplay: the chunk executor's per-group no-effect
+        // deferral fires BEFORE the turn-level check; the kernel shadows only the
+        // TURN-level decision.
+        let kernelEnabled = (defaultsStore.object(forKey: Self.reliabilityKernelKey) as? Bool) ?? false
+        let kernelProvider = kernelEnabled ? EpisodeReliabilityKernel.FedStateSignatureProvider() : nil
+        var kernelShadow = kernelEnabled ? EpisodeReliabilityKernel(
+            config: .init(
+                noEffectSignatureThreshold: Self.noEffectThreshold,
+                noEffectStallLimit: Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect)
+            ),
+            signatures: kernelProvider
+        ) : nil
+        var kernelDivergences = 0
+        var kernelTurnsObserved = 0
         func auditTiming(outcome: String) {
             let total = episodeStart.duration(to: .now)
             let detail = "\(outcome) · \(count + 1) turns · total \(Int(total / .milliseconds(1)))ms · model \(Int(modelTime / .milliseconds(1)))ms · actions \(Int(actionTime / .milliseconds(1)))ms · effort \(cuEffort) · \(cuModel)"
             Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.timing", detail: detail)) }
+            // Kernel shadow episode summary — piggybacks on the one call site every
+            // exit path already hits, so no return path is missed. Counts/tokens only.
+            if kernelEnabled {
+                let kernelDetail = Self.kernelShadowSummaryAuditDetail(
+                    outcome: outcome,
+                    turnsObserved: kernelTurnsObserved,
+                    divergences: kernelDivergences,
+                    repetitionCount: kernelShadow?.extraSignals.repetitionCount ?? 0,
+                    oscillationCount: kernelShadow?.extraSignals.oscillationCount ?? 0
+                )
+                Task { _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "kernel.shadow", detail: kernelDetail)) }
+            }
+        }
+        // Shadow comparison: feeds the loop's own signatures through the kernel's
+        // StateSignatureProvider seam, runs observe(), and audits any divergence
+        // from the inline verdict token. Every call is guarded by kernelShadow —
+        // with the flag OFF none of this executes.
+        func kernelShadowObserve(
+            _ observation: EpisodeReliabilityKernel.TurnObservation,
+            inlineDecision: String,
+            idleTurns: Int,
+            noEffectTurns: Int
+        ) async {
+            guard var kernel = kernelShadow else { return }
+            if let provider = kernelProvider {
+                // The provider IS the kernel's perception input, not decoration:
+                // observe() reads the pre-recheck after-frame from signature()
+                // and the settle decision from settleRecheck(after:) — the
+                // observation's after/settled fields here are the provider's
+                // feed values, all ones the loop already holds (zero extra
+                // captures). push(nil) = no decodable recapture this turn.
+                await provider.push(observation.after)
+                let settleChanged: Bool
+                if let settled = observation.settled, let before = observation.before {
+                    settleChanged = !EpisodeReliabilityKernel.isDuplicate(settled, of: before, threshold: Self.noEffectThreshold)
+                } else {
+                    // No settle re-check ran (or its recapture failed) — the
+                    // suspicion stands, exactly what the inline loop concludes.
+                    settleChanged = false
+                }
+                await provider.pushSettleResult(settleChanged)
+            }
+            let verdict = await kernel.observe(observation)
+            kernelShadow = kernel
+            kernelTurnsObserved += 1
+            let kernelDecision = Self.kernelShadowToken(verdict)
+            guard Self.kernelShadowDiverged(inline: inlineDecision, kernel: kernelDecision) else { return }
+            kernelDivergences += 1
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "kernel.shadow.diverged",
+                detail: Self.kernelShadowDivergedAuditDetail(
+                    turn: observation.turn,
+                    inline: inlineDecision,
+                    kernel: kernelDecision,
+                    idleTurns: idleTurns,
+                    noEffectTurns: noEffectTurns
+                )
+            ))
         }
         while count < maxSteps {
+            // Kernel shadow bookkeeping — locals written inside the EXISTING inline
+            // branches below and consumed only inside `if kernelShadow != nil`
+            // guards; with the flag OFF they are inert writes to locals.
+            var inlineVerdict = "proceed"
+            var kernelGroundMiss: EpisodeReliabilityKernel.GroundMiss?
+            var kernelSettledHashes: [UInt64]?
             if assistGeneration != gen {
                 auditTiming(outcome: "superseded")  // a newer voice turn took over
                 return .stopped
@@ -3815,11 +3937,25 @@ public final class CascadeAppModel: ObservableObject {
             if (step.actions.isEmpty && step.streamedActions == 0) || observationOnly {
                 idleTurns += 1
                 if idleTurns >= 3 {
+                    inlineVerdict = "idle-stall"
+                    if kernelShadow != nil {
+                        await kernelShadowObserve(
+                            EpisodeReliabilityKernel.TurnObservation(
+                                turn: count + 1,
+                                turnClass: observationOnly ? .observationOnly : .idle,
+                                before: lastFrameHashes.map(EpisodeReliabilityKernel.gridSignature)
+                            ),
+                            inlineDecision: inlineVerdict,
+                            idleTurns: idleTurns,
+                            noEffectTurns: noEffectTurns
+                        )
+                    }
                     auditTiming(outcome: "stalled")
                     _ = try? await store.appendAudit(AuditEvent(actor: "agent", action: "assist.stalled", detail: Self.assistStalledAuditDetail(text: step.text)))
                     return .stalled(step.text.isEmpty ? "I couldn't make progress on this." : step.text)
                 }
                 if idleTurns == 2 {
+                    inlineVerdict = "idle-nudge"
                     nudge = "You have now spent two turns looking or talking without acting. Either make the tool calls that do the work RIGHT NOW, or — if the task is already complete or impossible — say so and stop. Do not repeat yourself."
                 }
             } else {
@@ -3965,6 +4101,15 @@ public final class CascadeAppModel: ObservableObject {
                 ))
                 let missNote = "Couldn't locate “\(missed)” on screen. Describe the visible target more specifically, using a label, role, or nearby text from the current screen."
                 nudge = [nudge, missNote].compactMap { $0 }.joined(separator: " ")
+                inlineVerdict = "groundmiss-nudge"
+                if kernelShadow != nil {
+                    // Reuse the controls already fetched on this miss path — the
+                    // shadow adds no capture or AX walk of its own.
+                    kernelGroundMiss = EpisodeReliabilityKernel.GroundMiss(
+                        targetHash: Self.auditHash(missed),
+                        visibleControlCount: controls.count
+                    )
+                }
             }
 
             if let zoomRegion {
@@ -4010,6 +4155,9 @@ public final class CascadeAppModel: ObservableObject {
             let expectsChange = streamExpectedChange || Self.turnExpectsVisibleChange(step.actions)
             var observedShot = nextShot
             var observedHashes = Self.gridHashes(ofJPEG: nextShot)
+            // Kernel shadow: keep the PRE-recheck fingerprint (the recheck below
+            // overwrites observedHashes) — a guarded local copy, nothing else.
+            let kernelPreRecheckHashes = kernelShadow != nil ? observedHashes : nil
             if actedThisTurn, !observationOnly, expectsChange, let last = lastFrameHashes, let first = observedHashes,
                PerceptualHash.isDuplicateGrid(first, of: last, threshold: Self.noEffectThreshold) {
                 try? await Task.sleep(for: .milliseconds(400))
@@ -4017,9 +4165,14 @@ public final class CascadeAppModel: ObservableObject {
                     observedShot = recheck
                     observedHashes = Self.gridHashes(ofJPEG: recheck)
                 }
+                // Kernel shadow: the settle re-check ran — record the settled frame
+                // (falls back to the suspect frame when the recapture failed, which
+                // is exactly what the inline conclusion below decides on).
+                if kernelShadow != nil { kernelSettledHashes = observedHashes }
 	                if let confirmed = observedHashes,
 	                   !PerceptualHash.isDuplicateGrid(confirmed, of: last, threshold: Self.noEffectThreshold) {
 	                    // The effect just rendered late — the action DID work.
+	                    inlineVerdict = "recheck-cleared"
 	                    noEffectTurns = 0
 	                    recordGroundingVisibleEffect(from: agent)
 	                    _ = try? await store.appendAudit(AuditEvent(
@@ -4048,6 +4201,23 @@ public final class CascadeAppModel: ObservableObject {
 		                        }
 		                    }
 		                    if noEffectTurns >= Self.recoveryAttemptLimit(for: AgentOrchestrator.AgentFailureKind.noEffect) {
+                        inlineVerdict = "noeffect-stall"
+                        if kernelShadow != nil {
+                            await kernelShadowObserve(
+                                EpisodeReliabilityKernel.TurnObservation(
+                                    turn: count + 1,
+                                    turnClass: .acted(expectsChange: true),
+                                    before: lastFrameHashes.map(EpisodeReliabilityKernel.gridSignature),
+                                    after: kernelPreRecheckHashes.map(EpisodeReliabilityKernel.gridSignature),
+                                    settled: kernelSettledHashes.map(EpisodeReliabilityKernel.gridSignature),
+                                    groundMiss: kernelGroundMiss,
+                                    actionSignatureHash: step.actions.isEmpty ? nil : Self.auditHash(Self.actionSummary(step.actions))
+                                ),
+                                inlineDecision: inlineVerdict,
+                                idleTurns: idleTurns,
+                                noEffectTurns: noEffectTurns
+                            )
+                        }
                         _ = try? await store.appendAudit(AuditEvent(
                             actor: "agent", action: "assist.noeffect",
                             detail: Self.assistNoEffectAuditDetail(turn: count + 1, status: "stopping", noEffectStreak: noEffectTurns)
@@ -4055,6 +4225,7 @@ public final class CascadeAppModel: ObservableObject {
                         auditTiming(outcome: "stalled-noeffect")
                         return .stalled("My actions aren't changing anything on screen, so I've stopped — please take over or tell me another way.")
                     }
+                    inlineVerdict = "noeffect-nudge"
                     nudge = "Your last action did NOT change the screen at all — it had no effect (the control isn't where you clicked, is disabled, or needs a different gesture). Do NOT repeat that same click."
                     // Flail-moment grounding push (Cascade's "push elements at a
                     // flail moment, never a pull tool" lesson + the literature's
@@ -4163,6 +4334,29 @@ public final class CascadeAppModel: ObservableObject {
                 }
             }
             // A copy-only/wait-only acting turn leaves noEffectTurns untouched.
+            // Kernel shadow: one observation per turn, built ENTIRELY from values
+            // the loop already holds, compared against the inline decision above.
+            if kernelShadow != nil {
+                let kernelTurnClass: EpisodeReliabilityKernel.TurnClass = observationOnly
+                    ? .observationOnly
+                    : ((step.actions.isEmpty && step.streamedActions == 0)
+                        ? .idle
+                        : .acted(expectsChange: actedThisTurn && expectsChange))
+                await kernelShadowObserve(
+                    EpisodeReliabilityKernel.TurnObservation(
+                        turn: count + 1,
+                        turnClass: kernelTurnClass,
+                        before: lastFrameHashes.map(EpisodeReliabilityKernel.gridSignature),
+                        after: kernelPreRecheckHashes.map(EpisodeReliabilityKernel.gridSignature),
+                        settled: kernelSettledHashes.map(EpisodeReliabilityKernel.gridSignature),
+                        groundMiss: kernelGroundMiss,
+                        actionSignatureHash: step.actions.isEmpty ? nil : Self.auditHash(Self.actionSummary(step.actions))
+                    ),
+                    inlineDecision: inlineVerdict,
+                    idleTurns: idleTurns,
+                    noEffectTurns: noEffectTurns
+                )
+            }
             if let observedHashes { lastFrameHashes = observedHashes }
             streamActed = false
             streamActionTime = .zero
@@ -5301,6 +5495,78 @@ public final class CascadeAppModel: ObservableObject {
             "missedTargetHash=\(auditHash(missedTarget))",
             "controlCount=\(controlCount)",
             "labelsHash=\(auditHash(labels))",
+        ].joined(separator: " ")
+    }
+
+    // MARK: EpisodeReliabilityKernel shadow mapping (t09 — pure, unit-tested)
+
+    /// Maps a kernel verdict to the same token vocabulary the inline branches in
+    /// runAssistEpisode tag themselves with, so shadow divergence is a string
+    /// comparison the audit log can carry (counts/tokens only — P7).
+    nonisolated static func kernelShadowToken(_ v: EpisodeReliabilityKernel.Verdict) -> String {
+        switch v {
+        case .proceed: return "proceed"
+        case .recheckCleared: return "recheck-cleared"
+        case .nudge(.idleActNow): return "idle-nudge"
+        case .nudge(.noEffect): return "noeffect-nudge"
+        case .nudge(.groundMiss): return "groundmiss-nudge"
+        case .bail(.idleStall): return "idle-stall"
+        case .bail(.noEffectStall): return "noeffect-stall"
+        case .bail(.emptyViewMisses): return "groundmiss-bail"
+        }
+    }
+
+    /// Equal tokens agree. A kernel "groundmiss-bail" is NEVER divergence on the
+    /// Opus lane: the 4f62dab two-miss empty-view bail is Scout-only inline, so
+    /// here it is kernel-EXTRA (surfaced in the kernel.shadow summary row) —
+    /// counting it would manufacture permanent divergence and block promotion.
+    nonisolated static func kernelShadowDiverged(inline: String, kernel: String) -> Bool {
+        if kernel == "groundmiss-bail" { return false }
+        return inline != kernel
+    }
+
+    nonisolated static func kernelShadowDivergedAuditDetail(
+        turn: Int,
+        inline: String,
+        kernel: String,
+        idleTurns: Int,
+        noEffectTurns: Int
+    ) -> String {
+        [
+            "turn=\(turn)",
+            "inline=\(safeAuditToken(inline))",
+            "kernel=\(safeAuditToken(kernel))",
+            "idleTurns=\(idleTurns)",
+            "noEffectStreak=\(noEffectTurns)",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func kernelShadowForcedValidatorAuditDetail(
+        inline: Bool,
+        kernel: Bool,
+        partCount: Int
+    ) -> String {
+        [
+            "site=forced-validator",
+            "inline=\(inline)",
+            "kernel=\(kernel)",
+            "partCount=\(partCount)",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func kernelShadowSummaryAuditDetail(
+        outcome: String,
+        turnsObserved: Int,
+        divergences: Int,
+        repetitionCount: Int,
+        oscillationCount: Int
+    ) -> String {
+        [
+            "outcome=\(safeAuditToken(outcome))",
+            "turnsObserved=\(turnsObserved)",
+            "diverged=\(divergences)",
+            "repetition=\(repetitionCount)",
+            "oscillation=\(oscillationCount)",
         ].joined(separator: " ")
     }
 

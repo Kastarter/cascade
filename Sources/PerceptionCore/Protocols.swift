@@ -77,8 +77,9 @@ public protocol PerceptionSource: Sendable {
 }
 
 /// Provides UI state signatures, including the settle re-check seam
-/// (the 336263d 400ms slow-render re-check).
-public protocol StateSignatureProvider {
+/// (the 336263d 400ms slow-render re-check). Sendable: providers are consumed
+/// across async boundaries (e.g. a reliability kernel awaiting a signature).
+public protocol StateSignatureProvider: Sendable {
     func signature() async -> StateSignature
     func settleRecheck(after: Duration) async -> Bool
 }
