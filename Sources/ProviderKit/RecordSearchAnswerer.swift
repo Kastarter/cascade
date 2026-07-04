@@ -51,6 +51,9 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
     private let model: String
     private let maxHops: Int
     private let includeStructuredContent: Bool
+    /// Read per `answer` call for the default-off `cascade.recordAnswerTracing`
+    /// flag, so the user can flip tracing ON without relaunching.
+    private let tracingDefaults: RecordAnswerTracingDefaults
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "record-answerer")
     static let toolLoopPromptVersion = "record-search-answerer.tool-loop.prompt.v1"
     static let breadthPromptVersion = "record-search-answerer.breadth-synthesis.prompt.v1"
@@ -61,7 +64,8 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
         keyStore: AnthropicKeyStore = AnthropicKeyStore(),
         model: String = AnthropicModel.sonnet,
         maxHops: Int = 6,
-        includeStructuredContent: Bool = false
+        includeStructuredContent: Bool = false,
+        tracingDefaults: UserDefaults = .standard
     ) {
         self.store = store
         self.recall = RecordRecall(store: store, reranker: HeuristicRecordReranker())
@@ -70,6 +74,7 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
         self.model = model
         self.maxHops = maxHops
         self.includeStructuredContent = includeStructuredContent
+        self.tracingDefaults = RecordAnswerTracingDefaults(tracingDefaults)
     }
 
     public func configuredToolDefinitions() -> [[String: Any]] {
@@ -92,14 +97,37 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
         conversation: [(user: String, assistant: String)] = [],
         sourcePlan: SourcePlan?
     ) async throws -> RecordAnswer {
+        // Diagnosis-only tracer (default OFF): nil unless the user flipped
+        // `cascade.recordAnswerTracing`, so every emit below is a no-op then.
+        let tracer = RecordAnswerTracer.ifEnabled(store: store, defaults: tracingDefaults.defaults)
+        let routedQuestion = Self.routedQuestion(question, sourcePlan: sourcePlan)
+        await tracer?.emit("answer.begin", [
+            ("qhash", AuditIdentity.hash(question)),
+            ("qChars", "\(question.count)"),
+            ("conv", "\(conversation.count)"),
+            ("broad", "\(Self.isBroadQuestion(routedQuestion))"),
+            ("plan", sourcePlan?.routingIntent.rawValue ?? "none"),
+        ])
         guard let key = keyStore.readKey(), !key.isEmpty else {
+            await tracer?.emit("answer.exit", [("reason", "missing-key")])
             throw AnthropicError.missingKey
         }
-        let routedQuestion = Self.routedQuestion(question, sourcePlan: sourcePlan)
 
-        if Self.isBroadQuestion(routedQuestion),
-           let broad = try? await answerBroadQuestion(question: routedQuestion, conversation: conversation, sourcePlan: sourcePlan) {
-            return broad
+        if Self.isBroadQuestion(routedQuestion) {
+            // Semantically identical to the previous `try?` swallow: success
+            // returns the broad answer, any error falls through to the tool loop.
+            do {
+                let broad = try await answerBroadQuestion(
+                    question: routedQuestion,
+                    conversation: conversation,
+                    sourcePlan: sourcePlan,
+                    tracer: tracer
+                )
+                await tracer?.emit("broad.exit", [("ok", "true")])
+                return broad
+            } catch {
+                await tracer?.emit("broad.exit", [("err", "\(type(of: error))")])
+            }
         }
 
         var messages: [[String: Any]] = []
@@ -111,8 +139,10 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
 
         for hop in 0..<maxHops {
             let isLastHop = hop == maxHops - 1
-            let reply = try await send(key: key, messages: messages, toolsAllowed: !isLastHop)
+            await tracer?.emit("hop.begin", [("n", "\(hop)")])
+            let reply = try await send(key: key, messages: messages, toolsAllowed: !isLastHop, tracer: tracer)
             guard let content = reply["content"] as? [[String: Any]] else {
+                await tracer?.emit("answer.exit", [("reason", "empty-content")])
                 throw AnthropicError.emptyResponse
             }
 
@@ -120,7 +150,13 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
             if toolUses.isEmpty {
                 let text = content.compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
                     .joined(separator: "\n")
-                return Self.parseCitations(from: text)
+                let parsed = Self.parseCitations(from: text)
+                await tracer?.emit("answer.exit", [
+                    ("reason", "final"),
+                    ("hops", "\(hop + 1)"),
+                    ("cites", "\(parsed.citedMomentIDs.count)"),
+                ])
+                return parsed
             }
 
             messages.append(["role": "assistant", "content": content])
@@ -133,6 +169,7 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
             }
             messages.append(["role": "user", "content": results])
         }
+        await tracer?.emit("answer.exit", [("reason", "hop-exhausted")])
         throw AnthropicError.transport("no final answer within \(maxHops) hops")
     }
 
@@ -149,7 +186,12 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
 
     // MARK: - Request plumbing
 
-    private func send(key: String, messages: [[String: Any]], toolsAllowed: Bool) async throws -> [String: Any] {
+    private func send(
+        key: String,
+        messages: [[String: Any]],
+        toolsAllowed: Bool,
+        tracer: RecordAnswerTracer? = nil
+    ) async throws -> [String: Any] {
         let options = AnthropicCompletionOptions.deterministic(
             promptVersion: Self.toolLoopPromptVersion,
             schemaVersion: Self.schemaVersion,
@@ -173,40 +215,73 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
             offeredTools[offeredTools.count - 1]["cache_control"] = ["type": "ephemeral"]
             tools = offeredTools
         }
-        _ = try? await messagesClient.countTokens(
-            model: model,
-            maxTokens: 700,
-            system: system,
-            messages: messages,
-            temperature: options.temperature ?? 0,
-            tools: tools
-        )
-        let response = try await messagesClient.send(
-            model: model,
-            maxTokens: 700,
-            system: system,
-            messages: messages,
-            temperature: options.temperature ?? 0,
-            tools: tools,
-            timeout: 30
-        )
-        return response.raw
+        // Same swallow as the previous `_ = try?` — errors are discarded either
+        // way; the do/catch only makes the error KIND visible to the tracer.
+        let countStart = DispatchTime.now()
+        do {
+            _ = try await messagesClient.countTokens(
+                model: model,
+                maxTokens: 700,
+                system: system,
+                messages: messages,
+                temperature: options.temperature ?? 0,
+                tools: tools
+            )
+            await tracer?.emit("send.counttokens", [
+                ("ms", "\(RecordAnswerTracer.millisecondsSince(countStart))"),
+                ("ok", "true"),
+            ])
+        } catch {
+            await tracer?.emit("send.counttokens", [
+                ("ms", "\(RecordAnswerTracer.millisecondsSince(countStart))"),
+                ("err", "\(type(of: error))"),
+            ])
+        }
+        let modelStart = DispatchTime.now()
+        do {
+            let response = try await messagesClient.send(
+                model: model,
+                maxTokens: 700,
+                system: system,
+                messages: messages,
+                temperature: options.temperature ?? 0,
+                tools: tools,
+                timeout: 30
+            )
+            await tracer?.emit("send.model", [("ms", "\(RecordAnswerTracer.millisecondsSince(modelStart))")])
+            return response.raw
+        } catch {
+            await tracer?.emit("send.model", [
+                ("ms", "\(RecordAnswerTracer.millisecondsSince(modelStart))"),
+                ("err", "\(type(of: error))"),
+            ])
+            throw error
+        }
     }
 
     private func answerBroadQuestion(
         question: String,
         conversation: [(user: String, assistant: String)],
-        sourcePlan: SourcePlan?
+        sourcePlan: SourcePlan?,
+        tracer: RecordAnswerTracer? = nil
     ) async throws -> RecordAnswer {
         let intents = Self.searchIntents(for: question)
+        await tracer?.emit("broad.begin", [("intents", "\(intents.count)")])
         guard intents.count >= 2 else { throw AnthropicError.emptyResponse }
         var evidence: [(intent: String, output: String)] = []
         var allowedIDs = Set<Int64>()
-        for intent in intents.prefix(5) {
+        for (index, intent) in intents.prefix(5).enumerated() {
+            let scanStart = DispatchTime.now()
             let output = await recall.perform(.search(query: intent))
+            await tracer?.emit("broad.scan", [
+                ("i", "\(index)"),
+                ("ms", "\(RecordAnswerTracer.millisecondsSince(scanStart))"),
+                ("outChars", "\(output.count)"),
+            ])
             evidence.append((intent, output))
             allowedIDs.formUnion(Self.extractIDs(from: output))
         }
+        await tracer?.emit("broad.evidence", [("ids", "\(allowedIDs.count)")])
         guard !allowedIDs.isEmpty else { throw AnthropicError.emptyResponse }
         let prior = conversation.suffix(4).map { "User: \($0.user)\nAssistant: \($0.assistant)" }.joined(separator: "\n")
         let evidenceText = evidence.map { item in
@@ -230,13 +305,28 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
             callsite: "RecordSearchAnswerer.answerBroadQuestion"
         )
         let messages = [["role": "user", "content": user]]
-        _ = try? await messagesClient.countTokens(
-            model: model,
-            maxTokens: 700,
-            system: Self.breadthSynthesisSystemPrompt(),
-            messages: messages,
-            temperature: options.temperature ?? 0
-        )
+        // Same swallow as the previous `_ = try?`; do/catch only surfaces the
+        // error kind to the tracer.
+        let countStart = DispatchTime.now()
+        do {
+            _ = try await messagesClient.countTokens(
+                model: model,
+                maxTokens: 700,
+                system: Self.breadthSynthesisSystemPrompt(),
+                messages: messages,
+                temperature: options.temperature ?? 0
+            )
+            await tracer?.emit("broad.counttokens", [
+                ("ms", "\(RecordAnswerTracer.millisecondsSince(countStart))"),
+                ("ok", "true"),
+            ])
+        } catch {
+            await tracer?.emit("broad.counttokens", [
+                ("ms", "\(RecordAnswerTracer.millisecondsSince(countStart))"),
+                ("err", "\(type(of: error))"),
+            ])
+        }
+        let sendStart = DispatchTime.now()
         let response = try await messagesClient.send(
             model: model,
             maxTokens: 700,
@@ -245,6 +335,7 @@ public struct RecordSearchAnswerer: SourcePlanRecordAnswering, Sendable {
             temperature: options.temperature ?? 0,
             timeout: 30
         )
+        await tracer?.emit("broad.send", [("ms", "\(RecordAnswerTracer.millisecondsSince(sendStart))")])
         let parsed = Self.parseCitations(from: response.text)
         let validIDs = parsed.citedMomentIDs.filter { allowedIDs.contains($0) }
         return RecordAnswer(text: parsed.text, citedMomentIDs: Array(validIDs.prefix(4)))

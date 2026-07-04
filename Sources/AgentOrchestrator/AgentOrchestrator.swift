@@ -529,6 +529,9 @@ public actor CascadeOrchestrator {
     /// same unchanged list.
     private var curationCache: (key: Set<String>, keyed: Bool, agents: [CuratedAgent])?
     private let keyStore: AnthropicKeyStore
+    /// Read per `askRecord` call for the default-off `cascade.recordAnswerTracing`
+    /// flag, so the user can flip tracing ON without relaunching.
+    private let tracingDefaults: RecordAnswerTracingDefaults
 
     public init(
         store: CascadeStore,
@@ -538,7 +541,8 @@ public actor CascadeOrchestrator {
         planner: SingleStepPlanner? = nil,
         curator: WorkflowCurator? = nil,
         modelCallCache: ModelCallCache? = nil,
-        keyStore: AnthropicKeyStore = AnthropicKeyStore()
+        keyStore: AnthropicKeyStore = AnthropicKeyStore(),
+        tracingDefaults: RecordAnswerTracingDefaults = RecordAnswerTracingDefaults(.standard)
     ) {
         self.store = store
         self.localAnswerer = localAnswerer
@@ -547,6 +551,7 @@ public actor CascadeOrchestrator {
         self.planner = planner ?? ClaudeSingleStepPlanner(cache: modelCallCache)
         self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore), cache: modelCallCache)
         self.keyStore = keyStore
+        self.tracingDefaults = tracingDefaults
     }
 
     /// Grounded Q&A. Uses Claude when a key is connected (privacy-filtered context
@@ -565,25 +570,66 @@ public actor CascadeOrchestrator {
         conversation: [(user: String, assistant: String)] = [],
         sourcePlan: SourcePlan? = nil
     ) async throws -> RecordAnswer {
+        // Diagnosis-only tracer (default OFF): nil unless the user flipped
+        // `cascade.recordAnswerTracing`; optional chaining then skips both the
+        // emit and its argument evaluation, so the OFF path is unchanged.
+        let tracer = RecordAnswerTracer.ifEnabled(store: store, defaults: tracingDefaults.defaults)
+        await tracer?.emit("orchestrator.begin", [
+            ("qhash", AuditIdentity.hash(question)),
+            ("hasKey", "\(keyStore.hasKey())"),
+            ("plan", sourcePlan?.routingIntent.rawValue ?? "none"),
+        ])
         if let sourcePlan, !Self.planAllowsRecordedMemory(sourcePlan) {
+            await tracer?.emit("orchestrator.exit", [("reason", "source-mismatch")])
             return RecordAnswer(text: "source-mismatch: this ask was not routed to recorded memory.", citedMomentIDs: [])
         }
         let cleanPlanQuery = sourcePlan?.cleanQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let routedQuestion = cleanPlanQuery?.isEmpty == false
             ? (cleanPlanQuery ?? question)
             : question
-        if keyStore.hasKey(),
-           let answer = try? await answerRecord(
-            question: routedQuestion,
-            conversation: conversation,
-            sourcePlan: sourcePlan
-           ) {
-            return answer
+        if keyStore.hasKey() {
+            // Same nil-on-error swallow as the previous `try?`: success returns,
+            // any error falls through to grounding — only the error KIND is new.
+            let agenticStart = DispatchTime.now()
+            do {
+                let answer = try await answerRecord(
+                    question: routedQuestion,
+                    conversation: conversation,
+                    sourcePlan: sourcePlan
+                )
+                await tracer?.emit("agentic.exit", [
+                    ("ok", "true"),
+                    ("ms", "\(RecordAnswerTracer.millisecondsSince(agenticStart))"),
+                ])
+                return answer
+            } catch {
+                await tracer?.emit("agentic.exit", [
+                    ("err", "\(type(of: error))"),
+                    ("ms", "\(RecordAnswerTracer.millisecondsSince(agenticStart))"),
+                ])
+            }
         }
+        let groundingStart = DispatchTime.now()
         let grounding = try await chatGrounding(for: routedQuestion)
-        if keyStore.hasKey(), let answer = try? await claudeAnswerer.answer(question: routedQuestion, grounding: grounding) {
-            return RecordAnswer(text: answer, citedMomentIDs: [])
+        await tracer?.emit("grounding.done", [("ms", "\(RecordAnswerTracer.millisecondsSince(groundingStart))")])
+        if keyStore.hasKey() {
+            // Same nil-on-error swallow as the previous `try?` here too.
+            let singleShotStart = DispatchTime.now()
+            do {
+                let answer = try await claudeAnswerer.answer(question: routedQuestion, grounding: grounding)
+                await tracer?.emit("singleshot.exit", [
+                    ("ok", "true"),
+                    ("ms", "\(RecordAnswerTracer.millisecondsSince(singleShotStart))"),
+                ])
+                return RecordAnswer(text: answer, citedMomentIDs: [])
+            } catch {
+                await tracer?.emit("singleshot.exit", [
+                    ("err", "\(type(of: error))"),
+                    ("ms", "\(RecordAnswerTracer.millisecondsSince(singleShotStart))"),
+                ])
+            }
         }
+        await tracer?.emit("orchestrator.exit", [("reason", "local")])
         return RecordAnswer(
             text: try await localAnswerer.answer(question: routedQuestion, grounding: grounding),
             citedMomentIDs: []

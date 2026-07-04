@@ -24,6 +24,7 @@
 - Every agent/computer action audited to `audit_event`. STOP (esc) checked before posting events.
 
 ## Current State (2026-06-11)
+- NEW (2026-07-04): t05 record-answer tracing behind default-off `cascade.recordAnswerTracing` (instrument-only, no behavior fix): `RecordAnswerTracer` emits `record.answer.trace` audit rows (qhash/counts only, never question text) at every exit/branch and around countTokens/semantic-scan/model-send across CascadeAppModel.ask → CascadeOrchestrator.askRecord → RecordSearchAnswerer, so the "Searching your record…" hang's pre-LLM cause is readable from audit_event.
 - NEW (2026-06-27): D-13 wires local voice endpointing behind default-off `cascade.experimentalLocalVoiceEndpointing`; enabled PTT turns gate PCM through `LocalVoiceActivityGate` and use `VoiceTurnEndpointPolicy` for clear/wait/commit, while disabled keeps server turn detection off and immediate commit behavior.
 - NEW (2026-06-27): D-12 surfaces proactive next-action predictions only behind `cascade.experimentalSuggestionRanking`; opt-in offers render as dismissible review cards and persist hashed per-offer suppressions.
 - NEW (2026-06-27): D-11 records background runtime failure cases into the experience ledger only when `cascade.experimentalExperienceLedger` is enabled; stopped/refused/modal/no-effect/step-limit failures now retain typed ledger failure kinds via an explicit AppShell mapper from orchestrator taxonomy.

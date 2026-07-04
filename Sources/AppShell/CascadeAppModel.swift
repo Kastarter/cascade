@@ -998,11 +998,22 @@ public final class CascadeAppModel: ObservableObject {
         // Recent turns let "and after that?" follow-ups inherit context.
         let history = conversation.suffix(4).map { (user: $0.question, assistant: $0.answer) }
         Task {
+            // Diagnosis-only tracer (default OFF via `cascade.recordAnswerTracing`):
+            // bounds the full "Searching your record…" window and separates
+            // askRecord time from the citation lookup. All emits are no-ops
+            // when the flag is off (tracer is nil).
+            let tracer = RecordAnswerTracer.ifEnabled(store: store, defaults: defaultsStore)
+            await tracer?.emit("ui.ask.begin", [("qhash", AuditIdentity.hash(trimmed))])
+            let askStart = DispatchTime.now()
             var result: String
             var citations: [CitedMoment] = []
             var answered = true
             do {
                 let recordAnswer = try await orchestrator.askRecord(trimmed, conversation: Array(history))
+                await tracer?.emit("ui.askRecord.done", [
+                    ("ms", "\(RecordAnswerTracer.millisecondsSince(askStart))"),
+                    ("ok", "true"),
+                ])
                 // Show the FULL answer in the text thread. brief() is the ~280-char
                 // SPOKEN cap (voice replies stay short) — applying it here chopped
                 // multi-item summaries mid-word ("2. **Keyn…") even though the chat
@@ -1012,9 +1023,14 @@ public final class CascadeAppModel: ObservableObject {
                     CitedMoment(id: $0.id, appName: $0.appName, capturedAt: $0.capturedAt, imagePath: $0.imagePath)
                 }
             } catch {
+                await tracer?.emit("ui.askRecord.done", [
+                    ("ms", "\(RecordAnswerTracer.millisecondsSince(askStart))"),
+                    ("err", "\(type(of: error))"),
+                ])
                 result = error.localizedDescription
                 answered = false
             }
+            await tracer?.emit("ui.ask.end", [("ms", "\(RecordAnswerTracer.millisecondsSince(askStart))")])
             answer = result
             conversation.append(QATurn(question: trimmed, answer: result, citations: citations))
             // One brain: the voice agent sees what was said in chat, and vice
