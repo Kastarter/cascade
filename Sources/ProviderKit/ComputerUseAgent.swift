@@ -301,7 +301,15 @@ public final class ComputerUseAgent {
     private var episodePrunedImages = 0
     private var episodeCompactedToolResults = 0
     private var currentToolDefinitionCount = 0
-    nonisolated public static let screenshotKeepWindow = 8
+    // Keep the 3 most-recent screenshot turns (Anthropic computer-use default:
+    // only_n_most_recent_images=3). Older turns' images become "[earlier
+    // screenshot omitted]" text placeholders — the ACTION history (what the model
+    // did, notes, tool text) is preserved, only the stale pixels drop. Cuts the
+    // dominant per-turn cost: images are ~1,365 tokens each (1280×800), so keeping
+    // 8 dragged ~5 extra screenshots through every turn's cache read/write. 3 is
+    // enough visual state for a CU agent acting on the CURRENT frame; the text
+    // history covers "what happened before". Bump to 4-5 only if accuracy needs it.
+    nonisolated public static let screenshotKeepWindow = 3
     nonisolated public static let historyCompactionRecentTurnDefault = 6
     private let historyCompactionEnabled: Bool
     private let historyCompactionRecentTurns: Int
