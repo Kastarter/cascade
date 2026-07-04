@@ -755,6 +755,7 @@ public final class CascadeAppModel: ObservableObject {
                 indexWorkGraph: true,
                 structuredContent: experimentalStructuredContent,
                 governanceEnabled: GovernanceFlag.isEnabled(defaults: defaults),
+                frameRedaction: FrameRedactionFlag.isEnabled(defaults: defaults),
                 capturePolicy: initialCapturePolicy
             )
         )

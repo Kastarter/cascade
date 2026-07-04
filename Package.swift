@@ -22,7 +22,7 @@ let package = Package(
         // ActionDescriptor, never CUAction, so MacContextKit/AppShell can link it
         // without a dependency cycle.
         .target(name: "GovernanceKit", dependencies: ["CascadeMemory", "PerceptionCore"]),
-        .target(name: "MacContextKit", dependencies: ["CascadeMemory", "GovernanceKit"]),
+        .target(name: "MacContextKit", dependencies: ["CascadeMemory", "GovernanceKit", "PerceptionCore"]),
         .target(
             name: "ComputerUseKit",
             dependencies: ["CascadeMemory", "MacContextKit", "PerceptionCore"],
@@ -73,7 +73,7 @@ let package = Package(
         ),
         .testTarget(name: "ComputerUseKitTests", dependencies: ["ComputerUseKit", "CascadeMemory", "PerceptionCore"]),
         .testTarget(name: "GovernanceKitTests", dependencies: ["GovernanceKit", "CascadeMemory", "PerceptionCore"]),
-        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory", "GovernanceKit"]),
+        .testTarget(name: "MacContextKitTests", dependencies: ["MacContextKit", "CascadeMemory", "GovernanceKit", "PerceptionCore"]),
         .testTarget(
             name: "ProviderKitTests",
             dependencies: ["ProviderKit", "CascadeMemory"],

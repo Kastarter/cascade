@@ -3,7 +3,20 @@ import CoreGraphics
 import CryptoKit
 import Foundation
 import ImageIO
+import PerceptionCore
 import UniformTypeIdentifiers
+
+/// `cascade.frameRedaction` — default OFF (absent ⇒ false ⇒ today's capture is
+/// byte-identical: the capture-gate `.redact` verdict keeps degrading to drop,
+/// and the always-on PII redaction below runs unchanged). Read ONCE at
+/// construction (ContextRecorder.Options / CascadeAppModel init), never per frame.
+public enum FrameRedactionFlag {
+    public static let key = "cascade.frameRedaction"
+
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: key)
+    }
+}
 
 public enum FrameRedactor {
     public struct Metadata: Codable, Equatable, Sendable {
@@ -31,7 +44,9 @@ public enum FrameRedactor {
     public struct Result: Sendable {
         public let imageData: Data
         public let boxes: [ScreenTextRecognizer.TextBox]
-        public let redactionRects: [CGRect]
+        /// FrameSpace-typed (top-left pixel space) — an untyped or mis-spaced
+        /// rect can no longer reach the blur fill (the 34c2efa kill).
+        public let redactionRects: [Rect<FrameSpace>]
         public let metadata: Metadata
 
         public var redactedText: String {
@@ -55,15 +70,21 @@ public enum FrameRedactor {
         return decision.allowed ? nil : decision.reason
     }
 
+    /// `policyRegions` are tenant-policy `.redact(regions:)` rects (FrameSpace,
+    /// top-left) blurred ON TOP of the always-on PII redaction. Empty (the
+    /// default, and the only value reachable with `cascade.frameRedaction` OFF)
+    /// short-circuits every policy-region branch so this path is today's exact
+    /// code — byte-identity pinned in FrameRedactorTests.
     public static func redact(
         imageData: Data,
         boxes: [ScreenTextRecognizer.TextBox],
         policy: CapturePrivacyPolicy = .default,
-        compression: CGFloat = 0.6
+        compression: CGFloat = 0.6,
+        policyRegions: [Rect<FrameSpace>] = []
     ) -> Result? {
         guard let image = decode(imageData) else { return nil }
         var entityTypes = Set<String>()
-        var rects: [CGRect] = []
+        var rects: [Rect<FrameSpace>] = []
 
         // Pass 1: per-box sensitivity (keyword label or PII finding) + text redaction.
         var sensitive = [Bool](repeating: false, count: boxes.count)
@@ -98,10 +119,30 @@ public enum FrameRedactor {
             }
         }
 
+        // Pass 3 (only reachable when `cascade.frameRedaction` wired regions in):
+        // a tenant `.redact(regions:)` verdict — any OCR box intersecting a policy
+        // region loses its text too, so the blur and FTS/embedding agree, and the
+        // regions themselves are appended below so blank-region blur works even
+        // with zero OCR boxes.
+        if !policyRegions.isEmpty {
+            entityTypes.insert("POLICY_REGION")
+            for (i, box) in boxes.enumerated() {
+                let boxRect = frameRect(
+                    visionNormalized: box.boundingBox,
+                    imageWidth: image.width,
+                    imageHeight: image.height
+                )
+                if policyRegions.contains(where: { intersects($0, boxRect) }) {
+                    sensitive[i] = true
+                    redactedTexts[i] = "<SENSITIVE_TEXT>"
+                }
+            }
+        }
+
         var redactedBoxes: [ScreenTextRecognizer.TextBox] = []
         for (i, box) in boxes.enumerated() {
             if sensitive[i] {
-                rects.append(pixelRect(for: box.boundingBox, imageWidth: image.width, imageHeight: image.height))
+                rects.append(frameRect(visionNormalized: box.boundingBox, imageWidth: image.width, imageHeight: image.height))
             }
             redactedBoxes.append(ScreenTextRecognizer.TextBox(
                 text: redactedTexts[i],
@@ -109,6 +150,8 @@ public enum FrameRedactor {
                 confidence: box.confidence
             ))
         }
+
+        rects.append(contentsOf: policyRegions)
 
         guard let redactedImage = draw(image: image, covering: rects),
               let encoded = encodeJPEG(redactedImage, compression: compression) else { return nil }
@@ -130,7 +173,9 @@ public enum FrameRedactor {
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
 
-    private static func draw(image: CGImage, covering rects: [CGRect]) -> CGImage? {
+    /// Typed fill: only `Rect<FrameSpace>` can reach `context.fill` — a
+    /// mis-spaced rect is a COMPILE error, not raw PII persisted (34c2efa).
+    private static func draw(image: CGImage, covering rects: [Rect<FrameSpace>]) -> CGImage? {
         let width = image.width
         let height = image.height
         guard let context = CGContext(
@@ -146,22 +191,48 @@ public enum FrameRedactor {
         context.draw(image, in: full)
         context.setFillColor(CGColor(gray: 0, alpha: 1))
         for rect in rects {
-            context.fill(rect.intersection(full))
+            context.fill(cgFillRect(rect, imageHeight: height).intersection(full))
         }
         return context.makeImage()
     }
 
-    private static func pixelRect(for normalized: CGRect, imageWidth: Int, imageHeight: Int) -> CGRect {
+    /// The ONE Vision-normalized (bottom-left) → FrameSpace pixel (top-left)
+    /// conversion, preserving today's ±max(8, min(w,h)*0.01) padding and
+    /// `.integral`. `.integral` commutes with the integer-height flip applied
+    /// back at the fill site, so the blurred pixels are bit-identical to the
+    /// old bottom-left `pixelRect` math.
+    static func frameRect(visionNormalized normalized: CGRect, imageWidth: Int, imageHeight: Int) -> Rect<FrameSpace> {
         let w = CGFloat(imageWidth)
         let h = CGFloat(imageHeight)
         let padding = max(CGFloat(8), min(w, h) * 0.01)
-        let rect = CGRect(
+        let topLeft = CGRect(
             x: normalized.minX * w,
-            y: normalized.minY * h,
+            y: (1 - normalized.maxY) * h,
             width: normalized.width * w,
             height: normalized.height * h
-        ).insetBy(dx: -padding, dy: -padding)
-        return rect.integral
+        ).insetBy(dx: -padding, dy: -padding).integral
+        return Rect<FrameSpace>(
+            x: topLeft.minX,
+            y: topLeft.minY,
+            width: topLeft.width,
+            height: topLeft.height
+        )
+    }
+
+    /// The ONE FrameSpace (top-left) → CGContext (bottom-left) flip, applied
+    /// only at the fill site.
+    private static func cgFillRect(_ rect: Rect<FrameSpace>, imageHeight: Int) -> CGRect {
+        CGRect(
+            x: rect.x,
+            y: Double(imageHeight) - rect.y - rect.height,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    private static func intersects(_ a: Rect<FrameSpace>, _ b: Rect<FrameSpace>) -> Bool {
+        a.x < b.x + b.width && b.x < a.x + a.width
+            && a.y < b.y + b.height && b.y < a.y + a.height
     }
 
     private static func encodeJPEG(_ image: CGImage, compression: CGFloat) -> Data? {

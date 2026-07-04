@@ -191,17 +191,24 @@ public final class ContextRecorder: ObservableObject {
         /// `cascade.governance` — resolved ONCE by the caller (GovernanceFlag),
         /// default false ⇒ the capture gate is byte-identical to today.
         public var governanceEnabled: Bool
+        /// `cascade.frameRedaction` — resolved ONCE by the caller
+        /// (FrameRedactionFlag), default false ⇒ a capture-gate `.redact`
+        /// verdict keeps degrading to drop (LAW 7) and capture is byte-identical
+        /// to today. ON lets `.redact` persist with its typed regions blurred.
+        public var frameRedaction: Bool
         public var capturePolicy: CapturePrivacyPolicy
 
         public init(
             indexWorkGraph: Bool = true,
             structuredContent: Bool = false,
             governanceEnabled: Bool = false,
+            frameRedaction: Bool = false,
             capturePolicy: CapturePrivacyPolicy = .default
         ) {
             self.indexWorkGraph = indexWorkGraph
             self.structuredContent = structuredContent
             self.governanceEnabled = governanceEnabled
+            self.frameRedaction = frameRedaction
             self.capturePolicy = capturePolicy
         }
     }
@@ -285,6 +292,7 @@ public final class ContextRecorder: ObservableObject {
             indexWorkGraph: options.indexWorkGraph,
             structuredContent: options.structuredContent,
             governanceEnabled: options.governanceEnabled,
+            frameRedactionEnabled: options.frameRedaction,
             maintenanceScheduler: maintenanceScheduler,
             policy: options.capturePolicy
         ) { [weak self] context in
@@ -535,6 +543,10 @@ public final class ContextRecorder: ObservableObject {
             return nil
         }
         if let imageData = capturedImageData {
+            // NOTE (deliberate asymmetry): this timer-capture path has no
+            // governance-verdict seam, so it never receives `.redact` policy
+            // regions — the always-on PII redaction below is unconditional.
+            // Tenant `.redact` policies only affect the RewindEngine hot path.
             guard let redacted = FrameRedactor.redact(
                 imageData: imageData,
                 boxes: ocrBoxes,

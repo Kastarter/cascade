@@ -6,6 +6,7 @@ import CoreVideo
 import Foundation
 import GovernanceKit
 import OSLog
+import PerceptionCore
 import ScreenCaptureKit
 import Vision
 
@@ -634,6 +635,9 @@ actor RewindEngine {
     private let indexWorkGraph: Bool
     private let structuredContent: Bool
     private let governanceEnabled: Bool
+    /// `cascade.frameRedaction` — resolved ONCE by the caller (FrameRedactionFlag),
+    /// default false ⇒ a `.redact` capture verdict keeps degrading to drop.
+    private let frameRedactionEnabled: Bool
     private let maintenanceScheduler: RecorderMaintenanceScheduler?
     private let writeBuffer: ContextWriteBuffer
     private var policy: CapturePrivacyPolicy
@@ -660,6 +664,7 @@ actor RewindEngine {
         indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
         governanceEnabled: Bool = false,
+        frameRedactionEnabled: Bool = false,
         maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
@@ -668,6 +673,7 @@ actor RewindEngine {
         self.indexWorkGraph = indexWorkGraph
         self.structuredContent = structuredContent
         self.governanceEnabled = governanceEnabled
+        self.frameRedactionEnabled = frameRedactionEnabled
         self.maintenanceScheduler = maintenanceScheduler
         self.policy = policy
         self.onMoment = onMoment
@@ -750,19 +756,84 @@ actor RewindEngine {
         ))
     }
 
-    /// Verdict → may-this-frame-persist mapping at the pre-OCR choke point.
-    /// `.redact` has NO wired redactor here yet (the default policy never emits
-    /// it — dab9e5c; FrameRedactor runs downstream on a different trigger), so
-    /// until redaction wiring exists it degrades to drop: a MISSED frame, never
-    /// an un-redacted frame shipped as if it were redacted (LAW 7 — degrade to
-    /// MISSED, never FALSE). Revisit when a capture-gate redactor is wired.
-    internal nonisolated static func captureVerdictAllowsPersist(_ verdict: PolicyVerdict) -> Bool {
+    /// What the capture gate decided for one frame: persist it (carrying any
+    /// tenant-policy regions to blur ON TOP of the always-on PII redaction), or
+    /// drop it entirely.
+    enum CaptureDisposition: Equatable, Sendable {
+        case persist(policyRegions: [Rect<FrameSpace>])
+        case drop
+    }
+
+    /// Verdict → disposition at the pre-OCR choke point. The capture-gate
+    /// redactor IS wired now, behind `cascade.frameRedaction`: with the flag ON
+    /// a `.redact` verdict persists the frame WITH the policy's typed regions
+    /// (FrameRedactor.redact(policyRegions:) blurs them and scrubs overlapped
+    /// OCR text before FTS/embedding); with the flag OFF (the default) it keeps
+    /// degrading to drop — a MISSED frame, never an un-redacted frame shipped
+    /// as if it were redacted (LAW 7 — degrade to MISSED, never FALSE).
+    internal nonisolated static func captureVerdictDisposition(
+        _ verdict: PolicyVerdict,
+        frameRedactionEnabled: Bool
+    ) -> CaptureDisposition {
         switch verdict {
         case .allow:
-            return true
-        case .redact, .drop, .pause:
-            return false
+            return .persist(policyRegions: [])
+        case .redact(let regions):
+            return frameRedactionEnabled ? .persist(policyRegions: regions) : .drop
+        case .drop, .pause:
+            return .drop
         }
+    }
+
+    /// The historical flag-OFF truth table, kept as a delegating wrapper so the
+    /// existing CaptureGateParityTests matrix keeps pinning the shipped path.
+    internal nonisolated static func captureVerdictAllowsPersist(_ verdict: PolicyVerdict) -> Bool {
+        captureVerdictDisposition(verdict, frameRedactionEnabled: false) != .drop
+    }
+
+    /// The region-blind side channels — the AX exact-text walk, AX control
+    /// labels/values, and the native-resolution OCR rescue lines — carry no
+    /// geometry in the captured frame's FrameSpace: AX rects are CG-global
+    /// points and the native lines are normalized to a DIFFERENT (focused-window
+    /// crop) image. A tenant `.redact(regions:)` verdict therefore cannot be
+    /// region-scoped onto them the way stream-OCR boxes are, and persisting them
+    /// PII-scrubbed-only would ship non-PII region content (AX is
+    /// character-perfect for native apps) into FTS/embedding while the frame's
+    /// privacy manifest stamps POLICY_REGION — a FALSE "redacted" frame. LAW 7:
+    /// with regions present the whole channel degrades to MISSED for this frame;
+    /// the region-scrubbed stream-OCR channel still persists. With no regions
+    /// (the ONLY reachable state with `cascade.frameRedaction` OFF) this is
+    /// exactly today's always-on PII scrub, byte for byte.
+    internal nonisolated static func scrubbedSideChannels(
+        axText: String,
+        axControls: [ScreenContentStructurer.AXControl],
+        nativeOCRLines: [ScreenTextRecognizer.TextBox],
+        policy: CapturePrivacyPolicy,
+        policyRegions: [Rect<FrameSpace>]
+    ) -> (
+        axText: String,
+        axControls: [ScreenContentStructurer.AXControl],
+        nativeOCRLines: [ScreenTextRecognizer.TextBox]
+    ) {
+        guard policyRegions.isEmpty else { return ("", [], []) }
+        let scrubbedControls = axControls.map {
+            ScreenContentStructurer.AXControl(
+                id: $0.id,
+                kind: $0.kind,
+                label: $0.label.map { FrameRedactor.redactedText($0, policy: policy) },
+                value: $0.value.map { FrameRedactor.redactedText($0, policy: policy) },
+                rect: $0.rect,
+                confidence: $0.confidence
+            )
+        }
+        let scrubbedNativeLines = nativeOCRLines.map {
+            ScreenTextRecognizer.TextBox(
+                text: FrameRedactor.redactedText($0.text, policy: policy),
+                boundingBox: $0.boundingBox,
+                confidence: $0.confidence
+            )
+        }
+        return (FrameRedactor.redactedText(axText, policy: policy), scrubbedControls, scrubbedNativeLines)
     }
 
     private func process(_ frame: ChangedFrame, reason: CaptureReason) async {
@@ -780,13 +851,24 @@ actor RewindEngine {
         // before paying for OCR or writing a frame to disk. With `cascade.governance`
         // OFF (the default) this is byte-for-byte today's `policy.decision` early
         // return; ON routes through GovernanceKit's default policy (same outcome).
-        guard Self.captureVerdictAllowsPersist(Self.captureGateVerdict(
-            appName: snapshot.appName,
-            bundleIdentifier: snapshot.bundleIdentifier,
-            windowTitle: snapshot.windowTitle,
-            policy: policy,
-            governanceEnabled: governanceEnabled
-        )) else { return }
+        // A `.redact` verdict persists with the policy's typed regions only when
+        // `cascade.frameRedaction` is ON; OFF it degrades to drop (LAW 7).
+        let policyRegions: [Rect<FrameSpace>]
+        switch Self.captureVerdictDisposition(
+            Self.captureGateVerdict(
+                appName: snapshot.appName,
+                bundleIdentifier: snapshot.bundleIdentifier,
+                windowTitle: snapshot.windowTitle,
+                policy: policy,
+                governanceEnabled: governanceEnabled
+            ),
+            frameRedactionEnabled: frameRedactionEnabled
+        ) {
+        case .drop:
+            return
+        case .persist(let regions):
+            policyRegions = regions
+        }
 
         // The exact-text channel: the focused window's accessibility tree.
         // Character-perfect for native apps, immune to the resolution cap.
@@ -857,27 +939,31 @@ actor RewindEngine {
         ) != nil {
             return
         }
-        guard let redacted = FrameRedactor.redact(imageData: frame.jpeg, boxes: ocrBoxes, policy: policy) else { return }
+        guard let redacted = FrameRedactor.redact(
+            imageData: frame.jpeg,
+            boxes: ocrBoxes,
+            policy: policy,
+            policyRegions: policyRegions
+        ) else { return }
         redactedOCRBoxes = redacted.boxes
         ocrText = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false).readingOrderText
-        let redactedAXText = FrameRedactor.redactedText(axText, policy: policy)
-        let redactedAXControls = axControls.map {
-            ScreenContentStructurer.AXControl(
-                id: $0.id,
-                kind: $0.kind,
-                label: $0.label.map { FrameRedactor.redactedText($0, policy: policy) },
-                value: $0.value.map { FrameRedactor.redactedText($0, policy: policy) },
-                rect: $0.rect,
-                confidence: $0.confidence
-            )
-        }
-        nativeOCRLines = nativeOCRLines.map {
-            ScreenTextRecognizer.TextBox(
-                text: FrameRedactor.redactedText($0.text, policy: policy),
-                boundingBox: $0.boundingBox,
-                confidence: $0.confidence
-            )
-        }
+        // ONE choke point for the region-blind side channels (AX text, AX
+        // control labels/values, native-res OCR lines): with policy regions
+        // present they DROP (LAW 7 — a region cannot be intersected with their
+        // foreign/absent geometry, so persisting them would leak region text
+        // into FTS/embedding under a POLICY_REGION manifest); with no regions
+        // (always, when `cascade.frameRedaction` is OFF) this is today's exact
+        // PII scrub.
+        let sideChannels = Self.scrubbedSideChannels(
+            axText: axText,
+            axControls: axControls,
+            nativeOCRLines: nativeOCRLines,
+            policy: policy,
+            policyRegions: policyRegions
+        )
+        let redactedAXText = sideChannels.axText
+        let redactedAXControls = sideChannels.axControls
+        nativeOCRLines = sideChannels.nativeOCRLines
         let structuredRedacted = ScreenContentStructurer.structure(
             redactedOCRBoxes,
             topLeftOrigin: false,
@@ -1007,6 +1093,7 @@ final class RewindRecorder {
         indexWorkGraph: Bool = true,
         structuredContent: Bool = false,
         governanceEnabled: Bool = false,
+        frameRedactionEnabled: Bool = false,
         maintenanceScheduler: RecorderMaintenanceScheduler? = nil,
         policy: CapturePrivacyPolicy = .default,
         onMoment: @escaping @Sendable (RecordedContext) -> Void
@@ -1016,6 +1103,7 @@ final class RewindRecorder {
             indexWorkGraph: indexWorkGraph,
             structuredContent: structuredContent,
             governanceEnabled: governanceEnabled,
+            frameRedactionEnabled: frameRedactionEnabled,
             maintenanceScheduler: maintenanceScheduler,
             policy: policy,
             onMoment: onMoment

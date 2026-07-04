@@ -207,7 +207,47 @@ struct PostActionVerifierTests {
         #expect(changed.mechanism == "image_diff")
     }
 
-    // (6) predictedEffect(forKind:) is total over every kindToken CUStep emits,
+    // (6) The §7 redaction carve-out pin (the ONE CU seam): rung 2 reads the
+    // PRE-redaction in-memory OCR only, never persisted/redacted text — the
+    // live implementation (CascadeAppModel.ladderRectOCR) does a fresh
+    // live-screen crop + in-memory recognize and never touches FrameStore.
+    // Raw before/after card numbers differ ⇒ the delta verifies at rung 2.
+    // PIIDetector redacts BOTH sides to the IDENTICAL "<CREDIT_CARD>" string,
+    // so a post-redaction/persisted reader would see NO delta here. HONEST
+    // SCOPE: this test injects its own evidence strings, so it pins the
+    // DISCRIMINATOR (redaction collapses the delta) at the evidence level —
+    // it does NOT exercise CascadeAppModel.ladderRectOCR, and a refactor of
+    // that live path to read recorded frames would not fail this test. The
+    // carve-out stays structural only because ladderRectOCR itself does a
+    // fresh live crop, in memory, and never touches FrameStore.
+    @Test func rung2ReadsPreRedactionOCRNeverPersistedText() async {
+        let rawBefore = "Card 4111 1111 1111 1111"
+        let rawAfter = "Card 4242 4242 4242 4242"  // both Luhn-valid on purpose
+        let action = VerifiableAction(
+            kindToken: "click",
+            targetRect: CGRect(x: 100, y: 100, width: 320, height: 160)
+        )
+        let flags = ProbeFlags()
+        let verdict = await verifier.verify(
+            action,
+            evidence: evidence(flags: flags, ocrBefore: rawBefore, ocrAfter: rawAfter)
+        )
+        #expect(verdict.status == .verified)
+        #expect(verdict.rung == 2)
+        #expect(verdict.mechanism == "ocr_delta")
+        #expect(flags.didFire("ocr"))
+
+        // Redaction changes what PERSISTS, never what verify sees: both sides
+        // redact to the identical string, so a post-redaction reader would see
+        // NO delta here.
+        let redactedBefore = PIIDetector.redact(rawBefore, includeNames: false, highConfidenceOnly: false).redacted
+        let redactedAfter = PIIDetector.redact(rawAfter, includeNames: false, highConfidenceOnly: false).redacted
+        #expect(redactedBefore == redactedAfter)
+        #expect(redactedBefore.contains("<CREDIT_CARD>"))
+        #expect(redactedBefore != rawBefore)
+    }
+
+    // (7) predictedEffect(forKind:) is total over every kindToken CUStep emits,
     // with the exact structural mapping the ladder relies on.
     @Test func predictedEffectMappingIsTotalOverCUStepKindTokens() {
         let expected: [String: PredictedEffect] = [
