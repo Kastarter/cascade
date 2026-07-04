@@ -281,6 +281,17 @@ public enum KeyboardLayoutMapper {
         }
     }
 
+    // TISCopyCurrentKeyboardLayoutInputSource / TISGetInputSourceProperty are
+    // Text-Input-Source-Manager (Carbon) APIs that ASSERT they run on the main
+    // thread (dispatch_assert_queue). The typing path calls this from the background
+    // actuator thread → SIGTRAP crash. Fix: build the full character→keycode table
+    // ONCE on the main thread, cache it, and consult the cache from any thread.
+    // Bonus: ~512× less work per keystroke — it was running a 128×4 UCKeyTranslate
+    // sweep for every character; now once per keyboard layout.
+    private static let layoutLock = NSLock()
+    nonisolated(unsafe) private static var cachedLayoutTable: [Character: KeyboardKeyMapping]?
+    nonisolated(unsafe) private static var layoutObserverInstalled = false
+
     private static func currentLayoutMapping(for key: String) -> KeyboardKeyMapping? {
         // The Carbon TIS APIs below (TISCopyCurrentKeyboardLayoutInputSource /
         // TISGetInputSourceProperty) assert they run on the MAIN thread — calling them
@@ -291,13 +302,37 @@ public enum KeyboardLayoutMapper {
             return DispatchQueue.main.sync { currentLayoutMapping(for: key) }
         }
         guard key.count == 1, let target = key.first else { return nil }
+        return layoutTable()[target]
+    }
+
+    private static func layoutTable() -> [Character: KeyboardKeyMapping] {
+        layoutLock.lock()
+        if let table = cachedLayoutTable {
+            layoutLock.unlock()
+            return table
+        }
+        layoutLock.unlock()
+        // isMainThread guard so calling from the main thread never self-deadlocks on
+        // main.sync; the background typing path pays a single main hop, then caches.
+        let built: [Character: KeyboardKeyMapping] = Thread.isMainThread
+            ? buildLayoutTableOnMain()
+            : DispatchQueue.main.sync { buildLayoutTableOnMain() }
+        layoutLock.lock()
+        cachedLayoutTable = built
+        layoutLock.unlock()
+        return built
+    }
+
+    /// MUST run on the main thread — the TIS APIs assert the main queue.
+    private static func buildLayoutTableOnMain() -> [Character: KeyboardKeyMapping] {
+        installLayoutObserverIfNeeded()
         #if canImport(Carbon)
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let rawLayout = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
-            return nil
+            return [:]
         }
         let layoutData = unsafeBitCast(rawLayout, to: CFData.self)
-        guard let keyboardLayout = CFDataGetBytePtr(layoutData) else { return nil }
+        guard let keyboardLayout = CFDataGetBytePtr(layoutData) else { return [:] }
         let layout = unsafeBitCast(keyboardLayout, to: UnsafePointer<UCKeyboardLayout>.self)
         let modifierCandidates: [(UInt32, CGEventFlags)] = [
             (0, []),
@@ -305,6 +340,7 @@ public enum KeyboardLayoutMapper {
             (UInt32(optionKey >> 8), .maskAlternate),
             (UInt32((shiftKey | optionKey) >> 8), [.maskShift, .maskAlternate]),
         ]
+        var table: [Character: KeyboardKeyMapping] = [:]
         for keyCode in 0..<128 {
             for (modifierState, flags) in modifierCandidates {
                 var deadKeyState: UInt32 = 0
@@ -324,13 +360,34 @@ public enum KeyboardLayoutMapper {
                 )
                 guard status == noErr, length > 0 else { continue }
                 let produced = String(utf16CodeUnits: chars, count: length)
-                if produced.count == 1, produced.first == target {
-                    return KeyboardKeyMapping(keyCode: CGKeyCode(keyCode), requiredModifiers: flags)
+                // First (keyCode, modifier) that yields the character wins — matches the
+                // original early-return ordering (ascending keyCode, then modifier list).
+                if produced.count == 1, let ch = produced.first, table[ch] == nil {
+                    table[ch] = KeyboardKeyMapping(keyCode: CGKeyCode(keyCode), requiredModifiers: flags)
                 }
             }
         }
+        return table
+        #else
+        return [:]
         #endif
-        return nil
+    }
+
+    /// Drop the cached table when the user switches keyboard layout mid-session.
+    private static func installLayoutObserverIfNeeded() {
+        guard !layoutObserverInstalled else { return }
+        layoutObserverInstalled = true
+        #if canImport(Carbon)
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil,
+            queue: .main
+        ) { _ in
+            layoutLock.lock()
+            cachedLayoutTable = nil
+            layoutLock.unlock()
+        }
+        #endif
     }
 }
 
