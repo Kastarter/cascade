@@ -112,6 +112,31 @@ public enum AXTargetDescriptorBuilder {
         return descriptor.encodedJSON()
     }
 
+    /// Hit-tests the AX element at a CG-global point and climbs to the nearest
+    /// labeled, actionable ancestor — the shared "what did this click land on"
+    /// primitive. Body moved verbatim from `InputRecorder.axClickTarget` so the
+    /// perception-anchor capture path (CascadeAppModel) can reuse the exact
+    /// recorder hit test; the recorder delegates back here with
+    /// `createdFrom: "input_recorder"`, behavior-identical.
+    public static func clickTarget(
+        atCGPoint point: CGPoint,
+        windowTitle: String?,
+        createdFrom: String
+    ) -> (label: String, descriptor: String?)? {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.3)
+        var ref: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
+              let element = ref else { return nil }
+        return labeledActionableAncestor(
+            from: element,
+            windowTitle: windowTitle,
+            createdFrom: createdFrom
+        ).map {
+            ($0.label, $0.descriptor)
+        }
+    }
+
     public static func labeledActionableAncestor(
         from element: AXUIElement,
         maxHops: Int = 4,
@@ -515,18 +540,7 @@ public final class InputRecorder: @unchecked Sendable {
     /// identifier first, then role to disambiguate equal labels). `descriptor` is
     /// `nil` when the matched ancestor exposes neither a usable role nor identifier.
     private static func axClickTarget(atCG point: CGPoint, windowTitle: String?) -> (label: String, descriptor: String?)? {
-        let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.3)
-        var ref: AXUIElement?
-        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &ref) == .success,
-              let element = ref else { return nil }
-        return AXTargetDescriptorBuilder.labeledActionableAncestor(
-            from: element,
-            windowTitle: windowTitle,
-            createdFrom: "input_recorder"
-        ).map {
-            ($0.label, $0.descriptor)
-        }
+        AXTargetDescriptorBuilder.clickTarget(atCGPoint: point, windowTitle: windowTitle, createdFrom: "input_recorder")
     }
 
     /// The clicked element's structural container — its parent's "role: title" via the
@@ -666,6 +680,21 @@ public final class InputRecorder: @unchecked Sendable {
         flushTyped()
         if !events.isEmpty {
             try? await store.insertInputEvents(events)
+            // §4d perception-anchor WRITE hook (human clicks). Flag OFF (the
+            // default) costs exactly one UserDefaults bool read — no decode,
+            // no store call. Write failures are swallowed (try?) so anchor
+            // collection can only ever degrade to a MISSED anchor, never
+            // block recording (LAW 7).
+            if PerceptionAnchorWriteFlag.isEnabled() {
+                for candidate in PerceptionAnchorWriter.anchorCandidates(from: events) {
+                    _ = try? await store.upsertPerceptionAnchor(
+                        bundleID: candidate.bundleID,
+                        targetTextHash: candidate.textHash,
+                        descriptorJSON: candidate.descriptorJSON,
+                        source: "human"
+                    )
+                }
+            }
         }
     }
 

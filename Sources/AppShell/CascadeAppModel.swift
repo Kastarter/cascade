@@ -6453,6 +6453,13 @@ public final class CascadeAppModel: ObservableObject {
         let ladderPre: LadderPreActionEvidence? = postActionVerifierEnabled
             ? await ladderPreActionEvidence(for: action, on: screen)
             : nil
+        // §4d perception-anchor capture — MUST run BEFORE the click executes
+        // (the element may vanish/move after the effect). Both flags OFF (the
+        // default) evaluates to nil with zero AX work.
+        let anchorPre: PendingAnchorCapture? =
+            (postActionVerifierEnabled && PerceptionAnchorWriteFlag.isEnabled(defaults: defaultsStore))
+            ? await captureClickAnchor(for: action, on: screen)
+            : nil
         do {
             switch action {
             case .move(let x, let y):
@@ -6664,7 +6671,8 @@ public final class CascadeAppModel: ObservableObject {
                     action,
                     on: screen,
                     preOCR: ladderPre?.ocrBefore,
-                    hashesBefore: ladderPre?.gridHashesBefore
+                    hashesBefore: ladderPre?.gridHashesBefore,
+                    anchor: anchorPre
                 )
             } else {
                 await verifyPostAction(action)
@@ -6904,6 +6912,57 @@ public final class CascadeAppModel: ObservableObject {
         let gridHashesBefore: [UInt64]?
     }
 
+    /// §4d pre-action anchor evidence for an agent click, held in-memory until
+    /// the verifier confirms the click's effect — only then does it become a
+    /// perception_anchor row (source "agent_verified"). Captured pre-action
+    /// because the target element may vanish/move after the effect.
+    struct PendingAnchorCapture: Sendable {
+        let bundleID: String
+        let textHash: String
+        let descriptorJSON: String
+    }
+
+    /// AX hit test at an agent click's target point, BEFORE the click executes.
+    /// Only click/double-click/right-click kinds anchor; skips Cascade's own
+    /// bundle (the overlay could be resolved instead of the target app) and
+    /// descriptors without a semantic text hash (missed, never false — LAW 7).
+    /// Runs only when both cascade.postActionVerifier and cascade.anchorWrite
+    /// are ON.
+    private func captureClickAnchor(for action: CUAction, on screen: NSScreen) async -> PendingAnchorCapture? {
+        let x: Double
+        let y: Double
+        switch action {
+        case .click(let cx, let cy), .doubleClick(let cx, let cy), .rightClick(let cx, let cy):
+            x = cx
+            y = cy
+        default:
+            return nil
+        }
+        // Frontmost bundle captured pre-action — it is the app about to be clicked.
+        guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              !bundleID.isEmpty,
+              bundleID != Bundle.main.bundleIdentifier
+        else { return nil }
+        let mapper = DisplayCoordinateMapper(screen: screen)
+        let point = mapper?.cgGlobal(fromScreenLocal: CGPoint(x: x, y: y))
+            ?? Self.toCGGlobal(CGPoint(x: screen.frame.minX + x, y: screen.frame.minY + y))
+        // Position-based AX hit test (0.3s messaging timeout worst case) off
+        // the main actor; it does not need the pointer present, so pre-flight
+        // capture is safe.
+        let hit = await Task.detached(priority: .userInitiated) {
+            AXTargetDescriptorBuilder.clickTarget(
+                atCGPoint: point,
+                windowTitle: nil,
+                createdFrom: "agent_verified"
+            )
+        }.value
+        guard let json = hit?.descriptor,
+              let descriptor = AXTargetDescriptorV2.decode(json),
+              let hash = descriptor.semanticTextHash ?? descriptor.semanticHash
+        else { return nil }
+        return PendingAnchorCapture(bundleID: bundleID, textHash: hash, descriptorJSON: json)
+    }
+
     private func ladderPreActionEvidence(for action: CUAction, on screen: NSScreen) async -> LadderPreActionEvidence? {
         let descriptor = Self.postActionVerifiableAction(for: action, on: screen)
         let predicted = descriptor.predictedEffect
@@ -6946,7 +7005,8 @@ public final class CascadeAppModel: ObservableObject {
         _ action: CUAction,
         on screen: NSScreen,
         preOCR: String?,
-        hashesBefore: [UInt64]?
+        hashesBefore: [UInt64]?,
+        anchor: PendingAnchorCapture? = nil
     ) async {
         let descriptor = Self.postActionVerifiableAction(for: action, on: screen)
         let displayW = Int(screen.frame.width)
@@ -6978,6 +7038,19 @@ public final class CascadeAppModel: ObservableObject {
         )
 
         let verdict = await PostActionVerifier().verify(descriptor, evidence: evidence)
+
+        // §4d perception-anchor WRITE hook (agent clicks): only a
+        // verifier-CONFIRMED effect earns an anchor row; unclear/failed
+        // verdicts write nothing (missed, never false — LAW 7). try? so a
+        // write failure never disturbs the verdict/audit path.
+        if verdict.status == .verified, let anchor {
+            _ = try? await store.upsertPerceptionAnchor(
+                bundleID: anchor.bundleID,
+                targetTextHash: anchor.textHash,
+                descriptorJSON: anchor.descriptorJSON,
+                source: "agent_verified"
+            )
+        }
 
         let (evidenceName, evidenceText): (String, String)
         switch action {

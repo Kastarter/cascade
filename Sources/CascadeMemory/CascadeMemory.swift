@@ -3750,6 +3750,25 @@ public actor CascadeStore {
         CREATE INDEX IF NOT EXISTS idx_input_event_bundle_captured_ms_kind
             ON input_event(bundle_identifier, captured_ms ASC, kind);
 
+        -- §4d perception anchors: verified (bundle, semantic-text-hash) →
+        -- AXTargetDescriptor ensembles harvested from human clicks and
+        -- verifier-confirmed agent clicks. WRITE-ONLY collection behind
+        -- cascade.anchorWrite (see PerceptionAnchorStore.swift) — no runtime
+        -- read/recall path exists, so a missing/failed anchor degrades to a
+        -- missed recall, never a false one (LAW 7).
+        CREATE TABLE IF NOT EXISTS perception_anchor (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bundle_id TEXT NOT NULL,
+            target_text_hash TEXT NOT NULL,
+            descriptor_json TEXT NOT NULL,
+            source TEXT NOT NULL,
+            verified_count INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            UNIQUE(bundle_id, target_text_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_perception_anchor_bundle
+            ON perception_anchor(bundle_id, verified_count DESC);
+
         CREATE TABLE IF NOT EXISTS agents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
