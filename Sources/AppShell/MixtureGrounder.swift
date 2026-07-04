@@ -105,6 +105,36 @@ public struct MixtureGrounder: VisualGrounder {
         }
     }
 
+    /// One shadow-router decision alongside a live verified grounding call
+    /// (cascade.perceptionRouter, default OFF — advisory-to-audit only). The
+    /// decision is computed from the SAME frozen candidates the live path scored
+    /// and NEVER changes what is actuated; `diverged` marks the parity gap the
+    /// §6 promotion gate counts.
+    public struct ShadowRouteOutcome: Sendable, Equatable {
+        public let target: String
+        public let decision: GroundingRouter.RouteDecision
+        public let diverged: Bool
+        public let liveSource: GroundingSource?
+        public let liveVerdict: String
+        public let candidateCount: Int
+
+        public init(
+            target: String,
+            decision: GroundingRouter.RouteDecision,
+            diverged: Bool,
+            liveSource: GroundingSource?,
+            liveVerdict: String,
+            candidateCount: Int
+        ) {
+            self.target = target
+            self.decision = decision
+            self.diverged = diverged
+            self.liveSource = liveSource
+            self.liveVerdict = liveVerdict
+            self.candidateCount = candidateCount
+        }
+    }
+
     private let base: any VisualGrounder
     private let skills: AppSkillRegistry
     /// Minimum AX label-match score to TRUST a structural hit: 2 = one string
@@ -116,6 +146,10 @@ public struct MixtureGrounder: VisualGrounder {
     private let previousAnchor: VerifiedGroundingAnchor?
     private let candidateFailureCounts: [String: Int]
     private let onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)?
+    /// Shadow-router hook (cascade.perceptionRouter). nil (the default at every
+    /// existing callsite) keeps the OFF path byte-identical: no router, no
+    /// MainActor context probe, no audit row.
+    private let onRouteDecision: (@Sendable (ShadowRouteOutcome) async -> Void)?
     private let onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)?
     private let groundingCache: GroundingCache?
     private let cacheMode: GroundingCacheMode
@@ -146,7 +180,8 @@ public struct MixtureGrounder: VisualGrounder {
         },
         regionNarrower: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
         onRuntimeProfile: (@Sendable (AXRuntimeProfile) async -> Void)? = nil,
-        onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil
+        onVerifierOutcome: (@Sendable (VerifierOutcome) async -> Void)? = nil,
+        onRouteDecision: (@Sendable (ShadowRouteOutcome) async -> Void)? = nil
     ) {
         self.base = base
         self.skills = skills
@@ -160,6 +195,7 @@ public struct MixtureGrounder: VisualGrounder {
         self.regionNarrower = regionNarrower
         self.onRuntimeProfile = onRuntimeProfile
         self.onVerifierOutcome = onVerifierOutcome
+        self.onRouteDecision = onRouteDecision
     }
 
     public func ground(
@@ -328,6 +364,7 @@ public struct MixtureGrounder: VisualGrounder {
             // AX-sparse view with no viable candidate), a second visual-grounding pass
             // won't conjure one — it only adds a slow round-trip. Escalate best-of-N ONLY
             // when there WERE candidates but none was accepted (worth another look).
+            var effectiveBase = baseResult
             if selection.verifierResult.verdict != .accept,
                selection.verifierResult.failureKind != .noCandidates,
                ambiguityOptions.sampleCount == options.sampleCount,
@@ -340,6 +377,7 @@ public struct MixtureGrounder: VisualGrounder {
                     options: Self.escalatedGroundingOptions(from: options)
                 )
                 let retriedBase = Self.mergedGroundingResult(visualResult, indexedResult ?? baseResult)
+                effectiveBase = retriedBase
                 selection = Self.selectVerifiedCandidate(
                     axCandidate: axCandidate,
                     baseResult: retriedBase,
@@ -351,6 +389,12 @@ public struct MixtureGrounder: VisualGrounder {
                 )
             }
             await recordVerifierOutcomeIfNeeded(selection, target: target)
+            await runShadowRouter(
+                axCandidate: axCandidate,
+                baseResult: effectiveBase,
+                selection: selection,
+                target: target
+            )
             await storeGroundingCacheResult(selection.result, key: key)
             return selection.result
         }
@@ -1259,6 +1303,70 @@ public struct MixtureGrounder: VisualGrounder {
             nearbyOCRText: match.title,
             ocrDistancePoints: 0
         )
+    }
+
+    /// AX-skip context for the shadow GroundingRouter, computed from the EXACT
+    /// checks `axVerifierCandidate` already performs (canvas concept, Cascade's
+    /// own UI frontmost, axUnreliable skill flag, sparse runtime profile). Runs
+    /// on the MainActor (NSWorkspace/AX surfaces) and is invoked ONLY when the
+    /// `onRouteDecision` hook is non-nil — the OFF path never probes.
+    @MainActor
+    func axRouteContext(target: String) -> GroundingRouter.RouteContext {
+        let canvasTarget = Self.namesCanvasConcept(target)
+        let front = NSWorkspace.shared.frontmostApplication
+        let ownUI = front?.bundleIdentifier == Self.cascadeBundleID
+        let skill = skills.skill(appName: front?.localizedName, bundleIdentifier: front?.bundleIdentifier)
+        let axUnreliable = skill?.axUnreliable == true
+        let axSparse = AXElementResolver.runtimeProfileForFrontmost()?.isSparse == true
+        return GroundingRouter.RouteContext(
+            canvasTarget: canvasTarget,
+            ownUI: ownUI,
+            axUnreliable: axUnreliable,
+            axSparse: axSparse
+        )
+    }
+
+    /// SHADOW-FIRST router pass (b40ede8 discipline: never extract live-walked
+    /// routing without shadow parity). Called at the end of the verifyCandidates
+    /// `.key` branch AFTER the live selection is final — it routes the SAME frozen
+    /// candidate evidence the live verifier scored, compares the selected points
+    /// with the existing 24pt `pointsAgree` epsilon, and reports through the hook.
+    /// The live `selection.result` return expression is never touched: with the
+    /// hook nil (the shipped default) this is a single guard-return.
+    private func runShadowRouter(
+        axCandidate: GroundingVerifierCandidate?,
+        baseResult: GroundingResult,
+        selection: VerifiedGroundingSelection,
+        target: String
+    ) async {
+        guard let onRouteDecision else { return }
+        let context = await axRouteContext(target: target)
+        var frozen = baseResult.candidates
+        if let axCandidate { frozen.insert(axCandidate.candidate, at: 0) }
+        let decision = await GroundingRouter.shadowDecision(
+            candidates: frozen,
+            target: target,
+            context: context
+        )
+        let livePoint = selection.result.selectedPoint
+        let routedPoint = decision.selectedCGPoint
+        let diverged: Bool
+        switch (livePoint, routedPoint) {
+        case (nil, nil):
+            diverged = false
+        case (nil, .some), (.some, nil):
+            diverged = true
+        case (let live?, let routed?):
+            diverged = !Self.pointsAgree(live, routed)
+        }
+        await onRouteDecision(ShadowRouteOutcome(
+            target: target,
+            decision: decision,
+            diverged: diverged,
+            liveSource: selection.result.selectedCandidate?.source,
+            liveVerdict: selection.verifierResult.verdict.rawValue,
+            candidateCount: selection.result.candidates.count
+        ))
     }
 
     /// Words that denote a drawn surface with no faithful accessibility node, so a

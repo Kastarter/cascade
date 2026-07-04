@@ -25,6 +25,11 @@ public enum RouteReason: String, Sendable, Hashable, Codable {
     case axUnreliable
     case sparse
     case stale
+    /// Honest residual: the AX lane RAN (not skipped for canvas/ownUI/unreliable/sparse
+    /// context) but produced no label match above threshold. Mislabeling this as
+    /// `.sparse` would be a FALSE audit row (LAW 7 — degrade to MISSED, never FALSE):
+    /// the tree was rich, the match just missed. §4d's five visual reasons stay intact.
+    case axMiss
 }
 
 /// Structural evidence supporting a grounding candidate.

@@ -352,6 +352,11 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalStructuredContentKey = "cascade.experimentalStructuredContent"
     static let experimentalWorkGraphIndexKey = "cascade.experimentalWorkGraphIndex"
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
+    /// Shadow GroundingRouter (§3.2 perception layer) — default OFF. Even when ON
+    /// it is advisory-to-audit only: the router's verdict is computed ALONGSIDE
+    /// the live MixtureGrounder selection and never actuated. Promotion gate
+    /// (LAW 3): live `grounding.route` rows with zero `grounding.route.diverged`.
+    static let perceptionRouterKey = "cascade.perceptionRouter"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
     static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
@@ -3044,6 +3049,28 @@ public final class CascadeAppModel: ObservableObject {
         // Default ON: unset → enabled; explicit false → disabled (pure visual A/B).
         let mixture = (d.object(forKey: "cascade.mixtureGrounding") as? Bool) ?? true
         let verifyCandidates = (d.object(forKey: Self.experimentalGroundingVerifierKey) as? Bool) ?? mixture
+        // Shadow GroundingRouter — default OFF (unset or false ⇒ nil hook, so the
+        // MixtureGrounder OFF path stays byte-identical: no router, no MainActor
+        // context probe, no audit row). ON = advisory-to-audit only: one
+        // grounding.route row per verified ground call (+ grounding.route.diverged
+        // on parity gaps); the router never changes what is actuated.
+        let perceptionRouter = (d.object(forKey: Self.perceptionRouterKey) as? Bool) ?? false
+        var onRouteDecision: (@Sendable (MixtureGrounder.ShadowRouteOutcome) async -> Void)?
+        if perceptionRouter {
+            onRouteDecision = { [store = self.store] outcome in
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "grounding.route",
+                    detail: Self.groundingRouteAuditDetail(outcome)
+                ))
+                guard outcome.diverged else { return }
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "agent",
+                    action: "grounding.route.diverged",
+                    detail: Self.groundingRouteAuditDetail(outcome)
+                ))
+            }
+        }
         return mixture ? MixtureGrounder(
             base: base,
             skills: appSkills,
@@ -3079,7 +3106,8 @@ public final class CascadeAppModel: ObservableObject {
                     repairHint: "Re-describe the visible target once and prefer independent AX/OCR agreement over the rejected source.",
                     recoveryEvidenceSeed: "\(outcome.verifierResult.verdict.rawValue)|\(outcome.selectedCandidateHash ?? Self.auditHash(outcome.target))"
                 )
-            }
+            },
+            onRouteDecision: onRouteDecision
         ) : base
     }
 
@@ -5764,6 +5792,29 @@ public final class CascadeAppModel: ObservableObject {
             parts.append("selectedCandidateHash=\(safeAuditToken(selectedCandidateHash))")
         }
         return parts.joined(separator: " ")
+    }
+
+    /// Detail for `grounding.route` / `grounding.route.diverged` rows. P7
+    /// audit-PII discipline: fixed enum tokens, integer counts, and the target's
+    /// HASH only — the raw target text never reaches audit detail. `lane=key`
+    /// scopes the dashboard number honestly: the shadow only fires on the
+    /// verifyCandidates cache-`.key` path (cache hits/misses and non-verify
+    /// paths never route), so `grounding.route` shares cover key-path decisions.
+    nonisolated static func groundingRouteAuditDetail(_ outcome: MixtureGrounder.ShadowRouteOutcome) -> String {
+        [
+            "lane=key",
+            "reason=\(safeAuditToken(outcome.decision.reasonToken))",
+            "selected=\(safeAuditToken(outcome.decision.selectedSourceToken ?? "none"))",
+            // Fixed lane names + integer counts built in ProviderKit — no PII, and
+            // safeAuditToken would strip the ':'/',' separators, so embed verbatim.
+            "sources=\(outcome.decision.sourceCountsToken)",
+            "corroborated=\(outcome.decision.corroborated)",
+            "diverged=\(outcome.diverged)",
+            "live=\(safeAuditToken(outcome.liveSource?.rawValue ?? "none"))",
+            "liveVerdict=\(safeAuditToken(outcome.liveVerdict))",
+            "candidates=\(outcome.candidateCount)",
+            "targetHash=\(auditHash(outcome.target))",
+        ].joined(separator: " ")
     }
 
     nonisolated static func harnessDeniedWatchedAppAuditDetail(toolName: String, watchedApp: String) -> String {
