@@ -229,6 +229,19 @@ public final class ContextRecorder: ObservableObject {
         // instant private mode was toggled, which is the bug we're fixing.
     }
 
+    /// Teach-once demo burst: while a demonstration is being recorded, the capture
+    /// stream runs at the demo cadence (2fps, 0.5s persistence, tighter dedup) so
+    /// the whole concept of what happened lands in the record. The desired state is
+    /// remembered here, so a recorder started mid-demonstration comes up bursting.
+    public private(set) var demoBurstEnabled = false
+
+    public func setDemoBurst(_ enabled: Bool) {
+        guard demoBurstEnabled != enabled else { return }
+        demoBurstEnabled = enabled
+        guard let recorder = rewind else { return }
+        Task { @MainActor in await recorder.setDemoBurst(enabled) }
+    }
+
     public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
         self.store = store
         self.observer = observer
@@ -294,6 +307,10 @@ public final class ContextRecorder: ObservableObject {
         }
         Task { @MainActor in
             do {
+                // Apply the demonstration cadence BEFORE the stream exists so a
+                // recorder started mid-teach comes up at the right rate instead of
+                // starting at 1fps and immediately restarting.
+                if self.demoBurstEnabled { await recorder.setDemoBurst(true) }
                 try await recorder.start()
             } catch {
                 self.status.message = "Could not start recording: \(error.localizedDescription)"

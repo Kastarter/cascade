@@ -568,6 +568,92 @@ func curateRangeReturnsNilForAJunkRange() async throws {
 }
 
 @Test
+func curateRangeSamplesOCRAcrossTheWholeDemonstration() async throws {
+    // A Teach-once demo records densely (0.5s burst), so reading the first N moments
+    // would show the curator only the opening seconds. Evidence must be sampled
+    // EVENLY across the bracket: a screen seen only near the END of the demo still
+    // reaches the prompt.
+    let store = try makeStore()
+    try await store.insertInputEvents(copyPasteEvents())
+    for i in 0..<20 {
+        _ = try await store.insert(RecordedContext(
+            capturedAt: base.addingTimeInterval(Double(i) * 2),
+            source: .screen,
+            appName: "Mail",
+            ocrText: "Inbox — three refund requests waiting for a reply"
+        ))
+    }
+    for i in 0..<10 {
+        _ = try await store.insert(RecordedContext(
+            capturedAt: base.addingTimeInterval(60 + Double(i) * 2),
+            source: .screen,
+            appName: "Numbers",
+            ocrText: "Q2 tracker sheet — totals column updated to 469,100"
+        ))
+    }
+    let capture = PromptCapture()
+    let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.7}]}"#
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        curator: WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture))
+    )
+    _ = try await orchestrator.curateRange(from: base, to: base.addingTimeInterval(100))
+    let prompt = await capture.lastUser
+    #expect(prompt.contains("Inbox — three refund requests"))
+    #expect(prompt.contains("469,100")) // the demo's ENDING made it in
+}
+
+@Test
+func evenSamplingSpreadsAcrossTheListEndpointsIncluded() {
+    let picked = CascadeOrchestrator.sampleEvenly(Array(0..<30), limit: 12)
+    #expect(picked.count == 12)
+    #expect(picked.first! == 0)                     // the demo's starting state…
+    #expect(picked.last! == 29)                     // …and its OUTCOME always survive
+    #expect(picked == picked.sorted())              // order preserved
+    #expect(Set(picked).count == picked.count)      // no duplicates at this ratio
+    // Short lists pass through untouched; degenerate budgets stay sane.
+    #expect(CascadeOrchestrator.sampleEvenly([1, 2, 3], limit: 12) == [1, 2, 3])
+    #expect(CascadeOrchestrator.sampleEvenly(Array(0..<30), limit: 0).isEmpty)
+    #expect(CascadeOrchestrator.sampleEvenly(Array(0..<30), limit: 1) == [15])
+}
+
+@Test
+func bracketFetchCoversTheWholeDemonstrationNotJustItsOpening() async throws {
+    // The store's range query is oldest-first with a LIMIT, so one fetch of a demo
+    // longer than the budget would drop its ENDING. The sliced fetch must return
+    // moments from every quarter of the bracket even under a tiny budget.
+    let store = try makeStore()
+    for i in 0..<40 {
+        _ = try await store.insert(RecordedContext(
+            capturedAt: base.addingTimeInterval(Double(i) * 2.5),
+            source: .screen,
+            appName: "Mail",
+            ocrText: "moment \(i)"
+        ))
+    }
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FailingCompleter()))
+    let moments = try await orchestrator.bracketContexts(
+        from: base, to: base.addingTimeInterval(100), slices: 4, budget: 8
+    )
+    #expect(moments.count == 8)
+    #expect(moments.map(\.id) == moments.map(\.id).sorted()) // chronological, no dupes
+    // Every quarter contributed — including the final one a flat fetch would lose.
+    #expect(moments.first!.capturedAt < base.addingTimeInterval(25))
+    #expect(moments.last!.capturedAt >= base.addingTimeInterval(75))
+}
+
+@Test
+func curateOnePromptTeachesRunVaryingParameters() {
+    // A demonstration shows ONE example of fields that change every run (a date, an
+    // invoice number) — the single-demo prompt must tell the curator to write the
+    // goal around the CURRENT value, exactly like the batch prompt does.
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("live slots or parameters"))
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("CURRENT/appropriate value at run time"))
+    // Prompt changed → the model-call cache key must roll over.
+    #expect(WorkflowCurator.curateOnePromptVersion == "workflow-curator.curate-one.prompt.v2")
+}
+
+@Test
 func curateThenApprovePersistsCuratedNameAndGoal() async throws {
     let store = try makeStore()
     try await store.insertInputEvents(copyPasteEvents())

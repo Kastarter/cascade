@@ -1293,6 +1293,19 @@ func teachingGatesNarrationIntoIntentNotAnAssistRun() throws {
 }
 
 @MainActor @Test
+func teachingRunsTheDemoCaptureBurst() throws {
+    // While demonstrating, the recorder captures every 0.5s (instead of the normal
+    // 1s changed-frame cadence) so the whole concept of the demo lands on record;
+    // ending the demonstration restores the normal cadence.
+    let (model, _) = try makeModel()
+    #expect(!model.recorder.demoBurstEnabled)
+    model.beginTeaching()
+    #expect(model.recorder.demoBurstEnabled)
+    model.endTeaching()
+    #expect(!model.recorder.demoBurstEnabled)
+}
+
+@MainActor @Test
 func voicePartialUtteranceUpdatesStatusWithoutTeaching() throws {
     let (model, _) = try makeModel()
     let initialTeachMessage = model.teachMessage

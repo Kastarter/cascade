@@ -81,7 +81,7 @@ public struct WorkflowCurator: Sendable {
     private let cachedClient: ValidatingCachedMessageCompleter?
     private let model: String
     static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
-    static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v1"
+    static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v2"
     static let curateContextPromptVersion = "workflow-curator.context-waste.prompt.v1"
     static let schemaVersion = "workflow-curator.schema.v1"
 
@@ -245,6 +245,13 @@ public struct WorkflowCurator: Sendable {
     and goal CONCRETE about the real subject matter (e.g. "reply to the refund-request \
     emails", "update the Q2 pipeline sheet"), not generic. Never invent steps the \
     recipe does not contain, and never copy private values verbatim into the goal.
+
+    When the recipe lists live slots or parameters (values typed or pasted during the \
+    demonstration), those fields likely change each run — a date, an order number, an \
+    amount. They demonstrated ONE example; write the goal so the agent supplies the \
+    CURRENT/appropriate value at run time (e.g. "…using today's date", "…for the \
+    latest invoice"), and never bake the demonstrated value into the goal as if it \
+    were fixed.
 
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}

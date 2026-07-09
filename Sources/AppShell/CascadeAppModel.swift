@@ -374,6 +374,10 @@ public final class CascadeAppModel: ObservableObject {
     nonisolated static let experimentalAutoRecallKey = "cascade.experimentalAutoRecall"
     nonisolated static let experimentalActionTrajectoryCacheKey = "cascade.experimentalActionTrajectoryCache"
     static let auditIntegrityEnforcementKey = "cascade.auditIntegrityEnforcement"
+    /// Default-ON escape hatch for the Teach-once demo capture burst (the stream
+    /// restart at 2fps while demonstrating): `defaults write com.humain.cascade
+    /// cascade.teachDemoBurst -bool NO` keeps teaching on the normal 1s cadence.
+    static let teachDemoBurstKey = "cascade.teachDemoBurst"
     static let valueHourlyRateKey = "cascade.value.hourlyRateUSD"
     static let valueMonthlyRunBudgetKey = "cascade.value.monthlyRunBudget"
     static let valueMonthlyActionBudgetKey = "cascade.value.monthlyActionBudget"
@@ -7039,6 +7043,13 @@ public final class CascadeAppModel: ObservableObject {
         teachFinishing = false
         teachAmbientArmed = false
         teachingMode = true
+        // Demo burst: capture every 0.5s (instead of the normal 1s changed-frame
+        // cadence) for the length of the demonstration, so transient states — a
+        // menu open for half a second, a dialog dismissed quickly — become moments
+        // the curator can see. Default-on (teaching is an explicit user action);
+        // the defaults key is the escape hatch if a stream restart misbehaves.
+        let demoBurstArmed = Self.enabledByDefault(defaultsStore, key: Self.teachDemoBurstKey)
+        if demoBurstArmed { recorder.setDemoBurst(true) }
         teachStatus = "Watching — show me the task and talk me through it like a new hire. Press ⌥⌃T when you're done."
         // Teach-once is training an intern, not filling a form: the mic just opens and
         // listens. Whatever you say while you work — the way you'd instruct a new hire —
@@ -7053,7 +7064,7 @@ public final class CascadeAppModel: ObservableObject {
             self.teachAmbientArmed = true
             self.teachStatus = "Listening — talk me through it as you work. Press ⌥⌃T when you're done."
         }
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.started", detail: "")) }
+        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.started", detail: demoBurstArmed ? "cadence=0.5s" : "cadence=default")) }
     }
 
     /// End the demonstration and turn the bracketed range into a curated agent (shown
@@ -7070,6 +7081,7 @@ public final class CascadeAppModel: ObservableObject {
         let end = max(start, Date().addingTimeInterval(-Self.teachFinishGuard))
         teachingMode = false
         teachStartedAt = nil
+        recorder.setDemoBurst(false)
         // Close the mic. The final sentence can still be transcribing, so keep routing
         // late utterances into the intent buffer through the finish window —
         // buildTaughtAgent reads it after a short settle.

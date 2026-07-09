@@ -50,7 +50,7 @@ watch_audit() { sqlite3 "$DB" "SELECT created_at,actor,action FROM audit_event O
 
 ### Test A — Teach-once (demonstrate → agent)
 
-1. Press **⌥⌃T** → banner reads "Teaching — do the task…". *Verify:* `sqlite3 "$DB" "SELECT action FROM audit_event WHERE action='teach.started' ORDER BY id DESC LIMIT 1;"` returns `teach.started`.
+1. Press **⌥⌃T** → banner reads "Teaching — do the task…". *Verify:* `sqlite3 "$DB" "SELECT action,detail FROM audit_event WHERE action='teach.started' ORDER BY id DESC LIMIT 1;"` returns `teach.started` with `cadence=0.5s` (the demo capture burst armed — the rewind stream restarts at 2fps with a 0.5s persistence gap for the length of the demonstration). *Verify after step 3:* `sqlite3 "$DB" "SELECT COUNT(*) FROM recorded_context WHERE captured_ms BETWEEN <start_ms> AND <end_ms>;"` shows roughly 2 moments/second while the screen was changing (vs ~1/s normally).
 2. Do a real, repeatable task by hand (e.g. open `~/CascadeDemo/Invoices/falcon-invoice…`, copy the amount, paste into Numbers). Narrate if you like.
 3. Press **⌥⌃T** again → "Saving your demonstration…". *Verify:* `teach.stopped` row exists.
 4. A **preview sheet** appears with the curated agent (name + numbered steps). *This is the pass/fail moment.* If it says "Nothing repeatable in that demonstration yet," curation found no signal — a real failure to log.

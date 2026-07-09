@@ -235,6 +235,11 @@ public struct CaptureScheduler: Sendable, Equatable {
     /// scroll-through playback instead of one screenshot per 8 seconds.
     public static let streamHeartbeatInterval: TimeInterval = 1.0
 
+    /// The persistence gap for stream-delivered frames. Normally the 1s cadence;
+    /// a Teach-once demo burst tightens it to 0.5s so every changed state of the
+    /// demonstration becomes a moment.
+    public var streamHeartbeatGap: TimeInterval = CaptureScheduler.streamHeartbeatInterval
+
     private var lastCaptureByReason: [CaptureReason: Date] = [:]
 
     public init() {}
@@ -273,7 +278,7 @@ public struct CaptureScheduler: Sendable, Equatable {
         case .idleHeartbeat:
             minGap = Self.idleHeartbeatInterval
         case .streamHeartbeat:
-            minGap = Self.streamHeartbeatInterval
+            minGap = streamHeartbeatGap
         }
         if let previous = lastCaptureByReason[reason], now.timeIntervalSince(previous) < minGap {
             return false

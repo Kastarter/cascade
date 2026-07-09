@@ -115,3 +115,20 @@ func streamHeartbeatAdmitsEveryChangedFrameAtOneSecondCadence() {
     #expect(!sameSecondBurst)
     #expect(nextSecond)
 }
+
+@Test
+func streamHeartbeatGapIsTunableForTheDemoBurst() {
+    // Teach-once tightens the persistence gap to 0.5s so every changed state of a
+    // demonstration becomes a moment.
+    var scheduler = CaptureScheduler()
+    scheduler.streamHeartbeatGap = 0.5
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    let first = scheduler.admits(reason: .streamHeartbeat, now: now)
+    let insideGap = scheduler.admits(reason: .streamHeartbeat, now: now.addingTimeInterval(0.4))
+    let pastGap = scheduler.admits(reason: .streamHeartbeat, now: now.addingTimeInterval(0.55))
+
+    #expect(first)
+    #expect(!insideGap)
+    #expect(pastGap)
+}

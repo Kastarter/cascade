@@ -288,10 +288,16 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     private var display: CapturedDisplayMetadata?
     private var frameOrdinal = 0
 
-    init(engine: RewindEngine, threshold: Int, onStop: @escaping @Sendable (Error?) -> Void) {
+    init(
+        engine: RewindEngine,
+        threshold: Int,
+        heartbeatGap: TimeInterval,
+        onStop: @escaping @Sendable (Error?) -> Void
+    ) {
         self.engine = engine
         self.threshold = threshold
         self.onStop = onStop
+        scheduler.streamHeartbeatGap = heartbeatGap
     }
 
     func setDisplay(id: CGDirectDisplayID, bounds: CGRect) {
@@ -682,6 +688,7 @@ actor RewindEngine {
     private var processing = false
     private var lastStoredBucket: String?
     private var lastStoredSignature: FrameSignature?
+    private var skipThreshold = PerceptualHash.defaultSkipThreshold
     private var lastNativeOCRAt = Date.distantPast
     private let logger = Logger(subsystem: "com.humain.cascade", category: "rewind")
 
@@ -721,6 +728,13 @@ actor RewindEngine {
 
     func updateBudget(_ budget: RecorderCadenceBudget) {
         self.budget = budget
+    }
+
+    /// Teach-once demo burst: the stream-side gate tightens its dedup threshold,
+    /// and the store-side duplicate check here must match — otherwise the
+    /// transient states the burst exists to keep get re-dropped at persistence.
+    func updateSkipThreshold(_ threshold: Int) {
+        skipThreshold = threshold
     }
 
     func flushWrites() async {
@@ -948,8 +962,8 @@ actor RewindEngine {
         }
         let combinedDistance = PerceptualHash.hamming(signature.combinedGridHash, last.combinedGridHash)
         let blockDistance = PerceptualHash.hamming(signature.blockHash, last.blockHash)
-        return combinedDistance <= PerceptualHash.defaultSkipThreshold
-            && blockDistance <= PerceptualHash.defaultSkipThreshold
+        return combinedDistance <= skipThreshold
+            && blockDistance <= skipThreshold
     }
 
     private static func bucket(for snapshot: AppWindowSnapshot) -> String {
@@ -1015,6 +1029,55 @@ final class RewindRecorder {
     /// Whether a capture stream is currently live.
     var isRunning: Bool { stream != nil }
 
+    /// Teach-once demo burst: while the user demonstrates a task, the stream runs
+    /// denser (2fps, 0.5s persistence gap) with a tighter dedup threshold so
+    /// transient demo states — a menu open for half a second, a dialog — become
+    /// moments instead of falling between 1s heartbeats.
+    private(set) var demoBurst = false
+
+    /// The capture parameters for the current mode. Pure so tests can pin the
+    /// burst contract without a live stream.
+    nonisolated static func demoBurstParameters(
+        baseFPS: Int32,
+        baseThreshold: Int,
+        burst: Bool
+    ) -> (fps: Int32, threshold: Int, heartbeatGap: TimeInterval) {
+        guard burst else { return (baseFPS, baseThreshold, CaptureScheduler.streamHeartbeatInterval) }
+        return (max(baseFPS, 2), min(baseThreshold, 2), 0.5)
+    }
+
+    /// Flip the demonstration cadence. When a stream is live it restarts at the
+    /// new rate (the SCStream's frame interval is fixed at creation); when not,
+    /// the flag alone is enough — the next `start()` picks it up.
+    func setDemoBurst(_ on: Bool) async {
+        guard demoBurst != on else { return }
+        demoBurst = on
+        await restartLiveStream(reason: on ? "demo burst on" : "demo burst off")
+    }
+
+    /// Tear down the live stream and bring it back with the current configuration —
+    /// the one restart shared by display-follow and demo-burst toggles. A concurrent
+    /// `stop()`/pause landing while the old stream goes down WINS: the restart
+    /// stands down instead of resurrecting recording the user just stopped. A
+    /// transiently failed start (display briefly unavailable mid-swap) gets one
+    /// retry so a healthy stream is never traded for a dead one on a hiccup.
+    private func restartLiveStream(reason: String) async {
+        guard stream != nil, !stopping else { return }
+        let liveStream = stream
+        stream = nil
+        output = nil
+        streamedDisplayID = nil
+        if let liveStream { try? await liveStream.stopCapture() }
+        guard !stopping else { return }
+        logger.info("Restarting rewind stream (\(reason, privacy: .public)).")
+        try? await start()
+        if stream == nil, !stopping {
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !stopping else { return }
+            try? await start()
+        }
+    }
+
     func updatePolicy(_ policy: CapturePrivacyPolicy) {
         Task { await engine.updatePolicy(policy) }
     }
@@ -1026,14 +1089,22 @@ final class RewindRecorder {
     func start() async throws {
         guard stream == nil else { return }
         stopping = false
-        let output = RewindStreamOutput(engine: engine, threshold: threshold) { [weak self] error in
+        let mode = Self.demoBurstParameters(baseFPS: fps, baseThreshold: threshold, burst: demoBurst)
+        // The store-side duplicate gate must match the stream-side one, or burst
+        // frames that clear the tighter stream threshold get re-dropped at persist.
+        await engine.updateSkipThreshold(mode.threshold)
+        let output = RewindStreamOutput(
+            engine: engine,
+            threshold: mode.threshold,
+            heartbeatGap: mode.heartbeatGap
+        ) { [weak self] error in
             guard let self else { return }
             Task { await self.handleStreamStopped(error) }
         }
         guard let made = try await ScreenCaptureUtility.makeRewindStream(
             output: output,
             sampleHandlerQueue: sampleQueue,
-            fps: fps
+            fps: mode.fps
         ) else {
             return // Fail-closed (no permission / no display) — nothing started.
         }
@@ -1044,6 +1115,12 @@ final class RewindRecorder {
             return
         }
         try await made.stream.startCapture()
+        // A stop() can land while startCapture is in flight (it sees stream == nil
+        // and returns) — honor it instead of leaving an orphaned live stream.
+        guard !stopping else {
+            try? await made.stream.stopCapture()
+            return
+        }
         self.stream = made.stream
         self.output = output
         self.streamedDisplayID = made.displayID
@@ -1073,14 +1150,8 @@ final class RewindRecorder {
         guard stream != nil, !stopping else { return }
         guard let current = await ScreenCaptureUtility.currentCursorDisplayID(),
               let streamed = streamedDisplayID, current != streamed else { return }
-        logger.info("Cursor moved to display \(current) — restarting rewind stream there.")
-        let liveStream = stream
-        stream = nil
-        output = nil
-        streamedDisplayID = nil
-        if let liveStream { try? await liveStream.stopCapture() }
-        stopping = false
-        try? await start()
+        logger.info("Cursor moved to display \(current).")
+        await restartLiveStream(reason: "display change")
     }
 
     private func handleStreamStopped(_ error: Error?) async {

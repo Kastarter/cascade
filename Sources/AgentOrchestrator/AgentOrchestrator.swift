@@ -850,11 +850,19 @@ public actor CascadeOrchestrator {
         webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
     ) async throws -> CuratedAgent? {
         let events = try await store.inputEvents(between: start, and: end)
-        let contexts = try await store.contexts(between: start, and: end)
+        // A Teach-once demonstration records densely (0.5s burst), so a single
+        // bounded oldest-first fetch would truncate a long demo to its opening
+        // minutes — losing the ending, which is the outcome. Slice the bracket so
+        // every quarter of the demo stays represented whatever its length.
+        let contexts = try await bracketContexts(from: start, to: end)
         guard let waste = wasteDetector.waste(fromInstance: events, contexts: contexts, surface: webAppIdentity) else {
             return nil
         }
-        return await curator.curateOne(waste, statedIntent: statedIntent, onScreen: await onScreenText(for: waste))
+        // Evidence for the curator comes from the WHOLE demonstration, sampled
+        // evenly — not just the first seconds — so the goal reflects the full
+        // concept of what the user showed, start to finish.
+        let onScreen = Self.onScreenText(sampledAcross: contexts, snippetLimit: 5, budget: 900)
+        return await curator.curateOne(waste, statedIntent: statedIntent, onScreen: onScreen)
     }
 
     /// The detector's candidates, judged and named by the curator into the few
@@ -930,21 +938,77 @@ public actor CascadeOrchestrator {
         let start = waste.lastSeenAt.addingTimeInterval(-runLength - 3)
         let end = waste.lastSeenAt.addingTimeInterval(3)
         guard let moments = try? await store.contexts(between: start, and: end, limit: 12) else { return nil }
+        return Self.onScreenText(sampledAcross: moments, snippetLimit: 3, budget: 600)
+    }
+
+    /// A recorded range with WHOLE-bracket coverage: the store's range query is
+    /// oldest-first with a LIMIT, so one fetch of a long dense demonstration would
+    /// silently drop its ending. Fetching the bracket in chronological slices
+    /// bounds the cost while every part of the demo stays represented. Slice
+    /// boundaries are inclusive on both ends, so ids dedupe the shared edge.
+    func bracketContexts(
+        from start: Date,
+        to end: Date,
+        slices: Int = 4,
+        budget: Int = 600
+    ) async throws -> [RecordedContext] {
+        let span = end.timeIntervalSince(start)
+        guard span > 0, slices > 1 else {
+            return try await store.contexts(between: start, and: end, limit: budget)
+        }
+        let sliceLimit = max(1, budget / slices)
+        var seen = Set<Int64>()
+        var moments: [RecordedContext] = []
+        for slice in 0..<slices {
+            let sliceStart = start.addingTimeInterval(span * Double(slice) / Double(slices))
+            let sliceEnd = slice == slices - 1 ? end : start.addingTimeInterval(span * Double(slice + 1) / Double(slices))
+            let rows = try await store.contexts(between: sliceStart, and: sliceEnd, limit: sliceLimit)
+            for row in rows where seen.insert(row.id).inserted {
+                moments.append(row)
+            }
+        }
+        return moments
+    }
+
+    /// The shared snippet builder behind both evidence paths: privacy-filtered OCR
+    /// from moments sampled EVENLY across the given range (a dense Teach-once
+    /// bracket would otherwise surface only its opening seconds). Sensitive and
+    /// text-less moments are dropped BEFORE sampling so they never consume a time
+    /// bucket a nearby legible moment could fill. Whitespace runs collapse into
+    /// single spaces and each snippet is bounded so one busy screen can't dominate
+    /// the prompt. Returns nil when nothing legible/safe is on record.
+    nonisolated static func onScreenText(
+        sampledAcross moments: [RecordedContext],
+        sampleLimit: Int = 12,
+        snippetLimit: Int = 3,
+        budget: Int = 600
+    ) -> String? {
+        let legible = moments.filter { $0.ocrText?.isEmpty == false && !PrivacyRules.isSensitive($0) }
         var seen = Set<String>()
         var snippets: [String] = []
-        for moment in moments where !PrivacyRules.isSensitive(moment) {
+        for moment in sampleEvenly(legible, limit: sampleLimit) {
             guard let raw = moment.ocrText else { continue }
-            // Collapse the OCR's runs of whitespace/newlines into single spaces, then
-            // bound each snippet so one busy screen can't dominate the prompt.
             let cleaned = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard cleaned.count >= 8 else { continue }
             let snippet = String(cleaned.prefix(200))
             if seen.insert(snippet).inserted { snippets.append(snippet) }
-            if snippets.count >= 3 { break }
+            if snippets.count >= snippetLimit { break }
         }
         let joined = snippets.joined(separator: " ⋯ ")
-        return joined.isEmpty ? nil : String(joined.prefix(600))
+        return joined.isEmpty ? nil : String(joined.prefix(budget))
+    }
+
+    /// Up to `limit` elements spread evenly across the list, endpoints INCLUDED
+    /// (integer linspace) — a demonstration's first moment is its starting state
+    /// and its last is the outcome, so both always survive sampling. Pure integer
+    /// math: no Double→Int conversion to guard. Order-preserving; short lists pass
+    /// through untouched.
+    nonisolated static func sampleEvenly<T>(_ items: [T], limit: Int) -> [T] {
+        guard limit > 0 else { return [] }
+        guard items.count > limit else { return items }
+        guard limit > 1 else { return [items[items.count / 2]] }
+        return (0..<limit).map { items[($0 * (items.count - 1)) / (limit - 1)] }
     }
 
     /// Persists an agent from a curated proposal — the recorded recipe drives
