@@ -16,7 +16,7 @@ private struct RankingFakeCompleter: MessageCompleting {
     }
 }
 
-private let rankingBase = Date(timeIntervalSince1970: 1_720_000_000)
+private let rankingBase = Date()
 
 @MainActor
 private func makeRankingModel(curatorReply: String) throws -> (model: CascadeAppModel, store: CascadeStore, defaults: UserDefaults) {
@@ -28,26 +28,32 @@ private func makeRankingModel(curatorReply: String) throws -> (model: CascadeApp
         curator: WorkflowCurator(client: RankingFakeCompleter(canned: curatorReply))
     )
     let defaults = UserDefaults(suiteName: "CascadeSuggestionRanking-\(UUID().uuidString)")!
+    defaults.set(false, forKey: CascadeAppModel.experimentalContextWasteDetectionKey)
+    defaults.set(CascadeAppModel.LegacyActionWasteMode.fallbackReviewQueue.rawValue, forKey: CascadeAppModel.legacyActionWasteModeKey)
+    defaults.synchronize()
     let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
     return (model, store, defaults)
 }
 
 private func rankingWorkflowEvents() -> [InputEvent] {
+    let base = Date(timeIntervalSinceNow: -1_560)
     var events: [InputEvent] = []
     var i = 0
-    func appendRun(run: Int, app: String, first: String, second: String) {
+    func appendRun(run: Int, app: String, first: String, second: String, window: String) {
         let start = TimeInterval(run * 300)
-        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: first, appName: app)); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start + 10), kind: .key, key: "a", modifiers: ["command"], appName: app)); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start + 20), kind: .click, x: 30, y: 30, text: second, appName: app)); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: rankingBase.addingTimeInterval(start + 30), kind: .key, key: "Return", modifiers: ["command"], appName: app)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start), kind: .click, x: 10, y: 10, text: first, appName: app, windowTitle: window)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 10), kind: .key, key: "a", modifiers: ["command"], appName: app, windowTitle: window)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 20), kind: .type, text: "status update", appName: app, windowTitle: window)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 30), kind: .click, x: 30, y: 30, text: second, appName: app, windowTitle: window)); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 40), kind: .key, key: "Return", modifiers: ["command"], appName: app, windowTitle: window)); i += 1
     }
-    for run in 0..<3 { appendRun(run: run, app: "Safari", first: "Refund", second: "Send") }
-    for run in 3..<6 { appendRun(run: run, app: "Mail", first: "Invoice", second: "Archive") }
+    for run in 0..<3 { appendRun(run: run, app: "Safari", first: "Refund", second: "Send", window: "Inbox - Gmail - Safari") }
+    for run in 3..<6 { appendRun(run: run, app: "Mail", first: "Invoice", second: "Archive", window: "Invoices") }
     return events
 }
 
 private func descriptorBackedRankingEvents() throws -> (events: [InputEvent], descriptor: String) {
+    let base = Date(timeIntervalSinceNow: -32)
     let descriptor = try #require(AXTargetDescriptorV2.encode(
         label: "Approve Request",
         role: "AXButton",
@@ -59,12 +65,12 @@ private func descriptorBackedRankingEvents() throws -> (events: [InputEvent], de
     ))
     var events: [InputEvent] = []
     var i = 0
-    func at() -> Date { rankingBase.addingTimeInterval(Double(i) * 4) }
+    func at() -> Date { base.addingTimeInterval(Double(i) * 4) }
     func appendRun(includeNextAction: Bool) {
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Review Request", appName: "Safari")); i += 1
-        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "a", modifiers: ["command"], appName: "Safari")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 10, y: 10, text: "Review Request", appName: "Safari", windowTitle: "Request Review - Gmail - Safari")); i += 1
+        events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .key, key: "a", modifiers: ["command"], appName: "Safari", windowTitle: "Request Review - Gmail - Safari")); i += 1
         if includeNextAction {
-            events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 30, y: 30, appName: "Safari", targetDescriptor: descriptor)); i += 1
+            events.append(InputEvent(id: Int64(i), capturedAt: at(), kind: .click, x: 30, y: 30, appName: "Safari", windowTitle: "Request Review - Gmail - Safari", targetDescriptor: descriptor)); i += 1
         }
     }
     appendRun(includeNextAction: true)

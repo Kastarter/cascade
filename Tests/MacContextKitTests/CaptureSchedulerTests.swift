@@ -84,13 +84,34 @@ func recorderCadenceTypingPauseUsesFastInsuranceOCR() {
 }
 
 @Test
-func recorderCadenceScrollQuietDefersCapture() {
+func recorderCadenceScrollBurstStillCapturesWithFastOCR() {
+    // Mid-scroll frames are evidence — content scrolled past must land in the
+    // record (and its OCR), just on the cheap fast pass. Only thermal/low-power
+    // pressure sheds them.
     var controller = RecorderCadenceController()
     let now = Date(timeIntervalSince1970: 1_800_000_000)
 
     controller.record(activity: .scroll, at: now)
     let budget = controller.budget(now: now.addingTimeInterval(0.2))
 
-    #expect(!budget.admitsCapture)
+    #expect(budget.admitsCapture)
     #expect(budget.ocrPolicy == .fastOnly)
+    #expect(!budget.allowsNativeResolutionOCR)
+}
+
+@Test
+func streamHeartbeatAdmitsEveryChangedFrameAtOneSecondCadence() {
+    // The SCStream delivers ~1fps; a 1s persistence gap means every changed
+    // frame becomes a moment (smooth playback), while a same-second burst is
+    // still coalesced.
+    var scheduler = CaptureScheduler()
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    let first = scheduler.admits(reason: .streamHeartbeat, now: now)
+    let sameSecondBurst = scheduler.admits(reason: .streamHeartbeat, now: now.addingTimeInterval(0.4))
+    let nextSecond = scheduler.admits(reason: .streamHeartbeat, now: now.addingTimeInterval(1.05))
+
+    #expect(first)
+    #expect(!sameSecondBurst)
+    #expect(nextSecond)
 }

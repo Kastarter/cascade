@@ -1,5 +1,6 @@
 import ProviderKit
 import AgentOrchestrator
+import CascadeMemory
 import Testing
 
 @testable import SandboxKit
@@ -31,6 +32,59 @@ func plannerSplitsMultiPartJobs() async throws {
     #expect(plan[0].startURL == "https://www.google.com/travel/flights")
     #expect(plan[1].task == "Email the flight details to Sam")
     #expect(plan[1].web)
+}
+
+@Test
+func plannerPromptKeepsBatchSyncAsAControlLoop() {
+    let prompt = AgentTaskPlanner.systemPrompt(for: .webSandbox)
+
+    #expect(prompt.contains("batch/list sync jobs"))
+    #expect(prompt.contains("do NOT create one subtask per record/item"))
+    #expect(prompt.contains("measure/diff the destination"))
+    #expect(prompt.contains("report counts"))
+}
+
+@Test
+func batchFallbackSubtaskIsOneControlLoopWithoutRawSourceValues() {
+    let nameKey = AuditIdentity.hash("record_name")
+    let plan = BatchCompletionPlan(
+        goalHash: AuditIdentity.hash("Import Alpha Record and the rest"),
+        recipeStepCount: 4,
+        sourceSurfaceHashes: [AuditIdentity.hash("Source catalog")],
+        destinationSurfaceHashes: [AuditIdentity.hash("Destination tracker")],
+        fieldBindings: [
+            BatchCompletionFieldBinding(
+                label: "record name",
+                keyHash: nameKey,
+                kind: .freeText,
+                sourceOrders: [0],
+                targetOrder: 2,
+                sourceSurfaceHashes: [AuditIdentity.hash("Source catalog")],
+                targetSurfaceHash: AuditIdentity.hash("Destination tracker"),
+                transform: nil
+            )
+        ],
+        identityFieldKeyHash: nameKey
+    )
+
+    let task = "Sync every remaining record from the source list into the destination tracker"
+    let subtask = AgentTaskPlanner.batchFallbackSubtask(
+        for: plan,
+        originalTask: task,
+        in: .webSandbox
+    )
+
+    #expect(subtask.task.contains("structural batch/list control loop"))
+    #expect(subtask.task.contains(task))
+    #expect(subtask.task.contains("enumerate source records/items"))
+    #expect(subtask.task.contains("measure destination identities"))
+    #expect(subtask.task.contains("apply only missing records/items"))
+    #expect(subtask.task.contains("verify each record/item"))
+    #expect(subtask.task.contains("report count-only totals"))
+    #expect(subtask.task.contains("actively switch to the destination surface"))
+    #expect(subtask.web)
+    #expect(subtask.risk == .medium)
+    #expect(!subtask.task.contains("Alpha Record"))
 }
 
 @Test
@@ -278,6 +332,7 @@ func summaryReportsSkippedNativeParts() {
     )
     #expect(summary.contains("$420 on Delta"))
     #expect(summary.contains("Add it to Reminders (local desktop app)"))
+    #expect(summary.contains("How should I continue?"))
 }
 
 @Test
@@ -286,9 +341,38 @@ func summaryMentionsRunningLong() {
         findings: [(task: "Find the price", result: "$420 on Delta")],
         skipped: [], ranLongOn: "Email the price to Sam"
     )
-    #expect(summary.contains("Ran out of steps"))
+    #expect(summary.contains("ran out of steps"))
     #expect(summary.contains("Email the price to Sam"))
     #expect(summary.contains("$420 on Delta"))
+    #expect(summary.contains("How should I continue?"))
+}
+
+@Test
+func summarySeparatesCompletedWorkFromBlockedWork() {
+    let summary = AgentTaskPlanner.summary(
+        findings: [(task: "Find the price", result: "$420 on Delta")],
+        skipped: [],
+        ranLongOn: nil,
+        stalledOn: "Add it to the tracker",
+        stalledReason: "the destination form did not accept the value"
+    )
+    #expect(summary.contains("I did:"))
+    #expect(summary.contains("Find the price — $420 on Delta"))
+    #expect(summary.contains("I couldn't finish “Add it to the tracker” because the destination form did not accept the value"))
+    #expect(summary.contains("How should I continue?"))
+}
+
+@Test
+func summaryDoesNotCountBlockedFindingAsDone() {
+    let summary = AgentTaskPlanner.summary(
+        findings: [(task: "Add it to the tracker", result: "the destination form did not accept the value")],
+        skipped: [],
+        ranLongOn: nil,
+        stalledOn: "Add it to the tracker"
+    )
+    #expect(!summary.contains("I did:"))
+    #expect(summary.contains("I couldn't finish “Add it to the tracker” because the destination form did not accept the value"))
+    #expect(summary.contains("How should I continue?"))
 }
 
 @Test

@@ -197,6 +197,7 @@ public struct WasteDetector: Sendable {
         let abstractParameters: [Int: AbstractParameter]
         let abstractSanitizedKinds: [Int: RecipeParameterKind]
         let traceProfile: TraceProfile
+        let surfaceByEventKey: [String: String]
 
         init(
             patternTokens: [String],
@@ -215,6 +216,14 @@ public struct WasteDetector: Sendable {
             self.abstractSignatureTokens = abstractSignatureTokens
             self.abstractParameters = abstractParameters
             self.abstractSanitizedKinds = abstractSanitizedKinds
+            self.surfaceByEventKey = Dictionary(
+                occurrences.flatMap { occurrence in
+                    occurrence.map { event in
+                        (WasteDetector.eventIdentity(event), surface(event))
+                    }
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
             self.traceProfile = WasteDetector.traceProfile(
                 patternTokens: patternTokens,
                 occurrences: occurrences,
@@ -754,6 +763,10 @@ public struct WasteDetector: Sendable {
         var seen = Set<String>()
         var seenEventIDs = Set<Int64>()
         var occurrences: [[InputEvent]] = []
+        let surfaceByEventKey = Dictionary(
+            cluster.flatMap { candidate in candidate.surfaceByEventKey.map { ($0.key, $0.value) } },
+            uniquingKeysWith: { first, _ in first }
+        )
         for candidate in cluster.sorted(by: routineCandidateSort) {
             for occurrence in candidate.occurrences.sorted(by: episodeOccurrenceSort) {
                 let key = occurrenceIdentity(occurrence)
@@ -768,7 +781,7 @@ public struct WasteDetector: Sendable {
             patternTokens: representative.patternTokens,
             occurrences: occurrences,
             surface: { event in
-                representative.surfaces.first(where: { $0 == event.appName }) ?? event.appName
+                surfaceByEventKey[eventIdentity(event)] ?? event.appName
             },
             abstractSignatureTokens: representative.abstractSignatureTokens,
             abstractParameters: representative.abstractParameters,
@@ -816,16 +829,18 @@ public struct WasteDetector: Sendable {
     }
 
     private static func occurrenceIdentity(_ occurrence: [InputEvent]) -> String {
-        occurrence.map { event in
-            if event.id != 0 { return "id:\(event.id)" }
-            return [
-                "t:\(event.capturedAt.timeIntervalSince1970)",
-                "k:\(event.kind.rawValue)",
-                "a:\(event.appName)",
-                "x:\(event.text ?? "")",
-                "key:\(event.key ?? "")"
-            ].joined(separator: ";")
-        }.joined(separator: "|")
+        occurrence.map(eventIdentity).joined(separator: "|")
+    }
+
+    private static func eventIdentity(_ event: InputEvent) -> String {
+        if event.id != 0 { return "id:\(event.id)" }
+        return [
+            "t:\(event.capturedAt.timeIntervalSince1970)",
+            "k:\(event.kind.rawValue)",
+            "a:\(event.appName)",
+            "x:\(event.text ?? "")",
+            "key:\(event.key ?? "")"
+        ].joined(separator: ";")
     }
 
     private static func routineCandidateSimilarity(_ a: [String], _ b: [String]) -> Double {
@@ -1732,14 +1747,36 @@ public struct WasteDetector: Sendable {
     }
 
     private static func signatureTokens(_ signature: String) -> [String] {
+        let payload: String
         if signature.hasPrefix("routine:v2:") {
-            return signature
+            payload = signature
                 .split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
                 .dropFirst()
                 .first
-                .map { String($0).components(separatedBy: "|") } ?? []
+                .map(String.init) ?? ""
+        } else {
+            payload = signature
         }
-        return signature.components(separatedBy: "|")
+        return parseSignatureTokenPayload(payload)
+    }
+
+    private static func parseSignatureTokenPayload(_ payload: String) -> [String] {
+        let parts = payload.components(separatedBy: "|")
+        guard parts.contains("v1") else { return parts }
+        var tokens: [String] = []
+        var current: [String] = []
+        for part in parts {
+            if part == "v1", !current.isEmpty {
+                tokens.append(current.joined(separator: "|"))
+                current = [part]
+            } else {
+                current.append(part)
+            }
+        }
+        if !current.isEmpty {
+            tokens.append(current.joined(separator: "|"))
+        }
+        return tokens
     }
 
     private static func rankedResults(_ results: [DetectedWaste], maxResults: Int) -> [DetectedWaste] {

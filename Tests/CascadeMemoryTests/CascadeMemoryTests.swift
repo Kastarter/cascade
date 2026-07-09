@@ -82,3 +82,83 @@ func inputEventsBetweenReturnsOnlyTheBracketedRangeOldestFirst() async throws {
     let near = try await store.clickInputEvents(near: base.addingTimeInterval(4.2), window: 1.0, limit: 3)
     #expect(near.map(\.appName) == ["App4", "App5"])
 }
+
+@Test
+func contextsFromToReturnsOnlyTheBoundedDayNewestFirstWithoutHeavyPayloads() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeMemoryRange-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+
+    let dayStart = Date(timeIntervalSince1970: 1_751_500_800) // a fixed midnight-ish anchor
+    let dayEnd = dayStart.addingTimeInterval(24 * 3600)
+    _ = try await store.insert(RecordedContext(
+        capturedAt: dayStart.addingTimeInterval(-3600), source: .screen, appName: "Before",
+        ocrText: "yesterday", imagePath: "/tmp/before.jpg"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: dayStart.addingTimeInterval(9 * 3600), source: .screen, appName: "Morning",
+        ocrText: "heavy payload that must not decode", imagePath: "/tmp/morning.jpg"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: dayStart.addingTimeInterval(15 * 3600), source: .screen, appName: "Afternoon",
+        ocrText: "afternoon", imagePath: "/tmp/afternoon.jpg"
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: dayEnd.addingTimeInterval(60), source: .screen, appName: "NextDay",
+        ocrText: "tomorrow", imagePath: "/tmp/next.jpg"
+    ))
+
+    let day = try await store.contexts(from: dayStart, to: dayEnd)
+
+    // Only the bounded day, newest-first — the shape the Reel scrubber expects.
+    #expect(day.map(\.appName) == ["Afternoon", "Morning"])
+    // Cheap decode: OCR/metadata stay NULL, but the frame path (the evidence
+    // thumbnail) survives.
+    #expect(day.allSatisfy { $0.ocrText == nil })
+    #expect(day.first?.imagePath == "/tmp/afternoon.jpg")
+
+    // An inverted or empty range is empty, never a crash.
+    #expect(try await store.contexts(from: dayEnd, to: dayStart).isEmpty)
+}
+
+@Test
+func thinAgedFramesKeepsOneFilePerBucketAndPointsSiblingsAtIt() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeMemoryThin-\(UUID().uuidString).sqlite")
+        .path
+    let store = try CascadeStore(path: path)
+
+    let old = Date().addingTimeInterval(-3 * 24 * 3600)
+    var ids: [Int64] = []
+    for second in [0.0, 2, 4, 6, 8, 10] {
+        let inserted = try await store.insert(RecordedContext(
+            capturedAt: old.addingTimeInterval(second),
+            source: .screen,
+            appName: "Safari",
+            ocrText: "text at +\(Int(second))s",
+            imagePath: "/tmp/frame-\(Int(second)).heic"
+        ))
+        ids.append(inserted.id)
+    }
+    let recent = try await store.insert(RecordedContext(
+        capturedAt: Date().addingTimeInterval(-60),
+        source: .screen,
+        appName: "Safari",
+        imagePath: "/tmp/frame-recent.heic"
+    ))
+
+    let freed = try await store.thinAgedFrames(olderThan: Date().addingTimeInterval(-48 * 3600), keepEvery: 8)
+
+    // Buckets: [0s..8s) keeps +0s; +2/+4/+6 point at it. [8s..) keeps +8s; +10 points at it.
+    #expect(Set(freed) == ["/tmp/frame-2.heic", "/tmp/frame-4.heic", "/tmp/frame-6.heic", "/tmp/frame-10.heic"])
+    let thinned = try #require(try await store.context(id: ids[1]))
+    #expect(thinned.imagePath == "/tmp/frame-0.heic")
+    // OCR text survives thinning — search never loses evidence.
+    #expect(thinned.ocrText == "text at +2s")
+    #expect(try await store.context(id: ids[4])?.imagePath == "/tmp/frame-8.heic")
+    #expect(try await store.context(id: ids[5])?.imagePath == "/tmp/frame-8.heic")
+    // Recent frames untouched; a second pass is a no-op (idempotent).
+    #expect(try await store.context(id: recent.id)?.imagePath == "/tmp/frame-recent.heic")
+    #expect(try await store.thinAgedFrames(olderThan: Date().addingTimeInterval(-48 * 3600), keepEvery: 8).isEmpty)
+}

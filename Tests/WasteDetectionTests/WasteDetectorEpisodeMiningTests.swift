@@ -51,7 +51,7 @@ func defaultEpisodeMiningFlagUsesProductionEpisodePath() {
     #expect(implicit.map(\.signature) == explicitEpisode.map(\.signature))
     #expect(implicit.map(\.occurrences) == explicitEpisode.map(\.occurrences))
     #expect(explicitLegacy.isEmpty)
-    #expect(implicit.first?.signature == "click:open@Books|key:command+c@Books")
+    #expect(normalizedSignatureTokensForTest(implicit.first?.signature ?? "") == ["click:open@books", "key:command+c@books"])
 }
 
 @Test
@@ -74,7 +74,7 @@ func episodeMiningRecoversGappedRoutineTheContiguousMinerMisses() throws {
     let waste = try #require(firstRun.first)
 
     #expect(waste.occurrences == 3)
-    #expect(waste.signature == "click:open@Books|key:command+c@Books")
+    #expect(normalizedSignatureTokensForTest(waste.signature) == ["click:open@books", "key:command+c@books"])
     #expect(Set(waste.evidence) == Set([0, 2, 4, 6, 8, 10]))
     #expect(waste.recipe.steps.map(\.kind) == [.activateApp, .click, .key])
     #expect(firstRun.map(\.signature) == secondRun.map(\.signature))

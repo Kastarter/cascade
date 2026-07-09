@@ -1651,6 +1651,92 @@ public actor CascadeStore {
         }
     }
 
+    /// Thins aged frame files: for moments older than `olderThan`, keeps one
+    /// frame file per `keepEvery` bucket and points the bucket's other rows at
+    /// the kept file — old days scrub like the pre-1fps recorder did, while
+    /// every row's OCR text and search entries stay untouched forever.
+    /// Idempotent (already-shared paths are skipped). Returns the file paths
+    /// freed by thinning; the caller owns deleting them from disk.
+    public func thinAgedFrames(olderThan: Date, keepEvery: TimeInterval = 8, scanLimit: Int = 20000) throws -> [String] {
+        struct FrameRow { let id: Int64; let capturedMilliseconds: Int64; let path: String }
+        let cutoffMilliseconds = EventStoreLayout.capturedMilliseconds(for: olderThan)
+        let keepEveryMilliseconds = max(Int64(keepEvery * 1000), 1)
+        let rows: [FrameRow] = try withStatement("""
+        SELECT id, captured_ms, image_path FROM recorded_context
+        WHERE captured_ms < ? AND image_path IS NOT NULL
+        ORDER BY captured_ms ASC, id ASC
+        LIMIT ?;
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(scanLimit))
+            var result: [FrameRow] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let pathText = sqlite3_column_text(statement, 2) else { continue }
+                result.append(FrameRow(
+                    id: sqlite3_column_int64(statement, 0),
+                    capturedMilliseconds: sqlite3_column_int64(statement, 1),
+                    path: String(cString: pathText)
+                ))
+            }
+            return result
+        }
+        guard !rows.isEmpty else { return [] }
+
+        var freed: [String] = []
+        var keeperStartMilliseconds: Int64 = 0
+        var keeperPath = ""
+        try withTransaction {
+            for row in rows {
+                // keeperPath starts empty so the first row always opens a bucket
+                // (and the subtraction below never sees a sentinel that overflows).
+                if keeperPath.isEmpty || row.capturedMilliseconds - keeperStartMilliseconds >= keepEveryMilliseconds {
+                    keeperStartMilliseconds = row.capturedMilliseconds
+                    keeperPath = row.path
+                    continue
+                }
+                guard row.path != keeperPath else { continue }
+                try withStatement("UPDATE recorded_context SET image_path = ? WHERE id = ?;") { statement in
+                    bind(keeperPath, at: 1, in: statement)
+                    bind(row.id, at: 2, in: statement)
+                    _ = sqlite3_step(statement)
+                }
+                freed.append(row.path)
+            }
+        }
+        return freed
+    }
+
+    /// Moments captured within `[from, to)`, newest-first, decoded WITHOUT the
+    /// heavy OCR/metadata payloads. `contextTimeline(since:)` covers the live
+    /// "today" window; this bounds both ends so the Reel can load a *past* day
+    /// when a citation points at evidence from before today.
+    public func contexts(from: Date, to: Date, limit: Int = 8000) throws -> [RecordedContext] {
+        let fromMilliseconds = EventStoreLayout.capturedMilliseconds(for: from)
+        let toMilliseconds = EventStoreLayout.capturedMilliseconds(for: to)
+        guard toMilliseconds > fromMilliseconds else { return [] }
+        guard try hasDayPartitions(sinceMilliseconds: fromMilliseconds) else { return [] }
+        let sql = """
+        SELECT id, captured_at, source, app_name, bundle_identifier, window_title,
+               NULL, image_path, NULL, frame_hash,
+               source_trust, raw_trust_label, injection_score, injection_reasons,
+               user_confirmed, safe_to_show, safe_to_summarize, safe_for_control
+        FROM recorded_context
+        WHERE captured_ms >= ? AND captured_ms < ?
+        ORDER BY captured_ms DESC, id DESC
+        LIMIT ?;
+        """
+        return try withStatement(sql) { statement in
+            bind(fromMilliseconds, at: 1, in: statement)
+            bind(toMilliseconds, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var rows: [RecordedContext] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(decodeContext(statement))
+            }
+            return rows
+        }
+    }
+
     /// One representative moment per app per clock hour — the one with the most
     /// on-screen text — with the OCR trimmed to `excerptLength`. Spreads content
     /// coverage across the whole window so the chat can answer about things seen

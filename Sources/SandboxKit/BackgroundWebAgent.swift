@@ -259,7 +259,14 @@ public final class BackgroundWebAgent {
                 if await replanCurrentSubtaskIfPossible(sub: sub, failureReason: reason) {
                     continue episodes
                 }
-                onUpdate(Update(status: reason, snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
+                let summary = AgentTaskPlanner.summary(
+                    findings: findings,
+                    skipped: skipped,
+                    ranLongOn: nil,
+                    stalledOn: sub.task,
+                    stalledReason: reason
+                )
+                onUpdate(Update(status: summary, snapshotPNG: nil, url: sandbox.currentURL, done: true, result: nil))
                 return
             case .stopped:
                 break episodes
@@ -1332,5 +1339,59 @@ public final class BackgroundWebAgent {
         let rest = trimmed.dropFirst("INCOMPLETE".count)
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".:")))
         return rest.isEmpty ? "I couldn't finish this one." : rest
+    }
+}
+
+public struct BatchWebWorkflowDriver: BatchSourceEnumerating, BatchDestinationMeasuring, BatchItemApplying, BatchItemVerifying {
+    public typealias SourceEnumerator = @Sendable (BatchCompletionPlan, BatchWorkflowLimits) async throws -> BatchSourceEnumeration
+    public typealias DestinationMeasurer = @Sendable (BatchCompletionPlan, BatchWorkflowLimits) async throws -> BatchDestinationSnapshot
+    public typealias ItemApplier = @Sendable (BatchSourceItem, BatchCompletionPlan) async throws -> BatchApplyResult
+    public typealias ItemVerifier = @Sendable (BatchSourceItem, BatchApplyResult, BatchCompletionPlan) async throws -> BatchVerificationResult
+
+    private let enumerate: SourceEnumerator
+    private let measure: DestinationMeasurer
+    private let apply: ItemApplier
+    private let verify: ItemVerifier
+
+    public init(
+        enumerate: @escaping SourceEnumerator,
+        measure: @escaping DestinationMeasurer,
+        apply: @escaping ItemApplier,
+        verify: @escaping ItemVerifier
+    ) {
+        self.enumerate = enumerate
+        self.measure = measure
+        self.apply = apply
+        self.verify = verify
+    }
+
+    public func enumerateBatchSourceItems(
+        plan: BatchCompletionPlan,
+        limits: BatchWorkflowLimits
+    ) async throws -> BatchSourceEnumeration {
+        try await enumerate(plan, limits)
+    }
+
+    public func measureBatchDestination(
+        plan: BatchCompletionPlan,
+        limits: BatchWorkflowLimits
+    ) async throws -> BatchDestinationSnapshot {
+        try await measure(plan, limits)
+    }
+
+    public func applyBatchItem(_ item: BatchSourceItem, plan: BatchCompletionPlan) async throws -> BatchApplyResult {
+        try await apply(item, plan)
+    }
+
+    public func verifyBatchItem(
+        _ item: BatchSourceItem,
+        applyResult: BatchApplyResult,
+        plan: BatchCompletionPlan
+    ) async throws -> BatchVerificationResult {
+        try await verify(item, applyResult, plan)
+    }
+
+    public static func structuralControlLoopTask(for plan: BatchCompletionPlan, originalTask: String) -> AgentSubtask {
+        AgentTaskPlanner.batchFallbackSubtask(for: plan, originalTask: originalTask, in: .webSandbox)
     }
 }

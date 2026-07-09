@@ -250,15 +250,16 @@ public struct SuggestionRanker: Sendable {
         using model: PreferenceModel,
         context: PreferenceContext = PreferenceContext()
     ) -> PersonalizationThreshold {
+        let exactPreference = model.preference(key)
         let preference = model.preference(for: key, context: context)
         let evidence = model.evidenceCount(key)
         let confidence = min(1, evidence / 6)
         var repeats = baseRepeats
         var seconds = baseObservedSeconds
-        if evidence >= 2, preference >= 0.67 {
+        if evidence >= 2, exactPreference >= 0.67 {
             repeats -= 1
             seconds = max(20, baseObservedSeconds - 10)
-        } else if evidence >= 2, preference <= 0.33 {
+        } else if evidence >= 2, exactPreference <= 0.33 {
             repeats += 2
             seconds = baseObservedSeconds + 30
         } else if preference > 0.58 {

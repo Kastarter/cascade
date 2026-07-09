@@ -15,7 +15,7 @@ private struct EpisodeMiningFakeCompleter: MessageCompleting {
     }
 }
 
-private let episodeMiningIntegrationBase = Date(timeIntervalSince1970: 1_760_100_000)
+private let episodeMiningIntegrationBase = Date(timeIntervalSinceNow: -2_000)
 
 @MainActor
 private func makeEpisodeMiningModel() throws -> (model: CascadeAppModel, store: CascadeStore, defaults: UserDefaults) {
@@ -27,6 +27,7 @@ private func makeEpisodeMiningModel() throws -> (model: CascadeAppModel, store: 
         curator: WorkflowCurator(client: EpisodeMiningFakeCompleter())
     )
     let defaults = UserDefaults(suiteName: "CascadeEpisodeMining-\(UUID().uuidString)")!
+    defaults.set(CascadeAppModel.LegacyActionWasteMode.diagnosticsOnly.rawValue, forKey: CascadeAppModel.legacyActionWasteModeKey)
     let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
     return (model, store, defaults)
 }
@@ -79,12 +80,20 @@ func refreshAllUsesEpisodeMiningByDefaultAndAllowsOptOut() async throws {
     let events = divergentEpisodeMiningEvents()
     let oldSignatures = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).map(\.signature)
     let episodeSignatures = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: true).map(\.signature)
-    let contiguousSignature = "click:open invoice@Mail|key:command+c@Mail"
-    let gappedSignature = "click:open@Books|key:command+c@Books"
+    let isContiguousSignature: (String) -> Bool = {
+        $0.localizedCaseInsensitiveContains("surface=mail")
+            && $0.localizedCaseInsensitiveContains("label=open invoice")
+            && $0.localizedCaseInsensitiveContains("key=c")
+    }
+    let isGappedSignature: (String) -> Bool = {
+        $0.localizedCaseInsensitiveContains("surface=books")
+            && $0.localizedCaseInsensitiveContains("label=open")
+            && $0.localizedCaseInsensitiveContains("key=c")
+    }
 
-    #expect(oldSignatures.contains(contiguousSignature))
-    #expect(!oldSignatures.contains(gappedSignature))
-    #expect(episodeSignatures.contains(gappedSignature))
+    #expect(oldSignatures.contains(where: isContiguousSignature))
+    #expect(!oldSignatures.contains(where: isGappedSignature))
+    #expect(episodeSignatures.contains(where: isGappedSignature))
     #expect(oldSignatures != episodeSignatures)
 
     let (model, store, defaults) = try makeEpisodeMiningModel()
@@ -92,11 +101,11 @@ func refreshAllUsesEpisodeMiningByDefaultAndAllowsOptOut() async throws {
 
     await model.refreshAll()
     #expect(model.detectedWaste.map(\.signature) == episodeSignatures)
-    #expect(model.detectedWaste.map(\.signature).contains(gappedSignature))
+    #expect(model.detectedWaste.map(\.signature).contains(where: isGappedSignature))
 
     defaults.set(false, forKey: CascadeAppModel.experimentalEpisodeMiningKey)
     await model.refreshAll()
 
     #expect(model.detectedWaste.map(\.signature) == oldSignatures)
-    #expect(!model.detectedWaste.map(\.signature).contains(gappedSignature))
+    #expect(!model.detectedWaste.map(\.signature).contains(where: isGappedSignature))
 }

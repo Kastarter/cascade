@@ -4,6 +4,7 @@ import ComputerUseKit
 import Foundation
 import ProviderKit
 import Testing
+import WasteDetection
 
 private struct StubActuator: ComputerUseActuator {
     func health() async -> ComputerUseHealth {
@@ -135,6 +136,50 @@ private func makeStore() throws -> CascadeStore {
     return try CascadeStore(path: path)
 }
 
+private let contextWasteLinkBase = Date(timeIntervalSince1970: 1_700_300_000)
+
+private func invoiceContextSessions() -> [RecordedContext] {
+    var contexts: [RecordedContext] = []
+    var id: Int64 = 10_000
+    for run in 0..<3 {
+        let start = TimeInterval(run * 3_600)
+        for elapsed in stride(from: 0.0, through: 1_200.0, by: 300.0) {
+            contexts.append(RecordedContext(
+                id: id,
+                capturedAt: contextWasteLinkBase.addingTimeInterval(start + elapsed),
+                source: .screen,
+                appName: "QuickBooks",
+                bundleIdentifier: "com.intuit.quickbooks",
+                windowTitle: run == 0 ? "Acme invoice queue" : "Beta invoice queue",
+                ocrText: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+                metadataJSON: #"{"project":"Vendor invoices"}"#
+            ))
+            id += 1
+        }
+    }
+    return contexts
+}
+
+private func actionWaste(
+    title: String,
+    signature: String,
+    steps: [RecipeStep],
+    lastSeenAt: Date = contextWasteLinkBase.addingTimeInterval(7_500)
+) -> DetectedWaste {
+    DetectedWaste(
+        title: title,
+        apps: ["QuickBooks"],
+        occurrences: 3,
+        estimatedSecondsPerRun: 60,
+        estimatedTotalSeconds: 180,
+        recipe: AgentRecipe(steps: steps),
+        evidence: [1, 2, 3],
+        confidence: 0.8,
+        signature: signature,
+        lastSeenAt: lastSeenAt
+    )
+}
+
 @Test
 func askGroundsInTheWholeDayNotJustTheFreshestMoments() async throws {
     let store = try makeStore()
@@ -191,4 +236,89 @@ func askRecallsQuestionRelevantMomentsFromEarlierInTheDay() async throws {
     let answer = try await orchestrator.ask("when is the final project due?")
 
     #expect(answer.contains("Jul 30"))
+}
+
+@Test
+func contextWasteReportLinksCompatibleActionRecipe() async throws {
+    let store = try makeStore()
+    _ = try await store.insertContexts(invoiceContextSessions())
+    let orchestrator = CascadeOrchestrator(store: store)
+    let compatible = actionWaste(
+        title: "Review invoice queue",
+        signature: "invoice-action",
+        steps: [
+            RecipeStep(order: 0, kind: .click, x: 10, y: 10, appName: "QuickBooks", ocrAnchor: "Invoice queue"),
+            RecipeStep(
+                order: 1,
+                kind: .type,
+                text: "INV-001",
+                appName: "QuickBooks",
+                ocrAnchor: "Invoice number",
+                isParameter: true,
+                parameterKey: "invoice_number",
+                parameterKind: .number,
+                valueExamples: ["id:AAA-000"],
+                valueHashes: ["abc123"]
+            ),
+        ]
+    )
+
+    let report = try await orchestrator.contextWasteReport(linkingTo: [compatible])
+    let waste = try #require(report.results.first)
+
+    #expect(waste.linkedActionSignature == "invoice-action")
+    #expect(waste.linkedActionWaste?.recipe == compatible.recipe)
+    #expect(waste.feasibility == .linkedRecipe)
+}
+
+@Test
+func linkedContextWasteApprovalPersistsLinkedActionRecipe() async throws {
+    let store = try makeStore()
+    _ = try await store.insertContexts(invoiceContextSessions())
+    let orchestrator = CascadeOrchestrator(store: store)
+    let compatible = actionWaste(
+        title: "Review invoice queue",
+        signature: "invoice-action",
+        steps: [
+            RecipeStep(order: 0, kind: .click, x: 10, y: 10, appName: "QuickBooks", ocrAnchor: "Invoice queue"),
+            RecipeStep(order: 1, kind: .key, key: "v", modifiers: ["command"], appName: "QuickBooks", ocrAnchor: "Invoice number"),
+        ]
+    )
+    let report = try await orchestrator.contextWasteReport(linkingTo: [compatible])
+    let waste = try #require(report.results.first)
+    let curated = CuratedContextWaste(
+        source: waste,
+        name: "Reconcile vendor invoices",
+        why: "The record shows repeated invoice queue work.",
+        goal: "Reconcile the vendor invoice queue in QuickBooks.",
+        value: 0.9,
+        feasibility: .linkedRecipe
+    )
+
+    let agent = try await orchestrator.createAgent(from: curated)
+
+    #expect(agent.signature == "invoice-action")
+    #expect(agent.recipe == compatible.recipe)
+    #expect(!agent.recipe.steps.isEmpty)
+}
+
+@Test
+func contextWasteReportDoesNotLinkUnrelatedSameAppActionRecipe() async throws {
+    let store = try makeStore()
+    _ = try await store.insertContexts(invoiceContextSessions())
+    let orchestrator = CascadeOrchestrator(store: store)
+    let unrelated = actionWaste(
+        title: "Export payroll report",
+        signature: "payroll-action",
+        steps: [
+            RecipeStep(order: 0, kind: .click, x: 10, y: 10, appName: "QuickBooks", ocrAnchor: "Payroll"),
+            RecipeStep(order: 1, kind: .click, x: 20, y: 20, appName: "QuickBooks", ocrAnchor: "Export report"),
+        ]
+    )
+
+    let report = try await orchestrator.contextWasteReport(linkingTo: [unrelated])
+    let waste = try #require(report.results.first)
+
+    #expect(waste.linkedActionSignature == nil)
+    #expect(waste.feasibility == .goalOnlyCandidate)
 }

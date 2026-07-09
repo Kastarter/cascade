@@ -13,7 +13,7 @@ private struct ParameterizedMiningFakeCompleter: MessageCompleting {
     }
 }
 
-private let parameterizedAppShellBase = Date(timeIntervalSince1970: 1_792_000_000)
+private let parameterizedAppShellBase = Date(timeIntervalSinceNow: -9_000)
 
 @MainActor
 private func makeParameterizedMiningModel() throws -> (model: CascadeAppModel, store: CascadeStore, defaults: UserDefaults) {
@@ -25,6 +25,7 @@ private func makeParameterizedMiningModel() throws -> (model: CascadeAppModel, s
         curator: WorkflowCurator(client: ParameterizedMiningFakeCompleter())
     )
     let defaults = UserDefaults(suiteName: "CascadeParameterizedMining-\(UUID().uuidString)")!
+    defaults.set(CascadeAppModel.LegacyActionWasteMode.diagnosticsOnly.rawValue, forKey: CascadeAppModel.legacyActionWasteModeKey)
     let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
     return (model, store, defaults)
 }

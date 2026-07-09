@@ -91,6 +91,37 @@ private func waste(
     )
 }
 
+private func contextWaste(
+    _ title: String = "Repeated vendor invoice work",
+    linkedActionSignature: String? = nil
+) -> ContextWasteCandidate {
+    ContextWasteCandidate(
+        title: title,
+        apps: ["QuickBooks"],
+        occurrences: 3,
+        estimatedSecondsPerRun: 3_600,
+        estimatedTotalSeconds: 10_800,
+        evidenceContextIDs: [1, 2, 3],
+        sessionIDs: [1, 100, 200],
+        signature: "context-sig",
+        startedAt: base,
+        endedAt: base.addingTimeInterval(10_800),
+        lastSeenAt: base.addingTimeInterval(10_800),
+        snippets: ["Review vendor invoice queue and mark batch paid."],
+        entities: [ContextWasteEntity(kind: .project, canonicalValue: "vendor invoices", displayName: "Vendor invoices")],
+        quality: ContextWasteQuality(
+            supportScore: 0.8,
+            durationScore: 1.0,
+            semanticStabilityScore: 0.9,
+            actionabilityScore: 0.8,
+            privacyPenalty: 0,
+            noisePenalty: 0
+        ),
+        suggestedGoal: "Teach Cascade to handle vendor invoice review in QuickBooks.",
+        linkedActionSignature: linkedActionSignature
+    )
+}
+
 @Test
 func curatorKeepsRenamesAndDropsNoise() async {
     let candidates = [
@@ -111,6 +142,123 @@ func curatorKeepsRenamesAndDropsNoise() async {
     #expect(result[0].signature == "sig-a")
     #expect(result[0].source.apps == ["Mail", "Numbers"])
     #expect(result[0].evidence == [1, 2])
+}
+
+@Test
+func contextWasteCuratorKeepsFeasibilityAndEvidence() async {
+    let candidates = [contextWaste(linkedActionSignature: "action-sig")]
+    let canned = """
+    {"agents":[
+      {"index":0,"name":"Reconcile vendor invoices","why":"About three hours repeat in QuickBooks.","goal":"Reconcile the vendor invoice queue in QuickBooks.","value":0.9,"feasibility":"linkedRecipe"}
+    ]}
+    """
+
+    let result = await WorkflowCurator(client: FakeCompleter(canned: canned)).curateContextWaste(candidates)
+
+    #expect(result.count == 1)
+    #expect(result[0].name == "Reconcile vendor invoices")
+    #expect(result[0].feasibility == .linkedRecipe)
+    #expect(result[0].linkedActionSignature == "action-sig")
+    #expect(result[0].evidence == [1, 2, 3])
+}
+
+@Test
+func contextWasteCuratorFallsBackToGoalOnlyWhenModelFails() async {
+    let candidates = [contextWaste()]
+
+    let result = await WorkflowCurator(client: FailingCompleter()).curateContextWaste(candidates)
+
+    #expect(result.count == 1)
+    #expect(result[0].name == "Repeated vendor invoice work")
+    #expect(result[0].feasibility == .goalOnlyCandidate)
+    #expect(result[0].goal.contains("vendor invoice"))
+}
+
+@Test
+func contextWastePromptUsesParameterSummariesInsteadOfRawEntityValues() {
+    let candidate = ContextWasteCandidate(
+        title: "Repeated invoice queue work",
+        apps: ["QuickBooks"],
+        occurrences: 3,
+        estimatedSecondsPerRun: 1_200,
+        estimatedTotalSeconds: 3_600,
+        evidenceContextIDs: [1, 2, 3],
+        sessionIDs: [1, 100, 200],
+        signature: "context-process:v2|surface=quickbooks|verbs=review|objects=invoice|fields=invoice_id|entities=parameter:business_object",
+        startedAt: base,
+        endedAt: base.addingTimeInterval(3_600),
+        lastSeenAt: base.addingTimeInterval(3_600),
+        snippets: ["Review invoice INV-001 for Acme Corp at https://pay.example/invoices/INV-001 and mark $120.00 paid."],
+        entities: [ContextWasteEntity(kind: .organization, canonicalValue: "acme", displayName: "Acme Corp")],
+        processTerms: ["review", "invoice", "queue", "paid"],
+        parameters: [
+            ContextWasteParameter(
+                role: "business_object",
+                sourceKind: "field",
+                count: 3,
+                valueShapes: ["words:2"],
+                valueHashes: ["abc123"]
+            ),
+        ],
+        quality: ContextWasteQuality(
+            supportScore: 0.8,
+            durationScore: 0.5,
+            semanticStabilityScore: 0.9,
+            actionabilityScore: 0.8,
+            privacyPenalty: 0,
+            noisePenalty: 0
+        ),
+        suggestedGoal: "Teach Cascade to handle repeated invoice queue work in QuickBooks."
+    )
+
+    let prompt = WorkflowCurator.userPromptContextWaste([candidate])
+
+    #expect(prompt.contains("parameter role=business_object"))
+    #expect(prompt.contains("valueHashCount=1"))
+    #expect(prompt.contains("entity roles: organization=1"))
+    #expect(prompt.contains("evidenceHash="))
+    #expect(!prompt.lowercased().contains("acme"))
+    #expect(!prompt.lowercased().contains("inv-001"))
+    #expect(!prompt.lowercased().contains("https://pay.example"))
+    #expect(!prompt.contains("$120.00"))
+    #expect(!prompt.contains("on screen:"))
+}
+
+@Test
+func contextWasteCuratorScrubsUnsafeProperNounsFromModelOutput() {
+    let candidate = ContextWasteCandidate(
+        title: "Repeated receipt review work",
+        apps: ["QuickBooks"],
+        occurrences: 3,
+        estimatedSecondsPerRun: 1_200,
+        estimatedTotalSeconds: 3_600,
+        evidenceContextIDs: [1, 2, 3],
+        sessionIDs: [1, 100, 200],
+        signature: "context-process:v3|terms=review,receipt",
+        startedAt: base,
+        endedAt: base.addingTimeInterval(3_600),
+        lastSeenAt: base.addingTimeInterval(3_600),
+        snippets: [],
+        entities: [],
+        processTerms: ["review", "receipt", "status"],
+        parameters: [],
+        quality: ContextWasteQuality(
+            supportScore: 0.8,
+            durationScore: 0.5,
+            semanticStabilityScore: 0.9,
+            actionabilityScore: 0.8,
+            privacyPenalty: 0,
+            noisePenalty: 0
+        ),
+        suggestedGoal: "Teach Cascade to handle repeated receipt review work in QuickBooks."
+    )
+    let raw = #"{"agents":[{"index":0,"name":"Review PhoenixLabs receipts","why":"x","goal":"Review PhoenixLabs receipt status in QuickBooks.","value":0.8,"feasibility":"goalOnlyCandidate"}]}"#
+
+    let result = WorkflowCurator.parseContextWaste(raw, candidates: [candidate])
+
+    #expect(result?.first?.name.lowercased().contains("phoenixlabs") == false)
+    #expect(result?.first?.goal.lowercased().contains("phoenixlabs") == false)
+    #expect(result?.first?.name.contains("[value]") == true)
 }
 
 @Test
@@ -230,7 +378,9 @@ func curatorPromptFlagsParametersThatChangeEachRun() async {
     let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
     _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture)).curate([parameterized])
     let prompt = await capture.lastUser
-    #expect(prompt.contains("parameter field (freeText) changes each run"))
+    #expect(prompt.contains("live slot"))
+    #expect(prompt.contains("kind=freeText"))
+    #expect(prompt.contains("shapeCount=0"))
     #expect(!prompt.contains("report-q1"))
 }
 
@@ -260,8 +410,12 @@ func curatorPromptUsesPrivacySafeFieldAwareParameterMetadata() async {
     let canned = #"{"agents":[{"index":0,"name":"X","why":"y","goal":"z","value":0.5}]}"#
     _ = await WorkflowCurator(client: CapturingCompleter(canned: canned, capture: capture)).curate([parameterized])
     let prompt = await capture.lastUser
-    #expect(prompt.contains("parameter Invoice Number (number) changes each run"))
-    #expect(prompt.contains("earlier selected/copied value"))
+    #expect(prompt.contains("live slot"))
+    #expect(prompt.contains("kind=number"))
+    #expect(prompt.contains("shapeCount=1"))
+    #expect(prompt.contains("valueHashCount=1"))
+    #expect(prompt.contains("sourceStepCount=1"))
+    #expect(prompt.contains("dataflow edge"))
     #expect(!prompt.contains("INV-001"))
 }
 
@@ -461,6 +615,24 @@ func curateCacheRefreshesSourceCountsOnHit() async throws {
     #expect(second.first?.source.occurrences == 5)              // refreshed, not frozen
     #expect(second.first?.source.estimatedTotalSeconds == 150)  // 30 × 5
     #expect(second.first?.name == "Copy into Numbers")          // curated fields preserved
+}
+
+@Test
+func contextCurateCachePreservesNeedsDemoOnNoRecipeRefresh() async throws {
+    let candidate = contextWaste()
+    let canned = #"{"agents":[{"index":0,"name":"Reconcile invoices","why":"x","goal":"Teach one invoice reconciliation demo.","value":0.8,"feasibility":"needsDemo"}]}"#
+    let store = try makeStore()
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: canned)))
+
+    let first = await orchestrator.curateContextWaste([candidate])
+    #expect(first.first?.feasibility == .needsDemo)
+
+    let refreshed = await orchestrator.curateContextWaste([contextWaste()])
+    #expect(refreshed.first?.source.feasibility == .goalOnlyCandidate)
+    #expect(refreshed.first?.feasibility == .needsDemo)
+
+    let linked = await orchestrator.curateContextWaste([candidate.linked(to: "action-sig")])
+    #expect(linked.first?.feasibility == .linkedRecipe)
 }
 
 @Test

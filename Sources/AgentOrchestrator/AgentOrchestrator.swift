@@ -523,12 +523,15 @@ public actor CascadeOrchestrator {
     private let recordAnswerer: RecordAnswering
     private let planner: SingleStepPlanner
     private let wasteDetector = WasteDetector()
+    private let contextWasteDetector = ContextWasteDetector()
     private let curator: WorkflowCurator
     /// Curation is a model call; cache it against the set of candidate signatures
     /// (and whether a key is connected) so frequent refreshes don't re-curate the
     /// same unchanged list.
     private var curationCache: (key: Set<String>, keyed: Bool, agents: [CuratedAgent])?
+    private var contextCurationCache: (key: Set<String>, keyed: Bool, agents: [CuratedContextWaste])?
     private let keyStore: AnthropicKeyStore
+    private let detectedWasteReportObserver: (@Sendable () -> Void)?
 
     public init(
         store: CascadeStore,
@@ -538,7 +541,8 @@ public actor CascadeOrchestrator {
         planner: SingleStepPlanner? = nil,
         curator: WorkflowCurator? = nil,
         modelCallCache: ModelCallCache? = nil,
-        keyStore: AnthropicKeyStore = AnthropicKeyStore()
+        keyStore: AnthropicKeyStore = AnthropicKeyStore(),
+        detectedWasteReportObserver: (@Sendable () -> Void)? = nil
     ) {
         self.store = store
         self.localAnswerer = localAnswerer
@@ -547,6 +551,7 @@ public actor CascadeOrchestrator {
         self.planner = planner ?? ClaudeSingleStepPlanner(cache: modelCallCache)
         self.curator = curator ?? WorkflowCurator(client: AnthropicClient(keyStore: keyStore), cache: modelCallCache)
         self.keyStore = keyStore
+        self.detectedWasteReportObserver = detectedWasteReportObserver
     }
 
     /// Grounded Q&A. Uses Claude when a key is connected (privacy-filtered context
@@ -672,6 +677,7 @@ public actor CascadeOrchestrator {
         useEpisodeMining: Bool = true,
         useParameterizedMining: Bool = false
     ) async throws -> WasteDetectionReport {
+        detectedWasteReportObserver?()
         let contexts = try await store.recentContexts(limit: 400)
         let events = try await store.recentInputEvents(limit: 3000)
         return wasteDetector.detectReport(
@@ -683,6 +689,151 @@ public actor CascadeOrchestrator {
             useParameterizedMining: useParameterizedMining
         )
     }
+
+    /// Context-first waste detection: groups safe OCR/window/entity context into
+    /// repeated real-work sessions. It does not create replay recipes. When action
+    /// waste is supplied, candidates are tagged with a linked recipe signature only
+    /// if the same apps overlap the candidate's evidence window.
+    public func contextWasteReport(
+        maxResults: Int = 5,
+        linkingTo actionWastes: [DetectedWaste] = []
+    ) async throws -> ContextWasteReport {
+        let contexts = try await store.recentContexts(limit: 1_200)
+        let report = contextWasteDetector.detectReport(contexts: contexts, maxResults: maxResults)
+        return Self.linkContextWaste(report, to: actionWastes)
+    }
+
+    public func contextWaste(
+        maxResults: Int = 5,
+        linkingTo actionWastes: [DetectedWaste] = []
+    ) async throws -> [ContextWasteCandidate] {
+        try await contextWasteReport(maxResults: maxResults, linkingTo: actionWastes).results
+    }
+
+    private nonisolated static func linkContextWaste(
+        _ report: ContextWasteReport,
+        to actionWastes: [DetectedWaste]
+    ) -> ContextWasteReport {
+        guard !actionWastes.isEmpty, !report.results.isEmpty else { return report }
+        let linked = report.results.map { candidate in
+            candidate.linked(to: bestLinkedActionWaste(for: candidate, in: actionWastes))
+        }
+        return report.replacingResults(linked)
+    }
+
+    private nonisolated static func bestLinkedActionWaste(
+        for candidate: ContextWasteCandidate,
+        in actionWastes: [DetectedWaste]
+    ) -> DetectedWaste? {
+        let candidateApps = Set(candidate.apps.map { $0.lowercased() })
+        let evidenceStart = candidate.startedAt.addingTimeInterval(-300)
+        let evidenceEnd = candidate.endedAt.addingTimeInterval(300)
+        let maxDistance = max(TimeInterval(candidate.estimatedSecondsPerRun), 600)
+        let ranked = actionWastes.compactMap { waste -> (waste: DetectedWaste, score: Double)? in
+            let wasteApps = Set(waste.apps.map { $0.lowercased() })
+            let appOverlap = candidateApps.isEmpty || wasteApps.isEmpty || !candidateApps.isDisjoint(with: wasteApps)
+            guard appOverlap else { return nil }
+            let inWindow = evidenceStart...evidenceEnd ~= waste.lastSeenAt
+            let distance = abs(waste.lastSeenAt.timeIntervalSince(candidate.lastSeenAt))
+            guard inWindow || distance <= maxDistance else { return nil }
+            let compatibility = contextRecipeCompatibility(candidate: candidate, waste: waste)
+            guard compatibility > 0 else { return nil }
+            let appScore = Double(candidateApps.intersection(wasteApps).count)
+            let timeScore = max(0, 1.0 - min(distance, maxDistance) / maxDistance)
+            let recipeScore = min(1.0, Double(waste.recipe.steps.count) / 6.0)
+            return (waste, appScore + timeScore + recipeScore + compatibility)
+        }
+        return ranked.sorted { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return lhs.waste.signature < rhs.waste.signature
+        }.first?.waste
+    }
+
+    private nonisolated static func contextRecipeCompatibility(
+        candidate: ContextWasteCandidate,
+        waste: DetectedWaste
+    ) -> Double {
+        let candidateTerms = Set(candidate.processTerms.map { normalizedContextToken($0) }.filter { !$0.isEmpty })
+        let recipeTerms = Set(recipeVocabularyTerms(for: waste))
+        let overlap = candidateTerms.intersection(recipeTerms)
+        let vocabularyScore = min(2.0, Double(overlap.count) * 0.75)
+        let candidateRoles = Set(candidate.parameters.map(\.role).map(normalizedContextToken).filter { !$0.isEmpty })
+        let recipeRoles = Set(recipeRoleTerms(for: waste.recipe.steps))
+        let roleOverlap = candidateRoles.intersection(recipeRoles)
+        let roleScore = min(1.5, Double(roleOverlap.count) * 0.75)
+        guard vocabularyScore > 0 || roleScore > 0 else { return 0 }
+        return vocabularyScore + roleScore
+    }
+
+    private nonisolated static func recipeVocabularyTerms(for waste: DetectedWaste) -> [String] {
+        var values = [waste.title]
+        values += waste.recipe.humanSteps
+        for step in waste.recipe.steps {
+            values += [
+                step.appName,
+                step.surface,
+                step.windowTitleHint,
+                step.ocrAnchor,
+                step.targetDescriptor,
+                step.parameterKey,
+                step.dataflowEdgeID
+            ].compactMap { $0 }
+        }
+        return values.flatMap(contextTokens)
+    }
+
+    private nonisolated static func recipeRoleTerms(for steps: [RecipeStep]) -> [String] {
+        var terms: [String] = []
+        for step in steps {
+            if let key = step.parameterKey {
+                terms += contextTokens(key)
+            }
+            if let kind = step.parameterKind {
+                terms.append(normalizedContextToken(kind.rawValue))
+            }
+            if step.dataflowEdgeID != nil || !step.sourceStepIDs.isEmpty {
+                terms.append("data")
+            }
+            if step.isParameter {
+                terms.append("record_value")
+            }
+        }
+        return terms
+    }
+
+    private nonisolated static func contextTokens(_ value: String) -> [String] {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+            .reduce(into: "") { $0.append($1) }
+            .split(separator: " ")
+            .map { normalizedContextToken(String($0)) }
+            .filter { token in
+                token.count >= 3
+                    && !contextStopwords.contains(token)
+                    && token.rangeOfCharacter(from: .letters) != nil
+            }
+    }
+
+    private nonisolated static func normalizedContextToken(_ value: String) -> String {
+        let normalized = value.lowercased().replacingOccurrences(of: "_", with: " ")
+        let collapsed = normalized.split(separator: " ").joined(separator: "")
+        if collapsed.hasSuffix("ies"), collapsed.count > 4 {
+            return String(collapsed.dropLast(3)) + "y"
+        }
+        if collapsed.hasSuffix("s"),
+           !collapsed.hasSuffix("ss"),
+           !collapsed.hasSuffix("us"),
+           collapsed != "status" {
+            return String(collapsed.dropLast())
+        }
+        return collapsed
+    }
+
+    private nonisolated static let contextStopwords: Set<String> = [
+        "and", "app", "button", "click", "done", "from", "into", "key", "open",
+        "screen", "step", "switch", "the", "then", "this", "type", "value", "with"
+    ]
 
     /// Turns an arbitrary recorded time range into ONE named, grounded
     /// `CuratedAgent` — the single backend every *intentional* agent-creation front
@@ -743,6 +894,32 @@ public actor CascadeOrchestrator {
         return curated
     }
 
+    public func curateContextWaste(_ candidates: [ContextWasteCandidate]) async -> [CuratedContextWaste] {
+        let keyed = keyStore.hasKey()
+        let key = Set(candidates.map(\.signature))
+        if let cache = contextCurationCache, cache.key == key, cache.keyed == keyed {
+            let bySignature = Dictionary(candidates.map { ($0.signature, $0) }, uniquingKeysWith: { first, _ in first })
+            return cache.agents.map { agent in
+                guard let fresh = bySignature[agent.signature] else { return agent }
+                let feasibility: ContextWasteAgentFeasibility = fresh.linkedActionSignature == nil
+                    ? agent.feasibility
+                    : .linkedRecipe
+                return CuratedContextWaste(
+                    id: agent.id,
+                    source: fresh,
+                    name: agent.name,
+                    why: agent.why,
+                    goal: agent.goal,
+                    value: agent.value,
+                    feasibility: feasibility
+                )
+            }
+        }
+        let curated = await curator.curateContextWaste(candidates)
+        contextCurationCache = (key: key, keyed: keyed, agents: curated)
+        return curated
+    }
+
     /// A short, privacy-filtered excerpt of the text that was actually on screen while
     /// a detected workflow happened — the OCR/AX content of the moments around its most
     /// recent occurrence (`lastSeenAt` back one run length). Feeds the curator so goals
@@ -797,13 +974,24 @@ public actor CascadeOrchestrator {
         }
 
         let plan = AgentPlanSynthesizer().synthesize(from: curated)
+        let batchPlan = BatchCompletionPlanner().plan(from: curated)
         do {
             try AgentPlanValidator().validate(plan)
+            if let batchPlan {
+                try BatchCompletionPlanValidator().validate(batchPlan)
+            }
         } catch let validationError as AgentPlanValidationError {
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "agent",
                 action: "agent.synthesis.failed",
                 detail: plan.auditDetail(issueCodes: validationError.issueCodes)
+            ))
+            throw validationError
+        } catch let validationError as BatchCompletionPlanValidationError {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "agent.batch.plan.failed",
+                detail: batchPlan?.auditDetail(issueCodes: validationError.issueCodes) ?? "schema=\(BatchCompletionPlan.schemaVersion) issueCodes=missing_plan"
             ))
             throw validationError
         } catch {
@@ -820,6 +1008,47 @@ public actor CascadeOrchestrator {
             action: "agent.synthesis.validated",
             detail: plan.auditDetail()
         ))
+        if let batchPlan {
+            _ = try await store.appendAudit(AuditEvent(
+                actor: "agent",
+                action: "agent.batch.plan.ready",
+                detail: batchPlan.auditDetail()
+            ))
+        }
+        return try await store.upsertAgent(agent)
+    }
+
+    /// Persists a context-first agent from repeated OCR/Rewind evidence. These agents
+    /// intentionally do not replay mined clicks; they run from the curated goal through
+    /// the normal assist/background agent path.
+    @discardableResult
+    public func createAgent(from curated: CuratedContextWaste) async throws -> CascadeAgent {
+        let waste = curated.source
+        if curated.feasibility == .linkedRecipe {
+            guard let linkedWaste = waste.linkedActionWaste else {
+                throw CocoaError(.fileReadNoSuchFile)
+            }
+            return try await createAgent(from: CuratedAgent(
+                id: curated.id,
+                source: linkedWaste,
+                name: curated.name,
+                why: curated.why,
+                goal: curated.goal,
+                value: curated.value
+            ))
+        }
+        let agent = CascadeAgent(
+            name: curated.name,
+            source: .detected,
+            signature: waste.signature,
+            recipe: AgentRecipe(steps: []),
+            apps: waste.apps,
+            estimatedSeconds: waste.estimatedTotalSeconds,
+            estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
+            evidenceCount: waste.occurrences,
+            evidenceIDs: curated.evidence,
+            goal: curated.goal
+        )
         return try await store.upsertAgent(agent)
     }
 

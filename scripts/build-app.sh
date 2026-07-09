@@ -55,13 +55,22 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Prefer a stable self-signed identity so macOS TCC grants (Accessibility, Input
-# Monitoring, Screen Recording) persist across rebuilds. Falls back to ad-hoc if
-# the "Cascade Local Signing" cert isn't installed.
-if security find-identity -v 2>/dev/null | grep -q "Cascade Local Signing" \
-   || codesign --force --sign "Cascade Local Signing" --identifier "com.humain.cascade" "$APP" 2>/dev/null; then
-  codesign --force --deep --sign "Cascade Local Signing" --identifier "com.humain.cascade" "$APP"
+# Sign with a stable identity so macOS TCC grants (Accessibility, Input
+# Monitoring, Screen Recording) persist across rebuilds — ad-hoc signing gives
+# every build a fresh cdhash, which resets TCC on each install. Preference:
+# Apple Development cert (Apple-trusted, team-stable designated requirement) →
+# self-signed "Cascade Local Signing" → ad-hoc (LOUD, so the fallback is never
+# silent again).
+sign_with() {
+  codesign --force --deep --sign "$1" --identifier "com.humain.cascade" "$APP" 2>/dev/null
+}
+APPLE_DEV_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"')
+if [ -n "$APPLE_DEV_IDENTITY" ] && sign_with "$APPLE_DEV_IDENTITY"; then
+  echo "signed: $APPLE_DEV_IDENTITY"
+elif sign_with "Cascade Local Signing"; then
+  echo "signed: Cascade Local Signing"
 else
   codesign --force --deep --sign - --identifier "com.humain.cascade" "$APP"
+  echo "signed: AD-HOC (TCC grants will reset on install!)" >&2
 fi
 echo "$APP"

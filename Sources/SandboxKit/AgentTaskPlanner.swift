@@ -1,6 +1,7 @@
 import Foundation
 import OSLog
 import AgentOrchestrator
+import CascadeMemory
 import ProviderKit
 
 /// Observable state changes the executor/verifier can check after a subtask.
@@ -107,7 +108,7 @@ public struct AgentTaskFinding: Sendable, Equatable {
 
 public struct AgentRecoveryMemo: Sendable, Equatable {
     public let failedSubtask: AgentSubtask
-    public let failureKind: AgentFailureKind
+    public let failureKind: AgentOrchestrator.AgentFailureKind
     public let attemptedRecovery: RecoveryAction?
     public let firstBadActionHash: String?
     public let targetHash: String?
@@ -117,7 +118,7 @@ public struct AgentRecoveryMemo: Sendable, Equatable {
 
     public init(
         failedSubtask: AgentSubtask,
-        failureKind: AgentFailureKind,
+        failureKind: AgentOrchestrator.AgentFailureKind,
         attemptedRecovery: RecoveryAction? = nil,
         firstBadActionHash: String? = nil,
         targetHash: String? = nil,
@@ -337,6 +338,47 @@ public struct AgentTaskPlanner: Sendable {
         }
     }
 
+    public static func batchFallbackSubtask(
+        for plan: BatchCompletionPlan,
+        originalTask: String,
+        in environment: Environment,
+        procedureHint: String? = nil
+    ) -> AgentSubtask {
+        AgentSubtask(
+            task: batchFallbackTaskText(for: plan, originalTask: originalTask, procedureHint: procedureHint),
+            startURL: environment == .webSandbox ? "" : "",
+            app: "",
+            web: true,
+            note: "",
+            expectedEffects: [.noUnexpectedModal],
+            risk: .medium
+        )
+    }
+
+    public static func batchFallbackTaskText(
+        for plan: BatchCompletionPlan,
+        originalTask: String,
+        procedureHint: String? = nil
+    ) -> String {
+        let fields = plan.fieldBindings.prefix(8).map(\.label).joined(separator: ", ")
+        let fieldText = fields.isEmpty ? "the learned field bindings" : fields
+        var lines = [
+            "Run one structural batch/list control loop for this concrete task: \(originalTask)",
+            "Task audit identity: taskHash=\(AuditIdentity.hash(originalTask)) taskChars=\(originalTask.count).",
+            "Phases: enumerate source records/items completely, read source fields, measure destination identities, diff by normalized \(plan.identityFieldLabel), apply only missing records/items, verify each record/item before continuing, report count-only totals.",
+            "Fields: \(fieldText).",
+            "Limits: maxItems=\(plan.maxItems) maxPages=\(plan.maxPages) maxFailures=\(plan.maxFailures).",
+            "Do not split this into per-record/item subtasks and do not report raw source values; use ordinal plus identity hash for per-record/item progress."
+        ]
+        if let procedureHint = procedureHint?.trimmingCharacters(in: .whitespacesAndNewlines), !procedureHint.isEmpty {
+            lines.append("Destination procedure template: \(procedureHint)")
+        } else {
+            lines.append("Destination procedure template: use the demonstrated destination-entry flow; substitute each current source record's values, never the single demonstrated values.")
+        }
+        lines.append("After enumeration and diffing, actively switch to the destination surface and create/update the missing destination records/items; reading and recalling alone is not completion.")
+        return lines.joined(separator: "\n")
+    }
+
     static let webSandboxPrompt = """
     You split a job for a browser-automation agent into the smallest number of \
     sequential subtasks (1-\(maxSubtasks)). The agent works inside one isolated browser \
@@ -346,6 +388,10 @@ public struct AgentTaskPlanner: Sendable {
     Rules:
     - Most jobs are ONE subtask. Split only when the job has clearly separate parts — \
     different websites, or a find-something-then-use-it sequence.
+    - For batch/list sync jobs ("finish the rest", "import all rows/items", "sync this \
+    list"), do NOT create one subtask per record/item. Plan the control loop: enumerate \
+    the source list, measure/diff the destination, add missing records/items one at a \
+    time, verify each record/item, then report counts.
     - Each "task" says what to DO (imperative, self-contained), never what to research.
     - "startURL" is the best https:// page to start that part on — the real service's \
     own site, not a how-to article. Use "" only when the part continues on the page \
@@ -375,6 +421,10 @@ public struct AgentTaskPlanner: Sendable {
     Rules:
     - Most jobs are ONE subtask. Split only when the job has clearly separate parts — \
     different apps or sites, or a find-something-then-use-it sequence.
+    - For batch/list sync jobs ("finish the rest", "import all rows/items", "sync this \
+    list"), do NOT create one subtask per record/item. Plan the control loop: enumerate \
+    the source list, measure/diff the destination, add missing records/items one at a \
+    time, verify each record/item, then report counts.
     - Each "task" says what to DO (imperative, self-contained), carrying the concrete \
     details from the job that the part needs.
     - If a part happens in a specific macOS app, put the app's exact name in "app" \
@@ -650,25 +700,41 @@ public struct AgentTaskPlanner: Sendable {
         findings: [(task: String, result: String)],
         skipped: [AgentSubtask],
         ranLongOn: String?,
-        stalledOn: String? = nil
+        stalledOn: String? = nil,
+        stalledReason: String? = nil
     ) -> String {
         if findings.count == 1, skipped.isEmpty, ranLongOn == nil, stalledOn == nil { return findings[0].result }
+        var completed = findings
+        var blockedReason = stalledReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let stalledOn,
+           blockedReason?.isEmpty != false,
+           completed.last?.task == stalledOn {
+            blockedReason = completed.removeLast().result.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
         var pieces: [String] = []
+        if !completed.isEmpty {
+            let lines = completed.map { "• \($0.task) — \($0.result)" }.joined(separator: "\n")
+            pieces.append((ranLongOn == nil && stalledOn == nil && skipped.isEmpty ? "Done.\n" : "I did:\n") + lines)
+        }
         if let ranLongOn {
-            pieces.append("Ran out of steps on “\(ranLongOn)” — ask again and I'll continue.")
+            pieces.append("I ran out of steps while working on “\(ranLongOn)”.")
         }
         if let stalledOn {
-            pieces.append("I got stuck on “\(stalledOn)” and paused there — tell me more, or ask again and I'll retry.")
-        }
-        if !findings.isEmpty {
-            let lines = findings.map { "• \($0.task) — \($0.result)" }.joined(separator: "\n")
-            pieces.append((ranLongOn == nil && stalledOn == nil && skipped.isEmpty ? "Done.\n" : "Finished:\n") + lines)
+            if let blockedReason, !blockedReason.isEmpty {
+                pieces.append("I couldn't finish “\(stalledOn)” because \(blockedReason)")
+            } else {
+                pieces.append("I couldn't finish “\(stalledOn)” from the current state.")
+            }
         }
         if !skipped.isEmpty {
             let parts = skipped
                 .map { $0.note.isEmpty ? $0.task : "\($0.task) (\($0.note))" }
                 .joined(separator: "; ")
-            pieces.append("These need the Mac itself, not a browser — ask me on screen and I'll do them with you: \(parts).")
+            pieces.append("I couldn't do these in the browser because they need the Mac itself: \(parts).")
+        }
+        if ranLongOn != nil || stalledOn != nil || !skipped.isEmpty {
+            pieces.append("How should I continue? Tell me the missing detail, open the right page or screen, or say “continue” and I'll retry from here.")
         }
         return pieces.isEmpty ? "Done." : pieces.joined(separator: "\n")
     }
@@ -753,7 +819,7 @@ public struct AgentTaskPlanner: Sendable {
         }
     }
 
-    private static func pauseReason(for failureKind: AgentFailureKind, action: RecoveryAction) -> String {
+    private static func pauseReason(for failureKind: AgentOrchestrator.AgentFailureKind, action: RecoveryAction) -> String {
         "Recovery for \(failureKind.rawValue) reached \(action.rawValue); pause with the current evidence."
     }
 

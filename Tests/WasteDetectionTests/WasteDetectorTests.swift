@@ -5,6 +5,60 @@ import Testing
 
 private let base = Date(timeIntervalSince1970: 1_700_000_000)
 
+func normalizedSignatureTokensForTest(_ signature: String) -> [String] {
+    let payload: String
+    if signature.hasPrefix("routine:v2:") {
+        payload = signature
+            .split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+            .dropFirst()
+            .first
+            .map(String.init) ?? ""
+    } else {
+        payload = signature
+    }
+    let parts = payload.components(separatedBy: "|")
+    guard parts.contains("v1") else {
+        return parts.map { $0.lowercased() }
+    }
+
+    var actionTokens: [[String]] = []
+    var current: [String] = []
+    for part in parts {
+        if part == "v1", !current.isEmpty {
+            actionTokens.append(current)
+            current = [part]
+        } else {
+            current.append(part)
+        }
+    }
+    if !current.isEmpty {
+        actionTokens.append(current)
+    }
+
+    return actionTokens.map { fields in
+        var values: [String: String] = [:]
+        for field in fields.dropFirst() {
+            let split = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard split.count == 2 else { continue }
+            values[String(split[0])] = String(split[1])
+        }
+        let kind = values["kind"] ?? ""
+        let surface = values["surface"] ?? ""
+        switch kind {
+        case "key":
+            let modifiers = values["modifiers"]?.isEmpty == false ? "\(values["modifiers"]!)+" : ""
+            return "key:\(modifiers)\(values["key"] ?? "")@\(surface)"
+        case "click", "doubleclick", "rightclick":
+            let label = values["label"] ?? ""
+            return label.isEmpty ? "\(kind)@\(surface)" : "\(kind):\(label)@\(surface)"
+        case "type":
+            return "type@\(surface)"
+        default:
+            return "\(kind)@\(surface)"
+        }
+    }
+}
+
 private func event(_ i: Int, _ kind: InputEventKind, app: String, key: String? = nil, modifiers: [String] = []) -> InputEvent {
     InputEvent(
         id: Int64(i),
@@ -31,7 +85,7 @@ func tokenEncodesClickedElementIdentity() {
     let replyMessy = InputEvent(kind: .click, text: "  reply   all ", appName: "Mail")
     #expect(WasteDetector.token(reply, surface: "Mail") == WasteDetector.token(replyMessy, surface: "Mail"))
     // An unlabeled click degrades to the old coarse token (no regression).
-    #expect(WasteDetector.token(unlabeled, surface: "Mail") == "click@Mail")
+    #expect(normalizedSignatureTokensForTest(WasteDetector.token(unlabeled, surface: "Mail")) == ["click@mail"])
 }
 
 @Test
@@ -89,7 +143,7 @@ func interruptedRoutineIsRescuedByNoiseFilter() {
     let waste = try? #require(results.first)
     if let waste {
         #expect(waste.occurrences == 3)
-        #expect(waste.signature == "click:open@Books|key:command+c@Books")
+        #expect(normalizedSignatureTokensForTest(waste.signature) == ["click:open@books", "key:command+c@books"])
         #expect(!waste.recipe.steps.contains { ($0.ocrAnchor ?? "").hasPrefix("Stray") })
     }
 }
@@ -392,10 +446,12 @@ func crossAppPasteCarriesDataflowParameterMetadata() {
     let paste = waste.recipe.steps.first { $0.kind == .key && $0.key == "v" }
 
     #expect(paste?.isParameter == true)
-    #expect(paste?.parameterKey == "a1")
+    #expect(paste?.parameterKey?.hasPrefix("paste:field_") == true)
+    #expect(paste?.parameterKey?.contains(":from:field_") == true)
     #expect(paste?.parameterKind == .freeText)
     #expect(paste?.valueExamples == ["freeText:clipboard"])
     #expect(paste?.valueHashes.isEmpty == true)
+    #expect(paste?.dataflowEdgeID?.isEmpty == false)
     #expect(copy.map { paste?.sourceStepIDs.contains($0.order) == true } == true)
 }
 
@@ -607,7 +663,7 @@ func overlappingWorkflowsAreNotDoubleCounted() {
     let results = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
     #expect(results.count == 1)
     // H1: the click token now carries the element identity ("Inbox").
-    #expect(results.first?.signature == "click:inbox@Mail|key:command+c@Mail")
+    #expect(normalizedSignatureTokensForTest(results.first?.signature ?? "") == ["click:inbox@mail", "key:command+c@mail"])
     // The hard invariant: no event id is ever counted into two workflows.
     let allEvidence = results.flatMap(\.evidence)
     #expect(Set(allEvidence).count == allEvidence.count)
@@ -696,6 +752,9 @@ func webAppsInSameBrowserAreDistinctWorkflows() {
     // The real browser is still what's recorded, so replay + background routing work.
     #expect(results.allSatisfy { $0.apps == ["Google Chrome"] })
 
-    // Contrast: with no resolver, both collapse into a single "Chrome" workflow.
-    #expect(WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false).count == 1)
+    // Without a resolver the document identity still keeps the workflows distinct,
+    // but the cards fall back to the browser name instead of the web-app names.
+    let browserOnly = WasteDetector().detect(contexts: [], inputEvents: events, useEpisodeMining: false)
+    #expect(browserOnly.count == 2)
+    #expect(browserOnly.allSatisfy { $0.title.contains("Google Chrome") })
 }

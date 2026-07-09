@@ -124,6 +124,7 @@ public final class CascadeAppModel: ObservableObject {
     public struct LearningOpportunity: Identifiable, Sendable, Equatable {
         public enum Kind: String, Sendable {
             case repeatedWorkflow
+            case contextWaste
             case overlappingDrafts
             case recurringFailure
             case parameterizedRecipe
@@ -238,6 +239,10 @@ public final class CascadeAppModel: ObservableObject {
     /// The curated, judged, human-named view of `detectedWaste` — what the manager's
     /// review queue shows (the only place detected workflows surface to a person).
     @Published public private(set) var curatedWaste: [CuratedAgent] = []
+    /// OCR/context-derived repeated processes. These explain real wasted work, but
+    /// recipe-less candidates deploy as goal-driven agents instead of click replay.
+    @Published public private(set) var contextWaste: [ContextWasteCandidate] = []
+    @Published public private(set) var curatedContextWaste: [CuratedContextWaste] = []
     @Published public private(set) var learningOpportunities: [LearningOpportunity] = []
     @Published public private(set) var proactiveNextActionOffer: NextActionPredictor.Prediction?
     @Published public private(set) var proactiveOffer: ProactiveOffer?
@@ -317,6 +322,14 @@ public final class CascadeAppModel: ObservableObject {
     /// the curator's `statedIntent` (their own words = the best naming signal).
     private var teachIntentBuffer: [String] = []
 
+    /// True during the brief window after ⌥⌃T-finish while the final ambient-narration
+    /// transcript is still arriving — late utterances still route into the intent buffer.
+    private var teachFinishing = false
+
+    /// True while teach-once has opened the mic for hands-free narration (armed in
+    /// `beginTeaching` after the spoken prompt, committed in `endTeaching`).
+    private var teachAmbientArmed = false
+
     /// The companion-cursor colorway (cursor, trail, ripple, and highlight marquee
     /// all follow it). Picked from the notch; persists across launches.
     @Published public var cursorTheme: CursorTheme {
@@ -346,6 +359,8 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalEpisodeMiningKey = "cascade.experimentalEpisodeMining"
     static let experimentalParameterizedMiningKey = "cascade.experimentalParameterizedMining"
     static let experimentalSuggestionRankingKey = "cascade.experimentalSuggestionRanking"
+    static let experimentalContextWasteDetectionKey = "cascade.experimentalContextWasteDetection"
+    static let legacyActionWasteModeKey = "cascade.legacyActionWasteMode"
     static let experimentalSkillConsolidationKey = "cascade.experimentalSkillConsolidation"
     static let experimentalModelCallCacheKey = "cascade.experimentalModelCallCache"
     static let experimentalStructuredContentKey = "cascade.experimentalStructuredContent"
@@ -366,6 +381,13 @@ public final class CascadeAppModel: ObservableObject {
     static let proactiveModeKey = "cascade.proactive.mode"
     static let suggestionTimingPreferenceKey = "cascade.personalization.suggestionTiming"
     static let backgroundAgentPreferenceKey = "cascade.personalization.backgroundAgent"
+
+    public enum LegacyActionWasteMode: String, Sendable, Equatable {
+        case disabled
+        case diagnosticsOnly
+        case linkRecipes
+        case fallbackReviewQueue
+    }
 
     static func experimentalModelCallCache(defaults: UserDefaults, store: CascadeStore? = nil) -> ModelCallCache? {
         defaults.bool(forKey: Self.experimentalModelCallCacheKey) ? ModelCallCache(store: store) : nil
@@ -684,6 +706,7 @@ public final class CascadeAppModel: ObservableObject {
             refreshPermissionState()
             await refreshComputerUseHealth()
             contexts = try await store.recentContexts(limit: 80)
+            reelTimeline = try await store.contextTimeline(since: Calendar.current.startOfDay(for: Date()))
             let integrity = try await store.verifyAuditChain()
             auditIntegrityStatus = Self.auditIntegrityStatus(from: integrity)
             if trustedAuditHistoryForSensitiveAction() {
@@ -709,46 +732,100 @@ public final class CascadeAppModel: ObservableObject {
             let personalizationEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalSuggestionRankingKey)
             let episodeMiningEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalEpisodeMiningKey)
             let parameterizedMiningEnabled = episodeMiningEnabled && defaultsStore.bool(forKey: Self.experimentalParameterizedMiningKey)
-            let detectionReport = try await orchestrator.detectedWasteReport(
-                webAppIdentity: Self.webAppIdentity,
-                useEpisodeMining: episodeMiningEnabled,
-                useParameterizedMining: parameterizedMiningEnabled
+            let contextWasteEnabled = Self.enabledByDefault(defaultsStore, key: Self.experimentalContextWasteDetectionKey)
+            let legacyActionWasteMode = Self.legacyActionWasteMode(defaultsStore)
+            let shouldRunLegacyActions = !contextWasteEnabled || legacyActionWasteMode != .disabled
+            let detectionReport = shouldRunLegacyActions
+                ? try await orchestrator.detectedWasteReport(
+                    webAppIdentity: Self.webAppIdentity,
+                    useEpisodeMining: episodeMiningEnabled,
+                    useParameterizedMining: parameterizedMiningEnabled
+                )
+                : WasteDetectionReport(
+                    rawCount: 0,
+                    episodeCount: 0,
+                    literalCount: 0,
+                    parameterizedCount: 0,
+                    minedCount: 0,
+                    finalCount: 0,
+                    results: []
             )
             let rawDetectedWaste = detectionReport.results
             let preferenceModel = await suggestionPreferenceModel()
             var reviewableCount = 0
-            if personalizationEnabled {
+            if contextWasteEnabled {
+                let linkingCandidates = (legacyActionWasteMode == .linkRecipes || legacyActionWasteMode == .fallbackReviewQueue)
+                    ? rawDetectedWaste
+                    : []
+                contextWaste = try await orchestrator.contextWasteReport(linkingTo: linkingCandidates).results
+                detectedWaste = legacyActionWasteMode == .disabled ? [] : rawDetectedWaste
+                let approvedSignatures = Set(agents.map(\.signature))
+                let reviewableContext = contextWaste.filter {
+                    !approvedSignatures.contains($0.signature) && !dismissedWasteSignatures.contains($0.signature)
+                }
+                reviewableCount = reviewableContext.count
+                curatedContextWaste = await orchestrator.curateContextWaste(reviewableContext)
+                await recordCuratedContextProposalsShown(curatedContextWaste)
+                if legacyActionWasteMode == .fallbackReviewQueue && curatedContextWaste.isEmpty {
+                    let reviewable = rawDetectedWaste.filter {
+                        Self.isAutomatable($0, using: preferenceModel)
+                            && !dismissedWasteSignatures.contains($0.signature)
+                    }
+                    let curated = await orchestrator.curate(reviewable)
+                    curatedWaste = personalizationEnabled
+                        ? Self.rankCuratedSuggestions(curated, using: preferenceModel)
+                        : curated
+                    await recordCuratedProposalsShown(curatedWaste)
+                } else {
+                    curatedWaste = []
+                }
+                if personalizationEnabled {
+                    await refreshProactiveNextActionOffer(now: Date())
+                } else {
+                    proactiveNextActionOffer = nil
+                    proactiveOffer = nil
+                }
+            } else if personalizationEnabled {
+                curatedContextWaste = []
                 detectedWaste = SuggestionRanker().rankDetectedWaste(rawDetectedWaste, using: preferenceModel)
-                let reviewable = detectedWaste.filter { Self.isAutomatable($0, using: preferenceModel) }
+                let reviewable = detectedWaste.filter {
+                    Self.isAutomatable($0, using: preferenceModel)
+                        && !dismissedWasteSignatures.contains($0.signature)
+                }
                 reviewableCount = reviewable.count
                 let curated = await orchestrator.curate(reviewable)
                 curatedWaste = Self.rankCuratedSuggestions(curated, using: preferenceModel)
                 await recordCuratedProposalsShown(curatedWaste)
                 await refreshProactiveNextActionOffer(now: Date())
             } else {
+                curatedContextWaste = []
+                contextWaste = []
                 detectedWaste = rawDetectedWaste
                 // Only genuinely repeated, time-saving workflows (the automatable filter)
-		                // reach the curator and the manager's review queue.
-                let reviewable = detectedWaste.filter { Self.isAutomatable($0) }
+                // reach the curator and the manager's review queue.
+                let reviewable = detectedWaste.filter {
+                    Self.isAutomatable($0)
+                        && !dismissedWasteSignatures.contains($0.signature)
+                }
                 reviewableCount = reviewable.count
-			                curatedWaste = await orchestrator.curate(reviewable)
-			                proactiveNextActionOffer = nil
-			                proactiveOffer = nil
-			            }
+                curatedWaste = await orchestrator.curate(reviewable)
+                proactiveNextActionOffer = nil
+                proactiveOffer = nil
+            }
             if parameterizedMiningEnabled {
                 _ = try? await store.appendAudit(AuditEvent(
                     actor: "agent",
                     action: "workflow.parameterized_mining",
                     detail: Self.parameterizedMiningAuditDetail(
-                        detectionReport,
-                        reviewableCount: reviewableCount,
-                        curatedCount: curatedWaste.count,
-                        managerPendingCount: taughtForReview.count + curatedWaste.count
-                    )
-                ))
+	                        detectionReport,
+	                        reviewableCount: reviewableCount,
+	                        curatedCount: curatedWaste.count + curatedContextWaste.count,
+	                        managerPendingCount: taughtForReview.count + curatedWaste.count + curatedContextWaste.count
+	                    )
+	                ))
             }
-		            await refreshLearningOpportunities(from: detectedWaste)
-		            statusLine = recorder.status.message
+            await refreshLearningOpportunities(from: detectedWaste, contextWastes: contextWasteEnabled ? [] : contextWaste)
+            statusLine = recorder.status.message
         } catch {
             auditIntegrityStatus = .verificationFailed(error.localizedDescription)
             if auditIntegrityEnforcementEnabled { audit = [] }
@@ -1020,21 +1097,56 @@ public final class CascadeAppModel: ObservableObject {
     /// When set, the Reel scrubs to the moment nearest this time (then clears).
     @Published public var reelJumpTarget: Date?
 
+    /// A past day loaded into the Reel because a citation pointed there. `nil`
+    /// means the Reel shows today's live timeline (`reelTimeline`).
+    public struct ReelDayWindow: Equatable, Sendable {
+        public let dayStart: Date
+        public let contexts: [RecordedContext]
+    }
+
+    /// Today's moments, midnight → now, decoded without the heavy OCR/metadata
+    /// payloads. Drives the Reel's real 24-hour timeline; `contexts` (the recent
+    /// 80) keeps feeding everything that only needs the latest window.
+    @Published public var reelTimeline: [RecordedContext] = []
+
+    /// Set when the user jumped to evidence from a previous day.
+    @Published public var reelWindow: ReelDayWindow?
+
     /// Click a proof chip → see the actual recorded moment in the Reel.
     public func jumpToMoment(_ citation: CitedMoment) {
-        searchQuery = ""
-        selectedTab = .reel
-        reelJumpTarget = citation.capturedAt
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: "citation #\(citation.id)")) }
+        jumpReel(to: citation.capturedAt, auditDetail: "citation #\(citation.id)")
     }
 
     /// Jump the Reel to a recorded time — the Teach-once provenance chip's "show me
     /// the recording this agent was built from".
     public func jumpToReel(at date: Date) {
+        jumpReel(to: date, auditDetail: "teach provenance")
+    }
+
+    /// Drop back to today's live timeline (the GO LIVE control).
+    public func returnReelToLive() {
+        reelWindow = nil
+    }
+
+    /// Evidence can live on any recorded day, but the Reel scrubs one day at a
+    /// time — so jumping loads the cited day's timeline first, then targets the
+    /// moment. Today just clears any past-day window; the live timeline has it.
+    private func jumpReel(to date: Date, auditDetail: String) {
         searchQuery = ""
         selectedTab = .reel
-        reelJumpTarget = date
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: "teach provenance")) }
+        Task {
+            let calendar = Calendar.current
+            if calendar.isDateInToday(date) {
+                reelWindow = nil
+            } else {
+                let dayStart = calendar.startOfDay(for: date)
+                let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart.addingTimeInterval(24 * 3600)
+                let day = (try? await store.contexts(from: dayStart, to: dayEnd)) ?? []
+                reelWindow = day.isEmpty ? nil : ReelDayWindow(dayStart: dayStart, contexts: day)
+            }
+            reelJumpTarget = date
+            _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: auditDetail))
+        }
     }
 
     /// Captures the current screen, points the blue companion cursor at the element
@@ -1842,9 +1954,11 @@ public final class CascadeAppModel: ObservableObject {
         // Teach-once: while demonstrating, the user narrates what they're doing.
         // Those words are the agent's INTENT — captured for the curator, never run as
         // a command. Buffer them and stand down; nothing launches mid-demonstration.
-        if teachingMode {
+        if teachingMode || teachFinishing {
             teachIntentBuffer.append(q)
-            teachStatus = "Teaching — heard “\(q.prefix(48))”. Press ⌥⌃T to finish."
+            if teachingMode {
+                teachStatus = "I heard “\(q.prefix(48))”. Keep going; press ⌥⌃T when you're done."
+            }
             Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.intent", detail: Self.textAuditDetail("intent", q))) }
             voice.done()
             return
@@ -2188,6 +2302,7 @@ public final class CascadeAppModel: ObservableObject {
         var findings: [(task: String, result: String)] = []
         var ranLongOn: String?
         var stalledOn: String?
+        var stalledReason: String?
         var interrupted = false
         var shot: Data? = firstScreenshotPNG
         var appliedSearchRoutingKeys = Set<String>()
@@ -2397,18 +2512,18 @@ public final class CascadeAppModel: ObservableObject {
                             continue subgoal
                         case .pause(let pauseReason):
                             stalledOn = sub.task
-                            findings.append((task: sub.task, result: pauseReason))
+                            stalledReason = pauseReason
                             break parts
                         }
                     }
-                    findings.append((task: sub.task, result: reason))
                     stalledOn = sub.task
+                    stalledReason = reason
                     break parts
                 case .stalled(let text):
                     // The part did NOT complete — moving on to the next part would
                     // build on a missing foundation. Stop here and say so honestly.
-                    findings.append((task: sub.task, result: text))
                     stalledOn = sub.task
+                    stalledReason = text
                     break parts
                 case .stopped, .failed:
                     interrupted = true  // the episode already surfaced why
@@ -2422,7 +2537,13 @@ public final class CascadeAppModel: ObservableObject {
         }
 
         if !interrupted {
-            let summary = AgentTaskPlanner.summary(findings: findings, skipped: [], ranLongOn: ranLongOn, stalledOn: stalledOn)
+            let summary = AgentTaskPlanner.summary(
+                findings: findings,
+                skipped: [],
+                ranLongOn: ranLongOn,
+                stalledOn: stalledOn,
+                stalledReason: stalledReason
+            )
             teachMessage = summary
             // Don't say the same sentence twice — if the last progress line IS
             // the summary, the user already heard it.
@@ -5718,6 +5839,19 @@ public final class CascadeAppModel: ObservableObject {
         return parts.joined(separator: " ")
     }
 
+    nonisolated static func curatedContextAgentAuditDetail(_ curated: CuratedContextWaste, agentID: Int64? = nil) -> String {
+        var parts = [
+            "source=context",
+            "feasibility=\(safeAuditToken(curated.feasibility.rawValue))",
+            "evidenceCount=\(curated.evidence.count)",
+            textAuditDetail("name", curated.name),
+            textAuditDetail("goal", curated.goal),
+            textAuditDetail("signature", curated.signature),
+        ]
+        if let agentID { parts.insert("agentID=\(agentID)", at: 0) }
+        return parts.joined(separator: " ")
+    }
+
     nonisolated static func recipeAuditDetail(_ step: RecipeStep, tier: String? = nil) -> String {
         var parts = [
             "step=\(step.order)",
@@ -5727,6 +5861,7 @@ public final class CascadeAppModel: ObservableObject {
             "isParameter=\(step.isParameter)",
             "actionKeyHash=\(step.idempotentActionKeyHash)",
         ]
+        if let anchor = step.ocrAnchor { parts.append("anchorHash=\(auditHash(anchor))") }
         if let tier { parts.append("tier=\(safeAuditToken(tier))") }
         if let bundleIdentifier = step.bundleIdentifier { parts.append(textAuditDetail("bundle", bundleIdentifier)) }
         if let windowTitleHint = step.windowTitleHint { parts.append(textAuditDetail("window", windowTitleHint)) }
@@ -6901,8 +7036,23 @@ public final class CascadeAppModel: ObservableObject {
         }
         teachStartedAt = Date()
         teachIntentBuffer.removeAll()
+        teachFinishing = false
+        teachAmbientArmed = false
         teachingMode = true
-        teachStatus = "Teaching — do the task, narrate if you like, then press ⌥⌃T to finish."
+        teachStatus = "Watching — show me the task and talk me through it like a new hire. Press ⌥⌃T when you're done."
+        // Teach-once is training an intern, not filling a form: the mic just opens and
+        // listens. Whatever you say while you work — the way you'd instruct a new hire —
+        // becomes the agent's intent. A short acknowledgement, then hands-free listening
+        // (no key to hold); the delay lets the acknowledgement finish before the mic's
+        // barge-in would cut it off.
+        voice.speak("Okay, I'm watching — go ahead and show me.")
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1800))
+            guard let self, self.teachingMode, !self.assistTaskRunning, !self.agentRunning else { return }
+            self.voice.beginTalking()
+            self.teachAmbientArmed = true
+            self.teachStatus = "Listening — talk me through it as you work. Press ⌥⌃T when you're done."
+        }
         Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.started", detail: "")) }
     }
 
@@ -6920,9 +7070,25 @@ public final class CascadeAppModel: ObservableObject {
         let end = max(start, Date().addingTimeInterval(-Self.teachFinishGuard))
         teachingMode = false
         teachStartedAt = nil
+        // Close the mic. The final sentence can still be transcribing, so keep routing
+        // late utterances into the intent buffer through the finish window —
+        // buildTaughtAgent reads it after a short settle.
+        if teachAmbientArmed { voice.endTalking(); teachAmbientArmed = false }
+        teachFinishing = true
+        teachStatus = "Saving your demonstration…"
+        Task { await buildTaughtAgent(from: start, to: end) }
+    }
+
+    private func buildTaughtAgent(from start: Date, to end: Date) async {
+        // Let the always-on recorder's 1s drain flush the bracketed events AND attach
+        // AX click labels before we read them — the drain defers unlabeled clicks
+        // <0.35s old, and those labels are the strongest replay anchor, so a forced
+        // immediate flush would lose them. The extra headroom also lets the final
+        // ambient-narration transcript land in the intent buffer before we read it.
+        try? await Task.sleep(for: .milliseconds(1800))
+        teachFinishing = false
         let intent = teachIntentBuffer.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         teachIntentBuffer.removeAll()
-        teachStatus = "Saving your demonstration…"
         Task {
             _ = try? await store.appendAudit(AuditEvent(
                 actor: "employee",
@@ -6930,19 +7096,10 @@ public final class CascadeAppModel: ObservableObject {
                 detail: intent.isEmpty ? "status=silent" : Self.textAuditDetail("intent", intent)
             ))
         }
-        Task { await buildTaughtAgent(from: start, to: end, statedIntent: intent.isEmpty ? nil : intent) }
-    }
-
-    private func buildTaughtAgent(from start: Date, to end: Date, statedIntent: String?) async {
-        // Let the always-on recorder's 1s drain flush the bracketed events AND attach
-        // AX click labels before we read them — the drain defers unlabeled clicks
-        // <0.35s old, and those labels are the strongest replay anchor, so a forced
-        // immediate flush would lose them. ~1.5s is a safe settle.
-        try? await Task.sleep(for: .milliseconds(1500))
         do {
             let curated = try await orchestrator.curateRange(
                 from: start, to: end,
-                statedIntent: statedIntent,
+                statedIntent: intent.isEmpty ? nil : intent,
                 webAppIdentity: Self.webAppIdentity
             )
             if let curated {
@@ -7067,6 +7224,13 @@ public final class CascadeAppModel: ObservableObject {
             return value
         }
         return true
+    }
+
+    private static func legacyActionWasteMode(_ defaults: UserDefaults) -> LegacyActionWasteMode {
+        guard let raw = defaults.string(forKey: Self.legacyActionWasteModeKey),
+              let mode = LegacyActionWasteMode(rawValue: raw)
+        else { return .disabled }
+        return mode
     }
 
     public nonisolated static func rankCuratedSuggestions(
@@ -7202,6 +7366,23 @@ public final class CascadeAppModel: ObservableObject {
         }
     }
 
+    private func recordCuratedContextProposalsShown(_ proposals: [CuratedContextWaste]) async {
+        for (index, proposal) in proposals.enumerated() {
+            let key = "context:\(proposal.signature)#\(index)"
+            guard loggedCuratedProposalKeys.insert(key).inserted else { continue }
+            await appendPreferenceEvent(
+                kind: .agentProposed,
+                reward: 0,
+                surface: "manager.review",
+                appName: proposal.apps.first,
+                workflowSignature: proposal.signature,
+                agentID: nil,
+                features: Self.curatedContextFeaturePayload(proposal, displayedRank: index + 1, score: proposal.value),
+                evidence: Self.curatedContextEvidencePayload(proposal)
+            )
+        }
+    }
+
     private nonisolated static func curatedFeaturePayload(
         _ curated: CuratedAgent,
         displayedRank: Int? = nil,
@@ -7219,6 +7400,33 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     private nonisolated static func curatedEvidencePayload(_ curated: CuratedAgent) -> [String: String] {
+        [
+            "nameHash": auditHash(curated.name),
+            "goalHash": auditHash(curated.goal),
+            "whyHash": auditHash(curated.why),
+            "evidenceCount": "\(curated.evidence.count)",
+            "evidenceHash": auditHash(curated.evidence.map(String.init).joined(separator: "|"))
+        ]
+    }
+
+    private nonisolated static func curatedContextFeaturePayload(
+        _ curated: CuratedContextWaste,
+        displayedRank: Int? = nil,
+        score: Double? = nil
+    ) -> [String: String] {
+        var fields: [String: String] = [
+            "candidateType": "contextWasteAgent",
+            "backgroundCapable": runsInBackground(apps: curated.apps) ? "true" : "false",
+            "feasibility": curated.feasibility.rawValue,
+            "privacyRiskBucket": (curated.source.quality.privacyPenalty >= 0.25) ? "medium" : "low",
+            "appFamily": AuditIdentity.safeToken((curated.apps.first ?? "unknown").lowercased())
+        ]
+        if let displayedRank { fields["displayedRank"] = "\(displayedRank)" }
+        if let score { fields["score"] = String(format: "%.3f", score) }
+        return fields
+    }
+
+    private nonisolated static func curatedContextEvidencePayload(_ curated: CuratedContextWaste) -> [String: String] {
         [
             "nameHash": auditHash(curated.name),
             "goalHash": auditHash(curated.goal),
@@ -7783,7 +7991,22 @@ public final class CascadeAppModel: ObservableObject {
 	        }
 	    }
 
-    private func refreshLearningOpportunities(from wastes: [DetectedWaste]) async {
+    public var pendingCuratedContextWaste: [CuratedContextWaste] {
+        let approved = Set(agents.map(\.signature))
+        var seen = Set<String>()
+        return curatedContextWaste.filter { candidate in
+            guard !approved.contains(candidate.signature),
+                  !dismissedWasteSignatures.contains(candidate.signature),
+                  !seen.contains(candidate.signature) else { return false }
+            seen.insert(candidate.signature)
+            return true
+        }
+    }
+
+	    private func refreshLearningOpportunities(
+        from wastes: [DetectedWaste],
+        contextWastes: [ContextWasteCandidate] = []
+    ) async {
         var opportunities: [LearningOpportunity] = []
         var seen = Set<String>()
         func append(_ opportunity: LearningOpportunity) {
@@ -7802,6 +8025,17 @@ public final class CascadeAppModel: ObservableObject {
                 title: "Form a skill for \(waste.title)",
                 detail: "\(waste.occurrences) repeats, \(waste.estimatedSecondsPerRun)s each, with no active approved skill.",
                 actionTitle: "Review workflow"
+            ))
+        }
+
+        for waste in contextWastes where !approvedSignatures.contains(waste.signature) {
+            let feasibility = waste.feasibility == .linkedRecipe ? "a matching replay recipe" : "no replay recipe yet"
+            append(LearningOpportunity(
+                id: "context:\(waste.signature)",
+                kind: .contextWaste,
+                title: "Teach Cascade \(waste.title.lowercased())",
+                detail: "\(waste.occurrences) context repeats, \(max(1, waste.estimatedTotalSeconds / 60))m total, \(feasibility).",
+                actionTitle: waste.feasibility == .needsDemo ? "Teach once" : "Review process"
             ))
         }
 
@@ -7864,7 +8098,7 @@ public final class CascadeAppModel: ObservableObject {
         switch opportunity.kind {
         case .overlappingDrafts:
             selectedTab = .cascades
-        case .repeatedWorkflow, .recurringFailure, .parameterizedRecipe:
+        case .repeatedWorkflow, .contextWaste, .recurringFailure, .parameterizedRecipe:
             selectedTab = .manager
         }
     }
@@ -7936,6 +8170,82 @@ public final class CascadeAppModel: ObservableObject {
                 agentID: nil,
                 features: Self.curatedFeaturePayload(curated, score: curated.value),
                 evidence: Self.curatedEvidencePayload(curated)
+            )
+        }
+    }
+
+    /// The manager approves an OCR/Rewind-derived process insight. Unlike action-mined
+    /// proposals, this saves a goal-driven agent with no click replay recipe.
+    public func approveContextWaste(_ curated: CuratedContextWaste) {
+        if curated.feasibility == .needsDemo {
+            dismissedLearningOpportunityKeys.insert("context:\(curated.signature)")
+            flashManagerReviewNote("“\(curated.name)” needs one taught example before Cascade can run it.")
+            Task {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "manager",
+                    action: "agent.demo_needed",
+                    detail: Self.curatedContextAgentAuditDetail(curated)
+                ))
+                await appendPreferenceEvent(
+                    kind: .agentDeclined,
+                    reward: -0.15,
+                    surface: "manager.review",
+                    appName: curated.apps.first,
+                    workflowSignature: curated.signature,
+                    agentID: nil,
+                    features: Self.curatedContextFeaturePayload(curated, score: curated.value),
+                    evidence: Self.curatedContextEvidencePayload(curated)
+                )
+            }
+            return
+        }
+        Task {
+            do {
+	                let agent = try await orchestrator.createAgent(from: curated)
+	                dismissedWasteSignatures.insert(curated.signature)
+	                dismissedLearningOpportunityKeys.insert("context:\(curated.signature)")
+	                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "manager",
+                    action: "agent.approved",
+                    detail: Self.curatedContextAgentAuditDetail(curated, agentID: agent.id)
+                ))
+                await appendPreferenceEvent(
+                    kind: .agentApproved,
+                    reward: 1.0,
+                    surface: "manager.review",
+                    appName: curated.apps.first,
+                    workflowSignature: curated.signature,
+                    agentID: agent.id,
+                    features: Self.curatedContextFeaturePayload(curated, score: curated.value),
+                    evidence: Self.curatedContextEvidencePayload(curated)
+                )
+                flashManagerReviewNote("Approved “\(curated.name)” — it's now in the employee's Cascades, ready to run from context.")
+            } catch {
+                flashManagerReviewNote("Couldn't approve “\(curated.name)”: \(error.localizedDescription)")
+            }
+            await refreshAll()
+        }
+    }
+
+    public func declineContextWaste(_ curated: CuratedContextWaste) {
+        dismissedWasteSignatures.insert(curated.signature)
+        dismissedLearningOpportunityKeys.insert("context:\(curated.signature)")
+        flashManagerReviewNote("Dismissed “\(curated.name)” — you won't see it again.")
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "manager",
+                action: "agent.declined",
+                detail: Self.curatedContextAgentAuditDetail(curated)
+            ))
+            await appendPreferenceEvent(
+                kind: .agentDeclined,
+                reward: -1.0,
+                surface: "manager.review",
+                appName: curated.apps.first,
+                workflowSignature: curated.signature,
+                agentID: nil,
+                features: Self.curatedContextFeaturePayload(curated, score: curated.value),
+                evidence: Self.curatedContextEvidencePayload(curated)
             )
         }
     }
@@ -8120,6 +8430,13 @@ public final class CascadeAppModel: ObservableObject {
         // back to the agent name only when there's no goal.
         let trimmedGoal = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let intent = trimmedGoal.isEmpty ? agent.name : trimmedGoal
+        if let batchPlan = BatchCompletionPlanner().plan(for: agent) {
+            return AgentTaskPlanner.batchFallbackTaskText(
+                for: batchPlan,
+                originalTask: intent,
+                procedureHint: batchProcedureHint(for: agent, plan: batchPlan)
+            )
+        }
         var task = "Do this recurring web task the user normally does by hand: \(intent)."
         if let hint = agent.recipe.steps.compactMap(\.windowTitleHint).first(where: { !$0.isEmpty }) {
             task += " It normally happens on the page “\(String(hint.prefix(80)))”."
@@ -8128,6 +8445,32 @@ public final class CascadeAppModel: ObservableObject {
         if !steps.isEmpty { task += " The user's recorded steps look like: \(steps)." }
         task += " Carry it out and report the result."
         return task
+    }
+
+    private static func batchProcedureHint(for agent: CascadeAgent, plan: BatchCompletionPlan) -> String {
+        let fieldList = plan.fieldBindings.prefix(8).map(\.label).joined(separator: ", ")
+        var hints: [String] = []
+        if !fieldList.isEmpty {
+            hints.append("fill destination fields \(fieldList) with each current source record/item's values")
+        } else {
+            hints.append("fill the destination fields with each current source record/item's values")
+        }
+        let targetOrders = plan.fieldBindings.map(\.targetOrder)
+        if let firstDestinationOrder = targetOrders.min() {
+            let destinationSideSteps = agent.recipe.steps
+                .filter { $0.order >= firstDestinationOrder && $0.kind != .type && $0.kind != .scroll }
+                .sorted { $0.order < $1.order }
+            let procedureSteps = AgentRecipe(steps: destinationSideSteps)
+                .humanSteps
+                .filter { $0 != "type" && $0 != "scroll" }
+                .prefix(6)
+                .joined(separator: ", ")
+            if !procedureSteps.isEmpty {
+                hints.append("then use the demonstrated destination-side controls: \(procedureSteps)")
+            }
+        }
+        hints.append("never reuse the single demonstrated record/item values as the worklist")
+        return hints.joined(separator: "; ")
     }
 
     /// Runs a saved agent. Web workflows deploy as a BACKGROUND sandbox agent —
@@ -8140,8 +8483,10 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
         guard !agentRunning else { return }
-        guard !agent.recipe.steps.isEmpty else {
-            agentMessage = "“\(agent.name)” has no recorded steps yet."
+        let hasRecordedSteps = !agent.recipe.steps.isEmpty
+        let hasGoal = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        guard hasRecordedSteps || hasGoal else {
+            agentMessage = "“\(agent.name)” has no recorded steps or goal yet."
             return
         }
         if Self.runsInBackground(apps: agent.apps) {
@@ -8149,11 +8494,51 @@ public final class CascadeAppModel: ObservableObject {
             createSandboxAgent(task: Self.sandboxTask(for: agent), forAgent: agent.id)
             return
         }
+        if hasRecordedSteps, BatchCompletionPlanner().plan(for: agent) != nil {
+            driver.runState.reset()
+            agentRunning = true
+            agentMessage = "Deploying \(agent.name)…"
+            dock.show(title: "Cascade is working", detail: "Running batch workflow · press STOP to take control.")
+            Task { await runBatchAssistAgent(agent) }
+            return
+        }
+        if !hasRecordedSteps {
+            driver.runState.reset()
+            agentRunning = true
+            agentMessage = "Deploying \(agent.name)…"
+            dock.show(title: "Cascade is working", detail: "Running “\(agent.name)” from recorded context · press STOP to take control.")
+            Task { await runBatchAssistAgent(agent) }
+            return
+        }
         driver.runState.reset()
         agentRunning = true
         agentMessage = "Deploying \(agent.name)…"
         dock.show(title: "Cascade is working", detail: "Running “\(agent.name)” · press STOP to take control.")
         Task { await runAgentRecipe(agent) }
+    }
+
+    private func runBatchAssistAgent(_ agent: CascadeAgent) async {
+        defer { agentRunning = false }
+        guard trustedAuditHistoryForSensitiveAction() else {
+            refuseUntrustedAuditHistory()
+            return
+        }
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main else {
+            agentMessage = "Paused “\(agent.name)” — couldn't find a screen to run on."
+            dock.show(title: "Paused", detail: agentMessage)
+            return
+        }
+        assistGeneration += 1
+        let gen = assistGeneration
+        let res = AgentResolution.best(forWidth: Int(screen.frame.width), height: Int(screen.frame.height))
+        guard let shot = await ScreenCaptureUtility.captureCursorScreenJPEG(width: res.w, height: res.h) else {
+            agentMessage = "Paused “\(agent.name)” — couldn't capture the screen to run the batch workflow."
+            dock.show(title: "Paused", detail: agentMessage)
+            return
+        }
+        guard assistGeneration == gen else { return }
+        await runAssistTask(goal: Self.deployGoal(for: agent), screen: screen, firstScreenshotPNG: shot, gen: gen)
+        agentMessage = teachMessage
     }
 
     func runAgentRecipe(_ agent: CascadeAgent) async {
@@ -8731,6 +9116,13 @@ public final class CascadeAppModel: ObservableObject {
     static func deployGoal(for agent: CascadeAgent) -> String {
         let intent = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines)
         var goal = (intent?.isEmpty == false) ? intent! : agent.name
+        if let batchPlan = BatchCompletionPlanner().plan(for: agent) {
+            return AgentTaskPlanner.batchFallbackTaskText(
+                for: batchPlan,
+                originalTask: goal,
+                procedureHint: batchProcedureHint(for: agent, plan: batchPlan)
+            )
+        }
         let steps = agent.recipe.humanSteps.filter { $0 != "type" && $0 != "scroll" }.prefix(8).joined(separator: ", ")
         if !steps.isEmpty { goal += "\n(The user normally does this as: \(steps).)" }
         return goal
@@ -10362,14 +10754,35 @@ public final class CascadeAppModel: ObservableObject {
         NSPasteboard.general.setString(string, forType: .string)
     }
 
-    /// Prepends a freshly recorded moment to the Reel, newest-first, capped so the
-    /// in-memory list stays bounded.
+    /// Freshly recorded moments waiting to be published to the Reel. Every
+    /// @Published change re-renders the whole UI — at one capture per second,
+    /// per-moment publishing made the app visibly lag, so live moments batch
+    /// here and flush every ~2.5s.
+    private var pendingLiveMoments: [RecordedContext] = []
+    private var lastLiveMomentFlush = Date.distantPast
+
+    /// Prepends freshly recorded moments to the Reel in small batches,
+    /// newest-first, capped so the in-memory list stays bounded.
     private func ingestLiveMoment(_ context: RecordedContext) {
-        guard !contexts.contains(where: { $0.id == context.id }) else { return }
-        contexts.insert(context, at: 0)
+        pendingLiveMoments.insert(context, at: 0)
+        let now = Date()
+        guard now.timeIntervalSince(lastLiveMomentFlush) >= 2.5 else { return }
+        lastLiveMomentFlush = now
+        let fresh = pendingLiveMoments.filter { moment in
+            !contexts.contains(where: { $0.id == moment.id })
+        }
+        pendingLiveMoments.removeAll()
+        guard !fresh.isEmpty else { return }
+        contexts.insert(contentsOf: fresh, at: 0)
         if contexts.count > 200 {
             contexts.removeLast(contexts.count - 200)
         }
+        // The Reel's day timeline must ride live captures too — it only reloads
+        // on refreshAll, so without this prepend the rewind looks frozen at
+        // whatever was on screen when the app launched. IDs are monotonic, so
+        // anything newer than the current head is genuinely new.
+        let newestKnown = reelTimeline.first?.id ?? 0
+        reelTimeline.insert(contentsOf: fresh.filter { $0.id > newestKnown }, at: 0)
     }
 
     public func refreshClickMarkers(near context: RecordedContext?) {

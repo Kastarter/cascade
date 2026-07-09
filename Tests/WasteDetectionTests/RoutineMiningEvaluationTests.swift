@@ -156,8 +156,8 @@ private func recallKnownRoutines(_ resultsByFixture: [(RoutineMiningFixture, [De
 }
 
 private func signaturesMatch(_ actual: String, _ expected: String) -> Bool {
-    let actualTokens = actual.components(separatedBy: "|")
-    let expectedTokens = expected.components(separatedBy: "|")
+    let actualTokens = normalizedSignatureTokensForTest(actual)
+    let expectedTokens = normalizedSignatureTokensForTest(expected)
     return normalizedLevenshtein(actualTokens, expectedTokens) >= 0.70
         || jaccard(Set(actualTokens), Set(expectedTokens)) >= 0.70
 }

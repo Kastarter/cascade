@@ -549,16 +549,37 @@ private struct ReelScreen: View {
     /// has accumulated for the current speed.
     private let ticker = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
-    /// Search results when a query is active, otherwise the recent timeline.
+    /// The moment the scrubber is parked on, tracked by ID so live captures
+    /// prepending to the array can't silently shift the selection. `nil` = ride
+    /// the live edge.
+    @State private var anchorID: Int64?
+
+    /// Search results when a query is active, otherwise the displayed day —
+    /// a past day when a citation jumped there, today's timeline otherwise.
     private var moments: [RecordedContext] {
-        model.searchQuery.isEmpty ? model.contexts : model.searchResults
+        guard model.searchQuery.isEmpty else { return model.searchResults }
+        return model.reelWindow?.contexts ?? model.reelTimeline
+    }
+    /// Cheap change stamp for the timeline — comparing full ID arrays on every
+    /// live update is an O(n) scan per publish; count + newest ID catches every
+    /// prepend/replacement the Reel cares about.
+    private struct TimelineStamp: Equatable {
+        let count: Int
+        let newestID: Int64?
+    }
+    private var timelineStamp: TimelineStamp {
+        TimelineStamp(count: moments.count, newestID: moments.first?.id)
+    }
+    /// Local midnight of the day the timeline strip is showing.
+    private var timelineDayStart: Date {
+        model.reelWindow?.dayStart ?? Calendar.current.startOfDay(for: Date())
     }
     private var selected: RecordedContext? {
         guard !moments.isEmpty else { return nil }
         return moments[min(max(index, 0), moments.count - 1)]
     }
-    /// True when scrubbed to the newest moment ("now").
-    private var isLive: Bool { index == 0 }
+    /// True when riding the newest moment of *today* ("now").
+    private var isLive: Bool { index == 0 && model.reelWindow == nil }
 
     var body: some View {
         GeometryReader { geo in
@@ -578,18 +599,39 @@ private struct ReelScreen: View {
         }
         .background(alignment: .top) { reelGlow }
         .onReceive(ticker) { _ in advancePlaybackIfNeeded() }
-        .onChange(of: moments.count) { _, newCount in
-            index = min(index, max(newCount - 1, 0))
+        .onChange(of: index) { _, _ in
+            // Any scrub (user, playback, or jump) re-pins the anchor; parking on
+            // today's live edge clears it so the view keeps riding "now".
+            anchorID = isLive ? nil : selected?.id
+        }
+        .onChange(of: timelineStamp) { _, _ in
+            // Live captures prepend to the array — without an ID anchor the same
+            // index silently becomes a different (newer) moment every few seconds.
+            if let anchorID, let pinned = moments.firstIndex(where: { $0.id == anchorID }) {
+                index = pinned
+            } else {
+                index = min(index, max(moments.count - 1, 0))
+            }
         }
         .onChange(of: model.reelJumpTarget) { _, target in
-            // A citation chip was clicked — scrub to the moment it cites.
+            // A citation chip was clicked — scrub to the moment it cites. The
+            // model has already loaded the cited day into `reelWindow` if needed.
             guard let target, !moments.isEmpty else { return }
             isPlaying = false
             index = moments.indices.min(by: {
                 abs(moments[$0].capturedAt.timeIntervalSince(target)) < abs(moments[$1].capturedAt.timeIntervalSince(target))
             }) ?? 0
+            anchorID = selected?.id
             model.reelJumpTarget = nil
         }
+    }
+
+    /// GO LIVE: drop any past-day window and ride today's newest moment again.
+    private func returnToLive() {
+        model.returnReelToLive()
+        isPlaying = false
+        index = 0
+        anchorID = nil
     }
 
     /// Soft warm vignette at the top of the reel, echoing the captured-moment glow.
@@ -657,10 +699,12 @@ private struct ReelScreen: View {
                 onNewer: {
                     if index > 0 { index -= 1 }
                     isPlaying = false
-                }
+                },
+                onLive: returnToLive
             )
             ActivityTimeline(
                 contexts: moments,
+                dayStart: timelineDayStart,
                 currentIndex: index,
                 onScrub: { newIndex in
                     index = newIndex
@@ -734,9 +778,13 @@ private struct SceneCard: View {
             // natural-size overflow from inflating the layout.
             Color.clear
                 .overlay {
+                    // A short crossfade between moments makes scrubbing read as
+                    // continuous footage instead of flipping screenshots.
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFill()
+                        .contentTransition(.opacity)
+                        .animation(.easeInOut(duration: 0.15), value: context.id)
                 }
                 .clipped()
             clickOverlay(context: context, image: image)
@@ -917,6 +965,7 @@ private struct TransportBar: View {
     let latest: Date?
     let onOlder: () -> Void
     let onNewer: () -> Void
+    let onLive: () -> Void
 
     private let speeds: [Double] = [0.5, 1, 2, 8]
 
@@ -929,8 +978,9 @@ private struct TransportBar: View {
             }
             Rectangle().fill(Color.cascadeBorder).frame(width: 1, height: 26)
             // Live: one clock + the LIVE pill (current == latest, no point showing
-            // both). Scrubbed: "current / latest". Everything here is fixed-size so
-            // a narrow window can never squeeze the text into a vertical wrap.
+            // both). Scrubbed: "current / latest" plus a GO LIVE button back to
+            // now. Everything here is fixed-size so a narrow window can never
+            // squeeze the text into a vertical wrap.
             HStack(alignment: .firstTextBaseline, spacing: CascadeMetrics.s2) {
                 Text(current.map(ReelScreen.clock) ?? "—")
                     .font(.cascadeMono(20, .medium))
@@ -944,6 +994,7 @@ private struct TransportBar: View {
                         .foregroundStyle(Color.cascadeText3)
                         .lineLimit(1)
                         .fixedSize()
+                    goLiveButton
                 }
             }
             .layoutPriority(1)
@@ -995,6 +1046,26 @@ private struct TransportBar: View {
         .overlay(Capsule().stroke(Color.cascadeAccent.opacity(0.40), lineWidth: 1))
     }
 
+    /// Shown while scrubbed back (or parked on a past day) — one click back to now.
+    private var goLiveButton: some View {
+        Button(action: onLive) {
+            HStack(spacing: 5) {
+                Circle().fill(Color.cascadeText3).frame(width: 6, height: 6)
+                Text("GO LIVE")
+                    .font(.cascadeMono(10, .semibold))
+                    .tracking(0.6)
+                    .lineLimit(1)
+            }
+            .fixedSize()
+            .padding(.horizontal, CascadeMetrics.s2)
+            .padding(.vertical, 4)
+            .overlay(Capsule().stroke(Color.cascadeBorderHi, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Color.cascadeText2)
+        .help("Back to the newest moment")
+    }
+
     private var speedControls: some View {
         HStack(spacing: CascadeMetrics.s1) {
             ForEach(speeds, id: \.self) { value in
@@ -1027,41 +1098,88 @@ private struct TransportBar: View {
 
 private struct ActivityTimeline: View {
     let contexts: [RecordedContext]
+    /// Local midnight of the day this strip shows. The axis is always the real
+    /// 24-hour clock of that day — busy hours don't stretch, idle hours don't
+    /// vanish; every moment sits at its true time of day.
+    let dayStart: Date
     /// Current scrubber position as an index into `contexts` (0 = newest / live).
     let currentIndex: Int
     /// Called when the user clicks or drags the bar to a different moment.
     let onScrub: (Int) -> Void
 
-    private struct Run: Identifiable { let id = UUID(); let app: String; let bundle: String?; let count: Int }
+    private struct Segment: Identifiable {
+        let id = UUID()
+        let app: String
+        let bundle: String?
+        let start: Date
+        let end: Date
+    }
     private struct LegendItem: Identifiable { let id: String; let app: String; let bundle: String? }
 
-    private var runs: [Run] {
-        var result: [Run] = []
-        for context in contexts.reversed() {
+    /// A capture gap wider than this ends a segment, so idle time reads as an
+    /// empty stretch of track instead of one app smearing across it.
+    private static let gapBreak: TimeInterval = 180
+    /// A lone moment still paints a visible sliver of activity.
+    private static let minimumSpan: TimeInterval = 45
+
+    /// The day in real time: length of the displayed calendar day (DST-aware).
+    private var dayDuration: TimeInterval {
+        let end = Calendar.current.date(byAdding: .day, value: 1, to: dayStart)
+            ?? dayStart.addingTimeInterval(24 * 3600)
+        return max(end.timeIntervalSince(dayStart), 1)
+    }
+
+    /// 0…1 position of a date across the displayed day.
+    private func dayFraction(_ date: Date) -> CGFloat {
+        CGFloat(min(max(date.timeIntervalSince(dayStart) / dayDuration, 0), 1))
+    }
+
+    /// The strip paints at most ~1500 moments; beyond that, stride-sample. A
+    /// full day at one capture per second is tens of thousands of rows —
+    /// painting them all on every update costs main-thread milliseconds for
+    /// sub-pixel detail no one can see. Scrubbing still uses the full list.
+    private var paintSource: [RecordedContext] {
+        let limit = 1500
+        guard contexts.count > limit else { return contexts }
+        let stride = contexts.count / limit + 1
+        return contexts.enumerated().compactMap { index, element in
+            index % stride == 0 ? element : nil
+        }
+    }
+
+    private var segments: [Segment] {
+        var result: [Segment] = []
+        for context in paintSource.reversed() {
             // Group by the web app inside the browser when there is one, so the lanes
             // read "Gmail" / "Google Docs" instead of one long "Google Chrome".
             let app = CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle)
             let bundle = app == context.appName ? context.bundleIdentifier : nil
-            if let last = result.last, last.app == app {
-                result[result.count - 1] = Run(app: last.app, bundle: last.bundle, count: last.count + 1)
+            let at = context.capturedAt
+            if let last = result.last, last.app == app, at.timeIntervalSince(last.end) <= Self.gapBreak {
+                result[result.count - 1] = Segment(app: last.app, bundle: last.bundle, start: last.start, end: at)
             } else {
-                result.append(Run(app: app, bundle: bundle, count: 1))
+                result.append(Segment(app: app, bundle: bundle, start: at, end: at))
             }
         }
         return result
     }
 
+    /// The day's apps by time spent, biggest first, capped so the legend can't
+    /// overflow the strip on a many-app day.
     private var legend: [LegendItem] {
-        var seen = Set<String>()
-        var items: [LegendItem] = []
-        for context in contexts {
-            let app = CascadeAppModel.displayApp(appName: context.appName, windowTitle: context.windowTitle)
-            guard !seen.contains(app) else { continue }
-            seen.insert(app)
-            let bundle = app == context.appName ? context.bundleIdentifier : nil
-            items.append(LegendItem(id: app, app: app, bundle: bundle))
+        var duration: [String: TimeInterval] = [:]
+        var bundles: [String: String?] = [:]
+        for segment in segments {
+            duration[segment.app, default: 0] += max(segment.end.timeIntervalSince(segment.start), Self.minimumSpan)
+            if bundles[segment.app] == nil { bundles[segment.app] = segment.bundle }
         }
-        return items.sorted { $0.app < $1.app }
+        return duration.sorted { $0.value > $1.value }.prefix(6).map {
+            LegendItem(id: $0.key, app: $0.key, bundle: bundles[$0.key] ?? nil)
+        }
+    }
+
+    private var legendOverflowCount: Int {
+        max(Set(segments.map(\.app)).count - 6, 0)
     }
 
     var body: some View {
@@ -1073,7 +1191,7 @@ private struct ActivityTimeline: View {
     }
 
     @ViewBuilder private var label: some View {
-        if runs.isEmpty {
+        if segments.isEmpty {
             Text("NO ACTIVITY RECORDED YET")
                 .font(.cascadeMono(11, .semibold))
                 .tracking(0.8)
@@ -1088,37 +1206,41 @@ private struct ActivityTimeline: View {
                         Text(item.app).font(.cascadeMono(10)).foregroundStyle(Color.cascadeText2)
                     }
                 }
+                if legendOverflowCount > 0 {
+                    Text("+\(legendOverflowCount) more").font(.cascadeMono(10)).foregroundStyle(Color.cascadeText3)
+                }
             }
         }
     }
 
     @ViewBuilder private var track: some View {
-        if runs.isEmpty {
+        if segments.isEmpty {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.cascadePanel2)
                 .frame(height: 30)
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
         } else {
-            // Canvas paints each run at its exact fractional position, so the bar
-            // always fits its frame. (An HStack of min-6pt segments overflowed the
-            // track in narrow windows once many short runs were squeezed together —
-            // the bar bled past the playhead and the rounded border.)
-            let total = CGFloat(max(contexts.count, 1))
-            let segments = runs.map {
-                (color: AppVisuals.color(for: $0.app, bundleIdentifier: $0.bundle), count: CGFloat($0.count))
+            // Canvas paints each segment at its true clock position across the
+            // fixed 24h day, with hour gridlines so empty stretches stay legible.
+            let painted = segments.map {
+                (color: AppVisuals.color(for: $0.app, bundleIdentifier: $0.bundle), start: $0.start, end: $0.end)
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Canvas { context, size in
-                        var x: CGFloat = 0
-                        for segment in segments {
-                            let w = size.width * segment.count / total
-                            // Hairline gaps separate runs, but only when a run is
-                            // wide enough to survive one.
-                            let gap: CGFloat = w > 5 ? 1.5 : 0
-                            let rect = CGRect(x: x + gap / 2, y: 0, width: max(w - gap, 0.5), height: size.height)
+                        for hour in 1..<24 {
+                            let x = size.width * CGFloat(hour) / 24
+                            context.fill(
+                                Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
+                                with: .color(Color.cascadeBorder.opacity(hour % 6 == 0 ? 0.9 : 0.45))
+                            )
+                        }
+                        for segment in painted {
+                            let paintedEnd = max(segment.end, segment.start.addingTimeInterval(Self.minimumSpan))
+                            let startX = dayFraction(segment.start) * size.width
+                            let endX = max(dayFraction(paintedEnd) * size.width, startX + 1.5)
+                            let rect = CGRect(x: startX, y: 0, width: endX - startX, height: size.height)
                             context.fill(Path(rect), with: .color(segment.color))
-                            x += w
                         }
                     }
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1134,12 +1256,11 @@ private struct ActivityTimeline: View {
             }
             .frame(height: 30)
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorder, lineWidth: 1))
-            .help("Click or drag to scrub through your timeline")
+            .help("Click or drag to scrub through your day")
         }
     }
 
-    /// White handle marking the current moment. The bar runs oldest → newest
-    /// (left → right), so the newest moment (index 0) sits at the right edge.
+    /// White handle marking the current moment at its real time of day.
     private func playhead(width: CGFloat, height: CGFloat) -> some View {
         Capsule()
             .fill(Color.cascadeText)
@@ -1149,24 +1270,23 @@ private struct ActivityTimeline: View {
             .allowsHitTesting(false)
     }
 
-    /// The playhead sits at the *trailing edge* of the current moment's slot — a
-    /// moment spans from its capture until the next one — so at the live edge the
-    /// handle is flush with the end of the bar instead of half a slot short of it.
     private func playheadX(_ width: CGFloat) -> CGFloat {
-        let count = max(contexts.count, 1)
-        let ordinal = count - min(max(currentIndex, 0), count - 1)  // count = newest (right edge)
-        let fraction = Double(ordinal) / Double(count)
-        return min(CGFloat(fraction) * width, width - 2)
+        guard !contexts.isEmpty else { return 2 }
+        let clamped = min(max(currentIndex, 0), contexts.count - 1)
+        let x = dayFraction(contexts[clamped].capturedAt) * width
+        return min(max(x, 2), width - 2)
     }
 
-    /// Maps a tap/drag X into the matching moment index and reports it (only when it
-    /// actually changes, so dragging within one moment doesn't thrash state).
+    /// Maps a tap/drag X to a clock time on the day, then to the nearest captured
+    /// moment (only reporting real changes, so dragging inside one moment doesn't
+    /// thrash state). Clicking an idle stretch lands on the closest evidence.
     private func scrub(toX x: CGFloat, width: CGFloat) {
         guard !contexts.isEmpty, width > 0 else { return }
-        let count = contexts.count
         let fraction = min(max(Double(x / width), 0), 1)
-        let ordinal = min(Int(fraction * Double(count)), count - 1)  // 0 = oldest
-        let newIndex = count - 1 - ordinal
+        let target = dayStart.addingTimeInterval(fraction * dayDuration)
+        let newIndex = contexts.indices.min(by: {
+            abs(contexts[$0].capturedAt.timeIntervalSince(target)) < abs(contexts[$1].capturedAt.timeIntervalSince(target))
+        }) ?? 0
         if newIndex != currentIndex { onScrub(newIndex) }
     }
 
@@ -1179,18 +1299,15 @@ private struct ActivityTimeline: View {
         }
     }
 
-    /// Four evenly spaced hour ticks across the captured span (min 3h window),
-    /// oldest → newest, matching the track's left → right direction.
+    /// Real clock labels every 3 hours across the fixed 24h day, midnight →
+    /// midnight, matching the track's true-time positions.
     private var axisLabels: [String] {
-        let end = contexts.first?.capturedAt ?? Date()
-        let start = contexts.last?.capturedAt ?? end.addingTimeInterval(-3 * 3600)
-        let span = max(end.timeIntervalSince(start), 3 * 3600)
         let formatter = DateFormatter()
         formatter.dateFormat = "ha"
         formatter.amSymbol = "am"
         formatter.pmSymbol = "pm"
-        return (0..<4).map { i in
-            formatter.string(from: start.addingTimeInterval(span * Double(i) / 3)).lowercased()
+        return stride(from: 0, through: 24, by: 3).map { hour in
+            formatter.string(from: dayStart.addingTimeInterval(Double(hour) * 3600)).lowercased()
         }
     }
 }
@@ -1775,6 +1892,143 @@ private struct WasteCard: View {
     }
 }
 
+private struct ContextWasteCard: View {
+    let curated: CuratedContextWaste
+    let evidenceImagePath: String?
+    let onApprove: () -> Void
+    let onDecline: () -> Void
+
+    private var waste: ContextWasteCandidate { curated.source }
+
+    var body: some View {
+        CascadePanel {
+            HStack(alignment: .top, spacing: CascadeMetrics.s4) {
+                thumbnail
+                VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+                    HStack(alignment: .top) {
+                        Text(curated.name).font(.cascadeSans(15, .semibold))
+                        CascadeTag(feasibilityLabel, tone: curated.feasibility == .needsDemo ? .cascadeAccentWarm : .cascadeAgent)
+                        Spacer()
+                        Text("\(waste.occurrences)× · ~\(max(1, waste.estimatedTotalSeconds / 60))m observed")
+                            .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText3)
+                            .fixedSize()
+                    }
+                    if !curated.why.isEmpty {
+                        Text(curated.why)
+                            .font(.cascadeSans(12)).foregroundStyle(Color.cascadeText3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    AppChips(apps: waste.apps)
+                    whatItDoes
+                    safeEvidence
+                    HStack(spacing: CascadeMetrics.s2) {
+                        Text("last seen \(waste.lastSeenAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.cascadeMono(11)).foregroundStyle(Color.cascadeText4)
+                        Spacer()
+                        Button(action: onDecline) { Text("Dismiss") }
+                            .buttonStyle(.plain).foregroundStyle(Color.cascadeText3)
+                        Button(action: onApprove) { Text(primaryActionTitle) }
+                            .buttonStyle(CascadeAccentButtonStyle())
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var thumbnail: some View {
+        if let path = evidenceImagePath, let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 116, height: 74)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorderHi, lineWidth: 1))
+        } else {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.cascadePanel2)
+                .frame(width: 116, height: 74)
+                .overlay(Image(systemName: "text.viewfinder").foregroundStyle(Color.cascadeAgent))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cascadeBorderHi, lineWidth: 1))
+        }
+    }
+
+    private var whatItDoes: some View {
+        let goal = curated.goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        return VStack(alignment: .leading, spacing: 5) {
+            Text("WHEN DEPLOYED, CASCADE WILL")
+                .font(.cascadeMono(9, .semibold)).tracking(0.7).foregroundStyle(Color.cascadeText4)
+            Text(goal.isEmpty ? curated.name : goal)
+                .font(.cascadeSans(13)).foregroundStyle(Color.cascadeText)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 5) {
+                Image(systemName: curated.feasibility == .needsDemo ? "record.circle" : (CascadeAppModel.runsInBackground(apps: waste.apps) ? "macwindow.badge.plus" : "cursorarrow.rays"))
+                    .font(.system(size: 10)).foregroundStyle(Color.cascadeAgent)
+                Text(executionSummary)
+                    .font(.cascadeSans(11)).foregroundStyle(Color.cascadeText3)
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private var safeEvidence: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("EVIDENCE")
+                .font(.cascadeMono(9, .semibold)).tracking(0.7).foregroundStyle(Color.cascadeText4)
+            Text(evidenceSummary)
+                .font(.cascadeSans(12))
+                .foregroundStyle(Color.cascadeText3)
+                .fixedSize(horizontal: false, vertical: true)
+            if !parameterSummary.isEmpty {
+                Text(parameterSummary)
+                    .font(.cascadeMono(10))
+                    .foregroundStyle(Color.cascadeText4)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var evidenceSummary: String {
+        let anchors = "\(waste.evidenceContextIDs.count) Rewind anchors across \(waste.sessionIDs.count) task episodes"
+        let terms = waste.processTerms.prefix(5).joined(separator: ", ")
+        return terms.isEmpty ? anchors : "\(anchors) · process terms: \(terms)"
+    }
+
+    private var parameterSummary: String {
+        waste.parameters.prefix(5).map { parameter in
+            "\(parameter.role):\(parameter.count)"
+        }.joined(separator: " · ")
+    }
+
+    private var feasibilityLabel: String {
+        switch curated.feasibility {
+        case .linkedRecipe: "LINKED"
+        case .needsDemo: "TEACH"
+        case .goalOnlyCandidate: "CONTEXT"
+        }
+    }
+
+    private var primaryActionTitle: String {
+        switch curated.feasibility {
+        case .linkedRecipe: "Approve linked agent"
+        case .needsDemo: "Teach once"
+        case .goalOnlyCandidate: "Approve agent"
+        }
+    }
+
+    private var executionSummary: String {
+        switch curated.feasibility {
+        case .needsDemo:
+            return "Needs one taught example before it can run."
+        case .linkedRecipe:
+            return "Runs from context with linked recipe evidence."
+        case .goalOnlyCandidate:
+            return CascadeAppModel.runsInBackground(apps: waste.apps)
+                ? "Runs from the recorded context in the background."
+                : "Runs from the recorded context on screen."
+        }
+    }
+}
+
 private struct ProactiveNextActionCard: View {
     let offer: ProactiveOffer
     let onAccept: () -> Void
@@ -1953,6 +2207,25 @@ private struct AgentCard: View {
     }
 }
 
+enum ContextWasteEvidenceImagePicker {
+    static func safeImagePath(
+        for waste: ContextWasteCandidate,
+        contexts: [RecordedContext]
+    ) -> String? {
+        let evidenceIDs = Set(waste.evidenceContextIDs)
+        return contexts
+            .filter {
+                evidenceIDs.contains($0.id)
+                    && $0.imagePath != nil
+                    && $0.safeToShow
+                    && $0.safeToSummarize
+                    && !PrivacyRules.isSensitive($0)
+            }
+            .min { abs($0.capturedAt.timeIntervalSince(waste.lastSeenAt)) < abs($1.capturedAt.timeIntervalSince(waste.lastSeenAt)) }?
+            .imagePath
+    }
+}
+
 // MARK: - Manager screen (aggregate-only ANALYTICS; review/deploy live in Cascades)
 
 private struct ManagerScreen: View {
@@ -1972,8 +2245,9 @@ private struct ManagerScreen: View {
     /// agents that have never actually been deployed.
     private var minutesOnTheTable: Int {
         let pending = model.pendingCuratedAgents.map(\.source.estimatedTotalSeconds).reduce(0, +)
+        let pendingContext = model.pendingCuratedContextWaste.map(\.source.estimatedTotalSeconds).reduce(0, +)
         let approvedNeverRun = model.agents.filter { $0.runCount == 0 }.map(\.estimatedSeconds).reduce(0, +)
-        return (pending + approvedNeverRun) / 60
+        return (pending + pendingContext + approvedNeverRun) / 60
     }
 
     private var totalRuns: Int {
@@ -2064,6 +2338,7 @@ private struct ManagerScreen: View {
     private func learningOpportunityIcon(_ kind: CascadeAppModel.LearningOpportunity.Kind) -> String {
         switch kind {
         case .repeatedWorkflow: "repeat"
+        case .contextWaste: "text.viewfinder"
         case .overlappingDrafts: "square.stack.3d.up"
         case .recurringFailure: "wrench.and.screwdriver"
         case .parameterizedRecipe: "tag"
@@ -2074,10 +2349,10 @@ private struct ManagerScreen: View {
 	    /// Cascade caught, each judged and named by the curator. Approve to land a ready
 	    /// agent in the employee's Cascades; dismiss to never see it again.
 	    private var reviewQueueSection: some View {
-	        let hasProactiveOffer = model.proactiveOffer != nil
-	        let pendingCount = model.pendingCuratedAgents.count + (hasProactiveOffer ? 1 : 0)
-	        return VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
-            SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(pendingCount) pending")
+		        let hasProactiveOffer = model.proactiveOffer != nil
+		        let pendingCount = model.pendingCuratedAgents.count + model.pendingCuratedContextWaste.count + (hasProactiveOffer ? 1 : 0)
+		        return VStack(alignment: .leading, spacing: CascadeMetrics.s3) {
+	            SectionLabel(title: "REVIEW — WORKFLOWS WORTH AUTOMATING", trailing: "\(pendingCount) pending")
             if let note = model.managerReviewNote {
                 HStack(spacing: CascadeMetrics.s2) {
                     Image(systemName: "checkmark.seal.fill")
@@ -2098,19 +2373,27 @@ private struct ManagerScreen: View {
 	                    onDismiss: { model.dismissProactiveNextActionOffer() }
 	                )
 	            }
-            if model.pendingCuratedAgents.isEmpty && !hasProactiveOffer {
-                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats a task — same clicks, same shortcuts, three or more times — Cascade judges whether it's worth automating and surfaces the worthwhile ones here.") }
-            } else {
-                ForEach(model.pendingCuratedAgents) { curated in
-                    WasteCard(
+	            if model.pendingCuratedAgents.isEmpty && model.pendingCuratedContextWaste.isEmpty && !hasProactiveOffer {
+	                CascadePanel { EmptyState(title: "Nothing to review right now", detail: "When the employee repeats real work in the recorded context, Cascade judges whether it's worth automating and surfaces the worthwhile processes here.") }
+	            } else {
+	                ForEach(model.pendingCuratedAgents) { curated in
+	                    WasteCard(
                         curated: curated,
                         evidenceImagePath: evidenceImagePath(for: curated.source),
                         onApprove: { model.approveCurated(curated) },
-                        onDecline: { model.declineCurated(curated) }
-                    )
-                }
-            }
-        }
+	                        onDecline: { model.declineCurated(curated) }
+	                    )
+	                }
+                    ForEach(model.pendingCuratedContextWaste) { curated in
+                        ContextWasteCard(
+                            curated: curated,
+                            evidenceImagePath: evidenceImagePath(for: curated.source),
+                            onApprove: { model.approveContextWaste(curated) },
+                            onDecline: { model.declineContextWaste(curated) }
+                        )
+                    }
+	            }
+	        }
         .animation(.easeInOut(duration: 0.25), value: model.managerReviewNote)
     }
 
@@ -2121,6 +2404,10 @@ private struct ManagerScreen: View {
             .filter { $0.imagePath != nil && (waste.apps.contains($0.appName) || waste.apps.isEmpty) }
             .min { abs($0.capturedAt.timeIntervalSince(waste.lastSeenAt)) < abs($1.capturedAt.timeIntervalSince(waste.lastSeenAt)) }?
             .imagePath
+    }
+
+    private func evidenceImagePath(for waste: ContextWasteCandidate) -> String? {
+        ContextWasteEvidenceImagePicker.safeImagePath(for: waste, contexts: model.contexts)
     }
 
     /// Sample share per app — a quiet bar per row, computed from the real record.

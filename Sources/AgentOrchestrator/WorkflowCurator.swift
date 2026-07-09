@@ -36,6 +36,39 @@ public struct CuratedAgent: Identifiable, Sendable, Equatable {
     public var apps: [String] { source.apps }
 }
 
+public struct CuratedContextWaste: Identifiable, Sendable, Equatable {
+    public let id: UUID
+    public let source: ContextWasteCandidate
+    public let name: String
+    public let why: String
+    public let goal: String
+    public let value: Double
+    public let feasibility: ContextWasteAgentFeasibility
+
+    public init(
+        id: UUID = UUID(),
+        source: ContextWasteCandidate,
+        name: String,
+        why: String,
+        goal: String,
+        value: Double,
+        feasibility: ContextWasteAgentFeasibility
+    ) {
+        self.id = id
+        self.source = source
+        self.name = name
+        self.why = why
+        self.goal = goal
+        self.value = value
+        self.feasibility = feasibility
+    }
+
+    public var signature: String { source.signature }
+    public var evidence: [Int64] { source.evidenceContextIDs }
+    public var apps: [String] { source.apps }
+    public var linkedActionSignature: String? { source.linkedActionSignature }
+}
+
 /// The intelligence layer over `WasteDetector`. The detector is mechanical recall —
 /// it finds *repeated* action sequences. The curator decides which of those are
 /// genuinely worth automating for this user, names them like a person would, writes
@@ -49,6 +82,7 @@ public struct WorkflowCurator: Sendable {
     private let model: String
     static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
     static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v1"
+    static let curateContextPromptVersion = "workflow-curator.context-waste.prompt.v1"
     static let schemaVersion = "workflow-curator.schema.v1"
 
     public init(
@@ -132,6 +166,35 @@ public struct WorkflowCurator: Sendable {
         }
         Self.logger.error("single-recipe curation fell back to detector naming — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
         return Self.fallback(waste)
+    }
+
+    /// Curates OCR/context-derived waste. These candidates explain repeated real work,
+    /// but only candidates linked to an action recipe are immediately deployable. The
+    /// rest should route the user to teach/record a demo.
+    public func curateContextWaste(_ candidates: [ContextWasteCandidate]) async -> [CuratedContextWaste] {
+        guard !candidates.isEmpty else { return [] }
+        let user = Self.userPromptContextWaste(candidates)
+        let options = AnthropicCompletionOptions.deterministic(
+            promptVersion: Self.curateContextPromptVersion,
+            schemaVersion: Self.schemaVersion,
+            callsite: "WorkflowCurator.curateContextWaste"
+        )
+        let raw = try? await complete(
+            system: Self.contextWasteSystemPrompt,
+            user: user,
+            maxTokens: 900,
+            options: options,
+            validating: {
+                guard Self.parseContextWaste($0, candidates: candidates) != nil else {
+                    throw CachedMessageCompleterError.invalidResponse
+                }
+            }
+        )
+        if let raw, let picked = Self.parseContextWaste(raw, candidates: candidates) {
+            return picked
+        }
+        Self.logger.error("context-waste curator fell back to deterministic naming — \(raw == nil ? "request failed" : "reply did not parse", privacy: .public)")
+        return candidates.map(Self.fallbackContextWaste)
     }
 
     private static let logger = Logger(subsystem: "com.humain.cascade", category: "curator")
@@ -263,6 +326,30 @@ public struct WorkflowCurator: Sendable {
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
     """
 
+    static let contextWasteSystemPrompt = """
+    You curate repeated real-work processes detected from OCR, window titles, apps, \
+    URLs, and local work-graph entities. These are NOT action recipes. They are \
+    evidence-backed process insights. Your job is to keep only candidates that are \
+    genuinely worth pointing out or turning into an agent.
+
+    For each KEPT candidate return:
+    - "index": the candidate's number from the list.
+    - "name": what repeated process this is, in the user's words.
+    - "why": one short line explaining the wasted time, grounded only in the evidence.
+    - "goal": one imperative instruction for the agent the user should teach or approve.
+    - "value": 0.0-1.0, how worth acting on it is.
+    - "feasibility": "linkedRecipe" if the candidate says it has a linked recipe, \
+      "goalOnlyCandidate" when it can run from the curated goal and recorded context \
+      without a replay recipe, or "needsDemo" when the user should teach one example first.
+
+    The candidate list contains only redacted process terms, role counts, value shapes, \
+    and hashes. Never invent business facts, values, people, URLs, file paths, IDs, or \
+    private details. It is correct to keep none.
+
+    Reply with ONLY this JSON, no prose:
+    {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8,"feasibility":"goalOnlyCandidate"}]}
+    """
+
     /// The candidates as a compact numbered list — the facts the curator judges on.
     /// When `onScreen[signature]` holds the text visible while a workflow happened, it
     /// is added as an indented sub-line so the curator can name the real subject matter.
@@ -289,6 +376,52 @@ public struct WorkflowCurator: Sendable {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    static func userPromptContextWaste(_ candidates: [ContextWasteCandidate]) -> String {
+        var lines = ["Context waste candidates:"]
+        for (index, waste) in candidates.enumerated() {
+            let apps = waste.apps.joined(separator: " -> ")
+            let minutes = max(1, waste.estimatedTotalSeconds / 60)
+            let feasibility = waste.linkedActionSignature == nil ? "goal-only agent" : "has linked recipe"
+            var line = "[\(index)] \"\(waste.title)\" · apps: \(apps.isEmpty ? "-" : apps)"
+            line += " · seen \(waste.occurrences)x · ~\(minutes)m total · \(feasibility)"
+            let processTerms = waste.processTerms.prefix(8).map(AuditIdentity.safeToken).joined(separator: ",")
+            if !processTerms.isEmpty { line += " · process terms: \(processTerms)" }
+            let parameters = contextParameterPromptSummaries(for: waste.parameters)
+            if !parameters.isEmpty { line += " · " + parameters.joined(separator: "; ") }
+            let entityRoles = contextEntityRoleCounts(for: waste.entities)
+            if !entityRoles.isEmpty { line += " · entity roles: \(entityRoles)" }
+            line += " · evidenceCount=\(waste.evidenceContextIDs.count)"
+            line += " · evidenceHash=\(AuditIdentity.hash(waste.evidenceContextIDs.map(String.init).joined(separator: "|")))"
+            line += " · sessionHash=\(AuditIdentity.hash(waste.sessionIDs.map(String.init).joined(separator: "|")))"
+            line += " · quality=\(String(format: "%.2f", waste.quality.score))"
+            lines.append(line)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func contextParameterPromptSummaries(for parameters: [ContextWasteParameter]) -> [String] {
+        parameters.prefix(6).map { parameter in
+            [
+                "parameter role=\(AuditIdentity.safeToken(parameter.role))",
+                "source=\(AuditIdentity.safeToken(parameter.sourceKind))",
+                "count=\(parameter.count)",
+                "shapeCount=\(parameter.valueShapes.count)",
+                "shapeHash=\(AuditIdentity.hash(parameter.valueShapes.sorted().joined(separator: "|")))",
+                "valueHashCount=\(parameter.valueHashes.count)",
+                "valueHashesHash=\(AuditIdentity.hash(parameter.valueHashes.sorted().joined(separator: "|")))"
+            ].joined(separator: " ")
+        }
+    }
+
+    private static func contextEntityRoleCounts(for entities: [ContextWasteEntity]) -> String {
+        let counts = Dictionary(grouping: entities.filter { $0.kind != .app && $0.kind != .window }, by: \.kind.rawValue)
+            .mapValues(\.count)
+        return counts.sorted { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value > rhs.value }
+            return lhs.key < rhs.key
+        }.prefix(6).map { "\($0.key)=\($0.value)" }.joined(separator: ",")
     }
 
     private static func workflowPromptSummaries(for steps: [RecipeStep]) -> [String] {
@@ -397,6 +530,40 @@ public struct WorkflowCurator: Sendable {
         return kept.sorted { $0.value > $1.value }
     }
 
+    static func parseContextWaste(_ raw: String, candidates: [ContextWasteCandidate]) -> [CuratedContextWaste]? {
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end,
+              let data = String(raw[start...end]).data(using: .utf8),
+              let dto = try? JSONDecoder().decode(ContextWasteCurationDTO.self, from: data) else { return nil }
+        var seen = Set<Int>()
+        var kept: [CuratedContextWaste] = []
+        for item in dto.agents {
+            guard let index = item.index, candidates.indices.contains(index), !seen.contains(index) else { continue }
+            let name = (item.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let goal = (item.goal ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !goal.isEmpty else { continue }
+            seen.insert(index)
+            let source = candidates[index]
+            let safeName = scrubContextCurationText(name, source: source, limit: 80)
+            let safeGoal = scrubContextCurationText(goal, source: source, limit: 260)
+            let safeWhy = scrubContextCurationText((item.why ?? "").trimmingCharacters(in: .whitespacesAndNewlines), source: source, limit: 160)
+            guard !safeName.isEmpty, !safeGoal.isEmpty else { continue }
+            let fallbackFeasibility = source.feasibility
+            let requestedFeasibility = item.feasibility.flatMap(ContextWasteAgentFeasibility.init(rawValue:)) ?? fallbackFeasibility
+            let feasibility: ContextWasteAgentFeasibility = source.linkedActionSignature == nil
+                ? (requestedFeasibility == .needsDemo ? .needsDemo : .goalOnlyCandidate)
+                : .linkedRecipe
+            kept.append(CuratedContextWaste(
+                source: source,
+                name: safeName,
+                why: safeWhy,
+                goal: safeGoal,
+                value: min(1, max(0, item.value ?? source.quality.score)),
+                feasibility: feasibility
+            ))
+        }
+        return kept.sorted { $0.value > $1.value }
+    }
+
     /// Mechanical proposal used when the model is unavailable — exactly today's
     /// behaviour (show every detected workflow), just in the curated shape.
     static func fallback(_ waste: DetectedWaste) -> CuratedAgent {
@@ -409,6 +576,70 @@ public struct WorkflowCurator: Sendable {
         )
     }
 
+    static func fallbackContextWaste(_ waste: ContextWasteCandidate) -> CuratedContextWaste {
+        let minutes = max(1, waste.estimatedTotalSeconds / 60)
+        return CuratedContextWaste(
+            source: waste,
+            name: waste.title,
+            why: "The record shows \(waste.occurrences) similar sessions, about \(minutes)m total.",
+            goal: waste.suggestedGoal,
+            value: waste.quality.score,
+            feasibility: waste.feasibility
+        )
+    }
+
+    private static func scrubContextCurationText(_ text: String, source: ContextWasteCandidate, limit: Int) -> String {
+        let allowed = contextOutputAllowedTokens(for: source)
+        let pattern = #"\b[A-Z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]+)+\b|\b(?:[A-Z][A-Za-z0-9]{2,}\s+){1,3}[A-Z][A-Za-z0-9]{2,}\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
+        }
+        var scrubbed = text
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        for match in matches.reversed() {
+            let value = nsText.substring(with: match.range)
+            let tokens = contextOutputTokens(value)
+            guard !tokens.isEmpty,
+                  tokens.contains(where: { !allowed.contains($0) })
+            else { continue }
+            if let range = Range(match.range, in: scrubbed) {
+                scrubbed.replaceSubrange(range, with: "[value]")
+            }
+        }
+        return String(scrubbed.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
+    }
+
+    private static func contextOutputAllowedTokens(for source: ContextWasteCandidate) -> Set<String> {
+        var allowed: Set<String> = [
+            "agent", "and", "appropriate", "cascade", "current", "each", "handle",
+            "latest", "once", "relevant", "standard", "teach", "the", "to", "using", "work"
+        ]
+        allowed.formUnion(source.apps.flatMap(contextOutputTokens))
+        allowed.formUnion(source.processTerms.flatMap(contextOutputTokens))
+        allowed.formUnion(source.parameters.flatMap { contextOutputTokens($0.role.replacingOccurrences(of: "_", with: " ")) })
+        allowed.formUnion([
+            "account", "amount", "approve", "audit", "batch", "business", "case", "classify",
+            "copy", "crm", "customer", "dashboard", "data", "document", "draft", "email",
+            "export", "file", "fill", "form", "invoice", "lead", "mark", "order", "paid",
+            "paste", "pipeline", "process", "project", "queue", "receipt", "reconcile",
+            "record", "refund", "reply", "report", "request", "review", "row", "sheet",
+            "spreadsheet", "status", "submit", "support", "table", "task", "ticket",
+            "total", "triage", "update", "upload", "vendor"
+        ])
+        return allowed
+    }
+
+    private static func contextOutputTokens(_ value: String) -> [String] {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+            .reduce(into: "") { $0.append($1) }
+            .split(separator: " ")
+            .map { AuditIdentity.safeToken(String($0).lowercased()) }
+            .filter { !$0.isEmpty }
+    }
+
     private struct CurationDTO: Decodable {
         let agents: [Item]
         struct Item: Decodable {
@@ -417,6 +648,18 @@ public struct WorkflowCurator: Sendable {
             let why: String?
             let goal: String?
             let value: Double?
+        }
+    }
+
+    private struct ContextWasteCurationDTO: Decodable {
+        let agents: [Item]
+        struct Item: Decodable {
+            let index: Int?
+            let name: String?
+            let why: String?
+            let goal: String?
+            let value: Double?
+            let feasibility: String?
         }
     }
 }

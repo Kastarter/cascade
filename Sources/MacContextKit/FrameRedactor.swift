@@ -110,6 +110,21 @@ public enum FrameRedactor {
             ))
         }
 
+        // Clean frame — nothing to cover, so keep the original encoding (HEIC
+        // from the recorder) instead of decoding + redrawing + re-encoding to
+        // JPEG. Only frames that actually redact pay the JPEG re-encode.
+        if rects.isEmpty {
+            return Result(
+                imageData: imageData,
+                boxes: redactedBoxes,
+                redactionRects: [],
+                metadata: Metadata(
+                    redactionCount: 0,
+                    entityTypes: entityTypes.sorted(),
+                    redactedFrameHash: sha256Hex(imageData)
+                )
+            )
+        }
         guard let redactedImage = draw(image: image, covering: rects),
               let encoded = encodeJPEG(redactedImage, compression: compression) else { return nil }
         let metadata = Metadata(

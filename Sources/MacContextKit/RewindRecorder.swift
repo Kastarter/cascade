@@ -6,6 +6,7 @@ import CoreVideo
 import Foundation
 import OSLog
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 import Vision
 
 // Continuous, always-on screen recorder. Replaces the old 4s Timer with an
@@ -45,7 +46,8 @@ enum FrameOCRMode: String, Sendable, Equatable, Codable {
 }
 
 struct ChangedFrame: Sendable {
-    let jpeg: Data
+    /// HEIC-encoded (JPEG fallback) — see `FrameStore.encodeFrame`.
+    let imageData: Data
     let signature: FrameSignature
     let width: Int
     let height: Int
@@ -216,17 +218,44 @@ public enum FrameStore {
         return dir
     }
 
-    /// Persists pre-encoded JPEG bytes. Returns the file path, or nil on failure.
-    public static func save(jpeg: Data) -> String? {
+    /// Encodes a captured frame for persistence: HEIC (hardware-accelerated on
+    /// Apple silicon, ~2-3x smaller than JPEG for screen content at the same
+    /// legibility), with a JPEG fallback so recording never stops if the HEVC
+    /// encoder is unavailable. OCR and NSImage read either through CGImageSource.
+    static func encodeFrame(_ image: CGImage, quality: CGFloat = 0.55) -> Data? {
+        let data = NSMutableData()
+        if let destination = CGImageDestinationCreateWithData(data, UTType.heic.identifier as CFString, 1, nil) {
+            CGImageDestinationAddImage(destination, image, [
+                kCGImageDestinationLossyCompressionQuality as String: quality
+            ] as CFDictionary)
+            if CGImageDestinationFinalize(destination), data.length > 0 {
+                return data as Data
+            }
+        }
+        return NSBitmapImageRep(cgImage: image)
+            .representation(using: .jpeg, properties: [.compressionFactor: 0.6])
+    }
+
+    /// Persists an encoded frame, picking the extension from the container's
+    /// magic bytes (JPEG starts FF D8; anything else here is HEIC) so mixed
+    /// archives stay honest. Redacted frames come back as JPEG even when the
+    /// capture was HEIC, so both flow through this path.
+    public static func save(frame data: Data) -> String? {
+        let ext = data.starts(with: [0xFF, 0xD8]) ? "jpg" : "heic"
         guard let dir = directory() else { return nil }
-        let url = dir.appendingPathComponent("\(UUID().uuidString).jpg")
+        let url = dir.appendingPathComponent("\(UUID().uuidString).\(ext)")
         do {
-            try jpeg.write(to: url, options: .atomic)
+            try data.write(to: url, options: .atomic)
             return url.path
         } catch {
             logger.error("Frame write failed: \(error.localizedDescription, privacy: .public)")
             return nil
         }
+    }
+
+    /// Persists pre-encoded JPEG bytes. Returns the file path, or nil on failure.
+    public static func save(jpeg: Data) -> String? {
+        save(frame: jpeg)
     }
 
     /// Re-encodes arbitrary image data (e.g. a PNG from the single-shot path) to
@@ -306,8 +335,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
                 changedCellsMask: changedCellsMask
             )
 
-            guard let jpeg = NSBitmapImageRep(cgImage: cgImage)
-                .representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else {
+            guard let imageData = FrameStore.encodeFrame(cgImage) else {
                 return nil
             }
             let ocrPlan = Self.ocrPlan(
@@ -318,7 +346,7 @@ final class RewindStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unc
                 frameOrdinal: frameOrdinal
             )
             let frame = ChangedFrame(
-                jpeg: jpeg,
+                imageData: imageData,
                 signature: signature,
                 width: cgImage.width,
                 height: cgImage.height,
@@ -456,7 +484,19 @@ actor RecorderMaintenanceScheduler {
         pendingSemanticIndex[contextID] = trimmed
     }
 
+    /// Frames older than this thin from ~1/s to one per `thinnedFrameSpacing` —
+    /// the recent window stays video-smooth, aged days cost ~8x less disk, and
+    /// every row's OCR text stays searchable forever.
+    private static let thinFramesAfter: TimeInterval = 48 * 3600
+    private static let thinnedFrameSpacing: TimeInterval = 8
+
     func runOnce(reason: CascadeStoreMaintenanceReason = .idle) async {
+        if let freed = try? await store.thinAgedFrames(
+            olderThan: Date().addingTimeInterval(-Self.thinFramesAfter),
+            keepEvery: Self.thinnedFrameSpacing
+        ) {
+            for path in freed { FrameStore.delete(path) }
+        }
         if let removed = try? await store.prune() {
             for path in removed { FrameStore.delete(path) }
         }
@@ -690,7 +730,7 @@ actor RewindEngine {
     func updateLatest(_ frame: ChangedFrame) {
         if processing,
            let pending,
-           pending.frame.jpeg.count + frame.jpeg.count > budget.pendingFrameByteBudget {
+           pending.frame.imageData.count + frame.imageData.count > budget.pendingFrameByteBudget {
             latest = nil
             return
         }
@@ -702,7 +742,7 @@ actor RewindEngine {
     func captureLatest(reason: CaptureReason) async {
         guard budget.admitsCapture else { return }
         guard let frame = latest else { return }
-        guard frame.jpeg.count <= budget.pendingFrameByteBudget else {
+        guard frame.imageData.count <= budget.pendingFrameByteBudget else {
             latest = nil
             return
         }
@@ -767,7 +807,7 @@ actor RewindEngine {
         let recognitionLevel: VNRequestTextRecognitionLevel = budget.ocrPolicy == .fastOnly ? .fast : (axRich ? .fast : .accurate)
         let maxDecodeDimension = recognitionLevel == .fast && axRich ? 1280 : nil
         let ocrBoxes = ScreenTextRecognizer.recognizeBoxes(
-            inImageData: frame.jpeg,
+            inImageData: frame.imageData,
             level: recognitionLevel,
             regionOfInterest: ocrRegion,
             maxDecodeDimension: maxDecodeDimension
@@ -807,7 +847,7 @@ actor RewindEngine {
         ) != nil {
             return
         }
-        guard let redacted = FrameRedactor.redact(imageData: frame.jpeg, boxes: ocrBoxes, policy: policy) else { return }
+        guard let redacted = FrameRedactor.redact(imageData: frame.imageData, boxes: ocrBoxes, policy: policy) else { return }
         redactedOCRBoxes = redacted.boxes
         ocrText = ScreenContentStructurer.structure(redactedOCRBoxes, topLeftOrigin: false).readingOrderText
         let redactedAXText = FrameRedactor.redactedText(axText, policy: policy)
@@ -845,7 +885,7 @@ actor RewindEngine {
         if isDuplicate(bucket: bucket, signature: signature) {
             return
         }
-        guard let imagePath = FrameStore.save(jpeg: redacted.imageData) else { return }
+        guard let imagePath = FrameStore.save(frame: redacted.imageData) else { return }
 
         let context = RecordedContext(
             source: .screen,

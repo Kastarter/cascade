@@ -195,8 +195,11 @@ public struct RecorderCadenceController: Sendable, Equatable {
         }
 
         if typingQuiet || scrollQuiet {
+            // Mid-scroll frames ARE captured (with the cheap fast-OCR pass) —
+            // content the user scrolls past is exactly the evidence rewind exists
+            // to keep. Thermal/low-power branches above still shed scroll bursts.
             return RecorderCadenceBudget(
-                admitsCapture: !scrollQuiet,
+                admitsCapture: true,
                 heartbeatInterval: CaptureScheduler.idleHeartbeatInterval,
                 ocrPolicy: .fastOnly,
                 allowsNativeResolutionOCR: false,
@@ -227,7 +230,10 @@ public struct CaptureScheduler: Sendable, Equatable {
     public static let keyComboDelay: TimeInterval = 0.25
     public static let appActivationDelay: TimeInterval = 1.5
     public static let idleHeartbeatInterval: TimeInterval = 10
-    public static let streamHeartbeatInterval: TimeInterval = 8
+    /// The SCStream runs at ~1fps and dedup already drops unchanged frames, so a
+    /// 1s persistence gap means every *changed* frame becomes a moment — smooth
+    /// scroll-through playback instead of one screenshot per 8 seconds.
+    public static let streamHeartbeatInterval: TimeInterval = 1.0
 
     private var lastCaptureByReason: [CaptureReason: Date] = [:]
 

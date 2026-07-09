@@ -5,8 +5,23 @@ import Foundation
 /// a cheaper one. (See platform.claude.com model catalog.)
 public enum AnthropicModel {
     public static let opus = "claude-opus-4-8"
-    public static let sonnet = "claude-sonnet-4-6"
+    /// Sonnet 5: near-Opus coding/agentic quality, supports the same
+    /// computer-use beta (computer-use-2025-11-24). Note: rejects non-default
+    /// sampling params (temperature) with a 400 — the request builder drops
+    /// them for this family; new tokenizer counts ~30% more tokens than 4.6.
+    public static let sonnet = "claude-sonnet-5"
     public static let haiku = "claude-haiku-4-5"
+
+    /// Sonnet 5 / Opus 4.7+ / the Claude 5 family reject non-default sampling
+    /// parameters with a 400 — never send `temperature` to them; prompting is
+    /// the steering lever there. Older models keep their existing behavior.
+    public static func rejectsSamplingParameters(_ model: String) -> Bool {
+        model.hasPrefix("claude-sonnet-5")
+            || model.hasPrefix("claude-opus-4-7")
+            || model.hasPrefix("claude-opus-4-8")
+            || model.hasPrefix("claude-fable")
+            || model.hasPrefix("claude-mythos")
+    }
 }
 
 public enum AnthropicError: Error, LocalizedError {
@@ -330,7 +345,9 @@ public struct AnthropicMessagesClient: Sendable {
             "messages": messages,
         ]
         if let system { body["system"] = system }
-        if let temperature { body["temperature"] = temperature }
+        if let temperature, !AnthropicModel.rejectsSamplingParameters(model) {
+            body["temperature"] = temperature
+        }
         if let tools { body["tools"] = cappingStrictTools(tools) }
         if let toolChoice { body["tool_choice"] = toolChoice }
         if let thinking { body["thinking"] = thinking }

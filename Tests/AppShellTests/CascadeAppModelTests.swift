@@ -15,19 +15,51 @@ private struct FakeCompleter: MessageCompleting {
     }
 }
 
-private let base = Date(timeIntervalSince1970: 1_700_000_000)
+private final class DetectionSpy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func record() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private let base = Date(timeIntervalSinceNow: -24 * 60 * 60)
 
 /// Builds the model in HEADLESS mode — injected temp store + orchestrator, no taps,
 /// no capture, no audio, no scheduler — so the orchestration wiring can be exercised.
 @MainActor
-private func makeModel(curatorReply: String = #"{"agents":[]}"#) throws -> (model: CascadeAppModel, store: CascadeStore) {
+private func makeModel(
+    curatorReply: String = #"{"agents":[]}"#,
+    contextWasteDetectionEnabled: Bool? = nil,
+    legacyActionWasteMode: CascadeAppModel.LegacyActionWasteMode? = nil,
+    detectedWasteReportObserver: (@Sendable () -> Void)? = nil
+) throws -> (model: CascadeAppModel, store: CascadeStore) {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("CascadeAppShellIT-\(UUID().uuidString).sqlite").path
     let store = try CascadeStore(path: path)
-    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: curatorReply)))
+    let orchestrator = CascadeOrchestrator(
+        store: store,
+        curator: WorkflowCurator(client: FakeCompleter(canned: curatorReply)),
+        detectedWasteReportObserver: detectedWasteReportObserver
+    )
     // An ephemeral defaults suite per model — tests never read stale declines from,
     // or pollute, the real .standard defaults (and so don't contaminate each other).
     let defaults = UserDefaults(suiteName: "CascadeTest-\(UUID().uuidString)")!
+    if let contextWasteDetectionEnabled {
+        defaults.set(contextWasteDetectionEnabled, forKey: CascadeAppModel.experimentalContextWasteDetectionKey)
+    }
+    if let legacyActionWasteMode {
+        defaults.set(legacyActionWasteMode.rawValue, forKey: CascadeAppModel.legacyActionWasteModeKey)
+    }
     let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
     return (model, store)
 }
@@ -50,6 +82,29 @@ private func webWorkflowEvents() -> [InputEvent] {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 32), kind: .key, key: "Return", modifiers: ["command"], appName: "Safari", windowTitle: "Inbox - Gmail")); i += 1
     }
     return events
+}
+
+private func contextSession(
+    idStart: Int64,
+    start: TimeInterval,
+    title: String,
+    ocr: String,
+    metadataJSON: String
+) -> [RecordedContext] {
+    stride(from: 0.0, through: 1_200.0, by: 300.0).enumerated().map { offset, elapsed in
+        RecordedContext(
+            id: idStart + Int64(offset),
+            capturedAt: base.addingTimeInterval(start + elapsed),
+            source: .screen,
+            appName: "QuickBooks",
+            bundleIdentifier: "com.intuit.quickbooks",
+            windowTitle: title,
+            ocrText: ocr,
+            metadataJSON: metadataJSON,
+            safeToShow: true,
+            safeToSummarize: true
+        )
+    }
 }
 
 /// Polls a MainActor condition until true or it times out (~5s), yielding so the
@@ -104,6 +159,10 @@ private let curatorKeepsOne = """
 {"agents":[{"index":0,"name":"Reply to refund emails with the policy link","why":"You do it by hand several times a day.","goal":"In Gmail, reply to each new refund request with the standard policy link.","value":0.9}]}
 """
 
+private let contextCuratorKeepsOne = """
+{"agents":[{"index":0,"name":"Reconcile vendor invoices","why":"The record shows repeated invoice queue work.","goal":"Reconcile the vendor invoice queue in QuickBooks.","value":0.9,"feasibility":"goalOnlyCandidate"}]}
+"""
+
 @MainActor @Test
 func modelBuildsHeadlessWithoutStartingHardware() throws {
     let (model, _) = try makeModel()
@@ -116,7 +175,7 @@ func modelBuildsHeadlessWithoutStartingHardware() throws {
 
 @MainActor @Test
 func refreshAllCuratesDetectedWorkflows() async throws {
-    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, contextWasteDetectionEnabled: false)
     try await store.insertInputEvents(webWorkflowEvents())
 
     await model.refreshAll()
@@ -138,6 +197,298 @@ func refreshAllCuratesDetectedWorkflows() async throws {
 	}
 
 @MainActor @Test
+func refreshAllCuratesContextWasteByDefault() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeAppShellContextWaste-\(UUID().uuidString).sqlite").path
+    let store = try CascadeStore(path: path)
+    let contexts =
+        contextSession(
+            idStart: 1,
+            start: 0,
+            title: "Acme invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Acme invoices"}"#
+        )
+        + contextSession(
+            idStart: 100,
+            start: 3_600,
+            title: "Beta invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Beta invoices"}"#
+        )
+        + contextSession(
+            idStart: 200,
+            start: 7_200,
+            title: "Contoso invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Contoso invoices"}"#
+        )
+    _ = try await store.insertContexts(contexts)
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: contextCuratorKeepsOne)))
+    let defaults = UserDefaults(suiteName: "CascadeContextWasteTest-\(UUID().uuidString)")!
+    let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
+
+    await model.refreshAll()
+
+    let waste = try #require(model.contextWaste.first)
+    #expect(model.contextWaste.count == 1)
+    #expect(waste.occurrences == 3)
+    #expect(waste.feasibility == .goalOnlyCandidate)
+    #expect(waste.title.lowercased().contains("invoice"))
+    #expect(waste.signature.contains("context-process:v3"))
+    #expect(model.curatedWaste.isEmpty)
+    #expect(model.curatedContextWaste.count == 1)
+    #expect(model.pendingCuratedContextWaste.first?.name == "Reconcile vendor invoices")
+}
+
+@MainActor @Test
+func defaultRefreshSurfacesContextWasteNotLegacyActionCards() async throws {
+    let spy = DetectionSpy()
+    let (model, store) = try makeModel(curatorReply: contextCuratorKeepsOne, detectedWasteReportObserver: spy.record)
+    let contexts =
+        contextSession(
+            idStart: 1,
+            start: 0,
+            title: "Acme invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Acme invoices"}"#
+        )
+        + contextSession(
+            idStart: 100,
+            start: 3_600,
+            title: "Beta invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Beta invoices"}"#
+        )
+        + contextSession(
+            idStart: 200,
+            start: 7_200,
+            title: "Contoso invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Contoso invoices"}"#
+        )
+    try await store.insertInputEvents(webWorkflowEvents())
+    _ = try await store.insertContexts(contexts)
+
+    await model.refreshAll()
+
+    #expect(spy.count == 0)
+    #expect(model.contextWaste.count == 1)
+    #expect(model.detectedWaste.isEmpty)
+    #expect(model.curatedWaste.isEmpty)
+    #expect(model.pendingCuratedAgents.isEmpty)
+    #expect(model.pendingCuratedContextWaste.first?.name == "Reconcile vendor invoices")
+}
+
+@MainActor @Test
+func defaultRefreshDoesNotFallbackToClickOnlyRepeatsWhenContextMiningFindsNothing() async throws {
+    let spy = DetectionSpy()
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, detectedWasteReportObserver: spy.record)
+    try await store.insertInputEvents(webWorkflowEvents())
+
+    await model.refreshAll()
+
+    #expect(spy.count == 0)
+    #expect(model.contextWaste.isEmpty)
+    #expect(model.detectedWaste.isEmpty)
+    #expect(model.curatedWaste.isEmpty)
+    #expect(model.pendingCuratedAgents.isEmpty)
+    #expect(!model.learningOpportunities.contains { $0.kind == .repeatedWorkflow })
+}
+
+@MainActor @Test
+func fallbackReviewQueueSurfacesClickOnlyRepeatsOnlyWhenExplicitlyEnabled() async throws {
+    let spy = DetectionSpy()
+    let (model, store) = try makeModel(
+        curatorReply: curatorKeepsOne,
+        legacyActionWasteMode: .fallbackReviewQueue,
+        detectedWasteReportObserver: spy.record
+    )
+    try await store.insertInputEvents(webWorkflowEvents())
+
+    await model.refreshAll()
+
+    #expect(spy.count == 1)
+    #expect(model.contextWaste.isEmpty)
+    #expect(model.detectedWaste.count == 1)
+    #expect(model.curatedWaste.count == 1)
+    #expect(model.pendingCuratedAgents.first?.name == "Reply to refund emails with the policy link")
+}
+
+@MainActor @Test
+func legacyActionModesAreTheOnlyDefaultContextPathThatRunActionMining() async throws {
+    for mode in [
+        CascadeAppModel.LegacyActionWasteMode.diagnosticsOnly,
+        .linkRecipes,
+        .fallbackReviewQueue,
+    ] {
+        let spy = DetectionSpy()
+        let (model, store) = try makeModel(
+            curatorReply: contextCuratorKeepsOne,
+            legacyActionWasteMode: mode,
+            detectedWasteReportObserver: spy.record
+        )
+        try await store.insertInputEvents(webWorkflowEvents())
+
+        await model.refreshAll()
+
+        #expect(spy.count == 1)
+        #expect(model.detectedWaste.count == 1)
+    }
+}
+
+@MainActor @Test
+func contextWasteThumbnailOnlyUsesSafeVettedEvidenceFrames() {
+    let waste = ContextWasteCandidate(
+        title: "Repeated invoice work",
+        apps: ["QuickBooks"],
+        occurrences: 3,
+        estimatedSecondsPerRun: 60,
+        estimatedTotalSeconds: 180,
+        evidenceContextIDs: [1, 3],
+        sessionIDs: [1, 2, 3],
+        signature: "context-sig",
+        startedAt: base,
+        endedAt: base.addingTimeInterval(180),
+        lastSeenAt: base.addingTimeInterval(180),
+        snippets: [],
+        entities: [],
+        quality: ContextWasteQuality(
+            supportScore: 0.8,
+            durationScore: 0.5,
+            semanticStabilityScore: 0.9,
+            actionabilityScore: 0.8,
+            privacyPenalty: 0,
+            noisePenalty: 0
+        ),
+        suggestedGoal: "Teach Cascade invoice work."
+    )
+    let contexts = [
+        RecordedContext(id: 1, capturedAt: base.addingTimeInterval(10), source: .screen, appName: "QuickBooks", ocrText: "invoice queue", imagePath: "/frames/safe.png"),
+        RecordedContext(id: 2, capturedAt: base.addingTimeInterval(179), source: .screen, appName: "QuickBooks", ocrText: "nearby same app", imagePath: "/frames/same-app.png"),
+        RecordedContext(id: 3, capturedAt: base.addingTimeInterval(178), source: .screen, appName: "QuickBooks", ocrText: "unsafe evidence", imagePath: "/frames/unsafe.png", safeToShow: false),
+    ]
+
+    #expect(ContextWasteEvidenceImagePicker.safeImagePath(for: waste, contexts: contexts) == "/frames/safe.png")
+
+    let unsafeEvidenceOnly = ContextWasteCandidate(
+        title: waste.title,
+        apps: waste.apps,
+        occurrences: waste.occurrences,
+        estimatedSecondsPerRun: waste.estimatedSecondsPerRun,
+        estimatedTotalSeconds: waste.estimatedTotalSeconds,
+        evidenceContextIDs: [3],
+        sessionIDs: waste.sessionIDs,
+        signature: waste.signature,
+        startedAt: waste.startedAt,
+        endedAt: waste.endedAt,
+        lastSeenAt: waste.lastSeenAt,
+        snippets: waste.snippets,
+        entities: waste.entities,
+        processTerms: waste.processTerms,
+        parameters: waste.parameters,
+        quality: waste.quality,
+        suggestedGoal: waste.suggestedGoal
+    )
+    #expect(ContextWasteEvidenceImagePicker.safeImagePath(for: unsafeEvidenceOnly, contexts: contexts) == nil)
+}
+
+@MainActor @Test
+func approvingContextWasteCreatesGoalDrivenAgentWithoutReplayRecipe() async throws {
+    let (model, store) = try makeModel(curatorReply: contextCuratorKeepsOne)
+    let contexts =
+        contextSession(
+            idStart: 1,
+            start: 0,
+            title: "Acme invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Acme invoices"}"#
+        )
+        + contextSession(
+            idStart: 100,
+            start: 3_600,
+            title: "Beta invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Beta invoices"}"#
+        )
+        + contextSession(
+            idStart: 200,
+            start: 7_200,
+            title: "Contoso invoice queue",
+            ocr: "Review vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"Contoso invoices"}"#
+        )
+    _ = try await store.insertContexts(contexts)
+
+    await model.refreshAll()
+    let curated = try #require(model.pendingCuratedContextWaste.first)
+
+    model.approveContextWaste(curated)
+    try await waitUntil { model.agents.contains { $0.signature == curated.signature } }
+
+    let agent = try #require(model.agents.first { $0.signature == curated.signature })
+    #expect(agent.name == "Reconcile vendor invoices")
+    #expect(agent.goal == "Reconcile the vendor invoice queue in QuickBooks.")
+    #expect(agent.recipe.steps.isEmpty)
+    #expect(agent.evidenceIDs == curated.evidence)
+    #expect(!model.pendingCuratedContextWaste.contains { $0.signature == curated.signature })
+}
+
+@MainActor @Test
+func contextWasteApprovalAuditAndPreferencePayloadsDoNotExposeRawOCR() async throws {
+    let rawOCRToken = "ApertureDeltaContextOCRSecret"
+    let (model, store) = try makeModel(curatorReply: contextCuratorKeepsOne)
+    let contexts =
+        contextSession(
+            idStart: 1,
+            start: 0,
+            title: "Acme invoice queue",
+            ocr: "Review \(rawOCRToken) vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"\#(rawOCRToken) invoices"}"#
+        )
+        + contextSession(
+            idStart: 100,
+            start: 3_600,
+            title: "Beta invoice queue",
+            ocr: "Review \(rawOCRToken) vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"\#(rawOCRToken) invoices"}"#
+        )
+        + contextSession(
+            idStart: 200,
+            start: 7_200,
+            title: "Contoso invoice queue",
+            ocr: "Review \(rawOCRToken) vendor invoice queue, reconcile invoice totals, and mark vendor batch paid.",
+            metadataJSON: #"{"project":"\#(rawOCRToken) invoices"}"#
+        )
+    _ = try await store.insertContexts(contexts)
+
+    await model.refreshAll()
+    let waste = try #require(model.contextWaste.first)
+    let curated = try #require(model.pendingCuratedContextWaste.first)
+    #expect(!waste.snippets.joined(separator: " ").localizedCaseInsensitiveContains(rawOCRToken))
+
+    model.approveContextWaste(curated)
+
+    let approved = try await waitForAudit(store, action: "agent.approved")
+    #expect(approved.detail.contains("source=context"))
+    #expect(approved.detail.contains("nameHash="))
+    #expect(approved.detail.contains("goalHash="))
+    expectAuditDetail(approved.detail, excludesRawIdentityContaining: rawOCRToken)
+
+    let preferencePayloads = try await store.recentPreferenceEvents(limit: 20)
+        .map { event in
+            [
+                event.appName,
+                event.workflowSignature,
+                event.featureJSON,
+                event.evidenceJSON
+            ].compactMap { $0 }.joined(separator: " ")
+        }
+        .joined(separator: "\n")
+    #expect(!preferencePayloads.localizedCaseInsensitiveContains(rawOCRToken))
+}
+
+@MainActor @Test
 func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
     // A repeated NATIVE-app workflow (Mail→Numbers) that clears the habit + real-time
     // bars now becomes a reviewable agent — app identity no longer gates it. Browser
@@ -152,7 +503,7 @@ func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 16), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers")); i += 1
         events.append(InputEvent(id: Int64(i), capturedAt: base.addingTimeInterval(start + 24), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers")); i += 1
     }
-    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, contextWasteDetectionEnabled: false)
     try await store.insertInputEvents(events)
 
     await model.refreshAll()
@@ -166,7 +517,7 @@ func nativeWorkflowReachesTheReviewQueueAndDeploysOnScreen() async throws {
 
 @MainActor @Test
 func decliningHidesFromPendingImmediately() async throws {
-    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, contextWasteDetectionEnabled: false)
     try await store.insertInputEvents(webWorkflowEvents())
     await model.refreshAll()
     let curated = try #require(model.pendingCuratedAgents.first)
@@ -179,7 +530,7 @@ func decliningHidesFromPendingImmediately() async throws {
 
 @MainActor @Test
 func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws {
-    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, contextWasteDetectionEnabled: false)
     try await store.insertInputEvents(webWorkflowEvents())
     await model.refreshAll()
     let curated = try #require(model.pendingCuratedAgents.first)
@@ -200,7 +551,7 @@ func approvingCreatesAgentWithCuratedNameAndGoalThenLeavesPending() async throws
 func approveFlashesAManagerReviewNote() async throws {
     // The regression this fixes: approve happens on the Manager tab, so it must
     // give feedback THERE — the new agent landing in Cascades is out of sight.
-    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, contextWasteDetectionEnabled: false)
     try await store.insertInputEvents(webWorkflowEvents())
     await model.refreshAll()
     let curated = try #require(model.pendingCuratedAgents.first)
@@ -214,7 +565,7 @@ func approveFlashesAManagerReviewNote() async throws {
 
 @MainActor @Test
 func declineFlashesAManagerReviewNote() async throws {
-    let (model, store) = try makeModel(curatorReply: curatorKeepsOne)
+    let (model, store) = try makeModel(curatorReply: curatorKeepsOne, contextWasteDetectionEnabled: false)
     try await store.insertInputEvents(webWorkflowEvents())
     await model.refreshAll()
     let curated = try #require(model.pendingCuratedAgents.first)
@@ -683,6 +1034,133 @@ func deployGoalLeadsWithCuratedGoalThenRecordedSteps() {
 
     let noGoal = CascadeAgent(name: "Mail thing", source: .detected, signature: "s2", recipe: recipe)
     #expect(CascadeAppModel.deployGoal(for: noGoal).hasPrefix("Mail thing")) // falls back to the name
+}
+
+@MainActor @Test
+func deployGoalAndSandboxTaskCarryStructuralBatchContract() {
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(order: 0, kind: .click, appName: "Safari", surface: "Source catalog", ocrAnchor: "Alpha Record"),
+        RecipeStep(order: 1, kind: .click, appName: "Safari", surface: "Source catalog", ocrAnchor: "Amount"),
+        RecipeStep(
+            order: 2,
+            kind: .type,
+            text: "Sample record",
+            appName: "Safari",
+            surface: "Destination tracker",
+            isParameter: true,
+            parameterKey: "record_name",
+            parameterKind: .freeText,
+            sourceStepIDs: [0]
+        ),
+        RecipeStep(
+            order: 3,
+            kind: .type,
+            text: "$12",
+            appName: "Safari",
+            surface: "Destination tracker",
+            isParameter: true,
+            parameterKey: "amount",
+            parameterKind: .currency,
+            sourceStepIDs: [1]
+        ),
+    ])
+    let agent = CascadeAgent(
+        name: "Catalog import",
+        source: .detected,
+        signature: "catalog-import",
+        recipe: recipe,
+        apps: ["Safari"],
+        goal: "Finish all remaining records from the source catalog in the destination tracker"
+    )
+
+    let onScreenGoal = CascadeAppModel.deployGoal(for: agent)
+    let sandboxTask = CascadeAppModel.sandboxTask(for: agent)
+
+    #expect(onScreenGoal.contains("structural batch/list control loop"))
+    #expect(onScreenGoal.contains("measure destination identities"))
+    #expect(onScreenGoal.contains("report count-only totals"))
+    #expect(sandboxTask.contains("structural batch/list control loop"))
+    #expect(sandboxTask.contains("Do not split this into per-record/item subtasks"))
+    #expect(onScreenGoal.contains("source catalog"))
+    #expect(sandboxTask.contains("destination tracker"))
+    #expect(onScreenGoal.contains("Destination procedure template"))
+    #expect(sandboxTask.contains("actively switch to the destination surface"))
+    #expect(!onScreenGoal.contains("Sample record"))
+    #expect(!sandboxTask.contains("Sample record"))
+    #expect(!onScreenGoal.contains("Alpha Record"))
+    #expect(!sandboxTask.contains("Alpha Record"))
+}
+
+@MainActor @Test
+func deployAgentRoutesBatchAgentThroughAssistControlLoop() async throws {
+    let (model, store) = try makeModel()
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(order: 0, kind: .click, appName: "Numbers", surface: "Source catalog", ocrAnchor: "Alpha Record"),
+        RecipeStep(
+            order: 1,
+            kind: .type,
+            text: "Alpha Record",
+            appName: "Numbers",
+            surface: "Destination tracker",
+            isParameter: true,
+            parameterKey: "record_name",
+            parameterKind: .freeText,
+            sourceStepIDs: [0]
+        ),
+    ])
+    let agent = CascadeAgent(
+        name: "Catalog import",
+        source: .detected,
+        signature: "batch-route",
+        recipe: recipe,
+        apps: ["Numbers"],
+        goal: "Import all remaining records from the source catalog into the destination tracker"
+    )
+
+    model.deployAgent(agent)
+    try await waitUntil { !model.agentRunning }
+    let audit = try await store.recentAudit(limit: 40)
+
+    #expect(!audit.contains { $0.action == "agent.batch.run.started" })
+    #expect(!audit.contains { $0.action == "agent.batch.run.ended" })
+    #expect(!audit.contains { $0.action == "recipe.run.started" })
+    #expect(!audit.contains { $0.action == "recipe.parameter" })
+    #expect(!model.agentMessage.contains("Alpha Record"))
+    #expect(!model.agentRunning)
+}
+
+@MainActor @Test
+func deployAgentKeepsNonBatchParameterizedAgentOnExistingAssistEscalationPath() async throws {
+    let (model, store) = try makeModel()
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(
+            order: 0,
+            kind: .type,
+            text: "$420",
+            appName: "Numbers",
+            surface: "Numbers",
+            isParameter: true,
+            parameterKey: "invoice_total",
+            parameterKind: .currency,
+            sourceStepIDs: [0]
+        ),
+    ])
+    let agent = CascadeAgent(
+        name: "Invoice total",
+        source: .detected,
+        signature: "non-batch-parameter",
+        recipe: recipe,
+        apps: ["Numbers"],
+        goal: "Copy the latest invoice total into Numbers"
+    )
+
+    model.deployAgent(agent)
+    let parameter = try await waitForAudit(store, action: "recipe.parameter")
+    let audit = try await store.recentAudit(limit: 40)
+
+    #expect(parameter.detail.contains("recoveryAction="))
+    #expect(audit.contains { $0.action == "recipe.run.started" })
+    #expect(!audit.contains { $0.action == "agent.batch.run.started" })
 }
 
 @MainActor @Test
