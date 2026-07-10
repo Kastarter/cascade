@@ -368,6 +368,7 @@ public final class CascadeAppModel: ObservableObject {
     static let experimentalGroundingVerifierKey = "cascade.experimentalGroundingVerifier"
     static let experimentalGroundingCacheKey = "cascade.experimentalGroundingCache"
     static let experimentalSearchRoutingKey = "cascade.experimentalSearchRouting"
+    nonisolated static let experimentalSpeedRouterKey = "cascade.experimentalSpeedRouter"
     static let experimentalHistoryCompactionKey = "cascade.experimentalHistoryCompaction"
     static let experimentalHistoryCompactionTurnsKey = "cascade.experimentalHistoryCompactionTurns"
     static let experimentalActionChunkingKey = "cascade.experimentalActionChunking"
@@ -2279,6 +2280,7 @@ public final class CascadeAppModel: ObservableObject {
         let searchRoutingEnabled = defaultsStore.bool(forKey: Self.experimentalSearchRoutingKey)
         var routeHints: [String: SearchRouteHint] = [:]
         if searchRoutingEnabled {
+            let speedRouterEnabled = defaultsStore.bool(forKey: Self.experimentalSpeedRouterKey)
             let h = TextHelperModel.resolve()
             let router = AgentTaskPlanner(client: h.client, model: h.model, cache: modelCallCache)
             for subtask in plan {
@@ -2296,6 +2298,27 @@ public final class CascadeAppModel: ObservableObject {
                     action: "source.route",
                     detail: Self.sourceRouteAuditDetail(goal: subtask.task, plan: routeHint, status: "assist")
                 ))
+                if speedRouterEnabled {
+                    let speedDecision = AssistSpeedRouter().decide(
+                        goal: subtask.task,
+                        subtask: subtask,
+                        routeHint: routeHint,
+                        context: AssistRouteContext(
+                            backgroundWebAvailable: capturePrivacyPolicy.backgroundWebRunsAvailable,
+                            recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
+                            harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly
+                        )
+                    )
+                    _ = try? await store.appendAudit(AuditEvent(
+                        actor: "agent",
+                        action: "speed.route",
+                        detail: Self.speedRouteAuditDetail(
+                            goal: subtask.task,
+                            plan: speedDecision.speedPlan,
+                            status: "assist"
+                        )
+                    ))
+                }
             }
         }
         _ = try? await store.appendAudit(AuditEvent(
@@ -2379,8 +2402,24 @@ public final class CascadeAppModel: ObservableObject {
                             plan[index] = sub
                         }
                     }
-                    let shouldUseWeb = Self.shouldPreferBackgroundWeb(routeHint: routeHint)
-                        || localVerdict.map { Self.shouldEscalateSearchToWeb(routeHint: routeHint, verdict: $0) } == true
+                    let shouldUseWeb: Bool
+                    if defaultsStore.bool(forKey: Self.experimentalSpeedRouterKey) {
+                        let speedDecision = AssistSpeedRouter().decide(
+                            goal: sub.task,
+                            subtask: sub,
+                            routeHint: routeHint,
+                            context: AssistRouteContext(
+                                backgroundWebAvailable: capturePrivacyPolicy.backgroundWebRunsAvailable,
+                                recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
+                                harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly
+                            )
+                        )
+                        shouldUseWeb = speedDecision.shouldAttemptBackgroundWeb
+                            || localVerdict.map { Self.shouldEscalateSearchToWeb(routeHint: routeHint, verdict: $0) } == true
+                    } else {
+                        shouldUseWeb = Self.shouldPreferBackgroundWeb(routeHint: routeHint)
+                            || localVerdict.map { Self.shouldEscalateSearchToWeb(routeHint: routeHint, verdict: $0) } == true
+                    }
                     if shouldUseWeb {
                         switch await runAssistBackgroundWebSearch(subtask: sub, routeHint: routeHint) {
                         case .finding(let finding):
@@ -4579,6 +4618,10 @@ public final class CascadeAppModel: ObservableObject {
         routeNeedsSourceEvidence(plan) && !plan.candidateSources.contains(.onScreen)
     }
 
+    nonisolated static func experimentalSpeedRouterEnabled(defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: Self.experimentalSpeedRouterKey)
+    }
+
     nonisolated static func sourceRouteAuditDetail(goal: String, plan: SourcePlan, status: String = "planned") -> String {
         [
             "status=\(safeAuditToken(status))",
@@ -4590,6 +4633,38 @@ public final class CascadeAppModel: ObservableObject {
             "required=\(safeAuditToken(plan.requiredSource?.rawValue ?? "none"))",
             "escalation=\(safeAuditToken(plan.escalationPolicy.rawValue))",
             "stop=\(safeAuditToken(plan.stopPolicy.rawValue))",
+        ].joined(separator: " ")
+    }
+
+    nonisolated static func speedRoutePlan(
+        goal: String,
+        sourcePlan: SourcePlan,
+        backgroundWebAvailable: Bool = true,
+        recallEnabled: Bool = true,
+        harnessTier: HarnessTier = .readOnly
+    ) -> AgentSpeedRoutePlan {
+        AgentSpeedRouter.plan(
+            goal: goal,
+            sourcePlan: sourcePlan,
+            capabilities: AgentSpeedCapabilities(
+                harnessTier: harnessTier,
+                recallEnabled: recallEnabled,
+                backgroundWebAvailable: backgroundWebAvailable,
+                accessibilityAvailable: true,
+                localOCRAvailable: true,
+                directAppLaunchAvailable: true
+            )
+        )
+    }
+
+    nonisolated static func speedRouteAuditDetail(
+        goal: String,
+        plan: AgentSpeedRoutePlan,
+        status: String = "planned"
+    ) -> String {
+        [
+            "status=\(safeAuditToken(status))",
+            plan.auditDescriptor(goal: goal),
         ].joined(separator: " ")
     }
 
