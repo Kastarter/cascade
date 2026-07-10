@@ -14,6 +14,13 @@ enum AssistRouteLane: Sendable, Equatable {
 struct AssistRouteDecision: Sendable, Equatable {
     let lane: AssistRouteLane
     let speedPlan: AgentSpeedRoutePlan
+    let terminalAction: CUAction?
+
+    init(lane: AssistRouteLane, speedPlan: AgentSpeedRoutePlan, terminalAction: CUAction? = nil) {
+        self.lane = lane
+        self.speedPlan = speedPlan
+        self.terminalAction = terminalAction
+    }
 
     var shouldRunBackgroundWeb: Bool {
         lane == .backgroundWeb
@@ -45,19 +52,30 @@ struct AssistRouteContext: Sendable, Equatable {
     var harnessTier: HarnessTier
     var accessibilityAvailable: Bool
     var localOCRAvailable: Bool
+    var directAppHint: String?
+    var directURLHint: String?
 
     init(
         backgroundWebAvailable: Bool = true,
         recallEnabled: Bool = true,
         harnessTier: HarnessTier = .readOnly,
         accessibilityAvailable: Bool = true,
-        localOCRAvailable: Bool = true
+        localOCRAvailable: Bool = true,
+        directAppHint: String? = nil,
+        directURLHint: String? = nil
     ) {
         self.backgroundWebAvailable = backgroundWebAvailable
         self.recallEnabled = recallEnabled
         self.harnessTier = harnessTier
         self.accessibilityAvailable = accessibilityAvailable
         self.localOCRAvailable = localOCRAvailable
+        self.directAppHint = Self.cleanHint(directAppHint)
+        self.directURLHint = Self.cleanHint(directURLHint)
+    }
+
+    private static func cleanHint(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -82,11 +100,23 @@ struct AssistSpeedRouter: Sendable {
             )
         )
 
-        if !subtask.app.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return AssistRouteDecision(lane: .deterministicOpenApp(subtask.app), speedPlan: speedPlan)
+        let urlHint = subtask.startURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = urlHint.isEmpty ? context.directURLHint : urlHint
+        if let url, !url.isEmpty {
+            return AssistRouteDecision(
+                lane: .deterministicOpenURL(url),
+                speedPlan: speedPlan,
+                terminalAction: Self.isTerminalOpenOnly(goal) && Self.isSafeWebURL(url) ? .openURL(url) : nil
+            )
         }
-        if !subtask.startURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return AssistRouteDecision(lane: .deterministicOpenURL(subtask.startURL), speedPlan: speedPlan)
+        let appHint = subtask.app.trimmingCharacters(in: .whitespacesAndNewlines)
+        let app = appHint.isEmpty ? context.directAppHint : appHint
+        if let app, !app.isEmpty {
+            return AssistRouteDecision(
+                lane: .deterministicOpenApp(app),
+                speedPlan: speedPlan,
+                terminalAction: Self.isTerminalOpenOnly(goal) ? .openApp(app) : nil
+            )
         }
 
         switch speedPlan.primary?.lane {
@@ -101,5 +131,42 @@ struct AssistSpeedRouter: Sendable {
         case .visualComputerUse, nil:
             return AssistRouteDecision(lane: .fallbackComputerUse("no faster available lane"), speedPlan: speedPlan)
         }
+    }
+
+    static func isTerminalOpenOnly(_ goal: String) -> Bool {
+        let normalized = " " + goal.lowercased()
+            .folding(options: [.diacriticInsensitive, .widthInsensitive], locale: .current)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,"))) + " "
+        let startsOpen = [
+            " open ", " launch ", " go to ", " visit ",
+        ].contains { normalized.hasPrefix($0) }
+        guard startsOpen else { return false }
+        let followupMarkers = [
+            " and ", " then ", " after ", " write ", " type ", " send ", " fill ",
+            " submit ", " create ", " make ", " edit ", " change ", " update ",
+            " search ", " find ", " look up ", " read ", " summarize ", " compare ",
+            " book ", " buy ", " log in ", " sign in ", " upload ", " download ",
+        ]
+        return !followupMarkers.contains { normalized.contains($0) }
+    }
+
+    static func isSafeWebURL(_ value: String) -> Bool {
+        guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
+    }
+
+    static func firstSafeWebURL(in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"https?://[^\s<>"']+"#, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let matchRange = Range(match.range, in: text) else {
+            return nil
+        }
+        let value = String(text[matchRange])
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,);]")))
+        return isSafeWebURL(value) ? value : nil
     }
 }

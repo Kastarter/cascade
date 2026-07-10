@@ -2306,7 +2306,9 @@ public final class CascadeAppModel: ObservableObject {
                         context: AssistRouteContext(
                             backgroundWebAvailable: capturePrivacyPolicy.backgroundWebRunsAvailable,
                             recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
-                            harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly
+                            harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
+                            directAppHint: appNameHint(forCompletedVoiceGoal: subtask.task),
+                            directURLHint: AssistSpeedRouter.firstSafeWebURL(in: subtask.task)
                         )
                     )
                     _ = try? await store.appendAudit(AuditEvent(
@@ -2411,7 +2413,9 @@ public final class CascadeAppModel: ObservableObject {
                             context: AssistRouteContext(
                                 backgroundWebAvailable: capturePrivacyPolicy.backgroundWebRunsAvailable,
                                 recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
-                                harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly
+                                harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
+                                directAppHint: appNameHint(forCompletedVoiceGoal: sub.task),
+                                directURLHint: AssistSpeedRouter.firstSafeWebURL(in: sub.task)
                             )
                         )
                         shouldUseWeb = speedDecision.shouldAttemptBackgroundWeb
@@ -2439,6 +2443,57 @@ public final class CascadeAppModel: ObservableObject {
                             }
                             break
                         }
+                    }
+                }
+
+                if defaultsStore.bool(forKey: Self.experimentalSpeedRouterKey) {
+                    let speedDecision = AssistSpeedRouter().decide(
+                        goal: sub.task,
+                        subtask: sub,
+                        routeHint: subRouteHint,
+                        context: AssistRouteContext(
+                            backgroundWebAvailable: capturePrivacyPolicy.backgroundWebRunsAvailable,
+                            recallEnabled: capturePrivacyPolicy.recordRecallAvailable,
+                            harnessTier: effectivePowerHarnessEnabled ? .full : .readOnly,
+                            directAppHint: appNameHint(forCompletedVoiceGoal: sub.task),
+                            directURLHint: AssistSpeedRouter.firstSafeWebURL(in: sub.task)
+                        )
+                    )
+                    if let terminalAction = speedDecision.terminalAction {
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "speed.route",
+                            detail: Self.speedRouteAuditDetail(
+                                goal: sub.task,
+                                plan: speedDecision.speedPlan,
+                                status: "terminal_open"
+                            )
+                        ))
+                        if await executeTerminalSpeedAction(terminalAction) {
+                            _ = try? await store.appendAudit(AuditEvent(
+                                actor: "agent",
+                                action: "assist.subgoal.verify",
+                                detail: Self.assistSubgoalAuditDetail(
+                                    index: index,
+                                    total: plan.count,
+                                    subtask: sub,
+                                    status: "speed_terminal"
+                                )
+                            ))
+                            findings.append((task: sub.task, result: Self.terminalSpeedActionResult(terminalAction)))
+                            index += 1
+                            break subgoal
+                        }
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "assist.subgoal.fail",
+                            detail: Self.assistSubgoalAuditDetail(
+                                index: index,
+                                total: plan.count,
+                                subtask: sub,
+                                status: "speed_terminal_failed"
+                            )
+                        ))
                     }
                 }
 
@@ -4668,6 +4723,18 @@ public final class CascadeAppModel: ObservableObject {
         ].joined(separator: " ")
     }
 
+    nonisolated static func terminalSpeedActionResult(_ action: CUAction) -> String {
+        switch action {
+        case .openApp(let name):
+            return "Opened \(name)."
+        case .openURL(let value):
+            let host = URL(string: value)?.host() ?? "the page"
+            return "Opened \(host)."
+        default:
+            return "Completed directly."
+        }
+    }
+
     nonisolated static func sourceEvidenceAuditDetail(_ bundle: SourceEvidenceBundle) -> String {
         let evidence = bundle.sourcePlan.candidateSources.compactMap { bundle.evidenceBySource[$0] }
         let states = evidence.map { "\($0.source.rawValue):\($0.state.rawValue):\($0.resultCount):\($0.citationIDs.count):\($0.contentHash)" }
@@ -6210,6 +6277,39 @@ public final class CascadeAppModel: ObservableObject {
     /// the coordinate system AX element positions live in.
     nonisolated static func displayBounds(of screen: NSScreen) -> CGRect {
         DisplayCoordinateMapper(screen: screen)?.cgBounds ?? CGDisplayBounds(CGMainDisplayID())
+    }
+
+    private func executeTerminalSpeedAction(_ action: CUAction) async -> Bool {
+        guidanceOverlay.setThinking(false)
+        switch action {
+        case .openApp(let name):
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return false }
+            dock.show(title: "Opening \(trimmed)", detail: "")
+            let opened = await Self.openApp(named: trimmed)
+            guard opened else { return false }
+            for _ in 0..<32 {
+                if let front = NSWorkspace.shared.frontmostApplication?.localizedName,
+                   front.localizedCaseInsensitiveContains(trimmed)
+                    || trimmed.localizedCaseInsensitiveContains(front) {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            return true
+        case .openURL(let value):
+            guard let url = URL(string: value),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else {
+                return false
+            }
+            dock.show(title: "Opening \(url.host() ?? "page")", detail: "")
+            NSWorkspace.shared.open(url)
+            try? await Task.sleep(for: .milliseconds(900))
+            return true
+        default:
+            return false
+        }
     }
 
     private func executeCU(_ action: CUAction, on screen: NSScreen) async -> Bool {
