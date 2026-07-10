@@ -683,6 +683,30 @@ private func copyPasteInstance(_ start: Int) -> [InputEvent] {
     return e
 }
 
+private func scrollEvent(
+    _ i: Int,
+    dx: Int,
+    dy: Int,
+    at offset: TimeInterval? = nil,
+    x: Double = 100,
+    y: Double = 100,
+    app: String = "Safari",
+    bundle: String? = "com.apple.Safari",
+    window: String? = "Inbox - Gmail"
+) -> InputEvent {
+    InputEvent(
+        id: Int64(i),
+        capturedAt: base.addingTimeInterval(offset ?? Double(i)),
+        kind: .scroll,
+        x: x,
+        y: y,
+        modifiers: ["\(dx)", "\(dy)"],
+        appName: app,
+        bundleIdentifier: bundle,
+        windowTitle: window
+    )
+}
+
 @Test
 func wasteFromInstanceBuildsTheSameRecipeAsDetect() {
     // The intentional path (Teach-once) must yield the very recipe the automatic path
@@ -700,14 +724,182 @@ func wasteFromInstanceBuildsTheSameRecipeAsDetect() {
 }
 
 @Test
-func wasteFromInstanceRefusesAJunkRange() {
-    // A demonstration of only scrolling, or only typing, has no automatable structure
-    // — the same guard `detect` uses returns nil ("nothing repeatable here yet").
+func wasteFromInstanceRefusesPassiveScrollSpam() {
     let detector = WasteDetector()
-    let scrolls = (0..<8).map { event($0, .scroll, app: "Safari") }
+    let scrolls = (0..<8).map { scrollEvent($0, dx: 0, dy: 0, at: Double($0) * 0.1) }
     #expect(detector.waste(fromInstance: scrolls, contexts: []) == nil)
-    let typing = [InputEvent(id: 1, capturedAt: base, kind: .type, text: "hello", appName: "Notes")]
-    #expect(detector.waste(fromInstance: typing, contexts: []) == nil)
+}
+
+@Test
+func wasteFromInstanceRefusesBareEditingKeys() {
+    let detector = WasteDetector()
+    let keys = [
+        event(0, .key, app: "Notes", key: "Delete"),
+        event(1, .key, app: "Notes", key: "ArrowDown"),
+        event(2, .key, app: "Notes", key: "Return"),
+    ]
+    #expect(detector.waste(fromInstance: keys, contexts: []) == nil)
+}
+
+@Test
+func wasteFromInstanceAcceptsSingleTypedDemo() {
+    let detector = WasteDetector()
+    let typing = [InputEvent(id: 1, capturedAt: base, kind: .type, text: "typed 5 chars", appName: "Notes")]
+    let taught = detector.waste(fromInstance: typing, contexts: [])
+    #expect(taught?.recipe.steps.contains { $0.kind == .type && $0.isParameter } == true)
+}
+
+@Test
+func singleTypedDemosBecomeLiveParameters() throws {
+    let detector = WasteDetector()
+    let cases: [(String, RecipeParameterKind, Bool)] = [
+        ("mira@example.com", .email, true),
+        ("4471", .number, true),
+        ("please call later", .freeText, true),
+        ("typed 12 chars", .freeText, false),
+    ]
+
+    for (raw, expectedKind, expectsHash) in cases {
+        let taught = try #require(detector.waste(
+            fromInstance: [InputEvent(id: 1, capturedAt: base, kind: .type, text: raw, appName: "Notes")],
+            contexts: []
+        ))
+        let type = try #require(taught.recipe.steps.first { $0.kind == .type })
+        #expect(type.isParameter)
+        #expect(type.parameterKind == expectedKind)
+        #expect(type.text != raw || raw.hasPrefix("typed "))
+        #expect(type.valueExamples.first?.hasPrefix("\(expectedKind.rawValue):") == true)
+        #expect(type.valueHashes.isEmpty != expectsHash)
+    }
+}
+
+@Test
+func singleAppClickTypeReturnDemoBuildsAParameterizedRecipe() throws {
+    let detector = WasteDetector()
+    let events = [
+        InputEvent(id: 1, capturedAt: base, kind: .click, x: 10, y: 20, text: "Message", appName: "Notes"),
+        InputEvent(id: 2, capturedAt: base.addingTimeInterval(1), kind: .type, text: "Call Sam at 4", appName: "Notes"),
+        event(3, .key, app: "Notes", key: "Return"),
+    ]
+
+    let taught = try #require(detector.waste(fromInstance: events, contexts: []))
+    let type = try #require(taught.recipe.steps.first { $0.kind == .type })
+    #expect(taught.apps == ["Notes"])
+    #expect(type.isParameter)
+    #expect(type.parameterKind == .freeText)
+    #expect(type.text == "freeText:typed 13 chars")
+    #expect(!taught.recipe.steps.contains { $0.text == "Call Sam at 4" })
+}
+
+@Test
+func singleClickedDataTargetBecomesALiveParameter() throws {
+    let descriptor = AXTargetDescriptorV2.encode(label: "Acme Corp", role: "AXRow")
+    let events = [
+        InputEvent(id: 1, capturedAt: base, kind: .click, x: 10, y: 20, text: "Acme Corp", appName: "CRM", targetDescriptor: descriptor),
+        InputEvent(id: 2, capturedAt: base.addingTimeInterval(1), kind: .key, key: "Return", appName: "CRM"),
+    ]
+
+    let taught = try #require(WasteDetector().waste(fromInstance: events, contexts: []))
+    let click = try #require(taught.recipe.steps.first { $0.kind == .click })
+
+    #expect(click.isParameter)
+    #expect(click.parameterKind == .personName)
+    #expect(click.parameterKey?.hasPrefix("target_personName_") == true)
+    #expect(click.text == "personName slot")
+    #expect(click.ocrAnchor == "personName slot")
+    #expect(AXTargetDescriptorV2.decode(click.targetDescriptor)?.label == "personName slot")
+    #expect(click.valueHashes == [AuditIdentity.hash("acme corp")])
+    #expect(!taught.recipe.steps.contains { step in
+        [step.text, step.ocrAnchor, step.targetDescriptor, step.parameterKey].contains { $0?.contains("Acme Corp") == true }
+    })
+}
+
+@Test
+func singleClickedCommandTargetStaysAReplayAnchor() throws {
+    let events = [
+        InputEvent(id: 1, capturedAt: base, kind: .click, x: 10, y: 20, text: "Send", appName: "Mail"),
+        InputEvent(id: 2, capturedAt: base.addingTimeInterval(1), kind: .key, key: "Return", appName: "Mail"),
+    ]
+
+    let taught = try #require(WasteDetector().waste(fromInstance: events, contexts: []))
+    let click = try #require(taught.recipe.steps.first { $0.kind == .click })
+
+    #expect(!click.isParameter)
+    #expect(click.text == "Send")
+    #expect(click.ocrAnchor == "Send")
+}
+
+@Test
+func singleCopyPasteDemoKeepsPasteAsLiveDataflow() throws {
+    let taught = try #require(WasteDetector().waste(fromInstance: copyPasteInstance(0), contexts: []))
+    let copy = try #require(taught.recipe.steps.first { $0.kind == .key && $0.key == "c" })
+    let paste = try #require(taught.recipe.steps.first { $0.kind == .key && $0.key == "v" })
+    #expect(paste.isParameter)
+    #expect(paste.parameterKind == .freeText)
+    #expect(paste.valueExamples == ["freeText:clipboard"])
+    #expect(paste.valueHashes.isEmpty)
+    #expect(paste.sourceStepIDs.contains(copy.order))
+    #expect(paste.dataflowEdgeID?.isEmpty == false)
+}
+
+@Test
+func detectStillIgnoresSingleRunsAndConstantRepeatedTyping() throws {
+    let detector = WasteDetector()
+    let singleRun = [
+        InputEvent(id: 1, capturedAt: base, kind: .click, x: 10, y: 20, text: "Message", appName: "Notes"),
+        InputEvent(id: 2, capturedAt: base.addingTimeInterval(1), kind: .type, text: "same", appName: "Notes"),
+        event(3, .key, app: "Notes", key: "s", modifiers: ["command"]),
+    ]
+    #expect(detector.detect(contexts: [], inputEvents: singleRun, useEpisodeMining: false).isEmpty)
+
+    let repeated = singleRun + [
+        InputEvent(id: 4, capturedAt: base.addingTimeInterval(10), kind: .click, x: 10, y: 20, text: "Message", appName: "Notes"),
+        InputEvent(id: 5, capturedAt: base.addingTimeInterval(11), kind: .type, text: "same", appName: "Notes"),
+        InputEvent(id: 6, capturedAt: base.addingTimeInterval(12), kind: .key, key: "s", modifiers: ["command"], appName: "Notes"),
+        InputEvent(id: 7, capturedAt: base.addingTimeInterval(20), kind: .click, x: 10, y: 20, text: "Message", appName: "Notes"),
+        InputEvent(id: 8, capturedAt: base.addingTimeInterval(21), kind: .type, text: "same", appName: "Notes"),
+        InputEvent(id: 9, capturedAt: base.addingTimeInterval(22), kind: .key, key: "s", modifiers: ["command"], appName: "Notes"),
+    ]
+    let waste = try #require(detector.detect(contexts: [], inputEvents: repeated, useEpisodeMining: false).first)
+    let type = try #require(waste.recipe.steps.first { $0.kind == .type })
+    #expect(!type.isParameter)
+    #expect(type.text == "same")
+}
+
+@Test
+func teachScrollTicksCoalesceByDirectionAndSumDeltas() {
+    let events = [
+        scrollEvent(1, dx: 0, dy: -3, at: 0.0),
+        scrollEvent(2, dx: 0, dy: -4, at: 0.1),
+        scrollEvent(3, dx: 0, dy: -5, at: 0.2),
+    ]
+    let collapsed = WasteDetector.teachInstanceEvents(from: events)
+    #expect(collapsed.count == 1)
+    #expect(collapsed.first?.modifiers == ["0", "-12"])
+}
+
+@Test
+func teachScrollGesturesSplitOnWindowPointerAndDirection() {
+    let events = [
+        scrollEvent(1, dx: 0, dy: -3, at: 0.0, x: 10, y: 10, window: "Inbox - Gmail"),
+        scrollEvent(2, dx: 0, dy: -4, at: 0.1, x: 10, y: 10, window: "Tasks - Notion"),
+        scrollEvent(3, dx: 0, dy: -5, at: 0.2, x: 220, y: 10, window: "Tasks - Notion"),
+        scrollEvent(4, dx: 0, dy: 6, at: 0.3, x: 220, y: 10, window: "Tasks - Notion"),
+    ]
+    let collapsed = WasteDetector.teachInstanceEvents(from: events)
+    #expect(collapsed.count == 4)
+}
+
+@Test
+func teachScrollDirectionChangeIsPreservedBeforeClick() throws {
+    let detector = WasteDetector()
+    let events = [
+        scrollEvent(1, dx: 0, dy: -6, at: 0.0),
+        scrollEvent(2, dx: 0, dy: 5, at: 0.1),
+        InputEvent(id: 3, capturedAt: base.addingTimeInterval(0.2), kind: .click, x: 10, y: 20, text: "Open", appName: "Safari", bundleIdentifier: "com.apple.Safari", windowTitle: "Inbox - Gmail"),
+    ]
+    let taught = try #require(detector.waste(fromInstance: events, contexts: []))
+    #expect(taught.recipe.steps.filter { $0.kind == .scroll }.count == 2)
 }
 
 @Test

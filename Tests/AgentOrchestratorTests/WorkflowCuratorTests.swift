@@ -529,6 +529,38 @@ func curateRangeTurnsABracketedRangeIntoACuratedAgent() async throws {
 }
 
 @Test
+func curateRangeBuildsAgentFromSingleAppTypedDemo() async throws {
+    let store = try makeStore()
+    let events = [
+        InputEvent(id: 1, capturedAt: base, kind: .click, x: 10, y: 20, text: "Message", appName: "Notes"),
+        InputEvent(id: 2, capturedAt: base.addingTimeInterval(1), kind: .type, text: "typed 17 chars", appName: "Notes"),
+        InputEvent(id: 3, capturedAt: base.addingTimeInterval(2), kind: .key, key: "Return", appName: "Notes"),
+    ]
+    try await store.insertInputEvents(events)
+    let canned = #"{"agents":[{"index":0,"name":"Draft the Notes message","why":"shown once","goal":"Draft the current message in Notes and submit it.","value":0.8}]}"#
+    let orchestrator = CascadeOrchestrator(store: store, curator: WorkflowCurator(client: FakeCompleter(canned: canned)))
+
+    let curated = try await orchestrator.curateRange(from: base, to: base.addingTimeInterval(10))
+    let agent = try #require(curated)
+    let type = try #require(agent.source.recipe.steps.first { $0.kind == .type })
+    #expect(agent.name == "Draft the Notes message")
+    #expect(agent.apps == ["Notes"])
+    #expect(type.isParameter)
+    #expect(type.text == "freeText:typed 17 chars")
+}
+
+@Test
+func recipeScrollStepUsesRecorderDxDyModifierConvention() {
+    let action = AgentAction(recipeStep: RecipeStep(order: 1, kind: .scroll, modifiers: ["12", "-40"], appName: "Safari"))
+    guard case .computerUse(.scroll(let deltaX, let deltaY))? = action else {
+        Issue.record("expected a scroll action")
+        return
+    }
+    #expect(deltaX == 12)
+    #expect(deltaY == -40)
+}
+
+@Test
 func curateRangeFeedsRecordedOCRToTheCurator() async throws {
     // The whole point of change (a): real recorded on-screen text from the moments
     // around the workflow reaches the curator so the goal is content-aware. The
@@ -555,7 +587,7 @@ func curateRangeFeedsRecordedOCRToTheCurator() async throws {
 
 @Test
 func curateRangeReturnsNilForAJunkRange() async throws {
-    // A range of only scrolling/typing has nothing automatable — the spine refuses it.
+    // Passive scroll telemetry has no deliberate teach-once evidence.
     let store = try makeStore()
     var events: [InputEvent] = []
     for i in 0..<8 {
@@ -647,10 +679,85 @@ func curateOnePromptTeachesRunVaryingParameters() {
     // A demonstration shows ONE example of fields that change every run (a date, an
     // invoice number) — the single-demo prompt must tell the curator to write the
     // goal around the CURRENT value, exactly like the batch prompt does.
-    #expect(WorkflowCurator.curateOneSystemPrompt.contains("live slots or parameters"))
-    #expect(WorkflowCurator.curateOneSystemPrompt.contains("CURRENT/appropriate value at run time"))
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("Treat demonstration literals as examples"))
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("even when the recipe does not list a live slot"))
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("Typed text, pasted clipboard content"))
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("CURRENT-RUN value"))
+    #expect(WorkflowCurator.curateOneSystemPrompt.contains("never the demonstrated literal"))
     // Prompt changed → the model-call cache key must roll over.
-    #expect(WorkflowCurator.curateOnePromptVersion == "workflow-curator.curate-one.prompt.v2")
+    #expect(WorkflowCurator.curateOnePromptVersion == "workflow-curator.curate-one.prompt.v3")
+}
+
+@Test
+func curateOneUserPromptOmitsUnparameterizedDemoLiterals() {
+    let demonstrated = DetectedWaste(
+        title: "Send invoice update", apps: ["Mail"], occurrences: 1,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 20,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .click, x: 1, y: 1, appName: "Mail", ocrAnchor: "To"),
+            RecipeStep(order: 1, kind: .type, text: "alex@example.com", appName: "Mail"),
+            RecipeStep(order: 2, kind: .key, text: "INV-4821", key: "v", modifiers: ["command"], appName: "Mail"),
+        ]),
+        evidence: [1], confidence: 0.7, signature: "teach-literals"
+    )
+
+    let prompt = WorkflowCurator.userPromptOne(demonstrated, statedIntent: nil)
+
+    #expect(prompt.contains("Send invoice update"))
+    #expect(!prompt.contains("alex@example.com"))
+    #expect(!prompt.contains("INV-4821"))
+    #expect(!prompt.contains("live slot"))
+}
+
+@Test
+func curateOneUserPromptKeepsSafeLiveSlotAndDataflowMetadata() {
+    let demonstrated = DetectedWaste(
+        title: "Send invoice update", apps: ["Mail"], occurrences: 1,
+        estimatedSecondsPerRun: 20, estimatedTotalSeconds: 20,
+        recipe: AgentRecipe(steps: [
+            RecipeStep(order: 0, kind: .click, x: 1, y: 1, appName: "Mail", ocrAnchor: "Invoice"),
+            RecipeStep(
+                order: 1,
+                kind: .type,
+                text: "alex@example.com",
+                appName: "Mail",
+                isParameter: true,
+                parameterKey: "recipient_email",
+                parameterKind: .email,
+                valueExamples: ["email:local@example.com"],
+                valueHashes: ["abc123"]
+            ),
+            RecipeStep(
+                order: 2,
+                kind: .key,
+                text: "INV-4821",
+                key: "v",
+                modifiers: ["command"],
+                appName: "Mail",
+                dataflowEdgeID: "invoice-id-edge",
+                isParameter: true,
+                parameterKey: "invoice_id",
+                parameterKind: .number,
+                valueExamples: ["number:AAA-0000"],
+                valueHashes: ["def456"],
+                sourceStepIDs: [0]
+            ),
+        ]),
+        evidence: [1], confidence: 0.7, signature: "teach-parameterized-literals"
+    )
+
+    let prompt = WorkflowCurator.userPromptOne(demonstrated, statedIntent: nil)
+
+    #expect(prompt.contains("live slot"))
+    #expect(prompt.contains("kind=email"))
+    #expect(prompt.contains("kind=number"))
+    #expect(prompt.contains("shapeCount=1"))
+    #expect(prompt.contains("valueHashCount=1"))
+    #expect(prompt.contains("sourceStepCount=1"))
+    #expect(prompt.contains("pasteShortcut=true"))
+    #expect(prompt.contains("dataflow edge"))
+    #expect(!prompt.contains("alex@example.com"))
+    #expect(!prompt.contains("INV-4821"))
 }
 
 @Test

@@ -991,25 +991,20 @@ public struct WasteDetector: Sendable {
     /// Turns ONE recorded instance — an arbitrary bracketed time range — into a
     /// `DetectedWaste`, the reusable entry point behind every *intentional*
     /// agent-creation front door (Teach-once, a Reel selection). It filters
-    /// sensitive apps, collapses scroll bursts, and applies the SAME
-    /// intent/structural guard `detect` uses, so a range that is only scrolling or
-    /// typing returns `nil` ("nothing repeatable here yet") instead of a junk
-    /// recipe. `occurrences` is 1 for a single demonstration; `surface` defaults to
-    /// the app itself (pass a web-identity resolver to name by web app).
+    /// sensitive apps and applies a teach-only intent guard: explicit
+    /// demonstrations may be one-shot, while background mining still requires
+    /// repeated structure. `occurrences` is 1 for a single demonstration; `surface`
+    /// defaults to the app itself (pass a web-identity resolver to name by web app).
     public func waste(
         fromInstance events: [InputEvent],
         contexts: [RecordedContext],
         occurrences: Int = 1,
         surface: (@Sendable (InputEvent) -> String?)? = nil
     ) -> DetectedWaste? {
-        let instance = Self.collapsingScrollBursts(
-            events
-                .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
-                .sorted { $0.capturedAt < $1.capturedAt }
-        )
-        guard Self.isAutomatableInstance(instance) else { return nil }
+        let instance = Self.teachInstanceEvents(from: events)
+        guard Self.isTeachOnceCandidate(instance, contexts: contexts) else { return nil }
         let resolve: (InputEvent) -> String = { surface?($0) ?? $0.appName }
-        return makeWaste(instance: instance, occurrences: max(1, occurrences), contexts: contexts, surface: resolve)
+        return makeWaste(instance: instance, occurrences: max(1, occurrences), contexts: contexts, surface: resolve, inferSingleOccurrenceParameters: true)
     }
 
     private struct InferredParameter: Sendable {
@@ -1096,6 +1091,50 @@ public struct WasteDetector: Sendable {
         return inferred
     }
 
+    private static func singleOccurrenceParameters(in occurrence: [InputEvent]) -> [Int: InferredParameter] {
+        var inferred: [Int: InferredParameter] = [:]
+        let userDataKinds: Set<RecipeParameterKind> = [.email, .url, .filePath, .currency, .date, .number, .personName, .freeText]
+        for cell in typeCells(in: occurrence) {
+            let value = cell.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedParameterValue(value).isEmpty else { continue }
+            let isSanitizedTypedShape = matches(value, #"^typed \d+ chars$"#)
+            let kind: RecipeParameterKind = isSanitizedTypedShape ? .freeText : classifyParameter([value])
+            guard userDataKinds.contains(kind) else { continue }
+            let examples = isSanitizedTypedShape
+                ? ["freeText:\(value)"]
+                : Array(Set([valueShape(value, kind: kind)])).sorted()
+            let hashes = isSanitizedTypedShape
+                ? []
+                : [AuditIdentity.hash(normalizedParameterValue(value))]
+            inferred[cell.position] = InferredParameter(
+                position: cell.position,
+                parameterKey: parameterKey(from: cell.label, fallbackPosition: cell.position),
+                parameterKind: kind,
+                valueExamples: examples,
+                valueHashes: hashes,
+                sourceEventIndices: cell.sourceEventIndices,
+                transform: value == cell.value ? nil : "trim",
+                dataflowEdgeID: nil
+            )
+        }
+        for cell in targetCells(in: occurrence) where inferred[cell.position] == nil {
+            let value = cell.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            let kind = classifyParameter([value])
+            guard targetLabelIsRunSpecific(value, kind: kind, event: occurrence[cell.position]) else { continue }
+            inferred[cell.position] = InferredParameter(
+                position: cell.position,
+                parameterKey: targetParameterKey(kind: kind, event: occurrence[cell.position], position: cell.position),
+                parameterKind: kind,
+                valueExamples: Array(Set([valueShape(value, kind: kind)])).sorted(),
+                valueHashes: [AuditIdentity.hash(normalizedParameterValue(value))],
+                sourceEventIndices: [],
+                transform: value == cell.value ? nil : "trim",
+                dataflowEdgeID: nil
+            )
+        }
+        return inferred
+    }
+
     private static func typeCells(in occurrence: [InputEvent]) -> [TypeCell] {
         occurrence.indices.compactMap { index in
             let event = occurrence[index]
@@ -1109,6 +1148,91 @@ public struct WasteDetector: Sendable {
                 sourceEventIndices: sourceEventIndices(for: index, in: occurrence, value: event.text)
             )
         }
+    }
+
+    private static func targetCells(in occurrence: [InputEvent]) -> [TypeCell] {
+        occurrence.indices.compactMap { index in
+            let event = occurrence[index]
+            guard isTargetingEvent(event),
+                  let value = targetParameterValue(for: event) else { return nil }
+            let identity = targetIdentity(for: event)
+            let label = identity?.label.trimmingCharacters(in: .whitespacesAndNewlines)
+            return TypeCell(
+                position: index,
+                identity: identity?.key ?? "target:\(normalizedParameterValue(value))@\(event.appName.lowercased())",
+                label: label?.isEmpty == false ? label! : value,
+                value: value,
+                sourceEventIndices: []
+            )
+        }
+    }
+
+    private static func targetParameterValue(for event: InputEvent) -> String? {
+        let descriptor = AXTargetDescriptorV2.decode(event.targetDescriptor, fallbackLabel: event.text ?? "")
+        let label = descriptor?.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let label, !label.isEmpty { return label }
+        let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text?.isEmpty == false ? text : nil
+    }
+
+    private static func targetLabelIsRunSpecific(_ value: String, kind: RecipeParameterKind, event: InputEvent) -> Bool {
+        guard !normalizedParameterValue(value).isEmpty else { return false }
+        if targetLabelLooksLikeCommand(value) { return false }
+        if kind != .freeText { return true }
+        if PrivacyRules.isSensitiveText(value) || PIIDetector.containsHighConfidencePII(value) { return true }
+        return targetRoleLooksDataBearing(event) && valueContainsDataSignal(value)
+    }
+
+    private static func targetRoleLooksDataBearing(_ event: InputEvent) -> Bool {
+        let role = AXTargetDescriptorV2.decode(event.targetDescriptor, fallbackLabel: event.text ?? "")?.role?
+            .lowercased() ?? ""
+        guard !role.isEmpty else { return false }
+        if role.contains("button") || role.contains("menu") || role.contains("tab") || role.contains("checkbox") || role.contains("radio") {
+            return false
+        }
+        return role.contains("row")
+            || role.contains("cell")
+            || role.contains("table")
+            || role.contains("outline")
+            || role.contains("list")
+            || role.contains("statictext")
+            || role.contains("text")
+            || role.contains("link")
+            || role.contains("group")
+    }
+
+    private static func targetParameterKey(kind: RecipeParameterKind, event: InputEvent, position: Int) -> String {
+        let descriptor = AXTargetDescriptorV2.decode(event.targetDescriptor, fallbackLabel: event.text ?? "")
+        let role = descriptor?.role?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "target"
+        let identity = [
+            event.appName,
+            role,
+            event.kind.rawValue,
+            "\(position)"
+        ].joined(separator: "|")
+        return "target_\(kind.rawValue)_\(AuditIdentity.hash(identity).prefix(10))"
+    }
+
+    private static func targetLabelLooksLikeCommand(_ value: String) -> Bool {
+        let normalized = normalizedParameterValue(value)
+        let commands: Set<String> = [
+            "add", "archive", "back", "cancel", "close", "compose", "continue", "copy", "create",
+            "delete", "done", "edit", "export", "filter", "forward", "next", "new", "open",
+            "previous", "print", "reply", "reply all", "save", "search", "select", "send",
+            "share", "submit", "update"
+        ]
+        if commands.contains(normalized) { return true }
+        guard !matches(normalized, #"\d"#) else { return false }
+        let words = normalized.split(whereSeparator: \.isWhitespace)
+        return words.count <= 3 && words.first.map { commands.contains(String($0)) } == true
+    }
+
+    private static func valueContainsDataSignal(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if matches(trimmed, #"\d"#) { return true }
+        if matches(trimmed, #"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+"#) { return true }
+        if matches(trimmed, #"[_/@#$%]|[A-Z]{2,}-\d"#) { return true }
+        return trimmed.split(whereSeparator: \.isWhitespace).count >= 3
     }
 
     private static func targetIdentity(forTypeAt index: Int, in occurrence: [InputEvent]) -> TargetIdentity {
@@ -1434,7 +1558,8 @@ public struct WasteDetector: Sendable {
         abstractSignatureTokens: [String]? = nil,
         abstractParameters: [Int: AbstractParameter] = [:],
         abstractSanitizedKinds: [Int: RecipeParameterKind] = [:],
-        traceProfile: TraceProfile? = nil
+        traceProfile: TraceProfile? = nil,
+        inferSingleOccurrenceParameters: Bool = false
     ) -> DetectedWaste {
         // Which positions hold a typed value that CHANGES across the recorded
         // occurrences — those are parameters, not fixed content (B5/AWM). Empty for
@@ -1451,6 +1576,12 @@ public struct WasteDetector: Sendable {
                 transform: parameter.transform,
                 dataflowEdgeID: parameter.dataflowEdgeID
             )
+        }
+        if inferSingleOccurrenceParameters {
+            for (position, parameter) in Self.singleOccurrenceParameters(in: instance)
+            where parameterMetadata[position] == nil && abstractSanitizedKinds[position] == nil {
+                parameterMetadata[position] = parameter
+            }
         }
         for (position, parameter) in Self.dataflowParameters(in: instance, surface: surface)
         where parameterMetadata[position] == nil && abstractSanitizedKinds[position] == nil {
@@ -1470,6 +1601,8 @@ public struct WasteDetector: Sendable {
             let sourceStepIDs = parameter?.sourceEventIndices.compactMap { eventPositionToStepOrder[$0] } ?? []
             let sanitizedKind = abstractSanitizedKinds[position]
             let sanitizedByAbstractMining = sanitizedKind != nil
+            let sanitizedTextBySingleTeach = inferSingleOccurrenceParameters && parameter != nil && event.kind == .type
+            let sanitizedTargetBySingleTeach = inferSingleOccurrenceParameters && parameter != nil && Self.isTargetingEvent(event)
             let resolvedSurface = surface(event)
             let stepSurface = resolvedSurface == event.appName ? nil : resolvedSurface
             eventPositionToStepOrder[position] = order
@@ -1478,7 +1611,7 @@ public struct WasteDetector: Sendable {
                 kind: Self.recipeKind(event.kind),
                 x: event.x,
                 y: event.y,
-                text: sanitizedByAbstractMining ? Self.parameterizedText(for: event, parameter: parameter, kind: sanitizedKind) : event.text,
+                text: sanitizedByAbstractMining || sanitizedTextBySingleTeach || sanitizedTargetBySingleTeach ? Self.parameterizedText(for: event, parameter: parameter, kind: sanitizedKind) : event.text,
                 key: event.key,
                 modifiers: event.modifiers,
                 appName: event.appName,
@@ -1487,8 +1620,8 @@ public struct WasteDetector: Sendable {
                 surface: stepSurface,
                 documentIdentityHash: WebAppIdentity.from(windowTitle: event.windowTitle),
                 dataflowEdgeID: parameter?.dataflowEdgeID,
-                ocrAnchor: sanitizedByAbstractMining ? Self.parameterizedAnchor(parameter, kind: sanitizedKind) : Self.ocrAnchor(for: event, contexts: contexts),
-                targetDescriptor: sanitizedByAbstractMining ? Self.parameterizedTargetDescriptor(for: event, parameter: parameter, kind: sanitizedKind) : event.targetDescriptor,
+                ocrAnchor: sanitizedByAbstractMining || sanitizedTargetBySingleTeach ? Self.parameterizedAnchor(parameter, kind: sanitizedKind) : Self.ocrAnchor(for: event, contexts: contexts),
+                targetDescriptor: sanitizedByAbstractMining || sanitizedTargetBySingleTeach ? Self.parameterizedTargetDescriptor(for: event, parameter: parameter, kind: sanitizedKind) : event.targetDescriptor,
                 isParameter: parameter != nil,
                 parameterKey: parameter?.parameterKey,
                 parameterKind: parameter?.parameterKind,
@@ -2004,6 +2137,39 @@ public struct WasteDetector: Sendable {
         }
     }
 
+    static func teachInstanceEvents(from events: [InputEvent]) -> [InputEvent] {
+        collapsingTeachScrollGestures(
+            events
+                .filter { !PrivacyRules.isSensitive(appName: $0.appName, bundleIdentifier: $0.bundleIdentifier, windowTitle: $0.windowTitle) }
+                .sorted { $0.capturedAt < $1.capturedAt }
+        )
+    }
+
+    private static func isTeachOnceCandidate(_ instance: [InputEvent], contexts: [RecordedContext]) -> Bool {
+        guard !instance.isEmpty else { return false }
+        for event in instance {
+            switch event.kind {
+            case .type:
+                if !(event.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            case .key:
+                let modifiers = event.modifiers.map { $0.lowercased() }
+                if modifiers.contains("command") || modifiers.contains("control") { return true }
+            case .scroll:
+                let delta = scrollDelta(event)
+                if delta.dx != 0 || delta.dy != 0 { return true }
+            case .click, .doubleClick, .rightClick:
+                if hasSemanticClickEvidence(event, contexts: contexts) { return true }
+            }
+        }
+        return false
+    }
+
+    private static func hasSemanticClickEvidence(_ event: InputEvent, contexts: [RecordedContext]) -> Bool {
+        if !(event.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if !(event.targetDescriptor ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        return !(ocrAnchor(for: event, contexts: contexts) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// The bar a recorded instance must clear to become an automatable workflow:
     /// ≥2 structural actions (clicks / command shortcuts) AND one intent marker —
     /// a click on a *named* element, a real shortcut, or a cross-app flow. Two
@@ -2064,6 +2230,102 @@ public struct WasteDetector: Sendable {
             out.append(event)
         }
         return out
+    }
+
+    private static let teachScrollGestureWindow: TimeInterval = 0.65
+    private static let teachScrollPointerBucketSize = 64.0
+
+    private static func collapsingTeachScrollGestures(_ events: [InputEvent]) -> [InputEvent] {
+        var out: [InputEvent] = []
+        var previousRaw: InputEvent?
+        for event in events {
+            defer { previousRaw = event }
+            guard event.kind == .scroll,
+                  let previousRaw,
+                  previousRaw.kind == .scroll,
+                  let last = out.last,
+                  last.kind == .scroll,
+                  canMergeTeachScroll(previous: last, next: event, previousRaw: previousRaw)
+            else {
+                out.append(event)
+                continue
+            }
+            let old = scrollDelta(last)
+            let new = scrollDelta(event)
+            out[out.count - 1] = copyScrollEvent(
+                last,
+                modifiers: [scrollDeltaString(old.dx + new.dx), scrollDeltaString(old.dy + new.dy)]
+            )
+        }
+        return out
+    }
+
+    private static func canMergeTeachScroll(previous: InputEvent, next: InputEvent, previousRaw: InputEvent) -> Bool {
+        guard next.capturedAt.timeIntervalSince(previousRaw.capturedAt) <= teachScrollGestureWindow,
+              previous.appName == next.appName,
+              previous.bundleIdentifier == next.bundleIdentifier,
+              teachScrollWindowIdentity(previous) == teachScrollWindowIdentity(next),
+              teachScrollPointerBucket(previous) == teachScrollPointerBucket(next),
+              let previousDirection = teachScrollDirection(previous),
+              let nextDirection = teachScrollDirection(next),
+              previousDirection == nextDirection
+        else { return false }
+        return true
+    }
+
+    private static func scrollDelta(_ event: InputEvent) -> (dx: Double, dy: Double) {
+        let dx = Double(event.modifiers.first ?? "0") ?? 0
+        let dy = Double(event.modifiers.dropFirst().first ?? "0") ?? 0
+        return (dx, dy)
+    }
+
+    private static func teachScrollDirection(_ event: InputEvent) -> String? {
+        let delta = scrollDelta(event)
+        let absX = abs(delta.dx), absY = abs(delta.dy)
+        guard absX > 0 || absY > 0 else { return nil }
+        if absX > absY {
+            return "x:\(delta.dx > 0 ? 1 : -1)"
+        }
+        return "y:\(delta.dy > 0 ? 1 : -1)"
+    }
+
+    private static func teachScrollWindowIdentity(_ event: InputEvent) -> String {
+        if let document = WebAppIdentity.from(windowTitle: event.windowTitle), !document.isEmpty {
+            return "document:\(document)"
+        }
+        let title = event.windowTitle?
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return "window:\(title)"
+    }
+
+    private static func teachScrollPointerBucket(_ event: InputEvent) -> String {
+        guard let x = event.x, let y = event.y else { return "none" }
+        let bx = Int((x / teachScrollPointerBucketSize).rounded(.down))
+        let by = Int((y / teachScrollPointerBucketSize).rounded(.down))
+        return "\(bx):\(by)"
+    }
+
+    private static func copyScrollEvent(_ event: InputEvent, modifiers: [String]) -> InputEvent {
+        InputEvent(
+            id: event.id,
+            capturedAt: event.capturedAt,
+            kind: event.kind,
+            x: event.x,
+            y: event.y,
+            text: event.text,
+            key: event.key,
+            modifiers: modifiers,
+            appName: event.appName,
+            bundleIdentifier: event.bundleIdentifier,
+            windowTitle: event.windowTitle,
+            targetDescriptor: event.targetDescriptor
+        )
+    }
+
+    private static func scrollDeltaString(_ value: Double) -> String {
+        value.rounded() == value ? "\(Int(value))" : "\(value)"
     }
 
     /// Greedily selects non-overlapping occurrences (each at least `length` apart).

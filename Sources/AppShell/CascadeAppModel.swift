@@ -7118,7 +7118,7 @@ public final class CascadeAppModel: ObservableObject {
                 teachStatus = nil
                 teachPreview = curated
             } else {
-                flashTeachStatus("Nothing repeatable in that demonstration yet — try the task again.")
+                flashTeachStatus("I didn't catch enough concrete actions to build an agent from that demonstration. Try a short, clear sequence with a click, shortcut, typed value, or copy/paste step.")
             }
         } catch {
             flashTeachStatus("Couldn't build an agent from that: \(error.localizedDescription)")
@@ -8604,7 +8604,10 @@ public final class CascadeAppModel: ObservableObject {
                     agent,
                     reason: "this step enters a value that changes each run, and I need the current one",
                     failureKind: .parameterNeedsLiveValue,
-                    recoveryAction: recovery
+                    recoveryAction: recovery,
+                    sortedSteps: steps,
+                    currentIndex: index,
+                    triggeringStep: step
                 )
                 stoppedEarly = true
                 break
@@ -8630,7 +8633,10 @@ public final class CascadeAppModel: ObservableObject {
                                 agent,
                                 reason: reason,
                                 failureKind: .wrongStartState,
-                                recoveryAction: recovery
+                                recoveryAction: recovery,
+                                sortedSteps: steps,
+                                currentIndex: index,
+                                triggeringStep: step
                             )
                             stoppedEarly = true
                             break
@@ -8647,7 +8653,10 @@ public final class CascadeAppModel: ObservableObject {
                             agent,
                             reason: "an unexpected dialog (“\(modalTitle)”) appeared",
                             failureKind: .unexpectedModal,
-                            recoveryAction: recovery
+                            recoveryAction: recovery,
+                            sortedSteps: steps,
+                            currentIndex: index,
+                            triggeringStep: step
                         )
                         stoppedEarly = true
                         break
@@ -8655,8 +8664,29 @@ public final class CascadeAppModel: ObservableObject {
                 }
                 if let x = step.x, let y = step.y,
                    step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick {
+                    if Self.recipeStepBlocksOneShotCoordinateReplay(step, evidenceCount: agent.evidenceCount) {
+                        let recovery = Self.recoveryAction(for: .targetNotFound, attempt: 1)
+                        _ = try? await store.appendAudit(AuditEvent(
+                            actor: "agent",
+                            action: "recipe.pause.coordinate_only",
+                            detail: Self.recipeAuditDetail(step)
+                                + " failureKind=\(AgentOrchestrator.AgentFailureKind.targetNotFound.rawValue)"
+                                + " recoveryAction=\(recovery.rawValue)"
+                        ))
+                        await escalateRecipeToAssist(
+                            agent,
+                            reason: "this one-time demonstration only recorded a coordinate for this click",
+                            failureKind: .targetNotFound,
+                            recoveryAction: recovery,
+                            sortedSteps: steps,
+                            currentIndex: index,
+                            triggeringStep: step
+                        )
+                        stoppedEarly = true
+                        break
+                    }
                     let recorded = CGPoint(x: x, y: y)
-                    // Canvas apps (Blender) have an AX tree that never reflects
+	                    // Canvas apps (Blender) have an AX tree that never reflects
 	                    // their visible UI — the skill flags them so replay skips the
 	                    // AX tier and fingerprint verification instead of false-pausing.
 	                    let stepSkill = appSkills.skill(appName: step.appName, bundleIdentifier: step.bundleIdentifier)
@@ -8841,14 +8871,17 @@ public final class CascadeAppModel: ObservableObject {
                                         candidateCount: axResolution.topCandidates.count
                                     )
                                 ))
-                                await escalateRecipeToAssist(
-                                    agent,
-                                    reason: "multiple current targets match this recorded click",
-                                    failureKind: .targetNotFound,
-                                    recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
-                                    ambiguityChoices: choices,
-                                    ambiguityFrames: axResolution.topCandidates.compactMap { $0.candidate.frame }
-                                )
+	                                await escalateRecipeToAssist(
+	                                    agent,
+	                                    reason: "multiple current targets match this recorded click",
+	                                    failureKind: .targetNotFound,
+	                                    recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
+	                                    sortedSteps: steps,
+	                                    currentIndex: index,
+	                                    triggeringStep: step,
+	                                    ambiguityChoices: choices,
+	                                    ambiguityFrames: axResolution.topCandidates.compactMap { $0.candidate.frame }
+	                                )
                                 stoppedEarly = true
                                 break
                             }
@@ -8936,14 +8969,17 @@ public final class CascadeAppModel: ObservableObject {
                                         targetCandidateCount = axResolution?.topCandidates.count
                                         targetAnchorHash = nil
                                     } else if let axResolution {
-                                        await escalateRecipeToAssist(
-                                            agent,
-                                            reason: "the recorded target is low-confidence in the current UI",
-                                            failureKind: .targetNotFound,
-                                            recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
-                                            ambiguityChoices: Self.recipeCandidateChoices(axResolution.topCandidates),
-                                            ambiguityFrames: axResolution.topCandidates.compactMap { $0.candidate.frame }
-                                        )
+	                                        await escalateRecipeToAssist(
+	                                            agent,
+	                                            reason: "the recorded target is low-confidence in the current UI",
+	                                            failureKind: .targetNotFound,
+	                                            recoveryAction: Self.recoveryAction(for: .targetNotFound, attempt: 1),
+	                                            sortedSteps: steps,
+	                                            currentIndex: index,
+	                                            triggeringStep: step,
+	                                            ambiguityChoices: Self.recipeCandidateChoices(axResolution.topCandidates),
+	                                            ambiguityFrames: axResolution.topCandidates.compactMap { $0.candidate.frame }
+	                                        )
                                         stoppedEarly = true
                                         break
                                     } else {
@@ -9069,12 +9105,15 @@ public final class CascadeAppModel: ObservableObject {
 	                                        + " delta=\(Self.safeAuditToken(retryVerification.reason))"
 	                                ))
                                 if unverifiedStreak >= 2 {
-                                    await escalateRecipeToAssist(
-                                        agent,
-                                        reason: "the screen no longer matches the recorded steps",
-                                        failureKind: .noEffect,
-                                        recoveryAction: recovery
-                                    )
+	                                    await escalateRecipeToAssist(
+	                                        agent,
+	                                        reason: "the screen no longer matches the recorded steps",
+	                                        failureKind: .noEffect,
+	                                        recoveryAction: recovery,
+	                                        sortedSteps: steps,
+	                                        currentIndex: index,
+	                                        triggeringStep: step
+	                                    )
                                     stoppedEarly = true
                                     break
                                 }
@@ -9140,6 +9179,64 @@ public final class CascadeAppModel: ObservableObject {
         return goal
     }
 
+    static func assistContinuationGoal(
+        for agent: CascadeAgent,
+        reason: String,
+        sortedSteps: [RecipeStep]? = nil,
+        currentIndex: Int? = nil,
+        triggeringStep: RecipeStep? = nil,
+        ambiguityChoices: String? = nil
+    ) -> String {
+        var goal = deployGoal(for: agent)
+        var lines: [String] = []
+        lines.append("Replay continuation:")
+        lines.append("- Escalation reason: \(reason)")
+        if let sortedSteps, let currentIndex {
+            let stepNumber = currentIndex + 1
+            if currentIndex > 0 {
+                lines.append("- Recorded steps before step \(stepNumber) already ran on the live Mac; do not repeat them.")
+            } else {
+                lines.append("- No prior recorded steps ran before this handoff; start at the current step.")
+            }
+            let suffix = Array(sortedSteps.dropFirst(max(0, currentIndex)))
+            let remaining = AgentRecipe(steps: suffix)
+                .humanSteps
+                .filter { $0 != "scroll" }
+                .prefix(10)
+            if !remaining.isEmpty {
+                lines.append("- Remaining recorded process: \(remaining.joined(separator: " → ")).")
+            }
+        }
+        if let triggeringStep, recipeStepNeedsLiveValue(triggeringStep) {
+            if let line = parameterProcedureLine(triggeringStep) {
+                lines.append("Current live slot:")
+                lines.append(line)
+            }
+            if let sortedSteps {
+                let byOrder = Dictionary(uniqueKeysWithValues: sortedSteps.map { ($0.order, $0) })
+                let sourceLabels = triggeringStep.sourceStepIDs
+                    .compactMap { byOrder[$0]?.humanLabel }
+                    .filter { !$0.isEmpty }
+                if !sourceLabels.isEmpty {
+                    lines.append("Source steps: \(sourceLabels.joined(separator: "; ")).")
+                }
+            }
+        }
+        if let ambiguityChoices, !ambiguityChoices.isEmpty {
+            lines.append("Possible current targets: \(ambiguityChoices)")
+        }
+        let sketchGoal = agent.goal?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sketch = agent.demoSketches.first?.promptText
+            ?? TrajectorySketchBuilder(maxActions: 6, maxAnchors: 4, maxChecks: 3, maxCorrections: 2)
+                .build(goal: sketchGoal?.isEmpty == false ? sketchGoal! : agent.name, recipe: agent.recipe)
+                .promptText
+        if !sketch.isEmpty {
+            lines.append(sketch)
+        }
+        goal += "\n\n" + lines.joined(separator: "\n")
+        return goal
+    }
+
     /// Recipe replay drifted from the live UI — instead of pausing, hand the rest of
     /// the job to the FULL assist runtime (skills, harness, streaming) from the current
     /// screen. The "fast deterministic replay, escalate to cursor-class on drift"
@@ -9151,6 +9248,9 @@ public final class CascadeAppModel: ObservableObject {
         reason: String,
         failureKind: AgentOrchestrator.AgentFailureKind? = nil,
         recoveryAction: RecoveryAction? = nil,
+        sortedSteps: [RecipeStep]? = nil,
+        currentIndex: Int? = nil,
+        triggeringStep: RecipeStep? = nil,
         ambiguityChoices: String? = nil,
         ambiguityFrames: [CGRect] = []
     ) async {
@@ -9190,10 +9290,14 @@ public final class CascadeAppModel: ObservableObject {
             return
         }
         guard assistGeneration == gen else { return } // a barge-in superseded us
-        var goal = Self.deployGoal(for: agent)
-        if let ambiguityChoices, !ambiguityChoices.isEmpty {
-            goal += "\nPossible current targets: \(ambiguityChoices)"
-        }
+        let goal = Self.assistContinuationGoal(
+            for: agent,
+            reason: reason,
+            sortedSteps: sortedSteps,
+            currentIndex: currentIndex,
+            triggeringStep: triggeringStep,
+            ambiguityChoices: ambiguityChoices
+        )
         await runAssistTask(goal: goal, screen: screen, firstScreenshotPNG: shot, gen: gen)
         agentMessage = teachMessage
     }
@@ -9213,16 +9317,33 @@ public final class CascadeAppModel: ObservableObject {
     /// "Keynote" must still match a live "Keynote Creator Studio" (the exact-equality
     /// blind spot in `activateAndConfirm`). Pure + unit-pinned.
     /// Per-step precondition for parameterized replay (Phase 1, AWM-style). A
-    /// `.type` step flagged `isParameter` typed a value that VARIED across the
-    /// recorded occurrences — an order number, a date, a name that changes each
-    /// run. Deterministic replay only has the STALE recorded value, so its
-    /// precondition ("I have the current value") fails: replay must hand off to the
-    /// assist runtime, whose deploy goal is written parameter-aware and supplies
-    /// the right value from context — never blindly retype last run's. Fixed steps
-    /// and pre-`isParameter` recipes return false and replay normally. Pure +
+    /// Parameterized type/paste/click steps carry a value or target that changes each
+    /// run. Deterministic replay only has the stale demonstration value, so it hands
+    /// off to the assist runtime to supply the current value from context. Fixed
+    /// steps and pre-`isParameter` recipes return false and replay normally. Pure +
     /// pinned. See [[cascade-cu-downgrade-research]].
     nonisolated static func recipeStepNeedsLiveValue(_ step: RecipeStep) -> Bool {
-        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+        step.isParameter
+            && (step.kind == .type || recipeStepIsTargetClick(step) || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+    }
+
+    nonisolated static func recipeStepIsTargetClick(_ step: RecipeStep) -> Bool {
+        step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick
+    }
+
+    nonisolated static func recipeStepHasSemanticReplayTarget(_ step: RecipeStep) -> Bool {
+        [step.text, step.targetDescriptor, step.ocrAnchor].contains { value in
+            value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }
+    }
+
+    nonisolated static func recipeStepIsCoordinateOnlyReplayTarget(_ step: RecipeStep) -> Bool {
+        guard step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick else { return false }
+        return step.x != nil && step.y != nil && !recipeStepHasSemanticReplayTarget(step)
+    }
+
+    nonisolated static func recipeStepBlocksOneShotCoordinateReplay(_ step: RecipeStep, evidenceCount: Int) -> Bool {
+        evidenceCount == 1 && recipeStepIsCoordinateOnlyReplayTarget(step)
     }
 
     nonisolated static func isPasteShortcut(_ step: RecipeStep) -> Bool {

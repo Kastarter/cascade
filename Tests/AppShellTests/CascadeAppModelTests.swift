@@ -926,9 +926,11 @@ func parameterTypeStepEscalatesInsteadOfReplayingStaleValue() {
     // Old recipes predate isParameter (defaults false) → replay unchanged.
     #expect(!CascadeAppModel.recipeStepNeedsLiveValue(
         RecipeStep(order: 2, kind: .type, text: "anything", appName: "Mail")))
-    // Only .type carries a typed value; a click never needs a live value.
+    // Parameterized clicks represent run-specific target labels and need the current target.
+    #expect(CascadeAppModel.recipeStepNeedsLiveValue(
+        RecipeStep(order: 1, kind: .click, x: 1, y: 1, text: "personName slot", appName: "Mail", isParameter: true)))
     #expect(!CascadeAppModel.recipeStepNeedsLiveValue(
-        RecipeStep(order: 1, kind: .click, x: 1, y: 1, appName: "Mail", isParameter: true)))
+        RecipeStep(order: 1, kind: .click, x: 1, y: 1, text: "Send", appName: "Mail", isParameter: false)))
 }
 
 @Test
@@ -1034,6 +1036,81 @@ func deployGoalLeadsWithCuratedGoalThenRecordedSteps() {
 
     let noGoal = CascadeAgent(name: "Mail thing", source: .detected, signature: "s2", recipe: recipe)
     #expect(CascadeAppModel.deployGoal(for: noGoal).hasPrefix("Mail thing")) // falls back to the name
+}
+
+@MainActor @Test
+func recipeReplayTargetClassifiersSeparateSemanticFromCoordinateOnly() {
+    let textClick = RecipeStep(order: 0, kind: .click, x: 1, y: 1, text: "Send", appName: "Mail")
+    let descriptorClick = RecipeStep(order: 1, kind: .click, x: 1, y: 1, appName: "Mail", targetDescriptor: "role=AXButton id=send")
+    let anchorClick = RecipeStep(order: 2, kind: .click, x: 1, y: 1, appName: "Mail", ocrAnchor: "Archive")
+    let coordinateOnly = RecipeStep(order: 3, kind: .click, x: 1, y: 1, appName: "Mail")
+
+    #expect(CascadeAppModel.recipeStepHasSemanticReplayTarget(textClick))
+    #expect(CascadeAppModel.recipeStepHasSemanticReplayTarget(descriptorClick))
+    #expect(CascadeAppModel.recipeStepHasSemanticReplayTarget(anchorClick))
+    #expect(!CascadeAppModel.recipeStepHasSemanticReplayTarget(coordinateOnly))
+    #expect(CascadeAppModel.recipeStepIsCoordinateOnlyReplayTarget(coordinateOnly))
+    #expect(CascadeAppModel.recipeStepBlocksOneShotCoordinateReplay(coordinateOnly, evidenceCount: 1))
+    #expect(!CascadeAppModel.recipeStepBlocksOneShotCoordinateReplay(coordinateOnly, evidenceCount: 2))
+    #expect(!CascadeAppModel.recipeStepIsCoordinateOnlyReplayTarget(textClick))
+}
+
+@MainActor @Test
+func assistContinuationGoalCarriesCurrentSlotAndDemoContextWithoutLiteralReplay() {
+    let demoLiteral = "ACME-DEMO-SECRET-420"
+    let recipe = AgentRecipe(steps: [
+        RecipeStep(order: 0, kind: .click, x: 10, y: 10, appName: "Mail", ocrAnchor: "Invoice total"),
+        RecipeStep(order: 1, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        RecipeStep(order: 2, kind: .click, x: 20, y: 20, appName: "Numbers", ocrAnchor: "Amount"),
+        RecipeStep(
+            order: 3,
+            kind: .type,
+            text: demoLiteral,
+            appName: "Numbers",
+            isParameter: true,
+            parameterKey: "invoice_total",
+            parameterKind: .currency,
+            valueHashes: [AuditIdentity.hash(demoLiteral)],
+            sourceStepIDs: [0]
+        ),
+    ])
+    let agent = CascadeAgent(
+        name: "Copy invoice total",
+        source: .detected,
+        signature: "copy-total",
+        recipe: recipe,
+        apps: ["Mail", "Numbers"],
+        evidenceCount: 1,
+        goal: "Copy the current invoice total from Mail into Numbers",
+        demoSketches: [
+            AgentDemoSketch(
+                id: "demo",
+                appName: "Mail",
+                normalizedGoalTokens: ["copy", "invoice", "total"],
+                promptText: "TRAJECTORY SKETCH\napp: Mail\nfirst_actions:\n1. click \"Invoice total\"",
+                actionCount: 1,
+                anchorCount: 1,
+                checkCount: 0
+            )
+        ]
+    )
+
+    let goal = CascadeAppModel.assistContinuationGoal(
+        for: agent,
+        reason: "this step needs the current value",
+        sortedSteps: recipe.steps.sorted { $0.order < $1.order },
+        currentIndex: 3,
+        triggeringStep: recipe.steps[3]
+    )
+
+    #expect(goal.contains("Recorded steps before step 4 already ran"))
+    #expect(goal.contains("Current live slot:"))
+    #expect(goal.contains("invoice_total"))
+    #expect(goal.contains("<invoice_total>"))
+    #expect(goal.contains("Source steps: click “Invoice total”"))
+    #expect(goal.contains("Remaining recorded process: type"))
+    #expect(goal.contains("TRAJECTORY SKETCH"))
+    #expect(!goal.contains(demoLiteral))
 }
 
 @MainActor @Test
@@ -1245,6 +1322,14 @@ private func taughtCopyPasteEvents(at now: Date) -> [InputEvent] {
     ]
 }
 
+private func taughtSingleAppTypeEvents(at now: Date) -> [InputEvent] {
+    [
+        InputEvent(id: 10, capturedAt: now.addingTimeInterval(0.000), kind: .click, x: 10, y: 10, text: "Message", appName: "Notes"),
+        InputEvent(id: 11, capturedAt: now.addingTimeInterval(0.001), kind: .type, text: "typed 13 chars", appName: "Notes"),
+        InputEvent(id: 12, capturedAt: now.addingTimeInterval(0.002), kind: .key, key: "Return", appName: "Notes"),
+    ]
+}
+
 /// A taught proposal built directly, so the create/review paths can be tested without
 /// driving a live demonstration.
 private func taughtCurated(signature: String = "sig-taught", name: String = "My taught task") -> CuratedAgent {
@@ -1278,6 +1363,42 @@ func teachOnceBracketsTheDemonstrationIntoAPreview() async throws {
     try await waitUntil({ model.teachPreview != nil }, maxTries: 500)
     #expect(model.teachPreview?.name == "Reply to refund emails with the policy link")
     #expect(model.teachPreview?.apps == ["Mail", "Numbers"])
+}
+
+@MainActor @Test
+func teachOnceNoCandidateDoesNotAskForRepeatability() async throws {
+    let (model, _) = try makeModel()
+    model.beginTeaching()
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+
+    try await waitUntil({ model.teachStatus?.contains("concrete actions") == true }, maxTries: 500)
+    let status = try #require(model.teachStatus)
+    #expect(model.teachPreview == nil)
+    #expect(!status.localizedCaseInsensitiveContains("repeatable"))
+    #expect(!status.localizedCaseInsensitiveContains("try the task again"))
+    #expect(status.contains("short, clear sequence"))
+    #expect(status.contains("click, shortcut, typed value, or copy/paste step"))
+}
+
+@MainActor @Test
+func teachOnceSingleAppDemoBuildsPreview() async throws {
+    let reply = #"{"agents":[{"index":0,"name":"Draft the Notes message","why":"shown once","goal":"Draft the current message in Notes and submit it.","value":0.8}]}"#
+    let (model, store) = try makeModel(curatorReply: reply)
+    model.beginTeaching()
+
+    let now = Date()
+    try await store.insertInputEvents(taughtSingleAppTypeEvents(at: now))
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+
+    try await waitUntil({ model.teachPreview != nil }, maxTries: 500)
+    let preview = try #require(model.teachPreview)
+    let type = try #require(preview.source.recipe.steps.first { $0.kind == .type })
+    #expect(preview.name == "Draft the Notes message")
+    #expect(preview.apps == ["Notes"])
+    #expect(type.isParameter)
+    #expect(type.text == "freeText:typed 13 chars")
 }
 
 @MainActor @Test

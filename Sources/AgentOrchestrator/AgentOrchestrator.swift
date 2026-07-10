@@ -57,8 +57,8 @@ public extension AgentAction {
             guard let key = step.key else { return nil }
             self = .computerUse(.key(key, modifiers: step.modifiers))
         case .scroll:
-            let deltaY = Double(step.modifiers.first ?? "0") ?? 0
-            let deltaX = Double(step.modifiers.dropFirst().first ?? "0") ?? 0
+            let deltaX = Double(step.modifiers.first ?? "0") ?? 0
+            let deltaY = Double(step.modifiers.dropFirst().first ?? "0") ?? 0
             self = .computerUse(.scroll(deltaX: deltaX, deltaY: deltaY))
         }
     }
@@ -106,9 +106,14 @@ public struct AgentCreationPlan: Sendable, Equatable {
         public let hasCoordinate: Bool
         public let targetDescriptorHash: String?
         public let anchorHash: String?
+        public let targetTextHash: String?
+
+        public var hasSemanticReplayTarget: Bool {
+            targetDescriptorHash != nil || anchorHash != nil || targetTextHash != nil
+        }
 
         public var hasReplayTarget: Bool {
-            hasCoordinate || targetDescriptorHash != nil || anchorHash != nil
+            hasCoordinate || hasSemanticReplayTarget
         }
     }
 
@@ -152,7 +157,7 @@ public struct AgentCreationPlan: Sendable, Equatable {
             "surfaceCount=\(surfaceFlow.count)",
             "surfaceFlowHash=\(AuditIdentity.hash(surfaceFlow.map(\.surfaceHash).joined(separator: "|")))",
             "targetCount=\(targetChecks.count)",
-            "anchoredTargetCount=\(targetChecks.filter(\.hasReplayTarget).count)",
+            "anchoredTargetCount=\(targetChecks.filter(\.hasSemanticReplayTarget).count)",
             "liveSlotCount=\(liveValueSlots.count)",
             "dataflowEdgeCount=\(dataflowEdges.count)",
             "dataflowEdgeHash=\(AuditIdentity.hash(dataflowEdges.map(\.edgeHash).joined(separator: "|")))"
@@ -260,9 +265,17 @@ public struct AgentPlanSynthesizer: Sendable {
             surfaceHash: AuditIdentity.hash(surfaceIdentity(step)),
             documentHash: step.documentIdentityHash,
             hasCoordinate: step.x != nil && step.y != nil,
-            targetDescriptorHash: step.targetDescriptor.map(AuditIdentity.hash),
-            anchorHash: step.ocrAnchor.map(AuditIdentity.hash)
+            targetDescriptorHash: hashedNonEmpty(step.targetDescriptor),
+            anchorHash: hashedNonEmpty(step.ocrAnchor),
+            targetTextHash: hashedNonEmpty(step.text)
         )
+    }
+
+    private static func hashedNonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return AuditIdentity.hash(trimmed)
     }
 
     private static func liveValueSlot(for step: RecipeStep) -> AgentCreationPlan.LiveValueSlot {
@@ -298,7 +311,12 @@ public struct AgentPlanSynthesizer: Sendable {
     }
 
     private static func isLiveValueStep(_ step: RecipeStep) -> Bool {
-        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+        step.isParameter
+            && (step.kind == .type || isTargetClick(step) || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+    }
+
+    private static func isTargetClick(_ step: RecipeStep) -> Bool {
+        step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick
     }
 
     private static func isPasteShortcut(_ step: RecipeStep) -> Bool {
@@ -331,6 +349,9 @@ public struct AgentPlanValidator: Sendable {
 
         let missingTargets = plan.targetChecks.filter { !$0.hasReplayTarget }
         if !missingTargets.isEmpty { issues.append("missing_replay_targets") }
+        if plan.occurrenceCount == 1 && plan.targetChecks.contains(where: { $0.hasCoordinate && !$0.hasSemanticReplayTarget }) {
+            issues.append("coordinate_only_replay_target")
+        }
 
         let targetOrders = Set(plan.targetChecks.map(\.order))
         if targetOrders.count != plan.targetChecks.count { issues.append("duplicate_target_orders") }

@@ -81,7 +81,7 @@ public struct WorkflowCurator: Sendable {
     private let cachedClient: ValidatingCachedMessageCompleter?
     private let model: String
     static let curatePromptVersion = "workflow-curator.curate.prompt.v1"
-    static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v2"
+    static let curateOnePromptVersion = "workflow-curator.curate-one.prompt.v3"
     static let curateContextPromptVersion = "workflow-curator.context-waste.prompt.v1"
     static let schemaVersion = "workflow-curator.schema.v1"
 
@@ -246,12 +246,12 @@ public struct WorkflowCurator: Sendable {
     emails", "update the Q2 pipeline sheet"), not generic. Never invent steps the \
     recipe does not contain, and never copy private values verbatim into the goal.
 
-    When the recipe lists live slots or parameters (values typed or pasted during the \
-    demonstration), those fields likely change each run — a date, an order number, an \
-    amount. They demonstrated ONE example; write the goal so the agent supplies the \
-    CURRENT/appropriate value at run time (e.g. "…using today's date", "…for the \
-    latest invoice"), and never bake the demonstrated value into the goal as if it \
-    were fixed.
+    Treat demonstration literals as examples, even when the recipe does not list a \
+    live slot. Typed text, pasted clipboard content, selected row names, emails, IDs, \
+    dates, amounts, URLs, and free text are run-specific values unless the user's \
+    narration explicitly says they are fixed boilerplate. The goal should name the \
+    role/source and CURRENT-RUN value the agent must use (e.g. "…using the current \
+    invoice number", "…for the selected customer"), never the demonstrated literal.
 
     Reply with ONLY this JSON, no prose:
     {"agents":[{"index":0,"name":"...","why":"...","goal":"...","value":0.8}]}
@@ -494,7 +494,12 @@ public struct WorkflowCurator: Sendable {
     }
 
     private static func isLiveValueStep(_ step: RecipeStep) -> Bool {
-        step.isParameter && (step.kind == .type || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+        step.isParameter
+            && (step.kind == .type || isTargetClick(step) || isPasteShortcut(step) || !step.sourceStepIDs.isEmpty)
+    }
+
+    private static func isTargetClick(_ step: RecipeStep) -> Bool {
+        step.kind == .click || step.kind == .doubleClick || step.kind == .rightClick
     }
 
     private static func isPasteShortcut(_ step: RecipeStep) -> Bool {
