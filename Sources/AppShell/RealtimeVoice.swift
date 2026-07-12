@@ -155,6 +155,12 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     private var keyUpAtMs: Int?
     private var partialTranscript = ""
     private let lock = NSLock()
+    /// Serializes server-buffer mutations with terminal capture close. The audio tap
+    /// runs off-main while `endTalking` releases on the main actor; without this
+    /// boundary, VAD could decide `[append, commit]`, reset its turn state, and then
+    /// lose the race to a close that sent `clear` between those two events.
+    private let deliveryLock = NSLock()
+    private var closed = false
 
     init(
         mode: Mode,
@@ -198,29 +204,44 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     }
 
     func ingestConvertedPCM16(_ data: Data) {
-        guard mode != .passthroughRelease else {
+        let samples: [Int16]?
+        if mode == .passthroughRelease {
+            samples = nil
+        } else {
+            let converted = data.withUnsafeBytes { raw in
+                Array(raw.bindMemory(to: Int16.self))
+            }
+            guard !converted.isEmpty else { return }
+            samples = converted
+        }
+
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !closed else { return }
+
+        if mode == .passthroughRelease {
             sender.appendAudio(base64: data.base64EncodedString())
             return
         }
 
-        let samples = data.withUnsafeBytes { raw in
-            Array(raw.bindMemory(to: Int16.self))
-        }
-        guard !samples.isEmpty else { return }
-
-        for action in gatedUploadActions(from: samples) {
+        for action in gatedUploadActions(from: samples ?? []) {
             switch action {
             case .append(let audio):
                 sender.appendAudio(base64: audio.base64EncodedString())
             case .commit:
-                commit()
+                sendCommitLocked()
             }
         }
     }
 
     func release() -> ReleaseResult {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !closed else { return .cleared }
+
         guard mode != .passthroughRelease else {
-            commit()
+            closed = true
+            sendCommitLocked()
             return .committed
         }
 
@@ -230,25 +251,36 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
             let hadAudio = hasUploadedAudio
             lock.unlock()
             if hadAudio {
-                commit()
+                closed = true
+                sendCommitLocked()
                 return .committed
             }
-            clear()
+            closed = true
+            sendClearLocked()
             return .cleared
         case .tailWait(let remainingMs):
             return .tailWait(remainingMs: remainingMs)
         case .clear, .appendOnly:
-            clear()
+            closed = true
+            sendClearLocked()
             return .cleared
         }
     }
 
-    func commit() {
+    private func sendCommitLocked() {
         onCommit(purpose)
         sender.sendEvent(["type": "input_audio_buffer.commit"])
     }
 
     func clear() {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !closed else { return }
+        closed = true
+        sendClearLocked()
+    }
+
+    private func sendClearLocked() {
         sender.sendEvent(["type": "input_audio_buffer.clear"])
     }
 
