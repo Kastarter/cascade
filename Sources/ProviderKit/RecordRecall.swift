@@ -527,6 +527,7 @@ public struct RecordRecall: Sendable {
         let sessions: [ContextKnowledgeGraphNode]
         let relatedNodes: [ContextKnowledgeGraphNode]
         let membershipEdges: [ContextKnowledgeGraphEdge]
+        let observations: [ContextKnowledgeGraphObservation]
         let interval: ClosedRange<Int64>
         let searchTerms: [String]
     }
@@ -606,9 +607,8 @@ public struct RecordRecall: Sendable {
         let label = projectedSessionLabel(for: node, in: projection)
         let evidence = evidenceSnippet(
             for: node,
-            searchTerms: [],
-            includeOutsideInterval: false,
-            interval: projection.interval
+            projection: projection,
+            includeLegacyOutsideInterval: false
         )
         let suffix = evidence.map { " | \(String($0.prefix(400)))" } ?? ""
         return "[KG \(localDayLabel(for: clipped, timeZone: timeZone))] "
@@ -626,9 +626,8 @@ public struct RecordRecall: Sendable {
         var summary = "\(time(clipped.lowerBound, timeZone: timeZone))–\(time(clipped.upperBound, timeZone: timeZone)) \(label)"
         if let evidence = evidenceSnippet(
             for: node,
-            searchTerms: projection.searchTerms,
-            includeOutsideInterval: !projection.searchTerms.isEmpty,
-            interval: projection.interval
+            projection: projection,
+            includeLegacyOutsideInterval: !projection.searchTerms.isEmpty
         ) {
             summary += " · \(evidence)"
         }
@@ -673,23 +672,34 @@ public struct RecordRecall: Sendable {
 
     private static func evidenceSnippet(
         for session: ContextKnowledgeGraphNode,
-        searchTerms: [String],
-        includeOutsideInterval: Bool,
-        interval: ClosedRange<Int64>
+        projection: KnowledgeGraphProjection,
+        includeLegacyOutsideInterval: Bool
     ) -> String? {
-        // Evidence snippets are session-scoped but not individually timestamped.
-        // A narrow timeframe that clips a session therefore uses only its stable
-        // app/window identity; otherwise an OCR fact from outside the requested
-        // minutes could leak into the answer. Search has no requested interval, so
-        // it can safely render the matching session-scoped snippet.
-        let sessionIsContained = interval.lowerBound <= session.firstSeenMs
-            && interval.upperBound >= session.lastSeenMs
-        guard includeOutsideInterval || sessionIsContained else { return nil }
-        if !searchTerms.isEmpty,
-           let match = session.evidenceSnippets.first(where: { value in
-               text(value, containsAny: searchTerms)
+        let timestampedEvidence = projection.observations
+            .filter { $0.sessionID == session.id }
+            .map(\.text)
+        if !projection.searchTerms.isEmpty,
+           let match = timestampedEvidence.first(where: { value in
+               text(value, containsAny: projection.searchTerms)
            }) {
-            return match.replacingOccurrences(of: "\n", with: " · ")
+            return evidenceExcerpt(match, matching: projection.searchTerms)
+        }
+        if let evidence = timestampedEvidence.max(by: { $0.count < $1.count }) {
+            return evidence.replacingOccurrences(of: "\n", with: " · ")
+        }
+
+        // Schema-v1/v2 evidence snippets are session-scoped but not individually
+        // timestamped. A narrow timeframe that clips a legacy session therefore
+        // uses only stable identity; otherwise a fact from outside the requested
+        // minutes could leak into the answer.
+        let sessionIsContained = projection.interval.lowerBound <= session.firstSeenMs
+            && projection.interval.upperBound >= session.lastSeenMs
+        guard includeLegacyOutsideInterval || sessionIsContained else { return nil }
+        if !projection.searchTerms.isEmpty,
+           let match = session.evidenceSnippets.first(where: { value in
+               text(value, containsAny: projection.searchTerms)
+           }) {
+            return evidenceExcerpt(match, matching: projection.searchTerms)
         }
         let normalizedLabel = session.label.lowercased()
         let evidence = session.evidenceSnippets
@@ -700,6 +710,19 @@ public struct RecordRecall: Sendable {
             }
             ?? session.evidenceSnippets.max(by: { $0.count < $1.count })
         return evidence?.replacingOccurrences(of: "\n", with: " · ")
+    }
+
+    private static func evidenceExcerpt(_ value: String, matching terms: [String]) -> String {
+        let flattened = value.replacingOccurrences(of: "\n", with: " · ")
+        let match = terms.compactMap { term in
+            flattened.range(of: term, options: [.caseInsensitive, .diacriticInsensitive])
+        }.min { $0.lowerBound < $1.lowerBound }
+        guard let match else { return String(flattened.prefix(400)) }
+        let prefix = flattened[..<match.lowerBound].suffix(100)
+        let suffix = flattened[match.lowerBound...].prefix(280)
+        return (prefix.startIndex > flattened.startIndex ? "…" : "")
+            + String(prefix) + String(suffix)
+            + (suffix.endIndex < flattened.endIndex ? "…" : "")
     }
 
     private static func time(_ milliseconds: Int64, timeZone: TimeZone) -> String {
@@ -730,8 +753,13 @@ public struct RecordRecall: Sendable {
             let matchingNodeIDs = Set(graph.nodes.compactMap { node in
                 text(searchableText(for: node), containsAny: terms) ? node.id : nil
             })
+            let matchingObservationSessionIDs = Set(graph.observations.compactMap { observation in
+                text(observation.text, containsAny: terms) ? observation.sessionID : nil
+            })
             selectedSessionIDs = Set(allSessions.compactMap { session in
-                matchingNodeIDs.contains(session.id) ? session.id : nil
+                matchingNodeIDs.contains(session.id) || matchingObservationSessionIDs.contains(session.id)
+                    ? session.id
+                    : nil
             })
             for edge in graph.edges where edge.kind == .sessionMembership {
                 if matchingNodeIDs.contains(edge.from) {
@@ -764,6 +792,11 @@ public struct RecordRecall: Sendable {
                 if $0.type.rawValue != $1.type.rawValue { return $0.type.rawValue < $1.type.rawValue }
                 return $0.id < $1.id
             }
+        let observations = graph.observations.filter { observation in
+            guard sessionIDs.contains(observation.sessionID) else { return false }
+            guard let requestedInterval else { return true }
+            return requestedInterval.contains(observation.capturedAtMs)
+        }
 
         let selectedStart = first.firstSeenMs
         let selectedEnd = sessions.map(\.lastSeenMs).max() ?? first.lastSeenMs
@@ -780,6 +813,7 @@ public struct RecordRecall: Sendable {
             sessions: sessions,
             relatedNodes: relatedNodes,
             membershipEdges: membershipEdges,
+            observations: observations,
             interval: interval,
             searchTerms: terms
         )

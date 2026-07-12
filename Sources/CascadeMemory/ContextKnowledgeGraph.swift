@@ -43,6 +43,7 @@ public struct ContextKnowledgeGraph: Codable, Equatable, Sendable {
     public let summary: String
     public let nodes: [ContextKnowledgeGraphNode]
     public let edges: [ContextKnowledgeGraphEdge]
+    public let observations: [ContextKnowledgeGraphObservation]
 
     public init(
         schemaVersion: Int,
@@ -52,7 +53,8 @@ public struct ContextKnowledgeGraph: Codable, Equatable, Sendable {
         source: Source,
         summary: String,
         nodes: [ContextKnowledgeGraphNode],
-        edges: [ContextKnowledgeGraphEdge]
+        edges: [ContextKnowledgeGraphEdge],
+        observations: [ContextKnowledgeGraphObservation] = []
     ) {
         self.schemaVersion = schemaVersion
         self.partitionKey = partitionKey
@@ -62,6 +64,7 @@ public struct ContextKnowledgeGraph: Codable, Equatable, Sendable {
         self.summary = summary
         self.nodes = nodes
         self.edges = edges
+        self.observations = observations
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -73,6 +76,58 @@ public struct ContextKnowledgeGraph: Codable, Equatable, Sendable {
         case summary
         case nodes
         case edges
+        case observations
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            schemaVersion: try container.decode(Int.self, forKey: .schemaVersion),
+            partitionKey: try container.decode(String.self, forKey: .partitionKey),
+            day: try container.decode(String.self, forKey: .day),
+            range: try container.decode(Range.self, forKey: .range),
+            source: try container.decode(Source.self, forKey: .source),
+            summary: try container.decode(String.self, forKey: .summary),
+            nodes: try container.decode([ContextKnowledgeGraphNode].self, forKey: .nodes),
+            edges: try container.decode([ContextKnowledgeGraphEdge].self, forKey: .edges),
+            observations: try container.decodeIfPresent(
+                [ContextKnowledgeGraphObservation].self,
+                forKey: .observations
+            ) ?? []
+        )
+    }
+}
+
+/// Timestamped, session-linked source text retained after its recorded-context
+/// row expires. Node summaries stay deliberately small for prompt readability;
+/// these observations are the complete privacy-scrubbed searchable evidence.
+public struct ContextKnowledgeGraphObservation: Codable, Equatable, Sendable {
+    public let id: String
+    public let sessionID: String
+    public let appID: String
+    public let capturedAtMs: Int64
+    public let text: String
+
+    public init(
+        id: String,
+        sessionID: String,
+        appID: String,
+        capturedAtMs: Int64,
+        text: String
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.appID = appID
+        self.capturedAtMs = capturedAtMs
+        self.text = text
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "session_id"
+        case appID = "app_id"
+        case capturedAtMs = "captured_at_ms"
+        case text
     }
 }
 
@@ -249,12 +304,11 @@ public struct ContextKnowledgeGraphCompactionResult: Equatable, Sendable {
 }
 
 internal enum ContextKnowledgeGraphBuilder {
-    static let schemaVersion = 2
+    static let schemaVersion = 3
     private static let maxAliases = 12
     private static let maxKeywords = 16
     private static let maxEvidenceSnippets = 8
     private static let maxEvidenceCharacters = 240
-    private static let maxSearchCharacters = 64_000
 
     private struct NodeAccumulator {
         let id: String
@@ -427,6 +481,7 @@ internal enum ContextKnowledgeGraphBuilder {
         var sessionIDByContext: [Int64: String] = [:]
         var nodes: [String: NodeAccumulator] = [:]
         var edges: [EdgeKey: EdgeAccumulator] = [:]
+        var observations: [ContextKnowledgeGraphObservation] = []
 
         for episode in episodes {
             let sessionID = "session:\(day):\(episode.id)"
@@ -480,6 +535,19 @@ internal enum ContextKnowledgeGraphBuilder {
             var observedNodeIDs: Set<String> = []
             var appNodeIDs: Set<String> = []
             var documentNodeIDs: Set<String> = []
+
+            if let sessionID {
+                let text = durableEvidence(from: context)
+                if !text.isEmpty {
+                    observations.append(ContextKnowledgeGraphObservation(
+                        id: "observation:\(context.id)",
+                        sessionID: sessionID,
+                        appID: appID,
+                        capturedAtMs: capturedMs,
+                        text: text
+                    ))
+                }
+            }
 
             for mention in mentions {
                 let identity = nodeIdentity(for: mention, appID: appID)
@@ -565,7 +633,8 @@ internal enum ContextKnowledgeGraphBuilder {
             contextCount: ordered.count,
             maxContextID: ordered.map(\.id).max() ?? 0,
             nodes: nodes.values.map(\.node),
-            edges: edges.values.map(\.edge)
+            edges: edges.values.map(\.edge),
+            observations: observations
         )
     }
 
@@ -617,6 +686,11 @@ internal enum ContextKnowledgeGraphBuilder {
             )
         }
 
+        var observationsByID = Dictionary(uniqueKeysWithValues: existing.observations.map { ($0.id, $0) })
+        for observation in delta.observations {
+            observationsByID[observation.id] = observation
+        }
+
         return makeGraph(
             day: existing.day,
             startMs: min(existing.range.startMs, delta.range.startMs),
@@ -625,7 +699,8 @@ internal enum ContextKnowledgeGraphBuilder {
             contextCount: existing.source.contextCount + delta.source.contextCount,
             maxContextID: max(existing.source.maxContextID, delta.source.maxContextID),
             nodes: nodes.values.map(\.node),
-            edges: edges.values.map(\.edge)
+            edges: edges.values.map(\.edge),
+            observations: Array(observationsByID.values)
         )
     }
 
@@ -640,19 +715,20 @@ internal enum ContextKnowledgeGraphBuilder {
     }
 
     static func searchText(for graph: ContextKnowledgeGraph) -> String {
-        var parts = [graph.summary]
+        var summaryParts = [graph.summary]
         for node in graph.nodes {
-            parts.append(node.label)
-            parts.append(node.canonicalValue)
-            parts.append(contentsOf: node.aliases)
-            parts.append(contentsOf: node.keywords)
-            parts.append(contentsOf: node.evidenceSnippets)
+            summaryParts.append(node.label)
+            summaryParts.append(node.canonicalValue)
+            summaryParts.append(contentsOf: node.aliases)
+            summaryParts.append(contentsOf: node.keywords)
+            summaryParts.append(contentsOf: node.evidenceSnippets)
             if node.type == .session, let description = node.attributes["description"] {
-                parts.append(description)
+                summaryParts.append(description)
             }
         }
-        let unique = stableUnique(parts.map(cleanEvidence).filter { !$0.isEmpty })
-        return String(unique.joined(separator: "\n").prefix(maxSearchCharacters))
+        let searchableEvidence = graph.observations.map(\.text).filter { !$0.isEmpty }
+        let unique = stableUnique(summaryParts.map(cleanEvidence).filter { !$0.isEmpty } + searchableEvidence)
+        return unique.joined(separator: "\n")
     }
 
     private static func makeGraph(
@@ -663,7 +739,8 @@ internal enum ContextKnowledgeGraphBuilder {
         contextCount: Int,
         maxContextID: Int64,
         nodes: [ContextKnowledgeGraphNode],
-        edges: [ContextKnowledgeGraphEdge]
+        edges: [ContextKnowledgeGraphEdge],
+        observations: [ContextKnowledgeGraphObservation]
     ) -> ContextKnowledgeGraph {
         let orderedNodes = nodes.sorted {
             if $0.type.rawValue != $1.type.rawValue { return $0.type.rawValue < $1.type.rawValue }
@@ -674,6 +751,10 @@ internal enum ContextKnowledgeGraphBuilder {
             if $0.from != $1.from { return $0.from < $1.from }
             return $0.to < $1.to
         }
+        let orderedObservations = observations.sorted {
+            if $0.capturedAtMs != $1.capturedAtMs { return $0.capturedAtMs < $1.capturedAtMs }
+            return $0.id < $1.id
+        }
         return ContextKnowledgeGraph(
             schemaVersion: schemaVersion,
             partitionKey: "utc-day:\(day)",
@@ -682,7 +763,8 @@ internal enum ContextKnowledgeGraphBuilder {
             source: .init(contextCount: contextCount, maxContextID: maxContextID),
             summary: summary(day: day, contextCount: contextCount, nodes: orderedNodes),
             nodes: orderedNodes,
-            edges: orderedEdges
+            edges: orderedEdges,
+            observations: orderedObservations
         )
     }
 
@@ -816,6 +898,18 @@ internal enum ContextKnowledgeGraphBuilder {
     }
 
     private static func cleanEvidence(_ value: String) -> String {
+        String(cleanDurableEvidence(value).prefix(maxEvidenceCharacters))
+    }
+
+    private static func durableEvidence(from context: RecordedContext) -> String {
+        let values = [context.windowTitle, context.ocrText]
+            .compactMap { $0 }
+            .map(cleanDurableEvidence)
+            .filter { !$0.isEmpty }
+        return stableUnique(values).joined(separator: " · ")
+    }
+
+    private static func cleanDurableEvidence(_ value: String) -> String {
         let redactedPII = PIIDetector.redact(
             value,
             includeNames: false,
@@ -826,7 +920,7 @@ internal enum ContextKnowledgeGraphBuilder {
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        return String(collapsed.prefix(maxEvidenceCharacters))
+        return collapsed
     }
 
     private static func normalized(_ value: String) -> String {

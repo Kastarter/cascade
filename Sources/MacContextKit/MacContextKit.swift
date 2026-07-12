@@ -242,12 +242,30 @@ public final class ContextRecorder: ObservableObject {
         Task { @MainActor in await recorder.setDemoBurst(enabled) }
     }
 
-    public init(store: CascadeStore, observer: AppWindowObserver = AppWindowObserver(), options: Options = Options()) {
+    public convenience init(
+        store: CascadeStore,
+        observer: AppWindowObserver = AppWindowObserver(),
+        options: Options = Options()
+    ) {
+        self.init(
+            store: store,
+            observer: observer,
+            options: options,
+            maintenanceScheduler: RecorderMaintenanceScheduler(store: store)
+        )
+    }
+
+    internal init(
+        store: CascadeStore,
+        observer: AppWindowObserver = AppWindowObserver(),
+        options: Options = Options(),
+        maintenanceScheduler: RecorderMaintenanceScheduler
+    ) {
         self.store = store
         self.observer = observer
         self.options = options
         self.input = InputRecorder(store: store, policy: options.capturePolicy)
-        self.maintenanceScheduler = RecorderMaintenanceScheduler(store: store)
+        self.maintenanceScheduler = maintenanceScheduler
         let permissions = PermissionProbe.currentStatus()
         status = ContextRecorderStatus(
             running: false,
@@ -255,6 +273,7 @@ public final class ContextRecorder: ObservableObject {
             latestContext: nil,
             message: permissions.canRecordContext ? "Ready to record local context." : "Screen Recording is required before context recording starts."
         )
+        startRetention()
     }
 
     nonisolated static func captureAuditDetail(appName: String, axChars: Int? = nil, ocrChars: Int? = nil) -> String {
@@ -322,7 +341,6 @@ public final class ContextRecorder: ObservableObject {
         // (fail-closed) on Input Monitoring + Accessibility, independent of screen
         // recording.
         input.start()
-        startRetention()
         startIdleHeartbeat()
         startActivationCapture()
         startPowerObservers()
@@ -405,8 +423,7 @@ public final class ContextRecorder: ObservableObject {
         idleHeartbeatTask?.cancel()
         idleHeartbeatTask = nil
         Task {
-            await maintenanceScheduler.stop()
-            await maintenanceScheduler.runOnce(reason: .quit)
+            await maintenanceScheduler.runOnce(reason: .idle)
         }
         for task in scheduledCaptureTasks.values { task.cancel() }
         scheduledCaptureTasks.removeAll()
@@ -422,14 +439,15 @@ public final class ContextRecorder: ObservableObject {
         Task { @MainActor in await recorder.stop() }
     }
 
-    /// Background loop enforcing local retention (7 days / ≤5GB by default): prune
-    /// the DB and delete the frame files it reports, on launch and then hourly.
+    /// Application-lifetime loop enforcing local retention (7 days / ≤5GB by
+    /// default): prune the DB and delete aged frame files on launch and hourly.
+    /// It starts with the recorder facade itself, so capture permission and pause
+    /// state cannot suspend the 24-hour frame deadline.
     private func startRetention() {
         let budget = cadenceController.budget()
         Task {
             await maintenanceScheduler.updateBudget(budget)
             await maintenanceScheduler.start()
-            await maintenanceScheduler.runOnce(reason: .idle)
         }
     }
 

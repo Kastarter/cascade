@@ -189,13 +189,14 @@ func testCompactionDeletesOnlyFramesOlderThan24HoursAndPersistsGraph() async thr
     let encoded = try ContextKnowledgeGraphBuilder.canonicalData(for: graph)
     let decoded = try JSONDecoder().decode(ContextKnowledgeGraph.self, from: encoded)
     #expect(decoded == graph)
-    #expect(graph.schemaVersion == 2)
+    #expect(graph.schemaVersion == 3)
     #expect(graph.partitionKey == "utc-day:\(day)")
     #expect(graph.source.contextCount == 2)
     #expect(graph.range.endMs < EventStoreLayout.capturedMilliseconds(for: cutoff))
     #expect(Set(graph.nodes.map(\.type)) == Set(ContextKnowledgeGraphNode.NodeType.allCases))
     #expect(Set(graph.edges.map(\.kind)) == Set(ContextKnowledgeGraphEdge.Kind.allCases))
     #expect(graph.edges.allSatisfy { !$0.observedAtMs.isEmpty })
+    #expect(graph.observations.count == 2)
 
     let manifest = try #require(try await fixture.store.dayPartitionManifest(dayKey: day))
     #expect(manifest.frameCount == 2) // the equality and 23-hour rows share this UTC day
@@ -529,6 +530,48 @@ func testPruneAfterCompactionPreservesKGAndKGFTS() async throws {
     let graphHits = try await fixture.store.searchKnowledgeGraphs(matching: "elderberryarchive")
     #expect(graphHits.map(\.graph.day).contains(day))
     #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_fts;") == 1)
+}
+
+@Test
+func testCompactionKeepsLateSessionOCRSearchableAfterSourcePrune() async throws {
+    let fixture = try KnowledgeGraphFixture("ContextKGLateSessionOCR")
+    let now = Date()
+    let sessionStart = now.addingTimeInterval(-8 * 24 * 3600)
+    let lateToken = "lateuniquestatuszebra"
+    let frequentTerms = (0..<24).map { "frequentterm\($0)" }.joined(separator: " ")
+    var contexts: [RecordedContext] = []
+
+    for index in 0..<20 {
+        let frame = try fixture.frame("late-session-\(index).heic")
+        let lateFact = index == 13 ? " \(lateToken) amount 4817 approved" : ""
+        contexts.append(RecordedContext(
+            capturedAt: sessionStart.addingTimeInterval(TimeInterval(index * 60)),
+            source: .screen,
+            appName: "Notes",
+            bundleIdentifier: "com.apple.Notes",
+            windowTitle: "Weekly status",
+            ocrText: "context \(index) \(frequentTerms)\(lateFact)",
+            imagePath: frame
+        ))
+    }
+
+    let inserted = try await fixture.store.insertContexts(contexts)
+    let cutoff = now.addingTimeInterval(-24 * 3600)
+    let result = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    let day = EventStoreLayout.utcDayKey(for: sessionStart)
+    let graph = try #require(try await fixture.store.knowledgeGraph(forDay: day))
+
+    #expect(result.isCaughtUp)
+    #expect(result.frameReferencesCleared == contexts.count)
+    #expect(graph.observations.count == contexts.count)
+    #expect(graph.observations.contains { $0.text.contains(lateToken) && $0.text.contains("4817") })
+    #expect(try await fixture.store.searchKnowledgeGraphs(matching: lateToken).map(\.graph.day).contains(day))
+
+    _ = try await fixture.store.prune(maxAge: 7 * 24 * 3600, maxTotalBytes: .max)
+
+    #expect(try await fixture.store.searchContexts(query: lateToken).isEmpty)
+    #expect(try await fixture.store.searchKnowledgeGraphs(matching: lateToken).map(\.graph.day).contains(day))
+    #expect(try await fixture.store.context(id: inserted[13].id) == nil)
 }
 
 @Test

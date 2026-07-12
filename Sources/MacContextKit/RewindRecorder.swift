@@ -450,26 +450,42 @@ enum OCRLineBuilder {
 }
 
 actor RecorderMaintenanceScheduler {
-    private static let intervalSeconds: Int64 = 3600
     private static let catchUpLimit = 24
 
     private let store: CascadeStore
+    private let maintenanceInterval: Duration
+    private let maintenanceTolerance: Duration
+    private let now: @Sendable () -> Date
     private var budget: RecorderCadenceBudget = .normal
     private var pendingSemanticIndex: [Int64: String] = [:]
     private var task: Task<Void, Never>?
 
-    init(store: CascadeStore) {
+    init(
+        store: CascadeStore,
+        maintenanceInterval: Duration = .seconds(3600),
+        maintenanceTolerance: Duration = .seconds(300),
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
         self.store = store
+        self.maintenanceInterval = maintenanceInterval
+        self.maintenanceTolerance = maintenanceTolerance
+        self.now = now
     }
 
     func start() {
         guard task == nil else { return }
+        let interval = maintenanceInterval
+        let tolerance = maintenanceTolerance
         task = Task.detached(priority: .background) { [weak self] in
             while !Task.isCancelled {
-                await self?.runOnce(reason: .idle)
+                if let self {
+                    await self.runScheduledPass()
+                } else {
+                    return
+                }
                 try? await Task.sleep(
-                    for: .seconds(Self.intervalSeconds),
-                    tolerance: .seconds(300)
+                    for: interval,
+                    tolerance: tolerance
                 )
             }
         }
@@ -482,6 +498,10 @@ actor RecorderMaintenanceScheduler {
 
     func updateBudget(_ budget: RecorderCadenceBudget) {
         self.budget = budget
+    }
+
+    func isRunning() -> Bool {
+        task != nil
     }
 
     func enqueueSemanticIndexing(contextID: Int64, text: String) {
@@ -503,6 +523,10 @@ actor RecorderMaintenanceScheduler {
         }
         try? await store.performMaintenance(reason: reason)
         await flushSemanticIndexing()
+    }
+
+    private func runScheduledPass() async {
+        await runOnce(reason: .idle, now: now())
     }
 
     func flushSemanticIndexing() async {

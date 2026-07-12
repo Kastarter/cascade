@@ -387,6 +387,47 @@ func testSearchRecordFallsBackToKGAfterSourcePrune() async throws {
 }
 
 @Test
+func testSearchRecordReturnsLateUnclassifiedOCRFromDurableKG() async throws {
+    let directory = try recallKGDirectory("CascadeRecallKGLateOCR")
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let now = Date()
+    let sessionStart = now.addingTimeInterval(-8 * 24 * 3600)
+    let token = "lateuniquerecallzebra"
+    let frequentTerms = (0..<24).map { "frequentterm\($0)" }.joined(separator: " ")
+    var contexts: [RecordedContext] = []
+
+    for index in 0..<20 {
+        let frame = try writeRecallFrame(named: "late-\(index).heic", in: directory)
+        let lateFact = index == 13 ? " \(token) amount 4817 approved" : ""
+        contexts.append(RecordedContext(
+            capturedAt: sessionStart.addingTimeInterval(TimeInterval(index * 60)),
+            source: .screen,
+            appName: "Notes",
+            bundleIdentifier: "com.apple.Notes",
+            windowTitle: "Weekly status",
+            ocrText: "context \(index) \(frequentTerms)\(lateFact)",
+            imagePath: frame.path
+        ))
+    }
+
+    _ = try await store.insertContexts(contexts)
+    _ = try await store.compactAgedContextsIntoKnowledgeGraph(
+        olderThan: now.addingTimeInterval(-24 * 3600)
+    )
+    _ = try await store.prune(maxAge: 7 * 24 * 3600, maxTotalBytes: .max)
+
+    #expect(try await store.searchContexts(query: token).isEmpty)
+    let utc = try #require(TimeZone(secondsFromGMT: 0))
+    let output = await RecordRecall(store: store, presentationTimeZone: utc)
+        .perform(.search(query: token))
+
+    #expect(output.contains("[KG "))
+    #expect(output.contains(token))
+    #expect(output.contains("4817 approved"))
+    #expect(!output.contains("[#"))
+}
+
+@Test
 func testTimeframeAndSessionsFallBackToKGAfterSourcePrune() async throws {
     let fixture = try await makePrunedKnowledgeGraphStore(token: "amberarchive")
     let formatter = ISO8601DateFormatter()

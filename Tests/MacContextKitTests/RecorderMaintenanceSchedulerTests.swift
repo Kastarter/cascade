@@ -3,6 +3,39 @@ import Foundation
 @testable import MacContextKit
 import Testing
 
+private final class MaintenanceNow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date: Date
+
+    init(_ date: Date) {
+        self.date = date
+    }
+
+    func get() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return date
+    }
+
+    func set(_ date: Date) {
+        lock.lock()
+        self.date = date
+        lock.unlock()
+    }
+}
+
+@MainActor
+private func maintenanceEventually(
+    attempts: Int = 100,
+    _ condition: () async -> Bool
+) async -> Bool {
+    for _ in 0..<attempts {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+    return false
+}
+
 @Test
 func testRunOnceCompactsBeforePruneAtFixedNow() async throws {
     let directory = FileManager.default.temporaryDirectory
@@ -69,4 +102,52 @@ func testRunOnceCompactsBeforePruneAtFixedNow() async throws {
     let recent = try #require(try await store.context(id: inserted[2].id))
     #expect(recent.imagePath == recentPath)
     #expect(FileManager.default.fileExists(atPath: recentPath))
+}
+
+@MainActor @Test
+func testRecorderStartsMaintenanceWithoutCaptureAndKeepsItThroughPause() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("RecorderMaintenancePaused-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let frame = directory.appendingPathComponent("crosses-cutoff.heic")
+    try Data("real paused frame".utf8).write(to: frame, options: .atomic)
+    let initialNow = Date()
+    let context = try await store.insert(RecordedContext(
+        capturedAt: initialNow.addingTimeInterval(-23 * 3600),
+        source: .screen,
+        appName: "Notes",
+        bundleIdentifier: "com.apple.Notes",
+        windowTitle: "Paused retention",
+        ocrText: "pausedretentionmarker must compact after crossing",
+        imagePath: frame.path
+    ))
+    let clock = MaintenanceNow(initialNow)
+    let scheduler = RecorderMaintenanceScheduler(
+        store: store,
+        maintenanceInterval: .milliseconds(20),
+        maintenanceTolerance: .zero,
+        now: { clock.get() }
+    )
+    let recorder = ContextRecorder(store: store, maintenanceScheduler: scheduler)
+
+    #expect(await maintenanceEventually { await scheduler.isRunning() })
+    try? await Task.sleep(for: .milliseconds(80))
+    #expect(FileManager.default.fileExists(atPath: frame.path))
+    #expect(try await store.context(id: context.id)?.imagePath == frame.path)
+
+    recorder.pause()
+    #expect(await scheduler.isRunning())
+    clock.set(initialNow.addingTimeInterval(2 * 3600))
+
+    let deletedWhilePaused = await maintenanceEventually {
+        let stored = try? await store.context(id: context.id)
+        return stored?.imagePath == nil && !FileManager.default.fileExists(atPath: frame.path)
+    }
+    let stillRunning = await scheduler.isRunning()
+    await scheduler.stop()
+
+    #expect(deletedWhilePaused)
+    #expect(stillRunning)
+    #expect(try await store.searchKnowledgeGraphs(matching: "pausedretentionmarker").isEmpty == false)
 }
