@@ -729,6 +729,13 @@ public final class CascadeAppModel: ObservableObject {
         voice.onUtterance = { [weak self] utterance in
             self?.handleCompletedVoiceUtterance(utterance)
         }
+        // Counts-only lifecycle rows (voice.capture) so a silent teach demo names
+        // the dead link: mic never started, audio below the speech gate, commits
+        // without transcripts, or a session that never connected.
+        voice.onCaptureDiagnostics = { [weak self] detail in
+            guard let self else { return }
+            Task { _ = try? await self.store.appendAudit(AuditEvent(actor: "system", action: "voice.capture", detail: detail)) }
+        }
         voice.onPartialUtterance = { [weak self] partial in
             self?.handlePartialVoiceUtterance(partial)
         }

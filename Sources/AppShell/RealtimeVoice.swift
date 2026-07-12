@@ -161,6 +161,13 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     /// lose the race to a close that sent `clear` between those two events.
     private let deliveryLock = NSLock()
     private var closed = false
+    // Counts-only capture forensics: enough to tell a dead mic (no frames) from
+    // below-threshold audio (frames but no confirmed speech) from an endpoint that
+    // never commits (speech but no commits). Read via diagnosticsSummary().
+    private var ingestedFrameTotal = 0
+    private var uploadedFrameTotal = 0
+    private var speechConfirmTotal = 0
+    private var commitTotal = 0
 
     init(
         mode: Mode,
@@ -194,6 +201,18 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         )
     }
 
+    func diagnosticsSummary() -> String {
+        deliveryLock.lock()
+        let commits = commitTotal
+        deliveryLock.unlock()
+        lock.lock()
+        let frames = ingestedFrameTotal
+        let uploaded = uploadedFrameTotal
+        let confirms = speechConfirmTotal
+        lock.unlock()
+        return "frames=\(frames) uploadedFrames=\(uploaded) speechConfirms=\(confirms) commits=\(commits)"
+    }
+
     func captureBufferFrameCount(inputSampleRate: Double) -> AVAudioFrameCount {
         let frames = inputSampleRate * Double(gate.configuration.frameDurationMs) / 1_000.0
         return AVAudioFrameCount(max(1, Int(frames.rounded())))
@@ -222,6 +241,10 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         guard !closed else { return }
 
         if mode == .passthroughRelease {
+            lock.lock()
+            ingestedFrameTotal += 1
+            uploadedFrameTotal += 1
+            lock.unlock()
             sender.appendAudio(base64: data.base64EncodedString())
             return
         }
@@ -270,6 +293,7 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     }
 
     private func sendCommitLocked() {
+        commitTotal += 1
         let eventID = onCommit(purpose)
         sender.sendEvent([
             "type": "input_audio_buffer.commit",
@@ -301,6 +325,9 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
             let frame = Array(pendingSamples.prefix(samplesPerFrame))
             pendingSamples.removeFirst(samplesPerFrame)
             let result = gate.ingestPCM16Frame(frame)
+            ingestedFrameTotal += 1
+            uploadedFrameTotal += result.uploadFrames.count
+            if result.didConfirmSpeech { speechConfirmTotal += 1 }
             if !result.uploadFrames.isEmpty {
                 hasUploadedAudio = true
                 actions.append(.append(Self.pcm16Data(frames: result.uploadFrames)))
@@ -416,6 +443,26 @@ public final class RealtimeVoice: ObservableObject {
 
     /// Spoken phrase handed off to Claude when the user releases the talk key.
     public var onUtterance: ((CompletedUtterance) -> Void)?
+
+    /// Counts-only capture lifecycle forensics ("started"/"failed"/"closed" with the
+    /// endpoint session's frame/speech/commit tallies). The teach narration loss was
+    /// invisible because every link in this chain failed silently; the app audits
+    /// these lines so the next silent demo names the dead link.
+    public var onCaptureDiagnostics: ((String) -> Void)?
+    private var lastPrepareFailureReason = "unknown"
+
+    private static func purposeTag(_ purpose: CapturePurpose) -> String {
+        switch purpose {
+        case .pushToTalk: return "ptt"
+        case .teachAmbient: return "teach"
+        case .unknown: return "unknown"
+        }
+    }
+
+    private func emitCaptureDiagnostics(_ event: String, purpose: CapturePurpose, extra: String = "") {
+        let tail = extra.isEmpty ? "" : " " + extra
+        onCaptureDiagnostics?("purpose=\(Self.purposeTag(purpose)) event=\(event)" + tail)
+    }
     /// Live transcript prefix for UI and safe warmups only. Completed transcripts
     /// remain the only path to execution.
     public var onPartialUtterance: ((String) -> Void)?
@@ -545,6 +592,7 @@ public final class RealtimeVoice: ObservableObject {
         state = .idle
         Task { @MainActor in
             guard await prepareCapture() else {
+                emitCaptureDiagnostics("failed", purpose: request.purpose, extra: "reason=\(lastPrepareFailureReason)")
                 if requestedCapture == request { requestedCapture = nil }
                 return
             }
@@ -633,12 +681,15 @@ public final class RealtimeVoice: ObservableObject {
         if connected { return true }
         guard let key = keyStore.readKey(), !key.isEmpty else {
             permissionMessage = "Add your OpenAI key in Settings to use voice."
+            lastPrepareFailureReason = "no_openai_key"
             return false
         }
         if socket == nil { openSocket(key: key) }
-        return await withCheckedContinuation { continuation in
+        let connectedNow = await withCheckedContinuation { continuation in
             connectWaiters.append(continuation)
         }
+        if !connectedNow { lastPrepareFailureReason = "connect_failed" }
+        return connectedNow
     }
 
     private func openSocket(key: String) {
@@ -655,6 +706,9 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     private func handleClose() {
+        if let activeCapture {
+            emitCaptureDiagnostics("closed", purpose: activeCapture.purpose, extra: "reason=socket_closed " + (endpointSession?.diagnosticsSummary() ?? ""))
+        }
         cancelPendingEndpointCommit(clearBufferedAudio: false)
         stopCapture()
         endpointSession = nil
@@ -804,6 +858,7 @@ public final class RealtimeVoice: ObservableObject {
     private func startCapture(request: CaptureRequest) {
         guard let sender = captureEventSender else {
             permissionMessage = "No microphone input is available."
+            emitCaptureDiagnostics("failed", purpose: request.purpose, extra: "reason=no_sender")
             if requestedCapture == request { requestedCapture = nil }
             state = .idle
             return
@@ -837,10 +892,12 @@ public final class RealtimeVoice: ObservableObject {
             requestedCapture = nil
             activeCapture = request
             state = .listening
+            emitCaptureDiagnostics("started", purpose: request.purpose, extra: "mode=\(endpointMode(for: request.purpose))")
         } catch {
             self.endpointSession = nil
             if requestedCapture == request { requestedCapture = nil }
             permissionMessage = "No microphone input is available."
+            emitCaptureDiagnostics("failed", purpose: request.purpose, extra: "reason=tap_install")
             state = .idle
         }
     }
@@ -881,6 +938,7 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     private func abandonCaptureForNewPushToTalk(_ request: CaptureRequest) {
+        emitCaptureDiagnostics("abandoned", purpose: request.purpose, extra: endpointSession?.diagnosticsSummary() ?? "")
         endpointCommitTask?.cancel()
         endpointCommitTask = nil
         endpointSession?.clear()
@@ -921,6 +979,7 @@ public final class RealtimeVoice: ObservableObject {
 
     private func finishCapture(_ request: CaptureRequest, state newState: VoiceState) {
         guard activeCapture == request else { return }
+        emitCaptureDiagnostics("closed", purpose: request.purpose, extra: endpointSession?.diagnosticsSummary() ?? "")
         stopCapture()
         endpointSession = nil
         activeCapture = nil
@@ -1017,11 +1076,17 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Mic auth
 
     private func ensureMic() async -> Bool {
-        guard audioEnabled else { return false }
+        guard audioEnabled else {
+            lastPrepareFailureReason = "audio_disabled"
+            return false
+        }
         if micAuthorized { return true }
         let granted = await Self.requestMic()
         micAuthorized = granted
-        if !granted { permissionMessage = "Allow Microphone in Settings" }
+        if !granted {
+            permissionMessage = "Allow Microphone in Settings"
+            lastPrepareFailureReason = "mic_denied"
+        }
         return granted
     }
 
