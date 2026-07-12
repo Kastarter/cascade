@@ -330,6 +330,24 @@ public final class CascadeAppModel: ObservableObject {
     /// `beginTeaching` after the spoken prompt, committed in `endTeaching`).
     private var teachAmbientArmed = false
 
+    private struct RecentTeachSession {
+        let id: UUID
+        let start: Date
+        let bracketEnd: Date
+        let endedAt: Date
+        var intentFragments: [String]
+        var revision = 0
+        var initialResultPublished = false
+        var previewSignature: String?
+        var appliedRevision: Int?
+    }
+
+    private var activeTeachSessionID: UUID?
+    private var activeTeachPurpose: RealtimeVoice.CapturePurpose?
+    private var recentTeachSession: RecentTeachSession?
+    private var lateTeachRecurationTask: Task<Void, Never>?
+    private var lateTeachRecurationWorkerID: UUID?
+
     /// The companion-cursor colorway (cursor, trail, ripple, and highlight marquee
     /// all follow it). Picked from the notch; persists across launches.
     @Published public var cursorTheme: CursorTheme {
@@ -531,6 +549,7 @@ public final class CascadeAppModel: ObservableObject {
     /// `runState.reset()` could revive a loop the barge-in just stopped, leaving
     /// two loops fighting over the same cursor.
     private var assistGeneration = 0
+    var currentAssistGeneration: Int { assistGeneration }
     /// Set when the agent used its highlight tool during the current run, so the
     /// end-of-task cleanup doesn't erase the box the user asked to see (it fades
     /// on the overlay's own timer instead).
@@ -560,6 +579,10 @@ public final class CascadeAppModel: ObservableObject {
     private let visualGrounderOverride: (any VisualGrounder)?
     private let localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)?
     private let actionCriticOverride: (any ActionCritic)?
+    private let teachClock: @Sendable () -> Date
+    private let teachSessionIDFactory: @Sendable () -> UUID
+    private let teachRecorderSettleOperation: @Sendable () async -> Void
+    private let teachNarrationDrainOverride: (@Sendable (UUID, Duration) async -> RealtimeVoice.TranscriptionDrainResult)?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -570,7 +593,13 @@ public final class CascadeAppModel: ObservableObject {
         learnedSkillDirectory: URL? = nil,
         visualGrounderOverride: (any VisualGrounder)? = nil,
         localRegionNarrowerOverride: (@Sendable (Data, String, Int, Int) async -> ElementRegion?)? = nil,
-        actionCriticOverride: (any ActionCritic)? = nil
+        actionCriticOverride: (any ActionCritic)? = nil,
+        teachClock: @escaping @Sendable () -> Date = { Date() },
+        teachSessionIDFactory: @escaping @Sendable () -> UUID = { UUID() },
+        teachRecorderSettleOperation: @escaping @Sendable () async -> Void = {
+            try? await Task.sleep(for: .milliseconds(1800))
+        },
+        teachNarrationDrain: (@Sendable (UUID, Duration) async -> RealtimeVoice.TranscriptionDrainResult)? = nil
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
@@ -580,9 +609,13 @@ public final class CascadeAppModel: ObservableObject {
         self.visualGrounderOverride = visualGrounderOverride
         self.localRegionNarrowerOverride = localRegionNarrowerOverride
         self.actionCriticOverride = actionCriticOverride
+        self.teachClock = teachClock
+        self.teachSessionIDFactory = teachSessionIDFactory
+        self.teachRecorderSettleOperation = teachRecorderSettleOperation
+        self.teachNarrationDrainOverride = teachNarrationDrain
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
-        self.voice = RealtimeVoice(audioEnabled: startsSubsystems)
+        self.voice = RealtimeVoice(audioEnabled: startsSubsystems, defaults: defaults)
         let initialCapturePolicy = Self.restoreCapturePrivacyPolicy(defaults: defaults)
         // Production store anchors its audit-chain head in the Keychain so
         // truncation/rewrite of the local audit log is detectable. Tests inject a
@@ -671,8 +704,8 @@ public final class CascadeAppModel: ObservableObject {
         voice.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
-        voice.onUtterance = { [weak self] phrase in
-            self?.teach(question: phrase)
+        voice.onUtterance = { [weak self] utterance in
+            self?.handleCompletedVoiceUtterance(utterance)
         }
         voice.onPartialUtterance = { [weak self] partial in
             self?.handlePartialVoiceUtterance(partial)
@@ -1953,19 +1986,94 @@ public final class CascadeAppModel: ObservableObject {
         return appSkills.appNamed(inGoal: goal)
     }
 
+    private func bufferTeachIntent(_ text: String) {
+        let intent = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !intent.isEmpty else { return }
+        teachIntentBuffer.append(intent)
+        if teachingMode {
+            teachStatus = "I heard “\(intent.prefix(48))”. Keep going; press ⌥⌃T when you're done."
+        }
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "teach.intent",
+                detail: Self.textAuditDetail("intent", intent)
+            ))
+        }
+        voice.done()
+    }
+
+    /// Returns true only for a source-qualified completion from the most recent teach
+    /// capture inside the bounded safety-net window. Time alone is never enough: a PTT
+    /// command in the same 90 seconds bypasses this path in `handleCompletedVoiceUtterance`.
+    @discardableResult
+    private func reconcileLateTeachIntent(_ text: String, sessionID: UUID) -> Bool {
+        let intent = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !intent.isEmpty,
+              var session = recentTeachSession,
+              session.id == sessionID
+        else { return false }
+
+        let elapsed = teachClock().timeIntervalSince(session.endedAt)
+        guard elapsed >= 0, elapsed <= Self.lateTeachIntentWindow else { return false }
+
+        session.intentFragments.append(intent)
+        session.revision += 1
+        recentTeachSession = session
+        teachStatus = "I caught the rest of your narration — updating the taught agent…"
+        Task {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "teach.intent.late",
+                detail: Self.textAuditDetail("intent", intent)
+            ))
+        }
+        voice.done()
+        startLateTeachRecuration()
+        return true
+    }
+
+    func handleCompletedVoiceUtterance(_ utterance: RealtimeVoice.CompletedUtterance) {
+        switch utterance.purpose {
+        case .teachAmbient(let sessionID, _):
+            if activeTeachSessionID == sessionID, teachingMode || teachFinishing {
+                bufferTeachIntent(utterance.text)
+                return
+            }
+            if reconcileLateTeachIntent(utterance.text, sessionID: sessionID) {
+                return
+            }
+            if teachingMode || teachFinishing {
+                // A callback from an older teach capture must never mutate or launch
+                // work during a newer demonstration.
+                voice.done()
+                return
+            }
+            // Once the bounded reconciliation window expires, even a delayed teach
+            // item returns to ordinary routing instead of being quarantined forever.
+            processVoiceQuestion(utterance.text, bufferDuringTeaching: false)
+        case .pushToTalk:
+            // Source-qualified PTT is always a command. In particular, a fresh PTT
+            // utterance cannot be swallowed by the tail of a teach drain.
+            processVoiceQuestion(utterance.text, bufferDuringTeaching: false)
+        case .unknown:
+            // Preserve the legacy behavior for uncorrelated server events.
+            processVoiceQuestion(utterance.text, bufferDuringTeaching: true)
+        }
+    }
+
     public func teach(question: String) {
+        processVoiceQuestion(question, bufferDuringTeaching: true)
+    }
+
+    private func processVoiceQuestion(_ question: String, bufferDuringTeaching: Bool) {
         var q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { teachMessage = "Ask where something is, or what to do."; return }
         // Teach-once: while demonstrating, the user narrates what they're doing.
         // Those words are the agent's INTENT — captured for the curator, never run as
         // a command. Buffer them and stand down; nothing launches mid-demonstration.
-        if teachingMode || teachFinishing {
-            teachIntentBuffer.append(q)
-            if teachingMode {
-                teachStatus = "I heard “\(q.prefix(48))”. Keep going; press ⌥⌃T when you're done."
-            }
-            Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.intent", detail: Self.textAuditDetail("intent", q))) }
-            voice.done()
+        if bufferDuringTeaching, teachingMode || teachFinishing {
+            bufferTeachIntent(q)
             return
         }
         // Voice gives us everything the user says — including acknowledgments
@@ -7177,6 +7285,8 @@ public final class CascadeAppModel: ObservableObject {
     /// the recorded hotkey combo without dropping real work (the user is mid-keystroke
     /// reaching for the chord, not acting in the app).
     private static let teachFinishGuard: TimeInterval = 0.3
+    private static let teachNarrationDrainTimeout: Duration = .seconds(90)
+    private static let lateTeachIntentWindow: TimeInterval = 90
 
     /// ⌥⌃T toggles a demonstration: first press starts the bracket, second press ends
     /// it and curates the recording into an agent.
@@ -7209,11 +7319,23 @@ public final class CascadeAppModel: ObservableObject {
     /// be the agent's, not the user's hand).
     public func beginTeaching() {
         guard !teachingMode else { return }
+        guard !teachFinishing else { return }
         guard !assistTaskRunning, !agentRunning else {
             flashTeachStatus("Finish the running task before teaching.")
             return
         }
-        teachStartedAt = Date()
+        lateTeachRecurationTask?.cancel()
+        lateTeachRecurationTask = nil
+        lateTeachRecurationWorkerID = nil
+        recentTeachSession = nil
+        let sessionID = teachSessionIDFactory()
+        let purpose = RealtimeVoice.CapturePurpose.teachAmbient(
+            sessionID: sessionID,
+            automaticEndpointing: RealtimeVoice.teachAmbientVoiceEndpointingEnabled(defaults: defaultsStore)
+        )
+        teachStartedAt = teachClock()
+        activeTeachSessionID = sessionID
+        activeTeachPurpose = purpose
         teachIntentBuffer.removeAll()
         teachFinishing = false
         teachAmbientArmed = false
@@ -7232,10 +7354,15 @@ public final class CascadeAppModel: ObservableObject {
         // (no key to hold); the delay lets the acknowledgement finish before the mic's
         // barge-in would cut it off.
         voice.speak("Okay, I'm watching — go ahead and show me.")
-        Task { [weak self] in
+        Task { [weak self, purpose, sessionID] in
             try? await Task.sleep(for: .milliseconds(1800))
-            guard let self, self.teachingMode, !self.assistTaskRunning, !self.agentRunning else { return }
-            self.voice.beginTalking()
+            guard let self,
+                  self.teachingMode,
+                  self.activeTeachSessionID == sessionID,
+                  !self.assistTaskRunning,
+                  !self.agentRunning
+            else { return }
+            self.voice.beginTalking(purpose: purpose)
             self.teachAmbientArmed = true
             self.teachStatus = "Listening — talk me through it as you work. Press ⌥⌃T when you're done."
         }
@@ -7246,57 +7373,184 @@ public final class CascadeAppModel: ObservableObject {
     /// in the preview sheet). The curation rides the SAME spine as auto-detection —
     /// `curateRange` → `DetectedWaste` → `curateOne` → the existing `createAgent`.
     public func endTeaching() {
-        guard teachingMode, let start = teachStartedAt else { return }
+        guard teachingMode,
+              let start = teachStartedAt,
+              let sessionID = activeTeachSessionID,
+              let purpose = activeTeachPurpose
+        else { return }
         // The finishing ⌥⌃T press is itself recorded (control+option = a structural
         // key combo), so end the bracket just BEFORE it — otherwise it becomes a
         // spurious recipe step that on replay would re-trigger teaching. (The start
         // press is already excluded: it lands before `teachStartedAt` was stamped.)
         // The guard only drops the fraction of a second around the hotkey, where the
         // user is reaching for keys, never doing the task.
-        let end = max(start, Date().addingTimeInterval(-Self.teachFinishGuard))
+        let endedAt = teachClock()
+        let end = max(start, endedAt.addingTimeInterval(-Self.teachFinishGuard))
         teachingMode = false
+        teachFinishing = true
         teachStartedAt = nil
         recorder.setDemoBurst(false)
+        recentTeachSession = RecentTeachSession(
+            id: sessionID,
+            start: start,
+            bracketEnd: end,
+            endedAt: endedAt,
+            intentFragments: []
+        )
+        teachStatus = "Finishing your narration…"
         // Close the mic. The final sentence can still be transcribing, so keep routing
-        // late utterances into the intent buffer through the finish window —
-        // buildTaughtAgent reads it after a short settle.
-        if teachAmbientArmed { voice.endTalking(); teachAmbientArmed = false }
-        teachFinishing = true
-        teachStatus = "Saving your demonstration…"
-        Task { await buildTaughtAgent(from: start, to: end) }
+        // source-qualified utterances into the intent buffer until every commit from
+        // this teach capture settles (or the bounded liveness timeout expires).
+        if teachAmbientArmed {
+            voice.endTalking(purpose: purpose)
+            teachAmbientArmed = false
+        }
+        Task { await buildTaughtAgent(sessionID: sessionID) }
     }
 
-    private func buildTaughtAgent(from start: Date, to end: Date) async {
+    private func buildTaughtAgent(sessionID: UUID) async {
         // Let the always-on recorder's 1s drain flush the bracketed events AND attach
         // AX click labels before we read them — the drain defers unlabeled clicks
-        // <0.35s old, and those labels are the strongest replay anchor, so a forced
-        // immediate flush would lose them. The extra headroom also lets the final
-        // ambient-narration transcript land in the intent buffer before we read it.
-        try? await Task.sleep(for: .milliseconds(1800))
-        teachFinishing = false
-        let intent = teachIntentBuffer.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        teachIntentBuffer.removeAll()
-        Task {
-            _ = try? await store.appendAudit(AuditEvent(
-                actor: "employee",
-                action: "teach.stopped",
-                detail: intent.isEmpty ? "status=silent" : Self.textAuditDetail("intent", intent)
-            ))
+        // <0.35s old, and those labels are the strongest replay anchor. Narration
+        // completeness is independently owned by the tracked voice drain.
+        let recorderSettle = Task { [teachRecorderSettleOperation] in
+            await teachRecorderSettleOperation()
         }
+        let drainResult: RealtimeVoice.TranscriptionDrainResult
+        if let teachNarrationDrainOverride {
+            drainResult = await teachNarrationDrainOverride(sessionID, Self.teachNarrationDrainTimeout)
+        } else {
+            drainResult = await voice.drainTranscriptions(
+                forTeachingSession: sessionID,
+                timeout: Self.teachNarrationDrainTimeout
+            )
+        }
+        await recorderSettle.value
+
+        guard var session = recentTeachSession,
+              session.id == sessionID,
+              activeTeachSessionID == sessionID
+        else { return }
+
+        session.intentFragments = teachIntentBuffer
+        recentTeachSession = session
+        teachFinishing = false
+        activeTeachSessionID = nil
+        activeTeachPurpose = nil
+        let intent = session.intentFragments.joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        teachIntentBuffer.removeAll()
+        switch drainResult {
+        case .drained:
+            teachStatus = "Building your agent…"
+        case .timedOut, .disconnected:
+            teachStatus = "Building your agent with what I heard…"
+        }
+        let intentDetail = intent.isEmpty ? "status=silent" : Self.textAuditDetail("intent", intent)
+        _ = try? await store.appendAudit(AuditEvent(
+            actor: "employee",
+            action: "teach.stopped",
+            detail: "drain=\(drainResult.rawValue) \(intentDetail)"
+        ))
+
+        let requestedRevision = session.revision
         do {
             let curated = try await orchestrator.curateRange(
-                from: start, to: end,
+                from: session.start, to: session.bracketEnd,
                 statedIntent: intent.isEmpty ? nil : intent,
                 webAppIdentity: Self.webAppIdentity
             )
-            if let curated {
-                teachStatus = nil
-                teachPreview = curated
-            } else {
-                flashTeachStatus("I didn't catch enough concrete actions to build an agent from that demonstration. Try a short, clear sequence with a click, shortcut, typed value, or copy/paste step.")
-            }
+            publishInitialTeachResult(curated, sessionID: sessionID, requestedRevision: requestedRevision)
         } catch {
+            guard let current = recentTeachSession, current.id == sessionID else { return }
+            if current.revision != requestedRevision {
+                if current.appliedRevision != current.revision {
+                    startLateTeachRecuration()
+                }
+                return
+            }
             flashTeachStatus("Couldn't build an agent from that: \(error.localizedDescription)")
+        }
+    }
+
+    private func publishInitialTeachResult(
+        _ curated: CuratedAgent?,
+        sessionID: UUID,
+        requestedRevision: Int
+    ) {
+        guard var session = recentTeachSession, session.id == sessionID else { return }
+        guard session.revision == requestedRevision else {
+            if session.appliedRevision != session.revision {
+                startLateTeachRecuration()
+            }
+            return
+        }
+        if let curated {
+            teachStatus = nil
+            teachPreview = curated
+            session.initialResultPublished = true
+            session.previewSignature = curated.signature
+            session.appliedRevision = requestedRevision
+            recentTeachSession = session
+        } else {
+            flashTeachStatus("I didn't catch enough concrete actions to build an agent from that demonstration. Try a short, clear sequence with a click, shortcut, typed value, or copy/paste step.")
+        }
+    }
+
+    private func startLateTeachRecuration() {
+        guard lateTeachRecurationTask == nil else { return }
+        let workerID = UUID()
+        lateTeachRecurationWorkerID = workerID
+        lateTeachRecurationTask = Task { [weak self, workerID] in
+            guard let self else { return }
+            await self.runLateTeachRecuration()
+            guard self.lateTeachRecurationWorkerID == workerID else { return }
+            self.lateTeachRecurationTask = nil
+            self.lateTeachRecurationWorkerID = nil
+        }
+    }
+
+    private func runLateTeachRecuration() async {
+        while !Task.isCancelled {
+            guard let snapshot = recentTeachSession else { return }
+            let intent = snapshot.intentFragments.joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !intent.isEmpty else { return }
+
+            do {
+                let curated = try await orchestrator.curateRange(
+                    from: snapshot.start,
+                    to: snapshot.bracketEnd,
+                    statedIntent: intent,
+                    webAppIdentity: Self.webAppIdentity
+                )
+                guard var current = recentTeachSession, current.id == snapshot.id else { return }
+                if current.revision != snapshot.revision { continue }
+
+                if let curated {
+                    if !current.initialResultPublished {
+                        teachPreview = curated
+                        current.initialResultPublished = true
+                        current.previewSignature = curated.signature
+                    } else if let shownSignature = current.previewSignature,
+                              teachPreview?.signature == shownSignature {
+                        teachPreview = curated
+                        current.previewSignature = curated.signature
+                    }
+                    current.appliedRevision = snapshot.revision
+                    recentTeachSession = current
+                    flashTeachStatus("Updated the taught agent with the rest of your narration.")
+                    voice.speak("I caught the rest of your narration and updated the taught agent.")
+                } else {
+                    flashTeachStatus("I caught more narration, but couldn't update the taught agent from this recording.")
+                }
+                return
+            } catch {
+                guard recentTeachSession?.id == snapshot.id else { return }
+                if recentTeachSession?.revision != snapshot.revision { continue }
+                flashTeachStatus("I caught more narration, but couldn't update the taught agent: \(error.localizedDescription)")
+                return
+            }
         }
     }
 

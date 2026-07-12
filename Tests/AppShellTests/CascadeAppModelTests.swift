@@ -15,6 +15,70 @@ private struct FakeCompleter: MessageCompleting {
     }
 }
 
+private actor SequenceCompleter: MessageCompleting {
+    private let replies: [String]
+    private let holdFirst: Bool
+    private var users: [String] = []
+    private var firstWaiter: CheckedContinuation<Void, Never>?
+
+    init(replies: [String], holdFirst: Bool = false) {
+        self.replies = replies
+        self.holdFirst = holdFirst
+    }
+
+    func complete(system: String?, user: String, model: String, maxTokens: Int) async throws -> String {
+        let index = users.count
+        users.append(user)
+        if holdFirst, index == 0 {
+            await withCheckedContinuation { firstWaiter = $0 }
+        }
+        return replies[min(index, max(0, replies.count - 1))]
+    }
+
+    func releaseFirst() {
+        firstWaiter?.resume()
+        firstWaiter = nil
+    }
+
+    func prompts() -> [String] { users }
+    func callCount() -> Int { users.count }
+}
+
+private final class TestTeachClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) { self.value = value }
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(_ interval: TimeInterval) {
+        lock.lock()
+        value = value.addingTimeInterval(interval)
+        lock.unlock()
+    }
+}
+
+private actor TeachDrainGate {
+    private var waiter: CheckedContinuation<RealtimeVoice.TranscriptionDrainResult, Never>?
+    private var releasedResult: RealtimeVoice.TranscriptionDrainResult?
+
+    func wait() async -> RealtimeVoice.TranscriptionDrainResult {
+        if let releasedResult { return releasedResult }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func release(_ result: RealtimeVoice.TranscriptionDrainResult) {
+        releasedResult = result
+        waiter?.resume(returning: result)
+        waiter = nil
+    }
+}
+
 private final class DetectionSpy: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -41,14 +105,23 @@ private func makeModel(
     curatorReply: String = #"{"agents":[]}"#,
     contextWasteDetectionEnabled: Bool? = nil,
     legacyActionWasteMode: CascadeAppModel.LegacyActionWasteMode? = nil,
-    detectedWasteReportObserver: (@Sendable () -> Void)? = nil
+    detectedWasteReportObserver: (@Sendable () -> Void)? = nil,
+    curatorClient: (any MessageCompleting)? = nil,
+    teachClock: @escaping @Sendable () -> Date = { Date() },
+    teachSessionIDFactory: @escaping @Sendable () -> UUID = { UUID() },
+    teachRecorderSettleOperation: @escaping @Sendable () async -> Void = {
+        try? await Task.sleep(for: .milliseconds(1800))
+    },
+    teachNarrationDrain: (@Sendable (UUID, Duration) async -> RealtimeVoice.TranscriptionDrainResult)? = nil
 ) throws -> (model: CascadeAppModel, store: CascadeStore) {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("CascadeAppShellIT-\(UUID().uuidString).sqlite").path
     let store = try CascadeStore(path: path)
+    let curator = curatorClient.map { WorkflowCurator(client: $0) }
+        ?? WorkflowCurator(client: FakeCompleter(canned: curatorReply))
     let orchestrator = CascadeOrchestrator(
         store: store,
-        curator: WorkflowCurator(client: FakeCompleter(canned: curatorReply)),
+        curator: curator,
         detectedWasteReportObserver: detectedWasteReportObserver
     )
     // An ephemeral defaults suite per model — tests never read stale declines from,
@@ -60,7 +133,16 @@ private func makeModel(
     if let legacyActionWasteMode {
         defaults.set(legacyActionWasteMode.rawValue, forKey: CascadeAppModel.legacyActionWasteModeKey)
     }
-    let model = try CascadeAppModel(store: store, orchestrator: orchestrator, defaults: defaults, startsSubsystems: false)
+    let model = try CascadeAppModel(
+        store: store,
+        orchestrator: orchestrator,
+        defaults: defaults,
+        startsSubsystems: false,
+        teachClock: teachClock,
+        teachSessionIDFactory: teachSessionIDFactory,
+        teachRecorderSettleOperation: teachRecorderSettleOperation,
+        teachNarrationDrain: teachNarrationDrain
+    )
     return (model, store)
 }
 
@@ -166,6 +248,20 @@ private let curatorKeepsOne = """
 private let contextCuratorKeepsOne = """
 {"agents":[{"index":0,"name":"Reconcile vendor invoices","why":"The record shows repeated invoice queue work.","goal":"Reconcile the vendor invoice queue in QuickBooks.","value":0.9,"feasibility":"goalOnlyCandidate"}]}
 """
+
+private func teachCuratorReply(name: String, goal: String) -> String {
+    """
+    {"agents":[{"index":0,"name":"\(name)","why":"shown once","goal":"\(goal)","value":0.9}]}
+    """
+}
+
+private func waitForCompleterCalls(_ completer: SequenceCompleter, count: Int) async throws {
+    for _ in 0..<500 {
+        if await completer.callCount() >= count { return }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    throw CocoaError(.coderValueNotFound)
+}
 
 @MainActor @Test
 func modelBuildsHeadlessWithoutStartingHardware() throws {
@@ -1415,6 +1511,234 @@ func teachingGatesNarrationIntoIntentNotAnAssistRun() throws {
     #expect(model.teachingMode)             // still demonstrating
     #expect(!model.showSettings)            // the no-key assist path never ran
     #expect(model.teachStatus?.contains("heard") == true)
+}
+
+@MainActor @Test
+func teachFinishWaitsForDrainAndCuratesFinalCallbackIntent() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let clock = TestTeachClock(startedAt)
+    let sessionID = UUID()
+    let drainGate = TeachDrainGate()
+    let completer = SequenceCompleter(replies: [teachCuratorReply(
+        name: "Check course seats and report them",
+        goal: "Check the requested course seats and send the report."
+    )])
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionID },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in await drainGate.wait() }
+    )
+    model.beginTeaching()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: startedAt))
+    clock.advance(1)
+
+    model.endTeaching()
+
+    #expect(model.teachStatus == "Finishing your narration…")
+    #expect(model.teachPreview == nil)
+    try? await Task.sleep(for: .milliseconds(20))
+    #expect(await completer.callCount() == 0)
+
+    let finalNarration = "check empty seats for four courses and send the report"
+    model.voice.onUtterance?(RealtimeVoice.CompletedUtterance(
+        text: finalNarration,
+        itemID: "final-teach-item",
+        purpose: .teachAmbient(sessionID: sessionID, automaticEndpointing: true)
+    ))
+    #expect(model.teachPreview == nil)
+    await drainGate.release(.drained)
+
+    try await waitUntil({ model.teachPreview != nil })
+    let prompts = await completer.prompts()
+    #expect(prompts.count == 1)
+    #expect(prompts[0].contains(finalNarration))
+    let stopped = try await waitForAudit(store, action: "teach.stopped")
+    #expect(stopped.detail.contains("drain=drained"))
+    #expect(!stopped.detail.contains(finalNarration))
+    #expect(!stopped.detail.contains("status=silent"))
+}
+
+@MainActor @Test
+func teachFinishTimeoutCuratesWhateverNarrationAlreadyArrived() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_001_000)
+    let clock = TestTeachClock(startedAt)
+    let sessionID = UUID()
+    let completer = SequenceCompleter(replies: [teachCuratorReply(
+        name: "Prepare the weekly report",
+        goal: "Prepare the weekly report from the demonstrated sources."
+    )])
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionID },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .timedOut }
+    )
+    model.beginTeaching()
+    model.teach(question: "pull the weekly numbers into the Monday report")
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: startedAt))
+    clock.advance(1)
+
+    model.endTeaching()
+
+    try await waitUntil({ model.teachPreview != nil })
+    let prompts = await completer.prompts()
+    #expect(prompts.first?.contains("pull the weekly numbers into the Monday report") == true)
+    let stopped = try await waitForAudit(store, action: "teach.stopped")
+    #expect(stopped.detail.contains("drain=timed_out"))
+    #expect(!stopped.detail.contains("status=silent"))
+}
+
+@MainActor @Test
+func lateTeachTranscriptWithinWindowRecuratesVisiblePreviewWithoutTouchingAssistState() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_002_000)
+    let clock = TestTeachClock(startedAt)
+    let sessionID = UUID()
+    let completer = SequenceCompleter(replies: [
+        teachCuratorReply(name: "Initial taught agent", goal: "Copy the demonstrated values."),
+        teachCuratorReply(name: "Course seat report", goal: "Check course seats and send the report."),
+    ])
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionID },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .timedOut }
+    )
+    model.beginTeaching()
+    model.teach(question: "copy the demonstrated values")
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: startedAt))
+    clock.advance(1)
+    model.endTeaching()
+    try await waitUntil({ model.teachPreview?.name == "Initial taught agent" })
+
+    let generation = model.currentAssistGeneration
+    let stoppedBefore = model.driver.runState.isStopRequested
+    let lateNarration = "also check empty seats for four courses and send a report"
+    model.voice.onUtterance?(RealtimeVoice.CompletedUtterance(
+        text: lateNarration,
+        itemID: "late-teach-item",
+        purpose: .teachAmbient(sessionID: sessionID, automaticEndpointing: true)
+    ))
+
+    try await waitUntil({ model.teachPreview?.name == "Course seat report" })
+    let prompts = await completer.prompts()
+    #expect(prompts.count == 2)
+    #expect(prompts[1].contains("copy the demonstrated values"))
+    #expect(prompts[1].contains(lateNarration))
+    #expect(model.currentAssistGeneration == generation)
+    #expect(model.driver.runState.isStopRequested == stoppedBefore)
+    #expect(!model.showSettings)
+    let lateAudit = try await waitForAudit(store, action: "teach.intent.late")
+    #expect(!lateAudit.detail.contains(lateNarration))
+    #expect(!(try await store.recentAudit(limit: 80)).contains { $0.action == "assist.task" })
+}
+
+@MainActor @Test
+func pushToTalkTranscriptInsideLateWindowRoutesNormally() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_003_000)
+    let clock = TestTeachClock(startedAt)
+    let sessionID = UUID()
+    let completer = SequenceCompleter(replies: [teachCuratorReply(
+        name: "Initial taught agent",
+        goal: "Copy the demonstrated values."
+    )])
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionID },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .drained }
+    )
+    model.beginTeaching()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: startedAt))
+    clock.advance(1)
+    model.endTeaching()
+    try await waitUntil({ model.teachPreview != nil })
+
+    model.voice.onUtterance?(RealtimeVoice.CompletedUtterance(
+        text: "open Notes and write hello",
+        itemID: "fresh-ptt",
+        purpose: .pushToTalk
+    ))
+
+    #expect(model.showSettings)
+    #expect(await completer.callCount() == 1)
+    #expect((try await store.recentAudit(limit: 80)).allSatisfy { $0.action != "teach.intent.late" })
+}
+
+@MainActor @Test
+func expiredTeachTranscriptReturnsToNormalRouting() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_004_000)
+    let clock = TestTeachClock(startedAt)
+    let sessionID = UUID()
+    let completer = SequenceCompleter(replies: [teachCuratorReply(
+        name: "Initial taught agent",
+        goal: "Copy the demonstrated values."
+    )])
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionID },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .drained }
+    )
+    model.beginTeaching()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: startedAt))
+    clock.advance(1)
+    model.endTeaching()
+    try await waitUntil({ model.teachPreview != nil })
+    clock.advance(91)
+
+    model.voice.onUtterance?(RealtimeVoice.CompletedUtterance(
+        text: "open Notes and write hello",
+        itemID: "expired-teach-item",
+        purpose: .teachAmbient(sessionID: sessionID, automaticEndpointing: true)
+    ))
+
+    #expect(model.showSettings)
+    #expect(await completer.callCount() == 1)
+}
+
+@MainActor @Test
+func newerLateRevisionWinsOverInFlightInitialCuration() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_005_000)
+    let clock = TestTeachClock(startedAt)
+    let sessionID = UUID()
+    let completer = SequenceCompleter(
+        replies: [
+            teachCuratorReply(name: "Stale initial result", goal: "Copy the demonstrated values."),
+            teachCuratorReply(name: "Newest narrated result", goal: "Build the full narrated report."),
+        ],
+        holdFirst: true
+    )
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionID },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .timedOut }
+    )
+    model.beginTeaching()
+    model.teach(question: "copy the demonstrated values")
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: startedAt))
+    clock.advance(1)
+    model.endTeaching()
+    try await waitForCompleterCalls(completer, count: 1)
+
+    model.voice.onUtterance?(RealtimeVoice.CompletedUtterance(
+        text: "then build and send the full report",
+        itemID: "revision-two",
+        purpose: .teachAmbient(sessionID: sessionID, automaticEndpointing: true)
+    ))
+    try await waitUntil({ model.teachPreview?.name == "Newest narrated result" })
+    await completer.releaseFirst()
+    try? await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.teachPreview?.name == "Newest narrated result")
+    #expect(await completer.callCount() == 2)
 }
 
 @MainActor @Test

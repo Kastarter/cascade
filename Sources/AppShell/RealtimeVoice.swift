@@ -123,15 +123,31 @@ final class RealtimeVoiceResponseState: @unchecked Sendable {
 }
 
 final class RealtimeVoiceEndpointSession: @unchecked Sendable {
+    enum Mode: Equatable {
+        /// Legacy server-buffer upload: append every frame and commit only on release.
+        case passthroughRelease
+        /// D-13 PTT behavior: locally gate noise, then clear/wait/commit on release.
+        case gatedRelease
+        /// Teach ambient behavior: keep capture open and commit every VAD-delimited turn.
+        case continuousGated
+    }
+
     enum ReleaseResult: Equatable {
         case cleared
         case committed
         case tailWait(remainingMs: Int)
     }
 
-    private let localEndpointingEnabled: Bool
+    private enum UploadAction {
+        case append(Data)
+        case commit
+    }
+
+    private let mode: Mode
     private let sender: any RealtimeVoiceEventSending
     private let policy: VoiceTurnEndpointPolicy
+    private let purpose: RealtimeVoice.CapturePurpose
+    private let onCommit: @Sendable (RealtimeVoice.CapturePurpose) -> Void
     private var gate: LocalVoiceActivityGate
     private var pendingSamples: [Int16] = []
     /// Whether gated audio reached the server this turn. Non-speech turns clear.
@@ -141,15 +157,33 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     private let lock = NSLock()
 
     init(
+        mode: Mode,
+        sender: any RealtimeVoiceEventSending,
+        purpose: RealtimeVoice.CapturePurpose = .pushToTalk,
+        onCommit: @escaping @Sendable (RealtimeVoice.CapturePurpose) -> Void = { _ in },
+        gateConfiguration: LocalVoiceActivityGate.Configuration = LocalVoiceActivityGate.Configuration(),
+        endpointPolicy: VoiceTurnEndpointPolicy = VoiceTurnEndpointPolicy()
+    ) {
+        self.mode = mode
+        self.sender = sender
+        self.purpose = purpose
+        self.onCommit = onCommit
+        self.policy = endpointPolicy
+        self.gate = LocalVoiceActivityGate(configuration: gateConfiguration)
+    }
+
+    convenience init(
         localEndpointingEnabled: Bool,
         sender: any RealtimeVoiceEventSending,
         gateConfiguration: LocalVoiceActivityGate.Configuration = LocalVoiceActivityGate.Configuration(),
         endpointPolicy: VoiceTurnEndpointPolicy = VoiceTurnEndpointPolicy()
     ) {
-        self.localEndpointingEnabled = localEndpointingEnabled
-        self.sender = sender
-        self.policy = endpointPolicy
-        self.gate = LocalVoiceActivityGate(configuration: gateConfiguration)
+        self.init(
+            mode: localEndpointingEnabled ? .gatedRelease : .passthroughRelease,
+            sender: sender,
+            gateConfiguration: gateConfiguration,
+            endpointPolicy: endpointPolicy
+        )
     }
 
     func captureBufferFrameCount(inputSampleRate: Double) -> AVAudioFrameCount {
@@ -164,7 +198,7 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     }
 
     func ingestConvertedPCM16(_ data: Data) {
-        guard localEndpointingEnabled else {
+        guard mode != .passthroughRelease else {
             sender.appendAudio(base64: data.base64EncodedString())
             return
         }
@@ -174,13 +208,18 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         }
         guard !samples.isEmpty else { return }
 
-        let uploadFrames = gatedUploadFrames(from: samples)
-        guard !uploadFrames.isEmpty else { return }
-        sender.appendAudio(base64: Self.pcm16Data(frames: uploadFrames).base64EncodedString())
+        for action in gatedUploadActions(from: samples) {
+            switch action {
+            case .append(let audio):
+                sender.appendAudio(base64: audio.base64EncodedString())
+            case .commit:
+                commit()
+            }
+        }
     }
 
     func release() -> ReleaseResult {
-        guard localEndpointingEnabled else {
+        guard mode != .passthroughRelease else {
             commit()
             return .committed
         }
@@ -205,6 +244,7 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     }
 
     func commit() {
+        onCommit(purpose)
         sender.sendEvent(["type": "input_audio_buffer.commit"])
     }
 
@@ -212,10 +252,11 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         sender.sendEvent(["type": "input_audio_buffer.clear"])
     }
 
-    /// Re-chunks converted audio into exact gate frames and returns only the
-    /// prefix/speech/hangover frames the local gate authorizes for upload.
-    private func gatedUploadFrames(from samples: [Int16]) -> [[Int16]] {
-        var uploadFrames: [[Int16]] = []
+    /// Re-chunks converted audio into exact gate frames and preserves append/commit
+    /// ordering. Continuous teach capture resets only per-turn VAD state after a
+    /// commit; the AVAudioEngine tap and socket stay alive for the next utterance.
+    private func gatedUploadActions(from samples: [Int16]) -> [UploadAction] {
+        var actions: [UploadAction] = []
         lock.lock()
         pendingSamples.append(contentsOf: samples)
         let samplesPerFrame = gate.configuration.samplesPerFrame
@@ -224,12 +265,25 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
             pendingSamples.removeFirst(samplesPerFrame)
             let result = gate.ingestPCM16Frame(frame)
             if !result.uploadFrames.isEmpty {
-                uploadFrames.append(contentsOf: result.uploadFrames)
                 hasUploadedAudio = true
+                actions.append(.append(Self.pcm16Data(frames: result.uploadFrames)))
+            }
+            if mode == .continuousGated,
+               hasUploadedAudio,
+               result.snapshot.releaseDecision == .commit {
+                actions.append(.commit)
+                resetTurnLocked()
             }
         }
         lock.unlock()
-        return uploadFrames
+        return actions
+    }
+
+    private func resetTurnLocked() {
+        gate.reset()
+        hasUploadedAudio = false
+        keyUpAtMs = nil
+        partialTranscript = ""
     }
 
     private func endpointDecisionOnRelease() -> VoiceTurnEndpointPolicy.Decision {
@@ -281,6 +335,35 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
 public final class RealtimeVoice: ObservableObject {
     public enum VoiceState: Equatable { case idle, listening, working }
 
+    public enum CapturePurpose: Hashable, Sendable {
+        case pushToTalk
+        case teachAmbient(sessionID: UUID, automaticEndpointing: Bool)
+        case unknown
+
+        var teachingSessionID: UUID? {
+            if case .teachAmbient(let sessionID, _) = self { return sessionID }
+            return nil
+        }
+    }
+
+    public struct CompletedUtterance: Equatable, Sendable {
+        public let text: String
+        public let itemID: String
+        public let purpose: CapturePurpose
+
+        public init(text: String, itemID: String, purpose: CapturePurpose) {
+            self.text = text
+            self.itemID = itemID
+            self.purpose = purpose
+        }
+    }
+
+    public enum TranscriptionDrainResult: String, Equatable, Sendable {
+        case drained
+        case timedOut = "timed_out"
+        case disconnected
+    }
+
     @Published public private(set) var state: VoiceState = .idle
     @Published public private(set) var transcript = ""
     /// Live mic loudness (0…1, smoothed) while listening — drives the notch's
@@ -288,7 +371,7 @@ public final class RealtimeVoice: ObservableObject {
     @Published public private(set) var inputLevel: Float = 0
 
     /// Spoken phrase handed off to Claude when the user releases the talk key.
-    public var onUtterance: ((String) -> Void)?
+    public var onUtterance: ((CompletedUtterance) -> Void)?
     /// Live transcript prefix for UI and safe warmups only. Completed transcripts
     /// remain the only path to execution.
     public var onPartialUtterance: ((String) -> Void)?
@@ -296,6 +379,7 @@ public final class RealtimeVoice: ObservableObject {
     public var onInterrupt: (() -> Void)?
 
     public nonisolated static let experimentalLocalVoiceEndpointingKey = "cascade.experimentalLocalVoiceEndpointing"
+    public nonisolated static let teachAmbientVoiceEndpointingKey = "cascade.teachAmbientVoiceEndpointing"
 
     private let keyStore = OpenAIKeyStore()
     private var urlSession: URLSession?
@@ -315,18 +399,22 @@ public final class RealtimeVoice: ObservableObject {
     private var endpointSession: RealtimeVoiceEndpointSession?
     private var endpointCommitTask: Task<Void, Never>?
     private let responseState = RealtimeVoiceResponseState()
-    /// True between key-down and key-up. The connect → capture handshake is
-    /// async (the OpenAI socket isn't prewarmed), so on a cold start the user
-    /// can release the key before `startCapture()` runs. This flag lets that
-    /// in-flight task bail instead of starting a capture the release can no
-    /// longer end — which would wedge `state` at `.listening` and make every
-    /// subsequent press a silent no-op.
-    private var wantsToTalk = false
+    let transcriptionTracker = RealtimeVoiceTranscriptionTracker()
+    private var partialTranscriptsByItemID: [String: String] = [:]
+    /// Purpose ownership spans the async connect → capture handshake. A release
+    /// only closes the matching purpose, so Right Command cannot close the
+    /// hands-free microphone while a teaching demonstration owns it.
+    private(set) var requestedCapturePurpose: CapturePurpose?
+    private(set) var activeCapturePurpose: CapturePurpose?
 
     private static let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
     public nonisolated static func experimentalLocalVoiceEndpointingEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: experimentalLocalVoiceEndpointingKey)
+    }
+
+    public nonisolated static func teachAmbientVoiceEndpointingEnabled(defaults: UserDefaults = .standard) -> Bool {
+        (defaults.object(forKey: teachAmbientVoiceEndpointingKey) as? Bool) ?? true
     }
 
     public init(
@@ -363,9 +451,17 @@ public final class RealtimeVoice: ObservableObject {
 
     // MARK: - Push-to-talk
 
-    public func beginTalking() {
+    public func beginTalking(purpose: CapturePurpose = .pushToTalk) {
+        if let activeCapturePurpose {
+            guard activeCapturePurpose == purpose else { return }
+            return
+        }
+        if let requestedCapturePurpose {
+            guard requestedCapturePurpose == purpose else { return }
+            return
+        }
         cancelPendingEndpointCommit(clearBufferedAudio: true)
-        wantsToTalk = true
+        requestedCapturePurpose = purpose
         // Barge-in: cut the agent off and listen.
         if state == .working || (playerNode?.isPlaying ?? false) || responseState.hasActiveResponse {
             for event in responseState.bargeInEvents() {
@@ -377,45 +473,59 @@ public final class RealtimeVoice: ObservableObject {
         guard state != .listening else { return }
         state = .idle
         Task { @MainActor in
-            guard await ensureMic() else { return }
-            guard await ensureConnected() else { return }
+            guard await ensureMic() else {
+                if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
+                return
+            }
+            guard await ensureConnected() else {
+                if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
+                return
+            }
             // Cold WebSocket: the user may have already released the key while we
             // were connecting. Starting a capture they can no longer end would
             // wedge state at .listening and make the NEXT press a no-op. Bail and
             // settle back to idle instead. (Main-actor serialized, so this guard
             // and startCapture can't be split by a release.)
-            guard wantsToTalk else { state = .idle; return }
-            startCapture()
+            guard requestedCapturePurpose == purpose else { state = .idle; return }
+            startCapture(purpose: purpose)
         }
     }
 
-    public func endTalking() {
-        wantsToTalk = false
+    public func endTalking(purpose: CapturePurpose = .pushToTalk) {
+        if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
+        guard activeCapturePurpose == purpose else { return }
         guard state == .listening else { return }
+        transcriptionTracker.captureWillClose(purpose)
         guard let endpointSession else {
             stopCapture()
+            transcriptionTracker.noteCommit(from: purpose)
             socket?.sendEvent(["type": "input_audio_buffer.commit"])
+            activeCapturePurpose = nil
+            transcriptionTracker.captureDidClose(purpose)
             state = .working
             return
         }
 
         switch endpointSession.release() {
         case .cleared:
-            stopCapture()
-            self.endpointSession = nil
-            state = .idle
+            finishCapture(purpose: purpose, state: .idle)
         case .committed:
-            stopCapture()
-            self.endpointSession = nil
-            state = .working
+            finishCapture(purpose: purpose, state: .working)
         case .tailWait(let remainingMs):
             state = .working
-            scheduleEndpointTailWait(endpointSession, initialDelayMs: remainingMs)
+            scheduleEndpointTailWait(endpointSession, purpose: purpose, initialDelayMs: remainingMs)
         }
         // The transcript arrives via conversation.item.input_audio_transcription.completed.
     }
 
     public func done() { if state == .working { state = .idle } }
+
+    public func drainTranscriptions(
+        forTeachingSession sessionID: UUID,
+        timeout: Duration = .seconds(90)
+    ) async -> TranscriptionDrainResult {
+        await transcriptionTracker.drain(teachingSessionID: sessionID, timeout: timeout)
+    }
 
     public func speak(_ text: String) {
         guard audioEnabled else { return }
@@ -464,6 +574,10 @@ public final class RealtimeVoice: ObservableObject {
         cancelPendingEndpointCommit(clearBufferedAudio: false)
         stopCapture()
         endpointSession = nil
+        requestedCapturePurpose = nil
+        activeCapturePurpose = nil
+        partialTranscriptsByItemID.removeAll()
+        transcriptionTracker.disconnect()
         responseState.clear()
         connected = false
         socket = nil
@@ -503,35 +617,71 @@ public final class RealtimeVoice: ObservableObject {
     private func handle(_ text: String) {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = json["type"] as? String else { return }
+              json["type"] as? String != nil else { return }
+        handleServerEvent(json)
+    }
+
+    /// Internal event seam used by tests to exercise the real commit/transcription
+    /// lifecycle without a live WebSocket.
+    func handleServerEvent(_ json: [String: Any]) {
+        guard let type = json["type"] as? String else { return }
 
         switch type {
         case "session.created":
             socket?.sendEvent(sessionUpdate())
             connected = true
+            transcriptionTracker.connected()
             let waiters = connectWaiters
             connectWaiters.removeAll()
             waiters.forEach { $0.resume(returning: true) }
 
-        case "conversation.item.input_audio_transcription.completed":
-            let said = (json["transcript"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            transcript = ""
-            if said.count > 1 {
-                if state == .listening { state = .working }
-                onUtterance?(said)
-            } else if state == .working {
-                state = .idle
+        case "input_audio_buffer.committed":
+            if let itemID = json["item_id"] as? String {
+                transcriptionTracker.bindNextCommit(toItemID: itemID)
             }
 
+        case "conversation.item.input_audio_transcription.completed":
+            let itemID = json["item_id"] as? String ?? ""
+            let purpose = transcriptionTracker.purpose(forItemID: itemID) ?? .unknown
+            let said = (json["transcript"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            partialTranscriptsByItemID.removeValue(forKey: itemID)
+            transcript = ""
+            if said.count > 1 {
+                let continuingTeachCapture: Bool
+                if case .teachAmbient = purpose {
+                    continuingTeachCapture = activeCapturePurpose == purpose && state == .listening
+                } else {
+                    continuingTeachCapture = false
+                }
+                if state == .listening, !continuingTeachCapture { state = .working }
+                // Deliver before settling: a drain waiter may resume immediately when
+                // this is the final item, and the model must have buffered the text first.
+                onUtterance?(CompletedUtterance(text: said, itemID: itemID, purpose: purpose))
+            } else if state == .working, activeCapturePurpose == nil {
+                state = .idle
+            }
+            transcriptionTracker.settle(itemID: itemID)
+
         case "conversation.item.input_audio_transcription.delta":
-            if let delta = json["delta"] as? String, state == .listening {
-                transcript += delta
-                let partial = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-                endpointSession?.updatePartialTranscript(partial)
+            if let delta = json["delta"] as? String {
+                let itemID = json["item_id"] as? String ?? "unbound"
+                partialTranscriptsByItemID[itemID, default: ""] += delta
+                let partial = partialTranscriptsByItemID[itemID, default: ""]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if state == .listening { transcript = partial }
+                if activeCapturePurpose == .pushToTalk {
+                    endpointSession?.updatePartialTranscript(partial)
+                }
                 if !partial.isEmpty {
                     onPartialUtterance?(partial)
                 }
             }
+
+        case "conversation.item.input_audio_transcription.failed":
+            let itemID = json["item_id"] as? String ?? ""
+            partialTranscriptsByItemID.removeValue(forKey: itemID)
+            transcriptionTracker.settle(itemID: itemID)
+            if state == .working, activeCapturePurpose == nil { state = .idle }
 
         case "response.output_audio.delta":
             if let b64 = json["delta"] as? String, let pcm = Data(base64Encoded: b64) {
@@ -557,17 +707,23 @@ public final class RealtimeVoice: ObservableObject {
 
     // MARK: - Capture
 
-    private func startCapture() {
+    private func startCapture(purpose: CapturePurpose) {
         guard audioEnabled, let captureEngine, let socket else {
             permissionMessage = "No microphone input is available."
+            if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
             state = .idle
             return
         }
         cancelPendingEndpointCommit(clearBufferedAudio: false)
         transcript = ""
+        partialTranscriptsByItemID.removeAll()
         let endpointSession = RealtimeVoiceEndpointSession(
-            localEndpointingEnabled: localVoiceEndpointingEnabled,
-            sender: socket
+            mode: endpointMode(for: purpose),
+            sender: socket,
+            purpose: purpose,
+            onCommit: { [transcriptionTracker] purpose in
+                transcriptionTracker.noteCommit(from: purpose)
+            }
         )
         self.endpointSession = endpointSession
         socket.sendEvent(["type": "input_audio_buffer.clear"])
@@ -579,11 +735,25 @@ public final class RealtimeVoice: ObservableObject {
                     self.inputLevel = self.inputLevel * 0.6 + level * 0.4
                 }
             }
+            requestedCapturePurpose = nil
+            activeCapturePurpose = purpose
             state = .listening
         } catch {
             self.endpointSession = nil
+            if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
             permissionMessage = "No microphone input is available."
             state = .idle
+        }
+    }
+
+    private func endpointMode(for purpose: CapturePurpose) -> RealtimeVoiceEndpointSession.Mode {
+        switch purpose {
+        case .pushToTalk:
+            return localVoiceEndpointingEnabled ? .gatedRelease : .passthroughRelease
+        case .teachAmbient(_, let automaticEndpointing):
+            return automaticEndpointing ? .continuousGated : .passthroughRelease
+        case .unknown:
+            return .passthroughRelease
         }
     }
 
@@ -607,6 +777,7 @@ public final class RealtimeVoice: ObservableObject {
 
     private func scheduleEndpointTailWait(
         _ endpointSession: RealtimeVoiceEndpointSession,
+        purpose: CapturePurpose,
         initialDelayMs: Int
     ) {
         endpointCommitTask = Task { @MainActor [weak self, endpointSession] in
@@ -619,20 +790,24 @@ public final class RealtimeVoice: ObservableObject {
                     delayMs = remainingMs
                     continue
                 case .committed:
-                    self.stopCapture()
-                    self.endpointSession = nil
                     self.endpointCommitTask = nil
-                    self.state = .working
+                    self.finishCapture(purpose: purpose, state: .working)
                     return
                 case .cleared:
-                    self.stopCapture()
-                    self.endpointSession = nil
                     self.endpointCommitTask = nil
-                    self.state = .idle
+                    self.finishCapture(purpose: purpose, state: .idle)
                     return
                 }
             }
         }
+    }
+
+    private func finishCapture(purpose: CapturePurpose, state newState: VoiceState) {
+        stopCapture()
+        endpointSession = nil
+        if activeCapturePurpose == purpose { activeCapturePurpose = nil }
+        transcriptionTracker.captureDidClose(purpose)
+        state = newState
     }
 
     /// Installs the mic tap from a `nonisolated` context (the audio render thread must
