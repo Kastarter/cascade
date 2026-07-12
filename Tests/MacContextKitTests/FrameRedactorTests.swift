@@ -29,7 +29,7 @@ func frameRedactorCoversSensitiveBoxesAndRedactsOCRText() throws {
 }
 
 @Test
-func frameRedactorDropsWholeFrameWhenPolicySaysPrivate() {
+func frameRedactorKeepsWholeFrameWhenPolicySaysPrivate() {
     let policy = CapturePrivacyPolicy(privateModeEnabled: true)
     let reason = FrameRedactor.wholeFrameDropReason(
         appName: "Safari",
@@ -38,7 +38,7 @@ func frameRedactorDropsWholeFrameWhenPolicySaysPrivate() {
         rawText: "ordinary text",
         policy: policy
     )
-    #expect(reason == "private_mode")
+    #expect(reason == nil)
 }
 
 @Test

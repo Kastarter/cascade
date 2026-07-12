@@ -26,6 +26,9 @@ public struct CaptureRetentionPolicy: Codable, Equatable, Sendable {
 /// bundle, window-title, private-mode, and per-data-class retention knobs.
 public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
     public static let defaultVersion = "capture-policy-v1"
+    public static let defaultRetentionByDataClass = [
+        "frames": CaptureRetentionPolicy(maxAgeDays: 1),
+    ]
 
     public var version: String
     public var recordingAvailable: Bool
@@ -85,7 +88,7 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         deniedURLHosts: [String] = [],
         deniedURLKeywords: [String] = [],
         allowedBundleIdentifiers: [String] = [],
-        retentionByDataClass: [String: CaptureRetentionPolicy] = [:]
+        retentionByDataClass: [String: CaptureRetentionPolicy] = Self.defaultRetentionByDataClass
     ) {
         self.version = version
         self.recordingAvailable = recordingAvailable
@@ -126,7 +129,10 @@ public struct CapturePrivacyPolicy: Codable, Equatable, Sendable {
         self.deniedURLHosts = try container.decodeIfPresent([String].self, forKey: .deniedURLHosts) ?? []
         self.deniedURLKeywords = try container.decodeIfPresent([String].self, forKey: .deniedURLKeywords) ?? []
         self.allowedBundleIdentifiers = try container.decodeIfPresent([String].self, forKey: .allowedBundleIdentifiers) ?? []
-        self.retentionByDataClass = try container.decodeIfPresent([String: CaptureRetentionPolicy].self, forKey: .retentionByDataClass) ?? [:]
+        self.retentionByDataClass = try container.decodeIfPresent(
+            [String: CaptureRetentionPolicy].self,
+            forKey: .retentionByDataClass
+        ) ?? Self.defaultRetentionByDataClass
     }
 
     public static let `default` = CapturePrivacyPolicy()

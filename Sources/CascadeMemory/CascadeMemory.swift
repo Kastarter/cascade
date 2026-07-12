@@ -1654,7 +1654,8 @@ public actor CascadeStore {
     /// Thins aged frame files: for moments older than `olderThan`, keeps one
     /// frame file per `keepEvery` bucket and points the bucket's other rows at
     /// the kept file — old days scrub like the pre-1fps recorder did, while
-    /// every row's OCR text and search entries stay untouched forever.
+    /// every row's OCR text and search entries stay untouched until normal row
+    /// retention prunes them.
     /// Idempotent (already-shared paths are skipped). Returns the file paths
     /// freed by thinning; the caller owns deleting them from disk.
     public func thinAgedFrames(olderThan: Date, keepEvery: TimeInterval = 8, scanLimit: Int = 20000) throws -> [String] {
@@ -1704,6 +1705,489 @@ public actor CascadeStore {
             }
         }
         return freed
+    }
+
+    private struct KnowledgeGraphDayStats {
+        let day: String
+        let throughMilliseconds: Int64
+        let contextCount: Int
+        let maxContextID: Int64
+    }
+
+    private struct StoredKnowledgeGraph {
+        let graph: ContextKnowledgeGraph
+        let sha256: String
+    }
+
+    private struct PendingKnowledgeGraphWrite {
+        let graph: ContextKnowledgeGraph
+        let json: String
+        let searchText: String
+        let sha256: String
+        let contextsCovered: Int
+    }
+
+    /// Converts every context strictly older than `cutoff` into a durable,
+    /// day-partitioned knowledge graph before removing its frame from disk.
+    /// Text and the recorded-context FTS row remain available until normal row
+    /// retention removes them; the graph deliberately has no foreign key back to
+    /// those rows and therefore remains searchable afterwards.
+    public func compactAgedContextsIntoKnowledgeGraph(
+        olderThan cutoff: Date
+    ) throws -> ContextKnowledgeGraphCompactionResult {
+        try compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff) { path in
+            try FileManager.default.removeItem(atPath: path)
+        }
+    }
+
+    /// Test seam for deterministic filesystem-failure coverage. The closure is
+    /// synchronous because deletion happens while this store actor is isolated.
+    internal func compactAgedContextsIntoKnowledgeGraph(
+        olderThan cutoff: Date,
+        deletingFrameWith deleteFrame: (String) throws -> Void
+    ) throws -> ContextKnowledgeGraphCompactionResult {
+        let cutoffMilliseconds = EventStoreLayout.capturedMilliseconds(for: cutoff)
+        let stats = try eligibleKnowledgeGraphDayStats(before: cutoffMilliseconds)
+        var pendingWrites: [PendingKnowledgeGraphWrite] = []
+
+        for dayStats in stats {
+            let stored = try storedKnowledgeGraph(forDay: dayStats.day)
+            let needsUpdate = stored == nil
+                || dayStats.maxContextID > (stored?.graph.source.maxContextID ?? 0)
+                || dayStats.throughMilliseconds > (stored?.graph.range.endMs ?? Int64.min)
+                || dayStats.contextCount > (stored?.graph.source.contextCount ?? 0)
+            guard needsUpdate else { continue }
+
+            let graph: ContextKnowledgeGraph?
+            if let stored, dayStats.maxContextID > stored.graph.source.maxContextID {
+                let deltaContexts = try eligibleContexts(
+                    onDay: dayStats.day,
+                    before: cutoffMilliseconds,
+                    withIDGreaterThan: stored.graph.source.maxContextID
+                )
+                let expectedCompleteCount = stored.graph.source.contextCount + deltaContexts.count
+                if dayStats.contextCount < expectedCompleteCount {
+                    // Rows from this day were already pruned, then a late backfill
+                    // arrived. Never replace the complete historical graph with only
+                    // the surviving tail; merge just the higher-ID delta instead.
+                    graph = ContextKnowledgeGraphBuilder.build(
+                        day: dayStats.day,
+                        contexts: deltaContexts,
+                        cutoff: cutoff
+                    ).map { ContextKnowledgeGraphBuilder.merge(existing: stored.graph, delta: $0, cutoff: cutoff) }
+                } else {
+                    let contexts = try eligibleContexts(
+                        onDay: dayStats.day,
+                        before: cutoffMilliseconds,
+                        withIDGreaterThan: 0
+                    )
+                    graph = ContextKnowledgeGraphBuilder.build(day: dayStats.day, contexts: contexts, cutoff: cutoff)
+                }
+            } else if let stored, dayStats.contextCount < stored.graph.source.contextCount {
+                // The surviving source set cannot reconstruct this day and there
+                // is no higher-ID delta to merge. Keep the richer stored graph;
+                // the coverage gate below will stop deletion if its watermark is
+                // insufficient for any surviving eligible row.
+                graph = nil
+            } else {
+                let contexts = try eligibleContexts(
+                    onDay: dayStats.day,
+                    before: cutoffMilliseconds,
+                    withIDGreaterThan: 0
+                )
+                graph = ContextKnowledgeGraphBuilder.build(day: dayStats.day, contexts: contexts, cutoff: cutoff)
+            }
+
+            guard let graph else { continue }
+            let data = try ContextKnowledgeGraphBuilder.canonicalData(for: graph)
+            guard let json = String(data: data, encoding: .utf8) else {
+                throw CascadeStoreError.sqlite("Unable to encode context knowledge graph as UTF-8")
+            }
+            let sha256 = ContextKnowledgeGraphBuilder.sha256(for: data)
+            // A changed rolling cutoff alone is not a source change. Avoid
+            // rewriting updated_at for the same already-covered context set.
+            if let stored, stored.sha256 == sha256 { continue }
+            pendingWrites.append(PendingKnowledgeGraphWrite(
+                graph: graph,
+                json: json,
+                searchText: ContextKnowledgeGraphBuilder.searchText(for: graph),
+                sha256: sha256,
+                contextsCovered: max(0, graph.source.contextCount - (stored?.graph.source.contextCount ?? 0))
+            ))
+        }
+
+        // Phase one: a committed graph is a hard precondition for making any
+        // frame unreachable. A crash after this commit can safely retry phase two.
+        if !pendingWrites.isEmpty {
+            let timestamp = DateCodec.string(from: Date())
+            try withTransaction {
+                for write in pendingWrites {
+                    try upsertKnowledgeGraph(write, timestamp: timestamp)
+                }
+            }
+        }
+
+        guard try uncoveredKnowledgeGraphDayCount(before: cutoffMilliseconds) == 0 else {
+            throw CascadeStoreError.sqlite("Knowledge graph coverage incomplete; frame deletion deferred")
+        }
+
+        var frameReferencesCleared = 0
+        var filesDeleted = 0
+        var failedPaths: [String] = []
+        var lastPath = ""
+        let fileManager = FileManager.default
+
+        // Phase two: process paths in lexical keyset batches. Multiple old rows
+        // may share a path after legacy thinning, so each physical file is handled
+        // exactly once per run.
+        while true {
+            let paths = try eligibleFramePaths(
+                before: cutoffMilliseconds,
+                after: lastPath,
+                limit: 500
+            )
+            guard !paths.isEmpty else { break }
+            lastPath = paths.last ?? lastPath
+
+            var clearablePaths: [String] = []
+            for path in paths {
+                if try hasContextReferencingFrame(path, onOrAfter: cutoffMilliseconds) {
+                    // A recent row still owns the file. Clear only old references.
+                    clearablePaths.append(path)
+                    continue
+                }
+                if !fileManager.fileExists(atPath: path) {
+                    // Recovery from a crash after unlink but before the SQL update.
+                    clearablePaths.append(path)
+                    continue
+                }
+                do {
+                    try deleteFrame(path)
+                    if fileManager.fileExists(atPath: path) {
+                        failedPaths.append(path)
+                    } else {
+                        filesDeleted += 1
+                        clearablePaths.append(path)
+                    }
+                } catch {
+                    // Some filesystem implementations can report an error after
+                    // unlinking. Missing means the desired state was achieved.
+                    if fileManager.fileExists(atPath: path) {
+                        failedPaths.append(path)
+                    } else {
+                        filesDeleted += 1
+                        clearablePaths.append(path)
+                    }
+                }
+            }
+
+            if !clearablePaths.isEmpty {
+                let affectedDays = try dayKeysForFramePaths(clearablePaths, before: cutoffMilliseconds)
+                try withTransaction {
+                    for path in clearablePaths {
+                        try withStatement("""
+                        UPDATE recorded_context
+                        SET image_path = NULL
+                        WHERE captured_ms < ? AND image_path = ?;
+                        """) { statement in
+                            bind(cutoffMilliseconds, at: 1, in: statement)
+                            bind(path, at: 2, in: statement)
+                            try stepDone(statement)
+                            frameReferencesCleared += Int(sqlite3_changes(connection.db))
+                        }
+                    }
+                    try rebuildDayPartitions(days: affectedDays)
+                }
+            }
+        }
+
+        let remainingFrameReferences = try countEligibleFrameReferences(before: cutoffMilliseconds)
+        let uncoveredDays = try uncoveredKnowledgeGraphDayCount(before: cutoffMilliseconds)
+        let isCaughtUp = failedPaths.isEmpty && remainingFrameReferences == 0 && uncoveredDays == 0
+        let contextsCovered = pendingWrites.reduce(0) { $0 + $1.contextsCovered }
+
+        if !pendingWrites.isEmpty || frameReferencesCleared > 0 || filesDeleted > 0 {
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.frame_compaction",
+                detail: [
+                    "cutoffMs=\(cutoffMilliseconds)",
+                    "schemaVersion=\(ContextKnowledgeGraphBuilder.schemaVersion)",
+                    "days=\(stats.count)",
+                    "contexts=\(contextsCovered)",
+                    "graphs=\(pendingWrites.count)",
+                    "references=\(frameReferencesCleared)",
+                    "files=\(filesDeleted)",
+                    "failures=\(failedPaths.count)",
+                ].joined(separator: " ")
+            ))
+        }
+        if !failedPaths.isEmpty {
+            let hashes = failedPaths.prefix(20).map { AuditIdentity.hash("frame-path:\($0)") }.joined(separator: ",")
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.frame_delete_failed",
+                detail: "cutoffMs=\(cutoffMilliseconds) failures=\(failedPaths.count) pathHashes=\(hashes)"
+            ))
+        }
+
+        return ContextKnowledgeGraphCompactionResult(
+            cutoff: cutoff,
+            graphsWritten: pendingWrites.count,
+            contextsCovered: contextsCovered,
+            frameReferencesCleared: frameReferencesCleared,
+            filesDeleted: filesDeleted,
+            deletionFailures: failedPaths.count,
+            isCaughtUp: isCaughtUp
+        )
+    }
+
+    public func knowledgeGraph(forDay day: String) throws -> ContextKnowledgeGraph? {
+        try storedKnowledgeGraph(forDay: day)?.graph
+    }
+
+    public func knowledgeGraphs(
+        between start: Date,
+        and end: Date,
+        limit: Int = 31
+    ) throws -> [ContextKnowledgeGraph] {
+        guard end >= start, limit > 0 else { return [] }
+        let startMilliseconds = EventStoreLayout.capturedMilliseconds(for: start)
+        let endMilliseconds = EventStoreLayout.capturedMilliseconds(for: end)
+        return try withStatement("""
+        SELECT graph_json
+        FROM context_kg
+        WHERE source_through_ms >= ? AND source_start_ms <= ?
+        ORDER BY source_start_ms ASC, day ASC
+        LIMIT ?;
+        """) { statement in
+            bind(startMilliseconds, at: 1, in: statement)
+            bind(endMilliseconds, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(min(limit, Int(Int32.max))))
+            var graphs: [ContextKnowledgeGraph] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let json = text(statement, 0), let data = json.data(using: .utf8) else { continue }
+                graphs.append(try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data))
+            }
+            return graphs
+        }
+    }
+
+    public func searchKnowledgeGraphs(
+        matching query: String,
+        limit: Int = 12
+    ) throws -> [ContextKnowledgeGraphSearchHit] {
+        let match = Self.ftsAnyQuery(from: query)
+        guard !match.isEmpty, limit > 0 else { return [] }
+        return try withStatement("""
+        SELECT kg.graph_json,
+               snippet(context_kg_fts, 0, '', '', ' … ', 32),
+               bm25(context_kg_fts)
+        FROM context_kg_fts
+        JOIN context_kg kg ON kg.rowid = context_kg_fts.rowid
+        WHERE context_kg_fts MATCH ?
+        ORDER BY bm25(context_kg_fts), kg.source_through_ms DESC
+        LIMIT ?;
+        """) { statement in
+            bind(match, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(min(limit, Int(Int32.max))))
+            var hits: [ContextKnowledgeGraphSearchHit] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let json = text(statement, 0), let data = json.data(using: .utf8) else { continue }
+                hits.append(ContextKnowledgeGraphSearchHit(
+                    graph: try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data),
+                    snippet: String((text(statement, 1) ?? "").prefix(560)),
+                    rank: sqlite3_column_double(statement, 2)
+                ))
+            }
+            return hits
+        }
+    }
+
+    private func eligibleKnowledgeGraphDayStats(before cutoffMilliseconds: Int64) throws -> [KnowledgeGraphDayStats] {
+        try withStatement("""
+        SELECT captured_day, MAX(captured_ms), COUNT(*), MAX(id)
+        FROM recorded_context
+        WHERE captured_ms < ? AND captured_day IS NOT NULL
+        GROUP BY captured_day
+        ORDER BY captured_day ASC;
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            var result: [KnowledgeGraphDayStats] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let day = text(statement, 0) else { continue }
+                result.append(KnowledgeGraphDayStats(
+                    day: day,
+                    throughMilliseconds: sqlite3_column_int64(statement, 1),
+                    contextCount: Int(sqlite3_column_int64(statement, 2)),
+                    maxContextID: sqlite3_column_int64(statement, 3)
+                ))
+            }
+            return result
+        }
+    }
+
+    private func eligibleContexts(
+        onDay day: String,
+        before cutoffMilliseconds: Int64,
+        withIDGreaterThan minimumID: Int64
+    ) throws -> [RecordedContext] {
+        var contexts: [RecordedContext] = []
+        var lastMilliseconds = Int64.min
+        var lastID = Int64.min
+        while true {
+            let batch = try withStatement("""
+            SELECT \(Self.contextColumns())
+            FROM recorded_context
+            WHERE captured_day = ? AND captured_ms < ? AND id > ?
+              AND (captured_ms > ? OR (captured_ms = ? AND id > ?))
+            ORDER BY captured_ms ASC, id ASC
+            LIMIT 2000;
+            """) { statement in
+                bind(day, at: 1, in: statement)
+                bind(cutoffMilliseconds, at: 2, in: statement)
+                bind(minimumID, at: 3, in: statement)
+                bind(lastMilliseconds, at: 4, in: statement)
+                bind(lastMilliseconds, at: 5, in: statement)
+                bind(lastID, at: 6, in: statement)
+                var rows: [RecordedContext] = []
+                while sqlite3_step(statement) == SQLITE_ROW { rows.append(decodeContext(statement)) }
+                return rows
+            }
+            guard !batch.isEmpty else { break }
+            contexts.append(contentsOf: batch)
+            guard let last = batch.last else { break }
+            lastMilliseconds = EventStoreLayout.capturedMilliseconds(for: last.capturedAt)
+            lastID = last.id
+            if batch.count < 2000 { break }
+        }
+        return contexts
+    }
+
+    private func storedKnowledgeGraph(forDay day: String) throws -> StoredKnowledgeGraph? {
+        try withStatement("""
+        SELECT graph_json, graph_sha256
+        FROM context_kg WHERE day = ? LIMIT 1;
+        """) { statement in
+            bind(day, at: 1, in: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let json = text(statement, 0),
+                  let data = json.data(using: .utf8) else { return nil }
+            return StoredKnowledgeGraph(
+                graph: try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data),
+                sha256: text(statement, 1) ?? ""
+            )
+        }
+    }
+
+    private func upsertKnowledgeGraph(_ write: PendingKnowledgeGraphWrite, timestamp: String) throws {
+        try withStatement("""
+        INSERT INTO context_kg
+            (day, schema_version, source_start_ms, source_through_ms, source_context_count,
+             source_max_context_id, graph_json, search_text, graph_sha256, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day) DO UPDATE SET
+            schema_version = excluded.schema_version,
+            source_start_ms = excluded.source_start_ms,
+            source_through_ms = excluded.source_through_ms,
+            source_context_count = excluded.source_context_count,
+            source_max_context_id = excluded.source_max_context_id,
+            graph_json = excluded.graph_json,
+            search_text = excluded.search_text,
+            graph_sha256 = excluded.graph_sha256,
+            updated_at = excluded.updated_at
+        WHERE context_kg.source_max_context_id < excluded.source_max_context_id
+           OR context_kg.source_through_ms < excluded.source_through_ms
+           OR context_kg.graph_sha256 <> excluded.graph_sha256;
+        """) { statement in
+            bind(write.graph.day, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(write.graph.schemaVersion))
+            bind(write.graph.range.startMs, at: 3, in: statement)
+            bind(write.graph.range.endMs, at: 4, in: statement)
+            sqlite3_bind_int64(statement, 5, Int64(write.graph.source.contextCount))
+            bind(write.graph.source.maxContextID, at: 6, in: statement)
+            bind(write.json, at: 7, in: statement)
+            bind(write.searchText, at: 8, in: statement)
+            bind(write.sha256, at: 9, in: statement)
+            bind(timestamp, at: 10, in: statement)
+            bind(timestamp, at: 11, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    private func eligibleFramePaths(before cutoffMilliseconds: Int64, after path: String, limit: Int) throws -> [String] {
+        try withStatement("""
+        SELECT DISTINCT image_path
+        FROM recorded_context
+        WHERE captured_ms < ? AND image_path IS NOT NULL AND image_path > ?
+        ORDER BY image_path ASC
+        LIMIT ?;
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            bind(path, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(limit))
+            var paths: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let value = text(statement, 0) { paths.append(value) }
+            }
+            return paths
+        }
+    }
+
+    private func hasContextReferencingFrame(_ path: String, onOrAfter cutoffMilliseconds: Int64) throws -> Bool {
+        try withStatement("""
+        SELECT 1 FROM recorded_context
+        WHERE captured_ms >= ? AND image_path = ? LIMIT 1;
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            bind(path, at: 2, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW
+        }
+    }
+
+    private func dayKeysForFramePaths(_ paths: [String], before cutoffMilliseconds: Int64) throws -> Set<String> {
+        var days: Set<String> = []
+        for path in paths {
+            try withStatement("""
+            SELECT DISTINCT captured_day FROM recorded_context
+            WHERE captured_ms < ? AND image_path = ? AND captured_day IS NOT NULL;
+            """) { statement in
+                bind(cutoffMilliseconds, at: 1, in: statement)
+                bind(path, at: 2, in: statement)
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    if let day = text(statement, 0) { days.insert(day) }
+                }
+            }
+        }
+        return days
+    }
+
+    private func countEligibleFrameReferences(before cutoffMilliseconds: Int64) throws -> Int64 {
+        try withStatement("""
+        SELECT COUNT(*) FROM recorded_context
+        WHERE captured_ms < ? AND image_path IS NOT NULL;
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : 0
+        }
+    }
+
+    private func uncoveredKnowledgeGraphDayCount(before cutoffMilliseconds: Int64) throws -> Int64 {
+        try withStatement("""
+        SELECT COUNT(*) FROM (
+            SELECT c.captured_day
+            FROM recorded_context c
+            LEFT JOIN context_kg kg ON kg.day = c.captured_day
+            WHERE c.captured_ms < ? AND c.captured_day IS NOT NULL
+            GROUP BY c.captured_day
+            HAVING kg.day IS NULL
+                OR kg.source_max_context_id < MAX(c.id)
+                OR kg.source_through_ms < MAX(c.captured_ms)
+        );
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : 0
+        }
     }
 
     /// Moments captured within `[from, to)`, newest-first, decoded WITHOUT the
@@ -2001,7 +2485,8 @@ public actor CascadeStore {
     @discardableResult
     public func prune(
         maxAge: TimeInterval = 7 * 24 * 60 * 60,
-        maxTotalBytes: Int64 = 5 * 1024 * 1024 * 1024
+        maxTotalBytes: Int64 = 5 * 1024 * 1024 * 1024,
+        protectingContextsCapturedOnOrAfter protectedCutoff: Date? = nil
     ) throws -> [String] {
         var removed: [String] = []
 
@@ -2025,18 +2510,27 @@ public actor CascadeStore {
 
         // Size-based prune: keep newest moments until the frame-file budget is hit,
         // delete the older overflow.
-        let survivors = try withStatement("SELECT id, image_path, captured_day FROM recorded_context ORDER BY captured_ms DESC, id DESC;") { statement in
-            var rows: [(id: Int64, path: String?, day: String?)] = []
+        let survivors = try withStatement("SELECT id, image_path, captured_day, captured_ms FROM recorded_context ORDER BY captured_ms DESC, id DESC;") { statement in
+            var rows: [(id: Int64, path: String?, day: String?, capturedMilliseconds: Int64)] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                rows.append((sqlite3_column_int64(statement, 0), text(statement, 1), text(statement, 2)))
+                rows.append((
+                    sqlite3_column_int64(statement, 0),
+                    text(statement, 1),
+                    text(statement, 2),
+                    sqlite3_column_int64(statement, 3)
+                ))
             }
             return rows
         }
+        let protectedCutoffMilliseconds = protectedCutoff.map(EventStoreLayout.capturedMilliseconds(for:))
         var running: Int64 = 0
-        var overflow: [(id: Int64, path: String?, day: String?)] = []
+        var overflow: [(id: Int64, path: String?, day: String?, capturedMilliseconds: Int64)] = []
         for row in survivors {
             running += row.path.flatMap { Self.fileSize(at: $0) } ?? 0
-            if running > maxTotalBytes { overflow.append(row) }
+            let isProtected = protectedCutoffMilliseconds.map { row.capturedMilliseconds >= $0 } ?? false
+            if running > maxTotalBytes, !isProtected {
+                overflow.append(row)
+            }
         }
         var overflowDays: Set<String> = []
         for row in overflow {
@@ -3628,6 +4122,22 @@ public actor CascadeStore {
             sealed_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS context_kg (
+            day TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL,
+            source_start_ms INTEGER NOT NULL,
+            source_through_ms INTEGER NOT NULL,
+            source_context_count INTEGER NOT NULL,
+            source_max_context_id INTEGER NOT NULL,
+            graph_json TEXT NOT NULL,
+            search_text TEXT NOT NULL,
+            graph_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_kg_time
+            ON context_kg(source_start_ms, source_through_ms);
+
         CREATE TABLE IF NOT EXISTS audit_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -3808,6 +4318,26 @@ public actor CascadeStore {
             VALUES ('delete', old.id, old.ocr_text, old.window_title, old.app_name);
             INSERT INTO rewind_fts(rowid, ocr_text, window_title, app_name)
             VALUES (new.id, new.ocr_text, new.window_title, new.app_name);
+        END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS context_kg_fts USING fts5(
+            search_text,
+            content='context_kg', content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS context_kg_ai AFTER INSERT ON context_kg BEGIN
+            INSERT INTO context_kg_fts(rowid, search_text)
+            VALUES (new.rowid, new.search_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS context_kg_ad AFTER DELETE ON context_kg BEGIN
+            INSERT INTO context_kg_fts(context_kg_fts, rowid, search_text)
+            VALUES ('delete', old.rowid, old.search_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS context_kg_au AFTER UPDATE ON context_kg BEGIN
+            INSERT INTO context_kg_fts(context_kg_fts, rowid, search_text)
+            VALUES ('delete', old.rowid, old.search_text);
+            INSERT INTO context_kg_fts(rowid, search_text)
+            VALUES (new.rowid, new.search_text);
         END;
         """, db: db)
 
@@ -4400,8 +4930,14 @@ public actor CascadeStore {
         // Backfill the index for rows inserted before FTS existed (triggers only
         // fire on new writes). Counts match in steady state, so this rebuild runs
         // at most once after upgrading.
-        if scalarValue(db, "SELECT count(*) FROM recorded_context;") != scalarValue(db, "SELECT count(*) FROM rewind_fts;") {
+        // An external-content FTS table proxies `count(*)` to its content table,
+        // even when its own index is empty. Compare the docsize shadow table so
+        // legacy rows really are rebuilt before an UPDATE trigger issues a delete.
+        if scalarValue(db, "SELECT count(*) FROM recorded_context;") != scalarValue(db, "SELECT count(*) FROM rewind_fts_docsize;") {
             try? execute("INSERT INTO rewind_fts(rewind_fts) VALUES('rebuild');", db: db)
+        }
+        if scalarValue(db, "SELECT count(*) FROM context_kg;") != scalarValue(db, "SELECT count(*) FROM context_kg_fts_docsize;") {
+            try? execute("INSERT INTO context_kg_fts(context_kg_fts) VALUES('rebuild');", db: db)
         }
     }
 

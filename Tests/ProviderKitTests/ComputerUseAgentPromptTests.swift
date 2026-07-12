@@ -32,10 +32,10 @@ func resourceCatalogPromptReplacesSeparateFileAndRecallBlocks() {
     )
 
     #expect(prompt.components(separatedBy: "<resource_catalog>").count == 2)
-    #expect(prompt.contains("On screen now"))
-    #expect(prompt.contains("Recorded memory"))
-    #expect(prompt.contains("Local files"))
-    #expect(prompt.contains("Web"))
+    #expect(prompt.contains("onScreen [available]"))
+    #expect(prompt.contains("recordedMemory [available]"))
+    #expect(prompt.contains("localFiles [available]"))
+    #expect(prompt.contains("web [available]"))
     #expect(!prompt.contains("You also have direct file tools"))
     #expect(!prompt.contains("You can also recall the user's recorded screen history"))
 }

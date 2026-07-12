@@ -310,10 +310,17 @@ public struct RecordRecall: Sendable {
         case .search(let query):
             guard !query.isEmpty else { return Self.status(.error, tool: "search_record", kind: "validation_error", message: "search_record needs a query.") }
             let visible = await searchContexts(query: query, limit: 12, candidatePool: reranker == nil ? 40 : 80)
-            guard !visible.isEmpty else { return Self.status(.noResult, tool: "search_record", kind: "no_matches", message: "No recorded moments match “\(query)”. Try different words or a timeframe.") }
-            try? await store.markMemoryEventsAccessed(visible.map(\.id))
+            let rawDays = Set(visible.map { EventStoreLayout.utcDayKey(for: $0.capturedAt) })
+            let graphHits = ((try? await store.searchKnowledgeGraphs(matching: query, limit: 12)) ?? [])
+                .filter { !rawDays.contains($0.graph.day) }
+            guard !visible.isEmpty || !graphHits.isEmpty else {
+                return Self.status(.noResult, tool: "search_record", kind: "no_matches", message: "No recorded moments match “\(query)”. Try different words or a timeframe.")
+            }
+            if !visible.isEmpty { try? await store.markMemoryEventsAccessed(visible.map(\.id)) }
+            let lines = visible.map { Self.line(for: $0, textCap: 240) }
+                + graphHits.map { Self.knowledgeGraphLine(for: $0.graph, snippet: $0.snippet) }
             return Self.enveloped(
-                visible.map { Self.line(for: $0, textCap: 240) }.joined(separator: "\n"),
+                lines.joined(separator: "\n"),
                 source: "record search",
                 tool: "search_record"
             )
@@ -325,9 +332,16 @@ public struct RecordRecall: Sendable {
             }
             let rows = ((try? await store.contexts(between: start, and: end, limit: 60)) ?? [])
                 .filter { !PrivacyRules.isSensitive($0) }
-            guard !rows.isEmpty else { return Self.status(.noResult, tool: "get_timeframe", kind: "empty_window", message: "Nothing recorded in that window.") }
+            let rawDays = Set(rows.map { EventStoreLayout.utcDayKey(for: $0.capturedAt) })
+            let graphs = ((try? await store.knowledgeGraphs(between: start, and: end)) ?? [])
+                .filter { !rawDays.contains($0.day) }
+            guard !rows.isEmpty || !graphs.isEmpty else {
+                return Self.status(.noResult, tool: "get_timeframe", kind: "empty_window", message: "Nothing recorded in that window.")
+            }
+            let lines = rows.map { Self.line(for: $0, textCap: 160) }
+                + graphs.map { Self.knowledgeGraphLine(for: $0, snippet: nil) }
             return Self.enveloped(
-                rows.map { Self.line(for: $0, textCap: 160) }.joined(separator: "\n"),
+                lines.joined(separator: "\n"),
                 source: "record timeframe",
                 tool: "get_timeframe"
             )
@@ -423,9 +437,23 @@ public struct RecordRecall: Sendable {
                 episodes = (try? await store.timelineEpisodes(between: start, and: end)) ?? []
             }
             let visible = episodes.filter { !Self.isSensitive($0) }
-            guard !visible.isEmpty else { return Self.status(.noResult, tool: "list_sessions", kind: "empty_window", message: "No sessions recorded in that window.") }
+            let episodeDays = Set(visible.map { EventStoreLayout.utcDayKey(for: $0.startAt) })
+            let graphSessions = ((try? await store.knowledgeGraphs(between: start, and: end)) ?? [])
+                .filter { !episodeDays.contains($0.day) }
+                .flatMap { graph in
+                    graph.nodes
+                        .filter { node in
+                            node.type == .session
+                                && node.lastSeenMs >= EventStoreLayout.capturedMilliseconds(for: start)
+                                && node.firstSeenMs <= EventStoreLayout.capturedMilliseconds(for: end)
+                        }
+                        .map { Self.knowledgeGraphSessionLine(node: $0, day: graph.day) }
+                }
+            guard !visible.isEmpty || !graphSessions.isEmpty else {
+                return Self.status(.noResult, tool: "list_sessions", kind: "empty_window", message: "No sessions recorded in that window.")
+            }
             return Self.enveloped(
-                visible.map { Self.sessionLine(for: $0) }.joined(separator: "\n"),
+                (visible.map { Self.sessionLine(for: $0) } + graphSessions).joined(separator: "\n"),
                 source: "record sessions",
                 tool: "list_sessions"
             )
@@ -486,6 +514,49 @@ public struct RecordRecall: Sendable {
         let title = episode.windowTitleHint.map { " — \($0)" } ?? ""
         return "[#\(episode.representativeContextID)] \(time(episode.startAt))–\(time(episode.endAt)) "
             + "(\(duration(max(0, episode.endAt.timeIntervalSince(episode.startAt))))) \(episode.appName)\(title) · \(episode.contextCount) moments"
+    }
+
+    /// Knowledge-graph evidence intentionally has no `[#id]` token: its source
+    /// moment may already be pruned, so the answerer must not create a broken Reel
+    /// jump or proof chip for it.
+    static func knowledgeGraphLine(for graph: ContextKnowledgeGraph, snippet: String?) -> String {
+        let apps = graph.nodes.filter { $0.type == .app }
+            .sorted {
+                if $0.mentionCount != $1.mentionCount { return $0.mentionCount > $1.mentionCount }
+                return $0.label < $1.label
+            }
+            .prefix(4)
+            .map(\.label)
+        let facts = graph.nodes.filter { $0.type == .document || $0.type == .entity }
+            .sorted {
+                if $0.mentionCount != $1.mentionCount { return $0.mentionCount > $1.mentionCount }
+                return $0.label < $1.label
+            }
+            .prefix(5)
+            .map(\.label)
+        var parts = [
+            "[KG \(graph.day)] \(utcTime(graph.range.startMs))–\(utcTime(graph.range.endMs))",
+        ]
+        if !apps.isEmpty { parts.append(apps.joined(separator: ", ")) }
+        if !facts.isEmpty { parts.append(facts.joined(separator: ", ")) }
+        let evidence = (snippet?.isEmpty == false ? snippet : graph.summary) ?? graph.summary
+        let flattened = evidence.replacingOccurrences(of: "\n", with: " · ")
+        return parts.joined(separator: " · ") + " | " + String(flattened.prefix(560))
+    }
+
+    static func knowledgeGraphSessionLine(node: ContextKnowledgeGraphNode, day: String) -> String {
+        let description = node.attributes["description"] ?? node.label
+        let count = node.attributes["context_count"] ?? String(node.mentionCount)
+        return "[KG \(day)] \(utcTime(node.firstSeenMs))–\(utcTime(node.lastSeenMs)) "
+            + "\(node.label) · \(count) contexts | \(String(description.prefix(560)))"
+    }
+
+    static func utcTime(_ milliseconds: Int64) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: EventStoreLayout.date(fromCapturedMilliseconds: milliseconds))
     }
 
     static func isSensitive(_ episode: TimelineEpisode) -> Bool {

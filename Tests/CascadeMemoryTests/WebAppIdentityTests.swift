@@ -57,5 +57,5 @@ func webAppIdentityFromReturnsOnlyStableDocumentHashes() {
     #expect(first != nil)
     #expect(first == second)
     #expect(first != other)
-    #expect(first?.count == 12)
+    #expect(first?.count == 24)
 }

@@ -74,7 +74,11 @@ func experimentalModelCallCacheDefaultsOffAndLeavesPureCallsUncached() async thr
 func experimentalModelCallCacheEnabledDedupesPlannerCuratorAndTaskPlannerCalls() async throws {
     let defaults = UserDefaults(suiteName: "CascadeModelCallCacheOn-\(UUID().uuidString)")!
     defaults.set(true, forKey: CascadeAppModel.experimentalModelCallCacheKey)
-    let cache = try #require(CascadeAppModel.experimentalModelCallCache(defaults: defaults))
+    _ = try #require(CascadeAppModel.experimentalModelCallCache(defaults: defaults))
+    // A full package run can suspend this MainActor test for longer than the
+    // production cache's 30-second TTL while other suites execute. Keep this
+    // integration focused on request deduplication rather than scheduler load.
+    let cache = ModelCallCache(ttl: 5 * 60)
 
     let plannerClient = ModelCacheCountingClient(reply: validModelCacheStepJSON)
     let planner = ClaudeSingleStepPlanner(client: ModelCacheCountingCompleter(client: plannerClient), cache: cache)

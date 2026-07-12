@@ -315,6 +315,73 @@ func recallToolDefinitionsExposeEveryTool() {
     #expect(Set(names) == RecordRecall.toolNames())
 }
 
+// MARK: - knowledge-graph fallback after source retention
+
+private func makePrunedKnowledgeGraphStore(
+    token: String
+) async throws -> (store: CascadeStore, capturedAt: Date, day: String, contextID: Int64) {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeRecallKG-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let frame = directory.appendingPathComponent("historic.heic")
+    try Data("real historic frame".utf8).write(to: frame, options: .atomic)
+    let now = Date()
+    let capturedAt = now.addingTimeInterval(-8 * 24 * 3600)
+    let context = try await store.insert(RecordedContext(
+        capturedAt: capturedAt,
+        source: .screen,
+        appName: "Safari",
+        bundleIdentifier: "com.apple.Safari",
+        windowTitle: "Acme Q2 Budget",
+        ocrText: "\(token) APER-301 https://example.com/q2-budget TODO: reconcile Acme runway by 2026-08-01 #finance",
+        imagePath: frame.path
+    ))
+    _ = try await store.compactAgedContextsIntoKnowledgeGraph(
+        olderThan: now.addingTimeInterval(-24 * 3600)
+    )
+    _ = try await store.prune(maxAge: 7 * 24 * 3600, maxTotalBytes: .max)
+    #expect(try await store.context(id: context.id) == nil)
+    #expect(!FileManager.default.fileExists(atPath: frame.path))
+    return (store, capturedAt, EventStoreLayout.utcDayKey(for: capturedAt), context.id)
+}
+
+@Test
+func testSearchRecordFallsBackToKGAfterSourcePrune() async throws {
+    let fixture = try await makePrunedKnowledgeGraphStore(token: "violetarchive")
+
+    let output = await RecordRecall(store: fixture.store).perform(.search(query: "violetarchive"))
+
+    #expect(output.contains("[KG \(fixture.day)]"))
+    #expect(output.contains("Safari"))
+    #expect(output.contains("example.com/q2-budget") || output.contains("Q2 Budget"))
+    #expect(output.contains("violetarchive"))
+    #expect(!output.contains("[#\(fixture.contextID)]"))
+    #expect(!output.contains("[#"))
+    let envelope = try observationEnvelope(from: output)
+    #expect(envelope.acquiredByTool == "search_record")
+}
+
+@Test
+func testTimeframeAndSessionsFallBackToKGAfterSourcePrune() async throws {
+    let fixture = try await makePrunedKnowledgeGraphStore(token: "amberarchive")
+    let formatter = ISO8601DateFormatter()
+    let start = formatter.string(from: fixture.capturedAt.addingTimeInterval(-60))
+    let end = formatter.string(from: fixture.capturedAt.addingTimeInterval(600))
+
+    let timeframe = await RecordRecall(store: fixture.store).perform(.timeframe(startISO: start, endISO: end))
+    let sessions = await RecordRecall(store: fixture.store).perform(.sessions(startISO: start, endISO: end))
+
+    #expect(timeframe.contains("[KG \(fixture.day)]"))
+    #expect(timeframe.contains("Safari"))
+    #expect(timeframe.contains("amberarchive"))
+    #expect(!timeframe.contains("[#"))
+    #expect(sessions.contains("[KG \(fixture.day)]"))
+    #expect(sessions.contains("Safari"))
+    #expect(sessions.contains("contexts"))
+    #expect(!sessions.contains("[#"))
+}
+
 private func observationEnvelope(from rendered: String) throws -> ObservationEnvelope {
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601

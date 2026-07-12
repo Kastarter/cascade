@@ -87,7 +87,9 @@ struct GroundingCacheIntegrationTests {
 
     @Test
     func cachedMissSuppressesRepeatLookupUntilTTLExpires() async throws {
-        let cache = GroundingCache(negativeMissTTL: 0.05)
+        // Leave enough headroom for heavily parallel full-package runs while
+        // still exercising real wall-clock expiry through MixtureGrounder.
+        let cache = GroundingCache(negativeMissTTL: 1)
         let counter = GroundingCallCounter()
         let grounder = MixtureGrounder(
             base: CountingGrounder(counter: counter, result: GroundingResult()),
@@ -116,7 +118,7 @@ struct GroundingCacheIntegrationTests {
         #expect(second == nil)
         #expect(await counter.value() == 1)
 
-        try await Task.sleep(nanoseconds: 80_000_000)
+        try await Task.sleep(for: .seconds(1.1))
 
         let third = await grounder.ground(
             screenshot: screenshot,

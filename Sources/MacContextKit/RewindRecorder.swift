@@ -490,20 +490,15 @@ actor RecorderMaintenanceScheduler {
         pendingSemanticIndex[contextID] = trimmed
     }
 
-    /// Frames older than this thin from ~1/s to one per `thinnedFrameSpacing` —
-    /// the recent window stays video-smooth, aged days cost ~8x less disk, and
-    /// every row's OCR text stays searchable forever.
-    private static let thinFramesAfter: TimeInterval = 48 * 3600
-    private static let thinnedFrameSpacing: TimeInterval = 8
-
-    func runOnce(reason: CascadeStoreMaintenanceReason = .idle) async {
-        if let freed = try? await store.thinAgedFrames(
-            olderThan: Date().addingTimeInterval(-Self.thinFramesAfter),
-            keepEvery: Self.thinnedFrameSpacing
-        ) {
-            for path in freed { FrameStore.delete(path) }
-        }
-        if let removed = try? await store.prune() {
+    /// The recorder starts this immediately and repeats it hourly. A graph must
+    /// commit before a frame older than 24 hours is removed; prune is skipped if
+    /// compaction cannot fully catch up so source rows remain available to retry.
+    func runOnce(reason: CascadeStoreMaintenanceReason = .idle, now: Date = Date()) async {
+        let cutoff = now.addingTimeInterval(-24 * 3600)
+        if let result = try? await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff),
+           result.isCaughtUp,
+           result.deletionFailures == 0,
+           let removed = try? await store.prune(protectingContextsCapturedOnOrAfter: cutoff) {
             for path in removed { FrameStore.delete(path) }
         }
         try? await store.performMaintenance(reason: reason)

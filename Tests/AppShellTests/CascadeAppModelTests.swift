@@ -118,11 +118,13 @@ private func waitUntil(_ condition: () -> Bool, maxTries: Int = 500) async throw
     }
 }
 
+@MainActor
 private func waitForAudit(
     _ store: CascadeStore,
     action: String,
-    maxTries: Int = 500
+    maxTries: Int = 2_000
 ) async throws -> AuditEvent {
+    await Task.yield()
     var tries = 0
     while tries < maxTries {
         if let row = try await store.recentAudit(limit: 80).first(where: { $0.action == action }) {
@@ -134,12 +136,14 @@ private func waitForAudit(
     throw CocoaError(.fileReadNoSuchFile)
 }
 
+@MainActor
 private func waitForAudit(
     _ store: CascadeStore,
     action: String,
     detailContains needle: String,
-    maxTries: Int = 500
+    maxTries: Int = 2_000
 ) async throws -> AuditEvent {
+    await Task.yield()
     var tries = 0
     while tries < maxTries {
         if let row = try await store.recentAudit(limit: 80).first(where: { $0.action == action && $0.detail.contains(needle) }) {
