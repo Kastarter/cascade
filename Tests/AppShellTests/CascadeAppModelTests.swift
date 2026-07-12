@@ -201,7 +201,10 @@ private func makeModel(
         teachRecorderSettleOperation: teachRecorderSettleOperation,
         teachNarrationDrain: teachNarrationDrain,
         teachCurationOverride: teachCurationOverride,
-        assistTaskLifecycleOverride: assistTaskLifecycleOverride
+        assistTaskLifecycleOverride: assistTaskLifecycleOverride,
+        // Deterministic key absence: the real Keychain probe answers differently per
+        // machine/signing context, silently flipping hasAnthropicKey-guarded routing.
+        anthropicKeyProbeOverride: { false }
     )
     return (model, store)
 }

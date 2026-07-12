@@ -595,6 +595,10 @@ public final class CascadeAppModel: ObservableObject {
     private let teachNarrationDrainOverride: (@Sendable (UUID, Duration) async -> RealtimeVoice.TranscriptionDrainResult)?
     private let teachCurationOverride: (@Sendable (Date, Date, String?) async throws -> CuratedAgent?)?
     private let assistTaskLifecycleOverride: (@Sendable () async -> Void)?
+    /// Key presence must be deterministic in tests: the real Keychain probe answers
+    /// differently per machine and signing context, silently flipping every routing
+    /// decision that guards on `hasAnthropicKey`.
+    private let anthropicKeyProbeOverride: (@Sendable () -> Bool)?
 
     public init(
         store injectedStore: CascadeStore? = nil,
@@ -613,7 +617,8 @@ public final class CascadeAppModel: ObservableObject {
         },
         teachNarrationDrain: (@Sendable (UUID, Duration) async -> RealtimeVoice.TranscriptionDrainResult)? = nil,
         teachCurationOverride: (@Sendable (Date, Date, String?) async throws -> CuratedAgent?)? = nil,
-        assistTaskLifecycleOverride: (@Sendable () async -> Void)? = nil
+        assistTaskLifecycleOverride: (@Sendable () async -> Void)? = nil,
+        anthropicKeyProbeOverride: (@Sendable () -> Bool)? = nil
     ) throws {
         self.startsSubsystems = startsSubsystems
         self.defaultsStore = defaults
@@ -629,6 +634,7 @@ public final class CascadeAppModel: ObservableObject {
         self.teachNarrationDrainOverride = teachNarrationDrain
         self.teachCurationOverride = teachCurationOverride
         self.assistTaskLifecycleOverride = assistTaskLifecycleOverride
+        self.anthropicKeyProbeOverride = anthropicKeyProbeOverride
         self.appSkills = initialAppSkills ?? AppSkillRegistry.load()
         self.learnedSkillDirectory = learnedSkillDirectory
         self.voice = RealtimeVoice(audioEnabled: startsSubsystems, defaults: defaults)
@@ -11061,7 +11067,7 @@ public final class CascadeAppModel: ObservableObject {
     }
 
     public func refreshKeyStatus() {
-        hasAnthropicKey = keyStore.hasKey()
+        hasAnthropicKey = anthropicKeyProbeOverride?() ?? keyStore.hasKey()
         keyMessage = hasAnthropicKey
             ? "Claude key connected in macOS Keychain."
             : "Paste your Anthropic API key to enable Claude-backed Q&A and agent generation."
