@@ -310,7 +310,9 @@ public final class CascadeAppModel: ObservableObject {
     /// The curated agent built from the last demonstration, awaiting the user's review
     /// in the preview sheet (nil = no sheet). They pick "Add to my agents" or "Send to
     /// manager" from there.
-    @Published public var teachPreview: CuratedAgent?
+    @Published public var teachPreview: CuratedAgent? {
+        didSet { teachPreviewOwnerSessionID = nil }
+    }
     /// Demonstrations the employee chose to route to the MANAGER instead of adding
     /// directly — they surface in the manager's review queue alongside auto-detected
     /// workflows. In-memory for v1 (a taught recipe has no repeated waste behind it,
@@ -339,7 +341,6 @@ public final class CascadeAppModel: ObservableObject {
         var intentFragments: [String]
         var revision = 0
         var initialResultPublished = false
-        var previewSignature: String?
         var appliedRevision: Int?
         var curated: CuratedAgent?
     }
@@ -353,6 +354,9 @@ public final class CascadeAppModel: ObservableObject {
     private var recentTeachSessions: [UUID: RecentTeachSession] = [:]
     private var lateTeachRecurationTasks: [UUID: Task<Void, Never>] = [:]
     private var lateTeachRecurationWorkerIDs: [UUID: UUID] = [:]
+    /// UI ownership is session identity, never the workflow signature: reteaching the
+    /// same action sequence intentionally produces the same signature.
+    private var teachPreviewOwnerSessionID: UUID?
 
     /// The companion-cursor colorway (cursor, trail, ripple, and highlight marquee
     /// all follow it). Picked from the notch; persists across launches.
@@ -7557,13 +7561,13 @@ public final class CascadeAppModel: ObservableObject {
         }
         if let curated {
             session.initialResultPublished = true
-            session.previewSignature = curated.signature
             session.appliedRevision = requestedRevision
             session.curated = curated
             recentTeachSessions[sessionID] = session
             if isLatestRecentTeachSession(sessionID), activeTeachSessionID == nil {
                 teachStatus = nil
                 teachPreview = curated
+                teachPreviewOwnerSessionID = sessionID
             }
         } else {
             if isLatestRecentTeachSession(sessionID), activeTeachSessionID == nil {
@@ -7600,18 +7604,17 @@ public final class CascadeAppModel: ObservableObject {
                 if current.revision != snapshot.revision { continue }
 
                 if let curated {
-                    let shownSignature = current.previewSignature
-                    let previewIsShowingThisSession = shownSignature != nil
-                        && teachPreview?.signature == shownSignature
+                    let previewIsShowingThisSession = teachPreview != nil
+                        && teachPreviewOwnerSessionID == sessionID
                     let mayPresentNewPreview = !current.initialResultPublished
                         && teachPreview == nil
                         && isLatestRecentTeachSession(sessionID)
                         && activeTeachSessionID == nil
                     if previewIsShowingThisSession || mayPresentNewPreview {
                         teachPreview = curated
+                        teachPreviewOwnerSessionID = sessionID
                     }
                     current.initialResultPublished = true
-                    current.previewSignature = curated.signature
                     current.appliedRevision = snapshot.revision
                     current.curated = curated
                     recentTeachSessions[sessionID] = current

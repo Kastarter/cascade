@@ -147,7 +147,7 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     private let sender: any RealtimeVoiceEventSending
     private let policy: VoiceTurnEndpointPolicy
     private let purpose: RealtimeVoice.CapturePurpose
-    private let onCommit: @Sendable (RealtimeVoice.CapturePurpose) -> Void
+    private let onCommit: @Sendable (RealtimeVoice.CapturePurpose) -> String
     private var gate: LocalVoiceActivityGate
     private var pendingSamples: [Int16] = []
     /// Whether gated audio reached the server this turn. Non-speech turns clear.
@@ -166,7 +166,9 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         mode: Mode,
         sender: any RealtimeVoiceEventSending,
         purpose: RealtimeVoice.CapturePurpose = .pushToTalk,
-        onCommit: @escaping @Sendable (RealtimeVoice.CapturePurpose) -> Void = { _ in },
+        onCommit: @escaping @Sendable (RealtimeVoice.CapturePurpose) -> String = { _ in
+            "voice-commit-\(UUID().uuidString)"
+        },
         gateConfiguration: LocalVoiceActivityGate.Configuration = LocalVoiceActivityGate.Configuration(),
         endpointPolicy: VoiceTurnEndpointPolicy = VoiceTurnEndpointPolicy()
     ) {
@@ -268,8 +270,11 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     }
 
     private func sendCommitLocked() {
-        onCommit(purpose)
-        sender.sendEvent(["type": "input_audio_buffer.commit"])
+        let eventID = onCommit(purpose)
+        sender.sendEvent([
+            "type": "input_audio_buffer.commit",
+            "event_id": eventID,
+        ])
     }
 
     func clear() {
@@ -378,6 +383,13 @@ public final class RealtimeVoice: ObservableObject {
         }
     }
 
+    /// One physical press/open request. `CapturePurpose` says where a transcript routes;
+    /// it is deliberately not identity because two rapid PTT presses share that purpose.
+    private struct CaptureRequest: Equatable, Sendable {
+        let generation: UInt64
+        let purpose: CapturePurpose
+    }
+
     public struct CompletedUtterance: Equatable, Sendable {
         public let text: String
         public let itemID: String
@@ -433,11 +445,22 @@ public final class RealtimeVoice: ObservableObject {
     private let responseState = RealtimeVoiceResponseState()
     let transcriptionTracker = RealtimeVoiceTranscriptionTracker()
     private var partialTranscriptsByItemID: [String: String] = [:]
-    /// Purpose ownership spans the async connect → capture handshake. A release
-    /// only closes the matching purpose, so Right Command cannot close the
-    /// hands-free microphone while a teaching demonstration owns it.
-    private(set) var requestedCapturePurpose: CapturePurpose?
-    private(set) var activeCapturePurpose: CapturePurpose?
+    /// Request identity spans the async connect → capture handshake. Purpose still
+    /// prevents Right Command from closing teach capture, while generation prevents a
+    /// stale waiter/tail task from mutating a newer press with the same purpose.
+    private var nextCaptureGeneration: UInt64 = 0
+    private var requestedCapture: CaptureRequest?
+    private var activeCapture: CaptureRequest?
+    var requestedCapturePurpose: CapturePurpose? { requestedCapture?.purpose }
+    var activeCapturePurpose: CapturePurpose? { activeCapture?.purpose }
+    var requestedCaptureGeneration: UInt64? { requestedCapture?.generation }
+    var activeCaptureGeneration: UInt64? { activeCapture?.generation }
+
+    /// Narrow headless capture seam: tests exercise the real request/endpoint state
+    /// machine while replacing only microphone authorization, socket bring-up, and the
+    /// hardware tap. Production leaves both values nil.
+    private var capturePreparationOverride: (@Sendable () async -> Bool)?
+    private var captureSenderOverride: (any RealtimeVoiceEventSending)?
 
     private static let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
@@ -473,6 +496,16 @@ public final class RealtimeVoice: ObservableObject {
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
     }
 
+    convenience init(
+        testingEventSender: any RealtimeVoiceEventSending,
+        localEndpointingEnabled: Bool,
+        prepareCapture: @escaping @Sendable () async -> Bool = { true }
+    ) {
+        self.init(audioEnabled: false, localEndpointingEnabled: localEndpointingEnabled)
+        self.captureSenderOverride = testingEventSender
+        self.capturePreparationOverride = prepareCapture
+    }
+
     public var hint: String {
         switch state {
         case .idle: return permissionMessage ?? "Hold right ⌘ to talk"
@@ -484,16 +517,22 @@ public final class RealtimeVoice: ObservableObject {
     // MARK: - Push-to-talk
 
     public func beginTalking(purpose: CapturePurpose = .pushToTalk) {
-        if let activeCapturePurpose {
-            guard activeCapturePurpose == purpose else { return }
-            return
+        if let activeCapture {
+            guard activeCapture.purpose == purpose else { return }
+            // A locally-endpointed PTT release can still own the mic during its short
+            // tail wait. A genuinely new press must cancel that old generation before
+            // opening another; a repeat key-down while actively listening stays a no-op.
+            guard purpose == .pushToTalk, state == .working else { return }
+            abandonCaptureForNewPushToTalk(activeCapture)
         }
-        if let requestedCapturePurpose {
-            guard requestedCapturePurpose == purpose else { return }
+        if let requestedCapture {
+            guard requestedCapture.purpose == purpose else { return }
             return
         }
         cancelPendingEndpointCommit(clearBufferedAudio: true)
-        requestedCapturePurpose = purpose
+        nextCaptureGeneration &+= 1
+        let request = CaptureRequest(generation: nextCaptureGeneration, purpose: purpose)
+        requestedCapture = request
         // Barge-in: cut the agent off and listen.
         if state == .working || (playerNode?.isPlaying ?? false) || responseState.hasActiveResponse {
             for event in responseState.bargeInEvents() {
@@ -505,12 +544,8 @@ public final class RealtimeVoice: ObservableObject {
         guard state != .listening else { return }
         state = .idle
         Task { @MainActor in
-            guard await ensureMic() else {
-                if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
-                return
-            }
-            guard await ensureConnected() else {
-                if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
+            guard await prepareCapture() else {
+                if requestedCapture == request { requestedCapture = nil }
                 return
             }
             // Cold WebSocket: the user may have already released the key while we
@@ -518,21 +553,26 @@ public final class RealtimeVoice: ObservableObject {
             // wedge state at .listening and make the NEXT press a no-op. Bail and
             // settle back to idle instead. (Main-actor serialized, so this guard
             // and startCapture can't be split by a release.)
-            guard requestedCapturePurpose == purpose else { state = .idle; return }
-            startCapture(purpose: purpose)
+            guard requestedCapture == request else { return }
+            startCapture(request: request)
         }
     }
 
     public func endTalking(purpose: CapturePurpose = .pushToTalk) {
-        if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
-        guard activeCapturePurpose == purpose else { return }
+        if requestedCapture?.purpose == purpose { requestedCapture = nil }
+        guard let activeCapture, activeCapture.purpose == purpose else { return }
         guard state == .listening else { return }
         transcriptionTracker.captureWillClose(purpose)
         guard let endpointSession else {
             stopCapture()
-            transcriptionTracker.noteCommit(from: purpose)
-            socket?.sendEvent(["type": "input_audio_buffer.commit"])
-            activeCapturePurpose = nil
+            if let sender = captureEventSender {
+                let eventID = transcriptionTracker.noteCommit(from: purpose)
+                sender.sendEvent([
+                    "type": "input_audio_buffer.commit",
+                    "event_id": eventID,
+                ])
+            }
+            self.activeCapture = nil
             transcriptionTracker.captureDidClose(purpose)
             state = .working
             return
@@ -540,12 +580,12 @@ public final class RealtimeVoice: ObservableObject {
 
         switch endpointSession.release() {
         case .cleared:
-            finishCapture(purpose: purpose, state: .idle)
+            finishCapture(activeCapture, state: .idle)
         case .committed:
-            finishCapture(purpose: purpose, state: .working)
+            finishCapture(activeCapture, state: .working)
         case .tailWait(let remainingMs):
             state = .working
-            scheduleEndpointTailWait(endpointSession, purpose: purpose, initialDelayMs: remainingMs)
+            scheduleEndpointTailWait(endpointSession, request: activeCapture, initialDelayMs: remainingMs)
         }
         // The transcript arrives via conversation.item.input_audio_transcription.completed.
     }
@@ -577,6 +617,18 @@ public final class RealtimeVoice: ObservableObject {
 
     // MARK: - Connection
 
+    private var captureEventSender: (any RealtimeVoiceEventSending)? {
+        captureSenderOverride ?? socket
+    }
+
+    private func prepareCapture() async -> Bool {
+        if let capturePreparationOverride {
+            return await capturePreparationOverride()
+        }
+        guard await ensureMic() else { return false }
+        return await ensureConnected()
+    }
+
     private func ensureConnected() async -> Bool {
         if connected { return true }
         guard let key = keyStore.readKey(), !key.isEmpty else {
@@ -606,8 +658,8 @@ public final class RealtimeVoice: ObservableObject {
         cancelPendingEndpointCommit(clearBufferedAudio: false)
         stopCapture()
         endpointSession = nil
-        requestedCapturePurpose = nil
-        activeCapturePurpose = nil
+        requestedCapture = nil
+        activeCapture = nil
         partialTranscriptsByItemID.removeAll()
         transcriptionTracker.disconnect()
         responseState.clear()
@@ -728,8 +780,18 @@ public final class RealtimeVoice: ObservableObject {
 
         case "error":
             responseState.clear()
-            if let error = json["error"] as? [String: Any], let message = error["message"] as? String {
-                permissionMessage = message
+            if let error = json["error"] as? [String: Any] {
+                let failedEventID = (error["event_id"] as? String)
+                    ?? (json["event_id"] as? String)
+                if let failedEventID,
+                   transcriptionTracker.failCommit(eventID: failedEventID) != nil,
+                   state == .working,
+                   activeCapture == nil {
+                    state = .idle
+                }
+                if let message = error["message"] as? String {
+                    permissionMessage = message
+                }
             }
 
         default:
@@ -739,10 +801,10 @@ public final class RealtimeVoice: ObservableObject {
 
     // MARK: - Capture
 
-    private func startCapture(purpose: CapturePurpose) {
-        guard audioEnabled, let captureEngine, let socket else {
+    private func startCapture(request: CaptureRequest) {
+        guard let sender = captureEventSender else {
             permissionMessage = "No microphone input is available."
-            if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
+            if requestedCapture == request { requestedCapture = nil }
             state = .idle
             return
         }
@@ -750,29 +812,34 @@ public final class RealtimeVoice: ObservableObject {
         transcript = ""
         partialTranscriptsByItemID.removeAll()
         let endpointSession = RealtimeVoiceEndpointSession(
-            mode: endpointMode(for: purpose),
-            sender: socket,
-            purpose: purpose,
+            mode: endpointMode(for: request.purpose),
+            sender: sender,
+            purpose: request.purpose,
             onCommit: { [transcriptionTracker] purpose in
                 transcriptionTracker.noteCommit(from: purpose)
             }
         )
         self.endpointSession = endpointSession
-        socket.sendEvent(["type": "input_audio_buffer.clear"])
+        sender.sendEvent(["type": "input_audio_buffer.clear"])
         do {
-            try Self.installCaptureTap(engine: captureEngine, endpointSession: endpointSession) { [weak self] level in
-                Task { @MainActor in
-                    guard let self, self.state == .listening else { return }
-                    // Light smoothing so the bars breathe instead of flickering.
-                    self.inputLevel = self.inputLevel * 0.6 + level * 0.4
+            if captureSenderOverride == nil {
+                guard audioEnabled, let captureEngine else {
+                    throw NSError(domain: "Cascade.Voice", code: 3)
+                }
+                try Self.installCaptureTap(engine: captureEngine, endpointSession: endpointSession) { [weak self] level in
+                    Task { @MainActor in
+                        guard let self, self.state == .listening else { return }
+                        // Light smoothing so the bars breathe instead of flickering.
+                        self.inputLevel = self.inputLevel * 0.6 + level * 0.4
+                    }
                 }
             }
-            requestedCapturePurpose = nil
-            activeCapturePurpose = purpose
+            requestedCapture = nil
+            activeCapture = request
             state = .listening
         } catch {
             self.endpointSession = nil
-            if requestedCapturePurpose == purpose { requestedCapturePurpose = nil }
+            if requestedCapture == request { requestedCapture = nil }
             permissionMessage = "No microphone input is available."
             state = .idle
         }
@@ -796,6 +863,12 @@ public final class RealtimeVoice: ObservableObject {
         inputLevel = 0
     }
 
+    /// Feeds the same endpoint session as the hardware tap for deterministic ownership
+    /// and tail-wait tests. The production capture path never calls this seam.
+    func ingestCapturedPCM16ForTesting(_ data: Data) {
+        endpointSession?.ingestConvertedPCM16(data)
+    }
+
     private func cancelPendingEndpointCommit(clearBufferedAudio: Bool) {
         endpointCommitTask?.cancel()
         endpointCommitTask = nil
@@ -807,9 +880,21 @@ public final class RealtimeVoice: ObservableObject {
         }
     }
 
+    private func abandonCaptureForNewPushToTalk(_ request: CaptureRequest) {
+        endpointCommitTask?.cancel()
+        endpointCommitTask = nil
+        endpointSession?.clear()
+        guard activeCapture == request else { return }
+        stopCapture()
+        endpointSession = nil
+        activeCapture = nil
+        transcriptionTracker.captureDidClose(request.purpose)
+        state = .idle
+    }
+
     private func scheduleEndpointTailWait(
         _ endpointSession: RealtimeVoiceEndpointSession,
-        purpose: CapturePurpose,
+        request: CaptureRequest,
         initialDelayMs: Int
     ) {
         endpointCommitTask = Task { @MainActor [weak self, endpointSession] in
@@ -823,22 +908,23 @@ public final class RealtimeVoice: ObservableObject {
                     continue
                 case .committed:
                     self.endpointCommitTask = nil
-                    self.finishCapture(purpose: purpose, state: .working)
+                    self.finishCapture(request, state: .working)
                     return
                 case .cleared:
                     self.endpointCommitTask = nil
-                    self.finishCapture(purpose: purpose, state: .idle)
+                    self.finishCapture(request, state: .idle)
                     return
                 }
             }
         }
     }
 
-    private func finishCapture(purpose: CapturePurpose, state newState: VoiceState) {
+    private func finishCapture(_ request: CaptureRequest, state newState: VoiceState) {
+        guard activeCapture == request else { return }
         stopCapture()
         endpointSession = nil
-        if activeCapturePurpose == purpose { activeCapturePurpose = nil }
-        transcriptionTracker.captureDidClose(purpose)
+        activeCapture = nil
+        transcriptionTracker.captureDidClose(request.purpose)
         state = newState
     }
 

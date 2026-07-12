@@ -1473,12 +1473,12 @@ func groundingBucketReliabilityRequiresEnoughAccurateSamples() {
 
 /// A single cross-app copy/paste demonstration timestamped INSIDE the bracket
 /// `[now, now+offsets]`, increasing 1ms apart so the recipe order is deterministic.
-private func taughtCopyPasteEvents(at now: Date) -> [InputEvent] {
+private func taughtCopyPasteEvents(at now: Date, idStart: Int64 = 0) -> [InputEvent] {
     [
-        InputEvent(id: 0, capturedAt: now.addingTimeInterval(0.000), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail"),
-        InputEvent(id: 1, capturedAt: now.addingTimeInterval(0.001), kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
-        InputEvent(id: 2, capturedAt: now.addingTimeInterval(0.002), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers"),
-        InputEvent(id: 3, capturedAt: now.addingTimeInterval(0.003), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
+        InputEvent(id: idStart + 0, capturedAt: now.addingTimeInterval(0.000), kind: .click, x: 10, y: 10, text: "Inbox", appName: "Mail"),
+        InputEvent(id: idStart + 1, capturedAt: now.addingTimeInterval(0.001), kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        InputEvent(id: idStart + 2, capturedAt: now.addingTimeInterval(0.002), kind: .click, x: 20, y: 20, text: "A1", appName: "Numbers"),
+        InputEvent(id: idStart + 3, capturedAt: now.addingTimeInterval(0.003), kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
     ]
 }
 
@@ -1938,6 +1938,52 @@ func consecutiveTeachCallbacksReconcileToTheirOwnBracketsInEitherOrder(
     let audits = try await store.recentAudit(limit: 120)
     #expect(audits.filter { $0.action == "teach.intent.late" }.count == 2)
     #expect(!audits.contains { $0.action == "assist.task" || $0.action == "teach.reveal" })
+}
+
+@MainActor @Test
+func lateOlderTeachWithSameWorkflowSignatureCannotReplaceNewerPreview() async throws {
+    let startedAt = Date(timeIntervalSince1970: 1_800_002_750)
+    let clock = TestTeachClock(startedAt)
+    let firstSessionID = UUID()
+    let secondSessionID = UUID()
+    let sessionIDs = TestTeachSessionIDs([firstSessionID, secondSessionID])
+    let completer = SequenceCompleter(replies: [
+        teachCuratorReply(name: "First version", goal: "Copy the selected value."),
+        teachCuratorReply(name: "Clarified second version", goal: "Copy the selected value with the clarified process."),
+        teachCuratorReply(name: "Late first-session revision", goal: "Use the narration attached to the first recording."),
+    ])
+    let (model, store) = try makeModel(
+        curatorClient: completer,
+        teachClock: { clock.now() },
+        teachSessionIDFactory: { sessionIDs.next() },
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .timedOut }
+    )
+
+    model.beginTeaching()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: clock.now(), idStart: 100))
+    clock.advance(1)
+    model.endTeaching()
+    try await waitUntil({ model.teachPreview?.name == "First version" })
+    let firstSignature = try #require(model.teachPreview?.signature)
+
+    model.beginTeaching()
+    try await store.insertInputEvents(taughtCopyPasteEvents(at: clock.now(), idStart: 200))
+    clock.advance(1)
+    model.endTeaching()
+    try await waitUntil({ model.teachPreview?.name == "Clarified second version" })
+    #expect(model.teachPreview?.signature == firstSignature)
+
+    model.voice.onUtterance?(RealtimeVoice.CompletedUtterance(
+        text: "the first demonstration also uses the selected inbox value",
+        itemID: "late-first-same-signature",
+        purpose: .teachAmbient(sessionID: firstSessionID, automaticEndpointing: true)
+    ))
+
+    try await waitForCompleterCalls(completer, count: 3)
+    try await waitUntil({ model.teachStatus?.contains("Updated the taught agent") == true })
+    #expect(model.teachPreview?.name == "Clarified second version")
+    #expect(model.teachPreview?.signature == firstSignature)
 }
 
 @MainActor @Test

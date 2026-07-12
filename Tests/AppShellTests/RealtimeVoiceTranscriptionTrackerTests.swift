@@ -20,6 +20,16 @@ private final class LockedDrainResult: @unchecked Sendable {
     }
 }
 
+private final class TrackerRealtimeVoiceEventSender: RealtimeVoiceEventSending, @unchecked Sendable {
+    private(set) var events: [[String: Any]] = []
+
+    func sendEvent(_ object: [String: Any]) { events.append(object) }
+
+    func appendAudio(base64: String) {
+        sendEvent(["type": "input_audio_buffer.append", "audio": base64])
+    }
+}
+
 struct RealtimeVoiceTranscriptionTrackerTests {
     @MainActor @Test func teachDrainCannotFinishBeforeTheClosingTailCommitExists() async {
         let voice = RealtimeVoice(audioEnabled: false)
@@ -187,6 +197,63 @@ struct RealtimeVoiceTranscriptionTrackerTests {
 
         #expect(delivered["teach"] == teachPurpose)
         #expect(delivered["ptt"] == .pushToTalk)
+    }
+
+    @MainActor @Test func rejectedPreItemCommitIsRetiredBeforeNextTeachCommitBinds() async throws {
+        let sender = TrackerRealtimeVoiceEventSender()
+        let voice = RealtimeVoice(
+            testingEventSender: sender,
+            localEndpointingEnabled: false
+        )
+        voice.beginTalking()
+        for _ in 0..<100 where voice.state != .listening {
+            await Task.yield()
+        }
+        #expect(voice.state == .listening)
+        // The legacy/default path commits even when a very quick tap appended no audio.
+        voice.endTalking()
+        #expect(voice.state == .working)
+        let failedPushToTalkEventID = try #require(sender.events.last(where: {
+            $0["type"] as? String == "input_audio_buffer.commit"
+        })?["event_id"] as? String)
+        voice.handleServerEvent([
+            "type": "error",
+            "error": [
+                "type": "invalid_request_error",
+                "event_id": failedPushToTalkEventID,
+                "message": "buffer too small",
+            ],
+        ])
+        #expect(voice.state == .idle)
+
+        let sessionID = UUID()
+        let teachPurpose = RealtimeVoice.CapturePurpose.teachAmbient(
+            sessionID: sessionID,
+            automaticEndpointing: true
+        )
+        voice.transcriptionTracker.captureWillClose(teachPurpose)
+        let teachEventID = voice.transcriptionTracker.noteCommit(from: teachPurpose)
+        #expect(teachEventID != failedPushToTalkEventID)
+        voice.handleServerEvent([
+            "type": "input_audio_buffer.committed",
+            "item_id": "teach-after-rejected-ptt",
+        ])
+        voice.transcriptionTracker.captureDidClose(teachPurpose)
+
+        var delivered: RealtimeVoice.CompletedUtterance?
+        voice.onUtterance = { delivered = $0 }
+        voice.handleServerEvent([
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "teach-after-rejected-ptt",
+            "transcript": "this narration belongs to the demonstration",
+        ])
+
+        #expect(delivered?.purpose == teachPurpose)
+        #expect(delivered?.text == "this narration belongs to the demonstration")
+        #expect(await voice.drainTranscriptions(
+            forTeachingSession: sessionID,
+            timeout: .milliseconds(10)
+        ) == .drained)
     }
 
     @Test func disconnectReleasesWaitersWithoutFabricatingUtterance() async {

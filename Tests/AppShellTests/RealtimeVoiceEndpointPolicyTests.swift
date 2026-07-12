@@ -78,6 +78,22 @@ private final class ReleaseResultProbe: @unchecked Sendable {
     }
 }
 
+private actor CapturePreparationGate {
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
+
+    func prepare() async -> Bool {
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func waiterCount() -> Int { waiters.count }
+
+    func releaseAll() {
+        let ready = waiters
+        waiters.removeAll()
+        ready.forEach { $0.resume(returning: true) }
+    }
+}
+
 private let realtimeEndpointGateConfig = LocalVoiceActivityGate.Configuration(
     sampleRate: 24_000,
     frameDurationMs: 30,
@@ -195,6 +211,11 @@ struct RealtimeVoiceEndpointPolicyTests {
         feedRealtimeEndpoint(session, frames: utterance + utterance)
 
         #expect(sender.eventTypes.filter { $0 == "input_audio_buffer.commit" }.count == 2)
+        let commitEventIDs = sender.events
+            .filter { $0["type"] as? String == "input_audio_buffer.commit" }
+            .compactMap { $0["event_id"] as? String }
+        #expect(commitEventIDs.count == 2)
+        #expect(Set(commitEventIDs).count == 2)
         let firstCommit = sender.eventTypes.firstIndex(of: "input_audio_buffer.commit")
         let secondCommit = sender.eventTypes.lastIndex(of: "input_audio_buffer.commit")
         #expect(firstCommit != nil)
@@ -315,6 +336,80 @@ struct RealtimeVoiceEndpointPolicyTests {
 
         voice.endTalking()
         #expect(voice.requestedCapturePurpose == purpose)
+    }
+
+    @MainActor @Test func rapidPushToTalkPressCancelsOldEndpointTailAndStartsNewGeneration() async throws {
+        let sender = FakeRealtimeVoiceEventSender()
+        let voice = RealtimeVoice(
+            testingEventSender: sender,
+            localEndpointingEnabled: true
+        )
+
+        voice.beginTalking()
+        for _ in 0..<100 where voice.state != .listening {
+            await Task.yield()
+        }
+        #expect(voice.state == .listening)
+        let firstGeneration = try #require(voice.activeCaptureGeneration)
+
+        let speech = Array(repeating: realtimeSpeechFrame(), count: 8).flatMap { $0 }
+        voice.ingestCapturedPCM16ForTesting(realtimeFrameData(speech))
+        voice.endTalking()
+        #expect(voice.state == .working)
+        #expect(voice.activeCaptureGeneration == firstGeneration)
+
+        voice.beginTalking()
+        for _ in 0..<100 where voice.state != .listening {
+            await Task.yield()
+        }
+
+        #expect(voice.state == .listening)
+        #expect(voice.activeCapturePurpose == .pushToTalk)
+        #expect(voice.activeCaptureGeneration != firstGeneration)
+        #expect(sender.eventTypes.filter { $0 == "input_audio_buffer.clear" }.count >= 3)
+
+        voice.endTalking()
+        #expect(voice.state == .idle)
+    }
+
+    @MainActor @Test func staleColdConnectionWaiterCannotClearNewPushToTalkGeneration() async throws {
+        let sender = FakeRealtimeVoiceEventSender()
+        let preparation = CapturePreparationGate()
+        let voice = RealtimeVoice(
+            testingEventSender: sender,
+            localEndpointingEnabled: true,
+            prepareCapture: { await preparation.prepare() }
+        )
+
+        voice.beginTalking()
+        for _ in 0..<100 {
+            if await preparation.waiterCount() == 1 { break }
+            await Task.yield()
+        }
+        #expect(await preparation.waiterCount() == 1)
+        let firstGeneration = try #require(voice.requestedCaptureGeneration)
+
+        voice.endTalking()
+        #expect(voice.requestedCaptureGeneration == nil)
+        voice.beginTalking()
+        for _ in 0..<100 {
+            if await preparation.waiterCount() == 2 { break }
+            await Task.yield()
+        }
+        #expect(await preparation.waiterCount() == 2)
+        let secondGeneration = try #require(voice.requestedCaptureGeneration)
+        #expect(secondGeneration != firstGeneration)
+
+        await preparation.releaseAll()
+        for _ in 0..<100 where voice.state != .listening {
+            await Task.yield()
+        }
+
+        #expect(voice.state == .listening)
+        #expect(voice.requestedCaptureGeneration == nil)
+        #expect(voice.activeCaptureGeneration == secondGeneration)
+        voice.endTalking()
+        #expect(voice.state == .idle)
     }
 
     @Test func enabledShortSpeechReleaseClearsWithoutAppending() {
