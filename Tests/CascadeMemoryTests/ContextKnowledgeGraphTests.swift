@@ -487,6 +487,55 @@ func testDeletionFailureLeavesReferenceForRetry() async throws {
 }
 
 @Test
+func testInaccessibleFramePathFailsClosedAndRetries() async throws {
+    let fixture = try KnowledgeGraphFixture("ContextKGInaccessible")
+    let now = try fixedUTCDate("2030-05-04T12:00:00Z")
+    let lockedDirectory = fixture.directory.appendingPathComponent("locked", isDirectory: true)
+    try FileManager.default.createDirectory(at: lockedDirectory, withIntermediateDirectories: true)
+    let frame = lockedDirectory.appendingPathComponent("locked.heic").path
+    try Data("real-frame-locked".utf8).write(to: URL(fileURLWithPath: frame), options: .atomic)
+    let context = try await fixture.store.insert(RecordedContext(
+        capturedAt: now.addingTimeInterval(-25 * 3600),
+        source: .screen,
+        appName: "Xcode",
+        windowTitle: "Locked frame",
+        ocrText: "Inaccessible LOCK-42",
+        imagePath: frame
+    ))
+    let cutoff = now.addingTimeInterval(-24 * 3600)
+
+    // A transiently unreadable parent makes fileExists-style probes report the
+    // frame as absent while the bytes are still on disk. Retention must treat
+    // that as a failure to retry, never as proof of prior deletion.
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o000], ofItemAtPath: lockedDirectory.path
+    )
+    defer {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: lockedDirectory.path
+        )
+    }
+
+    let locked = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    #expect(locked.deletionFailures == 1)
+    #expect(locked.filesDeleted == 0)
+    #expect(!locked.isCaughtUp)
+    #expect(try await fixture.store.context(id: context.id)?.imagePath == frame)
+
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755], ofItemAtPath: lockedDirectory.path
+    )
+    #expect(FileManager.default.fileExists(atPath: frame))
+
+    let retried = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    #expect(retried.filesDeleted == 1)
+    #expect(retried.frameReferencesCleared == 1)
+    #expect(retried.isCaughtUp)
+    #expect(!FileManager.default.fileExists(atPath: frame))
+    #expect(try await fixture.store.context(id: context.id)?.imagePath == nil)
+}
+
+@Test
 func testFrameCompactionPreservesOCRAndRecordedContextFTS() async throws {
     let fixture = try KnowledgeGraphFixture("ContextKGFTS")
     let now = try fixedUTCDate("2030-06-02T12:00:00Z")

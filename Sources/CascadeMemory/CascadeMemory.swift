@@ -1743,6 +1743,27 @@ public actor CascadeStore {
         case afterReferenceCommit
     }
 
+    /// True only for an explicit file-not-found from an unlink attempt. Permission
+    /// and I/O failures must NOT match: for retention, "couldn't reach it" is not
+    /// "it is gone", and conflating them clears the only reference to a frame that
+    /// is still on disk. When an underlying POSIX error is present it decides —
+    /// Cocoa-level codes alone can describe an unreachable path the same way as a
+    /// missing one.
+    internal static func isFileNotFoundError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            if underlying.domain == NSPOSIXErrorDomain {
+                return underlying.code == Int(ENOENT)
+            }
+            return isFileNotFoundError(underlying)
+        }
+        if nsError.domain == NSPOSIXErrorDomain {
+            return nsError.code == Int(ENOENT)
+        }
+        return nsError.domain == NSCocoaErrorDomain
+            && (nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError)
+    }
+
     /// Converts every context strictly older than `cutoff` into durable, bounded
     /// knowledge-graph chunks before removing its frame from disk. Exact coverage
     /// rows make each chunk independently resumable: a later chunk failing cannot
@@ -2090,7 +2111,6 @@ public actor CascadeStore {
     ) throws -> FrameDeletionProgress {
         var progress = FrameDeletionProgress()
         var lastPath = ""
-        let fileManager = FileManager.default
 
         while true {
             let scannedPaths = try eligibleCoveredFramePaths(
@@ -2136,24 +2156,25 @@ public actor CascadeStore {
                     clearablePaths.append(path)
                     continue
                 }
-                if !fileManager.fileExists(atPath: path) {
-                    batchAlreadyMissing += 1
-                    clearablePaths.append(path)
-                    continue
-                }
+                // Fail closed: only the unlink's own explicit not-found may clear
+                // the reference without a delete. A stat-based existence probe
+                // reports false when it merely cannot traverse the path
+                // (permissions, transient I/O), and clearing on that would orphan
+                // the frame past the 24h window with nothing left to retry it.
+                // Keeping the reference lets the next hourly pass try again; an
+                // error thrown by a filesystem that already unlinked resolves to
+                // not-found on that retry.
                 do {
                     try deleteFrame(path)
-                } catch {
-                    // Some filesystems report an error after unlinking. The file's
-                    // postcondition, not the thrown value, determines safe progress.
-                }
-                if fileManager.fileExists(atPath: path) {
-                    progress.failedPaths.append(path)
-                    batchFailures += 1
-                } else {
                     progress.filesDeleted += 1
                     batchFilesDeleted += 1
                     clearablePaths.append(path)
+                } catch let error where Self.isFileNotFoundError(error) {
+                    batchAlreadyMissing += 1
+                    clearablePaths.append(path)
+                } catch {
+                    progress.failedPaths.append(path)
+                    batchFailures += 1
                 }
             }
             try onBatchPhase(.afterFileDeletion, batchID)
