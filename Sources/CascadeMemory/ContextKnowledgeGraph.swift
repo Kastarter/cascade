@@ -155,6 +155,11 @@ public struct ContextKnowledgeGraphEdge: Codable, Equatable, Sendable {
     public let weight: Int
     public let firstSeenMs: Int64
     public let lastSeenMs: Int64
+    /// Exact source observations represented by this aggregated edge. Keeping
+    /// these timestamps prevents recall from treating firstSeen...lastSeen as
+    /// continuous presence when the same window appears, disappears, and later
+    /// returns within one session.
+    public let observedAtMs: [Int64]
 
     public init(
         from: String,
@@ -162,7 +167,8 @@ public struct ContextKnowledgeGraphEdge: Codable, Equatable, Sendable {
         kind: Kind,
         weight: Int,
         firstSeenMs: Int64,
-        lastSeenMs: Int64
+        lastSeenMs: Int64,
+        observedAtMs: [Int64] = []
     ) {
         self.from = from
         self.to = to
@@ -170,6 +176,10 @@ public struct ContextKnowledgeGraphEdge: Codable, Equatable, Sendable {
         self.weight = weight
         self.firstSeenMs = firstSeenMs
         self.lastSeenMs = lastSeenMs
+        let observations = observedAtMs.isEmpty
+            ? [firstSeenMs, lastSeenMs]
+            : observedAtMs + [firstSeenMs, lastSeenMs]
+        self.observedAtMs = Array(Set(observations)).sorted()
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -179,6 +189,22 @@ public struct ContextKnowledgeGraphEdge: Codable, Equatable, Sendable {
         case weight
         case firstSeenMs = "first_seen_ms"
         case lastSeenMs = "last_seen_ms"
+        case observedAtMs = "observed_at_ms"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let firstSeenMs = try container.decode(Int64.self, forKey: .firstSeenMs)
+        let lastSeenMs = try container.decode(Int64.self, forKey: .lastSeenMs)
+        self.init(
+            from: try container.decode(String.self, forKey: .from),
+            to: try container.decode(String.self, forKey: .to),
+            kind: try container.decode(Kind.self, forKey: .kind),
+            weight: try container.decode(Int.self, forKey: .weight),
+            firstSeenMs: firstSeenMs,
+            lastSeenMs: lastSeenMs,
+            observedAtMs: try container.decodeIfPresent([Int64].self, forKey: .observedAtMs) ?? []
+        )
     }
 }
 
@@ -223,7 +249,7 @@ public struct ContextKnowledgeGraphCompactionResult: Equatable, Sendable {
 }
 
 internal enum ContextKnowledgeGraphBuilder {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
     private static let maxAliases = 12
     private static let maxKeywords = 16
     private static let maxEvidenceSnippets = 8
@@ -359,17 +385,20 @@ internal enum ContextKnowledgeGraphBuilder {
         var weight: Int
         var firstSeenMs: Int64
         var lastSeenMs: Int64
+        var observedAtMs: [Int64]
 
         mutating func observe(at milliseconds: Int64, weight: Int = 1) {
             self.weight += max(1, weight)
             firstSeenMs = min(firstSeenMs, milliseconds)
             lastSeenMs = max(lastSeenMs, milliseconds)
+            observedAtMs.append(milliseconds)
         }
 
         mutating func merge(_ edge: ContextKnowledgeGraphEdge) {
             weight += edge.weight
             firstSeenMs = min(firstSeenMs, edge.firstSeenMs)
             lastSeenMs = max(lastSeenMs, edge.lastSeenMs)
+            observedAtMs.append(contentsOf: edge.observedAtMs)
         }
 
         var edge: ContextKnowledgeGraphEdge {
@@ -379,7 +408,8 @@ internal enum ContextKnowledgeGraphBuilder {
                 kind: key.kind,
                 weight: max(1, weight),
                 firstSeenMs: firstSeenMs,
-                lastSeenMs: lastSeenMs
+                lastSeenMs: lastSeenMs,
+                observedAtMs: observedAtMs
             )
         }
     }
@@ -565,7 +595,8 @@ internal enum ContextKnowledgeGraphBuilder {
                     key: key,
                     weight: edge.weight,
                     firstSeenMs: edge.firstSeenMs,
-                    lastSeenMs: edge.lastSeenMs
+                    lastSeenMs: edge.lastSeenMs,
+                    observedAtMs: edge.observedAtMs
                 )
             }
         }
@@ -745,7 +776,8 @@ internal enum ContextKnowledgeGraphBuilder {
                 key: key,
                 weight: 1,
                 firstSeenMs: milliseconds,
-                lastSeenMs: milliseconds
+                lastSeenMs: milliseconds,
+                observedAtMs: [milliseconds]
             )
         }
     }

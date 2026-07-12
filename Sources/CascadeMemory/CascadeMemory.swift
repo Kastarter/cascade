@@ -1727,6 +1727,12 @@ public actor CascadeStore {
         let contextsCovered: Int
     }
 
+    internal enum FrameCompactionBatchPhase: Equatable {
+        case afterDeletionIntent
+        case afterFileDeletion
+        case afterReferenceCommit
+    }
+
     /// Converts every context strictly older than `cutoff` into a durable,
     /// day-partitioned knowledge graph before removing its frame from disk.
     /// Text and the recorded-context FTS row remain available until normal row
@@ -1746,6 +1752,21 @@ public actor CascadeStore {
         olderThan cutoff: Date,
         deletingFrameWith deleteFrame: (String) throws -> Void
     ) throws -> ContextKnowledgeGraphCompactionResult {
+        try compactAgedContextsIntoKnowledgeGraph(
+            olderThan: cutoff,
+            deletingFrameWith: deleteFrame,
+            onBatchPhase: { _, _ in }
+        )
+    }
+
+    /// Test seam for process interruption at the destructive batch boundaries.
+    /// The production overload uses a no-op handler; tests throw here to model a
+    /// termination after the durable intent, unlink, or reference commit.
+    internal func compactAgedContextsIntoKnowledgeGraph(
+        olderThan cutoff: Date,
+        deletingFrameWith deleteFrame: (String) throws -> Void,
+        onBatchPhase: (FrameCompactionBatchPhase, String) throws -> Void
+    ) throws -> ContextKnowledgeGraphCompactionResult {
         let cutoffMilliseconds = EventStoreLayout.capturedMilliseconds(for: cutoff)
         let stats = try eligibleKnowledgeGraphDayStats(before: cutoffMilliseconds)
         var pendingWrites: [PendingKnowledgeGraphWrite] = []
@@ -1753,6 +1774,7 @@ public actor CascadeStore {
         for dayStats in stats {
             let stored = try storedKnowledgeGraph(forDay: dayStats.day)
             let needsUpdate = stored == nil
+                || (stored?.graph.schemaVersion ?? 0) < ContextKnowledgeGraphBuilder.schemaVersion
                 || dayStats.maxContextID > (stored?.graph.source.maxContextID ?? 0)
                 || dayStats.throughMilliseconds > (stored?.graph.range.endMs ?? Int64.min)
                 || dayStats.contextCount > (stored?.graph.source.contextCount ?? 0)
@@ -1849,15 +1871,44 @@ public actor CascadeStore {
             guard !paths.isEmpty else { break }
             lastPath = paths.last ?? lastPath
 
+            var pathsWithRecentReferences: Set<String> = []
+            for path in paths where try hasContextReferencingFrame(path, onOrAfter: cutoffMilliseconds) {
+                pathsWithRecentReferences.insert(path)
+            }
+            let batchID = UUID().uuidString.lowercased()
+            let pathHashes = paths
+                .map { AuditIdentity.hash("frame-path:\($0)") }
+                .joined(separator: ",")
+            // This row commits before the first unlink. If the process exits in
+            // either following crash window, the intended paths and cutoff remain
+            // reconstructable without placing raw filesystem paths in the audit.
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.frame_delete_intent",
+                detail: [
+                    "batch=\(batchID)",
+                    "cutoffMs=\(cutoffMilliseconds)",
+                    "paths=\(paths.count)",
+                    "deleteCandidates=\(paths.count - pathsWithRecentReferences.count)",
+                    "shared=\(pathsWithRecentReferences.count)",
+                    "pathHashes=\(pathHashes)",
+                ].joined(separator: " ")
+            ))
+            try onBatchPhase(.afterDeletionIntent, batchID)
+
             var clearablePaths: [String] = []
+            var batchFilesDeleted = 0
+            var batchAlreadyMissing = 0
+            var batchFailures = 0
             for path in paths {
-                if try hasContextReferencingFrame(path, onOrAfter: cutoffMilliseconds) {
+                if pathsWithRecentReferences.contains(path) {
                     // A recent row still owns the file. Clear only old references.
                     clearablePaths.append(path)
                     continue
                 }
                 if !fileManager.fileExists(atPath: path) {
                     // Recovery from a crash after unlink but before the SQL update.
+                    batchAlreadyMissing += 1
                     clearablePaths.append(path)
                     continue
                 }
@@ -1865,8 +1916,10 @@ public actor CascadeStore {
                     try deleteFrame(path)
                     if fileManager.fileExists(atPath: path) {
                         failedPaths.append(path)
+                        batchFailures += 1
                     } else {
                         filesDeleted += 1
+                        batchFilesDeleted += 1
                         clearablePaths.append(path)
                     }
                 } catch {
@@ -1874,13 +1927,17 @@ public actor CascadeStore {
                     // unlinking. Missing means the desired state was achieved.
                     if fileManager.fileExists(atPath: path) {
                         failedPaths.append(path)
+                        batchFailures += 1
                     } else {
                         filesDeleted += 1
+                        batchFilesDeleted += 1
                         clearablePaths.append(path)
                     }
                 }
             }
+            try onBatchPhase(.afterFileDeletion, batchID)
 
+            var batchReferencesCleared = 0
             if !clearablePaths.isEmpty {
                 let affectedDays = try dayKeysForFramePaths(clearablePaths, before: cutoffMilliseconds)
                 try withTransaction {
@@ -1893,12 +1950,27 @@ public actor CascadeStore {
                             bind(cutoffMilliseconds, at: 1, in: statement)
                             bind(path, at: 2, in: statement)
                             try stepDone(statement)
-                            frameReferencesCleared += Int(sqlite3_changes(connection.db))
+                            batchReferencesCleared += Int(sqlite3_changes(connection.db))
                         }
                     }
                     try rebuildDayPartitions(days: affectedDays)
                 }
+                frameReferencesCleared += batchReferencesCleared
             }
+            try onBatchPhase(.afterReferenceCommit, batchID)
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.frame_delete_committed",
+                detail: [
+                    "batch=\(batchID)",
+                    "cutoffMs=\(cutoffMilliseconds)",
+                    "paths=\(paths.count)",
+                    "references=\(batchReferencesCleared)",
+                    "files=\(batchFilesDeleted)",
+                    "alreadyMissing=\(batchAlreadyMissing)",
+                    "failures=\(batchFailures)",
+                ].joined(separator: " ")
+            ))
         }
 
         let remainingFrameReferences = try countEligibleFrameReferences(before: cutoffMilliseconds)

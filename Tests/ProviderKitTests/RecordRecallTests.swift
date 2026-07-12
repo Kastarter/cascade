@@ -519,6 +519,84 @@ func recallProjectsKGFactsToTheRequestedTimeframe() async throws {
 }
 
 @Test
+func recallProjectsOnlyObservedFactsInsideAContinuousSession() async throws {
+    let directory = try recallKGDirectory("CascadeRecallKGContinuousSession")
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let firstFrame = try writeRecallFrame(named: "outer-first.heic", in: directory)
+    let innerFrame = try writeRecallFrame(named: "inner.heic", in: directory)
+    let lastFrame = try writeRecallFrame(named: "outer-last.heic", in: directory)
+    let start = try utcDate("2026-06-30T14:00:00Z")
+    let inner = start.addingTimeInterval(120)
+    let cutoff = start.addingTimeInterval(300)
+
+    _ = try await store.insertContexts([
+        RecordedContext(
+            capturedAt: start,
+            source: .screen,
+            appName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            windowTitle: "Outer Unrelated Ledger",
+            ocrText: "outer_ledger_fact",
+            imagePath: firstFrame.path
+        ),
+        RecordedContext(
+            capturedAt: inner,
+            source: .screen,
+            appName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            windowTitle: "Inner Relevant Invoice",
+            ocrText: "inner_invoice_fact",
+            imagePath: innerFrame.path
+        ),
+        RecordedContext(
+            capturedAt: start.addingTimeInterval(240),
+            source: .screen,
+            appName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            windowTitle: "Outer Unrelated Ledger",
+            ocrText: "outer_ledger_fact",
+            imagePath: lastFrame.path
+        ),
+    ])
+
+    _ = try await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    let graph = try #require(try await store.knowledgeGraph(forDay: EventStoreLayout.utcDayKey(for: start)))
+    let session = try #require(graph.nodes.first { $0.type == .session })
+    #expect(graph.nodes.filter { $0.type == .session }.count == 1)
+    let outerNode = try #require(graph.nodes.first { $0.type == .window && $0.label == "Outer Unrelated Ledger" })
+    let innerNode = try #require(graph.nodes.first { $0.type == .window && $0.label == "Inner Relevant Invoice" })
+    let outerMembership = try #require(graph.edges.first {
+        $0.kind == .sessionMembership && $0.from == outerNode.id && $0.to == session.id
+    })
+    let innerMembership = try #require(graph.edges.first {
+        $0.kind == .sessionMembership && $0.from == innerNode.id && $0.to == session.id
+    })
+    #expect(outerMembership.observedAtMs == [
+        EventStoreLayout.capturedMilliseconds(for: start),
+        EventStoreLayout.capturedMilliseconds(for: start.addingTimeInterval(240)),
+    ])
+    #expect(innerMembership.observedAtMs == [EventStoreLayout.capturedMilliseconds(for: inner)])
+    try await pruneRecallRows(through: cutoff, store: store)
+
+    #expect(!FileManager.default.fileExists(atPath: firstFrame.path))
+    #expect(!FileManager.default.fileExists(atPath: innerFrame.path))
+    #expect(!FileManager.default.fileExists(atPath: lastFrame.path))
+
+    let utc = try #require(TimeZone(secondsFromGMT: 0))
+    let recall = RecordRecall(store: store, presentationTimeZone: utc)
+    let formatter = ISO8601DateFormatter()
+    let rangeStart = formatter.string(from: inner.addingTimeInterval(-10))
+    let rangeEnd = formatter.string(from: inner.addingTimeInterval(10))
+    let timeframe = await recall.perform(.timeframe(startISO: rangeStart, endISO: rangeEnd))
+    let sessions = await recall.perform(.sessions(startISO: rangeStart, endISO: rangeEnd))
+
+    #expect(timeframe.contains("Inner Relevant Invoice"))
+    #expect(!timeframe.contains("Outer Unrelated Ledger"))
+    #expect(sessions.contains("Inner Relevant Invoice"))
+    #expect(!sessions.contains("Outer Unrelated Ledger"))
+}
+
+@Test
 func recallKeepsLocalTimeAndCalendarDayAfterKGFallback() async throws {
     let directory = try recallKGDirectory("CascadeRecallKGTimeZone")
     let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)

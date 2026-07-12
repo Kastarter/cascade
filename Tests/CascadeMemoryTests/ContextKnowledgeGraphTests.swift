@@ -24,6 +24,7 @@ private struct KnowledgeGraphFixture {
 }
 
 private enum TestDeleteError: Error { case forced }
+private enum TestInterruptionError: Error { case simulatedCrash }
 
 private func fixedUTCDate(_ value: String) throws -> Date {
     let formatter = ISO8601DateFormatter()
@@ -79,6 +80,12 @@ private func legacyEscaped(_ value: String) -> String {
     value.replacingOccurrences(of: "'", with: "''")
 }
 
+private func auditField(_ name: String, in detail: String) -> String? {
+    detail.split(separator: " ").first { $0.hasPrefix("\(name)=") }?
+        .dropFirst(name.count + 1)
+        .description
+}
+
 private func makeGraphContexts(
     firstDate: Date,
     secondDate: Date,
@@ -105,6 +112,24 @@ private func makeGraphContexts(
             imagePath: secondFrame
         ),
     ]
+}
+
+@Test
+func testLegacyKnowledgeGraphEdgesDecodeConservativeEndpointObservations() throws {
+    let json = """
+    {
+      "from": "window:legacy",
+      "to": "session:legacy",
+      "kind": "session_membership",
+      "weight": 3,
+      "first_seen_ms": 1000,
+      "last_seen_ms": 3000
+    }
+    """
+
+    let edge = try JSONDecoder().decode(ContextKnowledgeGraphEdge.self, from: Data(json.utf8))
+
+    #expect(edge.observedAtMs == [1000, 3000])
 }
 
 @Test
@@ -164,12 +189,13 @@ func testCompactionDeletesOnlyFramesOlderThan24HoursAndPersistsGraph() async thr
     let encoded = try ContextKnowledgeGraphBuilder.canonicalData(for: graph)
     let decoded = try JSONDecoder().decode(ContextKnowledgeGraph.self, from: encoded)
     #expect(decoded == graph)
-    #expect(graph.schemaVersion == 1)
+    #expect(graph.schemaVersion == 2)
     #expect(graph.partitionKey == "utc-day:\(day)")
     #expect(graph.source.contextCount == 2)
     #expect(graph.range.endMs < EventStoreLayout.capturedMilliseconds(for: cutoff))
     #expect(Set(graph.nodes.map(\.type)) == Set(ContextKnowledgeGraphNode.NodeType.allCases))
     #expect(Set(graph.edges.map(\.kind)) == Set(ContextKnowledgeGraphEdge.Kind.allCases))
+    #expect(graph.edges.allSatisfy { !$0.observedAtMs.isEmpty })
 
     let manifest = try #require(try await fixture.store.dayPartitionManifest(dayKey: day))
     #expect(manifest.frameCount == 2) // the equality and 23-hour rows share this UTC day
@@ -180,7 +206,109 @@ func testCompactionDeletesOnlyFramesOlderThan24HoursAndPersistsGraph() async thr
     #expect(audit.detail.contains("files=2"))
     #expect(!audit.detail.contains("reconcile runway"))
     #expect(!audit.detail.contains(fixture.directory.path))
+    let batchAudits = try await fixture.store.recentAudit(limit: 10)
+    let intent = try #require(batchAudits.first { $0.action == "retention.frame_delete_intent" })
+    let committed = try #require(batchAudits.first { $0.action == "retention.frame_delete_committed" })
+    #expect(auditField("batch", in: intent.detail) == auditField("batch", in: committed.detail))
+    #expect(intent.detail.contains(AuditIdentity.hash("frame-path:\(oldOne)")))
+    #expect(intent.detail.contains(AuditIdentity.hash("frame-path:\(oldTwo)")))
+    #expect(!intent.detail.contains(oldOne))
+    #expect(!intent.detail.contains(oldTwo))
+    #expect(committed.detail.contains("references=2"))
+    #expect(committed.detail.contains("files=2"))
+    #expect(committed.detail.contains("alreadyMissing=0"))
     #expect(CapturePrivacyPolicy.default.retentionByDataClass["frames"]?.maxAgeDays == 1)
+}
+
+@Test
+func testCrashAfterUnlinkKeepsIntentAndRecoveryAuditsMissingFile() async throws {
+    let fixture = try KnowledgeGraphFixture("ContextKGCrashAfterUnlink")
+    let now = try fixedUTCDate("2030-01-03T12:00:00Z")
+    let cutoff = now.addingTimeInterval(-24 * 3600)
+    let frame = try fixture.frame("crash-after-unlink.heic")
+    let context = try await fixture.store.insert(RecordedContext(
+        capturedAt: now.addingTimeInterval(-25 * 3600),
+        source: .screen,
+        appName: "Safari",
+        windowTitle: "Durable deletion intent",
+        ocrText: "frame must reconcile after a simulated crash",
+        imagePath: frame
+    ))
+
+    do {
+        _ = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(
+            olderThan: cutoff,
+            deletingFrameWith: { try FileManager.default.removeItem(atPath: $0) },
+            onBatchPhase: { phase, _ in
+                if phase == .afterFileDeletion { throw TestInterruptionError.simulatedCrash }
+            }
+        )
+        Issue.record("Expected simulated interruption after unlink")
+    } catch TestInterruptionError.simulatedCrash {
+        // Expected: this models termination before the image_path transaction.
+    }
+
+    #expect(!FileManager.default.fileExists(atPath: frame))
+    #expect(try await fixture.store.context(id: context.id)?.imagePath == frame)
+    let interruptedAudits = try await fixture.store.recentAudit(limit: 20)
+    let intent = try #require(interruptedAudits.first { $0.action == "retention.frame_delete_intent" })
+    #expect(intent.detail.contains(AuditIdentity.hash("frame-path:\(frame)")))
+    #expect(!intent.detail.contains(frame))
+    #expect(!interruptedAudits.contains { $0.action == "retention.frame_delete_committed" })
+
+    let recovered = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    #expect(recovered.filesDeleted == 0)
+    #expect(recovered.frameReferencesCleared == 1)
+    #expect(recovered.isCaughtUp)
+    #expect(try await fixture.store.context(id: context.id)?.imagePath == nil)
+    let recoveredAudits = try await fixture.store.recentAudit(limit: 30)
+    let outcome = try #require(recoveredAudits.first { $0.action == "retention.frame_delete_committed" })
+    #expect(outcome.detail.contains("references=1"))
+    #expect(outcome.detail.contains("files=0"))
+    #expect(outcome.detail.contains("alreadyMissing=1"))
+}
+
+@Test
+func testCrashAfterReferenceCommitLeavesCorrelatedDurableIntent() async throws {
+    let fixture = try KnowledgeGraphFixture("ContextKGCrashAfterReferenceCommit")
+    let now = try fixedUTCDate("2030-01-04T12:00:00Z")
+    let cutoff = now.addingTimeInterval(-24 * 3600)
+    let frame = try fixture.frame("crash-after-commit.heic")
+    let context = try await fixture.store.insert(RecordedContext(
+        capturedAt: now.addingTimeInterval(-25 * 3600),
+        source: .screen,
+        appName: "Notes",
+        windowTitle: "Committed reference clear",
+        ocrText: "intent survives the post-commit crash window",
+        imagePath: frame
+    ))
+
+    do {
+        _ = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(
+            olderThan: cutoff,
+            deletingFrameWith: { try FileManager.default.removeItem(atPath: $0) },
+            onBatchPhase: { phase, _ in
+                if phase == .afterReferenceCommit { throw TestInterruptionError.simulatedCrash }
+            }
+        )
+        Issue.record("Expected simulated interruption after reference commit")
+    } catch TestInterruptionError.simulatedCrash {
+        // Expected: the SQL commit landed but the outcome audit did not.
+    }
+
+    #expect(!FileManager.default.fileExists(atPath: frame))
+    #expect(try await fixture.store.context(id: context.id)?.imagePath == nil)
+    let audits = try await fixture.store.recentAudit(limit: 20)
+    let intent = try #require(audits.first { $0.action == "retention.frame_delete_intent" })
+    #expect(intent.detail.contains(AuditIdentity.hash("frame-path:\(frame)")))
+    #expect(!audits.contains { $0.action == "retention.frame_delete_committed" })
+
+    let retry = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    #expect(retry.frameReferencesCleared == 0)
+    #expect(retry.filesDeleted == 0)
+    #expect(retry.isCaughtUp)
+    let retryAudits = try await fixture.store.recentAudit(limit: 30)
+    #expect(retryAudits.contains { $0.id == intent.id })
 }
 
 @Test

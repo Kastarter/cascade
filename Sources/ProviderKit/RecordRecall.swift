@@ -474,7 +474,7 @@ public struct RecordRecall: Sendable {
                         .map {
                             Self.knowledgeGraphSessionLine(
                                 node: $0,
-                                interval: projection.interval,
+                                projection: projection,
                                 timeZone: presentationTimeZone
                             )
                         }
@@ -526,6 +526,7 @@ public struct RecordRecall: Sendable {
     private struct KnowledgeGraphProjection {
         let sessions: [ContextKnowledgeGraphNode]
         let relatedNodes: [ContextKnowledgeGraphNode]
+        let membershipEdges: [ContextKnowledgeGraphEdge]
         let interval: ClosedRange<Int64>
         let searchTerms: [String]
     }
@@ -585,8 +586,7 @@ public struct RecordRecall: Sendable {
         let sessionDetails = projection.sessions.prefix(6).map {
             knowledgeGraphSessionSummary(
                 node: $0,
-                interval: projection.interval,
-                searchTerms: projection.searchTerms,
+                projection: projection,
                 timeZone: timeZone
             )
         }
@@ -598,35 +598,77 @@ public struct RecordRecall: Sendable {
 
     private static func knowledgeGraphSessionLine(
         node: ContextKnowledgeGraphNode,
-        interval: ClosedRange<Int64>,
+        projection: KnowledgeGraphProjection,
         timeZone: TimeZone
     ) -> String {
-        let count = node.attributes["context_count"] ?? String(node.mentionCount)
-        let clipped = clippedInterval(for: node, to: interval)
-        let evidence = evidenceSnippet(for: node, searchTerms: [], includeOutsideInterval: false, interval: interval)
+        let count = projectedContextCount(for: node, in: projection)
+        let clipped = clippedInterval(for: node, to: projection.interval)
+        let label = projectedSessionLabel(for: node, in: projection)
+        let evidence = evidenceSnippet(
+            for: node,
+            searchTerms: [],
+            includeOutsideInterval: false,
+            interval: projection.interval
+        )
         let suffix = evidence.map { " | \(String($0.prefix(400)))" } ?? ""
         return "[KG \(localDayLabel(for: clipped, timeZone: timeZone))] "
             + "\(time(clipped.lowerBound, timeZone: timeZone))–\(time(clipped.upperBound, timeZone: timeZone)) "
-            + "\(node.label) · \(count) compacted contexts in session\(suffix)"
+            + "\(label) · \(count) compacted contexts in interval\(suffix)"
     }
 
     private static func knowledgeGraphSessionSummary(
         node: ContextKnowledgeGraphNode,
-        interval: ClosedRange<Int64>,
-        searchTerms: [String],
+        projection: KnowledgeGraphProjection,
         timeZone: TimeZone
     ) -> String {
-        let clipped = clippedInterval(for: node, to: interval)
-        var summary = "\(time(clipped.lowerBound, timeZone: timeZone))–\(time(clipped.upperBound, timeZone: timeZone)) \(node.label)"
+        let clipped = clippedInterval(for: node, to: projection.interval)
+        let label = projectedSessionLabel(for: node, in: projection)
+        var summary = "\(time(clipped.lowerBound, timeZone: timeZone))–\(time(clipped.upperBound, timeZone: timeZone)) \(label)"
         if let evidence = evidenceSnippet(
             for: node,
-            searchTerms: searchTerms,
-            includeOutsideInterval: !searchTerms.isEmpty,
-            interval: interval
+            searchTerms: projection.searchTerms,
+            includeOutsideInterval: !projection.searchTerms.isEmpty,
+            interval: projection.interval
         ) {
             summary += " · \(evidence)"
         }
         return String(summary.prefix(400))
+    }
+
+    private static func projectedSessionLabel(
+        for session: ContextKnowledgeGraphNode,
+        in projection: KnowledgeGraphProjection
+    ) -> String {
+        let sessionEdges = projection.membershipEdges.filter { $0.to == session.id }
+        let weightsByNodeID = Dictionary(grouping: sessionEdges, by: \.from).mapValues { edges in
+            edges.reduce(0) { partial, edge in
+                partial + observedTimes(for: edge, overlapping: projection.interval).count
+            }
+        }
+        let windows = projection.relatedNodes
+            .filter { $0.type == .window && weightsByNodeID[$0.id, default: 0] > 0 }
+            .sorted {
+                let left = weightsByNodeID[$0.id, default: 0]
+                let right = weightsByNodeID[$1.id, default: 0]
+                if left != right { return left > right }
+                if $0.firstSeenMs != $1.firstSeenMs { return $0.firstSeenMs < $1.firstSeenMs }
+                return $0.label < $1.label
+            }
+            .prefix(3)
+            .map(\.label)
+        let appName = session.attributes["app_name"] ?? session.aliases.first ?? session.label
+        guard !windows.isEmpty else { return appName }
+        return "\(appName) — \(windows.joined(separator: " / "))"
+    }
+
+    private static func projectedContextCount(
+        for session: ContextKnowledgeGraphNode,
+        in projection: KnowledgeGraphProjection
+    ) -> Int {
+        let observations = projection.membershipEdges
+            .filter { $0.to == session.id }
+            .flatMap { observedTimes(for: $0, overlapping: projection.interval) }
+        return max(1, Set(observations).count)
     }
 
     private static func evidenceSnippet(
@@ -698,12 +740,14 @@ public struct RecordRecall: Sendable {
             }
         }
 
+        let scopedMembershipEdges = graph.edges.filter { edge in
+            guard edge.kind == .sessionMembership, selectedSessionIDs.contains(edge.to) else { return false }
+            guard let requestedInterval else { return true }
+            return !observedTimes(for: edge, overlapping: requestedInterval).isEmpty
+        }
+        let observedSessionIDs = Set(scopedMembershipEdges.map(\.to))
         let sessions = allSessions
-            .filter { selectedSessionIDs.contains($0.id) }
-            .filter { session in
-                guard let requestedInterval else { return true }
-                return overlaps(session.firstSeenMs...session.lastSeenMs, requestedInterval)
-            }
+            .filter { selectedSessionIDs.contains($0.id) && observedSessionIDs.contains($0.id) }
             .filter { !isCovered($0, by: rawContexts) }
             .sorted {
                 if $0.firstSeenMs != $1.firstSeenMs { return $0.firstSeenMs < $1.firstSeenMs }
@@ -712,11 +756,7 @@ public struct RecordRecall: Sendable {
         guard let first = sessions.first else { return nil }
 
         let sessionIDs = Set(sessions.map(\.id))
-        let membershipEdges = graph.edges.filter { edge in
-            guard edge.kind == .sessionMembership, sessionIDs.contains(edge.to) else { return false }
-            guard let requestedInterval else { return true }
-            return overlaps(edge.firstSeenMs...edge.lastSeenMs, requestedInterval)
-        }
+        let membershipEdges = scopedMembershipEdges.filter { sessionIDs.contains($0.to) }
         let relatedNodeIDs = Set(membershipEdges.map(\.from))
         let relatedNodes = graph.nodes
             .filter { relatedNodeIDs.contains($0.id) }
@@ -739,6 +779,7 @@ public struct RecordRecall: Sendable {
         return KnowledgeGraphProjection(
             sessions: sessions,
             relatedNodes: relatedNodes,
+            membershipEdges: membershipEdges,
             interval: interval,
             searchTerms: terms
         )
@@ -852,8 +893,11 @@ public struct RecordRecall: Sendable {
         max(node.firstSeenMs, interval.lowerBound)...min(node.lastSeenMs, interval.upperBound)
     }
 
-    private static func overlaps(_ lhs: ClosedRange<Int64>, _ rhs: ClosedRange<Int64>) -> Bool {
-        lhs.upperBound >= rhs.lowerBound && lhs.lowerBound <= rhs.upperBound
+    private static func observedTimes(
+        for edge: ContextKnowledgeGraphEdge,
+        overlapping interval: ClosedRange<Int64>
+    ) -> [Int64] {
+        edge.observedAtMs.filter(interval.contains)
     }
 
     static func isSensitive(_ episode: TimelineEpisode) -> Bool {
