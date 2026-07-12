@@ -355,23 +355,6 @@ internal enum ContextKnowledgeGraphBuilder {
             mergeUnique(evidenceSnippets, into: &self.evidenceSnippets, limit: maxEvidenceSnippets)
         }
 
-        init(_ node: ContextKnowledgeGraphNode) {
-            self.init(
-                id: node.id,
-                type: node.type,
-                subtype: node.subtype,
-                label: node.label,
-                canonicalValue: node.canonicalValue,
-                firstSeenMs: node.firstSeenMs,
-                lastSeenMs: node.lastSeenMs,
-                mentionCount: node.mentionCount,
-                aliases: node.aliases,
-                keywords: node.keywords,
-                evidenceSnippets: node.evidenceSnippets,
-                attributes: node.attributes
-            )
-        }
-
         mutating func observe(
             label: String,
             aliases: [String],
@@ -392,21 +375,6 @@ internal enum ContextKnowledgeGraphBuilder {
             mergeUnique(evidence, into: &self.evidenceSnippets, limit: maxEvidenceSnippets)
             for key in attributes.keys.sorted() where self.attributes[key] == nil {
                 self.attributes[key] = attributes[key]
-            }
-        }
-
-        mutating func merge(_ other: ContextKnowledgeGraphNode) {
-            firstSeenMs = min(firstSeenMs, other.firstSeenMs)
-            lastSeenMs = max(lastSeenMs, other.lastSeenMs)
-            mentionCount += other.mentionCount
-            if label.isEmpty || (!other.label.isEmpty && other.label.localizedStandardCompare(label) == .orderedAscending) {
-                label = other.label
-            }
-            mergeUnique(other.aliases, into: &aliases, limit: maxAliases)
-            mergeUnique(other.keywords, into: &keywords, limit: maxKeywords)
-            mergeUnique(other.evidenceSnippets, into: &evidenceSnippets, limit: maxEvidenceSnippets)
-            for key in other.attributes.keys.sorted() where attributes[key] == nil {
-                attributes[key] = other.attributes[key]
             }
         }
 
@@ -448,13 +416,6 @@ internal enum ContextKnowledgeGraphBuilder {
             observedAtMs.append(milliseconds)
         }
 
-        mutating func merge(_ edge: ContextKnowledgeGraphEdge) {
-            weight += edge.weight
-            firstSeenMs = min(firstSeenMs, edge.firstSeenMs)
-            lastSeenMs = max(lastSeenMs, edge.lastSeenMs)
-            observedAtMs.append(contentsOf: edge.observedAtMs)
-        }
-
         var edge: ContextKnowledgeGraphEdge {
             ContextKnowledgeGraphEdge(
                 from: key.from,
@@ -468,7 +429,12 @@ internal enum ContextKnowledgeGraphBuilder {
         }
     }
 
-    static func build(day: String, contexts: [RecordedContext], cutoff: Date) -> ContextKnowledgeGraph? {
+    static func build(
+        day: String,
+        contexts: [RecordedContext],
+        cutoff: Date,
+        partitionKey: String? = nil
+    ) -> ContextKnowledgeGraph? {
         let ordered = contexts.sorted {
             if $0.capturedAt != $1.capturedAt { return $0.capturedAt < $1.capturedAt }
             return $0.id < $1.id
@@ -482,6 +448,7 @@ internal enum ContextKnowledgeGraphBuilder {
         var nodes: [String: NodeAccumulator] = [:]
         var edges: [EdgeKey: EdgeAccumulator] = [:]
         var observations: [ContextKnowledgeGraphObservation] = []
+        var appMentionCache: [String: [WorkGraphMention]] = [:]
 
         for episode in episodes {
             let sessionID = "session:\(day):\(episode.id)"
@@ -525,7 +492,14 @@ internal enum ContextKnowledgeGraphBuilder {
 
         for context in visible {
             let capturedMs = EventStoreLayout.capturedMilliseconds(for: context.capturedAt)
-            let mentions = WorkGraphExtractor.mentions(in: context)
+            let appCacheKey = "\(context.bundleIdentifier ?? "")|\(normalized(context.appName))"
+            let shouldExtractApp = appMentionCache[appCacheKey] == nil
+            var mentions = WorkGraphExtractor.mentions(in: context, includeApp: shouldExtractApp)
+            if shouldExtractApp {
+                appMentionCache[appCacheKey] = mentions.filter { $0.kind == .app }
+            } else {
+                mentions.insert(contentsOf: appMentionCache[appCacheKey] ?? [], at: 0)
+            }
             let appMention = mentions.first { $0.kind == .app }
             let appCanonical = appMention?.canonicalValue
                 ?? context.bundleIdentifier?.lowercased()
@@ -626,6 +600,7 @@ internal enum ContextKnowledgeGraphBuilder {
         }
 
         return makeGraph(
+            partitionKey: partitionKey ?? "utc-day:\(day)",
             day: day,
             startMs: EventStoreLayout.capturedMilliseconds(for: first.capturedAt),
             endMs: EventStoreLayout.capturedMilliseconds(for: last.capturedAt),
@@ -635,72 +610,6 @@ internal enum ContextKnowledgeGraphBuilder {
             nodes: nodes.values.map(\.node),
             edges: edges.values.map(\.edge),
             observations: observations
-        )
-    }
-
-    static func merge(
-        existing: ContextKnowledgeGraph,
-        delta: ContextKnowledgeGraph,
-        cutoff: Date
-    ) -> ContextKnowledgeGraph {
-        var nodes = Dictionary(uniqueKeysWithValues: existing.nodes.map { ($0.id, NodeAccumulator($0)) })
-        for node in delta.nodes {
-            if var accumulator = nodes[node.id] {
-                accumulator.merge(node)
-                nodes[node.id] = accumulator
-            } else {
-                nodes[node.id] = NodeAccumulator(node)
-            }
-        }
-
-        var edges: [EdgeKey: EdgeAccumulator] = [:]
-        for edge in (existing.edges + delta.edges) where edge.kind != .temporalSuccession {
-            let key = EdgeKey(from: edge.from, to: edge.to, kind: edge.kind)
-            if var accumulator = edges[key] {
-                accumulator.merge(edge)
-                edges[key] = accumulator
-            } else {
-                edges[key] = EdgeAccumulator(
-                    key: key,
-                    weight: edge.weight,
-                    firstSeenMs: edge.firstSeenMs,
-                    lastSeenMs: edge.lastSeenMs,
-                    observedAtMs: edge.observedAtMs
-                )
-            }
-        }
-
-        let sessionNodes = nodes.values
-            .filter { $0.type == .session }
-            .sorted {
-                if $0.firstSeenMs != $1.firstSeenMs { return $0.firstSeenMs < $1.firstSeenMs }
-                return $0.id < $1.id
-            }
-        for pair in zip(sessionNodes, sessionNodes.dropFirst()) {
-            observeEdge(
-                from: pair.0.id,
-                to: pair.1.id,
-                kind: .temporalSuccession,
-                at: pair.1.firstSeenMs,
-                edges: &edges
-            )
-        }
-
-        var observationsByID = Dictionary(uniqueKeysWithValues: existing.observations.map { ($0.id, $0) })
-        for observation in delta.observations {
-            observationsByID[observation.id] = observation
-        }
-
-        return makeGraph(
-            day: existing.day,
-            startMs: min(existing.range.startMs, delta.range.startMs),
-            endMs: max(existing.range.endMs, delta.range.endMs),
-            cutoffMs: EventStoreLayout.capturedMilliseconds(for: cutoff),
-            contextCount: existing.source.contextCount + delta.source.contextCount,
-            maxContextID: max(existing.source.maxContextID, delta.source.maxContextID),
-            nodes: nodes.values.map(\.node),
-            edges: edges.values.map(\.edge),
-            observations: Array(observationsByID.values)
         )
     }
 
@@ -732,6 +641,7 @@ internal enum ContextKnowledgeGraphBuilder {
     }
 
     private static func makeGraph(
+        partitionKey: String,
         day: String,
         startMs: Int64,
         endMs: Int64,
@@ -757,7 +667,7 @@ internal enum ContextKnowledgeGraphBuilder {
         }
         return ContextKnowledgeGraph(
             schemaVersion: schemaVersion,
-            partitionKey: "utc-day:\(day)",
+            partitionKey: partitionKey,
             day: day,
             range: .init(startMs: startMs, endMs: endMs, cutoffMs: cutoffMs),
             source: .init(contextCount: contextCount, maxContextID: maxContextID),

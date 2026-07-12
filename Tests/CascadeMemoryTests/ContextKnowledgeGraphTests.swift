@@ -185,12 +185,12 @@ func testCompactionDeletesOnlyFramesOlderThan24HoursAndPersistsGraph() async thr
     #expect(try await fixture.store.context(id: inserted[3].id)?.imagePath == recentPath)
 
     let day = EventStoreLayout.utcDayKey(for: inserted[0].capturedAt)
-    let graph = try #require(try await fixture.store.knowledgeGraph(forDay: day))
+    let graph = try #require((try await fixture.store.knowledgeGraphChunks(forDay: day)).first)
     let encoded = try ContextKnowledgeGraphBuilder.canonicalData(for: graph)
     let decoded = try JSONDecoder().decode(ContextKnowledgeGraph.self, from: encoded)
     #expect(decoded == graph)
     #expect(graph.schemaVersion == 3)
-    #expect(graph.partitionKey == "utc-day:\(day)")
+    #expect(graph.partitionKey.hasPrefix("utc-day:\(day):chunk:"))
     #expect(graph.source.contextCount == 2)
     #expect(graph.range.endMs < EventStoreLayout.capturedMilliseconds(for: cutoff))
     #expect(Set(graph.nodes.map(\.type)) == Set(ContextKnowledgeGraphNode.NodeType.allCases))
@@ -330,14 +330,14 @@ func testCompactionIsIdempotent() async throws {
     let first = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
     let metadataBefore = try kgRawStrings(
         fixture.databasePath,
-        "SELECT graph_sha256 || '|' || updated_at FROM context_kg;"
+        "SELECT graph_sha256 || '|' || updated_at FROM context_kg_chunk ORDER BY chunk_id;"
     )
     let auditBefore = try await fixture.store.recentAudit(limit: 20)
         .filter { $0.action == "retention.frame_compaction" }.count
     let second = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
     let metadataAfter = try kgRawStrings(
         fixture.databasePath,
-        "SELECT graph_sha256 || '|' || updated_at FROM context_kg;"
+        "SELECT graph_sha256 || '|' || updated_at FROM context_kg_chunk ORDER BY chunk_id;"
     )
     let auditAfter = try await fixture.store.recentAudit(limit: 20)
         .filter { $0.action == "retention.frame_compaction" }.count
@@ -382,7 +382,9 @@ func testCompactionAdvancesAPartialUTCDay() async throws {
     let first = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(
         olderThan: dayStart.addingTimeInterval(12 * 3600)
     )
-    let firstGraph = try #require(try await fixture.store.knowledgeGraph(forDay: EventStoreLayout.utcDayKey(for: dayStart)))
+    let firstGraph = try #require((try await fixture.store.knowledgeGraphChunks(
+        forDay: EventStoreLayout.utcDayKey(for: dayStart)
+    )).first)
     #expect(first.graphsWritten == 1)
     #expect(firstGraph.source.contextCount == 1)
     #expect(!FileManager.default.fileExists(atPath: earlyPath))
@@ -392,12 +394,15 @@ func testCompactionAdvancesAPartialUTCDay() async throws {
     let second = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(
         olderThan: dayStart.addingTimeInterval(15 * 3600)
     )
-    let secondGraph = try #require(try await fixture.store.knowledgeGraph(forDay: EventStoreLayout.utcDayKey(for: dayStart)))
+    let secondGraphs = try await fixture.store.knowledgeGraphChunks(
+        forDay: EventStoreLayout.utcDayKey(for: dayStart)
+    )
     #expect(second.graphsWritten == 1)
     #expect(second.contextsCovered == 1)
-    #expect(secondGraph.source.contextCount == 2)
-    #expect(secondGraph.source.maxContextID == inserted[1].id)
-    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg;") == 1)
+    #expect(secondGraphs.reduce(0) { $0 + $1.source.contextCount } == 2)
+    #expect(secondGraphs.map(\.source.maxContextID).max() == inserted[1].id)
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_chunk;") == 2)
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_coverage;") == 2)
     #expect(!FileManager.default.fileExists(atPath: laterPath))
     #expect(try await fixture.store.context(id: inserted[1].id)?.imagePath == nil)
 }
@@ -456,19 +461,21 @@ func testDeletionFailureLeavesReferenceForRetry() async throws {
     )
     let metadataBefore = try kgRawStrings(
         fixture.databasePath,
-        "SELECT graph_sha256 || '|' || updated_at FROM context_kg;"
+        "SELECT graph_sha256 || '|' || updated_at FROM context_kg_chunk ORDER BY chunk_id;"
     )
     #expect(failed.graphsWritten == 1)
     #expect(failed.deletionFailures == 1)
     #expect(!failed.isCaughtUp)
     #expect(FileManager.default.fileExists(atPath: frame))
     #expect(try await fixture.store.context(id: context.id)?.imagePath == frame)
-    #expect(try await fixture.store.knowledgeGraph(forDay: EventStoreLayout.utcDayKey(for: context.capturedAt)) != nil)
+    #expect(!(try await fixture.store.knowledgeGraphChunks(
+        forDay: EventStoreLayout.utcDayKey(for: context.capturedAt)
+    )).isEmpty)
 
     let retried = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
     let metadataAfter = try kgRawStrings(
         fixture.databasePath,
-        "SELECT graph_sha256 || '|' || updated_at FROM context_kg;"
+        "SELECT graph_sha256 || '|' || updated_at FROM context_kg_chunk ORDER BY chunk_id;"
     )
     #expect(retried.graphsWritten == 0)
     #expect(retried.filesDeleted == 1)
@@ -526,10 +533,10 @@ func testPruneAfterCompactionPreservesKGAndKGFTS() async throws {
 
     #expect(try await fixture.store.context(id: context.id) == nil)
     #expect(try await fixture.store.searchContexts(query: "elderberryarchive").isEmpty)
-    #expect(try await fixture.store.knowledgeGraph(forDay: day) != nil)
+    #expect(!(try await fixture.store.knowledgeGraphChunks(forDay: day)).isEmpty)
     let graphHits = try await fixture.store.searchKnowledgeGraphs(matching: "elderberryarchive")
     #expect(graphHits.map(\.graph.day).contains(day))
-    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_fts;") == 1)
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_chunk_fts;") == 1)
 }
 
 @Test
@@ -559,7 +566,7 @@ func testCompactionKeepsLateSessionOCRSearchableAfterSourcePrune() async throws 
     let cutoff = now.addingTimeInterval(-24 * 3600)
     let result = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
     let day = EventStoreLayout.utcDayKey(for: sessionStart)
-    let graph = try #require(try await fixture.store.knowledgeGraph(forDay: day))
+    let graph = try #require((try await fixture.store.knowledgeGraphChunks(forDay: day)).first)
 
     #expect(result.isCaughtUp)
     #expect(result.frameReferencesCleared == contexts.count)
@@ -575,7 +582,7 @@ func testCompactionKeepsLateSessionOCRSearchableAfterSourcePrune() async throws 
 }
 
 @Test
-func testLateBackfillMergesWithoutReplacingPrunedDayGraph() async throws {
+func testLateBackfillAddsBoundedChunkWithoutReplacingPrunedHistory() async throws {
     let fixture = try KnowledgeGraphFixture("ContextKGLateBackfill")
     let now = Date()
     let firstDate = now.addingTimeInterval(-8 * 24 * 3600)
@@ -604,13 +611,13 @@ func testLateBackfillMergesWithoutReplacingPrunedDayGraph() async throws {
     ))
     let result = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
     let day = EventStoreLayout.utcDayKey(for: firstDate)
-    let graph = try #require(try await fixture.store.knowledgeGraph(forDay: day))
+    let graphs = try await fixture.store.knowledgeGraphChunks(forDay: day)
 
     #expect(result.graphsWritten == 1)
     #expect(result.contextsCovered == 1)
-    #expect(graph.source.contextCount == 2)
-    #expect(graph.source.maxContextID == backfill.id)
-    #expect(graph.summary.contains("2 contexts"))
+    #expect(graphs.count == 2)
+    #expect(graphs.reduce(0) { $0 + $1.source.contextCount } == 2)
+    #expect(graphs.map(\.source.maxContextID).max() == backfill.id)
     #expect(try await fixture.store.searchKnowledgeGraphs(matching: "originalcobalt").map(\.graph.day).contains(day))
     #expect(try await fixture.store.searchKnowledgeGraphs(matching: "latevermilion").map(\.graph.day).contains(day))
     #expect(!FileManager.default.fileExists(atPath: backfillPath))
@@ -649,11 +656,200 @@ func testSizePruneProtectsContextsUntilTheir24HourCutoff() async throws {
     )
 
     #expect(try await fixture.store.context(id: inserted[0].id) == nil)
-    #expect(try await fixture.store.knowledgeGraph(forDay: EventStoreLayout.utcDayKey(for: inserted[0].capturedAt)) != nil)
+    #expect(!(try await fixture.store.knowledgeGraphChunks(
+        forDay: EventStoreLayout.utcDayKey(for: inserted[0].capturedAt)
+    )).isEmpty)
     let recent = try #require(try await fixture.store.context(id: inserted[1].id))
     #expect(recent.imagePath == recentPath)
     #expect(recent.ocrText?.contains("must survive") == true)
     #expect(FileManager.default.fileExists(atPath: recentPath))
+}
+
+@Test
+func testHighVolumeCompactionCommitsBoundedProgressAndResumesAcrossTwentyThousandContexts() async throws {
+    let fixture = try KnowledgeGraphFixture("ContextKGBoundedVolume")
+    let start = try fixedUTCDate("2030-08-01T01:00:00Z")
+    let cutoff = try fixedUTCDate("2030-08-02T12:00:00Z")
+    let sharedFrame = try fixture.frame("twenty-thousand-shared.heic")
+    let contextCount = 20_000
+    let insertBatchSize = 1_000
+    let chunkLimit = CascadeStore.knowledgeGraphChunkContextLimit
+    let longEvidence = String(repeating: "bounded evidence payload ", count: 96)
+
+    for batchStart in stride(from: 0, to: contextCount, by: insertBatchSize) {
+        let batchEnd = min(batchStart + insertBatchSize, contextCount)
+        let contexts = (batchStart..<batchEnd).map { index in
+            RecordedContext(
+                capturedAt: start.addingTimeInterval(TimeInterval(index)),
+                source: .screen,
+                appName: "Notes",
+                bundleIdentifier: "com.apple.Notes",
+                windowTitle: index.isMultiple(of: chunkLimit) ? "Bounded retention checkpoint" : nil,
+                ocrText: index == contextCount - 1
+                    ? "boundedvolumecontext finalscarletfact amount 90210"
+                    : (index.isMultiple(of: chunkLimit) ? longEvidence : nil),
+                imagePath: sharedFrame
+            )
+        }
+        _ = try await fixture.store.insertContexts(contexts)
+    }
+
+    do {
+        _ = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(
+            olderThan: cutoff,
+            deletingFrameWith: { try FileManager.default.removeItem(atPath: $0) },
+            onBatchPhase: { phase, _ in
+                if phase == .afterReferenceCommit { throw TestInterruptionError.simulatedCrash }
+            }
+        )
+        Issue.record("Expected interruption after the first independently committed chunk")
+    } catch TestInterruptionError.simulatedCrash {
+        // The first chunk and its exact coverage must survive independently.
+    }
+
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_chunk;") == 1)
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_coverage;") == Int64(chunkLimit))
+    #expect(try kgRawInt(
+        fixture.databasePath,
+        "SELECT COUNT(*) FROM recorded_context WHERE image_path IS NULL;"
+    ) == Int64(chunkLimit))
+    #expect(FileManager.default.fileExists(atPath: sharedFrame))
+
+    let resumed = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    let expectedChunks = (contextCount + chunkLimit - 1) / chunkLimit
+
+    #expect(resumed.isCaughtUp)
+    #expect(resumed.contextsCovered == contextCount - chunkLimit)
+    #expect(resumed.frameReferencesCleared == contextCount - chunkLimit)
+    #expect(resumed.filesDeleted == 1)
+    #expect(!FileManager.default.fileExists(atPath: sharedFrame))
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_chunk;") == Int64(expectedChunks))
+    #expect(try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM context_kg_coverage;") == Int64(contextCount))
+    #expect(try kgRawInt(
+        fixture.databasePath,
+        "SELECT MAX(source_context_count) FROM context_kg_chunk;"
+    ) <= Int64(chunkLimit))
+    #expect(try kgRawInt(
+        fixture.databasePath,
+        "SELECT COUNT(*) FROM recorded_context WHERE image_path IS NOT NULL;"
+    ) == 0)
+
+    let hit = try #require(try await fixture.store.searchKnowledgeGraphs(
+        matching: "finalscarletfact",
+        limit: 1
+    ).first)
+    #expect(hit.graph.source.contextCount <= chunkLimit)
+    #expect(hit.graph.observations.contains { $0.text.contains("finalscarletfact") })
+
+    let sampled = try await fixture.store.knowledgeGraphs(
+        between: start,
+        and: cutoff,
+        limit: .max
+    )
+    #expect(sampled.count == CascadeStore.knowledgeGraphReadChunkLimit)
+    #expect(sampled.last?.observations.contains { $0.text.contains("finalscarletfact") } == true)
+}
+
+@Test
+func testOversizedLegacyDayCannotAuthorizeDeletionUntilRebuiltIntoBoundedChunks() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ContextKGOversizedLegacy-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let path = directory.appendingPathComponent("legacy.sqlite").path
+    let frame = directory.appendingPathComponent("legacy-shared.heic").path
+    try Data("legacy-shared-real-frame".utf8).write(to: URL(fileURLWithPath: frame))
+
+    let capturedAt = try fixedUTCDate("2030-08-03T01:00:00Z")
+    let cutoff = capturedAt.addingTimeInterval(25 * 3600)
+    let dateFormatter = ISO8601DateFormatter()
+    dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let dateString = dateFormatter.string(from: capturedAt)
+    let capturedMilliseconds = EventStoreLayout.capturedMilliseconds(for: capturedAt)
+    let day = EventStoreLayout.utcDayKey(for: capturedAt)
+    let legacyCount = CascadeStore.knowledgeGraphChunkContextLimit + 1
+
+    try kgRawExec(path, """
+    CREATE TABLE recorded_context (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        captured_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        app_name TEXT NOT NULL,
+        bundle_identifier TEXT,
+        window_title TEXT,
+        ocr_text TEXT,
+        image_path TEXT,
+        metadata_json TEXT
+    );
+    CREATE TABLE input_event (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        captured_at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        x REAL,
+        y REAL,
+        text TEXT,
+        key TEXT,
+        modifiers TEXT,
+        app_name TEXT NOT NULL,
+        bundle_identifier TEXT,
+        window_title TEXT
+    );
+    CREATE TABLE context_kg (
+        day TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        source_start_ms INTEGER NOT NULL,
+        source_through_ms INTEGER NOT NULL,
+        source_context_count INTEGER NOT NULL,
+        source_max_context_id INTEGER NOT NULL,
+        graph_json TEXT NOT NULL,
+        search_text TEXT NOT NULL,
+        graph_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    WITH RECURSIVE sequence(value) AS (
+        SELECT 0
+        UNION ALL
+        SELECT value + 1 FROM sequence WHERE value < \(legacyCount - 1)
+    )
+    INSERT INTO recorded_context
+        (captured_at, source, app_name, bundle_identifier, window_title, ocr_text, image_path)
+    SELECT
+        '\(legacyEscaped(dateString))', 'screen', 'Notes', 'com.apple.Notes',
+        'Oversized legacy migration', printf('oversizedlegacyfact item-%d', value),
+        '\(legacyEscaped(frame))'
+    FROM sequence;
+    INSERT INTO context_kg
+        (day, schema_version, source_start_ms, source_through_ms, source_context_count,
+         source_max_context_id, graph_json, search_text, graph_sha256, created_at, updated_at)
+    VALUES (
+        '\(day)', \(ContextKnowledgeGraphBuilder.schemaVersion),
+        \(capturedMilliseconds), \(capturedMilliseconds), \(legacyCount), \(legacyCount),
+        '{}', 'oversizedlegacyblob', 'legacy-unbounded',
+        '\(legacyEscaped(dateString))', '\(legacyEscaped(dateString))'
+    );
+    """)
+
+    let store = try CascadeStore(path: path)
+
+    #expect(try kgRawInt(path, "SELECT COUNT(*) FROM context_kg;") == 1)
+    #expect(try kgRawInt(path, "SELECT COUNT(*) FROM context_kg_chunk;") == 0)
+    #expect(try kgRawInt(path, "SELECT COUNT(*) FROM context_kg_coverage;") == 0)
+    #expect(FileManager.default.fileExists(atPath: frame))
+
+    let result = try await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    let chunks = try await store.knowledgeGraphChunks(forDay: day, limit: 10)
+
+    #expect(result.graphsWritten == 2)
+    #expect(result.contextsCovered == legacyCount)
+    #expect(result.frameReferencesCleared == legacyCount)
+    #expect(result.filesDeleted == 1)
+    #expect(result.isCaughtUp)
+    #expect(chunks.count == 2)
+    #expect(chunks.allSatisfy { $0.source.contextCount <= CascadeStore.knowledgeGraphChunkContextLimit })
+    #expect(try kgRawInt(path, "SELECT COUNT(*) FROM context_kg;") == 0)
+    #expect(try kgRawInt(path, "SELECT COUNT(*) FROM context_kg_coverage;") == Int64(legacyCount))
+    #expect(!FileManager.default.fileExists(atPath: frame))
+    #expect(try await store.searchKnowledgeGraphs(matching: "oversizedlegacyfact").count == 2)
 }
 
 @Test
@@ -711,14 +907,15 @@ func testLegacyDatabaseMigrationCreatesAndUsesContextKG() async throws {
     #expect(result.graphsWritten == 1)
     #expect(result.filesDeleted == 1)
     #expect(!FileManager.default.fileExists(atPath: frame))
-    #expect(try await store.knowledgeGraph(forDay: day) != nil)
+    #expect(!(try await store.knowledgeGraphChunks(forDay: day)).isEmpty)
     #expect(try await store.searchKnowledgeGraphs(matching: "legacyquartz").map(\.graph.day).contains(day))
-    #expect(try kgRawStrings(path, "SELECT name FROM sqlite_master WHERE type='table';").contains("context_kg"))
+    #expect(try kgRawStrings(path, "SELECT name FROM sqlite_master WHERE type='table';").contains("context_kg_chunk"))
+    #expect(try kgRawStrings(path, "SELECT name FROM sqlite_master WHERE type='table';").contains("context_kg_coverage"))
     let triggerNames = try kgRawStrings(
         path,
-        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'context_kg_%' ORDER BY name;"
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'context_kg_chunk_%' ORDER BY name;"
     )
-    #expect(Set(triggerNames) == ["context_kg_ad", "context_kg_ai", "context_kg_au"])
-    let storedJSON = try #require(try kgRawStrings(path, "SELECT graph_json FROM context_kg;").first)
+    #expect(Set(triggerNames) == ["context_kg_chunk_ad", "context_kg_chunk_ai", "context_kg_chunk_au"])
+    let storedJSON = try #require(try kgRawStrings(path, "SELECT graph_json FROM context_kg_chunk;").first)
     #expect(try JSONDecoder().decode(ContextKnowledgeGraph.self, from: Data(storedJSON.utf8)).day == day)
 }

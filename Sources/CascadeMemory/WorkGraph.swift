@@ -341,10 +341,21 @@ public struct WorkGraphPlanningPrior: Equatable, Sendable {
 
 public enum WorkGraphExtractor {
     public static func mentions(in context: RecordedContext) -> [WorkGraphMention] {
+        mentions(in: context, includeApp: true)
+    }
+
+    /// KG chunk construction calls this with `includeApp: false` after caching the
+    /// validated app mention for an unchanged app identity. At 1fps, re-running
+    /// the same PII/privacy checks tens of thousands of times is pure duplicate
+    /// work; window/document/entity extraction remains per-context.
+    internal static func mentions(
+        in context: RecordedContext,
+        includeApp: Bool
+    ) -> [WorkGraphMention] {
         guard !PrivacyRules.isSensitive(context) else { return [] }
 
         var mentions: [WorkGraphMention] = []
-        appendAppMention(context, to: &mentions)
+        if includeApp { appendAppMention(context, to: &mentions) }
         appendWindowMention(context, to: &mentions)
 
         for segment in textSegments(context) {

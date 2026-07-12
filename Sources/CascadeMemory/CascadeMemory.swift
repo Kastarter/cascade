@@ -1707,25 +1707,35 @@ public actor CascadeStore {
         return freed
     }
 
-    private struct KnowledgeGraphDayStats {
-        let day: String
-        let throughMilliseconds: Int64
-        let contextCount: Int
-        let maxContextID: Int64
-    }
-
-    private struct StoredKnowledgeGraph {
-        let graph: ContextKnowledgeGraph
-        let sha256: String
-    }
-
     private struct PendingKnowledgeGraphWrite {
+        let chunkID: String
         let graph: ContextKnowledgeGraph
         let json: String
         let searchText: String
         let sha256: String
-        let contextsCovered: Int
+        let contexts: [RecordedContext]
     }
+
+    private struct FrameDeletionProgress {
+        var frameReferencesCleared = 0
+        var filesDeleted = 0
+        var failedPaths: [String] = []
+
+        mutating func merge(_ other: FrameDeletionProgress) {
+            frameReferencesCleared += other.frameReferencesCleared
+            filesDeleted += other.filesDeleted
+            failedPaths.append(contentsOf: other.failedPaths)
+        }
+    }
+
+    /// A single JSON graph is intentionally capped well below a day of 1fps
+    /// capture. Coverage is persisted per source row, so every chunk can commit,
+    /// delete its covered frames, and resume independently after interruption.
+    internal static let knowledgeGraphChunkContextLimit = 256
+    /// Recall decodes at most this many independently bounded JSON values per
+    /// request. Time-range reads sample across the full interval, while FTS finds
+    /// exact facts without scanning or decoding every chunk in a busy day.
+    internal static let knowledgeGraphReadChunkLimit = 32
 
     internal enum FrameCompactionBatchPhase: Equatable {
         case afterDeletionIntent
@@ -1733,11 +1743,12 @@ public actor CascadeStore {
         case afterReferenceCommit
     }
 
-    /// Converts every context strictly older than `cutoff` into a durable,
-    /// day-partitioned knowledge graph before removing its frame from disk.
-    /// Text and the recorded-context FTS row remain available until normal row
-    /// retention removes them; the graph deliberately has no foreign key back to
-    /// those rows and therefore remains searchable afterwards.
+    /// Converts every context strictly older than `cutoff` into durable, bounded
+    /// knowledge-graph chunks before removing its frame from disk. Exact coverage
+    /// rows make each chunk independently resumable: a later chunk failing cannot
+    /// strand frames whose graph already committed. Text and recorded-context FTS
+    /// rows remain until normal row retention; graph chunks deliberately have no
+    /// foreign key back to those source rows and remain searchable afterwards.
     public func compactAgedContextsIntoKnowledgeGraph(
         olderThan cutoff: Date
     ) throws -> ContextKnowledgeGraphCompactionResult {
@@ -1768,120 +1779,340 @@ public actor CascadeStore {
         onBatchPhase: (FrameCompactionBatchPhase, String) throws -> Void
     ) throws -> ContextKnowledgeGraphCompactionResult {
         let cutoffMilliseconds = EventStoreLayout.capturedMilliseconds(for: cutoff)
-        let stats = try eligibleKnowledgeGraphDayStats(before: cutoffMilliseconds)
-        var pendingWrites: [PendingKnowledgeGraphWrite] = []
+        var graphsWritten = 0
+        var contextsCovered = 0
+        var compactedDays: Set<String> = []
 
-        for dayStats in stats {
-            let stored = try storedKnowledgeGraph(forDay: dayStats.day)
-            let needsUpdate = stored == nil
-                || (stored?.graph.schemaVersion ?? 0) < ContextKnowledgeGraphBuilder.schemaVersion
-                || dayStats.maxContextID > (stored?.graph.source.maxContextID ?? 0)
-                || dayStats.throughMilliseconds > (stored?.graph.range.endMs ?? Int64.min)
-                || dayStats.contextCount > (stored?.graph.source.contextCount ?? 0)
-            guard needsUpdate else { continue }
+        // First reconcile chunks that committed before a previous interruption.
+        // Only covered rows are eligible, so this can never unlink an unpersisted
+        // screen even when an old and a recent context share the same file path.
+        var deletionProgress = try deleteCoveredFrameBatches(
+            before: cutoffMilliseconds,
+            onlyChunkID: nil,
+            deletingFrameWith: deleteFrame,
+            onBatchPhase: onBatchPhase,
+            skippingPaths: []
+        )
 
-            let graph: ContextKnowledgeGraph?
-            if let stored, dayStats.maxContextID > stored.graph.source.maxContextID {
-                let deltaContexts = try eligibleContexts(
-                    onDay: dayStats.day,
-                    before: cutoffMilliseconds,
-                    withIDGreaterThan: stored.graph.source.maxContextID
-                )
-                let expectedCompleteCount = stored.graph.source.contextCount + deltaContexts.count
-                if dayStats.contextCount < expectedCompleteCount {
-                    // Rows from this day were already pruned, then a late backfill
-                    // arrived. Never replace the complete historical graph with only
-                    // the surviving tail; merge just the higher-ID delta instead.
-                    graph = ContextKnowledgeGraphBuilder.build(
-                        day: dayStats.day,
-                        contexts: deltaContexts,
-                        cutoff: cutoff
-                    ).map { ContextKnowledgeGraphBuilder.merge(existing: stored.graph, delta: $0, cutoff: cutoff) }
-                } else {
-                    let contexts = try eligibleContexts(
-                        onDay: dayStats.day,
-                        before: cutoffMilliseconds,
-                        withIDGreaterThan: 0
-                    )
-                    graph = ContextKnowledgeGraphBuilder.build(day: dayStats.day, contexts: contexts, cutoff: cutoff)
-                }
-            } else if let stored, dayStats.contextCount < stored.graph.source.contextCount {
-                // The surviving source set cannot reconstruct this day and there
-                // is no higher-ID delta to merge. Keep the richer stored graph;
-                // the coverage gate below will stop deletion if its watermark is
-                // insufficient for any surviving eligible row.
-                graph = nil
-            } else {
-                let contexts = try eligibleContexts(
-                    onDay: dayStats.day,
-                    before: cutoffMilliseconds,
-                    withIDGreaterThan: 0
-                )
-                graph = ContextKnowledgeGraphBuilder.build(day: dayStats.day, contexts: contexts, cutoff: cutoff)
+        while let contexts = try nextUncoveredKnowledgeGraphContexts(before: cutoffMilliseconds) {
+            guard let first = contexts.first else { break }
+            let day = EventStoreLayout.utcDayKey(for: first.capturedAt)
+            let chunkID = Self.knowledgeGraphChunkID(day: day, contexts: contexts)
+            let partitionKey = "utc-day:\(day):chunk:\(chunkID.suffix(16))"
+            guard let graph = ContextKnowledgeGraphBuilder.build(
+                day: day,
+                contexts: contexts,
+                cutoff: cutoff,
+                partitionKey: partitionKey
+            ) else {
+                throw CascadeStoreError.sqlite("Unable to build context knowledge graph chunk")
             }
-
-            guard let graph else { continue }
             let data = try ContextKnowledgeGraphBuilder.canonicalData(for: graph)
             guard let json = String(data: data, encoding: .utf8) else {
                 throw CascadeStoreError.sqlite("Unable to encode context knowledge graph as UTF-8")
             }
-            let sha256 = ContextKnowledgeGraphBuilder.sha256(for: data)
-            // A changed rolling cutoff alone is not a source change. Avoid
-            // rewriting updated_at for the same already-covered context set.
-            if let stored, stored.sha256 == sha256 { continue }
-            pendingWrites.append(PendingKnowledgeGraphWrite(
+            let write = PendingKnowledgeGraphWrite(
+                chunkID: chunkID,
                 graph: graph,
                 json: json,
                 searchText: ContextKnowledgeGraphBuilder.searchText(for: graph),
-                sha256: sha256,
-                contextsCovered: max(0, graph.source.contextCount - (stored?.graph.source.contextCount ?? 0))
+                sha256: ContextKnowledgeGraphBuilder.sha256(for: data),
+                contexts: contexts
+            )
+
+            // Graph JSON and exact source coverage land in one transaction. A
+            // crash after this commit can only leave a covered frame for recovery;
+            // it cannot leave a deleted frame without durable knowledge evidence.
+            try withTransaction {
+                try insertKnowledgeGraphChunk(write, timestamp: DateCodec.string(from: Date()))
+                try insertKnowledgeGraphCoverage(for: write)
+            }
+            graphsWritten += 1
+            contextsCovered += contexts.count
+            compactedDays.insert(day)
+
+            let chunkDeletion = try deleteCoveredFrameBatches(
+                before: cutoffMilliseconds,
+                onlyChunkID: chunkID,
+                deletingFrameWith: deleteFrame,
+                onBatchPhase: onBatchPhase,
+                skippingPaths: Set(deletionProgress.failedPaths)
+            )
+            deletionProgress.merge(chunkDeletion)
+        }
+
+        let legacyGraphsReplaced = try deleteSupersededLegacyKnowledgeGraphs()
+        let remainingFrameReferences = try countEligibleFrameReferences(before: cutoffMilliseconds)
+        let uncoveredContexts = try uncoveredKnowledgeGraphContextCount(before: cutoffMilliseconds)
+        let isCaughtUp = deletionProgress.failedPaths.isEmpty
+            && remainingFrameReferences == 0
+            && uncoveredContexts == 0
+
+        if graphsWritten > 0
+            || deletionProgress.frameReferencesCleared > 0
+            || deletionProgress.filesDeleted > 0
+            || legacyGraphsReplaced > 0 {
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.frame_compaction",
+                detail: [
+                    "cutoffMs=\(cutoffMilliseconds)",
+                    "schemaVersion=\(ContextKnowledgeGraphBuilder.schemaVersion)",
+                    "days=\(compactedDays.count)",
+                    "contexts=\(contextsCovered)",
+                    "chunks=\(graphsWritten)",
+                    "references=\(deletionProgress.frameReferencesCleared)",
+                    "files=\(deletionProgress.filesDeleted)",
+                    "failures=\(deletionProgress.failedPaths.count)",
+                    "legacyGraphsReplaced=\(legacyGraphsReplaced)",
+                    "uncovered=\(uncoveredContexts)",
+                ].joined(separator: " ")
+            ))
+        }
+        if !deletionProgress.failedPaths.isEmpty {
+            let hashes = deletionProgress.failedPaths.prefix(20)
+                .map { AuditIdentity.hash("frame-path:\($0)") }
+                .joined(separator: ",")
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.frame_delete_failed",
+                detail: "cutoffMs=\(cutoffMilliseconds) failures=\(deletionProgress.failedPaths.count) pathHashes=\(hashes)"
             ))
         }
 
-        // Phase one: a committed graph is a hard precondition for making any
-        // frame unreachable. A crash after this commit can safely retry phase two.
-        if !pendingWrites.isEmpty {
-            let timestamp = DateCodec.string(from: Date())
-            try withTransaction {
-                for write in pendingWrites {
-                    try upsertKnowledgeGraph(write, timestamp: timestamp)
-                }
+        return ContextKnowledgeGraphCompactionResult(
+            cutoff: cutoff,
+            graphsWritten: graphsWritten,
+            contextsCovered: contextsCovered,
+            frameReferencesCleared: deletionProgress.frameReferencesCleared,
+            filesDeleted: deletionProgress.filesDeleted,
+            deletionFailures: deletionProgress.failedPaths.count,
+            isCaughtUp: isCaughtUp
+        )
+    }
+
+    /// Returns persisted chunks in chronological order, hard-capped to the recall
+    /// decode budget even if a caller supplies a larger limit.
+    public func knowledgeGraphChunks(
+        forDay day: String,
+        limit: Int = 32
+    ) throws -> [ContextKnowledgeGraph] {
+        guard limit > 0 else { return [] }
+        let boundedLimit = min(limit, Self.knowledgeGraphReadChunkLimit)
+        return try withStatement("""
+        SELECT graph_json
+        FROM context_kg_chunk
+        WHERE day = ?
+        ORDER BY source_start_ms ASC, source_min_context_id ASC, chunk_id ASC
+        LIMIT ?;
+        """) { statement in
+            bind(day, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(boundedLimit))
+            return try decodeKnowledgeGraphRows(statement)
+        }
+    }
+
+    /// Returns a bounded sample spanning the complete requested interval. Exact
+    /// term lookup uses `searchKnowledgeGraphs`, which queries every chunk via FTS.
+    public func knowledgeGraphs(
+        between start: Date,
+        and end: Date,
+        limit: Int = 32
+    ) throws -> [ContextKnowledgeGraph] {
+        guard end >= start, limit > 0 else { return [] }
+        let startMilliseconds = EventStoreLayout.capturedMilliseconds(for: start)
+        let endMilliseconds = EventStoreLayout.capturedMilliseconds(for: end)
+        let boundedLimit = min(limit, Self.knowledgeGraphReadChunkLimit)
+        return try withStatement("""
+        WITH bucketed AS (
+            SELECT graph_json, source_start_ms, source_min_context_id, chunk_id,
+                   NTILE(?) OVER (
+                       ORDER BY source_start_ms ASC, source_min_context_id ASC, chunk_id ASC
+                   ) AS sample_bucket
+            FROM context_kg_chunk
+            WHERE source_through_ms >= ? AND source_start_ms <= ?
+        ), sampled AS (
+            SELECT graph_json, source_start_ms, source_min_context_id, chunk_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY sample_bucket
+                       ORDER BY source_start_ms DESC, source_min_context_id DESC, chunk_id DESC
+                   ) AS sample_row
+            FROM bucketed
+        )
+        SELECT graph_json
+        FROM sampled
+        WHERE sample_row = 1
+        ORDER BY source_start_ms ASC, source_min_context_id ASC, chunk_id ASC
+        LIMIT ?;
+        """) { statement in
+            sqlite3_bind_int(statement, 1, Int32(boundedLimit))
+            bind(startMilliseconds, at: 2, in: statement)
+            bind(endMilliseconds, at: 3, in: statement)
+            sqlite3_bind_int(statement, 4, Int32(boundedLimit))
+            return try decodeKnowledgeGraphRows(statement)
+        }
+    }
+
+    public func searchKnowledgeGraphs(
+        matching query: String,
+        limit: Int = 12
+    ) throws -> [ContextKnowledgeGraphSearchHit] {
+        let match = Self.ftsAnyQuery(from: query)
+        guard !match.isEmpty, limit > 0 else { return [] }
+        let boundedLimit = min(limit, Self.knowledgeGraphReadChunkLimit)
+        return try withStatement("""
+        SELECT kg.graph_json,
+               snippet(context_kg_chunk_fts, 0, '', '', ' … ', 32),
+               bm25(context_kg_chunk_fts)
+        FROM context_kg_chunk_fts
+        JOIN context_kg_chunk kg ON kg.rowid = context_kg_chunk_fts.rowid
+        WHERE context_kg_chunk_fts MATCH ?
+        ORDER BY bm25(context_kg_chunk_fts), kg.source_through_ms DESC
+        LIMIT ?;
+        """) { statement in
+            bind(match, at: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(boundedLimit))
+            var hits: [ContextKnowledgeGraphSearchHit] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let json = text(statement, 0), let data = json.data(using: .utf8) else { continue }
+                hits.append(ContextKnowledgeGraphSearchHit(
+                    graph: try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data),
+                    snippet: String((text(statement, 1) ?? "").prefix(560)),
+                    rank: sqlite3_column_double(statement, 2)
+                ))
+            }
+            return hits
+        }
+    }
+
+    private func decodeKnowledgeGraphRows(_ statement: OpaquePointer) throws -> [ContextKnowledgeGraph] {
+        var graphs: [ContextKnowledgeGraph] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let json = text(statement, 0), let data = json.data(using: .utf8) else { continue }
+            graphs.append(try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data))
+        }
+        return graphs
+    }
+
+    private func nextUncoveredKnowledgeGraphContexts(
+        before cutoffMilliseconds: Int64
+    ) throws -> [RecordedContext]? {
+        let day = try withStatement("""
+        SELECT c.captured_day
+        FROM recorded_context c
+        LEFT JOIN context_kg_coverage coverage ON coverage.context_id = c.id
+        WHERE c.captured_ms < ? AND c.captured_day IS NOT NULL
+          AND coverage.context_id IS NULL
+        ORDER BY c.captured_ms ASC, c.id ASC
+        LIMIT 1;
+        """) { statement in
+            bind(cutoffMilliseconds, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW ? text(statement, 0) : nil
+        }
+        guard let day else { return nil }
+
+        let contexts = try withStatement("""
+        SELECT \(Self.contextColumns(prefix: "c"))
+        FROM recorded_context c
+        LEFT JOIN context_kg_coverage coverage ON coverage.context_id = c.id
+        WHERE c.captured_day = ? AND c.captured_ms < ?
+          AND coverage.context_id IS NULL
+        ORDER BY c.captured_ms ASC, c.id ASC
+        LIMIT ?;
+        """) { statement in
+            bind(day, at: 1, in: statement)
+            bind(cutoffMilliseconds, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(Self.knowledgeGraphChunkContextLimit))
+            var rows: [RecordedContext] = []
+            rows.reserveCapacity(Self.knowledgeGraphChunkContextLimit)
+            while sqlite3_step(statement) == SQLITE_ROW { rows.append(decodeContext(statement)) }
+            return rows
+        }
+        return contexts.isEmpty ? nil : contexts
+    }
+
+    private static func knowledgeGraphChunkID(day: String, contexts: [RecordedContext]) -> String {
+        let source = ([day] + contexts.map { String($0.id) }).joined(separator: "|")
+        let digest = ContextKnowledgeGraphBuilder.sha256(for: Data(source.utf8))
+        return "kgc:\(day):\(digest)"
+    }
+
+    private func insertKnowledgeGraphChunk(_ write: PendingKnowledgeGraphWrite, timestamp: String) throws {
+        let minimumContextID = write.contexts.map(\.id).min() ?? write.graph.source.maxContextID
+        try withStatement("""
+        INSERT OR IGNORE INTO context_kg_chunk
+            (chunk_id, day, schema_version, source_start_ms, source_through_ms,
+             source_context_count, source_min_context_id, source_max_context_id,
+             graph_json, search_text, graph_sha256, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """) { statement in
+            bind(write.chunkID, at: 1, in: statement)
+            bind(write.graph.day, at: 2, in: statement)
+            sqlite3_bind_int(statement, 3, Int32(write.graph.schemaVersion))
+            bind(write.graph.range.startMs, at: 4, in: statement)
+            bind(write.graph.range.endMs, at: 5, in: statement)
+            sqlite3_bind_int64(statement, 6, Int64(write.graph.source.contextCount))
+            bind(minimumContextID, at: 7, in: statement)
+            bind(write.graph.source.maxContextID, at: 8, in: statement)
+            bind(write.json, at: 9, in: statement)
+            bind(write.searchText, at: 10, in: statement)
+            bind(write.sha256, at: 11, in: statement)
+            bind(timestamp, at: 12, in: statement)
+            bind(timestamp, at: 13, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    private func insertKnowledgeGraphCoverage(for write: PendingKnowledgeGraphWrite) throws {
+        try withStatement("""
+        INSERT OR IGNORE INTO context_kg_coverage
+            (context_id, chunk_id, captured_day, captured_ms)
+        VALUES (?, ?, ?, ?);
+        """) { statement in
+            for context in write.contexts {
+                bind(context.id, at: 1, in: statement)
+                bind(write.chunkID, at: 2, in: statement)
+                bind(EventStoreLayout.utcDayKey(for: context.capturedAt), at: 3, in: statement)
+                bind(EventStoreLayout.capturedMilliseconds(for: context.capturedAt), at: 4, in: statement)
+                try stepDone(statement)
+                try resetStatement(statement)
+                try clearBindings(statement)
             }
         }
+    }
 
-        guard try uncoveredKnowledgeGraphDayCount(before: cutoffMilliseconds) == 0 else {
-            throw CascadeStoreError.sqlite("Knowledge graph coverage incomplete; frame deletion deferred")
-        }
-
-        var frameReferencesCleared = 0
-        var filesDeleted = 0
-        var failedPaths: [String] = []
+    private func deleteCoveredFrameBatches(
+        before cutoffMilliseconds: Int64,
+        onlyChunkID: String?,
+        deletingFrameWith deleteFrame: (String) throws -> Void,
+        onBatchPhase: (FrameCompactionBatchPhase, String) throws -> Void,
+        skippingPaths: Set<String>
+    ) throws -> FrameDeletionProgress {
+        var progress = FrameDeletionProgress()
         var lastPath = ""
         let fileManager = FileManager.default
 
-        // Phase two: process paths in lexical keyset batches. Multiple old rows
-        // may share a path after legacy thinning, so each physical file is handled
-        // exactly once per run.
         while true {
-            let paths = try eligibleFramePaths(
+            let scannedPaths = try eligibleCoveredFramePaths(
                 before: cutoffMilliseconds,
+                onlyChunkID: onlyChunkID,
                 after: lastPath,
                 limit: 500
             )
-            guard !paths.isEmpty else { break }
-            lastPath = paths.last ?? lastPath
+            guard !scannedPaths.isEmpty else { break }
+            lastPath = scannedPaths.last ?? lastPath
+            let paths = scannedPaths.filter { !skippingPaths.contains($0) }
+            guard !paths.isEmpty else { continue }
 
-            var pathsWithRecentReferences: Set<String> = []
-            for path in paths where try hasContextReferencingFrame(path, onOrAfter: cutoffMilliseconds) {
-                pathsWithRecentReferences.insert(path)
+            var pathsWithRetainedReferences: Set<String> = []
+            for path in paths where try hasUncoveredOrRecentContextReferencingFrame(
+                path,
+                cutoffMilliseconds: cutoffMilliseconds
+            ) {
+                pathsWithRetainedReferences.insert(path)
             }
             let batchID = UUID().uuidString.lowercased()
-            let pathHashes = paths
-                .map { AuditIdentity.hash("frame-path:\($0)") }
-                .joined(separator: ",")
-            // This row commits before the first unlink. If the process exits in
-            // either following crash window, the intended paths and cutoff remain
-            // reconstructable without placing raw filesystem paths in the audit.
+            let pathHashes = paths.map { AuditIdentity.hash("frame-path:\($0)") }.joined(separator: ",")
             _ = try appendAudit(AuditEvent(
                 actor: "system",
                 action: "retention.frame_delete_intent",
@@ -1889,8 +2120,8 @@ public actor CascadeStore {
                     "batch=\(batchID)",
                     "cutoffMs=\(cutoffMilliseconds)",
                     "paths=\(paths.count)",
-                    "deleteCandidates=\(paths.count - pathsWithRecentReferences.count)",
-                    "shared=\(pathsWithRecentReferences.count)",
+                    "deleteCandidates=\(paths.count - pathsWithRetainedReferences.count)",
+                    "shared=\(pathsWithRetainedReferences.count)",
                     "pathHashes=\(pathHashes)",
                 ].joined(separator: " ")
             ))
@@ -1901,51 +2132,45 @@ public actor CascadeStore {
             var batchAlreadyMissing = 0
             var batchFailures = 0
             for path in paths {
-                if pathsWithRecentReferences.contains(path) {
-                    // A recent row still owns the file. Clear only old references.
+                if pathsWithRetainedReferences.contains(path) {
                     clearablePaths.append(path)
                     continue
                 }
                 if !fileManager.fileExists(atPath: path) {
-                    // Recovery from a crash after unlink but before the SQL update.
                     batchAlreadyMissing += 1
                     clearablePaths.append(path)
                     continue
                 }
                 do {
                     try deleteFrame(path)
-                    if fileManager.fileExists(atPath: path) {
-                        failedPaths.append(path)
-                        batchFailures += 1
-                    } else {
-                        filesDeleted += 1
-                        batchFilesDeleted += 1
-                        clearablePaths.append(path)
-                    }
                 } catch {
-                    // Some filesystem implementations can report an error after
-                    // unlinking. Missing means the desired state was achieved.
-                    if fileManager.fileExists(atPath: path) {
-                        failedPaths.append(path)
-                        batchFailures += 1
-                    } else {
-                        filesDeleted += 1
-                        batchFilesDeleted += 1
-                        clearablePaths.append(path)
-                    }
+                    // Some filesystems report an error after unlinking. The file's
+                    // postcondition, not the thrown value, determines safe progress.
+                }
+                if fileManager.fileExists(atPath: path) {
+                    progress.failedPaths.append(path)
+                    batchFailures += 1
+                } else {
+                    progress.filesDeleted += 1
+                    batchFilesDeleted += 1
+                    clearablePaths.append(path)
                 }
             }
             try onBatchPhase(.afterFileDeletion, batchID)
 
             var batchReferencesCleared = 0
             if !clearablePaths.isEmpty {
-                let affectedDays = try dayKeysForFramePaths(clearablePaths, before: cutoffMilliseconds)
+                let affectedDays = try dayKeysForCoveredFramePaths(
+                    clearablePaths,
+                    before: cutoffMilliseconds
+                )
                 try withTransaction {
                     for path in clearablePaths {
                         try withStatement("""
                         UPDATE recorded_context
                         SET image_path = NULL
-                        WHERE captured_ms < ? AND image_path = ?;
+                        WHERE captured_ms < ? AND image_path = ?
+                          AND id IN (SELECT context_id FROM context_kg_coverage);
                         """) { statement in
                             bind(cutoffMilliseconds, at: 1, in: statement)
                             bind(path, at: 2, in: statement)
@@ -1955,7 +2180,7 @@ public actor CascadeStore {
                     }
                     try rebuildDayPartitions(days: affectedDays)
                 }
-                frameReferencesCleared += batchReferencesCleared
+                progress.frameReferencesCleared += batchReferencesCleared
             }
             try onBatchPhase(.afterReferenceCommit, batchID)
             _ = try appendAudit(AuditEvent(
@@ -1972,232 +2197,33 @@ public actor CascadeStore {
                 ].joined(separator: " ")
             ))
         }
-
-        let remainingFrameReferences = try countEligibleFrameReferences(before: cutoffMilliseconds)
-        let uncoveredDays = try uncoveredKnowledgeGraphDayCount(before: cutoffMilliseconds)
-        let isCaughtUp = failedPaths.isEmpty && remainingFrameReferences == 0 && uncoveredDays == 0
-        let contextsCovered = pendingWrites.reduce(0) { $0 + $1.contextsCovered }
-
-        if !pendingWrites.isEmpty || frameReferencesCleared > 0 || filesDeleted > 0 {
-            _ = try appendAudit(AuditEvent(
-                actor: "system",
-                action: "retention.frame_compaction",
-                detail: [
-                    "cutoffMs=\(cutoffMilliseconds)",
-                    "schemaVersion=\(ContextKnowledgeGraphBuilder.schemaVersion)",
-                    "days=\(stats.count)",
-                    "contexts=\(contextsCovered)",
-                    "graphs=\(pendingWrites.count)",
-                    "references=\(frameReferencesCleared)",
-                    "files=\(filesDeleted)",
-                    "failures=\(failedPaths.count)",
-                ].joined(separator: " ")
-            ))
-        }
-        if !failedPaths.isEmpty {
-            let hashes = failedPaths.prefix(20).map { AuditIdentity.hash("frame-path:\($0)") }.joined(separator: ",")
-            _ = try appendAudit(AuditEvent(
-                actor: "system",
-                action: "retention.frame_delete_failed",
-                detail: "cutoffMs=\(cutoffMilliseconds) failures=\(failedPaths.count) pathHashes=\(hashes)"
-            ))
-        }
-
-        return ContextKnowledgeGraphCompactionResult(
-            cutoff: cutoff,
-            graphsWritten: pendingWrites.count,
-            contextsCovered: contextsCovered,
-            frameReferencesCleared: frameReferencesCleared,
-            filesDeleted: filesDeleted,
-            deletionFailures: failedPaths.count,
-            isCaughtUp: isCaughtUp
-        )
+        return progress
     }
 
-    public func knowledgeGraph(forDay day: String) throws -> ContextKnowledgeGraph? {
-        try storedKnowledgeGraph(forDay: day)?.graph
-    }
-
-    public func knowledgeGraphs(
-        between start: Date,
-        and end: Date,
-        limit: Int = 31
-    ) throws -> [ContextKnowledgeGraph] {
-        guard end >= start, limit > 0 else { return [] }
-        let startMilliseconds = EventStoreLayout.capturedMilliseconds(for: start)
-        let endMilliseconds = EventStoreLayout.capturedMilliseconds(for: end)
-        return try withStatement("""
-        SELECT graph_json
-        FROM context_kg
-        WHERE source_through_ms >= ? AND source_start_ms <= ?
-        ORDER BY source_start_ms ASC, day ASC
-        LIMIT ?;
-        """) { statement in
-            bind(startMilliseconds, at: 1, in: statement)
-            bind(endMilliseconds, at: 2, in: statement)
-            sqlite3_bind_int(statement, 3, Int32(min(limit, Int(Int32.max))))
-            var graphs: [ContextKnowledgeGraph] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                guard let json = text(statement, 0), let data = json.data(using: .utf8) else { continue }
-                graphs.append(try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data))
-            }
-            return graphs
-        }
-    }
-
-    public func searchKnowledgeGraphs(
-        matching query: String,
-        limit: Int = 12
-    ) throws -> [ContextKnowledgeGraphSearchHit] {
-        let match = Self.ftsAnyQuery(from: query)
-        guard !match.isEmpty, limit > 0 else { return [] }
-        return try withStatement("""
-        SELECT kg.graph_json,
-               snippet(context_kg_fts, 0, '', '', ' … ', 32),
-               bm25(context_kg_fts)
-        FROM context_kg_fts
-        JOIN context_kg kg ON kg.rowid = context_kg_fts.rowid
-        WHERE context_kg_fts MATCH ?
-        ORDER BY bm25(context_kg_fts), kg.source_through_ms DESC
-        LIMIT ?;
-        """) { statement in
-            bind(match, at: 1, in: statement)
-            sqlite3_bind_int(statement, 2, Int32(min(limit, Int(Int32.max))))
-            var hits: [ContextKnowledgeGraphSearchHit] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                guard let json = text(statement, 0), let data = json.data(using: .utf8) else { continue }
-                hits.append(ContextKnowledgeGraphSearchHit(
-                    graph: try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data),
-                    snippet: String((text(statement, 1) ?? "").prefix(560)),
-                    rank: sqlite3_column_double(statement, 2)
-                ))
-            }
-            return hits
-        }
-    }
-
-    private func eligibleKnowledgeGraphDayStats(before cutoffMilliseconds: Int64) throws -> [KnowledgeGraphDayStats] {
-        try withStatement("""
-        SELECT captured_day, MAX(captured_ms), COUNT(*), MAX(id)
-        FROM recorded_context
-        WHERE captured_ms < ? AND captured_day IS NOT NULL
-        GROUP BY captured_day
-        ORDER BY captured_day ASC;
-        """) { statement in
-            bind(cutoffMilliseconds, at: 1, in: statement)
-            var result: [KnowledgeGraphDayStats] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                guard let day = text(statement, 0) else { continue }
-                result.append(KnowledgeGraphDayStats(
-                    day: day,
-                    throughMilliseconds: sqlite3_column_int64(statement, 1),
-                    contextCount: Int(sqlite3_column_int64(statement, 2)),
-                    maxContextID: sqlite3_column_int64(statement, 3)
-                ))
-            }
-            return result
-        }
-    }
-
-    private func eligibleContexts(
-        onDay day: String,
+    private func eligibleCoveredFramePaths(
         before cutoffMilliseconds: Int64,
-        withIDGreaterThan minimumID: Int64
-    ) throws -> [RecordedContext] {
-        var contexts: [RecordedContext] = []
-        var lastMilliseconds = Int64.min
-        var lastID = Int64.min
-        while true {
-            let batch = try withStatement("""
-            SELECT \(Self.contextColumns())
-            FROM recorded_context
-            WHERE captured_day = ? AND captured_ms < ? AND id > ?
-              AND (captured_ms > ? OR (captured_ms = ? AND id > ?))
-            ORDER BY captured_ms ASC, id ASC
-            LIMIT 2000;
-            """) { statement in
-                bind(day, at: 1, in: statement)
-                bind(cutoffMilliseconds, at: 2, in: statement)
-                bind(minimumID, at: 3, in: statement)
-                bind(lastMilliseconds, at: 4, in: statement)
-                bind(lastMilliseconds, at: 5, in: statement)
-                bind(lastID, at: 6, in: statement)
-                var rows: [RecordedContext] = []
-                while sqlite3_step(statement) == SQLITE_ROW { rows.append(decodeContext(statement)) }
-                return rows
-            }
-            guard !batch.isEmpty else { break }
-            contexts.append(contentsOf: batch)
-            guard let last = batch.last else { break }
-            lastMilliseconds = EventStoreLayout.capturedMilliseconds(for: last.capturedAt)
-            lastID = last.id
-            if batch.count < 2000 { break }
-        }
-        return contexts
-    }
-
-    private func storedKnowledgeGraph(forDay day: String) throws -> StoredKnowledgeGraph? {
-        try withStatement("""
-        SELECT graph_json, graph_sha256
-        FROM context_kg WHERE day = ? LIMIT 1;
-        """) { statement in
-            bind(day, at: 1, in: statement)
-            guard sqlite3_step(statement) == SQLITE_ROW,
-                  let json = text(statement, 0),
-                  let data = json.data(using: .utf8) else { return nil }
-            return StoredKnowledgeGraph(
-                graph: try JSONDecoder().decode(ContextKnowledgeGraph.self, from: data),
-                sha256: text(statement, 1) ?? ""
-            )
-        }
-    }
-
-    private func upsertKnowledgeGraph(_ write: PendingKnowledgeGraphWrite, timestamp: String) throws {
-        try withStatement("""
-        INSERT INTO context_kg
-            (day, schema_version, source_start_ms, source_through_ms, source_context_count,
-             source_max_context_id, graph_json, search_text, graph_sha256, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(day) DO UPDATE SET
-            schema_version = excluded.schema_version,
-            source_start_ms = excluded.source_start_ms,
-            source_through_ms = excluded.source_through_ms,
-            source_context_count = excluded.source_context_count,
-            source_max_context_id = excluded.source_max_context_id,
-            graph_json = excluded.graph_json,
-            search_text = excluded.search_text,
-            graph_sha256 = excluded.graph_sha256,
-            updated_at = excluded.updated_at
-        WHERE context_kg.source_max_context_id < excluded.source_max_context_id
-           OR context_kg.source_through_ms < excluded.source_through_ms
-           OR context_kg.graph_sha256 <> excluded.graph_sha256;
-        """) { statement in
-            bind(write.graph.day, at: 1, in: statement)
-            sqlite3_bind_int(statement, 2, Int32(write.graph.schemaVersion))
-            bind(write.graph.range.startMs, at: 3, in: statement)
-            bind(write.graph.range.endMs, at: 4, in: statement)
-            sqlite3_bind_int64(statement, 5, Int64(write.graph.source.contextCount))
-            bind(write.graph.source.maxContextID, at: 6, in: statement)
-            bind(write.json, at: 7, in: statement)
-            bind(write.searchText, at: 8, in: statement)
-            bind(write.sha256, at: 9, in: statement)
-            bind(timestamp, at: 10, in: statement)
-            bind(timestamp, at: 11, in: statement)
-            try stepDone(statement)
-        }
-    }
-
-    private func eligibleFramePaths(before cutoffMilliseconds: Int64, after path: String, limit: Int) throws -> [String] {
-        try withStatement("""
-        SELECT DISTINCT image_path
-        FROM recorded_context
-        WHERE captured_ms < ? AND image_path IS NOT NULL AND image_path > ?
-        ORDER BY image_path ASC
+        onlyChunkID: String?,
+        after path: String,
+        limit: Int
+    ) throws -> [String] {
+        let chunkPredicate = onlyChunkID == nil ? "" : "AND coverage.chunk_id = ?"
+        return try withStatement("""
+        SELECT DISTINCT c.image_path
+        FROM recorded_context c
+        JOIN context_kg_coverage coverage ON coverage.context_id = c.id
+        WHERE c.captured_ms < ? AND c.image_path IS NOT NULL AND c.image_path > ?
+          \(chunkPredicate)
+        ORDER BY c.image_path ASC
         LIMIT ?;
         """) { statement in
             bind(cutoffMilliseconds, at: 1, in: statement)
             bind(path, at: 2, in: statement)
-            sqlite3_bind_int(statement, 3, Int32(limit))
+            var limitIndex: Int32 = 3
+            if let onlyChunkID {
+                bind(onlyChunkID, at: 3, in: statement)
+                limitIndex = 4
+            }
+            sqlite3_bind_int(statement, limitIndex, Int32(limit))
             var paths: [String] = []
             while sqlite3_step(statement) == SQLITE_ROW {
                 if let value = text(statement, 0) { paths.append(value) }
@@ -2206,23 +2232,35 @@ public actor CascadeStore {
         }
     }
 
-    private func hasContextReferencingFrame(_ path: String, onOrAfter cutoffMilliseconds: Int64) throws -> Bool {
+    private func hasUncoveredOrRecentContextReferencingFrame(
+        _ path: String,
+        cutoffMilliseconds: Int64
+    ) throws -> Bool {
         try withStatement("""
-        SELECT 1 FROM recorded_context
-        WHERE captured_ms >= ? AND image_path = ? LIMIT 1;
+        SELECT 1
+        FROM recorded_context c
+        LEFT JOIN context_kg_coverage coverage ON coverage.context_id = c.id
+        WHERE c.image_path = ?
+          AND (c.captured_ms >= ? OR coverage.context_id IS NULL)
+        LIMIT 1;
         """) { statement in
-            bind(cutoffMilliseconds, at: 1, in: statement)
-            bind(path, at: 2, in: statement)
+            bind(path, at: 1, in: statement)
+            bind(cutoffMilliseconds, at: 2, in: statement)
             return sqlite3_step(statement) == SQLITE_ROW
         }
     }
 
-    private func dayKeysForFramePaths(_ paths: [String], before cutoffMilliseconds: Int64) throws -> Set<String> {
+    private func dayKeysForCoveredFramePaths(
+        _ paths: [String],
+        before cutoffMilliseconds: Int64
+    ) throws -> Set<String> {
         var days: Set<String> = []
         for path in paths {
             try withStatement("""
-            SELECT DISTINCT captured_day FROM recorded_context
-            WHERE captured_ms < ? AND image_path = ? AND captured_day IS NOT NULL;
+            SELECT DISTINCT c.captured_day
+            FROM recorded_context c
+            JOIN context_kg_coverage coverage ON coverage.context_id = c.id
+            WHERE c.captured_ms < ? AND c.image_path = ? AND c.captured_day IS NOT NULL;
             """) { statement in
                 bind(cutoffMilliseconds, at: 1, in: statement)
                 bind(path, at: 2, in: statement)
@@ -2244,21 +2282,36 @@ public actor CascadeStore {
         }
     }
 
-    private func uncoveredKnowledgeGraphDayCount(before cutoffMilliseconds: Int64) throws -> Int64 {
+    private func uncoveredKnowledgeGraphContextCount(before cutoffMilliseconds: Int64) throws -> Int64 {
         try withStatement("""
-        SELECT COUNT(*) FROM (
-            SELECT c.captured_day
-            FROM recorded_context c
-            LEFT JOIN context_kg kg ON kg.day = c.captured_day
-            WHERE c.captured_ms < ? AND c.captured_day IS NOT NULL
-            GROUP BY c.captured_day
-            HAVING kg.day IS NULL
-                OR kg.source_max_context_id < MAX(c.id)
-                OR kg.source_through_ms < MAX(c.captured_ms)
-        );
+        SELECT COUNT(*)
+        FROM recorded_context c
+        LEFT JOIN context_kg_coverage coverage ON coverage.context_id = c.id
+        WHERE c.captured_ms < ? AND c.captured_day IS NOT NULL
+          AND coverage.context_id IS NULL;
         """) { statement in
             bind(cutoffMilliseconds, at: 1, in: statement)
             return sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : 0
+        }
+    }
+
+    /// The first implementation stored one monolithic graph per day. Oversized
+    /// legacy rows never count as coverage; once their complete source range has
+    /// been rebuilt into bounded chunks, remove the redundant blob and its FTS row.
+    private func deleteSupersededLegacyKnowledgeGraphs() throws -> Int {
+        try withStatement("""
+        DELETE FROM context_kg
+        WHERE source_context_count <= (
+            SELECT COUNT(*)
+            FROM context_kg_coverage coverage
+            WHERE coverage.captured_day = context_kg.day
+              AND coverage.captured_ms >= context_kg.source_start_ms
+              AND coverage.captured_ms <= context_kg.source_through_ms
+              AND coverage.context_id <= context_kg.source_max_context_id
+        );
+        """) { statement in
+            try stepDone(statement)
+            return Int(sqlite3_changes(connection.db))
         }
     }
 
@@ -4194,6 +4247,9 @@ public actor CascadeStore {
             sealed_at TEXT
         );
 
+        -- Legacy single-row-per-day storage. Rows already within the current
+        -- chunk bound are promoted below; oversized rows remain here until their
+        -- source contexts have been rebuilt into bounded chunks.
         CREATE TABLE IF NOT EXISTS context_kg (
             day TEXT PRIMARY KEY,
             schema_version INTEGER NOT NULL,
@@ -4209,6 +4265,37 @@ public actor CascadeStore {
         );
         CREATE INDEX IF NOT EXISTS idx_context_kg_time
             ON context_kg(source_start_ms, source_through_ms);
+
+        CREATE TABLE IF NOT EXISTS context_kg_chunk (
+            chunk_id TEXT PRIMARY KEY,
+            day TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            source_start_ms INTEGER NOT NULL,
+            source_through_ms INTEGER NOT NULL,
+            source_context_count INTEGER NOT NULL,
+            source_min_context_id INTEGER NOT NULL,
+            source_max_context_id INTEGER NOT NULL,
+            graph_json TEXT NOT NULL,
+            search_text TEXT NOT NULL,
+            graph_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_kg_chunk_day
+            ON context_kg_chunk(day, source_start_ms, source_min_context_id);
+        CREATE INDEX IF NOT EXISTS idx_context_kg_chunk_time
+            ON context_kg_chunk(source_start_ms, source_through_ms);
+
+        CREATE TABLE IF NOT EXISTS context_kg_coverage (
+            context_id INTEGER PRIMARY KEY,
+            chunk_id TEXT NOT NULL REFERENCES context_kg_chunk(chunk_id) ON DELETE CASCADE,
+            captured_day TEXT NOT NULL,
+            captured_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_kg_coverage_chunk
+            ON context_kg_coverage(chunk_id, context_id);
+        CREATE INDEX IF NOT EXISTS idx_context_kg_coverage_day_time
+            ON context_kg_coverage(captured_day, captured_ms, context_id);
 
         CREATE TABLE IF NOT EXISTS audit_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4411,6 +4498,80 @@ public actor CascadeStore {
             INSERT INTO context_kg_fts(rowid, search_text)
             VALUES (new.rowid, new.search_text);
         END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS context_kg_chunk_fts USING fts5(
+            search_text,
+            content='context_kg_chunk', content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS context_kg_chunk_ai AFTER INSERT ON context_kg_chunk BEGIN
+            INSERT INTO context_kg_chunk_fts(rowid, search_text)
+            VALUES (new.rowid, new.search_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS context_kg_chunk_ad AFTER DELETE ON context_kg_chunk BEGIN
+            INSERT INTO context_kg_chunk_fts(context_kg_chunk_fts, rowid, search_text)
+            VALUES ('delete', old.rowid, old.search_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS context_kg_chunk_au AFTER UPDATE ON context_kg_chunk BEGIN
+            INSERT INTO context_kg_chunk_fts(context_kg_chunk_fts, rowid, search_text)
+            VALUES ('delete', old.rowid, old.search_text);
+            INSERT INTO context_kg_chunk_fts(rowid, search_text)
+            VALUES (new.rowid, new.search_text);
+        END;
+        """, db: db)
+
+        // Upgrade the feature's earlier rows without decoding them in-process, but
+        // only when they already satisfy the current chunk bound. A monolithic day
+        // row must never become deletion coverage: it stays isolated in the legacy
+        // table while surviving source contexts are rebuilt in resumable chunks.
+        try execute("""
+        INSERT OR IGNORE INTO context_kg_chunk
+            (chunk_id, day, schema_version, source_start_ms, source_through_ms,
+             source_context_count, source_min_context_id, source_max_context_id,
+             graph_json, search_text, graph_sha256, created_at, updated_at)
+        SELECT 'legacy-day:' || day,
+               day,
+               schema_version,
+               source_start_ms,
+               source_through_ms,
+               source_context_count,
+               COALESCE((
+                   SELECT MIN(c.id) FROM recorded_context c
+                   WHERE c.captured_day = context_kg.day
+                     AND c.captured_ms >= context_kg.source_start_ms
+                     AND c.captured_ms <= context_kg.source_through_ms
+                     AND c.id <= context_kg.source_max_context_id
+               ), source_max_context_id),
+               source_max_context_id,
+               graph_json,
+               search_text,
+               graph_sha256,
+               created_at,
+               updated_at
+        FROM context_kg
+        WHERE schema_version >= \(ContextKnowledgeGraphBuilder.schemaVersion)
+          AND source_context_count <= \(knowledgeGraphChunkContextLimit);
+
+        INSERT OR IGNORE INTO context_kg_coverage
+            (context_id, chunk_id, captured_day, captured_ms)
+        SELECT c.id,
+               'legacy-day:' || kg.day,
+               c.captured_day,
+               c.captured_ms
+        FROM recorded_context c
+        JOIN context_kg kg ON kg.day = c.captured_day
+        WHERE kg.schema_version >= \(ContextKnowledgeGraphBuilder.schemaVersion)
+          AND kg.source_context_count <= \(knowledgeGraphChunkContextLimit)
+          AND c.captured_ms >= kg.source_start_ms
+          AND c.captured_ms <= kg.source_through_ms
+          AND c.id <= kg.source_max_context_id;
+
+        DELETE FROM context_kg
+        WHERE schema_version >= \(ContextKnowledgeGraphBuilder.schemaVersion)
+          AND EXISTS (
+              SELECT 1 FROM context_kg_chunk chunk
+              WHERE chunk.chunk_id = 'legacy-day:' || context_kg.day
+          );
         """, db: db)
 
         // Recorded user input (clicks/keys) and saved agents built from repeated
@@ -5010,6 +5171,9 @@ public actor CascadeStore {
         }
         if scalarValue(db, "SELECT count(*) FROM context_kg;") != scalarValue(db, "SELECT count(*) FROM context_kg_fts_docsize;") {
             try? execute("INSERT INTO context_kg_fts(context_kg_fts) VALUES('rebuild');", db: db)
+        }
+        if scalarValue(db, "SELECT count(*) FROM context_kg_chunk;") != scalarValue(db, "SELECT count(*) FROM context_kg_chunk_fts_docsize;") {
+            try? execute("INSERT INTO context_kg_chunk_fts(context_kg_chunk_fts) VALUES('rebuild');", db: db)
         }
     }
 

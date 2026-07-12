@@ -601,7 +601,9 @@ func recallProjectsOnlyObservedFactsInsideAContinuousSession() async throws {
     ])
 
     _ = try await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
-    let graph = try #require(try await store.knowledgeGraph(forDay: EventStoreLayout.utcDayKey(for: start)))
+    let graph = try #require((try await store.knowledgeGraphChunks(
+        forDay: EventStoreLayout.utcDayKey(for: start)
+    )).first)
     let session = try #require(graph.nodes.first { $0.type == .session })
     #expect(graph.nodes.filter { $0.type == .session }.count == 1)
     let outerNode = try #require(graph.nodes.first { $0.type == .window && $0.label == "Outer Unrelated Ledger" })

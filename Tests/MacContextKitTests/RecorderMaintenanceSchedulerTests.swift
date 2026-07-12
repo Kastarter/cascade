@@ -90,7 +90,7 @@ func testRunOnceCompactsBeforePruneAtFixedNow() async throws {
 
     let expiredDay = EventStoreLayout.utcDayKey(for: inserted[0].capturedAt)
     #expect(try await store.context(id: inserted[0].id) == nil)
-    #expect(try await store.knowledgeGraph(forDay: expiredDay) != nil)
+    #expect(!(try await store.knowledgeGraphChunks(forDay: expiredDay)).isEmpty)
     #expect(try await store.searchKnowledgeGraphs(matching: "historicindigo").map(\.graph.day).contains(expiredDay))
     #expect(!FileManager.default.fileExists(atPath: expiredPath))
 
