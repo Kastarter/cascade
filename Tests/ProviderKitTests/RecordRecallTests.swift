@@ -346,11 +346,35 @@ private func makePrunedKnowledgeGraphStore(
     return (store, capturedAt, EventStoreLayout.utcDayKey(for: capturedAt), context.id)
 }
 
+private func recallKGDirectory(_ name: String) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+}
+
+private func utcDate(_ value: String) throws -> Date {
+    try #require(ISO8601DateFormatter().date(from: value))
+}
+
+private func writeRecallFrame(named name: String, in directory: URL) throws -> URL {
+    let frame = directory.appendingPathComponent(name)
+    try Data("real frame \(name)".utf8).write(to: frame, options: .atomic)
+    return frame
+}
+
+private func pruneRecallRows(through cutoff: Date, store: CascadeStore) async throws {
+    let maxAge = max(1, Date().timeIntervalSince(cutoff))
+    _ = try await store.prune(maxAge: maxAge, maxTotalBytes: .max)
+}
+
 @Test
 func testSearchRecordFallsBackToKGAfterSourcePrune() async throws {
     let fixture = try await makePrunedKnowledgeGraphStore(token: "violetarchive")
+    let utc = try #require(TimeZone(secondsFromGMT: 0))
 
-    let output = await RecordRecall(store: fixture.store).perform(.search(query: "violetarchive"))
+    let output = await RecordRecall(store: fixture.store, presentationTimeZone: utc)
+        .perform(.search(query: "violetarchive"))
 
     #expect(output.contains("[KG \(fixture.day)]"))
     #expect(output.contains("Safari"))
@@ -368,9 +392,11 @@ func testTimeframeAndSessionsFallBackToKGAfterSourcePrune() async throws {
     let formatter = ISO8601DateFormatter()
     let start = formatter.string(from: fixture.capturedAt.addingTimeInterval(-60))
     let end = formatter.string(from: fixture.capturedAt.addingTimeInterval(600))
+    let utc = try #require(TimeZone(secondsFromGMT: 0))
+    let recall = RecordRecall(store: fixture.store, presentationTimeZone: utc)
 
-    let timeframe = await RecordRecall(store: fixture.store).perform(.timeframe(startISO: start, endISO: end))
-    let sessions = await RecordRecall(store: fixture.store).perform(.sessions(startISO: start, endISO: end))
+    let timeframe = await recall.perform(.timeframe(startISO: start, endISO: end))
+    let sessions = await recall.perform(.sessions(startISO: start, endISO: end))
 
     #expect(timeframe.contains("[KG \(fixture.day)]"))
     #expect(timeframe.contains("Safari"))
@@ -380,6 +406,151 @@ func testTimeframeAndSessionsFallBackToKGAfterSourcePrune() async throws {
     #expect(sessions.contains("Safari"))
     #expect(sessions.contains("contexts"))
     #expect(!sessions.contains("[#"))
+}
+
+@Test
+func recallMergesRawAndKGHistoryWithinTheSameUTCDay() async throws {
+    let directory = try recallKGDirectory("CascadeRecallKGMixedDay")
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let oldFrame = try writeRecallFrame(named: "morning.heic", in: directory)
+    let recentFrame = try writeRecallFrame(named: "afternoon.heic", in: directory)
+    let morning = try utcDate("2026-07-01T10:00:00Z")
+    let cutoff = try utcDate("2026-07-01T12:00:00Z")
+    let afternoon = try utcDate("2026-07-01T13:00:00Z")
+
+    let old = try await store.insert(RecordedContext(
+        capturedAt: morning,
+        source: .screen,
+        appName: "Safari",
+        bundleIdentifier: "com.apple.Safari",
+        windowTitle: "Morning Archive",
+        ocrText: "transitionmarker morning_kg_fact",
+        imagePath: oldFrame.path
+    ))
+    let recent = try await store.insert(RecordedContext(
+        capturedAt: afternoon,
+        source: .screen,
+        appName: "Xcode",
+        bundleIdentifier: "com.apple.dt.Xcode",
+        windowTitle: "Afternoon Live",
+        ocrText: "transitionmarker afternoon_raw_fact",
+        imagePath: recentFrame.path
+    ))
+
+    _ = try await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    try await pruneRecallRows(through: cutoff, store: store)
+
+    #expect(try await store.context(id: old.id) == nil)
+    #expect(try await store.context(id: recent.id) != nil)
+    #expect(!FileManager.default.fileExists(atPath: oldFrame.path))
+    #expect(FileManager.default.fileExists(atPath: recentFrame.path))
+
+    let utc = try #require(TimeZone(secondsFromGMT: 0))
+    let recall = RecordRecall(store: store, presentationTimeZone: utc)
+    let formatter = ISO8601DateFormatter()
+    let start = formatter.string(from: morning.addingTimeInterval(-60))
+    let end = formatter.string(from: afternoon.addingTimeInterval(60))
+    let search = await recall.perform(.search(query: "transitionmarker"))
+    let timeframe = await recall.perform(.timeframe(startISO: start, endISO: end))
+    let sessions = await recall.perform(.sessions(startISO: start, endISO: end))
+
+    #expect(search.contains("morning_kg_fact"))
+    #expect(search.contains("afternoon_raw_fact"))
+    #expect(search.contains("[KG 2026-07-01]"))
+    #expect(search.contains("[#\(recent.id)]"))
+    #expect(timeframe.contains("morning_kg_fact"))
+    #expect(timeframe.contains("afternoon_raw_fact"))
+    #expect(timeframe.contains("[KG 2026-07-01]"))
+    #expect(timeframe.contains("[#\(recent.id)]"))
+    #expect(sessions.contains("Morning Archive"))
+    #expect(sessions.contains("Afternoon Live"))
+    #expect(sessions.contains("[KG 2026-07-01]"))
+    #expect(sessions.contains("[#\(recent.id)]"))
+}
+
+@Test
+func recallProjectsKGFactsToTheRequestedTimeframe() async throws {
+    let directory = try recallKGDirectory("CascadeRecallKGProjection")
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let morningFrame = try writeRecallFrame(named: "morning.heic", in: directory)
+    let eveningFrame = try writeRecallFrame(named: "evening.heic", in: directory)
+    let morning = try utcDate("2026-06-30T09:00:00Z")
+    let evening = try utcDate("2026-06-30T18:00:00Z")
+    let cutoff = try utcDate("2026-06-30T19:00:00Z")
+
+    _ = try await store.insert(RecordedContext(
+        capturedAt: morning,
+        source: .screen,
+        appName: "Safari",
+        bundleIdentifier: "com.apple.Safari",
+        windowTitle: "Morning In Scope",
+        ocrText: "morning_scope_fact review the launch brief",
+        imagePath: morningFrame.path
+    ))
+    _ = try await store.insert(RecordedContext(
+        capturedAt: evening,
+        source: .screen,
+        appName: "Xcode",
+        bundleIdentifier: "com.apple.dt.Xcode",
+        windowTitle: "Evening Outside Scope",
+        ocrText: "evening_scope_fact debug the unrelated build",
+        imagePath: eveningFrame.path
+    ))
+
+    _ = try await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    try await pruneRecallRows(through: cutoff, store: store)
+
+    let utc = try #require(TimeZone(secondsFromGMT: 0))
+    let recall = RecordRecall(store: store, presentationTimeZone: utc)
+    let formatter = ISO8601DateFormatter()
+    let start = formatter.string(from: morning.addingTimeInterval(-60))
+    let end = formatter.string(from: morning.addingTimeInterval(120))
+    let timeframe = await recall.perform(.timeframe(startISO: start, endISO: end))
+    let sessions = await recall.perform(.sessions(startISO: start, endISO: end))
+
+    #expect(timeframe.contains("Safari"))
+    #expect(timeframe.contains("Morning In Scope"))
+    #expect(timeframe.contains("morning_scope_fact"))
+    #expect(!timeframe.contains("Xcode"))
+    #expect(!timeframe.contains("Evening Outside Scope"))
+    #expect(!timeframe.contains("evening_scope_fact"))
+    #expect(sessions.contains("Morning In Scope"))
+    #expect(!sessions.contains("Evening Outside Scope"))
+}
+
+@Test
+func recallKeepsLocalTimeAndCalendarDayAfterKGFallback() async throws {
+    let directory = try recallKGDirectory("CascadeRecallKGTimeZone")
+    let store = try CascadeStore(path: directory.appendingPathComponent("cascade.sqlite").path)
+    let frame = try writeRecallFrame(named: "clock.heic", in: directory)
+    let capturedAt = try utcDate("2026-07-02T02:13:00Z")
+    let cutoff = try utcDate("2026-07-02T03:00:00Z")
+    let context = try await store.insert(RecordedContext(
+        capturedAt: capturedAt,
+        source: .screen,
+        appName: "Notes",
+        bundleIdentifier: "com.apple.Notes",
+        windowTitle: "Clock Stable",
+        ocrText: "clockstablemarker local presentation time",
+        imagePath: frame.path
+    ))
+    let toronto = try #require(TimeZone(identifier: "America/Toronto"))
+    let recall = RecordRecall(store: store, presentationTimeZone: toronto)
+
+    let raw = await recall.perform(.search(query: "clockstablemarker"))
+    #expect(raw.contains("22:13"))
+    #expect(raw.contains("[#\(context.id)]"))
+
+    _ = try await store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    try await pruneRecallRows(through: cutoff, store: store)
+    let compacted = await recall.perform(.search(query: "clockstablemarker"))
+
+    #expect(try await store.context(id: context.id) == nil)
+    #expect(!FileManager.default.fileExists(atPath: frame.path))
+    #expect(compacted.contains("[KG 2026-07-01]"))
+    #expect(compacted.contains("22:13"))
+    #expect(!compacted.contains("02:13"))
+    #expect(!compacted.contains("[#\(context.id)]"))
 }
 
 private func observationEnvelope(from rendered: String) throws -> ObservationEnvelope {
