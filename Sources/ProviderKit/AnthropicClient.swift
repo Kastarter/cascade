@@ -552,6 +552,56 @@ public protocol MessageCompleting: Sendable {
     func complete(system: String?, user: String, model: String, maxTokens: Int, options: AnthropicCompletionOptions) async throws -> String
 }
 
+/// A single user-message content block for model calls that need visual evidence.
+/// Keeping this separate from `MessageCompleting` preserves every existing text-only
+/// fake while allowing the teach-once curator to pass bounded screenshots through the
+/// same Anthropic request/retry/idempotency path.
+public enum MessageInputBlock: Sendable, Equatable {
+    case text(String)
+    case image(mediaType: String, data: Data)
+
+    fileprivate var dictionary: [String: Any] {
+        switch self {
+        case .text(let text):
+            return ["type": "text", "text": text]
+        case .image(let mediaType, let data):
+            return [
+                "type": "image",
+                "source": [
+                    "type": "base64",
+                    "media_type": mediaType,
+                    "data": data.base64EncodedString(),
+                ],
+            ]
+        }
+    }
+
+    fileprivate var textFallback: String {
+        switch self {
+        case .text(let text): text
+        case .image: "[visual keyframe omitted by text-only model client]"
+        }
+    }
+}
+
+public enum MessageInputBlockError: Error, Equatable, Sendable {
+    case emptyContent
+    case unsupportedMediaType(String)
+    case emptyImage
+    case imageTooLarge(Int)
+    case totalImagesTooLarge(Int)
+}
+
+public protocol MultimodalMessageCompleting: Sendable {
+    func complete(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> String
+}
+
 public struct MessageCompletionResult: Sendable, Equatable {
     public let text: String
     public let usage: ModelUsage?
@@ -602,7 +652,7 @@ public extension MessageCompleting {
     }
 }
 
-public struct RetryingMessageCompleter: MessageCompleting {
+public struct RetryingMessageCompleter: MessageCompleting, MultimodalMessageCompleting {
     private let client: any MessageCompleting
     private let retryPolicy: RetryBackoffPolicy
 
@@ -698,6 +748,72 @@ public struct RetryingMessageCompleter: MessageCompleting {
         }
     }
 
+    public func complete(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> String {
+        let optionsWithRetry = options.withRetryPolicy(options.retryPolicy ?? retryPolicy)
+        guard let multimodal = client as? any MultimodalMessageCompleting else {
+            // Route through this wrapper's normal text path so a legacy client keeps
+            // the same configured outer retry semantics after images are omitted.
+            return try await complete(
+                system: system,
+                user: content.map(\.textFallback).joined(separator: "\n"),
+                model: model,
+                maxTokens: maxTokens,
+                options: optionsWithRetry
+            )
+        }
+        // AnthropicClient performs the same policy-backed retry loop internally and
+        // records attempts against the canonical multimodal request hash.
+        if client is AnthropicClient {
+            return try await multimodal.complete(
+                system: system,
+                content: content,
+                model: model,
+                maxTokens: maxTokens,
+                options: optionsWithRetry
+            )
+        }
+
+        let key = try Self.idempotencyKey(
+            system: system,
+            content: content,
+            model: model,
+            maxTokens: maxTokens,
+            options: optionsWithRetry
+        )
+        var retryCount = 0
+        while true {
+            do {
+                return try await multimodal.complete(
+                    system: system,
+                    content: content,
+                    model: model,
+                    maxTokens: maxTokens,
+                    options: optionsWithRetry
+                )
+            } catch {
+                let classification = RetryErrorClassifier.classify(error)
+                guard let delay = retryPolicy.delay(
+                    afterRetryCount: retryCount,
+                    retryClass: key.retryClass,
+                    classification: classification,
+                    key: key
+                ) else {
+                    throw error
+                }
+                retryCount += 1
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: Self.nanoseconds(for: delay))
+                }
+            }
+        }
+    }
+
     private static func idempotencyKey(
         system: String?,
         user: String,
@@ -723,6 +839,32 @@ public struct RetryingMessageCompleter: MessageCompleting {
         )
     }
 
+    private static func idempotencyKey(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) throws -> ActionIdempotencyKey {
+        let body = try AnthropicClient.completionBodyData(
+            system: system,
+            content: content,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        )
+        let payload = try JSONSerialization.jsonObject(with: body, options: [])
+        return try ActionIdempotencyKey(
+            retryClass: options.idempotencyClass,
+            operation: options.callsite,
+            model: model,
+            prompt: options.promptVersion,
+            schema: options.schemaVersion,
+            payload: payload,
+            privateTextPolicy: .hash
+        )
+    }
+
     private static func nanoseconds(for delay: TimeInterval) -> UInt64 {
         let maxSeconds = Double(UInt64.max) / 1_000_000_000
         return UInt64((min(delay, maxSeconds) * 1_000_000_000).rounded())
@@ -731,7 +873,7 @@ public struct RetryingMessageCompleter: MessageCompleting {
 
 /// BYOK Anthropic Messages API client over `URLSession`. The key is read from the
 /// macOS Keychain at call time, never cached in the struct.
-public struct AnthropicClient: MessageCompleting {
+public struct AnthropicClient: MessageCompleting, MultimodalMessageCompleting {
     private let keyStore: AnthropicKeyStore
     private let session: URLSession
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
@@ -776,6 +918,39 @@ public struct AnthropicClient: MessageCompleting {
         options: AnthropicCompletionOptions
     ) async throws -> MessageCompletionResult {
         let messages = [AnthropicMessageRequestBody.Message(role: "user", content: user).dictionary]
+        return try await completeWithMetadata(
+            system: system,
+            messages: messages,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        )
+    }
+
+    public func complete(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> String {
+        let messages = try Self.multimodalMessages(content)
+        return try await completeWithMetadata(
+            system: system,
+            messages: messages,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        ).text
+    }
+
+    private func completeWithMetadata(
+        system: String?,
+        messages: [[String: Any]],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> MessageCompletionResult {
         let bodyData = try AnthropicMessagesClient.bodyData(
             model: model,
             maxTokens: maxTokens,
@@ -830,6 +1005,51 @@ public struct AnthropicClient: MessageCompleting {
             messages: [AnthropicMessageRequestBody.Message(role: "user", content: user).dictionary],
             temperature: options.temperature
         )
+    }
+
+    static func completionBodyData(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) throws -> Data {
+        try AnthropicMessagesClient.bodyData(
+            model: model,
+            maxTokens: maxTokens,
+            system: system,
+            messages: try multimodalMessages(content),
+            temperature: options.temperature,
+            stream: false
+        )
+    }
+
+    private static let supportedImageMediaTypes: Set<String> = [
+        "image/jpeg", "image/png", "image/gif", "image/webp"
+    ]
+    // Base64 expands by roughly 4/3. These raw-byte limits stay below Anthropic's
+    // per-image and whole-request encoded limits before any base64 strings allocate.
+    private static let maxRawImageBytes = 7_500_000
+    private static let maxTotalRawImageBytes = 24_000_000
+
+    private static func multimodalMessages(_ content: [MessageInputBlock]) throws -> [[String: Any]] {
+        guard !content.isEmpty else { throw MessageInputBlockError.emptyContent }
+        var totalImageBytes = 0
+        for block in content {
+            guard case .image(let mediaType, let data) = block else { continue }
+            guard supportedImageMediaTypes.contains(mediaType) else {
+                throw MessageInputBlockError.unsupportedMediaType(mediaType)
+            }
+            guard !data.isEmpty else { throw MessageInputBlockError.emptyImage }
+            guard data.count <= maxRawImageBytes else {
+                throw MessageInputBlockError.imageTooLarge(data.count)
+            }
+            guard totalImageBytes <= maxTotalRawImageBytes - data.count else {
+                throw MessageInputBlockError.totalImagesTooLarge(totalImageBytes + data.count)
+            }
+            totalImageBytes += data.count
+        }
+        return [["role": "user", "content": content.map(\.dictionary)]]
     }
 
     private struct ResponseBody: Decodable {

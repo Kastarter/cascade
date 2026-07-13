@@ -1,6 +1,7 @@
 import CascadeMemory
 import ComputerUseKit
 import Foundation
+import ImageIO
 import ProviderKit
 import WasteDetection
 
@@ -868,22 +869,47 @@ public actor CascadeOrchestrator {
         from start: Date,
         to end: Date,
         statedIntent: String? = nil,
-        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil
+        webAppIdentity: (@Sendable (InputEvent) -> String?)? = nil,
+        includeTeachEvidence: Bool = false
     ) async throws -> CuratedAgent? {
-        let events = try await store.inputEvents(between: start, and: end)
+        let events = try await store.inputEvents(
+            between: start,
+            and: end,
+            limit: includeTeachEvidence ? Int(Int32.max) : 2_000
+        )
         // A Teach-once demonstration records densely (0.5s burst), so a single
         // bounded oldest-first fetch would truncate a long demo to its opening
         // minutes — losing the ending, which is the outcome. Slice the bracket so
         // every quarter of the demo stays represented whatever its length.
-        let contexts = try await bracketContexts(from: start, to: end)
+        let contexts = try await bracketContexts(
+            from: start,
+            to: end,
+            includeTerminalContext: includeTeachEvidence
+        )
         guard let waste = wasteDetector.waste(fromInstance: events, contexts: contexts, surface: webAppIdentity) else {
             return nil
         }
-        // Evidence for the curator comes from the WHOLE demonstration, sampled
-        // evenly — not just the first seconds — so the goal reflects the full
-        // concept of what the user showed, start to finish.
-        let onScreen = Self.onScreenText(sampledAcross: contexts, snippetLimit: 5, budget: 900)
-        return await curator.curateOne(waste, statedIntent: statedIntent, onScreen: onScreen)
+        guard includeTeachEvidence else {
+            let onScreen = Self.onScreenText(sampledAcross: contexts, snippetLimit: 5, budget: 900)
+            return await curator.curateOne(waste, statedIntent: statedIntent, onScreen: onScreen)
+        }
+        // This packet is deliberately transient: it enriches this one curation call,
+        // while approval still persists only the generalized recipe/name/goal through
+        // `createAgent(from:)`. Automatic batch curation never enters this path.
+        let evidence = Self.teachDemonstrationEvidence(
+            from: start,
+            to: end,
+            events: events,
+            contexts: contexts,
+            recipe: waste.recipe
+        )
+        let onScreen = Self.teachOnScreenSummary(from: evidence.ocrTimeline, budget: 900)
+        return await curator.curateOne(
+            waste,
+            statedIntent: statedIntent,
+            onScreen: onScreen,
+            evidence: evidence
+        )
     }
 
     /// The detector's candidates, judged and named by the curator into the few
@@ -971,7 +997,8 @@ public actor CascadeOrchestrator {
         from start: Date,
         to end: Date,
         slices: Int = 4,
-        budget: Int = 600
+        budget: Int = 600,
+        includeTerminalContext: Bool = false
     ) async throws -> [RecordedContext] {
         let span = end.timeIntervalSince(start)
         guard span > 0, slices > 1 else {
@@ -988,7 +1015,17 @@ public actor CascadeOrchestrator {
                 moments.append(row)
             }
         }
-        return moments
+        if includeTerminalContext,
+           let terminalSummary = try await store.contexts(
+               from: start,
+               to: end.addingTimeInterval(0.001),
+               limit: 1
+           ).first,
+           let terminal = try await store.context(id: terminalSummary.id),
+           seen.insert(terminal.id).inserted {
+            moments.append(terminal)
+        }
+        return moments.sorted(by: Self.contextChronology)
     }
 
     /// The shared snippet builder behind both evidence paths: privacy-filtered OCR
@@ -1030,6 +1067,328 @@ public actor CascadeOrchestrator {
         guard items.count > limit else { return items }
         guard limit > 1 else { return [items[items.count / 2]] }
         return (0..<limit).map { items[($0 * (items.count - 1)) / (limit - 1)] }
+    }
+
+    // MARK: - Teach-once transient evidence
+
+    static let teachKeyFrameLimit = 4
+    static let teachKeyFrameByteLimit = 2_000_000
+    static let teachKeyFrameDimensionLimit = 4_096
+    static let teachOCRObservationLimit = 12
+
+    /// Builds exactly one ephemeral evidence packet for a deliberate Teach-once
+    /// bracket. The action list is the complete generalized recipe (not sampled),
+    /// while OCR and pixels are bounded observations spread over the bracket.
+    nonisolated static func teachDemonstrationEvidence(
+        from start: Date,
+        to end: Date,
+        events: [InputEvent],
+        contexts: [RecordedContext],
+        recipe: AgentRecipe
+    ) -> TeachDemonstrationEvidence {
+        TeachDemonstrationEvidence(
+            durationSeconds: boundedElapsedSeconds(from: start, to: end),
+            inputEventCount: events.count,
+            recordedContextCount: contexts.count,
+            actionTimeline: generalizedActionTimeline(for: recipe.steps),
+            ocrTimeline: teachOCRTimeline(
+                from: contexts,
+                bracketStart: start,
+                limit: teachOCRObservationLimit
+            ),
+            keyFrames: teachKeyFrames(
+                from: contexts,
+                bracketStart: start,
+                limit: teachKeyFrameLimit,
+                maxBytesPerFrame: teachKeyFrameByteLimit
+            )
+        )
+    }
+
+    /// Every recipe action, in stable recorded order. Typed and pasted values are
+    /// described by role only; their recorded literals are never interpolated.
+    nonisolated static func generalizedActionTimeline(for steps: [RecipeStep]) -> [String] {
+        steps.enumerated()
+            .sorted { lhs, rhs in
+                lhs.element.order == rhs.element.order
+                    ? lhs.offset < rhs.offset
+                    : lhs.element.order < rhs.element.order
+            }
+            .map { generalizedAction($0.element) }
+    }
+
+    /// Chronological, endpoint-preserving OCR observations. A sensitive moment is
+    /// dropped under `PrivacyRules`; every surviving observation is PII-redacted
+    /// before it can enter a provider prompt.
+    nonisolated static func teachOCRTimeline(
+        from contexts: [RecordedContext],
+        bracketStart: Date,
+        limit: Int = teachOCRObservationLimit
+    ) -> [String] {
+        let observations = contexts
+            .sorted(by: contextChronology)
+            .compactMap { context -> (RecordedContext, String)? in
+                guard context.safeToSummarize,
+                      !PrivacyRules.isSensitive(context),
+                      let raw = context.ocrText,
+                      let redacted = safeObservationText(raw, limit: 220)
+                else { return nil }
+                return (context, redacted)
+            }
+
+        return sampleEvenly(observations, limit: limit).map { context, text in
+            let elapsed = boundedElapsedSeconds(from: bracketStart, to: context.capturedAt)
+            let app = safeObservationText(context.appName, limit: 48) ?? "observed app"
+            let window = context.windowTitle.flatMap { safeObservationText($0, limit: 72) }
+            let surface = window.map { "\(app) — \($0)" } ?? app
+            return "+\(elapsed)s [\(surface)] \(text)"
+        }
+    }
+
+    /// A compatibility summary for the pre-existing `on screen` prompt field. It is
+    /// derived only from the already-redacted timeline and preserves both ends when
+    /// the character budget is smaller than the joined evidence.
+    nonisolated static func teachOnScreenSummary(from timeline: [String], budget: Int) -> String? {
+        guard budget > 0, !timeline.isEmpty else { return nil }
+        let joined = timeline.joined(separator: " ⋯ ")
+        guard joined.count > budget, budget >= 9 else { return String(joined.prefix(budget)) }
+        let separator = " ⋯ "
+        let remaining = budget - separator.count
+        let openingCount = remaining / 2
+        let outcomeCount = remaining - openingCount
+        return String(joined.prefix(openingCount)) + separator + String(joined.suffix(outcomeCount))
+    }
+
+    /// Up to four evenly spaced, verified image files. Unsafe contexts, paths that
+    /// do not resolve to readable regular files, unsupported/corrupt images, detected
+    /// PII, oversized payloads, and decompression-sized frames are skipped. Nearest
+    /// viable neighbours backfill an unreadable target so beginning/outcome coverage
+    /// survives whenever a safe frame exists there.
+    nonisolated static func teachKeyFrames(
+        from contexts: [RecordedContext],
+        bracketStart: Date,
+        limit: Int = teachKeyFrameLimit,
+        maxBytesPerFrame: Int = teachKeyFrameByteLimit
+    ) -> [TeachDemonstrationKeyFrame] {
+        guard limit > 0, maxBytesPerFrame > 0 else { return [] }
+        let candidates = contexts
+            .sorted(by: contextChronology)
+            .compactMap { imageCandidate(for: $0, maxBytes: maxBytesPerFrame) }
+        guard !candidates.isEmpty else { return [] }
+
+        let targets = sampleEvenly(Array(candidates.indices), limit: min(limit, candidates.count))
+        var used = Set<Int>()
+        var unavailable = Set<Int>()
+        var loaded: [(index: Int, frame: TeachDemonstrationKeyFrame)] = []
+
+        for target in targets {
+            let nearest = candidates.indices.sorted { lhs, rhs in
+                let leftDistance = abs(lhs - target)
+                let rightDistance = abs(rhs - target)
+                return leftDistance == rightDistance ? lhs < rhs : leftDistance < rightDistance
+            }
+            for index in nearest where !used.contains(index) && !unavailable.contains(index) {
+                guard let frame = loadKeyFrame(candidates[index], bracketStart: bracketStart) else {
+                    unavailable.insert(index)
+                    continue
+                }
+                used.insert(index)
+                loaded.append((index, frame))
+                break
+            }
+        }
+
+        return loaded.sorted { $0.index < $1.index }.map(\.frame)
+    }
+
+    private struct TeachImageCandidate {
+        let context: RecordedContext
+        let path: String
+        let mediaType: String
+    }
+
+    private nonisolated static func imageCandidate(
+        for context: RecordedContext,
+        maxBytes: Int
+    ) -> TeachImageCandidate? {
+        guard context.safeToShow,
+              context.safeToSummarize,
+              !PrivacyRules.isSensitive(context),
+              !containsPII(context.appName),
+              !containsPII(context.windowTitle),
+              !containsPII(context.ocrText),
+              let path = context.imagePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty,
+              !PrivacyRules.isSensitiveText(path),
+              let mediaType = supportedMediaType(for: path)
+        else { return nil }
+
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: path), manager.isReadableFile(atPath: path),
+              let attributes = try? manager.attributesOfItem(atPath: path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let byteCount = (attributes[.size] as? NSNumber)?.intValue,
+              byteCount > 0,
+              byteCount <= maxBytes
+        else { return nil }
+
+        return TeachImageCandidate(context: context, path: path, mediaType: mediaType)
+    }
+
+    private nonisolated static func loadKeyFrame(
+        _ candidate: TeachImageCandidate,
+        bracketStart: Date
+    ) -> TeachDemonstrationKeyFrame? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: candidate.path), options: [.mappedIfSafe]),
+              !data.isEmpty,
+              data.count <= teachKeyFrameByteLimit,
+              imageMagicMatches(data, mediaType: candidate.mediaType),
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0,
+              height > 0,
+              width <= teachKeyFrameDimensionLimit,
+              height <= teachKeyFrameDimensionLimit,
+              width * height <= teachKeyFrameDimensionLimit * teachKeyFrameDimensionLimit,
+              CGImageSourceCreateImageAtIndex(source, 0, nil) != nil
+        else { return nil }
+
+        let context = candidate.context
+        return TeachDemonstrationKeyFrame(
+            elapsedSeconds: boundedElapsedSeconds(from: bracketStart, to: context.capturedAt),
+            appName: safeObservationText(context.appName, limit: 48) ?? "observed app",
+            windowTitle: context.windowTitle.flatMap { safeObservationText($0, limit: 72) },
+            mediaType: candidate.mediaType,
+            imageData: data
+        )
+    }
+
+    private nonisolated static func generalizedAction(_ step: RecipeStep) -> String {
+        let app = safeObservationText(step.surface ?? step.appName, limit: 48) ?? "the current app"
+        switch step.kind {
+        case .activateApp:
+            return "Switch to \(app)"
+        case .click, .doubleClick, .rightClick:
+            let verb: String
+            switch step.kind {
+            case .doubleClick: verb = "Double-click"
+            case .rightClick: verb = "Right-click"
+            default: verb = "Click"
+            }
+            if step.isParameter {
+                let role = generalizedParameterRole(step)
+                return "\(verb) the current \(role) target in \(app)"
+            }
+            let target = step.ocrAnchor.flatMap { safeObservationText($0, limit: 64) }
+                ?? step.targetDescriptor.flatMap { safeObservationText($0, limit: 64) }
+            return target.map { "\(verb) \($0) in \(app)" } ?? "\(verb) the demonstrated control in \(app)"
+        case .type:
+            return step.isParameter
+                ? "Enter the current \(generalizedParameterRole(step)) value in \(app)"
+                : "Enter the demonstrated text role in \(app) (literal omitted)"
+        case .key:
+            if isShortcut(step, key: "c") { return "Copy the selected current value in \(app)" }
+            if isShortcut(step, key: "v") { return "Paste the current copied value in \(app)" }
+            return "Press \(generalizedShortcut(step)) in \(app)"
+        case .scroll:
+            return "Scroll in \(app)"
+        }
+    }
+
+    private nonisolated static func generalizedParameterRole(_ step: RecipeStep) -> String {
+        switch step.parameterKind {
+        case .freeText: return "free-text"
+        case .filePath: return "file-path"
+        case .personName: return "person-name"
+        case .some(let kind): return kind.rawValue.lowercased()
+        case nil: return "run-specific"
+        }
+    }
+
+    private nonisolated static func isShortcut(_ step: RecipeStep, key: String) -> Bool {
+        guard step.key?.lowercased() == key else { return false }
+        let modifiers = Set(step.modifiers.map { $0.lowercased() })
+        return !modifiers.isDisjoint(with: ["command", "cmd", "control", "ctrl"])
+    }
+
+    private nonisolated static func generalizedShortcut(_ step: RecipeStep) -> String {
+        let modifiers = step.modifiers.compactMap { modifier -> String? in
+            switch modifier.lowercased() {
+            case "command", "cmd": return "Command"
+            case "control", "ctrl": return "Control"
+            case "option", "alt": return "Option"
+            case "shift": return "Shift"
+            case "fn", "function": return "Function"
+            default: return nil
+            }
+        }
+        let rawKey = step.key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "key"
+        let key = rawKey.count <= 24 &&
+                   rawKey.rangeOfCharacter(from: .alphanumerics) != nil
+            ? rawKey
+            : "key"
+        return (modifiers + [key]).joined(separator: "+")
+    }
+
+    private nonisolated static func safeObservationText(_ raw: String, limit: Int) -> String? {
+        guard limit > 0 else { return nil }
+        let collapsed = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty, !PrivacyRules.isSensitiveText(collapsed) else { return nil }
+        let piiRedacted = PIIDetector.redact(
+            collapsed,
+            includeNames: true,
+            highConfidenceOnly: false
+        ).redacted
+        let keywordRedacted = PrivacyRules.redactingSensitiveKeywords(in: piiRedacted)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !keywordRedacted.isEmpty else { return nil }
+        return String(keywordRedacted.prefix(limit))
+    }
+
+    private nonisolated static func containsPII(_ text: String?) -> Bool {
+        guard let text, !text.isEmpty else { return false }
+        return !PIIDetector.findings(in: text, includeNames: true).isEmpty
+    }
+
+    private nonisolated static func supportedMediaType(for path: String) -> String? {
+        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        default: return nil
+        }
+    }
+
+    private nonisolated static func imageMagicMatches(_ data: Data, mediaType: String) -> Bool {
+        switch mediaType {
+        case "image/jpeg":
+            return data.count >= 3 && data.starts(with: [0xff, 0xd8, 0xff])
+        case "image/png":
+            return data.count >= 8 && data.starts(with: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        case "image/gif":
+            return data.count >= 6 && (data.starts(with: Data("GIF87a".utf8)) || data.starts(with: Data("GIF89a".utf8)))
+        case "image/webp":
+            return data.count >= 12
+                && data.prefix(4) == Data("RIFF".utf8)
+                && data.dropFirst(8).prefix(4) == Data("WEBP".utf8)
+        default:
+            return false
+        }
+    }
+
+    private nonisolated static func contextChronology(_ lhs: RecordedContext, _ rhs: RecordedContext) -> Bool {
+        lhs.capturedAt == rhs.capturedAt ? lhs.id < rhs.id : lhs.capturedAt < rhs.capturedAt
+    }
+
+    private nonisolated static func boundedElapsedSeconds(from start: Date, to end: Date) -> Int {
+        let seconds = end.timeIntervalSince(start)
+        guard seconds.isFinite, seconds > 0 else { return 0 }
+        return Int(min(seconds.rounded(), Double(Int.max)))
     }
 
     /// Persists an agent from a curated proposal — the recorded recipe drives

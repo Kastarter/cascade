@@ -7556,7 +7556,8 @@ public final class CascadeAppModel: ObservableObject {
             from: session.start,
             to: session.bracketEnd,
             statedIntent: statedIntent,
-            webAppIdentity: Self.webAppIdentity
+            webAppIdentity: Self.webAppIdentity,
+            includeTeachEvidence: true
         )
     }
 

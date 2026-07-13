@@ -432,4 +432,40 @@ public struct ValidatingCachedMessageCompleter: Sendable {
         }
         return payload.text
     }
+
+    /// Multimodal counterpart used by Teach-once curation. The cache key includes
+    /// block order, labels, media types, and image bytes, while the persisted cache
+    /// record stores only request hashes plus the validated text response.
+    public func complete(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions,
+        validating validate: @Sendable @escaping (String) throws -> Void = { _ in }
+    ) async throws -> String {
+        guard let multimodal = client as? any MultimodalMessageCompleting else {
+            throw CachedMessageCompleterError.invalidResponse
+        }
+        let body = try AnthropicClient.completionBodyData(
+            system: system,
+            content: content,
+            model: model,
+            maxTokens: maxTokens,
+            options: options
+        )
+        let request = try options.cacheRequest(model: model, maxTokens: maxTokens, body: body)
+        let payload = try await cache.value(for: request, as: CachedCompletion.self, policy: options.cachePolicy) {
+            let text = try await multimodal.complete(
+                system: system,
+                content: content,
+                model: model,
+                maxTokens: maxTokens,
+                options: options
+            )
+            try validate(text)
+            return CachedCompletion(text: text)
+        }
+        return payload.text
+    }
 }

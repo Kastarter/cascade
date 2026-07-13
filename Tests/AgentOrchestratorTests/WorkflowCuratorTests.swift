@@ -1,5 +1,7 @@
 import CascadeMemory
+import CoreGraphics
 import Foundation
+import ImageIO
 import ProviderKit
 import WasteDetection
 import Testing
@@ -69,6 +71,69 @@ private struct CapturingCompleter: MessageCompleting {
         await capture.record(user)
         return canned
     }
+}
+
+private actor MultimodalCapture {
+    private(set) var textCalls = 0
+    private(set) var multimodalCalls = 0
+    private(set) var content: [MessageInputBlock] = []
+
+    func recordTextCall() { textCalls += 1 }
+
+    func recordMultimodalCall(_ content: [MessageInputBlock]) {
+        multimodalCalls += 1
+        self.content = content
+    }
+
+    func snapshot() -> (textCalls: Int, multimodalCalls: Int, content: [MessageInputBlock]) {
+        (textCalls, multimodalCalls, content)
+    }
+}
+
+private struct CapturingMultimodalCompleter: MessageCompleting, MultimodalMessageCompleting {
+    let canned: String
+    let capture: MultimodalCapture
+
+    func complete(system: String?, user: String, model: String, maxTokens: Int) async throws -> String {
+        await capture.recordTextCall()
+        return canned
+    }
+
+    func complete(
+        system: String?,
+        content: [MessageInputBlock],
+        model: String,
+        maxTokens: Int,
+        options: AnthropicCompletionOptions
+    ) async throws -> String {
+        await capture.recordMultimodalCall(content)
+        return canned
+    }
+}
+
+private func makeTestPNG() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CascadeTeachFrame-\(UUID().uuidString).png")
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+    guard let context = CGContext(
+        data: nil,
+        width: 2,
+        height: 2,
+        bitsPerComponent: 8,
+        bytesPerRow: 8,
+        space: colorSpace,
+        bitmapInfo: bitmapInfo
+    ), let image = context.makeImage(),
+       let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil)
+    else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    return url
 }
 
 private func waste(
@@ -488,6 +553,92 @@ func curateOnePassesSpokenIntentToThePrompt() async {
 }
 
 @Test
+func curateOneUsesNarrationActionsOCRAndVisualKeyframesTogether() async {
+    let capture = MultimodalCapture()
+    let canned = #"{"agents":[{"index":0,"name":"Update the weekly report","why":"It removes a repeated handoff.","goal":"Update the weekly report with the current pipeline totals.","value":0.9}]}"#
+    let evidence = TeachDemonstrationEvidence(
+        durationSeconds: 42,
+        inputEventCount: 17,
+        recordedContextCount: 60,
+        actionTimeline: ["Switch to Mail", "Copy the selected current value in Mail", "Paste the current copied value in Numbers"],
+        ocrTimeline: ["+0s [Mail] Weekly pipeline email", "+42s [Numbers] Report updated"],
+        keyFrames: [TeachDemonstrationKeyFrame(
+            elapsedSeconds: 42,
+            appName: "Numbers",
+            mediaType: "image/png",
+            imageData: Data([0x89, 0x50, 0x4E, 0x47])
+        )]
+    )
+
+    let result = await WorkflowCurator(
+        client: CapturingMultimodalCompleter(canned: canned, capture: capture)
+    ).curateOne(
+        taughtWaste(),
+        statedIntent: "I am updating the weekly report with the current pipeline totals",
+        evidence: evidence
+    )
+
+    let snapshot = await capture.snapshot()
+    let text = snapshot.content.compactMap { block -> String? in
+        guard case .text(let value) = block else { return nil }
+        return value
+    }.joined(separator: "\n")
+    let imageCount = snapshot.content.reduce(into: 0) { count, block in
+        if case .image = block { count += 1 }
+    }
+    #expect(snapshot.multimodalCalls == 1)
+    #expect(snapshot.textCalls == 0)
+    #expect(imageCount == 1)
+    #expect(text.contains("COMPLETE USER NARRATION"))
+    #expect(text.contains("updating the weekly report"))
+    #expect(text.contains("Copy the selected current value"))
+    #expect(text.contains("Report updated"))
+    #expect(result.name == "Update the weekly report")
+}
+
+@Test
+func curateOneRedactsSensitiveModelOutputBeforePersistence() async {
+    let email = "alex@example.com"
+    let apiKey = "sk-ant-abcdefghijklmnopqrstuvwxyz123456"
+    let canned = """
+    {"agents":[{"index":0,"name":"Email \(email)","why":"Use \(apiKey)","goal":"Send the report to \(email) using \(apiKey).","value":0.8}]}
+    """
+
+    let result = await WorkflowCurator(client: FakeCompleter(canned: canned)).curateOne(taughtWaste())
+    let persistedText = [result.name, result.why, result.goal].joined(separator: " ")
+    #expect(!persistedText.contains(email))
+    #expect(!persistedText.contains(apiKey))
+    #expect(persistedText.contains("<EMAIL>"))
+    #expect(persistedText.contains("<API_KEY>"))
+}
+
+@Test
+func generalizedActionTimelineKeepsEveryActionInOrderWithoutLiterals() {
+    let secret = "alex@example.com INV-4821"
+    let steps = [
+        RecipeStep(order: 0, kind: .activateApp, appName: "Mail"),
+        RecipeStep(order: 1, kind: .click, appName: "Mail", ocrAnchor: "Inbox"),
+        RecipeStep(order: 2, kind: .type, text: secret, appName: "Mail"),
+        RecipeStep(order: 3, kind: .scroll, appName: "Mail"),
+        RecipeStep(order: 4, kind: .key, key: "c", modifiers: ["command"], appName: "Mail"),
+        RecipeStep(order: 5, kind: .activateApp, appName: "Numbers"),
+        RecipeStep(order: 6, kind: .click, appName: "Numbers", ocrAnchor: "Totals"),
+        RecipeStep(order: 7, kind: .key, key: "v", modifiers: ["command"], appName: "Numbers"),
+        RecipeStep(order: 8, kind: .key, key: "Return", appName: "Numbers"),
+        RecipeStep(order: 9, kind: .click, appName: "Numbers", ocrAnchor: "Done"),
+    ]
+
+    let timeline = CascadeOrchestrator.generalizedActionTimeline(for: steps)
+    #expect(timeline.count == steps.count)
+    #expect(timeline.first == "Switch to Mail")
+    #expect(timeline.last?.contains("Done") == true)
+    #expect(timeline.contains { $0.contains("Scroll") })
+    #expect(timeline.contains { $0.contains("Copy the selected current value") })
+    #expect(timeline.contains { $0.contains("Paste the current copied value") })
+    #expect(!timeline.joined(separator: " ").contains(secret))
+}
+
+@Test
 func curateOneAlwaysReturnsAnAgentEvenWhenTheModelFails() async {
     // A deliberate demonstration is something the user WANTS — on a dead key/network
     // it degrades to the detector's own naming, never to nothing.
@@ -583,6 +734,59 @@ func curateRangeFeedsRecordedOCRToTheCurator() async throws {
     let prompt = await capture.lastUser
     #expect(prompt.contains("on screen"))
     #expect(prompt.contains("Refund request for order #4821"))
+}
+
+@Test
+func curateRangeKeepsAutomaticPathTextOnlyAndTeachPathMultimodal() async throws {
+    let store = try makeStore()
+    try await store.insertInputEvents(copyPasteEvents())
+    let imageURL = try makeTestPNG()
+    defer { try? FileManager.default.removeItem(at: imageURL) }
+    _ = try await store.insert(RecordedContext(
+        capturedAt: base.addingTimeInterval(2),
+        source: .screen,
+        appName: "Numbers",
+        windowTitle: "Pipeline",
+        ocrText: "Quarterly totals updated",
+        imagePath: imageURL.path
+    ))
+    let canned = #"{"agents":[{"index":0,"name":"Update totals","why":"shown once","goal":"Update the current totals in Numbers.","value":0.8}]}"#
+
+    let automaticCapture = MultimodalCapture()
+    let automatic = CascadeOrchestrator(
+        store: store,
+        curator: WorkflowCurator(client: CapturingMultimodalCompleter(canned: canned, capture: automaticCapture))
+    )
+    _ = try await automatic.curateRange(from: base, to: base.addingTimeInterval(100))
+    let automaticSnapshot = await automaticCapture.snapshot()
+    #expect(automaticSnapshot.textCalls == 1)
+    #expect(automaticSnapshot.multimodalCalls == 0)
+
+    let teachCapture = MultimodalCapture()
+    let teach = CascadeOrchestrator(
+        store: store,
+        curator: WorkflowCurator(client: CapturingMultimodalCompleter(canned: canned, capture: teachCapture))
+    )
+    _ = try await teach.curateRange(
+        from: base,
+        to: base.addingTimeInterval(100),
+        statedIntent: "I am updating the current quarterly totals",
+        includeTeachEvidence: true
+    )
+    let teachSnapshot = await teachCapture.snapshot()
+    let text = teachSnapshot.content.compactMap { block -> String? in
+        guard case .text(let value) = block else { return nil }
+        return value
+    }.joined(separator: "\n")
+    let imageCount = teachSnapshot.content.reduce(into: 0) { count, block in
+        if case .image = block { count += 1 }
+    }
+    #expect(teachSnapshot.textCalls == 0)
+    #expect(teachSnapshot.multimodalCalls == 1)
+    #expect(imageCount == 1)
+    #expect(text.contains("I am updating the current quarterly totals"))
+    #expect(text.contains("Quarterly totals updated"))
+    #expect(text.contains("COMPLETE GENERALIZED ACTION TIMELINE"))
 }
 
 @Test
@@ -685,7 +889,7 @@ func curateOnePromptTeachesRunVaryingParameters() {
     #expect(WorkflowCurator.curateOneSystemPrompt.contains("CURRENT-RUN value"))
     #expect(WorkflowCurator.curateOneSystemPrompt.contains("never the demonstrated literal"))
     // Prompt changed → the model-call cache key must roll over.
-    #expect(WorkflowCurator.curateOnePromptVersion == "workflow-curator.curate-one.prompt.v3")
+    #expect(WorkflowCurator.curateOnePromptVersion == "workflow-curator.curate-one.prompt.v4")
 }
 
 @Test
