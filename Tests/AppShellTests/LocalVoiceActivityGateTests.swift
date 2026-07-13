@@ -152,3 +152,54 @@ struct LocalVoiceActivityGateTests {
         #expect(gate.snapshot.uploadedAudioMs == 540)
     }
 }
+
+// MARK: - Real-mic regression (2026-07-13)
+// A live teach demo delivered 1209 real mic frames and the gate confirmed ZERO:
+// laptop-mic speech sits well below the old 0.02 RMS / 0.05 peak thresholds, and
+// zero-tolerance candidacy meant one soft inter-syllable frame erased 200ms of
+// progress. These pins hold the empirically-set floor in place.
+
+/// Quiet speech (~0.009 RMS, ~0.024 peak — a realistic laptop-mic level, well below
+/// the OLD thresholds) with a syllable dip every few frames must still confirm.
+@Test
+func quietDippySpeechConfirms() {
+    var gate = LocalVoiceActivityGate(configuration: config)
+    var confirmed = false
+    for index in 0..<20 {
+        let frame = index % 4 == 3 ? silenceFrame() : speechFrame(amplitude: 800)
+        let result = gate.ingestPCM16Frame(frame)
+        if result.didConfirmSpeech { confirmed = true }
+    }
+    #expect(confirmed)
+    #expect(gate.snapshot.uploadedSpeechMs >= config.minSpeechMs)
+}
+
+/// A dip longer than the tolerance still resets candidacy — sustained near-silence
+/// after a short burst must not ride a stale candidate to confirmation.
+@Test
+func dipBeyondToleranceResetsCandidacy() {
+    var gate = LocalVoiceActivityGate(configuration: config)
+    var confirmed = false
+    // 3 speech frames (90ms) then 4 silence frames (120ms > 60ms tolerance), repeated:
+    // speech never accumulates minSpeechMs within one tolerance window.
+    for index in 0..<28 {
+        let frame = index % 7 < 3 ? speechFrame(amplitude: 800) : silenceFrame()
+        if gate.ingestPCM16Frame(frame).didConfirmSpeech { confirmed = true }
+    }
+    #expect(!confirmed)
+}
+
+/// The mic self-noise floor (~0.002 RMS) must never register as speech under the
+/// lowered thresholds.
+@Test
+func noiseFloorNeverConfirms() {
+    var gate = LocalVoiceActivityGate(configuration: config)
+    var generator = SystemRandomNumberGenerator()
+    for _ in 0..<40 {
+        let frame = (0..<config.samplesPerFrame).map { _ in Int16.random(in: -70...70, using: &generator) }
+        let result = gate.ingestPCM16Frame(frame)
+        #expect(result.kind == .silence)
+        #expect(!result.didConfirmSpeech)
+    }
+    #expect(gate.snapshot.uploadedSpeechMs == 0)
+}

@@ -17,6 +17,12 @@ public struct LocalVoiceActivityGate: Sendable {
         public let minSpeechPeak: Double
         public let impulsePeak: Double
         public let impulseCrestFactor: Double
+        /// How much accumulated sub-threshold audio a candidate run survives before
+        /// it resets. Real speech dips below any threshold between syllables; with
+        /// zero tolerance, confirmation required minSpeechMs of CONTINUOUS
+        /// above-threshold frames, which a live teach demo (1209 mic frames, zero
+        /// confirms) proved never happens at real mic levels.
+        public let candidateDipToleranceMs: Int
 
         public init(
             sampleRate: Int = 24_000,
@@ -24,10 +30,15 @@ public struct LocalVoiceActivityGate: Sendable {
             prefixPaddingMs: Int = 300,
             minSpeechMs: Int = 210,
             hangoverMs: Int = 240,
-            speechRMS: Double = 0.02,
-            minSpeechPeak: Double = 0.05,
+            // Empirically set (2026-07-13): 24k TTS speech scaled to 0.1x full
+            // scale — a realistic laptop-mic level, matching the live run where
+            // the old 0.02/0.05 thresholds passed 0 of 1209 real frames — confirms
+            // under these values, while a 0.0018-RMS mic noise floor passes 0/39.
+            speechRMS: Double = 0.008,
+            minSpeechPeak: Double = 0.02,
             impulsePeak: Double = 0.65,
-            impulseCrestFactor: Double = 12
+            impulseCrestFactor: Double = 12,
+            candidateDipToleranceMs: Int = 60
         ) {
             precondition(frameDurationMs == 20 || frameDurationMs == 30, "LocalVoiceActivityGate expects fixed 20 ms or 30 ms frames.")
             precondition(sampleRate > 0, "LocalVoiceActivityGate sampleRate must be positive.")
@@ -40,6 +51,7 @@ public struct LocalVoiceActivityGate: Sendable {
             self.minSpeechPeak = minSpeechPeak
             self.impulsePeak = impulsePeak
             self.impulseCrestFactor = impulseCrestFactor
+            self.candidateDipToleranceMs = max(0, candidateDipToleranceMs)
         }
 
         public var samplesPerFrame: Int {
@@ -95,6 +107,7 @@ public struct LocalVoiceActivityGate: Sendable {
     private var candidateFrames: [[Int16]] = []
     private var totalMs = 0
     private var candidateSpeechMs = 0
+    private var candidateDipMs = 0
     private var confirmedSpeechMs = 0
     private var uploadedSpeechMs = 0
     private var uploadedAudioMs = 0
@@ -124,6 +137,7 @@ public struct LocalVoiceActivityGate: Sendable {
         candidateFrames.removeAll(keepingCapacity: true)
         totalMs = 0
         candidateSpeechMs = 0
+        candidateDipMs = 0
         confirmedSpeechMs = 0
         uploadedSpeechMs = 0
         uploadedAudioMs = 0
@@ -188,6 +202,7 @@ public struct LocalVoiceActivityGate: Sendable {
         } else {
             candidateFrames.append(samples)
             candidateSpeechMs += configuration.frameDurationMs
+            candidateDipMs = 0
 
             if candidateSpeechMs >= configuration.minSpeechMs {
                 hasConfirmedSpeech = true
@@ -221,9 +236,17 @@ public struct LocalVoiceActivityGate: Sendable {
                 uploadFrames = [samples]
                 uploadedAudioMs += configuration.frameDurationMs
             }
+        } else if candidateSpeechMs > 0, candidateDipMs + configuration.frameDurationMs <= configuration.candidateDipToleranceMs {
+            // A syllable gap inside a candidate run: real speech dips below any
+            // threshold constantly, so a brief lull must not zero the progress
+            // toward minSpeechMs. Keep the frame so the confirmed upload is
+            // contiguous audio; only speech frames count toward confirmation.
+            candidateDipMs += configuration.frameDurationMs
+            candidateFrames.append(samples)
         } else {
             candidateFrames.removeAll(keepingCapacity: true)
             candidateSpeechMs = 0
+            candidateDipMs = 0
             appendPrefixFrame(samples)
         }
 
