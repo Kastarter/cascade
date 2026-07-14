@@ -210,7 +210,10 @@ struct RealtimeVoiceTranscriptionTrackerTests {
             await Task.yield()
         }
         #expect(voice.state == .listening)
-        // The legacy/default path commits even when a very quick tap appended no audio.
+        // Continuous capture clears (never commits) a tap that appended NO audio,
+        // so this scenario feeds real PCM first — the retirement contract needs a
+        // commit the server can then reject.
+        voice.ingestCapturedPCM16ForTesting(Data(repeating: 0x40, count: 3_200))
         voice.endTalking()
         #expect(voice.state == .working)
         let failedPushToTalkEventID = try #require(sender.events.last(where: {

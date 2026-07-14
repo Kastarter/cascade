@@ -184,13 +184,13 @@ struct RealtimeVoiceEndpointPolicyTests {
         #expect(!RealtimeVoice.experimentalLocalVoiceEndpointingEnabled(defaults: defaults))
     }
 
-    @Test func teachAmbientEndpointingDefaultsOnWithEscapeHatch() {
+    @Test func teachAmbientEndpointingDefaultsOffWithVADOptIn() {
         let defaults = UserDefaults(suiteName: "RealtimeVoiceTeachEndpoint-\(UUID().uuidString)")!
 
-        #expect(RealtimeVoice.teachAmbientVoiceEndpointingEnabled(defaults: defaults))
-
-        defaults.set(false, forKey: RealtimeVoice.teachAmbientVoiceEndpointingKey)
         #expect(!RealtimeVoice.teachAmbientVoiceEndpointingEnabled(defaults: defaults))
+
+        defaults.set(true, forKey: RealtimeVoice.teachAmbientVoiceEndpointingKey)
+        #expect(RealtimeVoice.teachAmbientVoiceEndpointingEnabled(defaults: defaults))
     }
 
     @Test func teachAmbientCommitsAtEachSpeechHangoverAndContinuesCapture() {
@@ -283,7 +283,7 @@ struct RealtimeVoiceEndpointPolicyTests {
         #expect(await tracker.drain(teachingSessionID: sessionID, timeout: .milliseconds(10)) == .drained)
     }
 
-    @Test func teachAmbientEscapeHatchFallsBackToOneCommitOnRelease() {
+    @Test func teachAmbientContinuousRecordingCommitsOnceOnRelease() {
         let sender = FakeRealtimeVoiceEventSender()
         let session = makeRealtimeEndpointSession(mode: .passthroughRelease, sender: sender)
         let utterance = Array(repeating: realtimeSpeechFrame(), count: 8)
@@ -294,6 +294,30 @@ struct RealtimeVoiceEndpointPolicyTests {
 
         #expect(session.release() == .committed)
         #expect(sender.eventTypes.filter { $0 == "input_audio_buffer.commit" }.count == 1)
+    }
+
+    @Test func teachAmbientContinuousRecordingKeepsQuietShortNarration() {
+        let sender = FakeRealtimeVoiceEventSender()
+        let session = makeRealtimeEndpointSession(mode: .passthroughRelease, sender: sender)
+        let frames = [realtimeClickFrame()]
+            + Array(repeating: realtimeSpeechFrame(amplitude: 120), count: 2)
+            + [realtimeSilenceFrame()]
+
+        feedRealtimeEndpoint(session, frames: frames)
+
+        #expect(appendedSampleCount(sender) == frames.flatMap { $0 }.count)
+        #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
+        #expect(session.release() == .committed)
+        #expect(sender.eventTypes.filter { $0 == "input_audio_buffer.commit" }.count == 1)
+    }
+
+    @Test func emptyTeachAmbientContinuousRecordingClearsWithoutCommit() {
+        let sender = FakeRealtimeVoiceEventSender()
+        let session = makeRealtimeEndpointSession(mode: .passthroughRelease, sender: sender)
+
+        #expect(session.release() == .cleared)
+        #expect(!sender.eventTypes.contains("input_audio_buffer.commit"))
+        #expect(sender.eventTypes.filter { $0 == "input_audio_buffer.clear" }.count == 1)
     }
 
     @Test func pushToTalkNeverAutoCommitsWhileHeld() {

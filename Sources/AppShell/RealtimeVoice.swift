@@ -124,7 +124,7 @@ final class RealtimeVoiceResponseState: @unchecked Sendable {
 
 final class RealtimeVoiceEndpointSession: @unchecked Sendable {
     enum Mode: Equatable {
-        /// Legacy server-buffer upload: append every frame and commit only on release.
+        /// Continuous server-buffer upload: preserve every frame and commit once on release.
         case passthroughRelease
         /// D-13 PTT behavior: locally gate noise, then clear/wait/commit on release.
         case gatedRelease
@@ -265,9 +265,16 @@ final class RealtimeVoiceEndpointSession: @unchecked Sendable {
         guard !closed else { return .cleared }
 
         guard mode != .passthroughRelease else {
+            lock.lock()
+            let hadAudio = ingestedFrameTotal > 0
+            lock.unlock()
             closed = true
-            sendCommitLocked()
-            return .committed
+            if hadAudio {
+                sendCommitLocked()
+                return .committed
+            }
+            sendClearLocked()
+            return .cleared
         }
 
         switch endpointDecisionOnRelease() {
@@ -516,7 +523,7 @@ public final class RealtimeVoice: ObservableObject {
     }
 
     public nonisolated static func teachAmbientVoiceEndpointingEnabled(defaults: UserDefaults = .standard) -> Bool {
-        (defaults.object(forKey: teachAmbientVoiceEndpointingKey) as? Bool) ?? true
+        (defaults.object(forKey: teachAmbientVoiceEndpointingKey) as? Bool) ?? false
     }
 
     public init(
