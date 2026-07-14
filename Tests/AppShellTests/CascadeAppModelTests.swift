@@ -1529,6 +1529,80 @@ func teachOnceBracketsTheDemonstrationIntoAPreview() async throws {
 }
 
 @MainActor @Test
+func teachOnceArmsNarrationImmediatelyInContinuousMode() async throws {
+    let (model, store) = try makeModel(
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .drained }
+    )
+
+    model.beginTeaching()
+
+    #expect(model.teachingMode)
+    #expect(model.teachStatus?.hasPrefix("Listening —") == true)
+    let started = try await waitForAudit(store, action: "teach.started")
+    #expect(started.detail.contains("voice=continuous"))
+
+    model.endTeaching()
+    _ = try await waitForAudit(store, action: "teach.stopped")
+}
+
+@MainActor @Test
+func teachOnceAuditsCuratedOutcomeAndCaptureState() async throws {
+    let (model, store) = try makeModel(
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .drained },
+        teachCurationOverride: { _, _, _ in taughtCurated() }
+    )
+    model.beginTeaching()
+    let started = try await waitForAudit(store, action: "teach.started")
+    // The recorder is never started in the harness — a demo against a dead
+    // capture stream must NAME that condition instead of hiding it.
+    #expect(started.detail.contains("capture=down"))
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+
+    let curated = try await waitForAudit(store, action: "teach.curated")
+    #expect(curated.detail.contains("nameHash="))
+    expectAuditDetail(curated.detail, excludesRawIdentityContaining: "My taught task")
+    try await waitUntil({ model.teachPreview != nil })
+    #expect(model.teachPreview?.name == "My taught task")
+}
+
+@MainActor @Test
+func teachOnceAuditsEmptyCuration() async throws {
+    let (model, store) = try makeModel(
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .drained },
+        teachCurationOverride: { _, _, _ in nil }
+    )
+    model.beginTeaching()
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+
+    let audit = try await waitForAudit(store, action: "teach.curate.empty")
+    #expect(audit.detail.contains("no_concrete_actions"))
+    #expect(model.teachPreview == nil)
+}
+
+@MainActor @Test
+func teachOnceAuditsFailedCuration() async throws {
+    struct CurationBoom: Error {}
+    let (model, store) = try makeModel(
+        teachRecorderSettleOperation: {},
+        teachNarrationDrain: { _, _ in .drained },
+        teachCurationOverride: { _, _, _ in throw CurationBoom() }
+    )
+    model.beginTeaching()
+    try await Task.sleep(for: .milliseconds(450))
+    model.endTeaching()
+
+    let audit = try await waitForAudit(store, action: "teach.curate.failed")
+    #expect(audit.detail.contains("type=CurationBoom"))
+    #expect(audit.detail.contains("errorHash="))
+    #expect(model.teachPreview == nil)
+}
+
+@MainActor @Test
 func teachOnceNoCandidateDoesNotAskForRepeatability() async throws {
     let (model, _) = try makeModel()
     model.beginTeaching()

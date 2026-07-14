@@ -1198,17 +1198,28 @@ public final class CascadeAppModel: ObservableObject {
     /// Evidence can live on any recorded day, but the Reel scrubs one day at a
     /// time — so jumping loads the cited day's timeline first, then targets the
     /// moment. Today just clears any past-day window; the live timeline has it.
+    /// The WATCHABLE record is strictly the trailing 24 hours: older moments have
+    /// been distilled into knowledge-graph chunks and their frames and rows
+    /// deleted, so a jump beyond the window falls back to the live timeline (and
+    /// the fetch is floored at the window even while a deletion backlog drains).
     private func jumpReel(to date: Date, auditDetail: String) {
         searchQuery = ""
         selectedTab = .reel
         Task {
             let calendar = Calendar.current
+            let watchableFloor = Date().addingTimeInterval(-24 * 3600)
             if calendar.isDateInToday(date) {
                 reelWindow = nil
+            } else if date < watchableFloor {
+                reelWindow = nil
+                reelJumpTarget = nil
+                flashTeachStatus("That moment is older than 24 hours — the recording was distilled into knowledge and deleted. Ask about it in chat instead.")
+                _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "reel.jump", detail: "\(auditDetail) beyond-24h"))
+                return
             } else {
                 let dayStart = calendar.startOfDay(for: date)
                 let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart.addingTimeInterval(24 * 3600)
-                let day = (try? await store.contexts(from: dayStart, to: dayEnd)) ?? []
+                let day = (try? await store.contexts(from: max(dayStart, watchableFloor), to: dayEnd)) ?? []
                 reelWindow = day.isEmpty ? nil : ReelDayWindow(dayStart: dayStart, contexts: day)
             }
             reelJumpTarget = date
@@ -7401,16 +7412,17 @@ public final class CascadeAppModel: ObservableObject {
         }
         pruneExpiredRecentTeachSessions(at: teachClock())
         let sessionID = teachSessionIDFactory()
+        let automaticEndpointing = RealtimeVoice.teachAmbientVoiceEndpointingEnabled(defaults: defaultsStore)
         let purpose = RealtimeVoice.CapturePurpose.teachAmbient(
             sessionID: sessionID,
-            automaticEndpointing: RealtimeVoice.teachAmbientVoiceEndpointingEnabled(defaults: defaultsStore)
+            automaticEndpointing: automaticEndpointing
         )
         teachStartedAt = teachClock()
         activeTeachSessionID = sessionID
         activeTeachPurpose = purpose
         teachIntentBuffer.removeAll()
         teachFinishing = false
-        teachAmbientArmed = false
+        teachAmbientArmed = true
         teachingMode = true
         // Demo burst: capture every 0.5s (instead of the normal 1s changed-frame
         // cadence) for the length of the demonstration, so transient states — a
@@ -7419,26 +7431,26 @@ public final class CascadeAppModel: ObservableObject {
         // the defaults key is the escape hatch if a stream restart misbehaves.
         let demoBurstArmed = Self.enabledByDefault(defaultsStore, key: Self.teachDemoBurstKey)
         if demoBurstArmed { recorder.setDemoBurst(true) }
-        teachStatus = "Watching — show me the task and talk me through it like a new hire. Press ⌥⌃T when you're done."
-        // Teach-once is training an intern, not filling a form: the mic just opens and
-        // listens. Whatever you say while you work — the way you'd instruct a new hire —
-        // becomes the agent's intent. A short acknowledgement, then hands-free listening
-        // (no key to hold); the delay lets the acknowledgement finish before the mic's
-        // barge-in would cut it off.
-        voice.speak("Okay, I'm watching — go ahead and show me.")
-        Task { [weak self, purpose, sessionID] in
-            try? await Task.sleep(for: .milliseconds(1800))
-            guard let self,
-                  self.teachingMode,
-                  self.activeTeachSessionID == sessionID,
-                  !self.assistTaskRunning,
-                  !self.agentRunning
-            else { return }
-            self.voice.beginTalking(purpose: purpose)
-            self.teachAmbientArmed = true
-            self.teachStatus = "Listening — talk me through it as you work. Press ⌥⌃T when you're done."
+        teachStatus = "Listening — talk me through it as you work. Press ⌥⌃T when you're done."
+        // Open the microphone immediately and keep every frame until the demonstration
+        // ends. There is no spoken acknowledgement to leak into the recording and no
+        // arming delay that can discard the user's first sentence. The previous local
+        // VAD segmentation remains available as an explicit defaults opt-in.
+        voice.beginTalking(purpose: purpose)
+        let cadence = demoBurstArmed ? "0.5s" : "default"
+        let voiceMode = automaticEndpointing ? "vad" : "continuous"
+        Task {
+            // capture=down means the demo is being recorded with NO screen
+            // moments (the OS tore the stream down and recovery hasn't brought
+            // it back) — the single condition that silently degraded past
+            // demonstrations. Naming it here makes the audit trail diagnostic.
+            let capture = recorder.captureStreamAlive ? "live" : "down"
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "employee",
+                action: "teach.started",
+                detail: "cadence=\(cadence) voice=\(voiceMode) capture=\(capture)"
+            ))
         }
-        Task { _ = try? await store.appendAudit(AuditEvent(actor: "employee", action: "teach.started", detail: demoBurstArmed ? "cadence=0.5s" : "cadence=default")) }
     }
 
     /// End the demonstration and turn the bracketed range into a curated agent (shown
@@ -7529,8 +7541,30 @@ public final class CascadeAppModel: ObservableObject {
         let requestedRevision = session.revision
         do {
             let curated = try await curateTaughtSession(session, intent: intent)
+            // The curation OUTCOME is audited unconditionally — a demonstration
+            // that yields no agent used to vanish without a trace (a 5-second
+            // banner was the only witness), which made "agents are not being
+            // created" undiagnosable after the fact.
+            if let curated {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "system",
+                    action: "teach.curated",
+                    detail: Self.curatedAgentAuditDetail(curated)
+                ))
+            } else {
+                _ = try? await store.appendAudit(AuditEvent(
+                    actor: "system",
+                    action: "teach.curate.empty",
+                    detail: "reason=no_concrete_actions"
+                ))
+            }
             publishInitialTeachResult(curated, sessionID: sessionID, requestedRevision: requestedRevision)
         } catch {
+            _ = try? await store.appendAudit(AuditEvent(
+                actor: "system",
+                action: "teach.curate.failed",
+                detail: "type=\(String(describing: Swift.type(of: error))) \(Self.textAuditDetail("error", error.localizedDescription))"
+            ))
             guard let current = recentTeachSessions[sessionID] else { return }
             if current.revision != requestedRevision {
                 if current.appliedRevision != current.revision {
