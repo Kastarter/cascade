@@ -94,10 +94,12 @@ func testRunOnceCompactsBeforePruneAtFixedNow() async throws {
     #expect(try await store.searchKnowledgeGraphs(matching: "historicindigo").map(\.graph.day).contains(expiredDay))
     #expect(!FileManager.default.fileExists(atPath: expiredPath))
 
-    let aged = try #require(try await store.context(id: inserted[1].id))
-    #expect(aged.imagePath == nil)
-    #expect(aged.ocrText?.contains("APER-202") == true)
+    // The aged (25h) moment is outside the 24-hour watchable window: its frame
+    // is compacted into the knowledge graph, and the source ROW is deleted too —
+    // the chunk is the only remaining representation, and it still answers.
+    #expect(try await store.context(id: inserted[1].id) == nil)
     #expect(!FileManager.default.fileExists(atPath: agedPath))
+    #expect(!(try await store.searchKnowledgeGraphs(matching: "APER-202")).isEmpty)
 
     let recent = try #require(try await store.context(id: inserted[2].id))
     #expect(recent.imagePath == recentPath)

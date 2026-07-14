@@ -222,6 +222,67 @@ func testCompactionDeletesOnlyFramesOlderThan24HoursAndPersistsGraph() async thr
 }
 
 @Test
+func testCoveredSourceRowsDeleteAfter24HoursWhileKGStillAnswers() async throws {
+    let fixture = try KnowledgeGraphFixture("ContextKGRowDelete")
+    let now = try fixedUTCDate("2030-01-02T12:00:00Z")
+    let cutoff = now.addingTimeInterval(-24 * 3600)
+    let oldOne = try fixture.frame("old-safari.heic")
+    let oldTwo = try fixture.frame("old-xcode.heic")
+    let recentPath = try fixture.frame("recent.heic")
+    let inserted = try await fixture.store.insertContexts(
+        makeGraphContexts(
+            firstDate: now.addingTimeInterval(-26 * 3600),
+            secondDate: now.addingTimeInterval(-25.5 * 3600),
+            firstFrame: oldOne,
+            secondFrame: oldTwo
+        ) + [
+            RecordedContext(
+                capturedAt: now.addingTimeInterval(-23 * 3600),
+                source: .screen,
+                appName: "Notes",
+                windowTitle: "Still recent",
+                ocrText: "This row must remain",
+                imagePath: recentPath
+            ),
+        ]
+    )
+
+    // Coverage is the deletion authority: an aged but UNCOVERED row (compaction
+    // has not run) may never be deleted, however old it is.
+    #expect(try await fixture.store.deleteKnowledgeGraphCoveredContexts(olderThan: cutoff) == 0)
+    #expect(try await fixture.store.context(id: inserted[0].id) != nil)
+
+    let result = try await fixture.store.compactAgedContextsIntoKnowledgeGraph(olderThan: cutoff)
+    #expect(result.isCaughtUp)
+
+    let deleted = try await fixture.store.deleteKnowledgeGraphCoveredContexts(olderThan: cutoff)
+    #expect(deleted == 2)
+    #expect(try await fixture.store.context(id: inserted[0].id) == nil)
+    #expect(try await fixture.store.context(id: inserted[1].id) == nil)
+    #expect(try await fixture.store.context(id: inserted[2].id)?.imagePath == recentPath)
+
+    // The knowledge-graph chunk still answers for the deleted day...
+    let day = EventStoreLayout.utcDayKey(for: inserted[0].capturedAt)
+    #expect(!(try await fixture.store.knowledgeGraphChunks(forDay: day)).isEmpty)
+    // ...while the raw rows, their FTS entries, and OCR side rows are gone.
+    let ftsRows = try kgRawInt(
+        fixture.databasePath,
+        "SELECT COUNT(*) FROM rewind_fts WHERE rewind_fts MATCH 'reconcile';"
+    )
+    #expect(ftsRows == 0)
+    let rowCount = try kgRawInt(fixture.databasePath, "SELECT COUNT(*) FROM recorded_context;")
+    #expect(rowCount == 1)
+
+    let audit = try #require(try await fixture.store.recentAudit(limit: 20)
+        .first { $0.action == "retention.context_rows_deleted" })
+    #expect(audit.detail.contains("rows=2"))
+    #expect(!audit.detail.contains("reconcile runway"))
+
+    // Idempotent: a second pass finds nothing left to delete.
+    #expect(try await fixture.store.deleteKnowledgeGraphCoveredContexts(olderThan: cutoff) == 0)
+}
+
+@Test
 func testCrashAfterUnlinkKeepsIntentAndRecoveryAuditsMissingFile() async throws {
     let fixture = try KnowledgeGraphFixture("ContextKGCrashAfterUnlink")
     let now = try fixedUTCDate("2030-01-03T12:00:00Z")

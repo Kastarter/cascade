@@ -242,6 +242,15 @@ public final class ContextRecorder: ObservableObject {
         Task { @MainActor in await recorder.setDemoBurst(enabled) }
     }
 
+    /// Whether the live capture stream is actually up. `status.running` reflects
+    /// INTENT (the user hasn't paused); this reflects REALITY — the OS tears the
+    /// stream down at screen lock/display sleep, and until recovery brings it
+    /// back nothing is being recorded. Teach demos audit this so a demonstration
+    /// recorded against a dead stream names its evidence conditions.
+    public var captureStreamAlive: Bool {
+        rewind?.isRunning ?? false
+    }
+
     public convenience init(
         store: CascadeStore,
         observer: AppWindowObserver = AppWindowObserver(),

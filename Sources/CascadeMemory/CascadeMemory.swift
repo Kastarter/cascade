@@ -2336,6 +2336,63 @@ public actor CascadeStore {
         }
     }
 
+    /// The watchable record is strictly the trailing 24 hours: once a moment's
+    /// knowledge-graph chunk is durably committed AND its frame file is gone
+    /// (`image_path` cleared by compaction), the source row itself is deleted —
+    /// its content lives on only inside the chunk JSON. Uncovered rows, and rows
+    /// whose frame deletion has not committed yet, are left for the compactor to
+    /// retry: deletion authority stays with coverage, exactly like frame files.
+    /// Returns the number of rows removed.
+    @discardableResult
+    public func deleteKnowledgeGraphCoveredContexts(olderThan cutoff: Date) throws -> Int {
+        let cutoffMilliseconds = EventStoreLayout.capturedMilliseconds(for: cutoff)
+        var totalDeleted = 0
+        var affectedDays: Set<String> = []
+        while true {
+            let batch: [(id: Int64, day: String?)] = try withStatement("""
+            SELECT rc.id, rc.captured_day
+            FROM recorded_context rc
+            JOIN context_kg_coverage coverage ON coverage.context_id = rc.id
+            WHERE rc.captured_ms < ? AND rc.image_path IS NULL
+            ORDER BY rc.id ASC
+            LIMIT 2048;
+            """) { statement in
+                bind(cutoffMilliseconds, at: 1, in: statement)
+                var rows: [(id: Int64, day: String?)] = []
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    rows.append((sqlite3_column_int64(statement, 0), text(statement, 1)))
+                }
+                return rows
+            }
+            guard !batch.isEmpty else { break }
+            try withTransaction {
+                try withStatement("DELETE FROM recorded_context WHERE id = ?;") { statement in
+                    for row in batch {
+                        sqlite3_bind_int64(statement, 1, row.id)
+                        try stepDone(statement)
+                        try resetStatement(statement)
+                        try clearBindings(statement)
+                    }
+                }
+            }
+            totalDeleted += batch.count
+            for row in batch {
+                if let day = row.day { affectedDays.insert(day) }
+            }
+        }
+        if totalDeleted > 0 {
+            try cleanupDetachedContextRows()
+            try rebuildDayPartitions(days: affectedDays)
+            try execute("PRAGMA wal_checkpoint(PASSIVE);")
+            _ = try appendAudit(AuditEvent(
+                actor: "system",
+                action: "retention.context_rows_deleted",
+                detail: "cutoffMs=\(cutoffMilliseconds) rows=\(totalDeleted) days=\(affectedDays.count)"
+            ))
+        }
+        return totalDeleted
+    }
+
     /// Moments captured within `[from, to)`, newest-first, decoded WITHOUT the
     /// heavy OCR/metadata payloads. `contextTimeline(since:)` covers the live
     /// "today" window; this bounds both ends so the Reel can load a *past* day

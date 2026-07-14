@@ -521,6 +521,11 @@ actor RecorderMaintenanceScheduler {
            let removed = try? await store.prune(protectingContextsCapturedOnOrAfter: cutoff) {
             for path in removed { FrameStore.delete(path) }
         }
+        // The Reel is watchable for the trailing 24 hours only: rows whose chunk
+        // is durably committed and whose frame file is already gone are removed
+        // outright. Coverage is the deletion authority, so this is safe to run
+        // even while compaction is still catching up on a backlog.
+        _ = try? await store.deleteKnowledgeGraphCoveredContexts(olderThan: cutoff)
         try? await store.performMaintenance(reason: reason)
         await flushSemanticIndexing()
     }
@@ -758,6 +763,13 @@ actor RewindEngine {
 
     func flushWrites() async {
         await writeBuffer.flush()
+    }
+
+    /// Stream lifecycle rows (`rewind.stream.lost` / `rewind.stream.recovered`)
+    /// so a capture outage names itself in the audit trail instead of appearing
+    /// only as a silent gap in the Reel.
+    func auditStreamEvent(action: String, detail: String) async {
+        _ = try? await store.appendAudit(AuditEvent(actor: "system", action: action, detail: detail))
     }
 
     func updateLatest(_ frame: ChangedFrame) {
@@ -1021,6 +1033,13 @@ final class RewindRecorder {
     private var output: RewindStreamOutput?
     private var streamedDisplayID: CGDirectDisplayID?
     private var stopping = false
+    /// Identifies which stream an OS stop event belongs to, so a late
+    /// `didStopWithError` from an already-replaced stream can't tear down its
+    /// healthy successor.
+    private var streamGeneration = 0
+    /// The supervised retry loop bringing a dead stream back (screen lock,
+    /// display sleep). One at a time; cancelled by a deliberate `stop()`.
+    private var recoveryTask: Task<Void, Never>?
     private let logger = Logger(subsystem: "com.humain.cascade", category: "rewind")
 
     init(
@@ -1080,8 +1099,11 @@ final class RewindRecorder {
     /// stands down instead of resurrecting recording the user just stopped. A
     /// transiently failed start (display briefly unavailable mid-swap) gets one
     /// retry so a healthy stream is never traded for a dead one on a hiccup.
+    /// A DEAD stream (nil but never deliberately stopped — the OS tore it down at
+    /// screen lock/display sleep) restarts here too: a teach demo beginning while
+    /// capture is down must revive it, not silently record nothing.
     private func restartLiveStream(reason: String) async {
-        guard stream != nil, !stopping else { return }
+        guard !stopping else { return }
         let liveStream = stream
         stream = nil
         output = nil
@@ -1094,6 +1116,9 @@ final class RewindRecorder {
             try? await Task.sleep(for: .milliseconds(500))
             guard !stopping else { return }
             try? await start()
+        }
+        if stream == nil, !stopping {
+            scheduleStreamRecovery(reason: "restart failed (\(reason))")
         }
     }
 
@@ -1112,20 +1137,26 @@ final class RewindRecorder {
         // The store-side duplicate gate must match the stream-side one, or burst
         // frames that clear the tighter stream threshold get re-dropped at persist.
         await engine.updateSkipThreshold(mode.threshold)
+        streamGeneration += 1
+        let generation = streamGeneration
         let output = RewindStreamOutput(
             engine: engine,
             threshold: mode.threshold,
             heartbeatGap: mode.heartbeatGap
         ) { [weak self] error in
             guard let self else { return }
-            Task { await self.handleStreamStopped(error) }
+            Task { await self.handleStreamStopped(error, generation: generation) }
         }
         guard let made = try await ScreenCaptureUtility.makeRewindStream(
             output: output,
             sampleHandlerQueue: sampleQueue,
             fps: mode.fps
         ) else {
-            return // Fail-closed (no permission / no display) — nothing started.
+            // Fail-closed (no permission / no display) — nothing started NOW,
+            // but keep retrying quietly: a launch while the screen is locked or
+            // asleep must not leave the recorder dead for the whole session.
+            scheduleStreamRecovery(reason: "no capturable display")
+            return
         }
         output.setDisplay(id: made.displayID, bounds: made.displayBounds)
         // A pause could have arrived while we awaited stream creation.
@@ -1143,6 +1174,8 @@ final class RewindRecorder {
         self.stream = made.stream
         self.output = output
         self.streamedDisplayID = made.displayID
+        recoveryTask?.cancel()
+        recoveryTask = nil
         logger.info("Rewind stream started on display \(made.displayID).")
     }
 
@@ -1152,6 +1185,8 @@ final class RewindRecorder {
 
     func stop() async {
         stopping = true
+        recoveryTask?.cancel()
+        recoveryTask = nil
         if let stream {
             self.stream = nil
             self.output = nil
@@ -1173,13 +1208,72 @@ final class RewindRecorder {
         await restartLiveStream(reason: "display change")
     }
 
-    private func handleStreamStopped(_ error: Error?) async {
+    private func handleStreamStopped(_ error: Error?, generation: Int) async {
+        // A stop event from an already-replaced stream must not touch its successor.
+        guard generation == streamGeneration else { return }
         logger.error("Rewind stream stopped unexpectedly: \(error?.localizedDescription ?? "no error", privacy: .public)")
-        guard !stopping, stream != nil else { return }
-        // The OS tore the stream down (e.g. display sleep/wake). Drop our handle and
-        // attempt a single restart; if permission is gone, start() fails closed.
+        guard !stopping else { return }
+        // The OS tore the stream down (display sleep, screen lock, wake, permission
+        // change). Drop our handle and attempt an immediate restart; while the
+        // screen is locked or asleep that restart FAILS, so on failure a supervised
+        // retry loop keeps trying until the display is capturable again — a lock
+        // must never leave the recorder dead for the rest of the session.
         self.stream = nil
         self.output = nil
+        self.streamedDisplayID = nil
         try? await start()
+        if stream == nil, !stopping {
+            scheduleStreamRecovery(reason: error?.localizedDescription ?? "stream stopped")
+        }
+    }
+
+    /// Backoff before recovery attempt `attempt` (0-based): 5s, 10s, 20s, 40s,
+    /// then 60s forever. System sleep pauses the loop; it resumes on wake, so a
+    /// locked-overnight Mac recovers within a minute of unlocking.
+    nonisolated static func streamRecoveryDelay(attempt: Int) -> Duration {
+        let bounded = min(max(attempt, 0), 4)
+        return .seconds(min(5 << bounded, 60))
+    }
+
+    /// Starts the supervised retry loop for a dead-but-wanted stream. One loop at
+    /// a time; a deliberate `stop()` cancels it; a successful `start()` clears it.
+    private func scheduleStreamRecovery(reason: String) {
+        guard recoveryTask == nil, !stopping else { return }
+        logger.error("Rewind stream is down (\(reason, privacy: .public)); retrying until the display is capturable again.")
+        let engine = self.engine
+        let boundedReason = String(reason.prefix(120))
+        Task {
+            await engine.auditStreamEvent(action: "rewind.stream.lost", detail: "reason=\(boundedReason)")
+        }
+        recoveryTask = Task { [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: RewindRecorder.streamRecoveryDelay(attempt: attempt))
+                guard !Task.isCancelled, let self else { return }
+                if await self.attemptStreamRecovery(attempt: attempt) { return }
+                attempt += 1
+            }
+        }
+    }
+
+    /// One recovery attempt. Returns true when the loop should end: the stream is
+    /// back (this attempt's start succeeded, or another path already revived it)
+    /// or the recorder was deliberately stopped.
+    private func attemptStreamRecovery(attempt: Int) async -> Bool {
+        guard !stopping else {
+            recoveryTask = nil
+            return true
+        }
+        if stream == nil {
+            try? await start()
+        }
+        guard stream != nil else { return false }
+        recoveryTask = nil
+        logger.info("Rewind stream recovered after \(attempt + 1) attempt(s).")
+        let engine = self.engine
+        Task {
+            await engine.auditStreamEvent(action: "rewind.stream.recovered", detail: "attempts=\(attempt + 1)")
+        }
+        return true
     }
 }
